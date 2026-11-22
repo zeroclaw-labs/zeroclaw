@@ -2422,6 +2422,107 @@ test('an idle reload that ended the conversation drops the old transcript on rec
   }
 });
 
+const startedOverNotices = (mounted: MountedChat) =>
+  mounted.context().messages.filter((m) => m.notice && m.content.includes('started over'));
+
+for (const [label, beforeReload] of [
+  ['while the reload asks for the turn state', false],
+  ['before the reload starts', true],
+] as const) {
+  test(`a reopen during a first turn whose session_start arrives ${label} shows the turn, not a started-over notice`, async () => {
+    const runtime = new FakeSessionRuntime();
+    const mounted = await mountChat(runtime);
+    await startSocket(runtime, 0);
+    await act(async () => { mounted.context().sendMessage('hello'); });
+
+    // The gateway stores a turn only when it ends, so during a conversation's
+    // first turn it reports no stored messages, yet the turn is running.
+    const check = new Deferred<SessionStateResponse>();
+    runtime.queueStatePlan('A', () => check.promise);
+    runtime.queueStates('A', 'idle');
+    runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+    runtime.queueMessages('A', () => Promise.resolve(answered('hello', 'the answer')));
+    await act(async () => { runtime.sockets[0]!.emitClose(1006); });
+
+    mock.timers.enable({ apis: ['setTimeout'] });
+    try {
+      if (beforeReload) {
+        // The frame arrives before the reload the reopen asked for has begun.
+        await act(async () => {
+          runtime.sockets[0]!.emitOpen();
+          runtime.sockets[0]!.emitMessage(sessionStart(0));
+        });
+      } else {
+        await openSocket(runtime, 0);
+        await act(async () => { runtime.sockets[0]!.emitMessage(sessionStart(0)); });
+      }
+      assert.equal(startedOverNotices(mounted).length, 0, 'no notice before the state check answers');
+
+      await act(async () => { check.resolve(sessionState('A', 'running', 'turn-1')); });
+      await flushPromises();
+      assert.equal(startedOverNotices(mounted).length, 0);
+      assert.equal(mounted.context().typing, true, 'the page shows the turn as running');
+      assert.equal(
+        mounted.context().messages.filter((m) => m.content === 'hello').length,
+        1,
+        'the prompt stays while the turn runs',
+      );
+
+      await advancePoll();
+      assert.equal(mounted.context().typing, false);
+      assert.ok(mounted.context().messages.some((m) => m.content === 'the answer'));
+      assert.equal(startedOverNotices(mounted).length, 0);
+    } finally {
+      mock.timers.reset();
+    }
+    await unmount(mounted.renderer);
+  });
+}
+
+test('a first turn that ends while the reopen asks for its state loads the answer without a notice', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountChat(runtime);
+  await startSocket(runtime, 0);
+  await act(async () => { mounted.context().sendMessage('hello'); });
+  const check = new Deferred<SessionStateResponse>();
+  runtime.queueStatePlan('A', () => check.promise);
+  // By the time the check answers, the turn has ended and the gateway has stored it.
+  runtime.queueMessages('A', () => Promise.resolve(answered('hello', 'the answer')));
+  await act(async () => { runtime.sockets[0]!.emitClose(1006); });
+
+  await openSocket(runtime, 0);
+  await act(async () => { runtime.sockets[0]!.emitMessage(sessionStart(0)); });
+  await act(async () => { check.resolve(sessionState('A', 'idle')); });
+  await flushPromises();
+  assert.equal(startedOverNotices(mounted).length, 0);
+  assert.ok(mounted.context().messages.some((m) => m.content === 'the answer'));
+  assert.equal(mounted.context().messages.filter((m) => m.content === 'hello').length, 1);
+  await unmount(mounted.renderer);
+});
+
+test('a reopen whose reload finds no running turn and nothing stored still shows the started-over notice', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountWithHistory(runtime);
+  await act(async () => { mounted.context().sendMessage('hello'); });
+  const check = new Deferred<SessionStateResponse>();
+  runtime.queueStatePlan('A', () => check.promise);
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  await act(async () => { runtime.sockets[0]!.emitClose(1006); });
+
+  await openSocket(runtime, 0);
+  await act(async () => { runtime.sockets[0]!.emitMessage(sessionStart(0)); });
+  assert.ok(
+    mounted.context().messages.some((m) => m.content === 'an earlier answer'),
+    'the transcript stays until the state check answers',
+  );
+
+  await act(async () => { check.resolve(sessionState('A', 'idle')); });
+  await flushPromises();
+  assertStartedOver(mounted);
+  assert.equal(mounted.context().typing, false);
+  await unmount(mounted.renderer);
+});
+
 test('a reload in the middle of a turn that ended the conversation keeps only the notice', async () => {
   {
     const runtime = new FakeSessionRuntime();

@@ -389,6 +389,18 @@ export function AgentProvider({
   // page no longer wants. Kept apart from `detachedTurnWatchRef` because a
   // conversation switch leaves only a watched turn running.
   const pendingTurnCheckRef = useRef<AbortController | null>(null);
+  // What the current reload's first state check has said: `pending` until it
+  // answers. During a conversation's first turn the gateway has stored
+  // nothing yet, so a `session_start` reporting no stored messages means the
+  // conversation started over only when no turn is running there.
+  const reloadTurnCheckRef = useRef<
+    { watch: AbortController; state: 'pending' | 'running' | 'idle' } | null
+  >(null);
+  // Set from a reopen until its reload has started that check: a
+  // `session_start` can arrive before the reload has begun.
+  const reloadDueRef = useRef(false);
+  // Conversation whose started-over notice waits for that check's answer.
+  const startedOverDueRef = useRef<string | null>(null);
   // The last definite answer on whether the gateway stores transcripts.
   // `sessionPersistence` is null again while each reload is in flight, and a
   // `session_start` arriving then still needs to know.
@@ -445,6 +457,25 @@ export function AgentProvider({
     void primeModelProviderCatalog();
   }, []);
 
+  // The server holds nothing for this page's conversation, yet the transcript
+  // shows messages: the server started it over (it was closed to make room for
+  // another, or a restart ended it). Those messages are no longer its context,
+  // so they must not look like it.
+  const showStartedOver = useCallback(() => {
+    localMessageMutationVersionRef.current += 1;
+    setMessages([
+      {
+        id: generateUUID(),
+        role: 'agent',
+        content: t('agent.conversation_started_over'),
+        timestamp: new Date(),
+        ephemeral: true,
+        notice: true,
+      },
+    ]);
+    setContextInput(EMPTY_CONTEXT_INPUT);
+  }, []);
+
   // Hydrate chat from server (preferred) or localStorage fallback. Re-runs on
   // every session switch, which is what rehydrates the transcript of the
   // conversation the operator just selected.
@@ -472,6 +503,7 @@ export function AgentProvider({
     setSessionPersistence(null);
     setHydratedSessionId(null);
     hydrationFailedRef.current = null;
+    if (startedOverDueRef.current !== sid) startedOverDueRef.current = null;
     const watch = new AbortController();
     // Whether the gateway is still running this conversation's turn. Any
     // failure, including the 404 of a gateway without session persistence,
@@ -530,6 +562,8 @@ export function AgentProvider({
     (async () => {
       let watching = false;
       pendingTurnCheckRef.current = watch;
+      reloadTurnCheckRef.current = { watch, state: 'pending' };
+      reloadDueRef.current = false;
       try {
         // Ask before loading the transcript. The gateway stores a turn before
         // it leaves `running`, so a turn that ends after this answer is either
@@ -537,10 +571,26 @@ export function AgentProvider({
         // ending between the two reads would leave its answer unloaded.
         const runningBeforeLoad = await turnStillRunning();
         if (cancelled) return;
+        reloadTurnCheckRef.current = { watch, state: runningBeforeLoad ? 'running' : 'idle' };
+        // A running turn means the gateway still has the conversation.
+        if (runningBeforeLoad && startedOverDueRef.current === sid) startedOverDueRef.current = null;
         const res = await sessionRuntime.getMessages(sid);
         if (cancelled) return;
         serverKeepsTranscriptsRef.current = res.session_persistence;
         setSessionPersistence(res.session_persistence);
+        if (startedOverDueRef.current === sid) {
+          startedOverDueRef.current = null;
+          // No turn running and still nothing stored (a turn that ended while
+          // the check was out is stored by now): the gateway did start over.
+          if (
+            res.session_persistence
+            && res.messages.length === 0
+            && !typingRef.current
+            && messagesRef.current.some((m) => !m.ephemeral)
+          ) {
+            showStartedOver();
+          }
+        }
         if (res.session_persistence) {
           if (localMessageMutationVersionRef.current === hydrationStartedAtMutationVersion) {
             const snapshotUsers = res.messages
@@ -589,6 +639,7 @@ export function AgentProvider({
         }
       } finally {
         if (pendingTurnCheckRef.current === watch) pendingTurnCheckRef.current = null;
+        if (reloadTurnCheckRef.current?.watch === watch) reloadTurnCheckRef.current = null;
         if (!cancelled) setHydratedSessionId(sid);
       }
 
@@ -623,7 +674,7 @@ export function AgentProvider({
       if (watchedTurnRef.current?.watch === watch) watchedTurnRef.current = null;
       if (stopRefusedRef.current?.watch === watch) stopRefusedRef.current = null;
     };
-  }, [sessionId, sessionRuntime, transcriptVersion, perSocket]);
+  }, [sessionId, sessionRuntime, transcriptVersion, perSocket, showStartedOver]);
 
   // Mirror transcript to localStorage (bounded); server remains source of truth when persistence is on
   useEffect(() => {
@@ -691,18 +742,13 @@ export function AgentProvider({
           && !typingRef.current
           && messagesRef.current.some((m) => !m.ephemeral)
         ) {
-          localMessageMutationVersionRef.current += 1;
-          setMessages([
-            {
-              id: generateUUID(),
-              role: 'agent',
-              content: t('agent.conversation_started_over'),
-              timestamp: new Date(),
-              ephemeral: true,
-              notice: true,
-            },
-          ]);
-          setContextInput(EMPTY_CONTEXT_INPUT);
+          const turnCheck = reloadDueRef.current ? 'pending' : reloadTurnCheckRef.current?.state;
+          if (turnCheck === 'pending') {
+            // The reload's state check decides once it answers.
+            startedOverDueRef.current = activeSessionIdRef.current;
+          } else if (turnCheck !== 'running') {
+            showStartedOver();
+          }
         }
         // A transcript that failed to load, typically because the
         // conversation didn't exist until this socket opened it, loads now.
@@ -997,7 +1043,7 @@ export function AgentProvider({
         setPendingApproval(null);
         break;
     }
-  }, [foldTurnStream, perSocket]);
+  }, [foldTurnStream, perSocket, showStartedOver]);
 
   // Wire up a WebSocketClient instance with version-guarded callbacks.
   const attachSocketCallbacks = useCallback((ws: SessionSocket) => {
@@ -1011,6 +1057,7 @@ export function AgentProvider({
       setError(null);
       if (resyncOnOpenRef.current) {
         resyncOnOpenRef.current = false;
+        reloadDueRef.current = true;
         setTranscriptVersion((v) => v + 1);
       }
 
