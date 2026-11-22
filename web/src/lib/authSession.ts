@@ -150,6 +150,7 @@ export function parseOidcSession(value: unknown): OidcSession | null {
     // A missing flag is a denial: the page then shows less, never more.
     features: {
       chat: flags.chat === true,
+      code: flags.code === true,
       operator_pages: flags.operator_pages === true,
       core_sessions: flags.core_sessions === true,
       config: flags.config === true,

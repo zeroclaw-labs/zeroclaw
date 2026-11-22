@@ -115,3 +115,12 @@ test("missing feature flags deny rather than allow", () => {
   assert.equal(pathAccess("/config", access), "not-available");
   assert.equal(homePathFor(access), null);
 });
+
+test("Code-only accounts land on Code and cannot open ACP, chat or settings", () => {
+  const access = navAccessFor(session({ chat: false, operator_pages: false, code: true }));
+  assert.equal(homePathFor(access), "/code");
+  assert.equal(pathAccess("/code?agent=assigned", access), "allowed");
+  assert.equal(pathAccess("/agents", access), "not-available");
+  assert.equal(pathAccess("/config", access), "not-available");
+  assert.equal(pathAccess("/acp-console", access), "needs-pairing");
+});

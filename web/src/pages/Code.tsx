@@ -40,6 +40,7 @@ import { useWorkspaceSettings } from "@/components/WorkspaceSettings";
 import { t } from "@/lib/i18n";
 import { useWorkspaceVisible } from "@/components/layout/WorkspaceOutlet";
 import WorkspaceAttention from "@/components/layout/WorkspaceAttention";
+import { useNavAccess, useOidcSession } from "@/hooks/useNavAccess";
 import { useTheme } from "@/hooks/useTheme";
 import ApprovalBanner from "@/components/ApprovalBanner";
 import type { PendingApproval, ApprovalDecision, Session } from "@/types/api";
@@ -88,6 +89,9 @@ export default function Code({
   onBusyChange?: (busy: boolean) => void;
 }) {
   const visible = useWorkspaceVisible();
+  const access = useNavAccess();
+  const account = useOidcSession();
+  const principal = account?.principal_id;
   const openSettings = useWorkspaceSettings();
   const [sessionQuery, setSessionQuery] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -119,7 +123,7 @@ export default function Code({
   >([]);
   const [messages, setMessages] = useState<CodeMessage[]>([]);
   const [stream, setStream] = useState("");
-  const draftKey = `code.${draftScope ?? attentionTarget ?? "workspace"}.${alias}.${session?.session_id ?? "new"}`;
+  const draftKey = `code.${principal ? JSON.stringify(principal) + "." : ""}${draftScope ?? attentionTarget ?? "workspace"}.${alias}.${session?.session_id ?? "new"}`;
   const { draft, saveDraft, clearDraft } = useDraft(draftKey);
   const [prompt, setPromptValue] = useState(draft);
   const setPrompt = (value: string) => {
@@ -177,13 +181,24 @@ export default function Code({
     const client = new AcpWebSocketClient(
       {
         onOpen: () => {
+          const identityKey = principal ? JSON.stringify(["code-transport", principal, alias, draftScope ?? "workspace"]) : null;
+          let identity: { tui_id?: string; tui_sig?: string } = {};
+          if (identityKey) {
+            try { identity = JSON.parse(sessionStorage.getItem(identityKey) ?? "{}") ?? {}; }
+            catch { /* A new tab can start a fresh connection. */ }
+          }
           void client
-            .request("initialize", {
+            .request<{ tui_id?: string; tui_sig?: string }>("initialize", {
+              tui_id: identity.tui_id, tui_sig: identity.tui_sig,
               protocol_version: 1,
               clientCapabilities: { elicitation: { form: {} } },
             })
-            .then(async () => {
+            .then(async (initialized) => {
               if (cancelled) return;
+              if (identityKey && initialized.tui_id && initialized.tui_sig) {
+                try { sessionStorage.setItem(identityKey, JSON.stringify({tui_id: initialized.tui_id, tui_sig: initialized.tui_sig})); }
+                catch { /* Connection stays usable when tab storage is unavailable. */ }
+              }
               const data = await client.request<{
                 sessions: (Session & { interaction_surface?: string })[];
               }>("session/list-acp");
@@ -281,7 +296,7 @@ export default function Code({
       client.disconnect();
       if (clientRef.current === client) clientRef.current = null;
     };
-  }, [alias, available, connection]);
+  }, [alias, available, connection, principal, draftScope]);
 
   useEffect(() => {
     onBusyChange?.(busy);
@@ -660,7 +675,7 @@ export default function Code({
                     : "code.connecting",
             )}
           </span>
-          <button
+          {access.config && <button
             type="button"
             onClick={() =>
               openSettings(`/config/agents/${encodeURIComponent(alias)}`)
@@ -669,14 +684,14 @@ export default function Code({
             className="ml-auto rounded-lg p-2 text-pc-text-muted hover:bg-pc-elevated"
           >
             <Settings className="h-4 w-4" />
-          </button>
+          </button>}
         </div>
         {available === false && (
           <div className="rounded-lg border border-pc-border p-4 text-sm">
             {t("code.unavailable")}{" "}
-            <Link to="/config/gateway" className="text-pc-accent">
+            {access.config && <Link to="/config/gateway" className="text-pc-accent">
               {t("nav.feature_settings")}
-            </Link>
+            </Link>}
           </div>
         )}
         {error && (
@@ -844,7 +859,7 @@ export default function Code({
               </div>
             </form>
           </section>
-          {!embedded && alias && available && (
+          {access.operatorPages && !embedded && alias && available && (
             <details
               className="shrink-0 rounded-xl border border-pc-border"
               open

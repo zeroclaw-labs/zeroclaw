@@ -12,6 +12,7 @@ import type { OidcSession } from './auth';
 export interface NavAccess {
   operatorPages: boolean;
   chat: boolean;
+  code: boolean;
   /** The config and setup pages. */
   config: boolean;
   /** Pages that only accept a pairing token. */
@@ -21,6 +22,7 @@ export interface NavAccess {
 export const FULL_ACCESS: NavAccess = {
   operatorPages: true,
   chat: true,
+  code: true,
   config: true,
   pairedBrowserPages: true,
 };
@@ -30,6 +32,7 @@ export function navAccessFor(session: OidcSession | null): NavAccess {
   return {
     operatorPages: session.features.operator_pages,
     chat: session.features.chat,
+    code: session.features.code === true,
     config: session.features.config === true,
     pairedBrowserPages: false,
   };
@@ -41,7 +44,7 @@ function underPath(pathname: string, prefix: string): boolean {
   return pathname === prefix || pathname.startsWith(`${prefix}/`);
 }
 
-const PAIRED_BROWSER_PATHS = ['/acp-console', '/code'];
+const PAIRED_BROWSER_PATHS = ['/acp-console'];
 const CONFIG_PATHS = ['/config', '/setup'];
 
 /** Chat: the agent list and an agent's chat, not its workspace files. */
@@ -56,6 +59,7 @@ export function pathAccess(rawPathname: string, access: NavAccess): PathAccess {
   if (PAIRED_BROWSER_PATHS.some((p) => underPath(pathname, p))) {
     return access.pairedBrowserPages ? 'allowed' : 'needs-pairing';
   }
+  if (underPath(pathname, '/code')) return access.code ? 'allowed' : 'not-available';
   if (access.operatorPages) return 'allowed';
   if (CONFIG_PATHS.some((p) => underPath(pathname, p))) {
     return access.config ? 'allowed' : 'not-available';
@@ -71,5 +75,6 @@ export function pathAccess(rawPathname: string, access: NavAccess): PathAccess {
 export function homePathFor(access: NavAccess): string | null {
   if (access.operatorPages) return '/';
   if (access.chat) return '/agents';
+  if (access.code) return '/code';
   return access.config ? '/config' : null;
 }
