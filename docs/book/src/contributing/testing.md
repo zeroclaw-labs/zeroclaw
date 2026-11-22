@@ -60,6 +60,14 @@ pushes to `master` and merge queue runs retain the full regression backstop.
 Override repetitions with `ZEROCLAW_PARALLEL_TEST_RUNS` and harness threads
 with `ZEROCLAW_PARALLEL_TEST_THREADS`.
 
+Each crate is compiled first, and every pass then runs under a deadline:
+`ZEROCLAW_PARALLEL_TEST_PASS_TIMEOUT_SECONDS`, 300 by default. A pass that stops
+making progress fails at the deadline with exit status 124 instead of holding
+the job until its timeout. The test harness prints a warning for any test that
+runs longer than 60 seconds, so the last such line in the log names the test
+that stopped. Where the `timeout` command is not installed, passes run without
+a deadline.
+
 ## Picking a level for a new test
 
 1. Testing one subsystem in isolation? → `tests/component/`
