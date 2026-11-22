@@ -3,12 +3,12 @@
 use crate::agent::agent::{Agent, StreamedTurnError, StreamedTurnSuccess, TurnEvent};
 use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
 use crate::agent::loop_::is_tool_loop_cancelled;
-use crate::agent::turn_accounting::UsageFold;
 use crate::rpc::types::{ProviderUsageTotals, TurnUsageTotals};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::model_provider::ConversationMessage;
+use zeroclaw_providers::turn_accounting::UsageFold;
 
 pub enum TurnOutcome {
     Completed {
