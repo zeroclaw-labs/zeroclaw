@@ -208,15 +208,15 @@ impl PacedChannel {
                 .retain(|pending| !(pending.expires_with_caller && pending.reply.is_closed()));
             // A final/durable reply takes precedence over live best-effort
             // notices from any conversation lane sharing this recipient.
-            if !expires_with_caller
-                && state.queue.len() >= self.queue_depth
-                && let Some(index) = state
+            if !expires_with_caller {
+                while let Some(superseded) = state
                     .queue
                     .iter()
                     .position(|pending| pending.expires_with_caller)
-                && let Some(superseded) = state.queue.remove(index)
-            {
-                let _ = superseded.reply.send(Ok(()));
+                    .and_then(|index| state.queue.remove(index))
+                {
+                    let _ = superseded.reply.send(Ok(()));
+                }
             }
             // Progress always belongs to the worker, including its first send:
             // dropping a slow direct send must not strand in_flight=true.
@@ -836,6 +836,12 @@ mod tests {
 
     #[tokio::test]
     async fn final_reply_supersedes_another_lanes_live_progress() {
+        for depth in [1, 16] {
+            assert_final_reply_supersedes_live_progress(depth).await;
+        }
+    }
+
+    async fn assert_final_reply_supersedes_live_progress(queue_depth: usize) {
         let inner = Arc::new(CountingChannel {
             sends: AtomicUsize::new(0),
             final_sends: AtomicUsize::new(0),
@@ -844,7 +850,7 @@ mod tests {
         let paced = Arc::new(PacedChannel {
             inner: inner.clone(),
             min_interval: Duration::from_millis(80),
-            queue_depth: 1,
+            queue_depth,
             recipients: Arc::new(Mutex::new(RecipientMap::new())),
         });
         paced
