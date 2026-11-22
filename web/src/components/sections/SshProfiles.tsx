@@ -7,6 +7,20 @@ const field = "block w-full rounded-md border border-border bg-background p-2";
 const roles: Record<PamChallengeRole, string> = {
   username: "Username", password: "Password", totp: "TOTP", password_then_totp: "Password followed by TOTP",
 };
+const promptKeys: Record<PamChallengeRole, string> = {
+  username: "ssh_profile_help.username_prompt",
+  password: "ssh_profile_help.password_prompt",
+  totp: "ssh_profile_help.totp_prompt",
+  password_then_totp: "ssh_profile_help.combined_prompt",
+};
+const englishPrompts = ["Username:", "Password:", "Verification code:", "Password and verification code:"];
+const normalizePrompt = (label: string) => label.trim().replace(/:+$/, "").trimEnd().toLowerCase();
+const suggestedPrompt = (role: PamChallengeRole) => role === "password_then_totp" ? "" : t(promptKeys[role]);
+function changeChallengeRole(label: string, role: PamChallengeRole) {
+  const suggestions = [...Object.values(promptKeys).map(key => t(key)), ...englishPrompts];
+  const isSuggestion = suggestions.some(suggestion => normalizePrompt(suggestion) === normalizePrompt(label));
+  return { role, label: !label.trim() || isSuggestion ? suggestedPrompt(role) : label };
+}
 const modes: Record<SshProfileAuth["mode"], string> = {
   public_key: "Public key", password: "Username and password", pam: "PAM keyboard-interactive",
 };
@@ -129,20 +143,34 @@ export default function SshProfiles({ rows, reload, form, setForm }: { rows: Htt
           </label>
           <fieldset className="space-y-3">
             <legend>PAM challenges in server order</legend>
+            <div className="flex flex-wrap gap-2">
+              <Button type="button" onClick={() => setForm({ ...form, auth: { ...auth, totp_alias: undefined,
+                challenges: [{ role: "password", label: suggestedPrompt("password") }] } })}>
+                {t("ssh_profile_help.preset_password")}
+              </Button>
+              <Button type="button" onClick={() => setForm({ ...form, auth: { ...auth,
+                challenges: [
+                  { role: "password", label: suggestedPrompt("password") },
+                  { role: "totp", label: suggestedPrompt("totp") },
+                ] } })}>
+                {t("ssh_profile_help.preset_totp")}
+              </Button>
+            </div>
             {auth.challenges.map((challenge, index) => <div key={index} className="space-y-2">
               <label className="block">Challenge role
                 <Select aria-label="Challenge role" value={challenge.role}
                   onChange={value => setForm({ ...form, auth: { ...auth, challenges: auth.challenges.map((item, pos) =>
-                    pos === index ? { ...item, role: value as PamChallengeRole } : item) } })}
+                    pos === index ? changeChallengeRole(item.label, value as PamChallengeRole) : item) } })}
                   options={Object.entries(roles).map(([value, label]) => ({ value, label }))} />
               </label>
-              <label className="block">Exact prompt label<input className={field} required maxLength={128} value={challenge.label}
+              <label className="block">{t("ssh_profile_help.prompt_label")}<input className={field} required maxLength={128}
+                placeholder={t(promptKeys[challenge.role])} value={challenge.label}
                 onChange={event => setForm({ ...form, auth: { ...auth, challenges: auth.challenges.map((item, pos) =>
                   pos === index ? { ...item, label: event.target.value } : item) } })} /></label>
               <Button type="button" onClick={() => setForm({ ...form, auth: { ...auth, challenges: auth.challenges.filter((_, pos) => pos !== index) } })}>Remove challenge</Button>
             </div>)}
             <Button type="button" disabled={auth.challenges.length >= 3} onClick={() =>
-              setForm({ ...form, auth: { ...auth, challenges: [...auth.challenges, { role: "password", label: "" }] } })}>Add challenge</Button>
+              setForm({ ...form, auth: { ...auth, challenges: [...auth.challenges, { role: "password", label: suggestedPrompt("password") }] } })}>Add challenge</Button>
           </fieldset>
         </>;
       })()}

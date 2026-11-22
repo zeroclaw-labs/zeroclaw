@@ -50,7 +50,9 @@ server also asks for a username, an operator-configured challenge can return
 that same login. It cannot select another account.
 
 Each keyboard-interactive profile declares an ordered set of expected challenge
-roles and exact labels for that deployment. Labels can be localized without
+roles and labels for that deployment. Matching ignores surrounding whitespace, case
+and trailing colons, and accepts common English labels only for the same role.
+Labels can be localized without
 changing the broker. The supported roles are username, password, TOTP and an
 explicit combined password-plus-code field. The combined role requires both
 grants and an operator-selected format. A password-only profile cannot answer
@@ -106,7 +108,8 @@ combined catalog currently deployed on Jarvis.
 
 The Rust broker and operator UI implement direct SSH connections on Linux.
 The operator configures the destination, account and authorized factor aliases
-in Secrets → Usage permissions. PAM profiles match ordered challenge labels.
+in Secrets → Usage permissions. PAM profiles match ordered challenge labels. The form offers password-only
+and password-plus-TOTP presets with editable prompt labels.
 Combined replies concatenate the password and current code.
 
 A disposable QEMU guest verified password-only and password plus separate

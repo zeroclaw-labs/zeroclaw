@@ -14,6 +14,26 @@ pub enum ChallengeRole {
     PasswordThenTotp,
 }
 
+impl ChallengeRole {
+    fn for_english_label(label: &str) -> Option<Self> {
+        match label {
+            "username" | "user name" | "login" => Some(Self::Username),
+            "password" => Some(Self::Password),
+            "verification code" | "otp" | "totp" | "one-time password" | "one-time code" => {
+                Some(Self::Totp)
+            }
+            "password and verification code" | "password followed by verification code" => {
+                Some(Self::PasswordThenTotp)
+            }
+            _ => None,
+        }
+    }
+}
+
+fn normalize_label(label: &str) -> String {
+    label.trim().trim_end_matches(':').trim_end().to_lowercase()
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PamChallenge {
@@ -78,12 +98,14 @@ impl SshAuthProfile {
                 let mut labels = HashSet::new();
                 let mut roles = HashSet::new();
                 for challenge in challenges {
+                    let label = normalize_label(&challenge.label);
                     ensure!(
-                        !challenge.label.is_empty()
+                        !label.is_empty()
                             && challenge.label.len() <= 128
-                            && challenge.label == challenge.label.trim()
                             && !challenge.label.chars().any(char::is_control)
-                            && labels.insert(challenge.label.as_str())
+                            && ChallengeRole::for_english_label(&label)
+                                .is_none_or(|role| role == challenge.role)
+                            && labels.insert(label)
                             && roles.insert(challenge.role),
                         "Invalid or duplicate PAM challenge"
                     );
@@ -107,8 +129,13 @@ impl SshAuthProfile {
 impl PamChallenge {
     /// The profile authorizes the role. A remote prompt can only match that role.
     pub fn match_prompt(&self, prompt: &str, echo: bool) -> Result<ChallengeRole> {
+        let label = normalize_label(prompt);
+        let label_matches = match ChallengeRole::for_english_label(&label) {
+            Some(role) => role == self.role,
+            None => label == normalize_label(&self.label),
+        };
         ensure!(
-            prompt.trim() == self.label && (!echo || self.role == ChallengeRole::Username),
+            !label.is_empty() && label_matches && (!echo || self.role == ChallengeRole::Username),
             "Unexpected PAM challenge"
         );
         Ok(self.role)
@@ -119,6 +146,7 @@ impl PamChallenge {
 pub struct PamExchange<'a> {
     remaining: &'a [PamChallenge],
     rejected: bool,
+    step: usize,
 }
 
 impl<'a> PamExchange<'a> {
@@ -130,6 +158,7 @@ impl<'a> PamExchange<'a> {
         Ok(Self {
             remaining: challenges,
             rejected: false,
+            step: 1,
         })
     }
 
@@ -140,7 +169,13 @@ impl<'a> PamExchange<'a> {
             .remaining
             .split_first()
             .ok_or_else(|| anyhow::Error::msg("Extra PAM challenge"))?;
-        let role = expected.match_prompt(prompt, echo)?;
+        let role = expected.match_prompt(prompt, echo).map_err(|_| {
+            anyhow::Error::msg(format!(
+                "SSH PAM challenge {} did not match the configured {:?} prompt",
+                self.step, expected.role
+            ))
+        })?;
+        self.step += 1;
         self.remaining = rest;
         self.rejected = false;
         Ok(role)
@@ -208,6 +243,43 @@ mod tests {
     }
 
     #[test]
+    fn pam_normalizes_labels_and_falls_back_to_english_by_role() -> Result<()> {
+        for (role, configured, localized, english) in [
+            (ChallengeRole::Username, " Usuário: ", "USUÁRIO", "Login:"),
+            (
+                ChallengeRole::Password,
+                " Senha ",
+                " SENHA : ",
+                " PASSWORD ",
+            ),
+            (
+                ChallengeRole::Totp,
+                " Código: ",
+                " CÓDIGO  ",
+                "Verification code:",
+            ),
+            (
+                ChallengeRole::PasswordThenTotp,
+                "Senha e código",
+                "SENHA E CÓDIGO:",
+                "Password and verification code:",
+            ),
+        ] {
+            let challenge = PamChallenge {
+                label: configured.into(),
+                role,
+            };
+            assert_eq!(challenge.match_prompt(localized, false)?, role);
+            assert_eq!(challenge.match_prompt(english, false)?, role);
+            assert!(challenge.match_prompt("Unrelated prompt:", false).is_err());
+            if role != ChallengeRole::Password {
+                assert!(challenge.match_prompt("Password:", false).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn exchange_rejects_reordered_repeated_and_missing_challenges() -> Result<()> {
         let profile: SshAuthProfile = serde_json::from_value(json!({
             "destination":{"host":"guest.example.test","port":2222,"username":"fixture"},
@@ -237,7 +309,7 @@ mod tests {
 
     #[test]
     fn pam_rejects_missing_factor_and_duplicate_labels() -> Result<()> {
-        for (totp_alias, label) in [(None, "Code:"), (Some("OTP"), "Password:")] {
+        for (totp_alias, label) in [(None, "Code:"), (Some("OTP"), "  PASSWORD  ")] {
             let profile: SshAuthProfile = serde_json::from_value(json!({
                 "destination":{"host":"guest.example.test","port":2222,"username":"fixture"},
                 "authentication":{"mode":"pam","password_alias":"PASSWORD","totp_alias":totp_alias,
