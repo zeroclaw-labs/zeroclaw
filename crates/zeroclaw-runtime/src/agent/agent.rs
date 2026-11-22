@@ -3046,13 +3046,14 @@ impl Agent {
     }
 
     /// Compose an ACP backchannel agent from its session's capability sources.
-    /// The caller supplies config-backed sources with the session memory already
-    /// resolved. Child operations continue to resolve their own agent's sources.
+    /// The prepared memory belongs to this agent. Delegates inherit the capability
+    /// sources and resolve their target agent's memory at admission.
     #[allow(clippy::too_many_arguments)]
     pub async fn from_acp_session_with_capabilities(
         config: &Config,
         agent_alias: &str,
         workspace: &Path,
+        session_memory: Arc<dyn Memory>,
         initialize_mcp: bool,
         exclude_memory: bool,
         capabilities: &crate::composition::RuntimeCapabilities,
@@ -3067,6 +3068,7 @@ impl Agent {
             config,
             agent_alias,
             capabilities,
+            Some(session_memory),
             CapabilityOrigin::Adapter,
             Some(workspace),
             initialize_mcp,
@@ -3105,6 +3107,7 @@ impl Agent {
             config,
             agent_alias,
             capabilities,
+            None,
             CapabilityOrigin::Supplied { principal },
             None,
             true,
@@ -3292,6 +3295,7 @@ impl Agent {
             config,
             agent_alias,
             &capabilities,
+            None,
             origin,
             session_cwd,
             initialize_mcp,
@@ -3316,6 +3320,7 @@ impl Agent {
         config: &Config,
         agent_alias: &str,
         capabilities: &crate::composition::RuntimeCapabilities,
+        session_memory: Option<Arc<dyn Memory>>,
         origin: CapabilityOrigin<'_>,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
@@ -3409,7 +3414,10 @@ impl Agent {
                     );
                 }
             };
-        let memory: Arc<dyn Memory> = capabilities.agent_memory(config, agent_alias).await?;
+        let memory = match session_memory {
+            Some(memory) => memory,
+            None => capabilities.agent_memory(config, agent_alias).await?,
+        };
 
         let tool_config = Arc::new(config.clone());
         let tool_request = crate::composition::ToolRequest {
