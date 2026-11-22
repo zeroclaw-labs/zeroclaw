@@ -2003,18 +2003,6 @@ impl Agent {
         self.memory_session_id = session_id;
     }
 
-    /// Borrow-clone the agent's canonical memory backend (`NoneMemory` when
-    /// memory is disabled or excluded).
-    pub fn memory_handle(&self) -> Arc<dyn Memory> {
-        Arc::clone(&self.memory)
-    }
-
-    /// Whether automatic memory persistence / consolidation is active on this
-    /// agent (`false` whenever persistent memory is excluded).
-    pub fn auto_save_enabled(&self) -> bool {
-        self.auto_save
-    }
-
     pub fn set_temperature(&mut self, temperature: Option<f64>) {
         self.temperature = temperature;
     }
@@ -3053,6 +3041,47 @@ impl Agent {
             None,
             acp_session_store,
             binding,
+        )
+        .await
+    }
+
+    /// Compose an ACP backchannel agent from its session's capability sources.
+    /// The caller supplies config-backed sources with the session memory already
+    /// resolved. Child operations continue to resolve their own agent's sources.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn from_acp_session_with_capabilities(
+        config: &Config,
+        agent_alias: &str,
+        workspace: &Path,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        capabilities: &crate::composition::RuntimeCapabilities,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas: Option<tools::CanvasStore>,
+        store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
+        live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+        execution: Option<AgentExecutionCapability>,
+    ) -> Result<Self> {
+        Self::build_with_capabilities(
+            config,
+            agent_alias,
+            capabilities,
+            CapabilityOrigin::Adapter,
+            Some(workspace),
+            initialize_mcp,
+            true,
+            exclude_memory,
+            true,
+            None,
+            sop_engine,
+            sop_audit,
+            canvas,
+            store,
+            live_config,
+            None,
+            None,
+            execution,
         )
         .await
     }

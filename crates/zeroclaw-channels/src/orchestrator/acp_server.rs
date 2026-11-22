@@ -182,7 +182,22 @@ impl AcpSessionPolicy {
 
 // ── Session state ────────────────────────────────────────────────
 
+/// Memory resolved by ACP for this build only. Native child agents resolve
+/// their own sources independently.
+struct AcpBuildMemory(Arc<dyn Memory>);
+
+#[async_trait::async_trait]
+impl zeroclaw_runtime::composition::MemorySource for AcpBuildMemory {
+    async fn memory(
+        &self,
+        _request: &zeroclaw_runtime::composition::MemoryRequest<'_>,
+    ) -> Result<Arc<dyn Memory>> {
+        Ok(Arc::clone(&self.0))
+    }
+}
+
 struct Session {
+    consolidation_memory: Option<Arc<dyn Memory>>,
     agent: Agent,
     _lifecycle_lease: zeroclaw_runtime::live_config_authority::AgentSessionLease,
     last_active: Instant,
@@ -488,78 +503,46 @@ impl AcpServer {
         agent_alias: &str,
         workspace_dir: &std::path::Path,
         policy: AcpSessionPolicy,
-    ) -> Result<Agent> {
-        let enable_mcp = policy.resolved_enable_mcp(config, agent_alias);
-        let exclude_memory = policy.exclude_memory;
-        let Some(store) = self.store.as_ref() else {
-            return if let ConfigSource::Live(live_config) = &self.config_source {
-                Agent::from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
-                    live_config.clone(),
-                    agent_alias,
-                    Some(workspace_dir),
-                    enable_mcp,
-                    exclude_memory,
-                    true,
-                    self.sop_engine.clone(),
-                    self.sop_audit.clone(),
-                    self.canvas_store.clone(),
-                    Some(zeroclaw_runtime::AgentExecutionCapability::from_parts(
-                        live_config.clone(),
-                        self.agent_lifecycle.clone(),
-                    )),
-                )
-                .await
-            } else {
-                Agent::from_config_with_session_cwd_and_mcp_backchannel(
-                    config,
-                    agent_alias,
-                    Some(workspace_dir),
-                    enable_mcp,
-                    exclude_memory,
-                    true,
-                    self.sop_engine.clone(),
-                    self.sop_audit.clone(),
-                    self.canvas_store.clone(),
-                )
-                .await
-            };
-        };
-        if let ConfigSource::Live(live_config) = &self.config_source {
-            let execution_capability = zeroclaw_runtime::AgentExecutionCapability::from_parts(
-                live_config.clone(),
-                self.agent_lifecycle.clone(),
-            );
-            Agent::from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions_with_capability(
-                live_config.clone(),
-                agent_alias,
-                Some(workspace_dir),
-                enable_mcp,
-                exclude_memory,
-                // ACP turns transport the typed file attachment `deliver_file` emits.
-                true,
-                self.sop_engine.clone(),
-                self.sop_audit.clone(),
-                self.canvas_store.clone(),
-                Arc::clone(store),
-                Some(execution_capability),
-            )
-            .await
-        } else {
-            Agent::from_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
+    ) -> Result<(Agent, Option<Arc<dyn Memory>>)> {
+        use zeroclaw_runtime::composition::{MemoryRequest, RuntimeCapabilities};
+        let mut capabilities = RuntimeCapabilities::config_backed(config);
+        let memory = capabilities
+            .memory
+            .memory(&MemoryRequest {
                 config,
                 agent_alias,
-                Some(workspace_dir),
-                enable_mcp,
-                exclude_memory,
-                // ACP turns transport the typed file attachment `deliver_file` emits.
-                true,
-                self.sop_engine.clone(),
-                self.sop_audit.clone(),
-                self.canvas_store.clone(),
-                Arc::clone(store),
+            })
+            .await?;
+        let consolidation_memory =
+            (!policy.exclude_memory && config.memory.auto_save && memory.name() != "none")
+                .then(|| Arc::clone(&memory));
+        capabilities.memory = Arc::new(AcpBuildMemory(memory));
+        let live = match &self.config_source {
+            ConfigSource::Live(handle) => Some(handle.clone()),
+            ConfigSource::Standalone(_) => None,
+        };
+        let execution = live.as_ref().map(|handle| {
+            zeroclaw_runtime::AgentExecutionCapability::from_parts(
+                handle.clone(),
+                self.agent_lifecycle.clone(),
             )
-            .await
-        }
+        });
+        let agent = Agent::from_acp_session_with_capabilities(
+            config,
+            agent_alias,
+            workspace_dir,
+            policy.resolved_enable_mcp(config, agent_alias),
+            policy.exclude_memory,
+            &capabilities,
+            self.sop_engine.clone(),
+            self.sop_audit.clone(),
+            self.canvas_store.clone(),
+            self.store.clone(),
+            live,
+            execution,
+        )
+        .await?;
+        Ok((agent, consolidation_memory))
     }
 
     fn apply_session_policy_to_agent(
@@ -1249,7 +1232,7 @@ impl AcpServer {
         // WebChat sessions resolve `AcpSessionPolicy::webchat()` so they run
         // with configured long-term memory, MCP bundles, and external channels.
         // Runs without the sessions lock held (see above).
-        let mut agent = match self
+        let (mut agent, consolidation_memory) = match self
             .build_agent(
                 &config,
                 &agent_alias,
@@ -1380,6 +1363,7 @@ impl AcpServer {
                 session_id.clone(),
                 Arc::new(Mutex::new(Session {
                     agent,
+                    consolidation_memory,
                     _lifecycle_lease: lifecycle_lease,
                     last_active: now,
                     agent_alias: agent_alias.clone(),
@@ -1640,7 +1624,7 @@ impl AcpServer {
                 data: None,
             });
 
-        let mut agent = match agent_result {
+        let (mut agent, consolidation_memory) = match agent_result {
             Ok(a) => a,
             Err(e) => {
                 self.loading_sessions.lock().await.remove(&session_id);
@@ -1781,6 +1765,7 @@ impl AcpServer {
                 session_id.clone(),
                 Arc::new(Mutex::new(Session {
                     agent,
+                    consolidation_memory,
                     _lifecycle_lease: lifecycle_lease,
                     last_active: now,
                     agent_alias: restore_alias.clone(),
@@ -1971,7 +1956,7 @@ impl AcpServer {
                 data: None,
             });
 
-        let mut agent = match agent_result {
+        let (mut agent, consolidation_memory) = match agent_result {
             Ok(a) => a,
             Err(e) => {
                 self.loading_sessions.lock().await.remove(&session_id);
@@ -2072,6 +2057,7 @@ impl AcpServer {
                 session_id.clone(),
                 Arc::new(Mutex::new(Session {
                     agent,
+                    consolidation_memory,
                     _lifecycle_lease: lifecycle_lease,
                     last_active: now,
                     agent_alias: restore_alias.clone(),
@@ -2508,15 +2494,9 @@ impl AcpServer {
                             .agent
                             .context_limits_for_route(&success.provider_name, &success.model)
                     });
-                    let consolidation_target = (session.agent.auto_save_enabled()
-                        && session.agent.memory_handle().name() != "none")
-                        .then(|| {
-                            (
-                                session.agent.memory_handle(),
-                                live_provider_ref.clone(),
-                                live_model,
-                            )
-                        });
+                    let consolidation_target = session.consolidation_memory.as_ref().map(|memory| {
+                        (Arc::clone(memory), live_provider_ref.clone(), live_model)
+                    });
                     TerminalOutcome::Success {
                         response: success.response,
                         provider_name: success.provider_name,
@@ -11853,6 +11833,7 @@ mod tests {
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
         let mut cfg = make_test_config(cwd.path());
         cfg.memory.backend = "sqlite".to_string();
+        cfg.memory.auto_save = true;
 
         let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(16);
         let server = Arc::new(
@@ -11875,8 +11856,11 @@ mod tests {
             let sessions = server.sessions.lock().await;
             let session = sessions.get(&ide_sid).unwrap().lock().await;
             assert_eq!(
-                session.agent.memory_handle().name(),
-                "none",
+                session
+                    .consolidation_memory
+                    .as_ref()
+                    .map(|memory| memory.name()),
+                None,
                 "vanilla ACP session must preserve exclude_memory = true"
             );
         }
@@ -11903,8 +11887,11 @@ mod tests {
             let sessions = server.sessions.lock().await;
             let session = sessions.get(&web_sid).unwrap().lock().await;
             assert_ne!(
-                session.agent.memory_handle().name(),
-                "none",
+                session
+                    .consolidation_memory
+                    .as_ref()
+                    .map(|memory| memory.name()),
+                None,
                 "webchat ACP session must attach configured persistent memory"
             );
         }
@@ -11931,8 +11918,11 @@ mod tests {
             let sessions = server.sessions.lock().await;
             let session = sessions.get(&web_sid).unwrap().lock().await;
             assert_ne!(
-                session.agent.memory_handle().name(),
-                "none",
+                session
+                    .consolidation_memory
+                    .as_ref()
+                    .map(|memory| memory.name()),
+                None,
                 "reloaded webchat session must restore persistent memory policy"
             );
         }
