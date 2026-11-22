@@ -182,20 +182,6 @@ impl AcpSessionPolicy {
 
 // ── Session state ────────────────────────────────────────────────
 
-/// Memory resolved by ACP for this build only. Native child agents resolve
-/// their own sources independently.
-struct AcpBuildMemory(Arc<dyn Memory>);
-
-#[async_trait::async_trait]
-impl zeroclaw_runtime::composition::MemorySource for AcpBuildMemory {
-    async fn memory(
-        &self,
-        _request: &zeroclaw_runtime::composition::MemoryRequest<'_>,
-    ) -> Result<Arc<dyn Memory>> {
-        Ok(Arc::clone(&self.0))
-    }
-}
-
 struct Session {
     consolidation_memory: Option<Arc<dyn Memory>>,
     agent: Agent,
@@ -505,7 +491,7 @@ impl AcpServer {
         policy: AcpSessionPolicy,
     ) -> Result<(Agent, Option<Arc<dyn Memory>>)> {
         use zeroclaw_runtime::composition::{MemoryRequest, RuntimeCapabilities};
-        let mut capabilities = RuntimeCapabilities::config_backed(config);
+        let capabilities = RuntimeCapabilities::config_backed(config);
         let memory = capabilities
             .memory
             .memory(&MemoryRequest {
@@ -516,7 +502,6 @@ impl AcpServer {
         let consolidation_memory =
             (!policy.exclude_memory && config.memory.auto_save && memory.name() != "none")
                 .then(|| Arc::clone(&memory));
-        capabilities.memory = Arc::new(AcpBuildMemory(memory));
         let live = match &self.config_source {
             ConfigSource::Live(handle) => Some(handle.clone()),
             ConfigSource::Standalone(_) => None,
@@ -531,6 +516,7 @@ impl AcpServer {
             config,
             agent_alias,
             workspace_dir,
+            memory,
             policy.resolved_enable_mcp(config, agent_alias),
             policy.exclude_memory,
             &capabilities,
