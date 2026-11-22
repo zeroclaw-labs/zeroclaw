@@ -260,6 +260,7 @@ them as Fluent keys.
 12. Target whose risk profile has `always_ask` entries: an independent target without a complete explicit approval route returns `delegate target "<target>" cannot run in independent mode from "<caller>": risk profile "<profile>" has always_ask entries (<list>). See ZeroClaw docs, "Delegation & SubAgents" > "What's not supported".` A bounded agentic target returns the same error with `cannot run in bounded agentic mode`.
 13. Agentic target with a missing target risk profile: error is `Agent '<target>' is agentic but risk_profile '<target_profile>' is not configured`.
 14. Agentic target with zero executable child tools: no error is emitted for the empty tool set itself; the target receives a normal model turn without tools.
+15. Argument the schema does not declare: one undeclared key returns `Unknown argument '<key>'. Use <comma-separated declared arguments>.` Multiple keys are listed in sorted order. The check runs before action dispatch or admission of the requested target.
 
 ### `delegate`: how to verify it actually fired
 

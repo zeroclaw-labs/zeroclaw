@@ -349,6 +349,70 @@ impl ToolResult {
     }
 }
 
+/// The refusal for a call that carries a top-level argument a closed `schema`
+/// does not declare, or `None` when there is nothing to refuse.
+///
+/// Checks top-level names on closed object schemas whose allowed names are
+/// enumerated in `properties`. Schemas with pattern-defined names require
+/// their own validation, so one with a non-empty `patternProperties` is left
+/// alone, as is one that does not set `additionalProperties: false`.
+///
+/// Call this first in `execute` with the tool's own `parameters_schema()`, so a
+/// caller learns that an option it sent was not applied. The error names each
+/// undeclared key, cut to 64 characters, never its value, and lists the
+/// declared arguments. A call whose arguments are not an object is left to the
+/// tool's own handling.
+pub fn refuse_undeclared_arguments(
+    schema: &serde_json::Value,
+    args: &serde_json::Value,
+) -> Option<ToolResult> {
+    const MAX_KEY_CHARS: usize = 64;
+    if schema.get("additionalProperties") != Some(&serde_json::Value::Bool(false)) {
+        return None;
+    }
+    let has_pattern_defined_names = schema
+        .get("patternProperties")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|patterns| !patterns.is_empty());
+    if has_pattern_defined_names {
+        return None;
+    }
+    let given = args.as_object()?;
+    let mut declared: Vec<&str> = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .map(|properties| properties.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    declared.sort_unstable();
+    let mut undeclared: Vec<&str> = given
+        .keys()
+        .map(String::as_str)
+        .filter(|key| declared.binary_search(key).is_err())
+        .collect();
+    if undeclared.is_empty() {
+        return None;
+    }
+    undeclared.sort_unstable();
+    let named = undeclared
+        .iter()
+        .map(|key| format!("'{}'", key.chars().take(MAX_KEY_CHARS).collect::<String>()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let noun = if undeclared.len() == 1 {
+        "argument"
+    } else {
+        "arguments"
+    };
+    let accepted = if declared.is_empty() {
+        "This tool takes no arguments.".to_string()
+    } else {
+        format!("Use {}.", declared.join(", "))
+    };
+    Some(ToolResult::err(format!(
+        "Unknown {noun} {named}. {accepted}"
+    )))
+}
+
 /// Loud, actionable banner that filesystem-touching tools surface when the
 /// active runtime uses an **ephemeral workspace** — e.g. a Docker container
 /// with no host volume mount, where the workspace is a private tmpfs. In that
@@ -1075,5 +1139,88 @@ mod tests {
         let out = with_ephemeral_workspace_warning("body");
         assert!(out.starts_with(EPHEMERAL_WORKSPACE_WARNING));
         assert!(out.ends_with("\n\nbody"));
+    }
+
+    fn closed_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "prompt": {"type": "string"}, "agent": {"type": "string"} }
+        })
+    }
+
+    #[test]
+    fn declared_arguments_are_not_refused() {
+        let args = serde_json::json!({"agent": "a", "prompt": "p"});
+        assert!(refuse_undeclared_arguments(&closed_schema(), &args).is_none());
+        assert!(refuse_undeclared_arguments(&closed_schema(), &serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn undeclared_arguments_are_named_sorted_without_values() {
+        let args = serde_json::json!({"prompt": "p", "zeta": "secret-one", "model": "secret-two"});
+        let refusal = refuse_undeclared_arguments(&closed_schema(), &args).unwrap();
+        assert!(!refusal.success);
+        assert_eq!(
+            refusal.error.as_deref(),
+            Some("Unknown arguments 'model', 'zeta'. Use agent, prompt.")
+        );
+    }
+
+    #[test]
+    fn a_single_undeclared_argument_uses_the_singular() {
+        let args = serde_json::json!({"model": 1});
+        let refusal = refuse_undeclared_arguments(&closed_schema(), &args).unwrap();
+        assert_eq!(
+            refusal.error.as_deref(),
+            Some("Unknown argument 'model'. Use agent, prompt.")
+        );
+    }
+
+    #[test]
+    fn an_open_schema_is_not_enforced() {
+        let mut open = closed_schema();
+        open.as_object_mut().unwrap().remove("additionalProperties");
+        let args = serde_json::json!({"model": 1});
+        assert!(refuse_undeclared_arguments(&open, &args).is_none());
+        open["additionalProperties"] = serde_json::json!(true);
+        assert!(refuse_undeclared_arguments(&open, &args).is_none());
+    }
+
+    #[test]
+    fn a_closed_schema_without_properties_takes_no_arguments() {
+        let schema = serde_json::json!({"type": "object", "additionalProperties": false});
+        let refusal = refuse_undeclared_arguments(&schema, &serde_json::json!({"x": 1})).unwrap();
+        assert_eq!(
+            refusal.error.as_deref(),
+            Some("Unknown argument 'x'. This tool takes no arguments.")
+        );
+    }
+
+    #[test]
+    fn pattern_defined_names_are_left_to_their_own_validation() {
+        let mut schema = closed_schema();
+        schema["patternProperties"] = serde_json::json!({ "^x-": {"type": "string"} });
+        let args = serde_json::json!({"prompt": "p", "x-trace": "abc"});
+        assert!(refuse_undeclared_arguments(&schema, &args).is_none());
+
+        // An empty pattern map declares no extra names, so the schema is still enforced.
+        schema["patternProperties"] = serde_json::json!({});
+        assert!(refuse_undeclared_arguments(&schema, &args).is_some());
+    }
+
+    #[test]
+    fn a_long_key_is_cut_and_non_object_arguments_are_left_alone() {
+        let long_key = "k".repeat(200);
+        let args = serde_json::json!({ long_key.clone(): 1 });
+        let error = refuse_undeclared_arguments(&closed_schema(), &args)
+            .unwrap()
+            .error
+            .unwrap();
+        assert!(error.contains(&format!("'{}'", "k".repeat(64))), "{error}");
+        assert!(!error.contains(&"k".repeat(65)), "{error}");
+        assert!(
+            refuse_undeclared_arguments(&closed_schema(), &serde_json::json!("text")).is_none()
+        );
     }
 }
