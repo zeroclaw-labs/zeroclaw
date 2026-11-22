@@ -468,6 +468,21 @@ impl HttpRequestTool {
         name: &str,
         target: &ValidatedHttpRequestTarget,
     ) -> anyhow::Result<Vec<String>> {
+        self.apply_scoped_credential_with_resolver(headers, name, target, resolve_scoped_value)
+            .await
+    }
+
+    async fn apply_scoped_credential_with_resolver<F, Fut>(
+        &self,
+        headers: &mut HeaderMap,
+        name: &str,
+        target: &ValidatedHttpRequestTarget,
+        resolve: F,
+    ) -> anyhow::Result<Vec<String>>
+    where
+        F: FnOnce(zeroclaw_config::schema::ScopedCredentialSource, String) -> Fut + Send,
+        Fut: std::future::Future<Output = anyhow::Result<String>> + Send,
+    {
         use base64::Engine as _;
         use zeroclaw_config::schema::{ScopedApiKeyHeader, ScopedHttpAuth, ScopedHttpCredential};
 
@@ -488,7 +503,7 @@ impl HttpRequestTool {
         }
         let (name, authorization, mut sensitive) = match credential.auth {
             ScopedHttpAuth::ApiKey { value, header } => {
-                let value = resolve_scoped_value(credential.source, value).await?;
+                let value = resolve(credential.source, value).await?;
                 match header {
                     ScopedApiKeyHeader::Bearer => {
                         (AUTHORIZATION, format!("Bearer {value}"), vec![value])
@@ -504,7 +519,7 @@ impl HttpRequestTool {
                 }
             }
             ScopedHttpAuth::UserPassword { username, password } => {
-                let password = resolve_scoped_value(credential.source, password).await?;
+                let password = resolve(credential.source, password).await?;
                 let pair = format!("{username}:{password}");
                 let encoded = base64::engine::general_purpose::STANDARD.encode(&pair);
                 (
@@ -1358,6 +1373,88 @@ mod tests {
         ] {
             assert!(
                 crate::scoped_credentials::decode_scoped_value(source, output.to_vec()).is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn revocation_during_scoped_lookup_never_inserts_authorization() {
+        use zeroclaw_config::{
+            schema::{Config, ScopedCredentialSource, ScopedHttpCredential},
+            secrets::SecretStore,
+        };
+        for delete in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut tool = HttpRequestTool::new(
+                Arc::new(SecurityPolicy::default()),
+                vec!["*".into()],
+                1024,
+                10,
+                false,
+                vec![],
+                vec![],
+            )
+            .unwrap();
+            let mut credential: ScopedHttpCredential = serde_json::from_value(serde_json::json!({
+                "origin": "https://example.com", "http_allowed": true,
+                "auth": {"kind": "api_key", "value": "kv/fixture/token", "header": "bearer"}
+            }))
+            .unwrap();
+            credential.source = ScopedCredentialSource::OpenBao;
+            tool.scoped_credential_fixture(dir.path(), credential);
+            let path = tool.config_path.clone().unwrap();
+            let target = ValidatedHttpRequestTarget {
+                url: "https://example.com/protected".into(),
+                host: String::new(),
+                resolved_addrs: Vec::new(),
+            };
+            let mut headers = HeaderMap::new();
+            let (started, lookup_started) = tokio::sync::oneshot::channel();
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            let apply = tool.apply_scoped_credential_with_resolver(
+                &mut headers,
+                "TEST",
+                &target,
+                |source, _| async move {
+                    assert!(matches!(source, ScopedCredentialSource::OpenBao));
+                    started.send(()).unwrap();
+                    resumed.await.unwrap();
+                    Ok("resolved-synthetic-token".into())
+                },
+            );
+            let revoke = async {
+                lookup_started.await.unwrap();
+                let mut config: Config =
+                    toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                if delete {
+                    config.http_request.scoped_credentials.remove("TEST");
+                } else {
+                    let store = SecretStore::new(dir.path(), true);
+                    let stored = &config.http_request.scoped_credentials["TEST"];
+                    let mut record: ScopedHttpCredential =
+                        serde_json::from_str(&store.decrypt(stored).unwrap()).unwrap();
+                    record.http_allowed = false;
+                    record.http_origins = Some(Vec::new());
+                    let replacement = store
+                        .encrypt(&serde_json::to_string(&record).unwrap())
+                        .unwrap();
+                    config
+                        .http_request
+                        .scoped_credentials
+                        .insert("TEST".into(), replacement);
+                }
+                std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+                resume.send(()).unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::join!(apply, revoke)
+            })
+            .await
+            .expect("lookup/revocation coordination must finish");
+            assert!(result.is_err());
+            assert!(
+                headers.is_empty(),
+                "revoked credentials must not reach request headers"
             );
         }
     }
