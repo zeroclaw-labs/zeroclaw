@@ -879,6 +879,171 @@ struct LiveSessionEffect<'a> {
 #[error("session effect refused: {0:?}")]
 struct SessionEffectDenied(JsonRpcError);
 
+struct DurableDeletionSelection {
+    chat: Option<Arc<dyn zeroclaw_infra::session_backend::SessionDeletionAdmission>>,
+    cross_domain: Option<Arc<CrossDomainDeletionAdmission>>,
+    acp: Option<zeroclaw_infra::acp_session_store::AcpDeletionCandidate>,
+}
+
+/// An unqualified, reaped deletion must keep both durable domains stable.
+/// ACP is reserved first; the Chat reservation is attempted without waiting
+/// so contention can release the first store before the caller retries.
+struct CrossDomainDeletionAdmission {
+    chat: Arc<dyn zeroclaw_infra::session_backend::SessionDeletionAdmission>,
+    acp: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    session_id: String,
+    secondary_acp_id: Option<String>,
+    observed_acp: Option<zeroclaw_infra::acp_session_store::AcpDeletionCandidate>,
+}
+
+impl CrossDomainDeletionAdmission {
+    fn with_acp<R>(
+        &self,
+        operation: impl FnOnce(
+            Option<&zeroclaw_infra::acp_session_store::AcpDeletionCandidate>,
+            Option<&zeroclaw_infra::acp_session_store::AcpDeletionCandidate>,
+            &mut dyn FnMut() -> anyhow::Result<bool>,
+        ) -> anyhow::Result<R>,
+    ) -> std::io::Result<R> {
+        self.acp
+            .with_deletion_reservation(
+                &self.session_id,
+                self.secondary_acp_id.as_deref(),
+                operation,
+            )
+            .map_err(|error| match error.downcast::<std::io::Error>() {
+                Ok(error) => error,
+                Err(error) => session_effect_io_error(error),
+            })
+    }
+
+    fn authorize_domains<'a>(
+        &self,
+        actual_acp: Option<&zeroclaw_infra::acp_session_store::AcpDeletionCandidate>,
+        secondary_acp: Option<&zeroclaw_infra::acp_session_store::AcpDeletionCandidate>,
+        chat: &[zeroclaw_infra::session_backend::SessionDeletionCandidate],
+        authorize: &zeroclaw_infra::session_backend::SessionDeletionAuthorization<'a>,
+    ) -> std::io::Result<Box<dyn zeroclaw_infra::session_backend::SessionEffectGuard + 'a>> {
+        let mut candidates = chat.to_vec();
+        if let Some(acp) = actual_acp {
+            candidates.push(zeroclaw_infra::session_backend::SessionDeletionCandidate {
+                key: self.session_id.clone(),
+                principal: acp.principal_id.clone(),
+            });
+        }
+        if let (Some(id), Some(acp)) = (&self.secondary_acp_id, secondary_acp) {
+            candidates.push(zeroclaw_infra::session_backend::SessionDeletionCandidate {
+                key: id.clone(),
+                principal: acp.principal_id.clone(),
+            });
+        }
+        // Authorize all present owners before revealing replacement or
+        // ambiguity, including an unowned ACP row.
+        let authority = authorize(&candidates)?;
+        if actual_acp != self.observed_acp.as_ref() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "ACP deletion target changed",
+            ));
+        }
+        if secondary_acp.is_some() || (actual_acp.is_some() && !chat.is_empty()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "session ID has ambiguous durable domains",
+            ));
+        }
+        Ok(authority)
+    }
+
+    fn delete_acp(
+        &self,
+        authorize: &zeroclaw_infra::session_backend::SessionDeletionAuthorization<'_>,
+    ) -> std::io::Result<bool> {
+        self.with_acp(|actual, secondary, delete| {
+            let mut deleted = false;
+            self.chat
+                .try_with_current(
+                    &|chat| self.authorize_domains(actual, secondary, chat, authorize),
+                    &mut || {
+                        deleted = delete().map_err(session_effect_io_error)?;
+                        Ok(())
+                    },
+                )
+                .map_err(anyhow::Error::new)?;
+            Ok(deleted)
+        })
+    }
+}
+
+impl zeroclaw_infra::session_backend::SessionDeletionAdmission for CrossDomainDeletionAdmission {
+    fn selected_key(&self) -> Option<&str> {
+        self.chat.selected_key()
+    }
+
+    fn principal(&self) -> Option<&str> {
+        self.chat.principal()
+    }
+
+    fn queue_identity_is_exact(&self) -> bool {
+        self.chat.queue_identity_is_exact()
+    }
+
+    fn with_current(
+        &self,
+        authorize: &zeroclaw_infra::session_backend::SessionDeletionAuthorization<'_>,
+        effect: &mut dyn FnMut() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        self.with_acp(|actual, secondary, _| {
+            self.chat
+                .try_with_current(
+                    &|chat| self.authorize_domains(actual, secondary, chat, authorize),
+                    effect,
+                )
+                .map_err(anyhow::Error::new)
+        })
+    }
+
+    fn delete(
+        &self,
+        authorize: &zeroclaw_infra::session_backend::SessionDeletionAuthorization<'_>,
+    ) -> std::io::Result<bool> {
+        self.with_acp(|actual, secondary, _| {
+            self.chat
+                .try_delete(&|chat| self.authorize_domains(actual, secondary, chat, authorize))
+                .map_err(anyhow::Error::new)
+        })
+    }
+}
+
+// Called on a blocking worker. A busy attempt has released all reservations
+// before this retry, allowing map-first writers to complete.
+fn retry_deletion_contention<T>(
+    mut effect: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    loop {
+        match effect() {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
+}
+
+async fn deletion_storage<T: Send + 'static>(
+    context: &'static str,
+    operation: impl FnOnce() -> std::io::Result<T> + Send + 'static,
+) -> Result<T, JsonRpcError> {
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| rpc_err(INTERNAL_ERROR, format!("{context}: {error}")))?
+        .map_err(|error| session_effect_error(error.into(), context))
+}
+
 fn session_effect_io_error(error: anyhow::Error) -> std::io::Error {
     // Preserve the concrete refusal across the object-safe backend's io error
     // boundary; anyhow's boxed adapter does not retain std downcast identity.
@@ -890,6 +1055,12 @@ fn session_effect_io_error(error: anyhow::Error) -> std::io::Error {
 
 fn session_effect_error(error: anyhow::Error, context: &str) -> JsonRpcError {
     for cause in error.chain() {
+        if cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+        {
+            return rpc_err(SESSION_BUSY, "Session deletion is busy; retry the request");
+        }
         if let Some(denied) = cause.downcast_ref::<SessionEffectDenied>() {
             return denied.0.clone();
         }
@@ -2332,6 +2503,17 @@ impl RpcDispatcher {
         selected_mode: Option<&ChatMode>,
         scope: Option<&str>,
     ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
+        self.resolve_session_record_with_deletion_admission(session_id, selected_mode, scope, None)
+            .await
+    }
+
+    async fn resolve_session_record_with_deletion_admission(
+        &self,
+        session_id: &str,
+        selected_mode: Option<&ChatMode>,
+        scope: Option<&str>,
+        admission: Option<&dyn zeroclaw_infra::session_backend::SessionDeletionAdmission>,
+    ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
         use super::session::{DurableSession, SessionRecord};
         let mut owners: Vec<Option<String>> = Vec::new();
         let live = self
@@ -2344,7 +2526,14 @@ impl RpcDispatcher {
         }
         let mut chat_durable: Option<DurableSession> = None;
         let mut has_acp = false;
-        if let Some(backend) = self.ctx.session_backend.as_ref() {
+        if let Some(admission) = admission {
+            if let Some(key) = admission.selected_key() {
+                owners.push(admission.principal().map(str::to_owned));
+                chat_durable = Some(DurableSession::Chat {
+                    key: key.to_owned(),
+                });
+            }
+        } else if let Some(backend) = self.ctx.session_backend.as_ref() {
             for key in [
                 format!("rpc_{session_id}"),
                 format!("gw_{session_id}"),
@@ -2475,8 +2664,31 @@ impl RpcDispatcher {
         selected_mode: Option<&ChatMode>,
         scope: Option<&str>,
     ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
+        self.authorize_session_owner_with_deletion_admission(
+            session_id,
+            method,
+            selected_mode,
+            scope,
+            None,
+        )
+        .await
+    }
+
+    async fn authorize_session_owner_with_deletion_admission(
+        &self,
+        session_id: &str,
+        method: Method,
+        selected_mode: Option<&ChatMode>,
+        scope: Option<&str>,
+        admission: Option<&dyn zeroclaw_infra::session_backend::SessionDeletionAdmission>,
+    ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
         let record = self
-            .resolve_session_record_for_mode(session_id, selected_mode, scope)
+            .resolve_session_record_with_deletion_admission(
+                session_id,
+                selected_mode,
+                scope,
+                admission,
+            )
             .await?;
         match scope {
             Some(mine) => match &record {
@@ -2540,15 +2752,33 @@ impl RpcDispatcher {
         authorized: Option<&super::session::SessionRecord>,
         scope: Option<&str>,
     ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
+        self.revalidate_session_with_deletion_admission(session_id, authorized, scope, None, None)
+            .await
+    }
+
+    async fn revalidate_session_with_deletion_admission(
+        &self,
+        session_id: &str,
+        authorized: Option<&super::session::SessionRecord>,
+        scope: Option<&str>,
+        admission: Option<&dyn zeroclaw_infra::session_backend::SessionDeletionAdmission>,
+        captured_mode: Option<&ChatMode>,
+    ) -> Result<Option<super::session::SessionRecord>, JsonRpcError> {
         let selected_mode = authorized
             .filter(|record| record.live_generation.is_some())
             .and_then(|record| match record.durable.as_ref() {
                 Some(DurableSession::Acp) => Some(ChatMode::Acp),
                 Some(DurableSession::Chat { .. }) => Some(ChatMode::Chat),
                 None => None,
-            });
+            })
+            .or_else(|| captured_mode.cloned());
         let current = self
-            .resolve_session_record_for_mode(session_id, selected_mode.as_ref(), scope)
+            .resolve_session_record_with_deletion_admission(
+                session_id,
+                selected_mode.as_ref(),
+                scope,
+                admission,
+            )
             .await?;
         if let Some(mine) = scope
             && current
@@ -4165,6 +4395,44 @@ impl RpcDispatcher {
             ));
         }
         Ok(lease)
+    }
+
+    fn deletion_effect_lease(
+        &self,
+        live_owner: Option<Option<&str>>,
+        candidates: &[zeroclaw_infra::session_backend::SessionDeletionCandidate],
+    ) -> Result<crate::rpc::auth::AuthorityLease<'_>, JsonRpcError> {
+        let lease = self.ctx.auth.hold_authority();
+        let grants = self
+            .auth
+            .as_ref()
+            .map(|auth| current_authority_under(&lease, auth, Method::SessionDelete))
+            .transpose()
+            .map_err(|denied| rpc_err(denied.code, denied.message))?;
+        if let Some(mine) = self.scoped_principal_id_from(grants.as_ref())
+            && (candidates
+                .iter()
+                .any(|candidate| candidate.principal.as_deref() != Some(mine.as_str()))
+                || live_owner.is_some_and(|owner| owner != Some(mine.as_str())))
+        {
+            return Err(rpc_err(
+                FORBIDDEN,
+                "Session not found or not owned by this principal",
+            ));
+        }
+        Ok(lease)
+    }
+
+    fn deletion_storage_guard<'a>(
+        &'a self,
+        owner: Option<Option<&str>>,
+        candidates: &[zeroclaw_infra::session_backend::SessionDeletionCandidate],
+    ) -> std::io::Result<Box<dyn zeroclaw_infra::session_backend::SessionEffectGuard + 'a>> {
+        self.deletion_effect_lease(owner, candidates)
+            .map(|lease| {
+                Box::new(lease) as Box<dyn zeroclaw_infra::session_backend::SessionEffectGuard>
+            })
+            .map_err(|error| session_effect_io_error(SessionEffectDenied(error).into()))
     }
 
     fn durable_effect_lease(
@@ -8610,6 +8878,14 @@ impl RpcDispatcher {
         // Admission orders the append between turns: a running turn replaces
         // the durable transcript with its own history when it finishes, which
         // would erase an append written underneath it.
+        let key = Self::rpc_chat_writer_key(sid, authorized.clone())?;
+        let append_target = Arc::clone(backend)
+            .admit_existing_append(
+                &[&key],
+                zeroclaw_infra::session_backend::AppendKeyLookup::Addressed,
+            )
+            .map_err(|error| session_effect_error(error.into(), "Failed to admit session append"))?
+            .ok_or_else(|| self.stale_session_incarnation_error())?;
         let _guard = self
             .ctx
             .sessions
@@ -8640,6 +8916,9 @@ impl RpcDispatcher {
         let grants = self.recheck_authority_after_admission(Method::SessionAppend)?;
         self.require_ownership_under(grants.as_ref(), admitted.as_ref())?;
         let key = Self::rpc_chat_writer_key(sid, admitted.clone())?;
+        if key != append_target.key() {
+            return Err(self.stale_session_incarnation_error());
+        }
         let expected_owner = admitted.as_ref().and_then(|record| record.owner.as_deref());
         let expected_generation = admitted.as_ref().and_then(|record| record.live_generation);
         let message = zeroclaw_providers::ChatMessage::assistant(&req.content);
@@ -8696,8 +8975,7 @@ impl RpcDispatcher {
                         }));
                     }
                 };
-                let mut work =
-                    || backend.append_authorized(&key, &message, &authorize, &mut committed);
+                let mut work = || append_target.append(&message, &authorize, true, &mut committed);
                 let result = if tokio::runtime::Handle::current().runtime_flavor()
                     == tokio::runtime::RuntimeFlavor::MultiThread
                 {
@@ -8706,13 +8984,21 @@ impl RpcDispatcher {
                     work()
                 };
                 result.map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        return self.stale_session_incarnation_error();
+                    }
                     session_effect_error(error.into(), "Failed to append session message")
                 })
             })
             .await?;
         to_result(SessionAppendResult {
             session_id: req.session_id.clone(),
-            message_count,
+            message_count: message_count.ok_or_else(|| {
+                rpc_err(
+                    INTERNAL_ERROR,
+                    "Session backend did not return an append count",
+                )
+            })?,
         })
     }
 
@@ -9504,11 +9790,16 @@ impl RpcDispatcher {
         // reconstructed from key names after an asynchronous wait.
         let gateway_candidate =
             zeroclaw_infra::gateway_session::gateway_cancel_key(&req.session_id);
+        let gateway_normalized =
+            zeroclaw_infra::gateway_session::gateway_session_key(&req.session_id);
         let mut candidates = vec![
             req.session_id.clone(),
             format!("rpc_{}", req.session_id),
             gateway_candidate,
         ];
+        if !candidates.contains(&gateway_normalized) {
+            candidates.push(gateway_normalized);
+        }
         if let Some(display) = req
             .session_id
             .strip_prefix("rpc_")
@@ -9518,31 +9809,53 @@ impl RpcDispatcher {
                 display.to_string(),
                 format!("rpc_{display}"),
                 zeroclaw_infra::gateway_session::gateway_cancel_key(display),
+                zeroclaw_infra::gateway_session::gateway_session_key(display),
             ] {
                 if !candidates.contains(&key) {
                     candidates.push(key);
                 }
             }
         }
-        let mut preliminary_mode = self
-            .ctx
-            .sessions
-            .generation_and_mode(&req.session_id)
-            .await
-            .map(|(_, mode)| mode)
+        let preliminary_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
+        let preliminary_mode = preliminary_identity
+            .as_ref()
+            .map(|(_, mode)| mode.clone())
             .or(req.chat_mode.clone());
         if preliminary_mode.is_none()
+            && self.ctx.expect_both_session_stores
+            && (self.ctx.session_backend.is_none() || self.ctx.acp_session_store.is_none())
+        {
+            return Err(rpc_err(
+                INTERNAL_ERROR,
+                "Cannot determine session identity while a configured session store is unavailable; specify chat_mode",
+            ));
+        }
+        let durable_admission: Option<
+            Arc<dyn zeroclaw_infra::session_backend::SessionDeletionAdmission>,
+        > = if preliminary_mode != Some(ChatMode::Acp)
+            && let Some(backend) = self.ctx.session_backend.clone()
+        {
+            let current = self.spawn_handle();
+            let admission = deletion_storage("Failed to admit session deletion", move || {
+                let keys: Vec<&str> = candidates.iter().map(String::as_str).collect();
+                backend.admit_session_deletion(&keys, &|rows| {
+                    current.deletion_storage_guard(None, rows)
+                })
+            })
+            .await?;
+            Some(Arc::from(admission))
+        } else {
+            None
+        };
+        let acp_candidate = if preliminary_mode != Some(ChatMode::Chat)
             && let Some(store) = self.ctx.acp_session_store.as_ref()
         {
             let store = Arc::clone(store);
             let sid = req.session_id.clone();
-            let present = tokio::task::spawn_blocking(move || store.session_principal(&sid))
+            tokio::task::spawn_blocking(move || store.deletion_candidate(&sid))
                 .await
                 .map_err(|error| {
-                    rpc_err(
-                        INTERNAL_ERROR,
-                        format!("Failed to inspect ACP session: {error}"),
-                    )
+                    rpc_err(INTERNAL_ERROR, format!("ACP lookup worker failed: {error}"))
                 })?
                 .map_err(|error| {
                     rpc_err(
@@ -9550,38 +9863,6 @@ impl RpcDispatcher {
                         format!("Failed to inspect ACP session: {error}"),
                     )
                 })?
-                .is_some();
-            if present {
-                preliminary_mode = Some(ChatMode::Acp);
-            }
-        }
-        let durable_admission = if preliminary_mode != Some(ChatMode::Acp) {
-            self.ctx
-                .session_backend
-                .as_ref()
-                .map(|backend| {
-                    let keys: Vec<&str> = candidates.iter().map(String::as_str).collect();
-                    Arc::clone(backend)
-                        .admit_session_deletion(&keys, &|owner| {
-                            self.session_effect_lease(Method::SessionDelete, owner)
-                                .map(|lease| {
-                                    Box::new(lease)
-                                        as Box<
-                                            dyn zeroclaw_infra::session_backend::SessionEffectGuard,
-                                        >
-                                })
-                                .map_err(|error| {
-                                    session_effect_io_error(SessionEffectDenied(error).into())
-                                })
-                        })
-                        .map_err(|error| {
-                            session_effect_error(
-                                anyhow::Error::new(error),
-                                "Failed to admit session deletion",
-                            )
-                        })
-                })
-                .transpose()?
         } else {
             None
         };
@@ -9599,17 +9880,21 @@ impl RpcDispatcher {
                     .generation_and_mode(&wire_session_id)
                     .await
                     .is_some()
-                    || self
-                        .ctx
-                        .sessions
-                        .generation_and_mode(display)
-                        .await
-                        .is_none()
                 {
-                    return Err(rpc_err(
-                        INTERNAL_ERROR,
-                        "Session deletion target has ambiguous lifecycle identity",
-                    ));
+                    let grants = self.recheck_authority_after_admission(Method::SessionDelete)?;
+                    return Err(
+                        if self.scoped_principal_id_from(grants.as_ref()).is_some() {
+                            rpc_err(
+                                FORBIDDEN,
+                                "Session not found or not owned by this principal",
+                            )
+                        } else {
+                            rpc_err(
+                                INTERNAL_ERROR,
+                                "Session deletion target has ambiguous lifecycle identity",
+                            )
+                        },
+                    );
                 }
                 secondary_rpc_id = Some(wire_session_id.clone());
                 req.session_id = display.to_string();
@@ -9621,16 +9906,88 @@ impl RpcDispatcher {
                     .await
                     .is_some()
                 {
-                    return Err(rpc_err(
-                        INTERNAL_ERROR,
-                        "Session deletion target has ambiguous lifecycle identity",
-                    ));
+                    let grants = self.recheck_authority_after_admission(Method::SessionDelete)?;
+                    return Err(
+                        if self.scoped_principal_id_from(grants.as_ref()).is_some() {
+                            rpc_err(
+                                FORBIDDEN,
+                                "Session not found or not owned by this principal",
+                            )
+                        } else {
+                            rpc_err(
+                                INTERNAL_ERROR,
+                                "Session deletion target has ambiguous lifecycle identity",
+                            )
+                        },
+                    );
                 }
                 raw_gateway_key = Some(wire_session_id.clone());
             }
         }
+        // A candidate found only by stripping a prefix can denote an
+        // unrelated resource. Until its lifecycle can be bound independently,
+        // do not infer that the caller meant that second interpretation.
+        if (wire_session_id.starts_with("gw_") || wire_session_id.starts_with("rpc_"))
+            && let Some(selected) = durable_admission
+                .as_ref()
+                .and_then(|admission| admission.selected_key())
+        {
+            let literal_candidates = [
+                wire_session_id.clone(),
+                format!("rpc_{wire_session_id}"),
+                zeroclaw_infra::gateway_session::gateway_cancel_key(&wire_session_id),
+                zeroclaw_infra::gateway_session::gateway_session_key(&wire_session_id),
+            ];
+            if !literal_candidates.iter().any(|key| key == selected) {
+                let grants = self.recheck_authority_after_admission(Method::SessionDelete)?;
+                return Err(
+                    if self.scoped_principal_id_from(grants.as_ref()).is_some() {
+                        rpc_err(
+                            FORBIDDEN,
+                            "Session not found or not owned by this principal",
+                        )
+                    } else {
+                        rpc_err(
+                            INTERNAL_ERROR,
+                            "Session deletion target has ambiguous lifecycle identity",
+                        )
+                    },
+                );
+            }
+        }
+        let cross_admission = if preliminary_mode.is_none() {
+            if let (Some(chat), Some(acp)) = (
+                durable_admission.as_ref(),
+                self.ctx.acp_session_store.as_ref(),
+            ) {
+                Some(Arc::new(CrossDomainDeletionAdmission {
+                    chat: Arc::clone(chat),
+                    acp: Arc::clone(acp),
+                    session_id: wire_session_id.clone(),
+                    secondary_acp_id: secondary_rpc_id.as_ref().map(|_| req.session_id.clone()),
+                    observed_acp: acp_candidate.clone(),
+                }))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let durable_admission = cross_admission
+            .as_ref()
+            .map(|admission| {
+                Arc::clone(admission)
+                    as Arc<dyn zeroclaw_infra::session_backend::SessionDeletionAdmission>
+            })
+            .or(durable_admission);
         let authorized = self
-            .authorize_session_owner(&req.session_id, Method::SessionDelete)
+            .authorize_session_owner_with_deletion_admission(
+                &req.session_id,
+                Method::SessionDelete,
+                req.chat_mode.as_ref(),
+                self.scoped_principal_id().as_deref(),
+                durable_admission.as_deref(),
+            )
             .await?;
         if let Some(admission) = durable_admission.as_ref() {
             let resolved_key =
@@ -9649,6 +10006,32 @@ impl RpcDispatcher {
             {
                 return Err(self.stale_session_incarnation_error());
             }
+        } else if authorized
+            .as_ref()
+            .is_some_and(|record| matches!(record.durable, Some(DurableSession::Chat { .. })))
+        {
+            return Err(self.stale_session_incarnation_error());
+        }
+        // Channel history keys are sanitizer-fixed and include a separator.
+        // A raw row with that shape may have an independent channel lane and
+        // cache, which this RPC lifecycle cannot drain or invalidate. Its
+        // spelling is not proof of channel ownership; it is a reason to
+        // refuse storage-only deletion when the lifecycle cannot be bound.
+        if secondary_rpc_id.is_none()
+            && raw_gateway_key.is_none()
+            && durable_admission
+                .as_ref()
+                .and_then(|admission| admission.selected_key())
+                .is_some_and(|key| {
+                    key == req.session_id
+                        && key.contains('_')
+                        && zeroclaw_api::session_keys::sanitize_session_key(key) == key
+                })
+        {
+            return Err(rpc_err(
+                INTERNAL_ERROR,
+                "Session lifecycle identity cannot be established",
+            ));
         }
         if authorized.is_none() {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
@@ -9658,10 +10041,19 @@ impl RpcDispatcher {
         // applies to a successor created with the same ID.
         let expected_generation = self.capture_session_access(&req.session_id).await?;
         let requested_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
-        if expected_generation
-            != requested_identity
-                .as_ref()
-                .map(|(generation, _)| *generation)
+        let wire_identity = if req.session_id == wire_session_id {
+            requested_identity.clone()
+        } else {
+            self.ctx
+                .sessions
+                .generation_and_mode(&wire_session_id)
+                .await
+        };
+        if wire_identity != preliminary_identity
+            || expected_generation
+                != requested_identity
+                    .as_ref()
+                    .map(|(generation, _)| *generation)
             || expected_generation
                 != authorized
                     .as_ref()
@@ -9720,15 +10112,24 @@ impl RpcDispatcher {
             })
         });
         let gateway_key = raw_gateway_key.unwrap_or_else(|| {
-            zeroclaw_infra::gateway_session::gateway_cancel_key(&req.session_id)
+            let raw = zeroclaw_infra::gateway_session::gateway_cancel_key(&req.session_id);
+            let normalized = zeroclaw_infra::gateway_session::gateway_session_key(&req.session_id);
+            if durable_admission
+                .as_ref()
+                .and_then(|admission| admission.selected_key())
+                == Some(normalized.as_str())
+            {
+                normalized
+            } else {
+                raw
+            }
         });
         if durable_admission.as_ref().is_some_and(|admission| {
-            admission.selected_key() == Some(gateway_key.as_str())
-                && !admission.gateway_queue_identity_is_exact()
+            admission.selected_key().is_some() && !admission.queue_identity_is_exact()
         }) {
             return Err(rpc_err(
                 INTERNAL_ERROR,
-                "Gateway session lifecycle identity is ambiguous",
+                "Session lifecycle identity is ambiguous",
             ));
         }
         let gateway = self.ctx.gateway_sessions.as_ref().filter(|_| {
@@ -9737,29 +10138,30 @@ impl RpcDispatcher {
                     .as_ref()
                     .is_some_and(|admission| admission.selected_key() == Some(gateway_key.as_str()))
         });
-        // Refuse an already-visible ambiguity before signalling either turn.
-        // This preflight is advisory; the backend repeats the check under its
-        // own serialization boundary before deleting anything.
-        if pre_mode == ChatMode::Chat
-            && let Some(backend) = self.ctx.session_backend.as_ref()
+        self.ctx
+            .sessions
+            .wait_test_effect_pause("deletion-preflight")
+            .await;
+        // Recheck the captured candidate set under the backend's own guard.
+        // This preflight must not expose a foreign alias via an unguarded count.
+        if (pre_mode == ChatMode::Chat || cross_admission.is_some())
+            && let Some(admission) = durable_admission.as_ref()
         {
-            let candidates = [
-                req.session_id.clone(),
-                format!("rpc_{}", req.session_id),
-                gateway_key.clone(),
-            ];
-            let mut existing = Vec::new();
-            for key in candidates {
-                if !existing.contains(&key) && backend.get_session_metadata(&key).is_some() {
-                    existing.push(key);
-                }
-            }
-            if existing.len() > 1 {
-                return Err(rpc_err(
-                    INTERNAL_ERROR,
-                    "Session deletion is ambiguous; no stored session was deleted",
-                ));
-            }
+            let admission = Arc::clone(admission);
+            let current = self.spawn_handle();
+            let owner = authorized.as_ref().map(|record| record.owner.clone());
+            deletion_storage("Failed to validate session deletion", move || {
+                admission.with_current(
+                    &|rows| {
+                        current.deletion_storage_guard(
+                            owner.as_ref().map(|value| value.as_deref()),
+                            rows,
+                        )
+                    },
+                    &mut || Ok(()),
+                )
+            })
+            .await?;
         }
         // Retain the capture lease through finalization: an idle reaper must
         // not erase the generation while this request waits for the turn.
@@ -9773,26 +10175,52 @@ impl RpcDispatcher {
         // has no production effect; `/new` replacement semantics remain
         // intentionally outside this PR's scope.
         self.ctx.sessions.wait_test_removal_signal_pause().await;
-        let _lifecycle_cancellation = if let Some(generation) = expected_generation {
-            let cancellation = if let Some(admission) = durable_admission.as_ref() {
-                self.ctx.sessions.signal_session_deletion_bound(
-                        &req.session_id,
-                        generation,
-                        self.resume_access_fence(Some(generation)),
-                        |live_owner, signal| {
-                            admission.with_current(&|actual| {
-                                let lease = if admission.selected_key().is_some() {
-                                    self.durable_effect_lease(Method::SessionDelete, live_owner, actual)
-                                } else {
-                                    self.session_effect_lease(Method::SessionDelete, live_owner)
-                                        .map_err(|error| SessionEffectDenied(error).into())
-                                }.map_err(session_effect_io_error)?;
-                                Ok(Box::new(lease) as Box<dyn zeroclaw_infra::session_backend::SessionEffectGuard>)
-                            }, &mut || { signal(); Ok(()) }).map_err(|error| {
-                                session_effect_error(anyhow::Error::new(error), "Failed to validate session cancellation")
-                            })
-                        },
-                    ).await?
+        if let Some(generation) = expected_generation {
+            let signalled = if let Some(admission) = durable_admission.as_ref() {
+                let admission = Arc::clone(admission);
+                let current = self.spawn_handle();
+                let id = req.session_id.clone();
+                let owner = authorized.as_ref().and_then(|record| record.owner.clone());
+                tokio::task::spawn_blocking(move || {
+                    retry_deletion_contention(|| {
+                        let mut signalled = false;
+                        admission.with_current(
+                            &|candidates| {
+                                current
+                                    .deletion_effect_lease(Some(owner.as_deref()), candidates)
+                                    .map(|lease| {
+                                        Box::new(lease)
+                                        as Box<
+                                            dyn zeroclaw_infra::session_backend::SessionEffectGuard,
+                                        >
+                                    })
+                                    .map_err(|error| {
+                                        session_effect_io_error(SessionEffectDenied(error).into())
+                                    })
+                            },
+                            &mut || {
+                                signalled = current.ctx.sessions.try_signal_session_deletion(
+                                    &id,
+                                    generation,
+                                    current.resume_access_fence(Some(generation)),
+                                    owner.as_deref(),
+                                )?;
+                                Ok(())
+                            },
+                        )?;
+                        Ok::<_, std::io::Error>(signalled)
+                    })
+                })
+                .await
+                .map_err(|error| {
+                    rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Cancellation worker failed: {error}"),
+                    )
+                })?
+                .map_err(|error| {
+                    session_effect_error(error.into(), "Failed to validate session cancellation")
+                })?
             } else {
                 self.ctx
                     .sessions
@@ -9804,13 +10232,15 @@ impl RpcDispatcher {
                         |owner| self.session_effect_lease(Method::SessionDelete, owner),
                     )
                     .await?
+                    .is_some()
             };
             self.ctx.sessions.notify_test_removal_signal_attempted();
-            Some(
-                cancellation.ok_or_else(|| {
-                    rpc_err(SESSION_NOT_FOUND, "Session was replaced before delete")
-                })?,
-            )
+            if !signalled {
+                return Err(rpc_err(
+                    SESSION_NOT_FOUND,
+                    "Session was replaced before delete",
+                ));
+            }
         } else {
             self.ctx
                 .sessions
@@ -9824,61 +10254,64 @@ impl RpcDispatcher {
                 .await?
                 .ok_or_else(|| self.stale_session_incarnation_error())?;
             self.ctx.sessions.notify_test_removal_signal_attempted();
-            None
-        };
+        }
         let mut gateway_cancellation = None;
-        if let (Some(coordination), Some((generation, _))) = (gateway, gateway_capture.as_ref()) {
-            if let Some(admission) = durable_admission.as_ref() {
-                if admission.selected_key() == Some(gateway_key.as_str()) {
-                    admission
-                        .with_current(
-                            &|owner| {
-                                self.durable_effect_lease(
-                                    Method::SessionDelete,
-                                    authorized
-                                        .as_ref()
-                                        .and_then(|record| record.owner.as_deref()),
-                                    owner,
-                                )
-                                .map(|lease| {
-                                    Box::new(lease)
-                                        as Box<
-                                            dyn zeroclaw_infra::session_backend::SessionEffectGuard,
-                                        >
-                                })
-                                .map_err(session_effect_io_error)
-                            },
-                            &mut || {
-                                gateway_cancellation = Some(
-                                    coordination
-                                        .signal_deletion_at_generation(&gateway_key, *generation),
-                                );
-                                Ok(())
-                            },
-                        )
-                        .map_err(|error| {
-                            session_effect_error(
-                                anyhow::Error::new(error),
-                                "Failed to authorize gateway session cancellation",
+        if let (Some(coordination), Some((generation, _))) = (gateway, gateway_capture.as_ref())
+            && let Some(admission) = durable_admission.as_ref()
+            && admission.selected_key() == Some(gateway_key.as_str())
+        {
+            let admission = Arc::clone(admission);
+            let current = self.spawn_handle();
+            let owner = authorized.as_ref().map(|record| record.owner.clone());
+            let coordination = coordination.clone();
+            let key = gateway_key.clone();
+            let generation = *generation;
+            gateway_cancellation = deletion_storage(
+                "Failed to authorize gateway session cancellation",
+                move || {
+                    let mut cancellation = None;
+                    admission.with_current(
+                        &|rows| {
+                            current.deletion_storage_guard(
+                                owner.as_ref().map(|value| value.as_deref()),
+                                rows,
                             )
-                        })?;
-                }
-            }
+                        },
+                        &mut || {
+                            cancellation =
+                                Some(coordination.signal_deletion_at_generation(&key, generation));
+                            Ok(())
+                        },
+                    )?;
+                    Ok(cancellation)
+                },
+            )
+            .await?;
         }
         let _gateway_cancellation = gateway_cancellation;
         // Deletion waits for the admitted turn to finalize before mutating
         // durable state. The cancellation guard remains live until that
         // finalization so an in-flight prompt cannot outlive the removal.
+        let expected_mode = requested_identity
+            .as_ref()
+            .map(|(_, mode)| mode.clone())
+            .or(req.chat_mode.clone());
         self.finalize_session_delete_at_generation(
             req,
             authorized,
-            durable_admission.as_deref(),
+            DurableDeletionSelection {
+                chat: durable_admission,
+                cross_domain: cross_admission,
+                acp: acp_candidate,
+            },
             wire_session_id,
-            secondary_rpc_id,
-            secondary_capture
-                .as_ref()
-                .map(|(generation, _)| *generation),
-            requested_identity.as_ref().map(|(_, mode)| mode.clone()),
+            (
+                secondary_rpc_id,
+                secondary_capture
+                    .as_ref()
+                    .map(|(generation, _)| *generation),
+            ),
+            expected_mode,
             expected_generation,
             expected_queue_generation,
             gateway
@@ -9902,10 +10335,9 @@ impl RpcDispatcher {
         &self,
         req: SessionDeleteParams,
         authorized: Option<super::session::SessionRecord>,
-        durable_admission: Option<&dyn zeroclaw_infra::session_backend::SessionDeletionAdmission>,
+        durable: DurableDeletionSelection,
         wire_session_id: String,
-        secondary_rpc_id: Option<String>,
-        secondary_queue_generation: Option<u64>,
+        secondary_queue: (Option<String>, Option<u64>),
         expected_mode: Option<ChatMode>,
         expected_generation: Option<u64>,
         expected_queue_generation: u64,
@@ -9916,6 +10348,13 @@ impl RpcDispatcher {
             ChatMode,
         )>,
     ) -> RpcResult {
+        let DurableDeletionSelection {
+            chat: durable_admission,
+            cross_domain: cross_admission,
+            acp: acp_candidate,
+        } = durable;
+        let durable_admission = durable_admission.as_ref();
+        let (secondary_rpc_id, secondary_queue_generation) = secondary_queue;
         // This is the same finalization authority used by prompt turns. Wait
         // for the captured incarnation to finish before deleting durable
         // state, so a storage failure leaves its completed session intact.
@@ -9952,8 +10391,15 @@ impl RpcDispatcher {
         }
         // Cross-surface deletion always acquires RPC before gateway. Gateway
         // handlers never await the RPC queue while holding their permit.
-        let _gateway_guard = match gateway.as_ref() {
-            Some((coordination, key, _, _)) => Some(
+        // Dashboard notifications can also address an RPC or raw transcript.
+        // Serialize their publication without signalling a gateway turn.
+        let notification_queue = self
+            .ctx
+            .gateway_sessions
+            .as_ref()
+            .zip(durable_admission.and_then(|admission| admission.selected_key()));
+        let _gateway_guard = match notification_queue {
+            Some((coordination, key)) => Some(
                 coordination
                     .queue()
                     .acquire(key)
@@ -9967,7 +10413,13 @@ impl RpcDispatcher {
         // Ownership revalidation precedes the generation fence so a scoped
         // caller receives the same denial for an unknown or foreign successor.
         let record = match self
-            .revalidate_admitted_session(&req.session_id, authorized.as_ref(), scope.as_deref())
+            .revalidate_session_with_deletion_admission(
+                &req.session_id,
+                authorized.as_ref(),
+                scope.as_deref(),
+                durable_admission.map(Arc::as_ref),
+                expected_mode.as_ref(),
+            )
             .await
         {
             Ok(record) => record,
@@ -9977,10 +10429,11 @@ impl RpcDispatcher {
                 // target only if the owner and storage domain are unchanged,
                 // and the caller still owns it under the current scope.
                 let current = self
-                    .resolve_session_record_for_mode(
+                    .resolve_session_record_with_deletion_admission(
                         &req.session_id,
                         expected_mode.as_ref(),
                         scope.as_deref(),
+                        durable_admission.map(Arc::as_ref),
                     )
                     .await?;
                 if current.as_ref().is_some_and(|record| {
@@ -10136,25 +10589,18 @@ impl RpcDispatcher {
         let durable_deleted = match chat_mode {
             ChatMode::Chat => {
                 if let Some(admission) = durable_admission {
-                    admission
-                        .delete(&|actual| {
-                            self.durable_effect_lease(
-                                Method::SessionDelete,
-                                expected_owner.as_deref(),
-                                actual,
+                    let admission = Arc::clone(admission);
+                    let current = self.spawn_handle();
+                    let owner = record.as_ref().map(|record| record.owner.clone());
+                    deletion_storage("Failed to delete persistent session", move || {
+                        admission.delete(&|rows| {
+                            current.deletion_storage_guard(
+                                owner.as_ref().map(|value| value.as_deref()),
+                                rows,
                             )
-                            .map(|lease| {
-                                Box::new(lease)
-                                    as Box<dyn zeroclaw_infra::session_backend::SessionEffectGuard>
-                            })
-                            .map_err(session_effect_io_error)
                         })
-                        .map_err(|error| {
-                            session_effect_error(
-                                anyhow::Error::new(error),
-                                "Failed to delete persistent session",
-                            )
-                        })?
+                    })
+                    .await?
                 } else {
                     false
                 }
@@ -10165,6 +10611,37 @@ impl RpcDispatcher {
                     Some(DurableSession::Acp)
                 ) {
                     false
+                } else if let Some(cross) = cross_admission {
+                    let current = self.spawn_handle();
+                    let owner = expected_owner.clone();
+                    tokio::task::spawn_blocking(move || {
+                        cross.delete_acp(&|candidates| {
+                            current
+                                .deletion_effect_lease(Some(owner.as_deref()), candidates)
+                                .map(|lease| {
+                                    Box::new(lease)
+                                        as Box<
+                                            dyn zeroclaw_infra::session_backend::SessionEffectGuard,
+                                        >
+                                })
+                                .map_err(|error| {
+                                    session_effect_io_error(SessionEffectDenied(error).into())
+                                })
+                        })
+                    })
+                    .await
+                    .map_err(|error| {
+                        rpc_err(
+                            INTERNAL_ERROR,
+                            format!("Failed to delete ACP session: {error}"),
+                        )
+                    })?
+                    .map_err(|error| {
+                        session_effect_error(
+                            anyhow::Error::new(error),
+                            "Failed to delete ACP session",
+                        )
+                    })?
                 } else {
                     let store = self.ctx.acp_session_store.clone().ok_or_else(|| {
                         rpc_err(INTERNAL_ERROR, "ACP session store is not available")
@@ -10173,12 +10650,19 @@ impl RpcDispatcher {
                     let owner = expected_owner.clone();
                     let current = self.spawn_handle();
                     tokio::task::spawn_blocking(move || {
-                        store.delete_session_authorized(&sid, owner.as_deref(), |actual| {
-                            current.durable_effect_lease(
+                        store.with_deletion_reservation(&sid, None, |actual, _, delete| {
+                            let _authority = current.durable_effect_lease(
                                 Method::SessionDelete,
                                 owner.as_deref(),
-                                actual,
-                            )
+                                actual.and_then(|candidate| candidate.principal_id.as_deref()),
+                            )?;
+                            if actual != acp_candidate.as_ref() {
+                                return Err(SessionEffectDenied(
+                                    current.stale_session_incarnation_error(),
+                                )
+                                .into());
+                            }
+                            delete()
                         })
                     })
                     .await
@@ -10230,6 +10714,63 @@ impl RpcDispatcher {
             }
         }
         let live_removed = match (expected_generation, prepared_live.as_ref()) {
+            (Some(generation), Some((agent, handles)))
+                if !durable_deleted
+                    && chat_mode == ChatMode::Chat
+                    && durable_admission.is_some() =>
+            {
+                let admission = Arc::clone(durable_admission.expect("guarded by is_some"));
+                let current = self.spawn_handle();
+                let id = req.session_id.clone();
+                let agent = Arc::clone(agent);
+                let owner = expected_owner.clone();
+                let removed = tokio::task::spawn_blocking(move || {
+                    retry_deletion_contention(|| {
+                        let mut removed = false;
+                        admission.with_current(
+                            &|candidates| {
+                                current
+                                    .deletion_effect_lease(Some(owner.as_deref()), candidates)
+                                    .map(|lease| {
+                                        Box::new(lease)
+                                        as Box<
+                                            dyn zeroclaw_infra::session_backend::SessionEffectGuard,
+                                        >
+                                    })
+                                    .map_err(|error| {
+                                        session_effect_io_error(SessionEffectDenied(error).into())
+                                    })
+                            },
+                            &mut || {
+                                removed = current.ctx.sessions.try_remove_generation_bound(
+                                    &id,
+                                    generation,
+                                    &agent,
+                                    owner.as_deref(),
+                                )?;
+                                Ok(())
+                            },
+                        )?;
+                        Ok::<_, std::io::Error>(removed)
+                    })
+                })
+                .await
+                .map_err(|error| {
+                    rpc_err(
+                        INTERNAL_ERROR,
+                        format!("Session removal worker failed: {error}"),
+                    )
+                })?
+                .map_err(|error| {
+                    session_effect_error(error.into(), "Failed to validate live session removal")
+                })?;
+                if removed {
+                    // Only the detached predecessor's handles are affected.
+                    // The caller still holds the session queue permit.
+                    handles.unregister_channel("rpc");
+                }
+                removed
+            }
             (Some(generation), Some((agent, handles))) => {
                 self.ctx
                     .sessions
@@ -35103,14 +35644,12 @@ mod tests {
         );
         let sid = "cross-surface-drain";
         let gw_key = format!("gw_{sid}");
-        for key in [gw_key.clone()] {
-            backend
-                .append(&key, &ChatMessage::user("predecessor"))
-                .unwrap();
-            backend
-                .set_session_prompt(&key, "task", "retain this task")
-                .unwrap();
-        }
+        backend
+            .append(&gw_key, &ChatMessage::user("predecessor"))
+            .unwrap();
+        backend
+            .set_session_prompt(&gw_key, "task", "retain this task")
+            .unwrap();
         let db = rusqlite::Connection::open(tmp.path().join("sessions/sessions.db")).unwrap();
         if storage_failure {
             db.execute_batch(
@@ -35194,12 +35733,10 @@ mod tests {
         } else {
             assert_eq!(result.unwrap()["deleted"], true);
         }
-        for key in [gw_key.clone()] {
-            assert_eq!(backend.session_exists(&key), storage_failure);
-            if storage_failure {
-                assert_eq!(backend.load(&key)[0].content, "predecessor");
-                assert_eq!(backend.list_session_prompts(&key).unwrap().len(), 1);
-            }
+        assert_eq!(backend.session_exists(&gw_key), storage_failure);
+        if storage_failure {
+            assert_eq!(backend.load(&gw_key)[0].content, "predecessor");
+            assert_eq!(backend.list_session_prompts(&gw_key).unwrap().len(), 1);
         }
         if storage_failure {
             assert_eq!(
@@ -35234,6 +35771,79 @@ mod tests {
     #[tokio::test]
     async fn rpc_delete_cancels_and_drains_registered_gateway_turn() {
         rpc_delete_drains_gateway_turn(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn rpc_delete_normalized_gateway_queue_or_refuses_distinct_rows() {
+        use zeroclaw_infra::gateway_session::{GatewaySessionCoordination, register_cancel_token};
+        for ambiguous in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = make_acp_test_config(&tmp);
+            let data_dir = config.data_dir.clone();
+            let (mut dispatcher, _, backend, _) =
+                make_persistence_test_dispatcher(config, &data_dir);
+            let coordination = GatewaySessionCoordination::for_gateway();
+            Arc::get_mut(&mut dispatcher.ctx).unwrap().gateway_sessions =
+                Some(coordination.clone());
+            backend
+                .append("gw_team_alpha", &ChatMessage::user("SSE history"))
+                .unwrap();
+            if ambiguous {
+                backend
+                    .append("gw_team.alpha", &ChatMessage::user("distinct WS history"))
+                    .unwrap();
+            }
+            let (generation, _lease) = coordination
+                .queue()
+                .capture_generation("gw_team_alpha")
+                .await;
+            let token = Arc::new(CancellationToken::new());
+            register_cancel_token(
+                coordination.cancellations(),
+                "gw_team.alpha",
+                "gw_team_alpha",
+                generation,
+                token.clone(),
+            );
+            let result = dispatcher
+                .handle_session_delete(&json!({"session_id":"team.alpha"}))
+                .await;
+            if ambiguous {
+                assert!(result.is_err());
+                assert!(!token.is_cancelled());
+                assert!(backend.session_exists("gw_team_alpha"));
+                assert!(backend.session_exists("gw_team.alpha"));
+            } else {
+                assert_eq!(result.unwrap()["deleted"], true);
+                assert!(token.is_cancelled());
+                assert!(!backend.session_exists("gw_team_alpha"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_delete_refuses_unbound_channel_shaped_raw_row() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _, backend, _) = make_persistence_test_dispatcher(config, &data_dir);
+        let key = "matrix_room_sender";
+        backend
+            .append(key, &ChatMessage::user("channel history"))
+            .unwrap();
+        backend
+            .set_session_prompt(key, "task", "retain attached prompt")
+            .unwrap();
+
+        let result = dispatcher
+            .handle_session_delete(&json!({"session_id": key}))
+            .await;
+        assert!(
+            result.is_err(),
+            "an unbound channel-shaped target must be refused"
+        );
+        assert_eq!(backend.load(key)[0].content, "channel history");
+        assert_eq!(backend.list_session_prompts(key).unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -35602,6 +36212,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_delete_refuses_acp_arrival_after_reaped_chat_admission() {
+        for boundary in ["deletion-preflight", "removal-store"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = make_acp_test_config(&tmp);
+            let data_dir = config.data_dir.clone();
+            let (dispatcher, sessions, backend, acp_store) =
+                make_persistence_test_dispatcher(config, &data_dir);
+            let sid = "cross-domain-arrival";
+            let key = format!("rpc_{sid}");
+            backend
+                .append(&key, &ChatMessage::user("chat predecessor"))
+                .unwrap();
+            let (arrived, release) = sessions.set_test_effect_pause(boundary);
+            let operation = zeroclaw_spawn::spawn!(async move {
+                dispatcher
+                    .handle_session_delete(&json!({"session_id": sid}))
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(10), arrived.notified())
+                .await
+                .unwrap();
+            acp_store
+                .create_session(sid, "test-agent", "/tmp/test-agent", None)
+                .unwrap();
+            release.notify_one();
+            assert!(operation.await.unwrap().is_err());
+            assert_eq!(backend.load(&key)[0].content, "chat predecessor");
+            assert!(acp_store.load_session(sid).unwrap().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_delete_refuses_chat_arrival_after_reaped_acp_admission() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "acp-domain-arrival";
+        acp_store
+            .create_session(sid, "test-agent", "/tmp/test-agent", None)
+            .unwrap();
+        let (arrived, release) = sessions.set_test_effect_pause("removal-store");
+        let operation = zeroclaw_spawn::spawn!(async move {
+            dispatcher
+                .handle_session_delete(&json!({"session_id": sid}))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), arrived.notified())
+            .await
+            .unwrap();
+        let key = format!("gw_{sid}");
+        backend
+            .append(&key, &ChatMessage::user("chat arrival"))
+            .unwrap();
+        release.notify_one();
+        assert!(operation.await.unwrap().is_err());
+        assert_eq!(backend.load(&key)[0].content, "chat arrival");
+        assert!(acp_store.load_session(sid).unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn rpc_delete_refuses_same_key_reset_after_admission() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = two_user_config(&tmp);
@@ -35642,6 +36314,269 @@ mod tests {
             zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&data_dir).unwrap();
         assert_eq!(reopened.load(key)[0].content, "successor");
         assert_eq!(reopened.list_session_prompts(key).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rpc_delete_absent_admission_preserves_foreign_and_unowned_arrivals() {
+        for pause in ["deletion-preflight", "deletion-signal", "removal-committed"] {
+            for foreign in [false, true] {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let config = two_user_config(&tmp);
+                let data_dir = config.data_dir.clone();
+                let (fixture, sessions, backend, _) =
+                    make_persistence_test_dispatcher(config, &data_dir);
+                let scoped = scoped_dispatcher(&fixture.ctx, 4242).await;
+                scoped.handle_session_new_for_test(&json!({"agent_alias":"test-agent", "session_id":"alpha", "chat_mode":"chat"})).await.unwrap();
+                assert!(backend.delete_session("rpc_alpha").unwrap());
+                let (arrived, release) = if pause == "deletion-signal" {
+                    let (arrived, release, _) = sessions.set_test_removal_signal_pause();
+                    (arrived, release)
+                } else {
+                    sessions.set_test_effect_pause(pause)
+                };
+                let params = json!({"session_id":"alpha"});
+                let deletion = scoped.handle_session_delete(&params);
+                tokio::pin!(deletion);
+                tokio::select! {
+                    reached = tokio::time::timeout(std::time::Duration::from_secs(10), arrived.notified()) => { reached.unwrap(); }
+                    result = &mut deletion => panic!("deletion completed before {pause}: {result:?}"),
+                }
+                backend
+                    .append("gw_alpha", &ChatMessage::user("new owner"))
+                    .unwrap();
+                if foreign {
+                    backend
+                        .set_session_principal("gw_alpha", "user:bob")
+                        .unwrap();
+                }
+                release.notify_one();
+                assert_eq!(deletion.await.unwrap_err().code, FORBIDDEN);
+                assert!(sessions.get_agent("alpha").await.is_some());
+                assert!(backend.session_exists("gw_alpha"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_delete_scoped_live_only_with_sqlite_absence() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_user_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (fixture, sessions, backend, _) = make_persistence_test_dispatcher(config, &data_dir);
+        let scoped = scoped_dispatcher(&fixture.ctx, 4242).await;
+        scoped
+            .handle_session_new_for_test(
+                &json!({"agent_alias":"test-agent", "session_id":"alpha", "chat_mode":"chat"}),
+            )
+            .await
+            .unwrap();
+        assert!(backend.delete_session("rpc_alpha").unwrap());
+        assert_eq!(
+            scoped
+                .handle_session_delete(&json!({"session_id":"alpha"}))
+                .await
+                .unwrap()["deleted"],
+            true
+        );
+        assert!(sessions.get_agent("alpha").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn rpc_delete_scoped_foreign_candidate_appearing_before_preflight_is_denied() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_user_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (fixture, sessions, backend, _) = make_persistence_test_dispatcher(config, &data_dir);
+        let scoped = scoped_dispatcher(&fixture.ctx, 4242).await;
+        scoped
+            .handle_session_new_for_test(
+                &json!({"agent_alias":"test-agent", "session_id":"alpha", "chat_mode":"chat"}),
+            )
+            .await
+            .unwrap();
+        let (arrived, release) = sessions.set_test_effect_pause("deletion-preflight");
+        let params = json!({"session_id":"alpha"});
+        let deletion = scoped.handle_session_delete(&params);
+        tokio::pin!(deletion);
+        tokio::select! {
+            reached = tokio::time::timeout(std::time::Duration::from_secs(10), arrived.notified()) => { reached.unwrap(); }
+            result = &mut deletion => panic!("deletion completed before preflight: {result:?}"),
+        }
+        backend
+            .append("gw_alpha", &ChatMessage::user("foreign"))
+            .unwrap();
+        backend
+            .set_session_principal("gw_alpha", "user:bob")
+            .unwrap();
+        release.notify_one();
+        assert_eq!(deletion.await.unwrap_err().code, FORBIDDEN);
+        assert!(sessions.get_agent("alpha").await.is_some());
+        assert!(backend.session_exists("rpc_alpha"));
+        assert!(backend.session_exists("gw_alpha"));
+    }
+
+    #[tokio::test]
+    async fn rpc_delete_requires_configured_stores_for_unqualified_durable_lookup() {
+        for missing_chat in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = make_acp_test_config(&tmp);
+            let data_dir = config.data_dir.clone();
+            let (mut dispatcher, _, chat, acp) =
+                make_persistence_test_dispatcher(config, &data_dir);
+            let sid = "stored";
+            let mode = if missing_chat {
+                acp.create_session(sid, "test-agent", "/tmp/test-agent", None)
+                    .unwrap();
+                "acp"
+            } else {
+                chat.append("rpc_stored", &ChatMessage::user("history"))
+                    .unwrap();
+                "chat"
+            };
+            let context = Arc::get_mut(&mut dispatcher.ctx).unwrap();
+            context.expect_both_session_stores = true;
+            if missing_chat {
+                context.session_backend = None;
+            } else {
+                context.acp_session_store = None;
+            }
+
+            let error = dispatcher
+                .handle_session_delete(&json!({"session_id": sid}))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, INTERNAL_ERROR);
+            let exists = || {
+                if missing_chat {
+                    acp.load_session(sid).unwrap().is_some()
+                } else {
+                    chat.session_exists("rpc_stored")
+                }
+            };
+            assert!(exists());
+            let result = dispatcher
+                .handle_session_delete(&json!({"session_id": sid, "chat_mode": mode}))
+                .await
+                .unwrap();
+            assert_eq!(result["deleted"], true);
+            assert!(!exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_delete_full_rpc_key_after_restart() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_user_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (fixture, sessions, backend, _) = make_persistence_test_dispatcher(config, &data_dir);
+        backend
+            .append("rpc_alpha", &ChatMessage::user("history"))
+            .unwrap();
+        backend
+            .set_session_principal("rpc_alpha", "user:alice")
+            .unwrap();
+        assert!(sessions.get_agent("alpha").await.is_none());
+        let scoped = scoped_dispatcher(&fixture.ctx, 4242).await;
+        let result = scoped
+            .handle_session_delete(&json!({"session_id":"rpc_alpha"}))
+            .await
+            .unwrap();
+        assert_eq!(result["session_id"], "rpc_alpha");
+        assert!(!backend.session_exists("rpc_alpha"));
+    }
+
+    #[tokio::test]
+    async fn rpc_delete_cleared_jsonl_file_respects_filesystem_proof() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut fixture, _, _, _) = make_persistence_test_dispatcher(config, &data_dir);
+        let backend =
+            Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append("legacy", &ChatMessage::user("history"))
+            .unwrap();
+        backend.clear_messages("legacy").unwrap();
+        assert!(backend.session_exists("legacy"));
+        let authorize = |_: &[zeroclaw_infra::session_backend::SessionDeletionCandidate]| -> std::io::Result<
+            Box<dyn zeroclaw_infra::session_backend::SessionEffectGuard>,
+        > { Ok(Box::new(())) };
+        let proof = backend
+            .clone()
+            .admit_session_deletion(&["legacy"], &authorize);
+        let supported = match proof {
+            Ok(_) => true,
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+                false
+            }
+        };
+        Arc::get_mut(&mut fixture.ctx).unwrap().session_backend = Some(backend.clone());
+        let result = fixture
+            .handle_session_delete(&json!({"session_id":"legacy"}))
+            .await;
+        if supported {
+            assert_eq!(result.unwrap()["deleted"], true);
+            assert!(!backend.session_exists("legacy"));
+        } else {
+            assert!(result.is_err());
+            assert!(backend.session_exists("legacy"));
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_delete_jsonl_live_only_named_administrator() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = two_user_config_with_administrator_alice(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut fixture, sessions, _, _) = make_persistence_test_dispatcher(config, &data_dir);
+        let backend =
+            Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+        Arc::get_mut(&mut fixture.ctx).unwrap().session_backend = Some(backend);
+        let admin = scoped_dispatcher(&fixture.ctx, 4242).await;
+        admin
+            .handle_session_new_for_test(
+                &json!({"agent_alias":"test-agent", "session_id":"liveonly", "chat_mode":"chat"}),
+            )
+            .await
+            .unwrap();
+        assert!(sessions.get_agent("liveonly").await.is_some());
+        assert_eq!(
+            admin
+                .handle_session_delete(&json!({"session_id":"liveonly"}))
+                .await
+                .unwrap()["deleted"],
+            true
+        );
+        assert!(sessions.get_agent("liveonly").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn rpc_delete_jsonl_lossy_name_preserves_session_and_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (mut fixture, sessions, _, _) = make_persistence_test_dispatcher(config, &data_dir);
+        let backend =
+            Arc::new(zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap());
+        Arc::get_mut(&mut fixture.ctx).unwrap().session_backend = Some(backend.clone());
+        fixture
+            .handle_session_new_for_test(
+                &json!({"agent_alias":"test-agent", "session_id":"team.alpha", "chat_mode":"chat"}),
+            )
+            .await
+            .unwrap();
+        backend
+            .append("rpc_team.alpha", &ChatMessage::user("history"))
+            .unwrap();
+        assert!(
+            fixture
+                .handle_session_delete(&json!({"session_id":"team_alpha"}))
+                .await
+                .is_err()
+        );
+        assert!(sessions.get_agent("team.alpha").await.is_some());
+        assert!(backend.session_exists("rpc_team_alpha"));
     }
 
     #[tokio::test]
@@ -41259,6 +42194,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_session_delete_rejects_normalized_gateway_collision() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _sessions, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "team.alpha";
+        let chat_key = zeroclaw_infra::gateway_session::gateway_session_key(sid);
+        chat_backend
+            .append(&chat_key, &ChatMessage::user("gateway history"))
+            .unwrap();
+        acp_store
+            .create_session(sid, "test-agent", "/tmp/test-agent", None)
+            .unwrap();
+
+        let error = dispatcher
+            .handle_session_delete(&json!({ "session_id": sid }))
+            .await
+            .expect_err("unqualified reaped deletion must reject both domains");
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert!(acp_store.load_session(sid).unwrap().is_some());
+        assert_eq!(chat_backend.load(&chat_key)[0].content, "gateway history");
+    }
+
+    #[tokio::test]
+    async fn acp_session_delete_preserves_same_owner_replacement_before_commit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "acp-same-owner-replacement";
+        acp_store
+            .create_session(sid, "test-agent", "/tmp/test-agent", None)
+            .unwrap();
+        let (arrived, release) = sessions.set_test_effect_pause("removal-store");
+        let operation = zeroclaw_spawn::spawn!(async move {
+            dispatcher
+                .handle_session_delete(&json!({"session_id": sid, "chat_mode": "acp"}))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), arrived.notified())
+            .await
+            .unwrap();
+        assert!(acp_store.delete_session(sid).unwrap());
+        let successor = acp_store
+            .create_session(sid, "test-agent", "/tmp/test-agent", None)
+            .unwrap();
+        release.notify_one();
+        assert!(operation.await.unwrap().is_err());
+        assert_eq!(
+            acp_store.deletion_candidate(sid).unwrap().unwrap().row_id,
+            successor
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_session_delete_explicit_reaped_mode_preserves_chat_collision() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, _, chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let sid = "explicit-reaped";
+        let chat_key = format!("rpc_{sid}");
+        chat_backend
+            .append(&chat_key, &ChatMessage::user("chat history"))
+            .unwrap();
+        acp_store
+            .create_session(sid, "test-agent", "/tmp/test-agent", None)
+            .unwrap();
+
+        let result = dispatcher
+            .handle_session_delete(&json!({"session_id": sid, "chat_mode": "acp"}))
+            .await
+            .expect("explicit ACP mode should select the ACP session");
+        assert_eq!(result["deleted"], true);
+        assert!(acp_store.load_session(sid).unwrap().is_none());
+        assert_eq!(chat_backend.load(&chat_key)[0].content, "chat history");
+    }
+
+    #[tokio::test]
     async fn acp_session_kill_rejects_ambiguous_reaped_durable_owner() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
@@ -42655,6 +43672,7 @@ mod tests {
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store,
+            expect_both_session_stores: false,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
@@ -48072,6 +49090,7 @@ mod tests {
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
+            expect_both_session_stores: false,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
@@ -48126,6 +49145,7 @@ mod tests {
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
+            expect_both_session_stores: false,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
@@ -48316,6 +49336,7 @@ mod tests {
             approval_pending: Arc::new(crate::rpc::context::ApprovalPendingMap::default()),
             tui_registry: Arc::new(crate::rpc::tui_identity::TuiRegistry::new_unsigned()),
             acp_session_store: None,
+            expect_both_session_stores: false,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,

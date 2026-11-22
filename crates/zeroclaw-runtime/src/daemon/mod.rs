@@ -1149,6 +1149,7 @@ pub async fn run_with_authority(
             ),
             tui_registry,
             acp_session_store,
+            expect_both_session_stores: true,
             sop_engine,
             sop_audit,
             sop_driver_handles,

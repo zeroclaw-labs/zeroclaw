@@ -5697,11 +5697,10 @@ async fn handle_runtime_command_for_delivery(
                     "Session prompts are enabled but the persisted session backend is unavailable"
                 );
             }
-            // When a durable session backend is attached, a reset must not
-            // report success until it has proved that the session (including
-            // any prompt attachments) was deleted. With no backend configured
-            // and prompt injection disabled, retain the legacy ephemeral
-            // reset behavior; that runtime has no durable owner it can clear.
+            // Keep the live session when the backend reports a deletion error.
+            // Legacy JSONL may report inaccessible transcripts as absent.
+            // Without an attached backend, prompt-disabled sessions retain
+            // the existing ephemeral reset behavior.
             if delete_error.is_some() || missing_required_store {
                 channel_runtime_cli_string("channel-runtime-new-session-failed")
             } else {

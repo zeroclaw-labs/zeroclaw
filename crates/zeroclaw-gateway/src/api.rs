@@ -1972,24 +1972,36 @@ pub async fn handle_api_session_message_post(
             .into_response();
     };
 
-    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
-    // Bind the durable existence observation and queue incarnation together
-    // before waiting. DELETE publishes invalidation through this same queue
-    // authority only after durable removal, so a queued request cannot adopt a
-    // successor generation after it observed the predecessor.
-    let Some((expected_generation, _session_lifecycle_lease)) = state
-        .session_queue
-        .capture_generation_if(&session_key, || backend.session_exists(&session_key))
-        .await
-    else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session not found"})),
-        )
-            .into_response();
+    let raw_gateway = format!("{GW_SESSION_PREFIX}{id}");
+    let normalized_gateway = gateway_session_key(&id);
+    let keys: &[&str] = if id.starts_with(GW_SESSION_PREFIX) {
+        &[&id]
+    } else {
+        &[&id, &raw_gateway, &normalized_gateway]
     };
+    let admission = match std::sync::Arc::clone(backend).admit_existing_append(
+        keys,
+        zeroclaw_infra::session_backend::AppendKeyLookup::Addressed,
+    ) {
+        Ok(Some(admission)) => admission,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Session not found"})),
+            )
+                .into_response();
+        }
+        Err(error) => return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to admit session message: {error}")})),
+        )
+            .into_response(),
+    };
+    let session_key = admission.key();
 
-    let _session_guard = match state.session_queue.acquire(&session_key).await {
+    let (expected_generation, _session_lifecycle_lease) =
+        state.session_queue.capture_generation(session_key).await;
+    let _session_guard = match state.session_queue.acquire(session_key).await {
         Ok(guard) => guard,
         Err(crate::session_queue::SessionQueueError::QueueFull { .. }) => {
             return (
@@ -2007,11 +2019,7 @@ pub async fn handle_api_session_message_post(
         }
     };
 
-    // Deletion shares this queue. Re-check after waiting so a queued POST
-    // cannot recreate metadata that DELETE removed while it was pending.
-    if !backend.session_exists(&session_key)
-        || state.session_queue.lifecycle_generation(&session_key).await != expected_generation
-    {
+    if state.session_queue.lifecycle_generation(session_key).await != expected_generation {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
@@ -2020,19 +2028,26 @@ pub async fn handle_api_session_message_post(
     }
 
     let message = zeroclaw_providers::ChatMessage::assistant(&body.content);
-    if let Err(e) = backend.append(&session_key, &message) {
+    if let Err(e) = admission.append(&message, &|_| Ok(Box::new(())), false, &mut || {}) {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Session not found"})),
+            )
+                .into_response();
+        }
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to append session message: {e}")})),
         )
             .into_response();
     }
-    state.session_queue.advance_generation(&session_key);
+    state.session_queue.advance_generation(session_key);
 
     // Match WS `?session_id=` / `event_matches_session` (display id), not the
     // path string — callers that pass the full `session_key` must still notify
     // the connected WebSocket.
-    let display_session_id = gateway_display_session_id(&session_key);
+    let display_session_id = gateway_display_session_id(session_key);
     let event = serde_json::json!({
         "type": "message",
         "session_id": display_session_id,
@@ -2056,13 +2071,15 @@ pub async fn handle_api_session_message_post(
 }
 
 #[cfg(test)]
-static DELETE_COMMIT_TEST_PAUSE: std::sync::Mutex<
-    Option<(
-        String,
-        std::sync::Arc<tokio::sync::Notify>,
-        std::sync::Arc<tokio::sync::Notify>,
-    )>,
-> = std::sync::Mutex::new(None);
+type DeleteCommitTestPause = (
+    String,
+    std::sync::Arc<tokio::sync::Notify>,
+    std::sync::Arc<tokio::sync::Notify>,
+);
+
+#[cfg(test)]
+static DELETE_COMMIT_TEST_PAUSE: std::sync::Mutex<Option<DeleteCommitTestPause>> =
+    std::sync::Mutex::new(None);
 
 /// DELETE /api/sessions/{id} — delete a gateway session
 pub async fn handle_api_session_delete(
@@ -2074,7 +2091,7 @@ pub async fn handle_api_session_delete(
         return e.into_response();
     }
 
-    let Some(ref backend) = state.session_backend else {
+    let Some(backend) = state.session_backend.clone() else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session persistence is disabled"})),
@@ -2082,32 +2099,32 @@ pub async fn handle_api_session_delete(
             .into_response();
     };
 
-    let gateway_raw = if id.starts_with("gw_") {
-        id.clone()
-    } else {
-        format!("gw_{id}")
-    };
-    let gateway_normalized = if id.starts_with("gw_") {
-        id.clone()
-    } else {
-        gateway_session_key(&id)
-    };
-    let candidates = [&id[..], &gateway_raw[..], &gateway_normalized[..]];
-    let authorize = |_: Option<&str>| -> std::io::Result<
+    // The Dashboard passes the exact storage key from its session list.
+    // Keep a prefixed key literal even when its row has already disappeared.
+    let admission_id = id.clone();
+    let authorize = |_: &[zeroclaw_infra::session_backend::SessionDeletionCandidate]| -> std::io::Result<
         Box<dyn zeroclaw_infra::session_backend::SessionEffectGuard>,
     > { Ok(Box::new(())) };
-    let admission = match backend
-        .clone()
-        .admit_session_deletion(&candidates, &authorize)
+    let admission = match tokio::task::spawn_blocking(move || {
+        if admission_id.starts_with(GW_SESSION_PREFIX) {
+            return backend.admit_session_deletion(&[&admission_id], &authorize);
+        }
+        let gateway_raw = format!("gw_{admission_id}");
+        let gateway_normalized = gateway_session_key(&admission_id);
+        let candidates = [&admission_id[..], &gateway_raw[..], &gateway_normalized[..]];
+        backend.admit_session_deletion(&candidates, &authorize)
+    })
+    .await
     {
-        Ok(admission) => admission,
-        Err(_) => return (
+        Ok(Ok(admission)) => admission,
+        Ok(Err(_)) => return (
             StatusCode::CONFLICT,
             Json(
                 serde_json::json!({"error": "Session deletion target is ambiguous or unavailable"}),
             ),
         )
             .into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let Some(session_key) = admission.selected_key().map(str::to_owned) else {
         return (
@@ -2125,49 +2142,58 @@ pub async fn handle_api_session_delete(
         )
             .into_response();
     }
-    if !admission.gateway_queue_identity_is_exact() {
+    if !admission.queue_identity_is_exact() {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({"error": "Gateway session lifecycle identity is ambiguous"})),
         )
             .into_response();
     }
-    let Some((expected_generation, _session_lifecycle_lease)) = state
-        .session_queue
-        .capture_generation_if(&session_key, || backend.session_exists(&session_key))
-        .await
-    else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session not found"})),
-        )
-            .into_response();
-    };
+    let (expected_generation, _session_lifecycle_lease) =
+        state.session_queue.capture_generation(&session_key).await;
 
     // Do not remove the token before finalization: the active turn owns that
     // registration and will clean it up. Cancellation is bound to the queue
     // incarnation captured above, so a stale DELETE cannot affect a same-ID
     // successor that has registered its own token.
-    let mut deletion_cancellation = None;
-    if admission
-        .with_current(&authorize, &mut || {
+    let request_cancelled = tokio_util::sync::CancellationToken::new();
+    let _request_guard = request_cancelled.clone().drop_guard();
+    let cancellation_request = request_cancelled.clone();
+    let cancellation_key = session_key.clone();
+    let cancellation_state = state.clone();
+    let (admission, deletion_cancellation) = match tokio::task::spawn_blocking(move || {
+        let mut deletion_cancellation = None;
+        admission.with_current(&authorize, &mut || {
+            if cancellation_request.is_cancelled() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "session deletion request cancelled",
+                ));
+            }
             deletion_cancellation = Some(signal_gateway_deletion_at_generation(
-                &state,
-                &session_key,
+                &cancellation_state,
+                &cancellation_key,
                 expected_generation,
             ));
             Ok(())
-        })
-        .is_err()
+        })?;
+        Ok::<_, std::io::Error>((
+            admission,
+            deletion_cancellation.expect("validated callback supplies a cancellation guard"),
+        ))
+    })
+    .await
     {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "Session deletion target changed"})),
-        )
-            .into_response();
-    }
-    let deletion_cancellation =
-        deletion_cancellation.expect("validated callback supplies a cancellation guard");
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "Session deletion target changed"})),
+            )
+                .into_response();
+        }
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
     if deletion_cancellation.cancelled_active_turn {
         ::zeroclaw_log::record!(
             INFO,
@@ -2205,8 +2231,6 @@ pub async fn handle_api_session_delete(
     // request times out or disconnects. Move the permit and deletion latch
     // into the settling task; cancellation before commit still stops it.
     let queue = state.session_queue.clone();
-    let request_cancelled = tokio_util::sync::CancellationToken::new();
-    let _request_guard = request_cancelled.clone().drop_guard();
     let settlement = zeroclaw_spawn::spawn!(async move {
         let _guards = (
             _session_guard,
@@ -2223,7 +2247,22 @@ pub async fn handle_api_session_delete(
         if request_cancelled.is_cancelled() {
             return StatusCode::REQUEST_TIMEOUT.into_response();
         }
-        match admission.delete(&|_| Ok(Box::new(()))) {
+        let deletion = tokio::task::spawn_blocking(move || {
+            admission.delete(&|current| {
+                if request_cancelled.is_cancelled() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "session deletion request cancelled",
+                    ));
+                }
+                authorize(current)
+            })
+        })
+        .await;
+        let Ok(deletion) = deletion else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        match deletion {
             Ok(true) => {
                 #[cfg(test)]
                 {
@@ -2254,6 +2293,9 @@ pub async fn handle_api_session_delete(
                 Json(serde_json::json!({"error": "Session not found"})),
             )
                 .into_response(),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                StatusCode::REQUEST_TIMEOUT.into_response()
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({"error": "Session deletion target changed"})),
@@ -4023,6 +4065,63 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn session_message_post_rejects_same_key_successor_without_queue_invalidation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let key = "rpc_test-session";
+        backend
+            .append(
+                key,
+                &zeroclaw_providers::ChatMessage::assistant("predecessor"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let session_guard = state.session_queue.acquire(key).await.unwrap();
+        let response_fut = handle_api_session_message_post(
+            State(state),
+            HeaderMap::new(),
+            Path(key.to_string()),
+            Json(
+                serde_json::from_value(serde_json::json!({
+                    "content": "stale queued notification"
+                }))
+                .unwrap(),
+            ),
+        );
+        tokio::pin!(response_fut);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut response_fut)
+                .await
+                .is_err()
+        );
+        assert!(backend.delete_session(key).unwrap());
+        backend
+            .append(
+                key,
+                &zeroclaw_providers::ChatMessage::assistant("successor"),
+            )
+            .unwrap();
+        drop(session_guard);
+
+        let response = tokio::time::timeout(Duration::from_secs(1), response_fut)
+            .await
+            .expect("queued POST should complete")
+            .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let messages = backend.load(key);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "successor");
+    }
+
+    #[tokio::test]
     async fn session_delete_refuses_sqlite_reset_successor_while_queued() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = zeroclaw_config::schema::Config {
@@ -4080,7 +4179,8 @@ pub(crate) mod tests {
             ..zeroclaw_config::schema::Config::default()
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
-        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
         let key = "gw_http-delete-disconnect";
         backend
             .append(
@@ -4138,7 +4238,8 @@ pub(crate) mod tests {
             ..zeroclaw_config::schema::Config::default()
         };
         std::fs::create_dir_all(&config.data_dir).unwrap();
-        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
         backend
             .append(
                 "gw_operator-1",
@@ -4602,6 +4703,46 @@ pub(crate) mod tests {
             "aborted"
         );
         assert!(underscored_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_delete_full_key_preserves_other_prefixed_rows() {
+        for (raw, doubled) in [(true, false), (false, true), (true, true)] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = zeroclaw_config::schema::Config {
+                data_dir: tmp.path().join("workspace"),
+                config_path: tmp.path().join("config.toml"),
+                ..zeroclaw_config::schema::Config::default()
+            };
+            std::fs::create_dir_all(&config.data_dir).unwrap();
+            let backend: Arc<dyn SessionBackend> =
+                Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+            for (exists, key) in [(raw, "gw_alpha"), (doubled, "gw_gw_alpha")] {
+                if exists {
+                    backend
+                        .append(key, &zeroclaw_providers::ChatMessage::assistant("saved"))
+                        .unwrap();
+                }
+            }
+            let state = test_state_with_session_backend(config, backend.clone());
+            let response = handle_api_session_delete(
+                State(state),
+                HeaderMap::new(),
+                Path("gw_alpha".to_string()),
+            )
+            .await
+            .into_response();
+            assert_eq!(
+                response.status(),
+                if raw {
+                    StatusCode::OK
+                } else {
+                    StatusCode::NOT_FOUND
+                }
+            );
+            assert!(!backend.session_exists("gw_alpha"));
+            assert_eq!(backend.session_exists("gw_gw_alpha"), doubled);
+        }
     }
 
     #[tokio::test]

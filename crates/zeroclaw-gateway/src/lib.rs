@@ -4469,14 +4469,19 @@ async fn run_gateway_chat_streaming_response(
             )
         }
     };
-    let session_generation = state.session_queue.lifecycle_generation(&session_key).await;
-    register_cancel_token(
-        &state.cancel_tokens,
-        &cancel_key,
-        &session_key,
-        session_generation,
-        Arc::clone(&cancel_token),
-    );
+    let ((), lifecycle_lease) = state
+        .session_queue
+        .capture_generation_with(&session_key, |generation| {
+            register_cancel_token(
+                &state.cancel_tokens,
+                &cancel_key,
+                &session_key,
+                generation,
+                Arc::clone(&cancel_token),
+            );
+        })
+        .await;
+    let lifecycle_lease = Arc::new(lifecycle_lease);
 
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<SseFrame>(16);
     let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel::<SseFrame>();
@@ -4488,7 +4493,9 @@ async fn run_gateway_chat_streaming_response(
     let alias_for_turn = agent_override.map(str::to_string);
     let session_key_for_turn = session_key.clone();
     let token_for_turn = Arc::clone(&cancel_token);
+    let turn_lease = Arc::clone(&lifecycle_lease);
     zeroclaw_spawn::spawn!(async move {
+        let _lifecycle_lease = turn_lease;
         let outcome = dispatch_gateway_turn_streaming(
             &state_for_turn,
             &message_owned,
@@ -4506,6 +4513,7 @@ async fn run_gateway_chat_streaming_response(
     let cancel_key_for_frames = cancel_key.clone();
     let token_for_stream = Arc::clone(&cancel_token);
     zeroclaw_spawn::spawn!(async move {
+        let _lifecycle_lease = lifecycle_lease;
         let mut terminal_tx = Some(terminal_tx);
         let mut cumulative = String::new();
         loop {
@@ -11336,7 +11344,12 @@ data: [DONE]\n\n";
 
     #[tokio::test]
     async fn webhook_sse_replacement_cancels_old_turn_without_removing_new_token() {
-        let state = sse_test_state(Arc::new(HangingProvider));
+        let mut state = sse_test_state(Arc::new(HangingProvider));
+        state.session_queue = Arc::new(session_queue::SessionActorQueue::new(8, 5, 0));
+        let session_key = gateway_session_key("sse-replace");
+        let guard = state.session_queue.acquire(&session_key).await.unwrap();
+        assert_eq!(state.session_queue.invalidate(&session_key).await, 1);
+        drop(guard);
         let request = || {
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -11362,6 +11375,12 @@ data: [DONE]\n\n";
             body,
         )
         .await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(state.session_queue.evict_idle().await, 0);
+        assert_eq!(
+            state.session_queue.lifecycle_generation(&session_key).await,
+            1
+        );
         let first_token = state
             .cancel_tokens
             .lock()

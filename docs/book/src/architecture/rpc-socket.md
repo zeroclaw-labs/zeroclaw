@@ -232,18 +232,38 @@ Kill and delete signal cancellation before attempting their fallible SQLite oper
 ### Chat deletion across RPC and the gateway
 
 In a supervised daemon, RPC `session/delete` shares the gateway's existing
-cancellation registry and actor queue. Chat deletion captures the gateway
-generation, signals cancellation for the authorized predecessor, and waits
-for its gateway permit after acquiring the RPC permit. It revalidates ownership
+cancellation registry and actor queue. When the admitted durable target is a
+gateway session, Chat deletion captures that gateway generation, signals its
+authorized predecessor, and waits for its gateway permit after acquiring the
+RPC permit. It revalidates ownership
 and generation before deleting an unambiguous raw, `rpc_` or `gw_` Chat row.
 Multiple distinct candidates are refused because they may be different
 sessions even when their owner is the same; SQLite checks this in the deletion
-transaction. An initial best-effort check avoids signalling turns when the
-ambiguity is already visible, but storage makes the authoritative decision.
+transaction. The guarded preflight checks all observed owners before reporting
+ambiguity. Storage repeats that check at each signal and commit; a newly arrived
+foreign or legacy-unowned row receives the same scoped ownership denial.
 Deletion retains the selected row's incarnation across queue waits and refuses
 if it was reset or replaced. For an accepted full stored-key spelling, the
 original wire ID remains in the response while cancellation and fencing use
 the identified owning RPC or gateway queue; unprovable identities are refused.
+An unqualified reaped deletion checks both configured durable domains, including
+normalized gateway keys. At commit it rejects an arrival in the other domain,
+preserving both transcripts. If a configured store is unavailable, specify
+`chat_mode` to select an available domain. Raw keys that could name a channel-owned
+transcript require a lifecycle binding before RPC can delete them.
+
+Dashboard notifications, RPC append, and `sessions_send` select an existing
+transcript and retain its identity until the write. A pending append cannot
+create a missing transcript or modify a same-key successor. The Dashboard
+notification queue serializes a successful append and its publication with
+RPC deletion, including for RPC or raw stored keys. JSONL append coordination
+is limited to handles in the same process.
+
+Custom `SessionBackend` implementations must implement
+`admit_existing_append` to support these three writers. A forwarding backend
+must forward the admission and preserve its conditional append behavior.
+The default returns an unsupported-operation error.
+
 Only a successful durable deletion invalidates the captured gateway generation.
 Old WebSockets cannot recreate metadata or write into a same-ID successor;
 a newly connected successor remains usable. Failed storage deletion preserves

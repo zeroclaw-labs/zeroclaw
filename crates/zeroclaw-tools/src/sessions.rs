@@ -778,26 +778,46 @@ impl Tool for SessionsSendTool {
             }
         }
 
-        let Some(target_session_key) =
-            resolve_existing_session_key(self.backend.as_ref(), session_id)
-        else {
-            return Ok(session_not_found(session_id));
+        let requested = session_id.trim();
+        let gateway_key = format!("gw_{requested}");
+        let keys: &[&str] = if requested.starts_with("gw_") {
+            &[requested]
+        } else {
+            &[requested, &gateway_key]
         };
+        let target = match Arc::clone(&self.backend).admit_existing_append(
+            keys,
+            zeroclaw_infra::session_backend::AppendKeyLookup::Listed,
+        ) {
+            Ok(Some(target)) => target,
+            Ok(None) => return Ok(session_not_found(session_id)),
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(tool_msg_with_args(
+                        "tool-sessions-send-error-append",
+                        &[("error", &error.to_string())],
+                    )),
+                });
+            }
+        };
+        let target_session_key = target.key();
 
         let chat_msg = zeroclaw_api::model_provider::ChatMessage::user(message);
 
-        match self.backend.append(&target_session_key, &chat_msg) {
-            Ok(()) => {
+        match target.append(&chat_msg, &|_| Ok(Box::new(())), false, &mut || {}) {
+            Ok(_) => {
                 let output = if target_session_key == session_id.trim() {
                     tool_msg_with_args(
                         "tool-sessions-send-output-appended",
-                        &[("session_id", &target_session_key)],
+                        &[("session_id", target_session_key)],
                     )
                 } else {
                     tool_msg_with_args(
                         "tool-sessions-send-output-appended-alias",
                         &[
-                            ("session_id", &target_session_key),
+                            ("session_id", target_session_key),
                             ("requested_id", session_id),
                         ],
                     )
@@ -808,6 +828,7 @@ impl Tool for SessionsSendTool {
                     error: None,
                 })
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(session_not_found(session_id)),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),

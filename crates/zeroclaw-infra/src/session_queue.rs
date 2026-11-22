@@ -138,55 +138,22 @@ impl SessionActorQueue {
             .unwrap_or(0)
     }
 
-    /// Capture a session incarnation only if a caller's synchronous durable
-    /// predicate still holds. The returned lease keeps idle eviction from
-    /// reclaiming the queue slot and generation tombstone before the caller
-    /// registers its queued operation with [`Self::acquire`]. The predicate
-    /// runs while the generation mutex is held, serializing its observation
-    /// with [`Self::invalidate`].
-    pub async fn capture_generation_if<F>(
-        &self,
-        session_id: &str,
-        predicate: F,
-    ) -> Option<(u64, SessionLease)>
-    where
-        F: FnOnce() -> bool,
-    {
-        // Keep the lock order slots -> generations aligned with evict_idle.
-        // Holding the slot-map lock while the synchronous predicate runs is
-        // intentional: it closes the observation-to-lease gap without
-        // introducing a generations -> slots deadlock.
-        let mut slots = self.slots.lock().await;
-        let generations = self.generations.lock().await;
-        if !predicate() {
-            return None;
-        }
-
-        let slot = slots
-            .entry(session_id.to_string())
-            .or_insert_with(|| {
-                Arc::new(SessionSlot {
-                    semaphore: Arc::new(Semaphore::new(1)),
-                    last_active: Mutex::new(Instant::now()),
-                    pending: AtomicUsize::new(0),
-                    leases: AtomicUsize::new(0),
-                })
-            })
-            .clone();
-        slot.leases.fetch_add(1, Ordering::Relaxed);
-        let generation = generations.get(session_id).copied().unwrap_or(0);
-        Some((
-            generation,
-            SessionLease {
-                _registration: LeaseRegistration { slot },
-            },
-        ))
-    }
-
     /// Capture the current lifecycle incarnation and retain its queue slot
     /// until the returned lease is dropped. This is for admission paths whose
     /// durable existence was checked separately before queue admission.
     pub async fn capture_generation(&self, session_id: &str) -> (u64, SessionLease) {
+        self.capture_generation_with(session_id, |generation| generation)
+            .await
+    }
+
+    /// Enroll an in-memory observer of the current generation atomically
+    /// with respect to invalidation, retaining the generation until the
+    /// lease drops. The callback must not perform blocking I/O.
+    pub async fn capture_generation_with<T>(
+        &self,
+        session_id: &str,
+        enroll: impl FnOnce(u64) -> T,
+    ) -> (T, SessionLease) {
         // Keep the lock order slots -> generations aligned with evict_idle.
         let mut slots = self.slots.lock().await;
         let generations = self.generations.lock().await;
@@ -203,12 +170,10 @@ impl SessionActorQueue {
             .clone();
         slot.leases.fetch_add(1, Ordering::Relaxed);
         let generation = generations.get(session_id).copied().unwrap_or(0);
-        (
-            generation,
-            SessionLease {
-                _registration: LeaseRegistration { slot },
-            },
-        )
+        let lease = SessionLease {
+            _registration: LeaseRegistration { slot },
+        };
+        (enroll(generation), lease)
     }
 
     /// Invalidate all holders of the current incarnation. Must be called
@@ -426,53 +391,6 @@ mod tests {
         assert!(queue.generations.lock().await.is_empty());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn capture_generation_if_serializes_the_predicate_with_invalidation() {
-        let queue = Arc::new(SessionActorQueue::new(8, 5, 600));
-        let initial_guard = queue.acquire("s1").await.unwrap();
-        assert_eq!(queue.invalidate("s1").await, 1);
-        drop(initial_guard);
-
-        let predicate_entered = Arc::new(std::sync::Barrier::new(2));
-        let predicate_release = Arc::new(std::sync::Barrier::new(2));
-        let snapshot_queue = Arc::clone(&queue);
-        let entered = Arc::clone(&predicate_entered);
-        let release = Arc::clone(&predicate_release);
-        let snapshot = zeroclaw_spawn::spawn!(async move {
-            snapshot_queue
-                .capture_generation_if("s1", move || {
-                    entered.wait();
-                    release.wait();
-                    true
-                })
-                .await
-        });
-
-        tokio::task::spawn_blocking(move || predicate_entered.wait())
-            .await
-            .unwrap();
-
-        let invalidate_queue = Arc::clone(&queue);
-        let mut invalidation = zeroclaw_spawn::spawn!(async move {
-            let _guard = invalidate_queue.acquire("s1").await.unwrap();
-            invalidate_queue.invalidate("s1").await
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut invalidation)
-                .await
-                .is_err(),
-            "invalidation must not advance while the durable predicate and its generation snapshot are coupled"
-        );
-
-        tokio::task::spawn_blocking(move || predicate_release.wait())
-            .await
-            .unwrap();
-        let (generation, _lease) = snapshot.await.unwrap().unwrap();
-        assert_eq!(generation, 1);
-        assert_eq!(invalidation.await.unwrap(), 2);
-        assert_eq!(queue.lifecycle_generation("s1").await, 2);
-    }
-
     #[tokio::test]
     async fn captured_generation_lease_blocks_idle_reclamation_until_admission() {
         let queue = SessionActorQueue::new(8, 5, 0);
@@ -481,10 +399,7 @@ mod tests {
         drop(guard);
         tokio::time::sleep(Duration::from_millis(1)).await;
 
-        let (generation, lease) = queue
-            .capture_generation_if("reused-session", || true)
-            .await
-            .unwrap();
+        let (generation, lease) = queue.capture_generation("reused-session").await;
         assert_eq!(generation, 1);
         assert_eq!(queue.evict_idle().await, 0);
         assert_eq!(queue.lifecycle_generation("reused-session").await, 1);

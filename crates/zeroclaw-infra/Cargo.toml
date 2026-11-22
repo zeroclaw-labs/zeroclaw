@@ -27,3 +27,9 @@ url = "2.5"
 
 [dev-dependencies]
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
+
+[target.'cfg(windows)'.dependencies]
+same-file = "1.0"

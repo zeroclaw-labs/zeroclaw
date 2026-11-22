@@ -1914,6 +1914,54 @@ impl SessionStore {
         Ok(true)
     }
 
+    /// Remove a live-only predecessor while the caller holds the durable
+    /// absence reservation. A contended live lock leaves every map untouched.
+    pub(crate) fn try_remove_generation_bound(
+        &self,
+        id: &str,
+        generation: u64,
+        agent: &Arc<Mutex<Agent>>,
+        expected_owner: Option<&str>,
+    ) -> std::io::Result<bool> {
+        let busy = || std::io::Error::from(std::io::ErrorKind::WouldBlock);
+        let mut sessions = self.sessions.try_lock().map_err(|_| busy())?;
+        if !sessions.get(id).is_some_and(|session| {
+            session.generation == generation
+                && Arc::ptr_eq(&session.agent, agent)
+                && session.owner_principal_id.as_deref() == expected_owner
+        }) {
+            return Ok(false);
+        }
+        let mut tokens = match self.cancel_tokens.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(busy()),
+        };
+        let mut causes = match self.cancel_causes.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(busy()),
+        };
+        if tokens
+            .get(id)
+            .is_some_and(|(_, bound, _)| *bound == Some(generation))
+            && let Some((_, _, token)) = tokens.remove(id)
+        {
+            causes.insert(id.to_string(), CancelCause::SessionRemoved);
+            token.cancel();
+        }
+        let removed = sessions
+            .remove(id)
+            .expect("validated under the session lock");
+        drop(causes);
+        drop(tokens);
+        drop(sessions);
+        if let Some(notify) = removed.pending_generation {
+            notify.notify_waiters();
+        }
+        Ok(true)
+    }
+
     pub async fn evict_same_mode_sibling(
         &self,
         tui_id: &str,
@@ -2670,46 +2718,46 @@ impl SessionStore {
         }))
     }
 
-    /// Signal only inside a caller-provided synchronous identity boundary.
-    /// The live-session and token locks remain held while the boundary checks
-    /// durable identity and invokes the effect.
-    pub(crate) async fn signal_session_deletion_bound<E>(
+    /// Called from a durable reservation. Never wait for a live lock here:
+    /// other RPC operations can already hold it while entering storage.
+    pub(crate) fn try_signal_session_deletion(
         &self,
         id: &str,
         expected_generation: u64,
         expected_access: Option<(u64, Option<&str>)>,
-        guarded: impl FnOnce(Option<&str>, &mut dyn FnMut()) -> Result<(), E>,
-    ) -> Result<Option<LifecycleCancellation<'_>>, E> {
-        let sessions = self.sessions.lock().await;
-        let Some(session) = sessions
-            .get(id)
-            .filter(|s| s.generation == expected_generation)
-        else {
-            return Ok(None);
+        expected_owner: Option<&str>,
+    ) -> std::io::Result<bool> {
+        let busy = || std::io::Error::from(std::io::ErrorKind::WouldBlock);
+        let sessions = self.sessions.try_lock().map_err(|_| busy())?;
+        let Some(session) = sessions.get(id).filter(|session| {
+            session.generation == expected_generation
+                && session.owner_principal_id.as_deref() == expected_owner
+        }) else {
+            return Ok(false);
         };
         if expected_access.is_some_and(|(generation, owner)| {
             generation != session.generation || owner != session.owner_tui_id()
         }) {
-            return Ok(None);
+            return Ok(false);
         }
-        let tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
-        let mut causes = self.cancel_causes.lock().unwrap_or_else(|e| e.into_inner());
-        let mut signal = || {
-            if let Some((_, _, token)) = tokens
-                .get(id)
-                .filter(|(_, generation, _)| *generation == Some(expected_generation))
-            {
-                causes.insert(id.to_string(), CancelCause::SessionRemoved);
-                token.cancel();
-            }
+        let tokens = match self.cancel_tokens.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(busy()),
         };
-        guarded(session.owner_principal_id.as_deref(), &mut signal)?;
-        Ok(Some(LifecycleCancellation {
-            store: self,
-            session_id: id.to_string(),
-            session_generation: expected_generation,
-            admin_kill_fence: false,
-        }))
+        let mut causes = match self.cancel_causes.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(busy()),
+        };
+        if let Some((_, _, token)) = tokens
+            .get(id)
+            .filter(|(_, generation, _)| *generation == Some(expected_generation))
+        {
+            causes.insert(id.to_string(), CancelCause::SessionRemoved);
+            token.cancel();
+        }
+        Ok(true)
     }
 
     /// Accept steering for the turn registered under `generation`. Removed
@@ -3438,6 +3486,44 @@ mod tests {
             &original,
             &store.get_agent("s").await.unwrap()
         ));
+    }
+
+    #[tokio::test]
+    async fn deletion_try_effect_preserves_session_when_cause_lock_is_held() {
+        let store = make_store(1);
+        store
+            .insert_if_absent(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let agent = store.get_agent("s").await.unwrap();
+        let generation = store.get_generation("s").await.unwrap();
+        {
+            let _causes = store.cancel_causes.lock().unwrap();
+            assert_eq!(
+                store
+                    .try_signal_session_deletion("s", generation, None, None)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            assert_eq!(
+                store
+                    .try_remove_generation_bound("s", generation, &agent, None)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+        assert_eq!(store.get_generation("s").await, Some(generation));
+        assert!(
+            store
+                .try_remove_generation_bound("s", generation, &agent, None)
+                .unwrap()
+        );
+        assert!(store.get_generation("s").await.is_none());
     }
 
     #[tokio::test]

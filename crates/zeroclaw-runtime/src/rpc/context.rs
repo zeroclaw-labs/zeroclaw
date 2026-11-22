@@ -284,6 +284,10 @@ pub struct RpcContext {
     /// callers must treat persistence as best-effort.
     pub acp_session_store: Option<Arc<AcpSessionStore>>,
 
+    /// Daemon startup configures both durable domains. A missing handle in
+    /// that context is an unavailable store and cannot establish absence.
+    pub expect_both_session_stores: bool,
+
     /// Shared SOP engine from the daemon (for RPC/TUI agent sessions).
     /// `None` when standalone — sessions build their own.
     pub sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
@@ -395,6 +399,7 @@ impl RpcContext {
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
+            expect_both_session_stores: false,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
@@ -437,6 +442,7 @@ impl RpcContext {
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry,
             acp_session_store: AcpSessionStore::new(data_dir.as_path()).ok().map(Arc::new),
+            expect_both_session_stores: false,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
@@ -470,6 +476,7 @@ impl RpcContext {
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
+            expect_both_session_stores: false,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
@@ -512,6 +519,7 @@ impl RpcContext {
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
+            expect_both_session_stores: false,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
@@ -595,6 +603,7 @@ impl RpcContext {
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
+            expect_both_session_stores: false,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
@@ -632,6 +641,7 @@ impl RpcContext {
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
+            expect_both_session_stores: false,
             sop_engine: Some(sop_engine),
             sop_driver_handles: Some(crate::sop::SopDriverHandles::default()),
             sop_audit: None,
@@ -675,6 +685,7 @@ impl RpcContext {
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
+            expect_both_session_stores: false,
             sop_engine: Some(sop_engine),
             sop_driver_handles,
             sop_audit: Some(sop_audit),
@@ -711,6 +722,7 @@ impl RpcContext {
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
+            expect_both_session_stores: false,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
@@ -748,6 +760,7 @@ impl RpcContext {
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
+            expect_both_session_stores: false,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
@@ -786,6 +799,7 @@ impl RpcContext {
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store,
+            expect_both_session_stores: false,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,
@@ -824,6 +838,7 @@ impl RpcContext {
             approval_pending: Arc::new(ApprovalPendingMap::default()),
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
+            expect_both_session_stores: false,
             sop_engine: None,
             sop_driver_handles: None,
             sop_audit: None,

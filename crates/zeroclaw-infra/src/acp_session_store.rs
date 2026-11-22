@@ -71,6 +71,13 @@ pub struct AcpSessionStore {
     conn: Mutex<Connection>,
 }
 
+/// Identity and owner of one persisted ACP session incarnation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpDeletionCandidate {
+    pub row_id: i64,
+    pub principal_id: Option<String>,
+}
+
 pub struct AcpSessionData {
     pub session_uuid: String,
     /// Owning principal (RFC 7141 session isolation). `None` marks an
@@ -722,6 +729,67 @@ impl AcpSessionStore {
             )
             .optional()?
             .flatten())
+    }
+
+    fn deletion_candidate_on(
+        conn: &Connection,
+        session_uuid: &str,
+    ) -> Result<Option<AcpDeletionCandidate>> {
+        conn.query_row(
+            "SELECT id, principal_id FROM acp_sessions WHERE session_uuid = ?1",
+            params![session_uuid],
+            |row| {
+                Ok(AcpDeletionCandidate {
+                    row_id: row.get(0)?,
+                    principal_id: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .context("Failed to inspect ACP deletion identity")
+    }
+
+    /// Capture an existing ACP row without creating a session.
+    pub fn deletion_candidate(&self, session_uuid: &str) -> Result<Option<AcpDeletionCandidate>> {
+        Self::deletion_candidate_on(&self.conn.lock(), session_uuid)
+    }
+
+    /// Hold the current ACP observation while a caller checks another durable
+    /// domain. The supplied delete commits this exact observed row; if unused,
+    /// the read-only reservation is released without a fallible commit.
+    pub fn with_deletion_reservation<R>(
+        &self,
+        session_uuid: &str,
+        secondary_uuid: Option<&str>,
+        effect: impl FnOnce(
+            Option<&AcpDeletionCandidate>,
+            Option<&AcpDeletionCandidate>,
+            &mut dyn FnMut() -> Result<bool>,
+        ) -> Result<R>,
+    ) -> Result<R> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = Self::deletion_candidate_on(&tx, session_uuid)?;
+        let secondary = secondary_uuid
+            .map(|uuid| Self::deletion_candidate_on(&tx, uuid))
+            .transpose()?
+            .flatten();
+        let mut tx = Some(tx);
+        let mut delete = || {
+            let transaction = tx
+                .take()
+                .context("ACP deletion reservation already consumed")?;
+            let Some(candidate) = current.as_ref() else {
+                return Ok(false);
+            };
+            let rows = transaction.execute(
+                "DELETE FROM acp_sessions WHERE id = ?1 AND session_uuid = ?2 AND principal_id IS ?3",
+                params![candidate.row_id, session_uuid, candidate.principal_id],
+            )?;
+            transaction.commit()?;
+            Ok(rows > 0)
+        };
+        effect(current.as_ref(), secondary.as_ref(), &mut delete)
     }
 
     /// Exact-owner deletion with a caller-owned guard at the write boundary.
@@ -3566,6 +3634,37 @@ fn parse_ts(s: &str, field: &'static str, session_uuid: &str) -> DateTime<Utc> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn acp_deletion_reservation_distinguishes_same_id_successor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = AcpSessionStore::new(tmp.path()).unwrap();
+        store
+            .create_session("session", "agent", "/tmp", Some("owner"))
+            .unwrap();
+        let predecessor = store.deletion_candidate("session").unwrap().unwrap();
+        assert!(store.delete_session("session").unwrap());
+        store
+            .create_session("session", "agent", "/tmp", Some("owner"))
+            .unwrap();
+
+        let stale = store.with_deletion_reservation("session", None, |current, _, delete| {
+            anyhow::ensure!(current == Some(&predecessor), "stale ACP identity");
+            delete()
+        });
+        assert!(stale.is_err());
+        let successor = store.deletion_candidate("session").unwrap().unwrap();
+        assert_ne!(predecessor.row_id, successor.row_id);
+        assert!(
+            store
+                .with_deletion_reservation("session", None, |current, _, delete| {
+                    anyhow::ensure!(current == Some(&successor), "changed ACP identity");
+                    delete()
+                })
+                .unwrap()
+        );
+        assert!(store.deletion_candidate("session").unwrap().is_none());
+    }
+
     #[test]
     fn guarded_effects_reauthorize_after_store_lock_without_partial_writes() {
         use std::sync::{

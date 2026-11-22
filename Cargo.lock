@@ -14284,6 +14284,8 @@ dependencies = [
  "parking_lot",
  "portable-atomic",
  "rusqlite",
+ "rustix 1.1.6",
+ "same-file",
  "serde",
  "serde_json",
  "sha2 0.10.9",

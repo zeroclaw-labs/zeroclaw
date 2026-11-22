@@ -42,26 +42,33 @@ idle and reports a failed turn to the client.
 Custom `SessionBackend` implementations used by RPC or operator HTTP deletion
 must implement the guarded `admit_session_deletion` operation and its
 identity-bound handle; prompt storage also requires
-`admit_session_prompt_owner_authorized`. Capture a non-creating observation,
-reject multiple distinct candidates, and compare that observation under the
-storage boundary before signalling or deletion. Resolve current authority
-under that boundary and retain its guard through each effect. Callbacks must not
-re-enter the backend. Defaults reject unsupported effects; forwarding decorators
-must forward the full candidate set and the handle without splitting commits.
-JSONL tracks intervening resets and deletes across store handles in the same
+`admit_session_prompt_owner_authorized`. The deletion authorization callback
+receives all currently present candidates at once. An empty set means absence;
+a present candidate with no principal is a legacy unowned session. Acquire one
+current authority guard for the observation and hold it through classification
+and each effect or commit. Forwarding decorators must retain the full candidate
+set and handle; callbacks must not re-enter storage. Defaults refuse unsupported
+effects.
+
+JSONL session filenames do not preserve the spelling of the original session
+key. To avoid deleting a different session, guarded RPC and operator HTTP
+session deletion refuses files whose identity cannot be proved. The current
+proof supports only an unchanged, underscore-free raw key in a native Linux
+ext-family directory whose casefold flag is disabled. It also checks the exact
+directory entry and refuses multiple hard links. Prefixed JSONL filenames,
+including ordinary `rpc_` and `gw_` keys, and files on other or unverified
+filesystems are refused. Live-only sessions can still be removed when storage
+confirms absence. JSONL tracks resets and deletes across handles within one
 process; it does not provide cross-process writer fencing or crash-atomic files.
-A gateway deletion also requires the backend to establish that the stored key
-identifies the exact live queue. JSONL refuses gateway names whose normalized
-filename could belong to a different live spelling. Custom deletion handles must
-explicitly report whether that queue identity is exact; the default is false.
 The operator Dashboard deletes gateway sessions only; use the owning interface
 to delete RPC or channel sessions.
 
 `/new` attempts that same durable cleanup even when prompt injection is
 currently disabled, provided a durable session backend is attached. If that
-backend cannot prove that cleanup completed, the command reports failure and
-leaves the existing session intact; it never claims a fresh session while the
-old attachment rows may still exist. When no durable backend is configured and
+backend returns a deletion error, the command reports failure and leaves the
+live session intact. Legacy JSONL cleanup can treat an inaccessible transcript
+as absent and reset the live session while the old transcript remains on disk.
+JSONL does not store prompt attachments. When no durable backend is configured and
 prompt injection is disabled, `/new` retains the legacy ephemeral reset
 behavior because that runtime has no attached durable owner it can clear. The
 same behavior occurs if persistence is configured but its backend fails to

@@ -1,7 +1,8 @@
 //! JSONL-based session persistence for channel conversations.
 
 use crate::session_backend::{
-    SessionBackend, SessionDeletionAdmission, SessionEffectAuthorization,
+    SessionBackend, SessionDeletionAdmission, SessionDeletionAuthorization,
+    SessionDeletionCandidate,
 };
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -16,14 +17,65 @@ pub(crate) struct MutationState {
     migrated: bool,
     receipt_state_uncertain: bool,
     deletion_observations: HashMap<PathBuf, Vec<Weak<AtomicBool>>>,
+    append_observations: HashMap<PathBuf, Vec<Weak<AtomicBool>>>,
 }
 
-fn invalidate_deletion_observations(state: &mut MutationState, path: &Path) {
-    if let Some(observers) = state.deletion_observations.remove(path) {
-        for token in observers.into_iter().filter_map(|token| token.upgrade()) {
+// Resolve aliases before unlink or rewrite changes the file identity.
+fn append_observation_paths(state: &MutationState, path: &Path) -> Vec<PathBuf> {
+    state
+        .append_observations
+        .keys()
+        .filter(|observed| *observed == path || possibly_same_transcript(observed, path))
+        .cloned()
+        .collect()
+}
+
+fn invalidate_transcript_observations(
+    state: &mut MutationState,
+    path: &Path,
+    append_paths: Vec<PathBuf>,
+) {
+    let observations = state.deletion_observations.remove(path);
+    let append_observations = append_paths
+        .iter()
+        .filter_map(|path| state.append_observations.remove(path));
+    for token in observations
+        .into_iter()
+        .chain(append_observations)
+        .flatten()
+    {
+        if let Some(token) = token.upgrade() {
             token.store(false, Ordering::Release);
         }
     }
+}
+
+#[cfg(unix)]
+fn possibly_same_transcript(first: &Path, second: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (
+        std::fs::symlink_metadata(first),
+        std::fs::symlink_metadata(second),
+    ) {
+        (Ok(first), Ok(second)) => first.dev() == second.dev() && first.ino() == second.ino(),
+        _ => true,
+    }
+}
+
+#[cfg(windows)]
+fn possibly_same_transcript(first: &Path, second: &Path) -> bool {
+    match (
+        same_file::Handle::from_path(first),
+        same_file::Handle::from_path(second),
+    ) {
+        (Ok(first), Ok(second)) => first == second,
+        _ => true,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn possibly_same_transcript(_first: &Path, _second: &Path) -> bool {
+    true
 }
 
 pub(crate) type MutationLock = parking_lot::Mutex<MutationState>;
@@ -49,25 +101,204 @@ struct JsonlDeletionAdmission {
     current: Arc<AtomicBool>,
 }
 
-fn jsonl_deletion_target(
-    candidates: &[(String, PathBuf)],
-) -> std::io::Result<Option<(String, PathBuf)>> {
-    let mut selected: Option<(String, PathBuf)> = None;
-    for (key, path) in candidates {
-        if validate_jsonl_session_file_path(path)? {
-            if selected
-                .as_ref()
-                .is_some_and(|(_, existing)| existing != path)
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "ambiguous session keys; refusing deletion",
-                ));
+struct JsonlExistingAppend {
+    store: Arc<SessionStore>,
+    key: String,
+    current: Arc<AtomicBool>,
+}
+
+impl crate::session_backend::ExistingSessionAppend for JsonlExistingAppend {
+    fn key(&self) -> &str {
+        &self.key
+    }
+
+    fn append(
+        &self,
+        message: &ChatMessage,
+        authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
+        include_count: bool,
+        committed: &mut dyn FnMut(),
+    ) -> std::io::Result<Option<usize>> {
+        let _guard = self.store.mutation_guard()?;
+        if !self.current.load(Ordering::Acquire)
+            || !validate_jsonl_session_file_path(&self.store.session_path(&self.key))?
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        }
+        let _authority = authorize(None)?;
+        let count = include_count
+            .then(|| self.store.try_load(&self.key).map(|items| items.len() + 1))
+            .transpose()?;
+        self.store.append_unlocked(&self.key, message)?;
+        committed();
+        Ok(count)
+    }
+}
+
+impl Drop for JsonlExistingAppend {
+    fn drop(&mut self) {
+        let path = self.store.session_path(&self.key);
+        let mut guard = self.store.mutation_lock.lock();
+        if let Some(tokens) = guard.append_observations.get_mut(&path) {
+            tokens.retain(|token| {
+                !token.ptr_eq(&Arc::downgrade(&self.current)) && token.strong_count() > 0
+            });
+            if tokens.is_empty() {
+                guard.append_observations.remove(&path);
             }
-            selected.get_or_insert_with(|| (key.clone(), path.clone()));
         }
     }
-    Ok(selected)
+}
+
+// A JSONL filename is not provenance: sanitization applies to the entire
+// historical key. Only accept a spelling where that transformation is injective
+// and the directory has a positively established bytewise lookup policy.
+#[cfg(target_os = "linux")]
+fn bytewise_directory(directory: &Path) -> std::io::Result<bool> {
+    use rustix::fs::{fstatfs, ioctl_getflags};
+    let fd = std::fs::File::open(directory)?;
+    const EXT_SUPER_MAGIC: u64 = 0xef53;
+    const FS_CASEFOLD_FL: u32 = 0x4000_0000;
+    let fs = fstatfs(&fd).map_err(std::io::Error::other)?;
+    if fs.f_type as u64 != EXT_SUPER_MAGIC {
+        return Ok(false);
+    }
+    let flags = ioctl_getflags(&fd).map_err(std::io::Error::other)?;
+    Ok(flags.bits() & FS_CASEFOLD_FL == 0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bytewise_directory(_directory: &Path) -> std::io::Result<bool> {
+    Ok(false)
+}
+
+fn jsonl_key_has_unique_spelling(key: &str, bytewise: bool) -> bool {
+    bytewise && !key.contains('_') && sanitize_session_key(key) == key
+}
+
+fn proved_jsonl_path(directory: &Path, key: &str, path: &Path) -> std::io::Result<bool> {
+    if !jsonl_key_has_unique_spelling(key, bytewise_directory(directory)?) {
+        return Ok(false);
+    }
+    let Some(file_name) = path.file_name() else {
+        return Ok(false);
+    };
+    let mut found = false;
+    for entry in std::fs::read_dir(directory)? {
+        if entry?.file_name() == file_name {
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::symlink_metadata(path)?.nlink() != 1 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn jsonl_deletion_observation(
+    candidates: &[(String, PathBuf)],
+) -> std::io::Result<Vec<SessionDeletionCandidate>> {
+    let mut present = Vec::new();
+    for (key, path) in candidates {
+        if validate_jsonl_session_file_path(path)? {
+            present.push(SessionDeletionCandidate {
+                key: key.clone(),
+                principal: None,
+            });
+        }
+    }
+    Ok(present)
+}
+
+fn jsonl_deletion_target(
+    directory: &Path,
+    candidates: &[(String, PathBuf)],
+    present: &[SessionDeletionCandidate],
+) -> std::io::Result<Option<(String, PathBuf)>> {
+    if present.len() > 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ambiguous session keys; refusing deletion",
+        ));
+    }
+    let Some(candidate) = present.first() else {
+        return Ok(None);
+    };
+    let Some((key, path)) = candidates.iter().find(|(key, _)| key == &candidate.key) else {
+        return Err(std::io::Error::other("invalid deletion observation"));
+    };
+    if !proved_jsonl_path(directory, key, path)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "JSONL session identity cannot be established",
+        ));
+    }
+    Ok(Some((key.clone(), path.clone())))
+}
+
+impl JsonlDeletionAdmission {
+    fn observe_and_effect(
+        &self,
+        authorize: &SessionDeletionAuthorization<'_>,
+        effect: &mut dyn FnMut() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let present = jsonl_deletion_observation(&self.candidates)?;
+        let _authority = authorize(&present)?;
+        if !self.current.load(Ordering::Acquire)
+            || jsonl_deletion_target(&self.store.sessions_dir, &self.candidates, &present)?
+                != self.selected
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "session deletion target changed",
+            ));
+        }
+        effect()
+    }
+
+    fn delete_locked(
+        &self,
+        guard: &mut MutationState,
+        authorize: &SessionDeletionAuthorization<'_>,
+    ) -> std::io::Result<bool> {
+        let present = jsonl_deletion_observation(&self.candidates)?;
+        let _authority = authorize(&present)?;
+        if !self.current.load(Ordering::Acquire)
+            || jsonl_deletion_target(&self.store.sessions_dir, &self.candidates, &present)?
+                != self.selected
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "session deletion target changed",
+            ));
+        }
+        let Some((key, _)) = self.selected.as_ref() else {
+            return Ok(false);
+        };
+        self.store.delete_session_unlocked(guard, key)
+    }
+
+    fn try_mutation_guard(&self) -> std::io::Result<parking_lot::MutexGuard<'_, MutationState>> {
+        let guard = self
+            .store
+            .mutation_lock
+            .try_lock()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::WouldBlock))?;
+        if guard.migrated || guard.receipt_state_uncertain {
+            return Err(std::io::Error::other(
+                "JSONL session store is inactive after SQLite migration",
+            ));
+        }
+        Ok(guard)
+    }
 }
 
 impl SessionDeletionAdmission for JsonlDeletionAdmission {
@@ -78,46 +309,36 @@ impl SessionDeletionAdmission for JsonlDeletionAdmission {
         None
     }
 
-    fn gateway_queue_identity_is_exact(&self) -> bool {
-        self.selected_key()
-            .and_then(|key| key.strip_prefix("gw_"))
-            .is_some_and(|id| !id.contains('_') && sanitize_session_key(id) == id)
+    fn queue_identity_is_exact(&self) -> bool {
+        self.selected.is_some()
     }
 
     fn with_current(
         &self,
-        authorize: &SessionEffectAuthorization<'_>,
+        authorize: &SessionDeletionAuthorization<'_>,
         effect: &mut dyn FnMut() -> std::io::Result<()>,
     ) -> std::io::Result<()> {
         let _guard = self.store.mutation_guard()?;
-        let _authority = authorize(None)?;
-        if !self.current.load(Ordering::Acquire)
-            || jsonl_deletion_target(&self.candidates)? != self.selected
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "session deletion target changed",
-            ));
-        }
-        effect()
+        self.observe_and_effect(authorize, effect)
     }
 
-    fn delete(&self, authorize: &SessionEffectAuthorization<'_>) -> std::io::Result<bool> {
+    fn try_with_current(
+        &self,
+        authorize: &SessionDeletionAuthorization<'_>,
+        effect: &mut dyn FnMut() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let _guard = self.try_mutation_guard()?;
+        self.observe_and_effect(authorize, effect)
+    }
+
+    fn delete(&self, authorize: &SessionDeletionAuthorization<'_>) -> std::io::Result<bool> {
         let mut guard = self.store.mutation_guard()?;
-        let _authority = authorize(None)?;
-        if !self.current.load(Ordering::Acquire)
-            || jsonl_deletion_target(&self.candidates)? != self.selected
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "session deletion target changed",
-            ));
-        }
-        let Some((key, path)) = self.selected.as_ref() else {
-            return Ok(false);
-        };
-        invalidate_deletion_observations(&mut guard, path);
-        self.store.delete_session_unlocked(key)
+        self.delete_locked(&mut guard, authorize)
+    }
+
+    fn try_delete(&self, authorize: &SessionDeletionAuthorization<'_>) -> std::io::Result<bool> {
+        let mut guard = self.try_mutation_guard()?;
+        self.delete_locked(&mut guard, authorize)
     }
 }
 
@@ -144,6 +365,7 @@ impl SessionStore {
     pub fn new(workspace_dir: &Path) -> std::io::Result<Self> {
         let sessions_dir = workspace_dir.join("sessions");
         std::fs::create_dir_all(&sessions_dir)?;
+        let sessions_dir = sessions_dir.canonicalize()?;
         let mutation_lock = mutation_lock_for(&sessions_dir)?;
         {
             let mut state = mutation_lock.lock();
@@ -450,11 +672,14 @@ impl SessionStore {
     /// the same key.
     pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         let mut guard = self.mutation_guard()?;
-        invalidate_deletion_observations(&mut guard, &self.session_path(session_key));
-        self.delete_session_unlocked(session_key)
+        self.delete_session_unlocked(&mut guard, session_key)
     }
 
-    fn delete_session_unlocked(&self, session_key: &str) -> std::io::Result<bool> {
+    fn delete_session_unlocked(
+        &self,
+        guard: &mut MutationState,
+        session_key: &str,
+    ) -> std::io::Result<bool> {
         let path = self.session_path(session_key);
         let crumb_path = self.trim_breadcrumb_path(session_key);
         if !is_regular_jsonl_session_file(&path) {
@@ -462,7 +687,9 @@ impl SessionStore {
             let _ = std::fs::remove_file(&crumb_path);
             return Ok(had_crumb);
         }
+        let append_paths = append_observation_paths(guard, &path);
         std::fs::remove_file(&path)?;
+        invalidate_transcript_observations(guard, &path, append_paths);
         let _ = std::fs::remove_file(crumb_path);
         Ok(true)
     }
@@ -570,8 +797,7 @@ pub(crate) fn mutation_lock_for(sessions_dir: &Path) -> std::io::Result<Arc<Muta
     let migrated = locks.get(&key).is_some_and(|record| record.migrated);
     let lock = Arc::new(MutationLock::new(MutationState {
         migrated,
-        receipt_state_uncertain: false,
-        deletion_observations: HashMap::new(),
+        ..MutationState::default()
     }));
     locks.insert(
         key,
@@ -617,10 +843,44 @@ pub(crate) fn forget_session_directory_migration_state_for_test(
 }
 
 impl SessionBackend for SessionStore {
+    fn admit_existing_append(
+        self: Arc<Self>,
+        keys: &[&str],
+        lookup: crate::session_backend::AppendKeyLookup,
+    ) -> std::io::Result<Option<Box<dyn crate::session_backend::ExistingSessionAppend>>> {
+        let mut guard = self.mutation_guard()?;
+        let listed = matches!(lookup, crate::session_backend::AppendKeyLookup::Listed)
+            .then(|| self.list_sessions());
+        for &key in keys {
+            if listed
+                .as_ref()
+                .is_some_and(|names| !names.iter().any(|name| name == key))
+            {
+                continue;
+            }
+            let path = self.session_path(key);
+            if validate_jsonl_session_file_path(&path)? {
+                let current = Arc::new(AtomicBool::new(true));
+                guard
+                    .append_observations
+                    .entry(path)
+                    .or_default()
+                    .push(Arc::downgrade(&current));
+                drop(guard);
+                return Ok(Some(Box::new(JsonlExistingAppend {
+                    store: self,
+                    key: key.to_owned(),
+                    current,
+                })));
+            }
+        }
+        Ok(None)
+    }
+
     fn admit_session_deletion(
         self: Arc<Self>,
         candidate_keys: &[&str],
-        authorize: &SessionEffectAuthorization<'_>,
+        authorize: &SessionDeletionAuthorization<'_>,
     ) -> std::io::Result<Box<dyn SessionDeletionAdmission>> {
         let mut candidates = Vec::new();
         for key in candidate_keys {
@@ -632,8 +892,13 @@ impl SessionBackend for SessionStore {
             }
         }
         let mut guard = self.mutation_guard()?;
-        let _authority = authorize(None)?;
-        let selected = jsonl_deletion_target(&candidates)?;
+        let present = jsonl_deletion_observation(&candidates)?;
+        let _authority = if present.is_empty() {
+            None
+        } else {
+            Some(authorize(&present)?)
+        };
+        let selected = jsonl_deletion_target(&self.sessions_dir, &candidates, &present)?;
         let current = Arc::new(AtomicBool::new(true));
         if let Some((_, path)) = selected.as_ref() {
             guard
@@ -781,8 +1046,14 @@ impl SessionBackend for SessionStore {
 
     fn reset_session(&self, session_key: &str) -> std::io::Result<usize> {
         let mut guard = self.mutation_guard()?;
-        invalidate_deletion_observations(&mut guard, &self.session_path(session_key));
-        self.clear_messages_unlocked(session_key)
+        let path = self.session_path(session_key);
+        if !is_regular_jsonl_session_file(&path) {
+            return self.clear_messages_unlocked(session_key);
+        }
+        let append_paths = append_observation_paths(&guard, &path);
+        let count = self.clear_messages_unlocked(session_key)?;
+        invalidate_transcript_observations(&mut guard, &path, append_paths);
+        Ok(count)
     }
 
     fn with_session_owner(
@@ -805,8 +1076,7 @@ impl SessionBackend for SessionStore {
         if expected_owner.is_some() {
             return Ok(false);
         }
-        invalidate_deletion_observations(&mut guard, &self.session_path(session_key));
-        self.delete_session_unlocked(session_key)
+        self.delete_session_unlocked(&mut guard, session_key)
     }
 
     fn delete_session_key_set_authorized(
@@ -825,8 +1095,7 @@ impl SessionBackend for SessionStore {
         // migration fence for the entire operation rather than per file.
         let mut deleted = false;
         for session_key in session_keys {
-            invalidate_deletion_observations(&mut guard, &self.session_path(session_key));
-            deleted |= self.delete_session_unlocked(session_key)?;
+            deleted |= self.delete_session_unlocked(&mut guard, session_key)?;
         }
         Ok(deleted)
     }
@@ -845,13 +1114,136 @@ impl SessionBackend for SessionStore {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn jsonl_identity_policy_requires_injective_names_and_proved_bytewise_lookup() {
+        for key in ["rpc_123", "rpc.123", "gw_clean", "team.alpha"] {
+            assert!(!jsonl_key_has_unique_spelling(key, true), "{key}");
+        }
+        for key in ["alpha", "Ｋ", "123-456"] {
+            assert!(jsonl_key_has_unique_spelling(key, true), "{key}");
+            assert!(!jsonl_key_has_unique_spelling(key, false), "{key}");
+        }
+        assert_eq!(
+            sanitize_session_key("rpc_123"),
+            sanitize_session_key("rpc.123")
+        );
+    }
+
+    #[test]
+    fn admitted_existing_jsonl_append_rejects_replacement_across_handles() {
+        use crate::session_backend::{AppendKeyLookup, SessionEffectGuard};
+
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let other = SessionStore::new(tmp.path()).unwrap();
+        let key = "gw_existing";
+        store.append(key, &ChatMessage::user("original")).unwrap();
+        let admission = store
+            .clone()
+            .admit_existing_append(&[key], AppendKeyLookup::Addressed)
+            .unwrap()
+            .unwrap();
+        let authorize =
+            |_: Option<&str>| -> std::io::Result<Box<dyn SessionEffectGuard>> { Ok(Box::new(())) };
+        other
+            .append(key, &ChatMessage::user("intervening"))
+            .unwrap();
+        assert_eq!(SessionBackend::reset_session(&other, "absent").unwrap(), 0);
+        other
+            .append("unrelated", &ChatMessage::user("other"))
+            .unwrap();
+        assert_eq!(
+            SessionBackend::reset_session(&other, "unrelated").unwrap(),
+            1
+        );
+        assert_eq!(
+            admission
+                .append(&ChatMessage::user("accepted"), &authorize, true, &mut || {})
+                .unwrap(),
+            Some(3)
+        );
+        assert!(other.delete_session(key).unwrap());
+        other.append(key, &ChatMessage::user("successor")).unwrap();
+        assert_eq!(
+            admission
+                .append(
+                    &ChatMessage::user("stale"),
+                    &authorize,
+                    false,
+                    &mut || panic!("unexpected append")
+                )
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(other.load(key).len(), 1);
+        assert_eq!(other.load(key)[0].content, "successor");
+    }
+
+    #[test]
+    fn admitted_deletion_try_reservation_does_not_wait_for_jsonl_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let authorize = |_: &[SessionDeletionCandidate]| -> std::io::Result<
+            Box<dyn crate::session_backend::SessionEffectGuard>,
+        > { Ok(Box::new(())) };
+        let admission = store
+            .clone()
+            .admit_session_deletion(&["missing"], &authorize)
+            .unwrap();
+        let guard = store.mutation_lock.lock();
+        assert_eq!(
+            admission
+                .try_with_current(&authorize, &mut || panic!("effect must not run"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            admission.try_delete(&authorize).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(guard);
+        admission
+            .try_with_current(&authorize, &mut || Ok(()))
+            .unwrap();
+    }
+
+    #[test]
+    fn admitted_deletion_refuses_case_alias_on_non_bytewise_filesystem() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        store
+            .append("CaseName", &ChatMessage::user("preserved"))
+            .unwrap();
+        if !store.session_exists("casename") {
+            return;
+        }
+        let authorize = |_: &[SessionDeletionCandidate]| -> std::io::Result<
+            Box<dyn crate::session_backend::SessionEffectGuard>,
+        > { Ok(Box::new(())) };
+        assert!(
+            store
+                .clone()
+                .admit_session_deletion(&["CaseName"], &authorize)
+                .is_err()
+        );
+        assert!(
+            store
+                .clone()
+                .admit_session_deletion(&["casename"], &authorize)
+                .is_err()
+        );
+        assert_eq!(store.try_load("CaseName").unwrap().len(), 1);
+    }
+
+    #[test]
     fn admitted_deletion_hides_ambiguity_and_marks_lossy_gateway_keys() {
         let tmp = TempDir::new().unwrap();
         let store = Arc::new(SessionStore::new(tmp.path()).unwrap());
         for key in ["alpha", "rpc_alpha", "gw_team.alpha", "gw_clean"] {
             store.append(key, &ChatMessage::user("saved")).unwrap();
         }
-        let deny = |_: Option<&str>| -> std::io::Result<Box<dyn crate::session_backend::SessionEffectGuard>> {
+        let deny = |_: &[SessionDeletionCandidate]| -> std::io::Result<Box<dyn crate::session_backend::SessionEffectGuard>> {
             Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"))
         };
         let error = match store
@@ -862,17 +1254,19 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-        let allow = |_: Option<&str>| -> std::io::Result<Box<dyn crate::session_backend::SessionEffectGuard>> { Ok(Box::new(())) };
-        let ambiguous = store
-            .clone()
-            .admit_session_deletion(&["gw_team.alpha", "gw_team_alpha"], &allow)
-            .unwrap();
-        assert!(!ambiguous.gateway_queue_identity_is_exact());
-        let clean = store
-            .clone()
-            .admit_session_deletion(&["gw_clean"], &allow)
-            .unwrap();
-        assert!(clean.gateway_queue_identity_is_exact());
+        let allow = |_: &[SessionDeletionCandidate]| -> std::io::Result<Box<dyn crate::session_backend::SessionEffectGuard>> { Ok(Box::new(())) };
+        assert!(
+            store
+                .clone()
+                .admit_session_deletion(&["gw_team.alpha", "gw_team_alpha"], &allow)
+                .is_err()
+        );
+        assert!(
+            store
+                .clone()
+                .admit_session_deletion(&["gw_clean"], &allow)
+                .is_err()
+        );
     }
 
     // Similar keys cannot prove that distinct files are the same session.
@@ -883,7 +1277,7 @@ mod tests {
         for key in ["alpha", "rpc_alpha"] {
             store.append(key, &ChatMessage::user("preserved")).unwrap();
         }
-        let authorize = |_: Option<&str>| -> std::io::Result<
+        let authorize = |_: &[SessionDeletionCandidate]| -> std::io::Result<
             Box<dyn crate::session_backend::SessionEffectGuard>,
         > { Ok(Box::new(())) };
         assert!(
@@ -903,28 +1297,38 @@ mod tests {
         let store = Arc::new(SessionStore::new(tmp.path()).unwrap());
         let other = SessionStore::new(tmp.path()).unwrap();
         store
-            .append("rpc_alpha", &ChatMessage::user("original"))
+            .append("alpha", &ChatMessage::user("original"))
             .unwrap();
-        let authorize = |_: Option<&str>| -> std::io::Result<
+        let authorize = |_: &[SessionDeletionCandidate]| -> std::io::Result<
             Box<dyn crate::session_backend::SessionEffectGuard>,
         > { Ok(Box::new(())) };
+        if !bytewise_directory(&store.sessions_dir).unwrap_or(false) {
+            assert!(
+                store
+                    .clone()
+                    .admit_session_deletion(&["alpha"], &authorize)
+                    .is_err()
+            );
+            assert_eq!(store.try_load("alpha").unwrap().len(), 1);
+            return;
+        }
         let admitted = store
             .clone()
-            .admit_session_deletion(&["alpha", "rpc_alpha", "gw_alpha"], &authorize)
+            .admit_session_deletion(&["alpha"], &authorize)
             .unwrap();
-        SessionBackend::reset_session(&other, "rpc_alpha").unwrap();
+        SessionBackend::reset_session(&other, "alpha").unwrap();
         other
-            .append("rpc_alpha", &ChatMessage::user("successor"))
+            .append("alpha", &ChatMessage::user("successor"))
             .unwrap();
         assert!(admitted.delete(&authorize).is_err());
-        assert_eq!(store.try_load("rpc_alpha").unwrap()[0].content, "successor");
+        assert_eq!(store.try_load("alpha").unwrap()[0].content, "successor");
         drop(admitted);
         let unchanged = store
             .clone()
-            .admit_session_deletion(&["rpc_alpha"], &authorize)
+            .admit_session_deletion(&["alpha"], &authorize)
             .unwrap();
         other
-            .append("rpc_alpha", &ChatMessage::user("ordinary append"))
+            .append("alpha", &ChatMessage::user("ordinary append"))
             .unwrap();
         assert!(unchanged.delete(&authorize).unwrap());
     }

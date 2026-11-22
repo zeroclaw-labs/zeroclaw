@@ -153,33 +153,101 @@ impl<T> SessionEffectGuard for T {}
 pub type SessionEffectAuthorization<'a> =
     dyn Fn(Option<&str>) -> std::io::Result<Box<dyn SessionEffectGuard + 'a>> + 'a;
 
+/// One currently present deletion candidate. A missing owner is distinct from
+/// the absence of every candidate and must be authorized as a legacy row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDeletionCandidate {
+    pub key: String,
+    pub principal: Option<String>,
+}
+
+/// Authorize the complete observation under one current authority lease.
+/// An empty slice means no durable candidate was observed.
+pub type SessionDeletionAuthorization<'a> =
+    dyn Fn(&[SessionDeletionCandidate]) -> std::io::Result<Box<dyn SessionEffectGuard + 'a>> + 'a;
+
 /// An exact, non-creating observation of a possible durable deletion target.
 /// Implementations retain their own opaque incarnation proof and compare the
 /// complete candidate set before any authorized effect and before deletion.
 pub trait SessionDeletionAdmission: Send + Sync {
     fn selected_key(&self) -> Option<&str>;
     fn principal(&self) -> Option<&str>;
-    /// Whether the exact stored gateway key identifies its live queue without
+    /// Whether the exact stored key identifies its live queue without
     /// a lossy storage normalization. Unknown backends must fail closed.
-    fn gateway_queue_identity_is_exact(&self) -> bool {
+    fn queue_identity_is_exact(&self) -> bool {
         false
     }
     fn with_current(
         &self,
-        authorize: &SessionEffectAuthorization<'_>,
+        authorize: &SessionDeletionAuthorization<'_>,
         effect: &mut dyn FnMut() -> std::io::Result<()>,
     ) -> std::io::Result<()>;
-    fn delete(&self, authorize: &SessionEffectAuthorization<'_>) -> std::io::Result<bool>;
+    /// Attempt the same observation without waiting for the store's mutation
+    /// boundary. A caller composing two stores must release its first
+    /// reservation on `WouldBlock` before retrying.
+    fn try_with_current(
+        &self,
+        _authorize: &SessionDeletionAuthorization<'_>,
+        _effect: &mut dyn FnMut() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "nonblocking session deletion reservation unsupported",
+        ))
+    }
+    fn delete(&self, authorize: &SessionDeletionAuthorization<'_>) -> std::io::Result<bool>;
+    /// Attempt deletion without waiting for the mutation boundary.
+    fn try_delete(&self, _authorize: &SessionDeletionAuthorization<'_>) -> std::io::Result<bool> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "nonblocking session deletion unsupported",
+        ))
+    }
+}
+
+/// Whether a candidate must match a stored name literally or may use the
+/// backend's normal path lookup semantics.
+#[derive(Clone, Copy)]
+pub enum AppendKeyLookup {
+    Listed,
+    Addressed,
+}
+
+/// An existing transcript selected before a caller waits for its turn.
+pub trait ExistingSessionAppend: Send + Sync {
+    fn key(&self) -> &str;
+
+    /// Append only to the original transcript, checking current ownership at
+    /// commit. A missing or replaced transcript must never be created here.
+    fn append(
+        &self,
+        message: &ChatMessage,
+        authorize: &SessionEffectAuthorization<'_>,
+        include_count: bool,
+        committed: &mut dyn FnMut(),
+    ) -> std::io::Result<Option<usize>>;
 }
 
 /// Trait for session persistence backends shared across async tasks.
 pub trait SessionBackend: Send + Sync {
+    /// Select the first existing candidate and capture its identity together.
+    fn admit_existing_append(
+        self: Arc<Self>,
+        _keys: &[&str],
+        _lookup: AppendKeyLookup,
+    ) -> std::io::Result<Option<Box<dyn ExistingSessionAppend>>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "existing session append admission unsupported",
+        ))
+    }
+
     /// Capture deletion identity without creating a missing session. Backends
     /// without a reliable conditional-deletion primitive fail closed.
     fn admit_session_deletion(
         self: Arc<Self>,
         _candidate_keys: &[&str],
-        _authorize: &SessionEffectAuthorization<'_>,
+        _authorize: &SessionDeletionAuthorization<'_>,
     ) -> std::io::Result<Box<dyn SessionDeletionAdmission>> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
