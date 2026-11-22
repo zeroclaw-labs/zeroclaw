@@ -26,7 +26,9 @@ pub use crate::skills::frontmatter::SkillFrontmatter;
 pub(crate) fn safeguard_fallback_wire(
     notice: &zeroclaw_providers::SafeguardFallbackNotice,
 ) -> SafeguardFallbackWire {
-    use crate::agent::turn_accounting::{SafeguardFallbackDisplay, SafeguardFallbackKindLabel};
+    use zeroclaw_providers::turn_accounting::{
+        SafeguardFallbackDisplay, SafeguardFallbackKindLabel,
+    };
     let display = SafeguardFallbackDisplay::from_notice_ref(notice);
     SafeguardFallbackWire {
         fallback_kind: match display.fallback_kind {

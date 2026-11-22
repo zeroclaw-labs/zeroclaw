@@ -259,6 +259,15 @@ impl AcpTurnHub {
         }))
     }
 
+    fn running_server(&self, session_id: &str, owner: Option<&str>) -> Option<Arc<AcpServer>> {
+        let turns = self.turns.lock().unwrap_or_else(|error| error.into_inner());
+        let turn = turns.get(session_id)?;
+        if turn.completed || turn.principal_id.as_deref() != owner {
+            return None;
+        }
+        turn.server.upgrade()
+    }
+
     /// Cancel an active turn if owned by `principal_id`.
     pub(crate) fn cancel_turn(
         &self,
@@ -728,6 +737,19 @@ async fn handle_socket(
                                 });
                                 let _ = wire_tx.send(err.to_string()).await;
                             }
+                        }
+                        continue;
+                    }
+                    if method == "_zeroclaw/session/steer"
+                        && parsed["jsonrpc"] == "2.0"
+                        && let Some(sid) = parsed["params"].get("sessionId").or_else(|| parsed["params"].get("session_id")).and_then(serde_json::Value::as_str)
+                        && attached_sessions.contains(sid)
+                        && server.has_gateway_session(sid).await
+                        && let Some(owner) = turn_hub.running_server(sid, principal_id.as_deref())
+                    {
+                        let response = owner.gateway_steer(&parsed["params"], parsed["id"].clone()).await;
+                        if parsed.get("id").is_some() {
+                            let _ = wire_tx.send(serde_json::json!(response).to_string()).await;
                         }
                         continue;
                     }

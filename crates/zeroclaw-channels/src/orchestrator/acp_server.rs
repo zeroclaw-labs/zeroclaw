@@ -24,11 +24,11 @@ use zeroclaw_config::schema::{Config, ResolvedContextLimits};
 use zeroclaw_infra::acp_session_store::{AcpSessionData, AcpSessionRestore, AcpSessionStore};
 use zeroclaw_memory::Memory;
 use zeroclaw_providers::SafeguardFallbackNotice;
-use zeroclaw_runtime::agent::SteeringInput;
-use zeroclaw_runtime::agent::agent::{Agent, TurnEvent};
-use zeroclaw_runtime::agent::turn_accounting::{
+use zeroclaw_providers::turn_accounting::{
     ContextDisplay, SafeguardFallbackDisplay, UsageFold, done_frame_context_limits,
 };
+use zeroclaw_runtime::agent::SteeringInput;
+use zeroclaw_runtime::agent::agent::{Agent, TurnEvent};
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::tools::CanvasStore;
 
@@ -3945,6 +3945,31 @@ impl AcpServer {
                 message: format!("Session not found: {session_id}"),
                 data: None,
             })
+        }
+    }
+
+    /// Return a steering response to the gateway socket that owns the request.
+    pub async fn gateway_steer(&self, params: &Value, id: Value) -> JsonRpcResponse {
+        match self.handle_session_steer(params).await {
+            Ok(result) => JsonRpcResponse {
+                jsonrpc: "2.0",
+                result: Some(result),
+                error: None,
+                id,
+            },
+            Err(error) => {
+                let data = error.wire_data();
+                JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: error.code,
+                        message: error.message,
+                        data,
+                    }),
+                    id,
+                }
+            }
         }
     }
 
