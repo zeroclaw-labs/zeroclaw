@@ -258,6 +258,8 @@ pub struct AcpServer {
     /// `None` for unscoped/operator sessions; `Some(id)` stamps created
     /// sessions and restricts list/rename/load/resume to that exact principal.
     principal_id: Option<String>,
+    scoped_grants:
+        Option<Arc<dyn Fn() -> Option<zeroclaw_api::grants::ResolvedGrants> + Send + Sync>>,
     /// Process- or connection-scoped default agent alias (`--agent` for
     /// standalone ACP or `?agent=` on the gateway endpoint). Slots into the
     /// `session/new` alias precedence chain between an explicit `agentAlias`
@@ -412,6 +414,7 @@ impl AcpServer {
             default_session_policy: AcpSessionPolicy::default(),
             allow_webchat_policy: false,
             principal_id: None,
+            scoped_grants: None,
             connection_default_agent: None,
             client_elicitation_caps: std::sync::RwLock::new(ElicitationCapabilities::default()),
         }
@@ -488,6 +491,42 @@ impl AcpServer {
     }
 
     async fn build_agent(
+        &self,
+        config: &Config,
+        agent_alias: &str,
+        workspace_dir: &std::path::Path,
+        policy: AcpSessionPolicy,
+    ) -> Result<Agent> {
+        let grants = if let Some(resolve) = &self.scoped_grants {
+            let grants = resolve()
+                .filter(|g| g.may_use_agent(agent_alias))
+                .ok_or_else(|| anyhow::anyhow!("ACP agent access revoked"))?;
+            anyhow::ensure!(
+                self.connection_default_agent.as_deref() == Some(agent_alias),
+                "ACP agent is outside this connection's grant"
+            );
+            Some(grants)
+        } else {
+            None
+        };
+        let mut agent = self
+            .build_configured_agent(config, agent_alias, workspace_dir, policy)
+            .await?;
+        if let Some(owner) = &self.principal_id {
+            agent.route_memory_to_principal(
+                zeroclaw_api::memory_traits::PrincipalScope::new(owner.clone())
+                    .with_agent(Some(agent_alias.to_owned())),
+            )?;
+        }
+        if let Some(grants) = grants {
+            agent.apply_principal_tool_posture(
+                zeroclaw_runtime::rpc::dispatch::principal_tool_posture(&grants),
+            );
+        }
+        Ok(agent)
+    }
+
+    async fn build_configured_agent(
         &self,
         config: &Config,
         agent_alias: &str,
@@ -651,6 +690,15 @@ impl AcpServer {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        self
+    }
+
+    /// Resolve the authenticated dashboard caller's current grants at agent admission.
+    pub fn with_scoped_grants(
+        mut self,
+        grants: Option<Arc<dyn Fn() -> Option<zeroclaw_api::grants::ResolvedGrants> + Send + Sync>>,
+    ) -> Self {
+        self.scoped_grants = grants;
         self
     }
 
@@ -1170,6 +1218,19 @@ impl AcpServer {
                     .to_string(),
                 data: None,
             })?;
+        if let Some(resolve) = &self.scoped_grants
+            && (self.connection_default_agent.as_deref() != Some(&agent_alias)
+                || !resolve().is_some_and(|g| g.may_use_agent(&agent_alias))
+                || self.requested_session_cwd(params).is_some())
+        {
+            return Err(RpcError {
+                code: FORBIDDEN,
+                message:
+                    "Scoped ACP session requires its authorized agent and configured workspace"
+                        .into(),
+                data: None,
+            });
+        }
         Self::validate_dispatchable_agent_alias(&config, &agent_alias)?;
         let admission = self
             .agent_lifecycle
@@ -1465,6 +1526,10 @@ impl AcpServer {
         };
         let sessions: Vec<_> = rows
             .into_iter()
+            .filter(|(s, _)| {
+                self.scoped_grants.is_none()
+                    || self.connection_default_agent.as_deref() == Some(s.agent_alias.as_str())
+            })
             .map(|(session, name)| {
                 serde_json::json!({
                     "sessionId": session.session_uuid,
@@ -1499,6 +1564,9 @@ impl AcpServer {
             data: None,
         })?;
         let id = session_id.to_owned();
+        if self.scoped_grants.is_some() {
+            self.load_session_for_restore(&store, session_id)?;
+        }
         let persisted_name = name.to_owned();
         let principal = self.principal_id.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -1526,7 +1594,18 @@ impl AcpServer {
         session_id: &str,
     ) -> Result<Box<AcpSessionData>, RpcError> {
         match store.load_session_for_restore_owned(session_id, self.principal_id.as_deref()) {
-            Ok(Some(AcpSessionRestore::Restorable(data))) => Ok(data),
+            Ok(Some(AcpSessionRestore::Restorable(data)))
+                if self.scoped_grants.is_none()
+                    || self.connection_default_agent.as_deref()
+                        == Some(data.agent_alias.as_str()) =>
+            {
+                Ok(data)
+            }
+            Ok(Some(AcpSessionRestore::Restorable(_))) => Err(RpcError {
+                code: FORBIDDEN,
+                message: "Session agent is outside this connection".into(),
+                data: None,
+            }),
             Ok(Some(AcpSessionRestore::Missing)) => Err(RpcError {
                 code: SESSION_NOT_FOUND,
                 message: format!("Session not found: {session_id}"),
@@ -2291,6 +2370,60 @@ impl AcpServer {
     }
 
     async fn handle_session_prompt(&self, params: &Value, _request_id: &Value) -> RpcResult {
+        self.run_prompt(params, tokio_util::sync::CancellationToken::new())
+            .await
+    }
+
+    /// Whether this socket has already admitted the session for this principal and agent.
+    pub async fn has_gateway_session(&self, id: &str) -> bool {
+        self.sessions.lock().await.contains_key(id)
+    }
+
+    /// Dispatch an admitted gateway turn with the same cancellation token that reconnect uses.
+    pub async fn gateway_prompt(
+        &self,
+        id: Value,
+        params: &Value,
+        cancel: tokio_util::sync::CancellationToken,
+        refresh: bool,
+    ) {
+        if refresh {
+            let refreshed = async {
+                self.handle_session_close(params).await?;
+                self.handle_session_resume(params).await
+            }
+            .await;
+            if let Err(e) = refreshed {
+                self.write_error_with_data(id, e.code, &e.message, e.wire_data())
+                    .await;
+                return;
+            }
+        }
+        match self.run_prompt(params, cancel).await {
+            Ok(value) => self.write_result(id, value).await,
+            Err(e) => {
+                self.write_error_with_data(id, e.code, &e.message, e.wire_data())
+                    .await
+            }
+        }
+    }
+
+    /// Route a reattached client's answer back to the original pending ACP request.
+    pub fn answer_request(&self, id: &str, response: &Value) {
+        self.rpc.dispatch_response(
+            id,
+            response.get("result").cloned(),
+            response
+                .get("error")
+                .and_then(|e| serde_json::from_value(e.clone()).ok()),
+        );
+    }
+
+    async fn run_prompt(
+        &self,
+        params: &Value,
+        cancel_token: tokio_util::sync::CancellationToken,
+    ) -> RpcResult {
         let session_id = params
             .get("sessionId")
             .or_else(|| params.get("session_id"))
@@ -2336,7 +2469,6 @@ impl AcpServer {
         // `resource.blob` parts writes files into uploads/; two concurrent prompts for
         // the same session must not both perform that side effect before one is
         // rejected with SESSION_BUSY. Reserve first, then do the work.
-        let cancel_token = tokio_util::sync::CancellationToken::new();
         self.register_cancel_token(&session_id, cancel_token.clone())?;
 
         // Hold the per-session finalization gate for the rest of the prompt,

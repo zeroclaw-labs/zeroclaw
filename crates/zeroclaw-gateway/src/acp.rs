@@ -15,8 +15,8 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::jsonrpc::error_codes::{FORBIDDEN, SESSION_BUSY};
@@ -37,12 +37,15 @@ pub(crate) struct AcpTurnEventFrame {
 
 struct ActiveAcpTurn {
     principal_id: Option<String>,
-    events: Vec<AcpTurnEventFrame>,
+    events: VecDeque<AcpTurnEventFrame>,
+    identity: uuid::Uuid,
+    server: Weak<AcpServer>,
+    pending: HashMap<String, AcpTurnEventFrame>,
     next_seq: u64,
     completed: bool,
     tx: broadcast::Sender<AcpTurnEventFrame>,
     cancel: CancellationToken,
-    _guard: SessionGuard,
+    guard: Option<SessionGuard>,
 }
 
 /// Snapshot + live receiver returned when a reconnected socket reattaches to
@@ -51,6 +54,7 @@ pub(crate) struct AcpTurnAttachment {
     pub(crate) replay: Vec<AcpTurnEventFrame>,
     pub(crate) live: broadcast::Receiver<AcpTurnEventFrame>,
     pub(crate) completed: bool,
+    pub(crate) turn_id: uuid::Uuid,
 }
 
 /// Gateway-shared registry of in-flight ACP turns, backed by [`SessionActorQueue`]
@@ -68,24 +72,6 @@ impl AcpTurnHub {
         }
     }
 
-    /// Return the canonical [`AcpTurnHub`] associated with a gateway's
-    /// [`SessionActorQueue`], automatically pruning entries whose queue has
-    /// been dropped.
-    pub(crate) fn for_queue(queue: &Arc<SessionActorQueue>) -> Arc<Self> {
-        type AcpTurnHubMap = HashMap<usize, (Weak<SessionActorQueue>, Arc<AcpTurnHub>)>;
-        static HUBS: OnceLock<StdMutex<AcpTurnHubMap>> = OnceLock::new();
-        let map = HUBS.get_or_init(|| StdMutex::new(HashMap::new()));
-        let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
-        guard.retain(|_, (weak, _)| weak.strong_count() > 0);
-        let key = Arc::as_ptr(queue) as usize;
-        if let Some((_, existing)) = guard.get(&key) {
-            return Arc::clone(existing);
-        }
-        let hub = Arc::new(Self::new(Arc::clone(queue)));
-        guard.insert(key, (Arc::downgrade(queue), Arc::clone(&hub)));
-        hub
-    }
-
     /// Acquire the per-session [`SessionActorQueue`] permit and register an
     /// active turn for `session_id`.
     pub(crate) async fn start_turn(
@@ -93,6 +79,7 @@ impl AcpTurnHub {
         session_id: &str,
         principal_id: Option<String>,
         cancel: CancellationToken,
+        server: Weak<AcpServer>,
     ) -> Result<(), SessionQueueError> {
         let permit = self.queue.acquire(session_id).await?;
         let (tx, _) = broadcast::channel(256);
@@ -101,12 +88,15 @@ impl AcpTurnHub {
             session_id.to_string(),
             ActiveAcpTurn {
                 principal_id,
-                events: Vec::new(),
+                events: VecDeque::new(),
+                identity: uuid::Uuid::new_v4(),
+                server,
+                pending: HashMap::new(),
                 next_seq: 1,
                 completed: false,
                 tx,
                 cancel,
-                _guard: permit,
+                guard: Some(permit),
             },
         );
         Ok(())
@@ -119,30 +109,93 @@ impl AcpTurnHub {
         session_id: &str,
         payload: String,
         is_terminal: bool,
-    ) -> Option<u64> {
+    ) -> Option<AcpTurnEventFrame> {
         let mut turns = self.turns.lock().unwrap_or_else(|e| e.into_inner());
         let turn = turns.get_mut(session_id)?;
         let seq = turn.next_seq;
         turn.next_seq = turn.next_seq.saturating_add(1);
+        let mut parsed: serde_json::Value = serde_json::from_str(&payload).ok()?;
+        parsed["_meta"]["zeroclawTurn"] = serde_json::json!({"sessionId":session_id,"turnId":turn.identity.to_string(),"seq":seq});
+        let request_id = parsed
+            .get("method")
+            .and_then(|_| parsed.get("id"))
+            .and_then(|id| id.as_str())
+            .map(str::to_owned);
+        if let Some(id) = &request_id {
+            parsed["id"] = format!("{}:{id}", turn.identity).into();
+        }
+        let payload = parsed.to_string();
         let frame = AcpTurnEventFrame {
             seq,
             payload,
             is_terminal,
         };
-        if turn.events.len() < MAX_BUFFERED_TURN_EVENTS {
-            turn.events.push(frame.clone());
+        if let Some(id) = request_id {
+            turn.pending.insert(id, frame.clone());
         }
+        if turn.events.len() == MAX_BUFFERED_TURN_EVENTS {
+            turn.events.pop_front();
+        }
+        turn.events.push_back(frame.clone());
         if is_terminal {
             turn.completed = true;
         }
-        let _ = turn.tx.send(frame);
-        Some(seq)
+        let _ = turn.tx.send(frame.clone());
+        Some(frame)
     }
 
-    /// Finish and remove an active turn, releasing its [`SessionGuard`] permit.
-    pub(crate) fn finish_turn(&self, session_id: &str) {
+    /// Release admission immediately but keep the terminal response available across a reload.
+    pub(crate) fn finish_turn(self: &Arc<Self>, session_id: &str) {
         let mut turns = self.turns.lock().unwrap_or_else(|e| e.into_inner());
-        turns.remove(session_id);
+        let Some(turn) = turns.get_mut(session_id) else {
+            return;
+        };
+        turn.guard.take();
+        turn.pending.clear();
+        turn.completed = true;
+        turn.server = Weak::new();
+        let identity = turn.identity;
+        let hub = Arc::downgrade(self);
+        let sid = session_id.to_owned();
+        zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            if let Some(hub) = hub.upgrade() {
+                let mut turns = hub.turns.lock().unwrap_or_else(|e| e.into_inner());
+                if turns
+                    .get(&sid)
+                    .is_some_and(|turn| turn.identity == identity)
+                {
+                    turns.remove(&sid);
+                }
+            }
+        });
+    }
+
+    fn answer(
+        &self,
+        session_id: &str,
+        principal: Option<&str>,
+        id: &str,
+        response: &serde_json::Value,
+    ) -> bool {
+        let Some((identity, request)) = id.split_once(':') else {
+            return false;
+        };
+        let mut turns = self.turns.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(turn) = turns.get_mut(session_id) else {
+            return false;
+        };
+        if turn.principal_id.as_deref() != principal
+            || turn.identity.to_string() != identity
+            || turn.pending.remove(request).is_none()
+        {
+            return false;
+        }
+        if let Some(server) = turn.server.upgrade() {
+            server.answer_request(request, response);
+            return true;
+        }
+        false
     }
 
     /// Reattach to an active turn for `session_id`, enforcing exact principal
@@ -162,16 +215,38 @@ impl AcpTurnHub {
         if turn.principal_id.as_deref() != principal_id {
             return Err(FORBIDDEN);
         }
-        let replay = turn
+        if turn
+            .events
+            .front()
+            .is_some_and(|e| e.seq > after_seq.saturating_add(1))
+        {
+            return Err(zeroclaw_api::jsonrpc::error_codes::INVALID_PARAMS);
+        }
+        let mut replay: Vec<_> = turn
             .events
             .iter()
-            .filter(|event| event.seq > after_seq)
+            .filter(|e| {
+                e.seq > after_seq && {
+                    let request = serde_json::from_str::<serde_json::Value>(&e.payload)
+                        .ok()
+                        .is_some_and(|v| v.get("method").is_some() && v.get("id").is_some());
+                    !request || turn.pending.values().any(|pending| pending.seq == e.seq)
+                }
+            })
             .cloned()
             .collect();
+        replay.extend(
+            turn.pending
+                .values()
+                .filter(|e| e.seq <= after_seq)
+                .cloned(),
+        );
+        replay.sort_by_key(|e| e.seq);
         Ok(Some(AcpTurnAttachment {
             replay,
             live: turn.tx.subscribe(),
             completed: turn.completed,
+            turn_id: turn.identity,
         }))
     }
 
@@ -203,7 +278,8 @@ pub struct AcpQuery {
     agent: Option<String>,
 }
 
-pub async fn handle_ws_acp(
+pub(crate) async fn handle_ws_acp(
+    Extension(turn_hub): Extension<Arc<AcpTurnHub>>,
     State(state): State<AppState>,
     dashboard: Option<Extension<Arc<DashboardAuth>>>,
     Query(params): Query<AcpQuery>,
@@ -212,6 +288,9 @@ pub async fn handle_ws_acp(
 ) -> impl IntoResponse {
     let mut session_watch = None;
     let mut principal_id = None;
+    let mut scoped_grants: Option<
+        Arc<dyn Fn() -> Option<zeroclaw_api::grants::ResolvedGrants> + Send + Sync>,
+    > = None;
 
     if state.pairing.require_pairing() {
         if let Some(token) = extract_ws_token(&headers, params.token.as_deref()) {
@@ -230,12 +309,26 @@ pub async fn handle_ws_acp(
                         session_watch = Some(SessionWatch::new(auth, session, true, &state));
                     } else {
                         let pid = session.principal().id.as_str().to_string();
-                        let watch = if let Some(ref agent) = params.agent {
-                            SessionWatch::for_chat(auth, session, agent, &state)
-                        } else {
-                            SessionWatch::new(auth, session, false, &state)
+                        let Some(agent) = params.agent.as_deref() else {
+                            return (
+                                axum::http::StatusCode::BAD_REQUEST,
+                                "Scoped chat requires an agent",
+                            )
+                                .into_response();
                         };
-                        session_watch = Some(watch);
+                        if !crate::dashboard_core::may_chat(&session.grants)
+                            || !session.grants.may_use_agent(agent)
+                        {
+                            return (axum::http::StatusCode::FORBIDDEN, "Chat access denied")
+                                .into_response();
+                        }
+                        let auth_for_grants = Arc::clone(&auth);
+                        let session_for_grants = Arc::clone(&session);
+                        scoped_grants = Some(Arc::new(move || {
+                            auth_for_grants.chat_grants(&session_for_grants)
+                        }));
+                        session_watch =
+                            Some(SessionWatch::for_acp_chat(auth, session, agent, &state));
                         principal_id = Some(pid);
                     }
                 }
@@ -274,7 +367,15 @@ pub async fn handle_ws_acp(
     };
 
     ws.on_upgrade(move |socket| {
-        handle_socket(socket, state, params.agent, session_watch, principal_id)
+        handle_socket(
+            socket,
+            state,
+            params.agent,
+            session_watch,
+            principal_id,
+            scoped_grants,
+            turn_hub,
+        )
     })
     .into_response()
 }
@@ -285,12 +386,16 @@ async fn handle_socket(
     default_agent: Option<String>,
     mut session_watch: Option<SessionWatch>,
     principal_id: Option<String>,
+    scoped_grants: Option<
+        Arc<dyn Fn() -> Option<zeroclaw_api::grants::ResolvedGrants> + Send + Sync>,
+    >,
+    turn_hub: Arc<AcpTurnHub>,
 ) {
     let (mut sender, mut receiver) = socket.split();
     let (input_tx, input_rx) = mpsc::channel::<String>(256);
     let (output_tx, mut output_rx) = mpsc::channel::<String>(256);
     let (wire_tx, mut wire_rx) = mpsc::channel::<String>(256);
-    let turn_hub = AcpTurnHub::for_queue(&state.session_queue);
+
     let mut shutdown_rx = state.shutdown_tx.subscribe();
 
     let config = state.config.read().clone();
@@ -325,6 +430,7 @@ async fn handle_socket(
             .with_cost_tracker(state.cost_tracker.clone())
             .with_allow_webchat_policy(true)
             .with_principal_id(principal_id.clone())
+            .with_scoped_grants(scoped_grants)
             .with_connection_default_agent(default_agent),
         )
     } else {
@@ -340,6 +446,7 @@ async fn handle_socket(
             .with_cost_tracker(state.cost_tracker.clone())
             .with_allow_webchat_policy(true)
             .with_principal_id(principal_id.clone())
+            .with_scoped_grants(scoped_grants)
             .with_connection_default_agent(default_agent),
         )
     };
@@ -353,20 +460,33 @@ async fn handle_socket(
     let active_prompts: Arc<StdMutex<HashMap<String, String>>> =
         Arc::new(StdMutex::new(HashMap::new()));
 
+    let local_generations = Arc::new(StdMutex::new(HashMap::<String, u64>::new()));
+    let output_generations = Arc::clone(&local_generations);
     let hub_for_output = Arc::clone(&turn_hub);
     let prompts_for_output = Arc::clone(&active_prompts);
     let wire_tx_for_output = wire_tx.clone();
     let output_bridge = zeroclaw_spawn::spawn!(async move {
-        while let Some(line) = output_rx.recv().await {
+        while let Some(mut line) = output_rx.recv().await {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
                 if let Some(method) = parsed.get("method").and_then(serde_json::Value::as_str)
-                    && (method == "session/update" || method.starts_with("_zeroclaw/"))
+                    && (method == "session/update"
+                        || method.starts_with("_zeroclaw/")
+                        || method == "session/request_permission"
+                        || method == "elicitation/create")
                     && let Some(sid) = parsed
                         .get("params")
-                        .and_then(|p| p.get("sessionId"))
+                        .and_then(|p| p.get("sessionId").or_else(|| p.get("session_id")))
                         .and_then(serde_json::Value::as_str)
                 {
-                    let _ = hub_for_output.record_frame(sid, line.clone(), false);
+                    if prompts_for_output
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .values()
+                        .any(|v| v == sid)
+                        && let Some(frame) = hub_for_output.record_frame(sid, line.clone(), false)
+                    {
+                        line = frame.payload;
+                    }
                 } else if let Some(id) = parsed.get("id")
                     && (parsed.get("result").is_some() || parsed.get("error").is_some())
                 {
@@ -376,7 +496,11 @@ async fn handle_socket(
                         .unwrap_or_else(|e| e.into_inner())
                         .remove(&id_key);
                     if let Some(sid) = finished_sid {
-                        let _ = hub_for_output.record_frame(&sid, line.clone(), true);
+                        if let Some(frame) = hub_for_output.record_frame(&sid, line.clone(), true) {
+                            line = frame.payload;
+                        }
+                        let generation = hub_for_output.queue.advance_generation(&sid);
+                        output_generations.lock().unwrap_or_else(|e|e.into_inner()).insert(sid.clone(),generation);
                         hub_for_output.finish_turn(&sid);
                     }
                 }
@@ -418,11 +542,16 @@ async fn handle_socket(
         }
     });
 
+    let revoked_token = CancellationToken::new();
+    let disconnected = CancellationToken::new();
+    let mut attached_sessions = std::collections::HashSet::<String>::new();
+
     let mut revoked = false;
     loop {
         tokio::select! {
             code = session_lost(&mut session_watch, &state) => {
                 revoked = true;
+                revoked_token.cancel();
                 server.cancel_active_turns();
                 *close_code.lock().unwrap_or_else(|e| e.into_inner()) =
                     Some((code, if code == WS_CLOSE_SESSION_ENDED { "dashboard session ended" } else { "access revoked" }));
@@ -431,6 +560,7 @@ async fn handle_socket(
             }
             changed = shutdown_rx.changed() => {
                 if changed.is_ok() && *shutdown_rx.borrow() {
+                    revoked_token.cancel();
                     *close_code.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some((1012, "gateway shutting down"));
                     close_signal.notify_one();
@@ -479,6 +609,19 @@ async fn handle_socket(
                     }
                 };
 
+                if let Err(code) = crate::dashboard_session::session_admits_now(&mut session_watch, &state).await {
+                    revoked = true;
+                    revoked_token.cancel();
+                    server.cancel_active_turns();
+                    *close_code.lock().unwrap_or_else(|e|e.into_inner()) = Some((code,"access revoked"));
+                    break;
+                }
+                if let Ok(reply) = serde_json::from_str::<serde_json::Value>(&text)
+                    && (reply.get("result").is_some() || reply.get("error").is_some())
+                    && let Some(id) = reply["id"].as_str()
+                    && attached_sessions.iter().any(|sid| turn_hub.answer(sid,principal_id.as_deref(),id,&reply)) {
+                    continue;
+                }
                 // Intercept gateway-level turn coordination frames:
                 // 1) `_zeroclaw/session/reattach` reattaches to an in-flight turn
                 // 2) `session/cancel` cancels a detached turn if owned by this principal
@@ -490,7 +633,7 @@ async fn handle_socket(
                         let req_id = parsed.get("id").cloned().unwrap_or(serde_json::Value::Null);
                         let sid = parsed
                             .get("params")
-                            .and_then(|p| p.get("sessionId"))
+                            .and_then(|p| p.get("sessionId").or_else(||p.get("session_id")))
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("");
                         let after_seq = parsed
@@ -498,6 +641,11 @@ async fn handle_socket(
                             .and_then(|p| p.get("afterSeq"))
                             .and_then(serde_json::Value::as_u64)
                             .unwrap_or(0);
+                        if !server.has_gateway_session(sid).await {
+                            let _ = wire_tx.send(serde_json::json!({"jsonrpc":"2.0","id":req_id,"error":{"code":FORBIDDEN,"message":"Restore the session before reattaching"}}).to_string()).await;
+                            continue;
+                        }
+                        attached_sessions.insert(sid.to_owned());
                         match turn_hub.reattach(sid, principal_id.as_deref(), after_seq) {
                             Ok(Some(attachment)) => {
                                 let ack = serde_json::json!({
@@ -507,15 +655,17 @@ async fn handle_socket(
                                         "sessionId": sid,
                                         "inFlight": !attachment.completed,
                                         "replayed": attachment.replay.len(),
+                                        "turnId": attachment.turn_id.to_string(),
                                     }
                                 });
                                 let _ = wire_tx.send(ack.to_string()).await;
                                 let wire_tx_sub = wire_tx.clone();
+                                let sid = sid.to_string();
                                 zeroclaw_spawn::spawn!(async move {
                                     let mut last_seq = after_seq;
                                     for ev in attachment.replay {
                                         last_seq = ev.seq;
-                                        if wire_tx_sub.send(ev.payload).await.is_err() {
+                                        if wire_tx_sub.send(replay_payload(&sid,ev.clone())).await.is_err() {
                                             return;
                                         }
                                         if ev.is_terminal {
@@ -526,13 +676,21 @@ async fn handle_socket(
                                         return;
                                     }
                                     let mut rx = attachment.live;
-                                    while let Ok(ev) = rx.recv().await {
+                                    loop {
+                                        let ev = match rx.recv().await {
+                                            Ok(ev) => ev,
+                                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                                let _ = wire_tx_sub.send(serde_json::json!({"jsonrpc":"2.0","method":"_zeroclaw/replay_gap","params":{"sessionId":sid,"afterSeq":last_seq}}).to_string()).await;
+                                                break;
+                                            }
+                                            Err(broadcast::error::RecvError::Closed) => break,
+                                        };
                                         if ev.seq <= last_seq {
                                             continue;
                                         }
                                         last_seq = ev.seq;
                                         let done = ev.is_terminal;
-                                        if wire_tx_sub.send(ev.payload).await.is_err() || done {
+                                        if wire_tx_sub.send(replay_payload(&sid,ev.clone())).await.is_err() || done {
                                             break;
                                         }
                                     }
@@ -560,43 +718,52 @@ async fn handle_socket(
                     if method == "session/cancel"
                         && let Some(sid) = parsed
                             .get("params")
-                            .and_then(|p| p.get("sessionId"))
+                            .and_then(|p| p.get("sessionId").or_else(||p.get("session_id")))
                             .and_then(serde_json::Value::as_str)
                     {
-                        let _ = turn_hub.cancel_turn(sid, principal_id.as_deref());
+                        if server.has_gateway_session(sid).await {
+                            let _ = turn_hub.cancel_turn(sid, principal_id.as_deref());
+                        }
                     }
                     if method == "session/prompt"
                         && let Some(sid) = parsed
                             .get("params")
-                            .and_then(|p| p.get("sessionId"))
+                            .and_then(|p| p.get("sessionId").or_else(||p.get("session_id")))
                             .and_then(serde_json::Value::as_str)
                     {
                         let req_id = parsed.get("id").cloned().unwrap_or(serde_json::Value::Null);
-                        let turn_cancel = CancellationToken::new();
-                        if let Err(err) = turn_hub
-                            .start_turn(sid, principal_id.clone(), turn_cancel.clone())
-                            .await
-                        {
-                            let resp = serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "id": req_id,
-                                "error": {
-                                    "code": SESSION_BUSY,
-                                    "message": err.to_string(),
-                                }
-                            });
-                            let _ = wire_tx.send(resp.to_string()).await;
+                        if req_id.is_null() || parsed["jsonrpc"] != "2.0" || !server.has_gateway_session(sid).await {
+                            let _ = wire_tx.send(serde_json::json!({"jsonrpc":"2.0","id":req_id,"error":{"code":zeroclaw_api::jsonrpc::error_codes::INVALID_REQUEST,"message":"Prompt requires an id and an open session"}}).to_string()).await;
                             continue;
                         }
-                        active_prompts
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .insert(req_id.to_string(), sid.to_string());
-                        let server_for_cancel = Arc::clone(&server);
+                        let sid = sid.to_owned();
+                        attached_sessions.insert(sid.clone());
+                        let params = parsed["params"].clone();
+                        let turn_cancel = revoked_token.child_token();
+                        let hub = Arc::clone(&turn_hub);
+                        let server = Arc::clone(&server);
+                        let wire = wire_tx.clone();
+                        let principal = principal_id.clone();
+                        let prompts = Arc::clone(&active_prompts);
+                        let closed = disconnected.clone();
+                        let generations = Arc::clone(&local_generations);
                         zeroclaw_spawn::spawn!(async move {
-                            turn_cancel.cancelled().await;
-                            server_for_cancel.cancel_active_turns();
+                            let admitted = tokio::select! {
+                                biased;
+                                () = closed.cancelled() => return,
+                                result = hub.start_turn(&sid,principal,turn_cancel.clone(),Arc::downgrade(&server)) => result,
+                            };
+                            if let Err(e) = admitted {
+                                let _ = wire.send(serde_json::json!({"jsonrpc":"2.0","id":req_id,"error":{"code":SESSION_BUSY,"message":e.to_string()}}).to_string()).await;
+                                return;
+                            }
+                            let generation = hub.queue.generation(&sid);
+                            let stale = generations.lock().unwrap_or_else(|e|e.into_inner()).get(&sid).copied().unwrap_or(0) != generation;
+                            prompts.lock().unwrap_or_else(|e|e.into_inner()).insert(req_id.to_string(),sid.clone());
+                            server.gateway_prompt(req_id,&params,turn_cancel,stale).await;
+
                         });
+                        continue;
                     }
                 }
 
@@ -607,35 +774,45 @@ async fn handle_socket(
         }
     }
 
+    disconnected.cancel();
+    close_signal.notify_one();
     drop(input_tx);
-
-    // If the socket closed cleanly without revocation while a turn is still
-    // running, let `server_task` and `output_bridge` finish in the background
-    // so the turn completes, persists its transcript, and streams to any
-    // reattached socket! On revocation, wait for the cancelled turn to unwind.
-    if revoked {
-        if let Err(e) = server_task.await {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "ACP WebSocket server task panicked"
-            );
+    drop(server);
+    drop(wire_tx);
+    zeroclaw_spawn::spawn!(async move {
+        let _ = server_task.await;
+        let mut bridge = output_bridge;
+        if revoked {
+            let _ = bridge.await;
+        } else {
+            tokio::select! {
+                _ = &mut bridge => (),
+                _ = session_lost(&mut session_watch,&state) => {
+                    revoked_token.cancel();
+                    let _ = bridge.await;
+                }
+                _ = shutdown_rx.changed() => {
+                    revoked_token.cancel();
+                    let _ = bridge.await;
+                }
+            }
         }
-        let _ = output_bridge.await;
-    } else {
-        zeroclaw_spawn::spawn!(async move {
-            let _ = server_task.await;
-            let _ = output_bridge.await;
-        });
-    }
+    });
     let _ = output_task.await;
     ::zeroclaw_log::record!(
         DEBUG,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
         "ACP WebSocket disconnected"
     );
+}
+
+fn replay_payload(sid: &str, event: AcpTurnEventFrame) -> String {
+    if !event.is_terminal {
+        return event.payload;
+    }
+    let response: serde_json::Value =
+        serde_json::from_str(&event.payload).expect("hub stores encoded JSON");
+    serde_json::json!({"jsonrpc":"2.0","method":"_zeroclaw/turn_complete","params":{"sessionId":sid,"result":response["result"],"error":response["error"]},"_meta":response["_meta"]}).to_string()
 }
 
 fn extract_ws_token<'a>(headers: &'a HeaderMap, query_token: Option<&'a str>) -> Option<&'a str> {
@@ -837,24 +1014,44 @@ mod tests {
         let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
             4, 10, 60,
         ));
-        let hub = super::AcpTurnHub::for_queue(&queue);
+        let hub = Arc::new(super::AcpTurnHub::new(queue.clone()));
         let cancel = tokio_util::sync::CancellationToken::new();
 
-        hub.start_turn("sess-reload", Some("alice".into()), cancel)
-            .await
-            .expect("first turn must acquire permit");
+        hub.start_turn(
+            "sess-reload",
+            Some("alice".into()),
+            cancel,
+            std::sync::Weak::new(),
+        )
+        .await
+        .expect("first turn must acquire permit");
 
         // Emit 3 tool calls + partial output before the client reloads.
         assert_eq!(
-            hub.record_frame("sess-reload", "tool_call:1".into(), false),
+            hub.record_frame(
+                "sess-reload",
+                serde_json::json!({"data":"tool_call:1"}).to_string(),
+                false
+            )
+            .map(|f| f.seq),
             Some(1)
         );
         assert_eq!(
-            hub.record_frame("sess-reload", "tool_result:1".into(), false),
+            hub.record_frame(
+                "sess-reload",
+                serde_json::json!({"data":"tool_result:1"}).to_string(),
+                false
+            )
+            .map(|f| f.seq),
             Some(2)
         );
         assert_eq!(
-            hub.record_frame("sess-reload", "tool_call:2".into(), false),
+            hub.record_frame(
+                "sess-reload",
+                serde_json::json!({"data":"tool_call:2"}).to_string(),
+                false
+            )
+            .map(|f| f.seq),
             Some(3)
         );
 
@@ -864,16 +1061,35 @@ mod tests {
             .expect("owner reattach must succeed")
             .expect("turn is still active");
         assert!(!attached.completed);
-        let mut observed: Vec<String> = attached.replay.iter().map(|e| e.payload.clone()).collect();
+        let mut observed: Vec<String> = attached
+            .replay
+            .iter()
+            .map(|e| {
+                serde_json::from_str::<serde_json::Value>(&e.payload).unwrap()["data"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
         let mut last_seq = attached.replay.last().map_or(1, |e| e.seq);
 
         // Turn continues live after reload with another tool call and terminal response.
         assert_eq!(
-            hub.record_frame("sess-reload", "tool_result:2".into(), false),
+            hub.record_frame(
+                "sess-reload",
+                serde_json::json!({"data":"tool_result:2"}).to_string(),
+                false
+            )
+            .map(|f| f.seq),
             Some(4)
         );
         assert_eq!(
-            hub.record_frame("sess-reload", "final_response".into(), true),
+            hub.record_frame(
+                "sess-reload",
+                serde_json::json!({"data":"final_response"}).to_string(),
+                true
+            )
+            .map(|f| f.seq),
             Some(5)
         );
         hub.finish_turn("sess-reload");
@@ -883,7 +1099,12 @@ mod tests {
                 continue;
             }
             last_seq = ev.seq;
-            observed.push(ev.payload);
+            observed.push(
+                serde_json::from_str::<serde_json::Value>(&ev.payload).unwrap()["data"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
             if ev.is_terminal {
                 break;
             }
@@ -902,8 +1123,8 @@ mod tests {
         assert!(
             hub.reattach("sess-reload", Some("alice"), 0)
                 .unwrap()
-                .is_none(),
-            "finished turn must be removed from the active hub"
+                .is_some_and(|a| a.completed),
+            "terminal replay must survive completion"
         );
     }
 
@@ -912,12 +1133,17 @@ mod tests {
         let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
             4, 10, 60,
         ));
-        let hub = super::AcpTurnHub::for_queue(&queue);
+        let hub = Arc::new(super::AcpTurnHub::new(queue.clone()));
         let cancel = tokio_util::sync::CancellationToken::new();
 
-        hub.start_turn("sess-scoped", Some("alice".into()), cancel.clone())
-            .await
-            .unwrap();
+        hub.start_turn(
+            "sess-scoped",
+            Some("alice".into()),
+            cancel.clone(),
+            std::sync::Weak::new(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             hub.reattach("sess-scoped", Some("bob"), 0).err(),
@@ -943,12 +1169,13 @@ mod tests {
         let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
             1, 1, 60,
         ));
-        let hub = super::AcpTurnHub::for_queue(&queue);
+        let hub = Arc::new(super::AcpTurnHub::new(queue.clone()));
 
         hub.start_turn(
             "sess-serial",
             None,
             tokio_util::sync::CancellationToken::new(),
+            std::sync::Weak::new(),
         )
         .await
         .unwrap();
@@ -958,6 +1185,7 @@ mod tests {
                 "sess-serial",
                 None,
                 tokio_util::sync::CancellationToken::new(),
+                std::sync::Weak::new(),
             )
             .await
             .expect_err("second concurrent turn on same session must be rejected by queue limit");
@@ -972,6 +1200,7 @@ mod tests {
             "sess-serial",
             None,
             tokio_util::sync::CancellationToken::new(),
+            std::sync::Weak::new(),
         )
         .await
         .expect("after finish_turn releases permit, next turn must succeed");
@@ -1024,7 +1253,7 @@ mod tests {
         .await
         .expect("gateway should accept connections");
 
-        let resp = tokio_tungstenite::connect_async(format!("ws://{addr}/acp")).await;
+        let resp = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/acp")).await;
         assert!(
             matches!(
                 resp,
@@ -1083,7 +1312,7 @@ mod tests {
         .await
         .expect("gateway should accept connections");
 
-        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/acp"))
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/acp"))
             .await
             .expect("WS upgrade should succeed");
 
