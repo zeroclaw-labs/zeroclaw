@@ -1346,6 +1346,77 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn stale_operator_tab_cannot_restore_a_revoked_http_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let mut config = editor_config(
+            &tmp,
+            &idp.uri(),
+            &[Verb::Read, Verb::Create, Verb::Update, Verb::Delete],
+            &["*"],
+        );
+        config.secrets.encrypt = true;
+        zeroclaw_config::secrets::SecretStore::new(tmp.path(), true)
+            .encrypt("initialize-fixture-key")
+            .unwrap();
+        let router = router_for(config);
+        let url = "/api/config/http-credentials";
+        let create = serde_json::json!({
+            "name": "TEST_HTTP", "operation": "create",
+            "credential": {"origin": "https://example.com",
+                "auth": {"kind": "api_key", "value": "synthetic", "header": "bearer"}}
+        });
+        assert_eq!(
+            send(&router, "POST", url, OPERATOR.0, OPERATOR.1, Some(create))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        let (_, catalog) = send(&router, "GET", url, OPERATOR.0, OPERATOR.1, None).await;
+        let revision = catalog["credentials"][0]["permission_revision"].clone();
+        let grant = serde_json::json!({"name": "TEST_HTTP", "operation": "replace",
+            "permissions": {"expected_revision": revision,
+                "http_origins": ["https://example.com", "https://example.org"]}});
+        assert_eq!(
+            send(&router, "POST", url, OPERATOR.0, OPERATOR.1, Some(grant))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        // Both operator tabs loaded this revision before either edited it.
+        let (_, catalog) = send(&router, "GET", url, OPERATOR.0, OPERATOR.1, None).await;
+        let revision = catalog["credentials"][0]["permission_revision"].clone();
+        let revoke = serde_json::json!({"name": "TEST_HTTP", "operation": "replace",
+            "permissions": {"expected_revision": revision,
+                "http_origins": ["https://example.org"]}});
+        assert_eq!(
+            send(&router, "POST", url, OPERATOR.0, OPERATOR.1, Some(revoke))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        let before = std::fs::read(tmp.path().join("config.toml")).unwrap();
+        let stale = serde_json::json!({"name": "TEST_HTTP", "operation": "replace",
+            "permissions": {"expected_revision": revision,
+                "http_origins": ["https://example.com", "https://example.net"]}});
+        assert_eq!(
+            send(&router, "POST", url, OPERATOR.0, OPERATOR.1, Some(stale))
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("config.toml")).unwrap(),
+            before
+        );
+        let (_, catalog) = send(&router, "GET", url, OPERATOR.0, OPERATOR.1, None).await;
+        assert_eq!(
+            catalog["credentials"][0]["http_origins"],
+            serde_json::json!(["https://example.org"])
+        );
+    }
+
     #[cfg(feature = "plugins-wasm")]
     #[tokio::test]
     async fn plugin_tls_credential_api_is_operator_only_and_write_only() {
