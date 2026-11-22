@@ -4,6 +4,7 @@
 pub mod acp_embedded;
 #[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
+pub mod consolidation;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
