@@ -114,12 +114,12 @@ impl Factors {
 
     async fn password(&self) -> Result<String> {
         let (source, reference) = self.password.as_ref().context("SSH password missing")?;
-        resolve_scoped_value(source.clone(), reference.clone()).await
+        resolve_scoped_value(*source, reference.clone()).await
     }
 
     async fn totp(&self) -> Result<String> {
         let (source, reference) = self.seed.as_ref().context("SSH TOTP missing")?;
-        let seed = resolve_scoped_value(source.clone(), reference.clone()).await?;
+        let seed = resolve_scoped_value(*source, reference.clone()).await?;
         let bytes = data_encoding::BASE32_NOPAD
             .decode(
                 seed.trim()
