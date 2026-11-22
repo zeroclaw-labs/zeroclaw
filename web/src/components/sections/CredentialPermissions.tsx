@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Button, Select } from "@/components/ui";
 import { HttpError, changeHttpCredential, listHttpCredentials, type HttpCredentialRow } from "@/lib/api";
 import { t } from "@/lib/i18n";
-import SshProfiles from "./SshProfiles";
+import SshProfiles, { emptySshProfile, type SshProfileForm } from "./SshProfiles";
 import { parseSshDestinations } from "./HttpCredentials";
 
 type Consumer = "http" | "browser" | "ssh";
@@ -92,14 +92,22 @@ export default function CredentialPermissions() {
     }
   }
 
+  const [sshForm, setSshForm] = useState<SshProfileForm>();
   const field = "block w-full rounded-md border border-border bg-background p-2";
   return (
     <section className="space-y-4">
       {message && <p role="status">{message}</p>}
-      <Button type="button" disabled={busy || !eligible.length} onClick={() => {
-        setEditing(undefined);
-        if (eligible[0]) select(eligible[0].name);
-      }}>{t("http_credentials.add_permission")}</Button>
+      <div className="flex flex-wrap gap-2">
+        <Button type="button" disabled={busy || !eligible.length || !!sshForm} onClick={() => {
+          setEditing(undefined);
+          if (eligible[0]) select(eligible[0].name);
+        }}>{t("http_credentials.add_permission")}</Button>
+        {rows.some(credential => credential.ssh_profiles !== undefined) && (
+          <Button type="button" disabled={busy || !!draft} onClick={() => setSshForm(emptySshProfile())}>
+            Add SSH profile
+          </Button>
+        )}
+      </div>
       {draft && row && (
         <form className="space-y-4 rounded-md border p-4" onSubmit={event => {
           event.preventDefault();
@@ -128,6 +136,7 @@ export default function CredentialPermissions() {
           </div>
         </form>
       )}
+      <SshProfiles rows={rows} form={sshForm} setForm={setSshForm} reload={async () => setRows((await listHttpCredentials()).credentials)} />
       {grants.length === 0 && <p>{t("http_credentials.no_permissions")}</p>}
       <ul className="space-y-2">
         {grants.map(entry => (
@@ -143,7 +152,6 @@ export default function CredentialPermissions() {
           </li>
         ))}
       </ul>
-      <SshProfiles rows={rows} reload={async () => setRows((await listHttpCredentials()).credentials)} />
     </section>
   );
 }

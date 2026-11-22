@@ -9,16 +9,15 @@ const roles: Record<PamChallengeRole, string> = {
 const modes: Record<SshProfileAuth["mode"], string> = {
   public_key: "Public key", password: "Username and password", pam: "PAM keyboard-interactive",
 };
-type Form = { destination: SshDestination; auth: SshProfileAuth; previous?: { anchor: string; index: number; revision: string } };
-const empty = (): Form => ({
+export type SshProfileForm = { destination: SshDestination; auth: SshProfileAuth; previous?: { anchor: string; index: number; revision: string } };
+export const emptySshProfile = (): SshProfileForm => ({
   destination: { host: "", port: 22, username: "" },
   auth: { mode: "password", password_alias: "" },
 });
 const matches = (a: SshDestination, b: SshDestination) =>
   a.host.toLowerCase() === b.host.toLowerCase() && a.port === b.port && a.username === b.username;
 
-export default function SshProfiles({ rows, reload }: { rows: HttpCredentialRow[]; reload: () => Promise<void> }) {
-  const [form, setForm] = useState<Form>();
+export default function SshProfiles({ rows, reload, form, setForm }: { rows: HttpCredentialRow[]; reload: () => Promise<void>; form: SshProfileForm | undefined; setForm: (form: SshProfileForm | undefined) => void }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(false);
 
@@ -50,7 +49,7 @@ export default function SshProfiles({ rows, reload }: { rows: HttpCredentialRow[
     if (value === "password") return { mode: value, password_alias: "" };
     return { mode: value, challenges: [] };
   }
-  function update(form: Form) {
+  function update(form: SshProfileForm) {
     const { destination, auth, previous } = form;
     const factors = auth.mode === "public_key" ? [auth.key_alias]
       : auth.mode === "password" ? [auth.password_alias] : [auth.password_alias, auth.totp_alias];
@@ -75,7 +74,6 @@ export default function SshProfiles({ rows, reload }: { rows: HttpCredentialRow[
   if (!rows.some(row => row.ssh_profiles !== undefined)) return null;
   return <section className="space-y-4">
     <h3 className="font-medium">SSH authentication profiles</h3>
-    <Button type="button" disabled={busy} onClick={() => { setError(false); setForm(empty()); }}>Add SSH profile</Button>
     {error && <p role="alert">Could not save the SSH profile. Check its destination, grants and challenge settings.</p>}
     {form && <form className="space-y-3" onSubmit={event => { event.preventDefault(); update(form); }}>
       <label className="block">Host<input className={field} required value={form.destination.host}
