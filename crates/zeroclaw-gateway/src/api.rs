@@ -1473,13 +1473,20 @@ pub async fn handle_api_openrouter_credits(
         }
     };
 
-    if !response.status().is_success() {
+    let status = response.status();
+    if !status.is_success() {
+        let message = match status {
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                "OpenRouter credits API rejected the configured management key"
+            }
+            _ => "OpenRouter credits API returned an unsuccessful status",
+        };
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"status": response.status().as_u16()})),
-            "OpenRouter credits API rejected the configured management key"
+                .with_attrs(::serde_json::json!({"status": status.as_u16()})),
+            message
         );
         return StatusCode::NO_CONTENT.into_response();
     }
