@@ -27,13 +27,13 @@ use zeroclaw_providers::SafeguardFallbackNotice;
 use zeroclaw_runtime::agent::SteeringInput;
 use zeroclaw_runtime::agent::agent::{Agent, TurnEvent};
 use zeroclaw_runtime::agent::turn_accounting::{
-    ContextDisplay, SafeguardFallbackDisplay, UsageFold, build_consolidation_model,
-    done_frame_context_limits,
+    ContextDisplay, SafeguardFallbackDisplay, UsageFold, done_frame_context_limits,
 };
 use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::tools::CanvasStore;
 
 use super::acp_embedded;
+use super::consolidation::build_consolidation_model;
 use crate::acp_channel::AcpChannel;
 
 /// Tool name of the structured, replay-only cancellation event a client-cancel
@@ -569,34 +569,20 @@ impl AcpServer {
 
     fn apply_session_policy_to_agent(
         config: &Config,
+        agent_alias: &str,
         agent: &mut Agent,
         session_id: &str,
         policy: AcpSessionPolicy,
     ) {
         if !policy.exclude_memory {
-            agent.set_memory_session_id(Some(session_id.to_string()));
+            agent.set_memory_session_id(Some(zeroclaw_api::session_keys::sanitize_session_key(
+                session_id,
+            )));
         }
         if policy.seed_external_channels {
             let ch = agent.channel_handles();
-            let channel_names = crate::orchestrator::register_channels_for_tools(
-                config,
-                &ch.ask_user,
-                &ch.channel_room,
-                &Some(ch.reaction.clone()),
-                &ch.poll,
-                &ch.escalate,
-            );
-            if !channel_names.is_empty() {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_category(::zeroclaw_log::EventCategory::Channel)
-                        .with_attrs(::serde_json::json!({
-                            "channels": channel_names,
-                            "session_id": session_id,
-                        })),
-                    "Seeded external channel(s) into ACP session"
-                );
+            for (name, channel) in super::live_channel_map_for_agent(config, agent_alias) {
+                ch.register_channel(name, channel);
             }
         }
     }
@@ -1108,7 +1094,7 @@ impl AcpServer {
     /// The process/connection default is intentionally omitted: restore accepts
     /// only a session ID and must not let launcher or transport input rebind a
     /// persisted workspace/history to a different agent.
-    fn resolve_restore_agent_alias(config: &Config, persisted_agent_alias: &str) -> String {
+    pub fn resolve_restore_agent_alias(config: &Config, persisted_agent_alias: &str) -> String {
         Self::alias_if_dispatchable(config, persisted_agent_alias)
             .or_else(|| {
                 config
@@ -1347,7 +1333,13 @@ impl AcpServer {
         ));
         agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
-        Self::apply_session_policy_to_agent(&config, &mut agent, &session_id, session_policy);
+        Self::apply_session_policy_to_agent(
+            &config,
+            &agent_alias,
+            &mut agent,
+            &session_id,
+            session_policy,
+        );
 
         // Persist before publishing the session, so a failed write never
         // leaves a live-but-unpersisted session; release the reservation on
@@ -1786,7 +1778,13 @@ impl AcpServer {
         ));
         agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
-        Self::apply_session_policy_to_agent(&config, &mut agent, &session_id, session_policy);
+        Self::apply_session_policy_to_agent(
+            &config,
+            &restore_alias,
+            &mut agent,
+            &session_id,
+            session_policy,
+        );
 
         let lifecycle_lease = match admission.publish() {
             Ok(lease) => lease,
@@ -2071,7 +2069,13 @@ impl AcpServer {
         ));
         agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
-        Self::apply_session_policy_to_agent(&config, &mut agent, &session_id, session_policy);
+        Self::apply_session_policy_to_agent(
+            &config,
+            &restore_alias,
+            &mut agent,
+            &session_id,
+            session_policy,
+        );
 
         let lifecycle_lease = match admission.publish() {
             Ok(lease) => lease,
