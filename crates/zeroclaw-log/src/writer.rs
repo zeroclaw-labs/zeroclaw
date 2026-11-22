@@ -1448,7 +1448,11 @@ mod tests {
         }
         flush_for_test().unwrap();
 
-        let dir = runtime_trace_path().unwrap().parent().unwrap().to_path_buf();
+        let dir = runtime_trace_path()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
         assert_eq!(trim_temp_names(&dir), Vec::<String>::new());
     }
 
@@ -2226,7 +2230,11 @@ mod tests {
         let _guard = WRITER_TEST_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
         install_writer(tmp.path(), 10);
-        let dir = runtime_trace_path().unwrap().parent().unwrap().to_path_buf();
+        let dir = runtime_trace_path()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("runtime-trace.0000000007-20260624-031500.jsonl"),
