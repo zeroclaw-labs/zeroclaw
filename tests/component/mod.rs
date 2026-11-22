@@ -23,6 +23,8 @@ mod degraded_config_remediation;
 mod desktop_cli_linux;
 mod direct_cli_terminal_completion;
 mod dockerignore_test;
+#[cfg(feature = "agent-runtime")]
+mod estop_cli;
 #[cfg(feature = "gateway")]
 mod gateway;
 mod gemini_capabilities;
@@ -38,6 +40,8 @@ mod reply_target_field_regression;
 mod schema_export_feature_graph;
 mod security;
 mod skills_bundle_cli;
+#[cfg(feature = "agent-runtime")]
+mod status_memory_cli;
 #[cfg(feature = "agent-runtime")]
 mod verifiable_intent_notice_visibility;
 #[cfg(feature = "gateway")]
