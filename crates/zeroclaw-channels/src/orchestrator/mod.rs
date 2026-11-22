@@ -1159,7 +1159,12 @@ const MAX_CONCURRENT_STOP_REPLIES: usize = 8;
 /// than this is a clarification of history, not a live prompt: it is
 /// recorded as passive context instead of triggering an agent turn.
 /// Deliberately not operator-configurable.
-const EDIT_FRESHNESS_SECS: u64 = 600;
+/// How long after the ORIGINAL send an edit still counts as live. The same
+/// window bounds both sides of an edit: the orchestrator classifies stale
+/// edits as passive history, and the Telegram adapter suppresses the
+/// ack/typing hint for them. Shared with the channel adapter so a stale
+/// edit never announces a turn the runtime will not run.
+pub(crate) const EDIT_FRESHNESS_SECS: u64 = 600;
 
 /// Bound on distinct pending edits retained for latest-wins coalescing, so a
 /// flood of edits across many messages cannot pin unbounded content behind
@@ -1169,6 +1174,10 @@ const PENDING_EDITS_LIMIT: usize = 128;
 /// Marker prepended to a dispatched edit's content so the model sees the
 /// message evolved instead of arriving fresh.
 const EDITED_CONTENT_PREFIX: &str = "[edited] ";
+
+/// Marker for a stale edit recorded as passive history: the model sees an
+/// out-of-order line that revises an earlier message, not a new instruction.
+const EDITED_STALE_PREFIX: &str = "[edited earlier message] ";
 
 /// Key of one pending edit: the edited message's reply target, sender, and
 /// channel message id.
@@ -12513,12 +12522,19 @@ async fn run_message_dispatch_loop_until_cancelled(
         // this global channel registry and prompt config.
         // Guarded here, not in the worker: these paths answer and cancel before
         // the worker runs. The worker still records the passive turn.
+        //
+        // Edited messages are excluded: an edit is a revision of an earlier
+        // turn, not a new instruction, and letting the gate read the edited
+        // body would resolve a parked approval from a stale edit before the
+        // freshness policy below can classify it. The edit policy handles
+        // edits in full after ownership resolution.
         let gate_ctx = router
             .single_ctx
             .as_ref()
             .cloned()
             .or_else(|| router.by_agent.values().next().cloned());
         if !msg.passive_context
+            && !msg.edited
             && let Some(gate_ctx) = gate_ctx
         {
             let gate_channel = find_channel_for_message(&gate_ctx.channels_by_name, &msg).cloned();
@@ -12574,6 +12590,11 @@ async fn run_message_dispatch_loop_until_cancelled(
                 .unwrap_or_default()
                 .as_secs();
             if now.saturating_sub(msg.timestamp) > EDIT_FRESHNESS_SECS {
+                // Recorded, not dispatched — and marked, so the model can
+                // tell an out-of-order history line that revises an earlier
+                // message from a brand-new one.
+                let mut msg = msg;
+                msg.content = format!("{EDITED_STALE_PREFIX}{}", msg.content);
                 let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
                 record_passive_context(ctx.as_ref(), &msg, &history_key);
                 continue;
@@ -12994,6 +13015,30 @@ async fn run_message_dispatch_loop_until_cancelled(
             }),
         );
     };
+
+    // Edits still coalescing in the quiet window never dispatch once the
+    // loop stops: their timers would fire into a receiver nothing polls
+    // anymore (closed input) or prolong the shutdown drain (cancellation).
+    // Cancel them deliberately and say so, rather than letting a generation
+    // boundary swallow them silently.
+    let abandoned_edits: Vec<PendingEdit> = {
+        let mut pending = pending_edits.lock().unwrap_or_else(|e| e.into_inner());
+        pending.drain().map(|(_key, edit)| edit).collect()
+    };
+    if !abandoned_edits.is_empty() {
+        for edit in &abandoned_edits {
+            edit.cancel.cancel();
+        }
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "count": abandoned_edits.len(),
+                })
+            ),
+            "dispatch loop exiting: dropped pending edits that never reached their quiet window"
+        );
+    }
 
     if cancelled {
         // Stop admission first, then cancel every accepted turn. Closing the
@@ -29646,8 +29691,12 @@ BTC is currently around $65,000 based on latest tool output."#
             "stale edit must be recorded as history context, got: {user_content}"
         );
         assert!(
+            user_content.contains("[edited earlier message] old clarification"),
+            "a recorded stale edit must be marked as a revision of an earlier message, got: {user_content}"
+        );
+        assert!(
             !user_content.contains("[edited] old clarification"),
-            "a recorded stale edit is passive context, not a dispatch"
+            "a recorded stale edit is passive context, never a dispatch marker"
         );
     }
 

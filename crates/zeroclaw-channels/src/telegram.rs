@@ -7564,7 +7564,17 @@ impl TelegramChannel {
     ) -> bool {
         // Silent observation: a passive message must not tell the room the
         // bot saw it, so it gets neither an ack reaction nor a typing hint.
-        if !msg.passive_context {
+        // A stale edit is the same case from the room's point of view: the
+        // orchestrator will record it as passive history, not answer it, so
+        // showing typing for it promises a turn that never comes.
+        let stale_edit = msg.edited
+            && std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_sub(msg.timestamp)
+                > crate::orchestrator::EDIT_FRESHNESS_SECS;
+        if !msg.passive_context && !stale_edit {
             if self.ack_reactions
                 && let Some((reaction_chat_id, reaction_message_id)) =
                     Self::extract_update_message_target(update)
