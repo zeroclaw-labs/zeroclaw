@@ -104,5 +104,13 @@ The native broker and the scoped credential catalog must both be present in
 the integration base. The upstream broker branch alone does not include the
 combined catalog currently deployed on Jarvis.
 
-This document records the proposed contract. Runtime implementation and
-guest verification are required before the feature can be enabled.
+The Rust broker and operator UI implement direct SSH connections on Linux.
+The operator configures the destination, account and authorized factor aliases
+in Secrets → Usage permissions. PAM profiles match ordered challenge labels.
+Combined replies concatenate the password and current code.
+
+A disposable QEMU guest verified password-only and password plus separate
+PAM TOTP challenges, reuse of a single SSH connection, rejection of the wrong
+account, denial of the next lease after removing the TOTP alias, and socket
+cleanup at task exit. Combined and username challenge handling have unit
+coverage and still need guest-level verification.
