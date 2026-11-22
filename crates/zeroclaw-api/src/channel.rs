@@ -476,6 +476,26 @@ pub struct SendMessage {
     pub force_voice: bool,
 }
 
+/// What happens when someone votes on a poll this channel posted.
+///
+/// A poll that gathers opinions and one that opens a sale need opposite
+/// behaviour in the same chat, so this travels per poll rather than as a
+/// channel setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PollVoteReply {
+    /// Votes are recorded as ordinary context and start no turn. The default,
+    /// because a poll in a busy group would otherwise have the agent
+    /// answering every voter.
+    #[default]
+    Ignore,
+    /// Each vote starts a turn in the chat the poll was posted in.
+    InChat,
+    /// Each vote starts a turn addressed to the voter privately, leaving the
+    /// rest of the chat out of whatever follows.
+    Direct,
+}
+
 /// A native poll to post in a chat.
 ///
 /// Channels that cannot post one report [`Channel::supports_native_polls`] as
@@ -489,6 +509,8 @@ pub struct PollRequest {
     pub options: Vec<String>,
     /// How many options one voter may pick. `1` is a single-choice poll.
     pub selectable_count: u32,
+    /// What a vote on this poll should do. See [`PollVoteReply`].
+    pub vote_reply: PollVoteReply,
 }
 
 impl PollRequest {
@@ -504,7 +526,14 @@ impl PollRequest {
             question: question.into(),
             options,
             selectable_count: 1,
+            vote_reply: PollVoteReply::Ignore,
         }
+    }
+
+    #[must_use]
+    pub fn with_vote_reply(mut self, vote_reply: PollVoteReply) -> Self {
+        self.vote_reply = vote_reply;
+        self
     }
 
     #[must_use]
