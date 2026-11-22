@@ -120,10 +120,12 @@ struct WorkerState {
     /// Sequence number for the next archive this writer creates.
     ///
     /// Stamped into the archive name so segment order is fixed at write time
-    /// rather than inferred by a reader from mtimes. Seeded at startup from
-    /// the highest number already on disk and the best-effort high-water
-    /// sidecar, so the series normally keeps increasing across restarts and
-    /// reloads even after retention removes older archives.
+    /// rather than inferred by a reader from mtimes. Under a policy that owns
+    /// archives it is seeded at startup from the highest number already on
+    /// disk and the best-effort high-water sidecar, so the series normally
+    /// keeps increasing across restarts and reloads even after retention
+    /// removes older archives. Under any other policy nothing reads it and it
+    /// holds a placeholder (see `initial_archive_seq`).
     next_archive_seq: AtomicU64,
 }
 
@@ -210,7 +212,7 @@ fn init_from_config_with_migration_and_shutdown_warning<F>(
             policy: policy.clone(),
             worker_dead: Arc::clone(&worker_dead),
             line_count: AtomicU64::new(initial_line_count),
-            next_archive_seq: AtomicU64::new(seed_archive_seq(&policy.path)),
+            next_archive_seq: AtomicU64::new(initial_archive_seq(&policy)),
         });
         spawn_worker(rx, worker_state);
     } else {
@@ -923,6 +925,12 @@ fn maybe_rotate_for_entry_count(state: &Arc<WorkerState>) -> Result<bool> {
 }
 
 fn rotate_active(state: &Arc<WorkerState>, when: DateTime<Utc>) -> Result<()> {
+    // The sequence is only seeded from disk when the policy owns archives, so a
+    // rotation under any other policy would stamp a meaningless number.
+    debug_assert!(
+        state.policy.storage.reads_archives(),
+        "rotate_active reached under a policy that does not own archives"
+    );
     let path = &state.policy.path;
     // Claim the next number before renaming so the archive name records where
     // this segment falls in the series.
@@ -986,6 +994,21 @@ fn read_seq_watermark(active: &Path) -> u64 {
         .ok()
         .and_then(|raw| raw.trim().parse().ok())
         .unwrap_or(0)
+}
+
+/// The value `WorkerState::next_archive_seq` starts from.
+///
+/// Only a policy that owns archives reads the disk. Listing the log directory
+/// costs time proportional to its entry count and runs while the daemon holds
+/// config ownership, so the other policies skip it: they never create archives
+/// and never read this number. `1` is what `seed_archive_seq` returns for a
+/// directory with no archives and no sidecar.
+fn initial_archive_seq(policy: &ResolvedPolicy) -> u64 {
+    if policy.storage.reads_archives() {
+        seed_archive_seq(&policy.path)
+    } else {
+        1
+    }
 }
 
 /// The next archive sequence number to issue.
@@ -2143,6 +2166,81 @@ mod tests {
             seed_archive_seq(&active),
             8,
             "the series must resume above the highest number already on disk"
+        );
+    }
+
+    #[test]
+    fn only_a_policy_that_owns_archives_reads_the_directory_for_the_sequence() {
+        // Archive 7 and a watermark of 30 are on disk. `rotating` must resume
+        // past both; every other policy never reads the number, so it must not
+        // pay for a directory listing and starts from the empty-directory value.
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut policy = detached_enabled_policy(tmp.path());
+        fs::write(&policy.path, "").unwrap();
+        fs::write(
+            tmp.path()
+                .join("runtime-trace.0000000007-20260624-031500.jsonl"),
+            "x\n",
+        )
+        .unwrap();
+        record_seq_watermark(&policy.path, 30);
+
+        for (storage, expected) in [
+            (StoragePolicy::Rotating, 31),
+            (StoragePolicy::Rolling, 1),
+            (StoragePolicy::Full, 1),
+            (StoragePolicy::None, 1),
+        ] {
+            policy.storage = storage;
+            assert_eq!(
+                initial_archive_seq(&policy),
+                expected,
+                "unexpected initial sequence for {storage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_from_rolling_to_rotating_resumes_past_existing_archives() {
+        // A reload from `rolling` to `rotating` builds a new worker, and that
+        // worker must seed its sequence from the disk even though the previous
+        // one did not.
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 10);
+        fs::write(
+            tmp.path()
+                .join("runtime-trace.0000000007-20260624-031500.jsonl"),
+            "x\n",
+        )
+        .unwrap();
+
+        let cfg = LogConfig {
+            log_persistence: "rotating".into(),
+            log_persistence_max_bytes: 0,
+            log_persistence_rotate_daily: false,
+            log_persistence_retention_max_files: 0,
+            log_persistence_max_entries_per_segment: 2,
+            ..LogConfig::default()
+        };
+        init_from_config(&cfg, tmp.path());
+        let path = runtime_trace_path().unwrap();
+        emit("event-1");
+        emit("event-2");
+
+        let highest = list_archives(&path)
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, order)| match order {
+                ArchiveOrder::Seq(n) => Some(n),
+                ArchiveOrder::Legacy(_) => None,
+            })
+            .max();
+        assert_eq!(
+            highest,
+            Some(8),
+            "the first rotation after the reload must take the next number"
         );
     }
 
