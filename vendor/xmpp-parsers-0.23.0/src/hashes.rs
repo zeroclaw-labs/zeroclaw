@@ -154,25 +154,35 @@ impl Hash {
 
     /// Like [new](#method.new) but takes hex-encoded data before decoding it.
     pub fn from_hex(algo: Algo, hex: &str) -> Result<Hash, ParseIntError> {
-        let mut bytes = vec![];
-        for i in 0..hex.len() / 2 {
-            let byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16)?;
-            bytes.push(byte);
-        }
+        let bytes = hex
+            .as_bytes()
+            .chunks(2)
+            .map(Self::parse_hex_byte)
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Hash::new(algo, bytes))
     }
 
     /// Like [new](#method.new) but takes hex-encoded data before decoding it.
     pub fn from_colon_separated_hex(algo: Algo, hex: &str) -> Result<Hash, ParseIntError> {
-        let mut bytes = vec![];
-        for i in 0..(1 + hex.len()) / 3 {
-            let byte = u8::from_str_radix(&hex[3 * i..3 * i + 2], 16)?;
-            if 3 * i + 2 < hex.len() {
-                assert_eq!(&hex[3 * i + 2..3 * i + 3], ":");
-            }
-            bytes.push(byte);
+        if hex.is_empty() {
+            return Ok(Hash::new(algo, vec![]));
         }
+        let bytes = hex
+            .as_bytes()
+            .split(|byte| *byte == b':')
+            .map(Self::parse_hex_byte)
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Hash::new(algo, bytes))
+    }
+
+    fn parse_hex_byte(pair: &[u8]) -> Result<u8, ParseIntError> {
+        // Use the existing ParseIntError API for invalid lengths or digits.
+        let text = if pair.len() == 2 && pair.iter().all(u8::is_ascii_hexdigit) {
+            core::str::from_utf8(pair).unwrap_or_default()
+        } else {
+            "?"
+        };
+        u8::from_str_radix(text, 16)
     }
 
     /// Formats this hash into base64.
@@ -318,4 +328,21 @@ mod tests {
         };
         assert_eq!(message, "Unknown child in Hash element.");
     }
+}
+
+#[cfg(test)]
+#[test]
+fn hexadecimal_decoding_requires_complete_bytes() {
+    assert_eq!(
+        Hash::from_hex(Algo::Sha_1, "012f").unwrap().to_hex(),
+        "012f"
+    );
+    assert_eq!(
+        Hash::from_colon_separated_hex(Algo::Sha_1, "01:2f")
+            .unwrap()
+            .to_hex(),
+        "012f"
+    );
+    assert!(Hash::from_hex(Algo::Sha_1, "1").is_err());
+    assert!(Hash::from_colon_separated_hex(Algo::Sha_1, "01:").is_err());
 }

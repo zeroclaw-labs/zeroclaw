@@ -264,7 +264,7 @@ pub enum ChannelCommands {
     #[cfg(all(feature = "channel-xmpp", target_os = "linux"))]
     // i18n-exempt: clap derive help requires a compile-time literal.
     #[command(
-        long_about = "Offline native OMEMO inbox administration. Stop the owning daemon first. Arguments: OP VAULT_ROOT STATE_DIR ALIAS ACCOUNT PEER ID [REVIEW_TOKEN EVIDENCE]. OP is inspect, inspect-release, release-returned, inspect-session, or reset-session. For session operations ID is the peer device ID. A reset requires a fresh review token and evidence; settle pending/uncertain peer ingress and all outbox reservations first."
+        long_about = "Offline native OMEMO inbox administration. Stop the owning daemon first. Arguments: OP VAULT_ROOT STATE_DIR ALIAS ACCOUNT PEER ID [REVIEW_TOKEN EVIDENCE]. OP is inspect, inspect-release, release-returned, inspect-session, reset-session, inspect-outbox, or retire-outbox. For session operations ID is the peer device ID; for outbox operations it is the stanza ID. Retirement requires a fresh review token and evidence and leaves delivery unknown. A reset requires a fresh review token and evidence; settle pending/uncertain peer ingress and all outbox reservations first."
     )]
     XmppInbox {
         #[arg(required = true, num_args = 1..)]

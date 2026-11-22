@@ -250,6 +250,21 @@ before the reader answers them. A full queue drops excess messages before admiss
 logs the overload without disconnecting the alias; it does not report those
 messages as accepted.
 
+### Review an interrupted OMEMO send
+
+Stop the owning daemon and run as the vault/state owner. Review the affected
+stanza against your transport evidence before retiring a reservation.
+
+```sh
+zeroclaw channel xmpp-inbox inspect-outbox VAULT_ROOT STATE_DIR ALIAS ACCOUNT PEER STANZA_ID
+zeroclaw channel xmpp-inbox retire-outbox VAULT_ROOT STATE_DIR ALIAS ACCOUNT PEER STANZA_ID REVIEW_TOKEN EVIDENCE_REFERENCE
+```
+
+The token binds the exact saved envelope and owning account. Retirement stores
+an encrypted operator receipt, frees the reservation and leaves delivery
+unknown. It does not send again, rewind any device ratchet, or change replay
+markers.
+
 ### Peer resets an OMEMO session
 
 If a pinned contact resets its session while retaining the same identity and

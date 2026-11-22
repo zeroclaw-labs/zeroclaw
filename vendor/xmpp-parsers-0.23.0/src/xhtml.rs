@@ -27,22 +27,12 @@ pub struct XhtmlIm {
 impl XhtmlIm {
     /// Serialise formatted text to HTML.
     pub fn into_html(self) -> String {
-        let mut html = Vec::new();
         // TODO: use the best language instead.
-        // XXX: Remove this flag later when fixing the code below
-        #[allow(clippy::never_loop)]
-        for (lang, body) in self.bodies {
-            if lang.is_empty() {
-                assert!(body.xml_lang.is_none());
-            } else {
-                assert_eq!(Some(lang), body.xml_lang);
-            }
-            for tag in body.children {
-                html.push(tag.into_html());
-            }
-            break;
-        }
-        html.concat()
+        self.bodies
+            .into_values()
+            .next()
+            .map(|body| body.children.into_iter().map(Child::into_html).collect())
+            .unwrap_or_default()
     }
 
     /// Removes all unknown elements.
@@ -75,12 +65,8 @@ impl TryFrom<Element> for XhtmlIm {
         let mut bodies = BTreeMap::new();
         for child in elem.children() {
             if child.is("body", ns::XHTML) {
-                let child = child.clone();
-                let lang = child
-                    .attr_ns(rxml::Namespace::xml(), "lang")
-                    .unwrap_or("")
-                    .to_string();
-                let body = Body::try_from(child)?;
+                let body = Body::try_from(child.clone())?;
+                let lang = body.xml_lang.clone().unwrap_or_default();
                 match bodies.insert(lang, body) {
                     None => (),
                     Some(_) => {
@@ -102,14 +88,7 @@ impl TryFrom<Element> for XhtmlIm {
 impl From<XhtmlIm> for Element {
     fn from(wrapper: XhtmlIm) -> Element {
         Element::builder("html", ns::XHTML_IM)
-            .append_all(wrapper.bodies.into_iter().map(|(lang, body)| {
-                if lang.is_empty() {
-                    assert!(body.xml_lang.is_none());
-                } else {
-                    assert_eq!(Some(lang), body.xml_lang);
-                }
-                Element::from(body)
-            }))
+            .append_all(wrapper.bodies.into_values().map(Element::from))
             .build()
     }
 }
@@ -169,7 +148,9 @@ impl TryFrom<Element> for Body {
 
         Ok(Body {
             style: parse_css(elem.attr("style")),
-            xml_lang: elem.attr_ns("xml", "lang").map(ToString::to_string),
+            xml_lang: elem
+                .attr_ns(Namespace::xml(), "lang")
+                .map(ToString::to_string),
             children,
         })
     }
@@ -183,7 +164,7 @@ impl From<Body> for Element {
                 get_style_string(body.style),
             )
             .attr_ns(
-                Into::<Namespace>::into(String::from("xml")),
+                Namespace::xml().clone(),
                 rxml::xml_ncname!("lang").into(),
                 body.xml_lang,
             )
@@ -650,4 +631,29 @@ mod tests {
             })],
         };
     }
+}
+
+#[cfg(test)]
+#[test]
+fn language_tagged_body_renders_and_round_trips() {
+    let body = Element::builder("body", ns::XHTML)
+        .attr_ns(
+            Namespace::xml().clone(),
+            rxml::xml_ncname!("lang").into(),
+            "pt-BR",
+        )
+        .append("example")
+        .build();
+    let original = Element::builder("html", ns::XHTML_IM).append(body).build();
+    let parsed = XhtmlIm::try_from(original).unwrap();
+    assert_eq!(parsed.clone().into_html(), "example");
+    let encoded = Element::from(parsed);
+    assert_eq!(
+        encoded
+            .children()
+            .next()
+            .unwrap()
+            .attr_ns(Namespace::xml(), "lang"),
+        Some("pt-BR")
+    );
 }

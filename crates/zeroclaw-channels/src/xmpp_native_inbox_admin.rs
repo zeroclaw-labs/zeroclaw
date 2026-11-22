@@ -18,6 +18,8 @@ pub fn run(args: &[String]) -> Result<Value> {
                     | "release-returned"
                     | "inspect-session"
                     | "reset-session"
+                    | "inspect-outbox"
+                    | "retire-outbox"
             )
         ),
         "Unknown offline ingress operation"
@@ -25,7 +27,10 @@ pub fn run(args: &[String]) -> Result<Value> {
     let operation = &args[0];
     ensure!(
         args.len()
-            == if matches!(operation.as_str(), "release-returned" | "reset-session") {
+            == if matches!(
+                operation.as_str(),
+                "release-returned" | "reset-session" | "retire-outbox"
+            ) {
                 9
             } else {
                 7
@@ -92,6 +97,18 @@ pub fn run(args: &[String]) -> Result<Value> {
             &cipher,
         );
     }
+    if matches!(operation.as_str(), "inspect-outbox" | "retire-outbox") {
+        let review = (operation == "retire-outbox").then(|| (args[7].as_str(), args[8].as_str()));
+        return recover_outbox(
+            db,
+            account,
+            peer,
+            id,
+            review,
+            &format!("uid:{uid}"),
+            &cipher,
+        );
+    }
     if operation == "inspect-release" {
         let receipt = inbox::inspect_release(db, &cipher, account, peer, id)?;
         return Ok(json!({"operation":operation,"release":receipt}));
@@ -133,6 +150,92 @@ pub fn run(args: &[String]) -> Result<Value> {
 
 // Offline recovery deliberately requires an operator review instead of accepting
 // a replacement ratchet from an unauthenticated network packet.
+fn recover_outbox(
+    db: &mut rusqlite::Connection,
+    account: &str,
+    peer: &str,
+    id: &str,
+    review: Option<(&str, &str)>,
+    operator: &str,
+    cipher: &Arc<dyn InboxCipher>,
+) -> Result<Value> {
+    use crate::xmpp_omemo::{jid::BareJid, store};
+    use sha2::{Digest, Sha256};
+
+    for jid in [account, peer] {
+        let canonical: BareJid = jid.try_into()?;
+        ensure!(
+            canonical.as_str() == jid,
+            "Canonical account and peer required"
+        );
+    }
+    ensure!(!id.is_empty() && id.len() <= 512, "Invalid stanza ID");
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let (_, own, own_device) = store::identity(&tx, account)?;
+    let raw: String = tx.query_row(
+        "SELECT envelope FROM native_omemo_outbox WHERE id=?1",
+        [id],
+        |row| row.get(0),
+    )?;
+    let envelope: store::ReservedEnvelope = serde_json::from_str(&raw)?;
+    ensure!(
+        envelope.id == id
+            && envelope.peer == peer
+            && envelope.sender_fingerprint == own
+            && envelope.sender_device == own_device,
+        "Outbox reservation identity mismatch"
+    );
+    let mut digest = Sha256::new();
+    digest.update(b"zeroclaw-offline-outbox-retire-v1");
+    for value in [account.as_bytes(), raw.as_bytes()] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    let token = hex::encode(digest.finalize());
+    if let Some((expected, evidence)) = review {
+        ensure!(
+            expected == token,
+            "Outbox reservation changed since inspection"
+        );
+        ensure!(
+            !evidence.trim().is_empty()
+                && evidence.len() <= 2048
+                && !evidence.chars().any(char::is_control),
+            "Bounded operator evidence required"
+        );
+        let receipt = zeroize::Zeroizing::new(
+            json!({
+                "account":account,"peer":peer,"stanza_id":id,"operator":operator,
+                "review_token":token,"evidence":evidence,"delivery":"unknown"
+            })
+            .to_string(),
+        );
+        let sealed = cipher.seal(&receipt)?;
+        tx.execute(
+            "INSERT INTO state(key,value) VALUES(?1,?2)",
+            rusqlite::params![
+                format!("native_omemo_outbox_retired/{token}"),
+                serde_json::to_string(&sealed)?
+            ],
+        )?;
+        ensure!(
+            tx.execute(
+                "DELETE FROM native_omemo_outbox WHERE id=?1 AND envelope=?2",
+                rusqlite::params![id, raw]
+            )? == 1,
+            "Outbox reservation changed during retirement"
+        );
+        tx.commit()?;
+        return Ok(json!({"operation":"retire-outbox","retired":true,"delivery":"unknown"}));
+    }
+    tx.commit()?;
+    Ok(json!({
+        "operation":"inspect-outbox","stanza_id":id,"peer":peer,
+        "sender_device":own_device,"recipient_device":envelope.device,
+        "review_token":token,"delivery":"unknown"
+    }))
+}
+
 struct SessionReview {
     prefix: String,
     fingerprint: [u8; 32],
@@ -506,31 +609,48 @@ mod tests {
             "uncertain",
             "unowned_route",
         )?;
-        db.execute(
-            "INSERT INTO native_omemo_outbox(id,envelope) VALUES('uncertain-send','{}')",
-            [],
-        )?;
+        let ratchet_key =
+            format!("omemo//eu.siacs.conversations.axolotl/alice@example.test/1010/double_ratchet");
+        let outbound = store::Outbound {
+            account: "bob@example.test",
+            peer: "alice@example.test",
+            peer_device: 1010,
+            pinned_fingerprint: peer_ed.to_montgomery().to_bytes(),
+            stanza_id: "uncertain-send",
+            plaintext: b"fixture",
+        };
+        store::reserve_send_many(db, outbound, &[(1010, peer_ed.to_montgomery().to_bytes())])?;
+        let reserved_ratchet = store::load(&db.transaction()?, &ratchet_key)?;
         drop(owner);
         let inspect = run(&args)?;
         assert_eq!(inspect["pending_outbox"], 1);
-        assert!(
-            run(&reset_args(&inspect)).is_err(),
-            "uncertain send reservation stays protected"
-        );
+        assert!(run(&reset_args(&inspect)).is_err());
+        let mut outbox = args.clone();
+        outbox[0] = "inspect-outbox".into();
+        outbox[6] = "uncertain-send".into();
+        let view = run(&outbox)?;
+        assert_eq!(view["delivery"], "unknown");
+        assert!(view.get("ciphertext").is_none());
+        let mut retire = outbox;
+        retire[0] = "retire-outbox".into();
+        retire.push("00".repeat(32));
+        retire.push("reviewed transport interruption".into());
+        assert!(run(&retire).is_err());
+        retire[7] = view["review_token"].as_str().unwrap().to_string();
+        assert_eq!(run(&retire)?["retired"], true);
+        assert!(run(&retire).is_err());
         let mut owner = PrivateStore::open_existing(&state)?;
         let db = owner.connection();
         assert_eq!(
-            db.query_row(
-                "SELECT envelope FROM native_omemo_outbox WHERE id='uncertain-send'",
-                [],
-                |r| r.get::<_, String>(0)
-            )?,
-            "{}"
+            store::load(&db.transaction()?, &ratchet_key)?,
+            reserved_ratchet
         );
-        db.execute(
-            "DELETE FROM native_omemo_outbox WHERE id='uncertain-send'",
+        let count: u32 = db.query_row(
+            "SELECT count(*) FROM state WHERE key LIKE 'native_omemo_outbox_retired/%'",
             [],
-        )?; // fixture reconciles its own synthetic send
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 1);
         drop(owner);
         let inspect = run(&args)?;
         let mut wrong = reset_args(&inspect);
