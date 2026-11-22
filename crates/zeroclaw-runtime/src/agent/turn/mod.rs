@@ -4421,6 +4421,22 @@ fn build_owned_step_system_prompt(
     )
 }
 
+/// Keeps a same-agent step's completed delta when its future is cancelled.
+/// The child starts with an empty buffer, so it cannot resync the parent's
+/// earlier messages into its working history.
+struct SopStepMessages<'a> {
+    messages: Vec<ChatMessage>,
+    parent: Option<&'a mut Vec<ChatMessage>>,
+}
+
+impl Drop for SopStepMessages<'_> {
+    fn drop(&mut self) {
+        if let Some(parent) = self.parent.as_deref_mut() {
+            parent.append(&mut self.messages);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_live_sop_actions(
     queued_actions: Vec<crate::sop::executor::QueuedSopAction>,
@@ -4700,10 +4716,10 @@ async fn drive_live_sop_actions(
 
                     let nested_turn_id = format!("sop:{run_id}:step:{}", step.number);
                     let step_call_sink = crate::sop::executor::new_step_call_sink();
-                    // Empty buffer for same-agent child loops: populated by
-                    // the child's dual-write, then replayed to the parent's
-                    // new_messages_out after the child returns (§3.2.4).
-                    let mut inner_new_msgs: Vec<ChatMessage> = Vec::new();
+                    let mut inner_new_msgs = SopStepMessages {
+                        messages: Vec::new(),
+                        parent: new_messages_out.as_deref_mut(),
+                    };
                     let step_output = if let Some(err) = assembly_error {
                         // Fail closed: never run a delegated step with the parent
                         // agent's broader context when the step agent's own
@@ -4993,15 +5009,15 @@ async fn drive_live_sop_actions(
                                     // the child loop's one-time clone-and-append
                                     // does not sync the parent's accumulated
                                     // messages into the child's nested_history.
-                                    // After the child returns, replay its buffer
-                                    // back to the parent's new_messages_out.
+                                    // The scope guard forwards completed rows
+                                    // even if cancellation drops this future.
                                     // Cross-agent: None (child transcript does
                                     // not flow into the parent's persisted
                                     // conversation; only the final output does).
                                     new_messages_out: if owned.is_some() {
                                         None
                                     } else {
-                                        Some(&mut inner_new_msgs)
+                                        Some(&mut inner_new_msgs.messages)
                                     },
                                     image_cache: nested_image_state,
                                     memory: None,
@@ -5031,13 +5047,6 @@ async fn drive_live_sop_actions(
                                 )
                             )
                             .await;
-                            // Replay child loop's new messages to the parent's
-                            // new_messages_out for same-agent steps (§3.2.4).
-                            if owned.is_none()
-                                && let Some(outer) = new_messages_out.as_deref_mut()
-                            {
-                                outer.extend_from_slice(&inner_new_msgs);
-                            }
                             // A same-agent step ran over the parent
                             // transcript: adopt whatever breadcrumb state the
                             // sub-loop's trim paths left behind.
@@ -5047,6 +5056,7 @@ async fn drive_live_sop_actions(
                             step_result
                         }
                     };
+                    drop(inner_new_msgs);
                     // A cross-agent step's final output flows back into the
                     // parent transcript (and new-message capture) so the outer
                     // conversation stays coherent; the reverse direction — the
@@ -5245,6 +5255,46 @@ fn refresh_prompt_anchor(history: &mut [ChatMessage], use_native_tools: bool) {
 mod surface3_tests {
     use super::*;
     use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
+
+    #[tokio::test]
+    async fn cancelled_same_agent_sop_keeps_completed_results_once() {
+        let mut retained = vec![ChatMessage::user("original inbound")];
+        let (ready, completed) = tokio::sync::oneshot::channel();
+        let mut child = Box::pin(async {
+            let mut capture = SopStepMessages {
+                messages: Vec::new(),
+                parent: Some(&mut retained),
+            };
+            // A result is recorded before completion-progress delivery waits.
+            capture
+                .messages
+                .push(ChatMessage::tool("completed operation"));
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        tokio::select! {
+            () = &mut child => panic!("completion delivery should still be blocked"),
+            result = completed => result.unwrap(),
+        }
+        drop(child);
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].content, "original inbound");
+        assert_eq!(retained[1].role, "tool");
+        assert_eq!(retained[1].content, "completed operation");
+        {
+            let mut next = SopStepMessages {
+                messages: Vec::new(),
+                parent: Some(&mut retained),
+            };
+            assert!(
+                next.messages.is_empty(),
+                "the next step must not replay the parent delta"
+            );
+            next.messages.push(ChatMessage::tool("next operation"));
+        }
+        assert_eq!(retained.len(), 3);
+        assert_eq!(retained[2].content, "next operation");
+    }
 
     #[test]
     fn single_tool_prompt_changes_only_owned_protocol_and_is_idempotent() {
