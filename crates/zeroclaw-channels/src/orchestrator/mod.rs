@@ -1758,6 +1758,12 @@ fn conversation_history_key_in_scope(
     channel_scope: &str,
     matrix_thread_scoped: bool,
 ) -> String {
+    if matrix_thread_scoped
+        && msg.conversation_scope == zeroclaw_api::channel::ChannelConversationScope::Sender
+        && let Some(root) = msg.thread_ts.as_deref()
+    {
+        return matrix_thread_history_key(msg, channel_scope, root);
+    }
     let thread_scope = match msg.thread_ts.as_deref() {
         // Matrix thread_ts is a delivery anchor, not a topic boundary: root
         // and follow-ups share one sender+room session unless the alias opted
@@ -1777,6 +1783,34 @@ fn conversation_history_key_in_scope(
         }
     };
     sanitize_session_key(&raw)
+}
+
+/// History key for a `room_sender_thread` Matrix session.
+///
+/// The default `_`-joined, sanitized shape is not injective: sanitizing maps
+/// every Matrix sigil, `:` and `.` to `_`, so `($root_, @alice)` and
+/// `($root, @_alice)` would share one transcript. The thread root is
+/// sender-controlled (`m.relates_to.event_id`), so this namespace hashes the
+/// length-prefixed raw components instead. The digest also keeps the key a
+/// fixed, filename-safe length; the readable thread root and sender live in
+/// the session metadata stamped by `stamp_session_routing_context`.
+fn matrix_thread_history_key(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    channel_scope: &str,
+    thread_root: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let target = &msg.reply_target;
+    let sender = &msg.sender;
+    let identity = format!(
+        "{}:{channel_scope}:{}:{target}:{}:{thread_root}:{}:{sender}",
+        channel_scope.len(),
+        target.len(),
+        thread_root.len(),
+        sender.len()
+    );
+    let digest = hex::encode(Sha256::digest(identity.as_bytes()));
+    sanitize_session_key(&format!("{channel_scope}_thread_{digest}"))
 }
 
 /// History key with every channel's default thread semantics. Runtime paths
@@ -40072,7 +40106,11 @@ BTC is currently around $65,000 based on latest tool output."#
         let key_a = runtime_conversation_history_key(&ctx, &root_a);
         assert_eq!(key_a, runtime_conversation_history_key(&ctx, &follow_a));
         assert_ne!(key_a, runtime_conversation_history_key(&ctx, &root_b));
-        assert_eq!(key_a, "matrix_home__room_server__a_server__alice_server");
+        // Pinned: changing the encoding orphans stored thread sessions.
+        assert_eq!(
+            key_a,
+            "matrix_home_thread_13b14e1d6fbb85afb71cbf0411b72ed389f3d866641c166515282c83e2ca0d13"
+        );
         assert!(
             !key_a.contains("a2"),
             "a follow-up's own event id must never enter the session key"
@@ -40168,7 +40206,12 @@ BTC is currently around $65,000 based on latest tool output."#
             Arc::new(SqliteSessionBackend::new(store_dir.path()).unwrap());
         let ctx = matrix_scope_ctx(&live, Some(Arc::clone(&store)));
         let room_sender_key = "matrix_home__room_server__alice_server";
-        let thread_key = "matrix_home__room_server__a_server__alice_server";
+        let thread_key = matrix_thread_history_key(
+            &matrix_message("$a2:server", None, ""),
+            "matrix.home",
+            "$a:server",
+        );
+        let thread_key = thread_key.as_str();
 
         // An existing installation: history already lives under room+sender.
         record_passive(
@@ -40344,6 +40387,62 @@ BTC is currently around $65,000 based on latest tool output."#
             reopened.load(&key_b).len(),
             1,
             "/new inside thread A must keep thread B's durable transcript"
+        );
+    }
+
+    /// Sanitizing the `_`-joined room/root/sender shape maps both of these
+    /// (root, sender) pairs to one string; the thread key must keep them apart
+    /// for hydration, persistence and `/new`.
+    #[tokio::test]
+    async fn matrix_thread_scope_keys_do_not_collide_across_component_boundaries() {
+        let live = zeroclaw_config::live::LiveConfig::new(matrix_scope_config(
+            zeroclaw_config::schema::MatrixSessionScope::RoomSenderThread,
+        ));
+        let store_dir = TempDir::new().unwrap();
+        let store: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(store_dir.path()).unwrap());
+        let ctx = matrix_scope_ctx(&live, Some(Arc::clone(&store)));
+        let victim = ChannelMessage {
+            sender: "@_alice:example.org".into(),
+            ..matrix_message("$v:server", Some("$actualRoot"), "victim turn")
+        };
+        let other = ChannelMessage {
+            sender: "@alice:example.org".into(),
+            ..matrix_message("$o:server", Some("$actualRoot_"), "other turn")
+        };
+        assert_eq!(
+            sanitize_session_key(&format!(
+                "matrix.home_{}_{}_{}",
+                victim.reply_target, "$actualRoot", victim.sender
+            )),
+            sanitize_session_key(&format!(
+                "matrix.home_{}_{}_{}",
+                other.reply_target, "$actualRoot_", other.sender
+            )),
+            "precondition: the naive joined shape collides"
+        );
+        let victim_key = runtime_conversation_history_key(&ctx, &victim);
+        let other_key = runtime_conversation_history_key(&ctx, &other);
+        assert_ne!(victim_key, other_key);
+
+        record_passive(&ctx, &victim).await;
+        record_passive(&ctx, &other).await;
+        assert_eq!(store.load(&victim_key).len(), 1);
+        assert_eq!(store.load(&other_key).len(), 1);
+
+        let reset = ChannelMessage {
+            content: "/new".into(),
+            id: "$reset:server".into(),
+            ..other.clone()
+        };
+        let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+        assert!(handle_runtime_command_if_needed(&ctx, &reset, Some(&channel)).await);
+        let reopened = SqliteSessionBackend::new(store_dir.path()).unwrap();
+        assert!(reopened.load(&other_key).is_empty());
+        assert_eq!(
+            reopened.load(&victim_key).len(),
+            1,
+            "another sender's /new must not reset the victim's thread history"
         );
     }
 
