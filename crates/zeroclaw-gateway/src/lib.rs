@@ -3327,12 +3327,16 @@ fn public_health_snapshot() -> serde_json::Value {
 }
 
 /// GET /health — always public (no secrets leaked)
-async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
+async fn handle_health(
+    State(state): State<AppState>,
+    cutover: Option<axum::Extension<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>>,
+) -> impl IntoResponse {
     let body = serde_json::json!({
         "status": "ok",
         "paired": state.pairing.is_paired(),
         "require_pairing": state.pairing.require_pairing(),
         "runtime": public_health_snapshot(),
+        "chat_transport": if cutover.is_some() { "acp" } else { "legacy" },
     });
     Json(body)
 }
@@ -6233,7 +6237,7 @@ mod tests {
         zeroclaw_runtime::health::mark_component_error(&component, sensitive_error);
 
         let tmp = tempfile::TempDir::new().unwrap();
-        let response = handle_health(State(admin_paircode_state(&tmp, false, false)))
+        let response = handle_health(State(admin_paircode_state(&tmp, false, false)), None)
             .await
             .into_response();
         assert_eq!(response.status(), StatusCode::OK);

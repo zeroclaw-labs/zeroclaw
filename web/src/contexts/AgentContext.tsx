@@ -1339,85 +1339,6 @@ export function AgentProvider({
     setContextInput(EMPTY_CONTEXT_INPUT);
   }, [foldTurnStream]);
 
-  const clearAllMessages = useCallback(() => {
-    resetTranscriptState();
-
-    if (perSocket) {
-      // A new conversation: close this one (the gateway closes it with its
-      // socket) and wait for the message that starts the next. Nothing is
-      // deleted.
-      pendingSendRef.current = null;
-      conversationIdRef.current = null;
-      setConversationLimited(false);
-      setError(null);
-      const oldWs = wsRef.current;
-      if (oldWs) {
-        oldWs.onOpen = null;
-        oldWs.onClose = null;
-        oldWs.onError = null;
-        oldWs.onMessage = null;
-        oldWs.disconnect();
-      }
-      wsRef.current = null;
-      setConnected(false);
-      setStartsConversationOnSend(true);
-      return;
-    }
-
-    const sid = activeSessionIdRef.current;
-    // Socket identity at the moment of the clear. If it changes while the
-    // delete is in flight, a session switch (or another rebuild) has taken over
-    // and this closure must not resurrect a connection for the old session.
-    const wsAtClear = wsRef.current;
-
-    // The live WebSocket Agent holds the full conversation in memory for the
-    // life of the connection, and the gateway persists each turn to the
-    // session backend. Clearing only React state leaves both intact, so the
-    // next turn still carries prior context and a reload/reconnect repopulates
-    // the old transcript (issue #7126). To genuinely reset context we must:
-    //   1. delete the persisted backend session history, and
-    //   2. tear down + reconnect the socket so the gateway builds a fresh
-    //      Agent that seeds from the now-empty backend.
-    void (async () => {
-      try {
-        // Reuses the existing DELETE /api/sessions/{id} primitive
-        // (gateway -> SessionBackend::delete_session). Best-effort: a 404 when
-        // session persistence is disabled, or any transport failure, must not
-        // block the local clear or the reconnect below.
-        await sessionRuntimeRef.current.delete(sid);
-      } catch {
-        // Persistence disabled or request failed — proceed with the reconnect
-        // so the live in-memory context is reset regardless.
-      }
-
-      if (wsRef.current !== wsAtClear) return;
-
-      // Rebuild the socket so the backend constructs a new Agent with no seeded
-      // history. Detach the old socket's callbacks first so its onClose does
-      // not write stale connection state. If there is no socket (disconnected),
-      // the alias-bound effect will reconnect on its own — nothing to do here.
-      const oldWs = wsRef.current;
-      if (oldWs) {
-        oldWs.onOpen = null;
-        oldWs.onClose = null;
-        oldWs.onError = null;
-        oldWs.onMessage = null;
-        oldWs.disconnect();
-
-        const ws = sessionRuntimeRef.current.createSocket({
-          agentAlias,
-          sessionId: activeSessionIdRef.current,
-          autoReconnect: !perSocket,
-        });
-        // Assign wsRef before connect() so a synchronous throw can't strand the
-        // page on the old intentionally-closed socket (see switchModel).
-        wsRef.current = ws;
-        attachSocketCallbacks(ws);
-        ws.connect();
-      }
-    })();
-  }, [agentAlias, attachSocketCallbacks, foldTurnStream, perSocket]);
-
   const addLocalMessage = useCallback((content: string) => {
     localMessageMutationVersionRef.current += 1;
     setMessages((prev) => [
@@ -1480,6 +1401,92 @@ export function AgentProvider({
     onSessionChange?.(nextSessionId);
     return true;
   }, [agentAlias, onSessionChange, resetTranscriptState, abortLiveSession]);
+
+  const clearAllMessages = useCallback(() => {
+    resetTranscriptState();
+
+    if (perSocket) {
+      // A new conversation: close this one (the gateway closes it with its
+      // socket) and wait for the message that starts the next. Nothing is
+      // deleted.
+      pendingSendRef.current = null;
+      conversationIdRef.current = null;
+      setConversationLimited(false);
+      setError(null);
+      const oldWs = wsRef.current;
+      if (oldWs) {
+        oldWs.onOpen = null;
+        oldWs.onClose = null;
+        oldWs.onError = null;
+        oldWs.onMessage = null;
+        oldWs.disconnect();
+      }
+      wsRef.current = null;
+      setConnected(false);
+      setStartsConversationOnSend(true);
+      return;
+    }
+
+    const sid = activeSessionIdRef.current;
+    // Socket identity at the moment of the clear. If it changes while the
+    // delete is in flight, a session switch (or another rebuild) has taken over
+    // and this closure must not resurrect a connection for the old session.
+    const wsAtClear = wsRef.current;
+
+    // The live WebSocket Agent holds the full conversation in memory for the
+    // life of the connection, and the gateway persists each turn to the
+    // session backend. Clearing only React state leaves both intact, so the
+    // next turn still carries prior context and a reload/reconnect repopulates
+    // the old transcript (issue #7126). To genuinely reset context we must:
+    //   1. delete the persisted backend session history, and
+    //   2. tear down + reconnect the socket so the gateway builds a fresh
+    //      Agent that seeds from the now-empty backend.
+    void (async () => {
+      try {
+        // Reuses the existing DELETE /api/sessions/{id} primitive
+        // (gateway -> SessionBackend::delete_session). Best-effort: a 404 when
+        // session persistence is disabled, or any transport failure, must not
+        // block the local clear or the reconnect below.
+        await sessionRuntimeRef.current.delete(sid);
+        if (wsAtClear instanceof AcpChatSocket) {
+          removeChatHistory(sid);
+          if (wsRef.current === wsAtClear && activeSessionIdRef.current === sid) {
+            transitionToSession(sessionRuntimeRef.current.mintId(), true);
+          }
+          return;
+        }
+      } catch {
+        // Persistence disabled or request failed — proceed with the reconnect
+        // so the live in-memory context is reset regardless.
+      }
+
+      if (wsRef.current !== wsAtClear) return;
+
+      // Rebuild the socket so the backend constructs a new Agent with no seeded
+      // history. Detach the old socket's callbacks first so its onClose does
+      // not write stale connection state. If there is no socket (disconnected),
+      // the alias-bound effect will reconnect on its own — nothing to do here.
+      const oldWs = wsRef.current;
+      if (oldWs) {
+        oldWs.onOpen = null;
+        oldWs.onClose = null;
+        oldWs.onError = null;
+        oldWs.onMessage = null;
+        oldWs.disconnect();
+
+        const ws = sessionRuntimeRef.current.createSocket({
+          agentAlias,
+          sessionId: activeSessionIdRef.current,
+          autoReconnect: !perSocket,
+        });
+        // Assign wsRef before connect() so a synchronous throw can't strand the
+        // page on the old intentionally-closed socket (see switchModel).
+        wsRef.current = ws;
+        attachSocketCallbacks(ws);
+        ws.connect();
+      }
+    })();
+  }, [agentAlias, attachSocketCallbacks, perSocket, resetTranscriptState, transitionToSession]);
 
   const goToSession = useCallback((nextSessionId: string): boolean => (
     transitionToSession(nextSessionId)

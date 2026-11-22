@@ -19,6 +19,20 @@ export default defineConfig(({ command }) => ({
   plugins: [
     react(),
     tailwindcss(),
+    {
+      name: "zeroclaw-dev-chat-transport",
+      apply: "serve",
+      async transformIndexHtml() {
+        // The gateway owns the transport choice even when Vite serves the HTML.
+        const response = await fetch(new URL("/health", gatewayTarget), { signal: AbortSignal.timeout(2000) })
+          .catch(() => null);
+        if (!response?.ok) return;
+        const health = await response.json();
+        if (health.chat_transport === "acp") {
+          return [{ tag: "meta", attrs: { name: "zeroclaw-chat-transport", content: "acp" }, injectTo: "head" }];
+        }
+      },
+    },
     // Dev-only: the production gateway serves static assets under `/_app/*` by
     // stripping that prefix and reading from `web/dist/` (see
     // crates/zeroclaw-gateway/src/static_files.rs). Vite dev doesn't know about
