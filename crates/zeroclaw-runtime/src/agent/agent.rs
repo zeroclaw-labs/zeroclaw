@@ -18286,6 +18286,90 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn non_streamed_turn_forwards_session_agent_to_task_helper() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        if let Some(capture) = std::env::var_os("ZEROCLAW_TEST_NONSTREAMED_SSH_CAPTURE") {
+            let provider = Box::new(TranscriptCaptureModelProvider {
+                alias: "session-agent".into(),
+                responses: Mutex::new(
+                    (0..2)
+                        .map(|_| zeroclaw_providers::ChatResponse {
+                            text: Some("done".into()),
+                            tool_calls: vec![],
+                            usage: None,
+                            reasoning_content: None,
+                        })
+                        .collect(),
+                ),
+                seen_messages: Arc::new(Mutex::new(Vec::new())),
+            });
+            let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..Default::default()
+            };
+            let mut agent = Agent::builder()
+                .model_provider(provider)
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
+                .memory(Arc::from(
+                    zeroclaw_memory::create_memory(&memory_cfg, directory.path(), None).unwrap(),
+                ))
+                .observer(Arc::new(crate::observability::NoopObserver {}))
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(directory.path().into())
+                .build()
+                .unwrap();
+            for socket in [
+                "/synthetic/session-a/agent.sock",
+                "/synthetic/session-b/agent.sock",
+            ] {
+                agent.forwarded_environment = Some(Arc::new(std::collections::HashMap::from([(
+                    "SSH_AUTH_SOCK".into(),
+                    socket.into(),
+                )])));
+                assert_eq!(agent.turn("synthetic request").await.unwrap(), "done");
+                assert_eq!(std::fs::read_to_string(&capture).unwrap(), socket);
+                assert!(zeroclaw_tools::task_ssh::current().is_none());
+            }
+            return;
+        }
+        // Run with an isolated process environment: other tests must never
+        // inherit the synthetic helper or either session's agent socket.
+        let helper = directory.path().join("helper");
+        std::fs::write(&helper, "#!/bin/sh\nprintf '%s' \"$SSH_AUTH_SOCK\" > \"$ZEROCLAW_TEST_NONSTREAMED_SSH_CAPTURE\"\nprintf '{\"ready\":true,\"state_dir\":\"/tmp\"}\\n'\ncat >/dev/null\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (_, module) = module_path!().split_once("::").unwrap();
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                &format!("{module}::non_streamed_turn_forwards_session_agent_to_task_helper"),
+                "--nocapture",
+            ])
+            .env("ZEROCLAW_SSH_TASK_HELPER", &helper)
+            .env(
+                "ZEROCLAW_TEST_NONSTREAMED_SSH_CAPTURE",
+                directory.path().join("captured-agent"),
+            )
+            .env("SSH_AUTH_SOCK", "/synthetic/wrong-inherited-agent.sock")
+            .kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(30), child.output())
+            .await
+            .expect("non-streamed agent child must finish")
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
     /// Steering sent while a tool runs reaches the model at the very next
     /// step of the same turn, after that tool's result, not after the model's
     /// final answer.
