@@ -92,6 +92,7 @@ rand = "0.10"
 libc = "0.2"
 
 [dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 # A plain HTTP/2 (h2c) client for the connection-drain tests.
 h2 = "0.4"
 zeroclaw-config = { workspace = true, features = ["test-helpers"] }

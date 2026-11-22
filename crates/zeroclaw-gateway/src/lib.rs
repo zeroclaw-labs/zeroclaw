@@ -2125,23 +2125,29 @@ pub async fn run_gateway_with_plugin_webhooks(
         None
     };
 
-    let session_backend = if config.gateway.acp_webchat_cutover {
+    let cutover_store = if config.gateway.acp_webchat_cutover {
         let legacy = session_backend.as_deref().ok_or_else(|| {
             anyhow::Error::msg("ACP WebChat cutover requires an available legacy session backend")
         })?;
         // The listener is bound but the router is not serving yet. With the
         // previous gateway stopped, no legacy chat writes can race the copy.
-        zeroclaw_infra::acp_session_store::AcpSessionStore::new(&config.data_dir)?
-            .import_legacy_gateway_sessions(legacy, |persisted| {
-                let alias = zeroclaw_channels::orchestrator::acp_server::AcpServer::resolve_restore_agent_alias(&config, persisted.unwrap_or(""));
-                let workspace = config.agent_workspace_dir(&alias);
-                (alias,workspace)
-            })?;
-        // Legacy REST and webhook handlers must no longer write to this store.
-        None
+        let store = Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(
+            &config.data_dir,
+        )?);
+        store.import_legacy_gateway_sessions(legacy, |persisted| {
+            let alias =
+                zeroclaw_channels::orchestrator::acp_server::AcpServer::resolve_restore_agent_alias(
+                    &config,
+                    persisted.unwrap_or(""),
+                );
+            let workspace = config.agent_workspace_dir(&alias);
+            (alias, workspace)
+        })?;
+        Some(store)
     } else {
-        session_backend
+        None
     };
+    let session_backend = session_backend.filter(|_| cutover_store.is_none());
 
     // ── Pairing guard ──────────────────────────────────────
     // Supervised runs share the daemon's live authority so pairing and
@@ -2884,6 +2890,12 @@ pub async fn run_gateway_with_plugin_webhooks(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
         ));
+
+    let inner = if let Some(store) = cutover_store {
+        inner.layer(axum::Extension(store))
+    } else {
+        inner
+    };
 
     // The dashboard image upload lives on its own sub-router so it can opt out
     // of the 64 KB gateway-wide RequestBodyLimitLayer, which is sized for JSON
@@ -6569,7 +6581,7 @@ path = "{trigger_path}"
         path: &'static str,
         state: AppState,
     ) -> axum::response::Response {
-        static_files::handle_spa_fallback(State(state), Uri::from_static(path)).await
+        static_files::handle_spa_fallback(State(state), None, Uri::from_static(path)).await
     }
 
     async fn static_route_response(

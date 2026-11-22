@@ -6,6 +6,7 @@ import type {
   WsMessage,
 } from '@/types/api';
 import {
+  WebSocketClient,
   WS_CLOSE_ACCESS_LOST,
   WS_CLOSE_CONVERSATION_CLOSED,
   WS_CLOSE_CONVERSATION_LIMIT,
@@ -261,7 +262,9 @@ export interface AgentSessionRuntime {
 }
 
 const defaultSessionRuntime: AgentSessionRuntime = {
-  createSocket: (options) => new AcpChatSocket(options),
+  createSocket: (options) => document.querySelector?.('meta[name="zeroclaw-chat-transport"]')?.getAttribute('content') === 'acp'
+    ? new AcpChatSocket(options)
+    : new WebSocketClient(options),
   getMessages: getSessionMessages,
   delete: deleteSession,
   rename: renameSession,

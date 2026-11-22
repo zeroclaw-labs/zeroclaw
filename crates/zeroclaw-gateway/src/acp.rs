@@ -500,7 +500,10 @@ async fn handle_socket(
                             line = frame.payload;
                         }
                         let generation = hub_for_output.queue.advance_generation(&sid);
-                        output_generations.lock().unwrap_or_else(|e|e.into_inner()).insert(sid.clone(),generation);
+                        output_generations
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(sid.clone(), generation);
                         hub_for_output.finish_turn(&sid);
                     }
                 }
@@ -978,7 +981,8 @@ mod tests {
 
         let url = format!("ws://127.0.0.1:{port}/acp");
         if cutover {
-            let legacy = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/chat")).await;
+            let legacy =
+                tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws/chat")).await;
             assert!(
                 matches!(
                     legacy,
@@ -1045,6 +1049,59 @@ mod tests {
         .await
         .expect("session response should arrive before timeout");
 
+        if cutover {
+            let client = reqwest::Client::new();
+            let sessions_url = format!("http://127.0.0.1:{port}/api/sessions");
+            let session_url = format!("{sessions_url}/team_alpha");
+            let history: serde_json::Value = client
+                .get(format!("{session_url}/messages"))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(history["messages"][1]["content"], "legacy answer");
+            client
+                .put(&session_url)
+                .json(&serde_json::json!({"name":"Restored chat"}))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            let list: serde_json::Value = client
+                .get(&sessions_url)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(list["sessions"][0]["name"], "Restored chat");
+            client
+                .delete(&session_url)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            let list: serde_json::Value = client
+                .get(&sessions_url)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(list["sessions"], serde_json::json!([]));
+        }
         shutdown_tx.send(true).ok();
         server.abort();
 

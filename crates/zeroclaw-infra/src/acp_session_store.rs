@@ -1441,7 +1441,7 @@ impl AcpSessionStore {
     /// Stale projected counts are rescored from the rows first, so the listing
     /// never reports a cache another writer left behind.
     pub fn list_sessions(&self) -> Result<Vec<AcpSessionSummary>> {
-        self.list_live_sessions(None)
+        self.list_live_sessions(None, None)
             .map(|rows| rows.into_iter().map(|(summary, _)| summary).collect())
     }
 
@@ -1449,12 +1449,64 @@ impl AcpSessionStore {
         &self,
         owner: Option<&str>,
     ) -> Result<Vec<(AcpSessionSummary, Option<String>)>> {
-        self.list_live_sessions(Some(owner))
+        self.list_live_sessions(Some(owner), None)
+    }
+
+    /// Live operator dashboard conversations, excluding IDE and principal-owned sessions.
+    pub fn operator_webchats(&self) -> Result<Vec<(AcpSessionSummary, Option<String>)>> {
+        self.list_live_sessions(Some(None), Some("webchat"))
+    }
+
+    /// Read the visible dashboard transcript in persistence order with its original timestamps.
+    pub fn operator_webchat_history(
+        &self,
+        id: &str,
+    ) -> Result<Vec<crate::session_backend::TimestampedMessage>> {
+        let conn = self.conn.lock();
+        let mut query = conn.prepare("SELECT m.role,m.content,m.created_at FROM acp_messages m JOIN acp_sessions s ON s.id=m.session_id WHERE s.session_uuid=?1 AND s.principal_id IS NULL AND s.killed_at IS NULL AND s.interaction_surface='webchat' AND m.role IN ('user','assistant') ORDER BY m.id")?;
+        let rows = query.query_map([id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (role, content, ts) = row?;
+            Ok(crate::session_backend::TimestampedMessage {
+                message: if role == "user" {
+                    ChatMessage::user(content)
+                } else {
+                    ChatMessage::assistant(content)
+                },
+                created_at: Some(parse_ts(&ts, "created_at", id)),
+            })
+        })
+        .collect()
+    }
+
+    /// Rename only an active operator WebChat in the same statement that checks its scope.
+    pub fn rename_operator_webchat(&self, id: &str, name: &str) -> Result<bool> {
+        Ok(self.conn.lock().execute("UPDATE acp_sessions SET name=?2 WHERE session_uuid=?1 AND principal_id IS NULL AND killed_at IS NULL AND interaction_surface='webchat'",params![id,name])? == 1)
+    }
+
+    /// Erase the conversation while reserving its ID so a repeated legacy import cannot resurrect it.
+    pub fn delete_operator_webchat(&self, id: &str) -> Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deleted=tx.execute("DELETE FROM acp_sessions WHERE session_uuid=?1 AND principal_id IS NULL AND killed_at IS NULL AND interaction_surface='webchat'",[id])?;
+        if deleted == 1 {
+            let now = Utc::now().to_rfc3339();
+            tx.execute("INSERT INTO acp_sessions(session_uuid,agent_alias,workspace_dir,killed_at,created_at,last_activity) VALUES(?1,'','',?2,?2,?2)", params![id,now])?;
+        }
+        tx.commit()?;
+        Ok(deleted == 1)
     }
 
     fn list_live_sessions(
         &self,
         owner_filter: Option<Option<&str>>,
+        surface: Option<&str>,
     ) -> Result<Vec<(AcpSessionSummary, Option<String>)>> {
         let mut conn = self.conn.lock();
         Self::refresh_stale_projected_counts(&mut conn, ProjectedCountScope::Live)?;
@@ -1470,14 +1522,14 @@ impl AcpSessionStore {
                         s.principal_id,
                         s.name
                  FROM acp_sessions s
-                 WHERE s.killed_at IS NULL AND (NOT ?1 OR s.principal_id IS ?2)
+                 WHERE s.killed_at IS NULL AND (NOT ?1 OR s.principal_id IS ?2) AND (?3 IS NULL OR s.interaction_surface = ?3)
                  ORDER BY s.last_activity DESC, s.session_uuid",
             )
             .context("Failed to prepare ACP session list query")?;
 
         let rows = stmt
             .query_map(
-                params![owner_filter.is_some(), owner_filter.flatten()],
+                params![owner_filter.is_some(), owner_filter.flatten(), surface],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,

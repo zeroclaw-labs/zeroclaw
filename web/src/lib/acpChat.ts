@@ -161,6 +161,7 @@ export class AcpChatSocket {
   private currentDelay: number;
   private generation = 0;
   private activePrompt = false;
+  private interruptedPrompt = false;
   private readonly permissions = new Map<string, PendingPermission>();
   private readonly agentAlias: string;
   private readonly sessionId: string;
@@ -196,6 +197,7 @@ export class AcpChatSocket {
       },
       onClose: (event) => {
         if (this.generation !== generation) return;
+        this.interruptedPrompt ||= this.activePrompt;
         this.ready = false;
         this.permissions.clear();
         this.onClose?.(event);
@@ -212,6 +214,26 @@ export class AcpChatSocket {
       },
       onNotification: (notification) => {
         if (this.generation !== generation || !this.matchesSession(notification.params)) return;
+        if (notification.method === '_zeroclaw/turn_complete') {
+          this.activePrompt = false;
+          const params = record(notification.params);
+          if (params?.error) {
+            this.onMessage?.({
+              type: 'error',
+              code: 'PROVIDER_ERROR',
+              message: stringValue(record(params.error)?.message),
+            });
+          } else if (params?.result) {
+            const result = params.result as AcpSessionPromptResult;
+            if (result.stopReason === 'cancelled') this.onMessage?.({ type: 'aborted' });
+            this.onMessage?.(acpPromptResultToWsMessage(result));
+          }
+          return;
+        }
+        if (notification.method === '_zeroclaw/replay_gap') {
+          client.disconnect();
+          return;
+        }
         const message = acpNotificationToWsMessage(notification);
         if (message) this.onMessage?.(message);
       },
@@ -220,7 +242,7 @@ export class AcpChatSocket {
       },
     });
     this.client = client;
-    client.connect();
+    client.connect(this.agentAlias);
   }
 
   disconnect(): void {
@@ -272,6 +294,7 @@ export class AcpChatSocket {
     }).catch((error: unknown) => {
       if (this.generation !== generation) return;
       this.activePrompt = false;
+      if (!client.connected) return;
       const code = error instanceof AcpError && error.code === ACP_SESSION_LIMIT_REACHED
         ? 'CONVERSATION_LIMIT'
         : 'PROVIDER_ERROR';
@@ -342,6 +365,17 @@ export class AcpChatSocket {
         }
       }
       if (this.generation !== generation) return;
+      if (resumedExisting) {
+        const attachment = await client.request<{ inFlight: boolean }>('_zeroclaw/session/reattach', {
+          sessionId: this.sessionId,
+          afterSeq: 0,
+          activeOnly: !this.interruptedPrompt,
+          acceptPartial: true,
+        });
+        if (this.generation !== generation) return;
+        this.activePrompt = attachment.inFlight;
+        this.interruptedPrompt = false;
+      }
       this.ready = true;
       this.onOpen?.();
       this.onMessage?.({
@@ -350,14 +384,6 @@ export class AcpChatSocket {
         resumed: messageCount > 0,
         message_count: messageCount,
       });
-      if (resumedExisting) {
-        void client.request('_zeroclaw/session/reattach', {
-          sessionId: this.sessionId,
-          afterSeq: 0,
-        }).catch(() => {
-          // Best-effort reattach; standalone/older servers without reattach continue normally.
-        });
-      }
     } catch (error) {
       if (this.generation !== generation) return;
       if (error instanceof AcpError && error.code === ACP_SESSION_LIMIT_REACHED) {
