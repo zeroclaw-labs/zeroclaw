@@ -563,6 +563,7 @@ impl AcpServer {
     }
 
     fn apply_session_policy_to_agent(
+        &self,
         config: &Config,
         agent_alias: &str,
         agent: &mut Agent,
@@ -576,7 +577,21 @@ impl AcpServer {
         }
         if policy.seed_external_channels {
             let ch = agent.channel_handles();
-            for (name, channel) in super::live_channel_map_for_agent(config, agent_alias) {
+            let published = super::CRON_CHANNEL_REGISTRY
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let available = published.unwrap_or_else(|| {
+                let live = match &self.config_source {
+                    ConfigSource::Live(live) => live.clone(),
+                    ConfigSource::Standalone(_) => {
+                        zeroclaw_config::live::LiveConfig::new(config.clone()).handle()
+                    }
+                };
+                let clients = super::collect_configured_channels(&live, "", &[], None, None, None);
+                Arc::new(super::configured_channel_map(&clients))
+            });
+            for (name, channel) in super::channel_map_for_agent(config, agent_alias, &available) {
                 ch.register_channel(name, channel);
             }
         }
@@ -1300,7 +1315,7 @@ impl AcpServer {
         ));
         agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
-        Self::apply_session_policy_to_agent(
+        self.apply_session_policy_to_agent(
             &config,
             &agent_alias,
             &mut agent,
@@ -1657,7 +1672,7 @@ impl AcpServer {
         ));
         agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
-        Self::apply_session_policy_to_agent(
+        self.apply_session_policy_to_agent(
             &config,
             &restore_alias,
             &mut agent,
@@ -1961,7 +1976,7 @@ impl AcpServer {
         ));
         agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
-        Self::apply_session_policy_to_agent(
+        self.apply_session_policy_to_agent(
             &config,
             &restore_alias,
             &mut agent,
