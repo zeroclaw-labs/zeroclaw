@@ -28,7 +28,7 @@ export default defineConfig(({ command }) => ({
           .catch(() => null);
         if (!response?.ok) return;
         const health = await response.json();
-        if (health.chat_transport === "acp") {
+        if (health && typeof health === "object" && "chat_transport" in health && health.chat_transport === "acp") {
           return [{ tag: "meta", attrs: { name: "zeroclaw-chat-transport", content: "acp" }, injectTo: "head" }];
         }
       },
