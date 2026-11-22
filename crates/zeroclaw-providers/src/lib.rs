@@ -13,6 +13,7 @@ pub mod factory;
 pub mod gemini;
 pub mod gemini_cli;
 pub mod grok_cli;
+pub mod turn_accounting;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod hailo_ollama;
 pub mod kilocli;
