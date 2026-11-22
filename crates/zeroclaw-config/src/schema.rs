@@ -14678,17 +14678,22 @@ impl Config {
         profile_aliases.sort();
         for alias in profile_aliases {
             let profile = &self.permission_profiles[alias];
-            for agent in &profile.allowed_agents {
-                let trimmed = agent.trim();
-                if trimmed.is_empty() || trimmed == "*" {
-                    continue;
-                }
-                if !self.agents.contains_key(trimmed) {
-                    validation_bail!(
-                        DanglingReference,
-                        format!("permission_profiles.{alias}.allowed_agents"),
-                        "permission_profiles.{alias}.allowed_agents names {trimmed:?} but [agents.{trimmed}] is not configured (use \"*\" for every agent)",
-                    );
+            for (field, agents) in [
+                ("allowed_agents", &profile.allowed_agents),
+                ("allowed_code_agents", &profile.allowed_code_agents),
+            ] {
+                for agent in agents {
+                    let trimmed = agent.trim();
+                    if trimmed.is_empty() || trimmed == "*" {
+                        continue;
+                    }
+                    if !self.agents.contains_key(trimmed) {
+                        validation_bail!(
+                            DanglingReference,
+                            format!("permission_profiles.{alias}.{field}"),
+                            "permission_profiles.{alias}.{field} names {trimmed:?} but [agents.{trimmed}] is not configured (use \"*\" for every agent)",
+                        );
+                    }
                 }
             }
         }
@@ -15036,6 +15041,9 @@ pub struct PermissionProfileConfig {
     /// Agent aliases holders of this profile may bind or address. Empty
     /// grants NO agents; grant every agent with the explicit `"*"` entry.
     pub allowed_agents: Vec<String>,
+    /// Agent aliases granted to the dashboard Code workspace. Empty denies all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_code_agents: Vec<String>,
     /// Dotted config path prefixes holders may write. A trailing `.*`
     /// grants the subtree (e.g. `channels.*`); a bare path grants that
     /// exact prop; `"*"` grants every path. Empty grants NO paths.
@@ -15050,7 +15058,7 @@ pub struct PermissionProfileConfig {
     /// on top.)
     pub allowed_tools: Vec<String>,
     /// Resource-class grants: for each resource kind, the verbs
-    /// permitted. Resources: `system`, `sessions`, `memory`, `cron`,
+    /// permitted. Resources: `system`, `sessions`, `code`, `memory`, `cron`,
     /// `config`, `agents`, `cost`, `skills`, `personality`, `logs`,
     /// `tui`, `files`, `locales`, `quickstart`, `channels`, `providers`,
     /// `models`, `peer_groups`, `plugins`, `tools`, `sops`. Verbs:
@@ -15071,6 +15079,13 @@ impl PermissionProfileConfig {
         // must match too, so `" main "` cannot validate and then never match.
         resolved.allowed_agents = self
             .allowed_agents
+            .iter()
+            .map(|a| a.trim())
+            .filter(|a| !a.is_empty())
+            .map(|a| AgentAlias(a.to_string()))
+            .collect();
+        resolved.allowed_code_agents = self
+            .allowed_code_agents
             .iter()
             .map(|a| a.trim())
             .filter(|a| !a.is_empty())

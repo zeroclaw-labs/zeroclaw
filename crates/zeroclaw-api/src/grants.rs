@@ -54,6 +54,8 @@ pub enum Resource {
     System,
     /// Agent chat sessions (create, prompt, list, kill, approve).
     Sessions,
+    /// Agent sessions reached through the dashboard Code workspace.
+    Code,
     /// Long-term memory entries.
     Memory,
     /// Scheduled jobs and their run history.
@@ -142,6 +144,9 @@ pub struct ResolvedGrants {
     /// broad access requires the explicit [`WILDCARD`] entry.
     #[serde(default)]
     pub allowed_agents: Vec<AgentAlias>,
+    /// Agents available through a Code connection, independent of ordinary chat.
+    #[serde(default)]
+    pub allowed_code_agents: Vec<AgentAlias>,
     /// Dotted config path prefixes this principal may write. A trailing
     /// `.*` grants the subtree; a bare path grants that exact prop; the
     /// [`WILDCARD`] entry grants every path. Empty = none.
@@ -200,6 +205,45 @@ impl ResolvedGrants {
             .any(|a| a.as_str() == WILDCARD || a.as_str() == alias)
     }
 
+    /// Whether this dashboard account can use the full interactive Code protocol.
+    pub fn may_open_code(&self) -> bool {
+        self.admin
+            || (!self.allowed_code_agents.is_empty()
+                && [Verb::Create, Verb::Read, Verb::Execute, Verb::Update]
+                    .into_iter()
+                    .all(|v| self.permits(Resource::Code, v)))
+    }
+
+    /// Effective authority of a server-bound Code connection. The dispatcher
+    /// still uses its session verbs and ownership checks. Even an administrator
+    /// acts as an individual principal on this connection.
+    pub fn code_session_grants(&self) -> Self {
+        let mut scoped = Self::none();
+        if !self.may_open_code() {
+            return scoped;
+        }
+        scoped.allowed_agents = if self.admin {
+            vec![AgentAlias(WILDCARD.into())]
+        } else {
+            self.allowed_code_agents.clone()
+        };
+        scoped.resources.insert(
+            Resource::Sessions,
+            [Verb::Create, Verb::Read, Verb::Execute, Verb::Update].into(),
+        );
+        if self.permits(Resource::Tools, Verb::Execute) {
+            scoped
+                .resources
+                .insert(Resource::Tools, [Verb::Execute].into());
+            scoped.allowed_tools = if self.admin {
+                vec![WILDCARD.into()]
+            } else {
+                self.allowed_tools.clone()
+            };
+        }
+        scoped
+    }
+
     /// Whether this principal may cause the named tool to run. An empty
     /// selector list grants no tools; broad access requires the explicit
     /// [`WILDCARD`] entry or `admin`.
@@ -248,6 +292,10 @@ impl ResolvedGrants {
                 self.allowed_agents.push(alias.clone());
             }
         }
+        self.allowed_code_agents
+            .extend_from_slice(&other.allowed_code_agents);
+        self.allowed_code_agents.sort();
+        self.allowed_code_agents.dedup();
         for path in &other.config_write_paths {
             if !self.config_write_paths.contains(path) {
                 self.config_write_paths.push(path.clone());
@@ -362,6 +410,25 @@ mod tests {
         assert!(g.may_write_config("cron.enabled"));
         assert!(!g.may_write_config("cron.max_jobs"));
         assert!(!g.may_write_config("security.estop"));
+    }
+
+    #[test]
+    fn code_sessions_have_their_own_agents_and_no_operator_bypass() {
+        let mut code = grants_with(
+            Resource::Code,
+            &[Verb::Create, Verb::Read, Verb::Update, Verb::Execute],
+        );
+        assert!(!code.may_open_code());
+        code.allowed_code_agents.push(AgentAlias("project".into()));
+        code.allowed_agents.push(AgentAlias("other".into()));
+        assert!(!code.permits(Resource::Sessions, Verb::Create));
+        let scoped = code.code_session_grants();
+        assert!(scoped.permits(Resource::Sessions, Verb::Create));
+        assert!(scoped.may_use_agent("project"));
+        assert!(!scoped.may_use_agent("other"));
+        assert!(!scoped.permits(Resource::Tools, Verb::Execute));
+        assert!(!ResolvedGrants::all().code_session_grants().admin);
+        assert!(!ResolvedGrants::none().may_open_code());
     }
 
     #[test]
