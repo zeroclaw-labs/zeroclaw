@@ -3016,7 +3016,7 @@ mod inbound {
     /// How long after the ORIGINAL an edit still starts a turn. Fixing a
     /// typo in an old message clarifies history, it is not a live prompt;
     /// edits of older originals are dropped. Matches the freshness window
-    /// of the Telegram edit policy (#12371) so both channels bound edits
+    /// of the Telegram edit policy so both channels bound edits
     /// the same way.
     pub(super) const EDIT_FRESHNESS_SECS: u64 = 600;
 
