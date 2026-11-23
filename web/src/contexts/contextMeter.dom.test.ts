@@ -289,6 +289,27 @@ test('Codex usage displays the server-selected route before the first message', 
   }
 });
 
+test('Codex usage displays only reported windows, without hiding real zero or unknown values', async () => {
+  const chat = await mountMeter();
+  try {
+    const weekly = { used_percent: 2, resets_at: '2027-01-15T12:00:00Z' };
+    chat.socket.usage = async () => ({ ...usageFrame(37), five_hour: null, weekly });
+    await chat.click('Codex usage');
+    await chat.click('Check Codex usage');
+    assert.match(chat.text(), /Weekly window2% usedResets /);
+    assert.doesNotMatch(chat.text(), /5-hour window|Not reported/);
+
+    chat.socket.usage = async () => ({
+      ...usageFrame(0), weekly: { used_percent: null, resets_at: null },
+    });
+    await chat.click('Check Codex usage');
+    assert.match(chat.text(), /5-hour window0% used/);
+    assert.match(chat.text(), /Weekly windowUnknown/);
+  } finally {
+    await chat.unmount();
+  }
+});
+
 test('Loading the model picker label does not clear usage for the same socket', async () => {
   let loaded!: (property: unknown) => void;
   modelPickerProperty = new Promise((resolve) => { loaded = resolve; });

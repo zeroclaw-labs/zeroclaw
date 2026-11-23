@@ -17,29 +17,20 @@ function localTime(iso: string): string {
   return date.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
 }
 
-function WindowRow({ label, window }: { label: string; window: CodexUsageWindow | null }) {
-  // A window the server did not report is "Not reported"; a reported but
-  // missing percentage is "Unknown". Neither is shown as 0%.
-  let used: string;
-  let reset: string | null = null;
-  if (window === null) {
-    used = t('agent.codex_usage_not_reported');
-  } else {
-    used =
-      window.used_percent === null
-        ? t('agent.codex_usage_unknown')
-        : t('agent.codex_usage_used').replace('{percent}', formatPercent(window.used_percent));
-    reset = t('agent.codex_usage_resets').replace(
-      '{time}',
-      window.resets_at ? localTime(window.resets_at) : t('agent.codex_usage_unknown'),
-    );
-  }
+function WindowRow({ label, window }: { label: string; window: CodexUsageWindow }) {
+  const used = window.used_percent === null
+    ? t('agent.codex_usage_unknown')
+    : t('agent.codex_usage_used').replace('{percent}', formatPercent(window.used_percent));
+  const reset = t('agent.codex_usage_resets').replace(
+    '{time}',
+    window.resets_at ? localTime(window.resets_at) : t('agent.codex_usage_unknown'),
+  );
   return (
     <div className="flex flex-col gap-0.5">
       <dt className="text-pc-text-secondary">{label}</dt>
       <dd className="text-pc-text">
         {used}
-        {reset && <span className="block text-pc-text-secondary">{reset}</span>}
+        <span className="block text-pc-text-secondary">{reset}</span>
       </dd>
     </div>
   );
@@ -52,8 +43,8 @@ function Windows({ usage }: { usage: CodexUsageOk }) {
         {t('agent.codex_usage_route').replace('{route}', () => usage.route)}
       </p>
       <dl className="flex flex-col gap-2">
-        <WindowRow label={t('agent.codex_usage_five_hour')} window={usage.five_hour} />
-        <WindowRow label={t('agent.codex_usage_weekly')} window={usage.weekly} />
+        {usage.five_hour && <WindowRow label={t('agent.codex_usage_five_hour')} window={usage.five_hour} />}
+        {usage.weekly && <WindowRow label={t('agent.codex_usage_weekly')} window={usage.weekly} />}
       </dl>
       <p className="text-pc-text-secondary">
         {t('agent.codex_usage_checked').replace('{time}', localTime(usage.checked_at))}

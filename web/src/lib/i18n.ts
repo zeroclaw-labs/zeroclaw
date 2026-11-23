@@ -1720,7 +1720,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.codex_usage_weekly': 'Weekly window',
     'agent.codex_usage_used': '{percent}% used',
     'agent.codex_usage_unknown': 'Unknown',
-    'agent.codex_usage_not_reported': 'Not reported',
     'agent.codex_usage_resets': 'Resets {time}',
     'agent.codex_usage_checked': 'Last checked {time}',
     'agent.codex_usage_route': 'Chat route: {route}',
