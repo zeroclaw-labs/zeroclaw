@@ -14798,6 +14798,7 @@ dependencies = [
  "nanohtml2text",
  "parking_lot",
  "probe-rs",
+ "quick-xml",
  "rcgen",
  "regex",
  "reqwest 0.12.28",

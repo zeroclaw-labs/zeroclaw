@@ -27,6 +27,8 @@ pub enum WebDavError {
     ByteLimit,
     #[error("remote_files_webdav_staging_size_mismatch")]
     StagingSizeMismatch,
+    #[error("remote_files_webdav_invalid_properties")]
+    InvalidProperties,
     #[error("remote_files_webdav_destination_io")]
     DestinationIo(#[source] io::Error),
 }
@@ -73,6 +75,42 @@ impl WebDavRead {
             .build()
             .map_err(|_| WebDavError::Transport)?;
         Ok(Self { root, client })
+    }
+
+    /// Confirm a single resource's DAV type before a file-only mutation.
+    /// WebDAV DELETE on a collection is recursive, so callers must never
+    /// infer a file type from a URL suffix or a successful GET alone.
+    pub async fn resource_kind(
+        &self,
+        path: &str,
+        authorization: Option<HeaderValue>,
+    ) -> Result<WebDavResourceKind, WebDavError> {
+        let url = resource_url(&self.root, path)?;
+        let method = Method::from_bytes(b"PROPFIND").map_err(|_| WebDavError::Transport)?;
+        let request = self
+            .client
+            .request(method, url.clone())
+            .timeout(Duration::from_secs(30))
+            .header("Depth", "0")
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/xml; charset=utf-8",
+            )
+            .body(r#"<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>"#);
+        let response = with_authorization(request, authorization)
+            .send()
+            .await
+            .map_err(|_| WebDavError::Transport)?;
+        let mut response = require_status(response, StatusCode::MULTI_STATUS)?;
+        const MAX_RESPONSE: usize = 64 * 1024;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| WebDavError::Transport)? {
+            if chunk.len() > MAX_RESPONSE - body.len() {
+                return Err(WebDavError::InvalidProperties);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        parse_resource_kind(&body, &url)
     }
 
     pub async fn file_size(
@@ -415,6 +453,122 @@ fn upload_stream<R: AsyncRead + Unpin>(
             Ok(Some((buffer, (source, total))))
         }
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WebDavResourceKind {
+    File,
+    Collection,
+}
+
+/// Parse the narrow Depth: 0 response profile used by the adapter. Refuse
+/// ambiguous resources, foreign properties, and extra propstat results.
+fn parse_resource_kind(xml: &[u8], target: &Url) -> Result<WebDavResourceKind, WebDavError> {
+    use quick_xml::{NsReader, events::Event, name::ResolveResult};
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Tag {
+        MultiStatus,
+        Response,
+        Href,
+        PropStat,
+        Prop,
+        ResourceType,
+        Status,
+        Collection,
+    }
+    use Tag::*;
+
+    let mut reader = NsReader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+    reader.config_mut().expand_empty_elements = true;
+    let mut stack = Vec::new();
+    let mut completed = false;
+    let mut saw_response = false;
+    let mut saw_propstat = false;
+    let mut href = None;
+    let mut status = None;
+    let mut kind = None;
+    let mut collection = false;
+    loop {
+        let (namespace, event) = reader
+            .read_resolved_event()
+            .map_err(|_| WebDavError::InvalidProperties)?;
+        match event {
+            Event::Start(tag) => {
+                if !matches!(namespace, ResolveResult::Bound(ns) if ns.as_ref() == b"DAV:") {
+                    return Err(WebDavError::InvalidProperties);
+                }
+                let next = match (stack.last(), tag.local_name().as_ref()) {
+                    (None, b"multistatus") if !completed => MultiStatus,
+                    (Some(MultiStatus), b"response") if !saw_response => {
+                        saw_response = true;
+                        Response
+                    }
+                    (Some(Response), b"href") if href.is_none() => Href,
+                    (Some(Response), b"propstat") if !saw_propstat => {
+                        saw_propstat = true;
+                        PropStat
+                    }
+                    (Some(PropStat), b"prop") if kind.is_none() => Prop,
+                    (Some(Prop), b"resourcetype") if kind.is_none() => ResourceType,
+                    (Some(PropStat), b"status") if status.is_none() => Status,
+                    (Some(ResourceType), b"collection") if !collection => {
+                        collection = true;
+                        Collection
+                    }
+                    _ => return Err(WebDavError::InvalidProperties),
+                };
+                stack.push(next);
+            }
+            Event::End(_) => match stack.pop().ok_or(WebDavError::InvalidProperties)? {
+                ResourceType => {
+                    kind = Some(if collection {
+                        WebDavResourceKind::Collection
+                    } else {
+                        WebDavResourceKind::File
+                    })
+                }
+                MultiStatus => completed = true,
+                _ => {}
+            },
+            Event::Text(text) => {
+                let value = text.decode().map_err(|_| WebDavError::InvalidProperties)?;
+                match stack.last() {
+                    Some(Href) if href.is_none() => href = Some(value.into_owned()),
+                    Some(Status) if status.is_none() => {
+                        let mut words = value.split_whitespace();
+                        status = Some(
+                            words.next().is_some_and(|word| word.starts_with("HTTP/"))
+                                && words.next() == Some("200"),
+                        );
+                    }
+                    _ => return Err(WebDavError::InvalidProperties),
+                }
+            }
+            Event::Decl(_) if stack.is_empty() && !completed => {}
+            Event::Eof => break,
+            _ => return Err(WebDavError::InvalidProperties),
+        }
+    }
+
+    let kind = kind.ok_or(WebDavError::InvalidProperties)?;
+    let href = href.ok_or(WebDavError::InvalidProperties)?;
+    let resolved = target
+        .join(&href)
+        .map_err(|_| WebDavError::InvalidProperties)?;
+    // Servers commonly append a slash to a collection's href.
+    let mut expected = target.clone();
+    if kind == WebDavResourceKind::Collection && resolved.path().ends_with('/') {
+        expected
+            .path_segments_mut()
+            .map_err(|()| WebDavError::InvalidProperties)?
+            .push("");
+    }
+    if !completed || !stack.is_empty() || status != Some(true) || resolved != expected {
+        return Err(WebDavError::InvalidProperties);
+    }
+    Ok(kind)
 }
 
 fn with_authorization(
@@ -926,6 +1080,46 @@ mod tests {
         assert!(stream.next().await.unwrap().is_err());
         assert!(progress.limit_reached.load(Ordering::Acquire));
         assert!(!progress.finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn dav_properties_distinguish_a_file_from_a_collection_and_reject_ambiguity() {
+        let root = Url::parse("https://files.test/dav/report").unwrap();
+        let xml = |href: &str, resource_type: &str, status: &str| {
+            format!(
+                r#"<d:multistatus xmlns:d="DAV:"><d:response><d:href>{href}</d:href><d:propstat><d:prop>{resource_type}</d:prop><d:status>{status}</d:status></d:propstat></d:response></d:multistatus>"#
+            )
+        };
+        let file = xml("/dav/report", "<d:resourcetype/>", "HTTP/1.1 200 OK");
+        assert!(matches!(
+            parse_resource_kind(file.as_bytes(), &root),
+            Ok(WebDavResourceKind::File)
+        ));
+        let directory = xml(
+            "/dav/report/",
+            "<d:resourcetype><d:collection/></d:resourcetype>",
+            "HTTP/1.1 200 OK",
+        );
+        assert!(matches!(
+            parse_resource_kind(directory.as_bytes(), &root),
+            Ok(WebDavResourceKind::Collection)
+        ));
+        for bad in [
+            file.replace("DAV:", "wrong:"),
+            file.replace("/dav/report", "https://elsewhere.test/dav/report"),
+            file.replace("200 OK", "404 Not Found"),
+            file.replace(
+                "</d:multistatus>",
+                "<d:response><d:href>/dav/other</d:href></d:response></d:multistatus>",
+            ),
+            file.replace(
+                "<d:resourcetype/>",
+                "<d:resourcetype><d:unknown/></d:resourcetype>",
+            ),
+            format!("<!DOCTYPE d:multistatus>{file}"),
+        ] {
+            assert!(parse_resource_kind(bad.as_bytes(), &root).is_err());
+        }
     }
 
     #[test]
