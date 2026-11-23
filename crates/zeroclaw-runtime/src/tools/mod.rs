@@ -2990,7 +2990,8 @@ fn all_tools_with_runtime_on_thread(
             ))
             .with_firecrawl_api_key_override(WebSearchTool::firecrawl_api_key_override(
                 root_config,
-            )),
+            ))
+            .with_deepseek_api_key_override(root_config),
                 security.clone(),
             ))
         );

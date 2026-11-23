@@ -12,12 +12,67 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_config::schema::{Config, WebSearchConfig};
+use zeroclaw_config::secrets::SecretStore;
 
 // AnySearch skill protocol identifier. Keep this synchronized with the
 // upstream anysearch-ai/anysearch-skill CLIENT_HEADER value.
 const ANYSEARCH_CLIENT_HEADER: &str = "skill/3.1.1";
 const ANYSEARCH_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
 const ANYSEARCH_CONFIG_PARSE_ERROR: &str = "anysearch_config_parse_failed";
+const DEEPSEEK_SEARCH_ORIGIN: &str = "https://api.deepseek.com";
+const DEEPSEEK_QUERY_LIMIT: usize = 128;
+const DEEPSEEK_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
+
+#[derive(serde::Deserialize)]
+struct DeepSeekSearchResponse {
+    results: Vec<DeepSeekSearchResult>,
+}
+
+#[derive(serde::Deserialize)]
+struct DeepSeekSearchResult {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+fn read_deepseek_api_key(
+    config_path: &Path,
+    secrets_encrypt: bool,
+) -> anyhow::Result<Option<String>> {
+    let contents = std::fs::read_to_string(config_path).map_err(|_| {
+        anyhow::Error::msg(get_required_tool_string(
+            "tool-web-search-tool-error-deepseek-config-read",
+        ))
+    })?;
+    // The parser can quote credential values. Report the failure without its source chain.
+    let parse_error = |_| {
+        anyhow::Error::msg(get_required_tool_string(
+            "tool-web-search-tool-error-deepseek-config-parse",
+        ))
+    };
+    let mut config: toml::Table = toml::from_str(&contents).map_err(parse_error)?;
+    let Some(section) = config.remove("web_search") else {
+        return Ok(None);
+    };
+    let config: WebSearchConfig = section.try_into().map_err(parse_error)?;
+    let Some(key) = config.deepseek_api_key else {
+        return Ok(None);
+    };
+    if !SecretStore::is_encrypted(&key) {
+        return Ok(Some(key));
+    }
+
+    let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+    SecretStore::new(config_dir, secrets_encrypt)
+        .decrypt(&key)
+        .map(Some)
+        .map_err(|_| {
+            anyhow::Error::msg(get_required_tool_string(
+                "tool-web-search-tool-error-deepseek-key-resolve",
+            ))
+        })
+}
 
 fn anysearch_config_parse_line(contents: &str, error: &toml::de::Error) -> Option<usize> {
     let offset = error.span()?.start.min(contents.len());
@@ -195,20 +250,20 @@ impl SerplyConfigParseFailure {
 /// Jina AI (requires API key), Bocha AI (requires API key, Chinese-friendly),
 /// AnySearch (optional API key; anonymous access has a lower quota),
 /// Serply (Google web results, requires API key), Keenable (keyless public
-/// endpoint; an optional API key lifts rate limits), and Firecrawl (requires
-/// API key).
+/// endpoint with an optional API key), Firecrawl and DeepSeek (each requires
+/// an API key).
 ///
 /// API keys are resolved lazily at execution time: if the boot-time key
 /// is missing or still encrypted, the tool re-reads `config.toml`, decrypts the
 /// corresponding `[web_search]` field, and uses the result. This ensures that
 /// keys set or rotated after boot, and encrypted keys, are correctly picked up.
-/// The Bocha, AnySearch, Serply, Keenable and Firecrawl keys have no boot-time snapshot at all: they
+/// The Bocha, AnySearch, Serply, Keenable, Firecrawl and DeepSeek keys
 /// are always resolved from `config.toml` at use time, so their canonical
 /// `[web_search]` fields stay the single source of truth and rotation/removal
 /// takes effect without a restart. The exception is a schema-mirror env
 /// override (`ZEROCLAW_web_search__anysearch_api_key`,
 /// `ZEROCLAW_web_search__serply_api_key`, `ZEROCLAW_web_search__keenable_api_key`,
-/// `ZEROCLAW_web_search__firecrawl_api_key`):
+/// `ZEROCLAW_web_search__firecrawl_api_key`, `ZEROCLAW_web_search__deepseek_api_key`):
 /// the loader applies it to the
 /// in-memory `Config` only, so the runtime hands the effective value to the
 /// tool and the resolver uses it instead of the on-disk field for the lifetime
@@ -252,6 +307,8 @@ pub struct WebSearchTool {
     /// `Some(None)` for a blank override, `None` when no override is active
     /// and the key is resolved from `config.toml` at use time.
     firecrawl_api_key_override: Option<Option<String>>,
+    /// An explicit blank override suppresses the on-disk value.
+    deepseek_api_key_override: Option<String>,
 }
 
 impl WebSearchTool {
@@ -276,6 +333,7 @@ impl WebSearchTool {
             secrets_encrypt: false,
             keenable_api_key_override: None,
             firecrawl_api_key_override: None,
+            deepseek_api_key_override: None,
         }
     }
 
@@ -321,6 +379,20 @@ impl WebSearchTool {
         self
     }
 
+    /// Carry only the applied environment override. Resolve the disk key at use time.
+    pub fn with_deepseek_api_key_override(mut self, config: &Config) -> Self {
+        self.deepseek_api_key_override = config
+            .prop_is_env_overridden("web_search.deepseek_api_key")
+            .then(|| {
+                config
+                    .web_search
+                    .deepseek_api_key
+                    .clone()
+                    .unwrap_or_default()
+            });
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_config(
         model_provider: String,
@@ -347,6 +419,7 @@ impl WebSearchTool {
             secrets_encrypt,
             keenable_api_key_override: None,
             firecrawl_api_key_override: None,
+            deepseek_api_key_override: None,
         }
     }
 
@@ -1612,6 +1685,100 @@ impl WebSearchTool {
             .await
     }
 
+    async fn resolve_deepseek_api_key(&self) -> anyhow::Result<String> {
+        let key = if let Some(key) = &self.deepseek_api_key_override {
+            Some(key.clone())
+        } else if self.config_path.as_os_str().is_empty() {
+            None
+        } else {
+            let config_path = self.config_path.clone();
+            let secrets_encrypt = self.secrets_encrypt;
+            // SecretStore may resolve an external secret via the 1Password CLI.
+            tokio::task::spawn_blocking(move || {
+                read_deepseek_api_key(&config_path, secrets_encrypt)
+            })
+            .await
+            .map_err(|_| {
+                anyhow::Error::msg(get_required_tool_string(
+                    "tool-web-search-tool-error-deepseek-key-resolve",
+                ))
+            })??
+        };
+        key.as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                anyhow::Error::msg(get_required_tool_string(
+                    "tool-web-search-tool-error-deepseek-key-missing",
+                ))
+            })
+    }
+
+    async fn search_deepseek(&self, query: &str, origin: &str) -> anyhow::Result<String> {
+        let query = query.trim();
+        if query.chars().nth(DEEPSEEK_QUERY_LIMIT).is_some() {
+            anyhow::bail!(get_required_tool_string_with_args(
+                "tool-web-search-tool-error-deepseek-query-length",
+                &[("limit", &DEEPSEEK_QUERY_LIMIT.to_string())],
+            ));
+        }
+
+        let api_key = self.resolve_deepseek_api_key().await?;
+        let builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .redirect(reqwest::redirect::Policy::none());
+        let client =
+            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.web_search")
+                .build()
+                .map_err(|err| transport_search_failure("deepseek", "client", &err))?;
+        let response = client
+            .post(format!("{origin}/v1/tools/search"))
+            .bearer_auth(api_key)
+            .json(&json!({"query": query, "count": self.max_results}))
+            .send()
+            .await
+            .map_err(|err| transport_search_failure("deepseek", "request", &err))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(http_search_failure("deepseek", status));
+        }
+
+        let body = response_body::read_bounded(response, Some(DEEPSEEK_RESPONSE_LIMIT_BYTES))
+            .await
+            .map_err(|err| match err.downcast_ref::<reqwest::Error>() {
+                Some(err) => transport_search_failure("deepseek", "response", err),
+                None => bounded_body_search_failure("deepseek", "body"),
+            })?;
+        if body.overflowed {
+            return Err(bounded_body_search_failure("deepseek", "oversized"));
+        }
+        let response: DeepSeekSearchResponse = serde_json::from_slice(&body.bytes)
+            .map_err(|_| bounded_body_search_failure("deepseek", "decode"))?;
+        if response.results.is_empty() {
+            return Ok(no_results_message(query));
+        }
+
+        let mut blocks = Vec::new();
+        for (i, result) in response
+            .results
+            .into_iter()
+            .take(self.max_results)
+            .enumerate()
+        {
+            let mut block = vec![
+                format!("{}. {}", i + 1, result.title),
+                format!("   {}", result.url),
+            ];
+            if !result.snippet.is_empty() {
+                block.push(format!("   {}", cap_result_content(&result.snippet)));
+            }
+            blocks.push(block);
+        }
+        Ok(render_results(results_header(query, "DeepSeek"), blocks))
+    }
+
     /// Inner Keenable request, parameterized on the HTTP client and API base
     /// URL so request-shape tests can target a local mock server. The endpoint
     /// path is chosen here, not by the caller: a configured key selects
@@ -2312,7 +2479,7 @@ fn cap_provider_error(message: &str) -> String {
 }
 
 /// Header line for a rendered result list. Shared so the echoed query is
-/// bounded — and the wording stays identical — across all nine providers.
+/// bounded — and the wording stays identical — across providers.
 fn results_header(query: &str, provider: &str) -> String {
     format!(
         "Search results for: {} (via {provider})",
@@ -2322,7 +2489,7 @@ fn results_header(query: &str, provider: &str) -> String {
 
 /// The reply every provider returns when a search matched nothing.
 ///
-/// One shared function rather than nine copies: this path returns before
+/// One shared function: this path returns before
 /// [`render_results`], so it is the only place the echoed query is bounded at
 /// all, and a per-provider copy would be a per-provider chance to forget.
 fn no_results_message(query: &str) -> String {
@@ -2333,7 +2500,7 @@ fn no_results_message(query: &str) -> String {
 /// [`MAX_TOTAL_OUTPUT_CHARS`].
 ///
 /// Trimming happens at whole-result granularity so the model never receives a
-/// result cut off mid-field. Shared by all nine provider parsers — the cap must
+/// result cut off mid-field. Shared by all provider parsers — the cap must
 /// not depend on which provider answered.
 fn render_results(header: String, blocks: Vec<Vec<String>>) -> String {
     let mut out = header;
@@ -2717,6 +2884,17 @@ impl Tool for WebSearchTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.execute_with_deepseek_origin(args, DEEPSEEK_SEARCH_ORIGIN)
+            .await
+    }
+}
+
+impl WebSearchTool {
+    async fn execute_with_deepseek_origin(
+        &self,
+        args: serde_json::Value,
+        deepseek_origin: &str,
+    ) -> anyhow::Result<ToolResult> {
         let query = args.get("query").and_then(|q| q.as_str()).ok_or_else(|| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -2762,6 +2940,9 @@ impl Tool for WebSearchTool {
             WebSearchProviderRoute::Serply => self.search_serply(query).await?,
             WebSearchProviderRoute::Keenable => self.search_keenable(query).await?,
             WebSearchProviderRoute::Firecrawl => self.search_firecrawl(query).await?,
+            WebSearchProviderRoute::DeepSeek => {
+                self.search_deepseek(query, deepseek_origin).await?
+            }
         };
 
         Ok(ToolResult {
@@ -2775,6 +2956,230 @@ impl Tool for WebSearchTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn configured_deepseek_tool(config: &Config) -> WebSearchTool {
+        WebSearchTool::new_with_config(
+            config.web_search.search_provider.clone(),
+            None,
+            None,
+            None,
+            None,
+            config.web_search.max_results,
+            config.web_search.timeout_secs,
+            config.config_path.clone(),
+            config.secrets.encrypt,
+        )
+        .with_deepseek_api_key_override(config)
+    }
+
+    #[tokio::test]
+    async fn deepseek_sends_configured_search_and_renders_ranked_results() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _proxy_guard = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config: Config = toml::from_str(
+            "[web_search]\nsearch_provider = \"deepseek\"\ndeepseek_api_key = \"fixture-key\"\nmax_results = 2\n",
+        )
+        .unwrap();
+        config.config_path = tmp.path().join("config.toml");
+        config.data_dir = tmp.path().join("data");
+        config.secrets.encrypt = true;
+        config.save().await.unwrap();
+        let saved: Config =
+            toml::from_str(&std::fs::read_to_string(&config.config_path).unwrap()).unwrap();
+        assert!(SecretStore::is_encrypted(
+            saved.web_search.deepseek_api_key.as_deref().unwrap()
+        ));
+
+        let tool = configured_deepseek_tool(&config);
+        let server = MockServer::start().await;
+        let query = "\"async Rust\" site:example.com";
+        Mock::given(method("POST"))
+            .and(path("/v1/tools/search"))
+            .and(header("authorization", "Bearer fixture-key"))
+            .and(header("content-type", "application/json"))
+            .and(body_json(json!({"query": query, "count": 2})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results": [
+                {"title": "First", "url": "https://example.com/one", "snippet": "First description", "summary": "Unused long summary"},
+                {"title": "Second", "url": "https://example.com/two", "snippet": "Second description"},
+                {"title": "Third", "url": "https://example.com/three", "snippet": "Outside the result limit"}
+            ]})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let result = tool
+            .execute_with_deepseek_origin(json!({"query": query}), &server.uri())
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(
+            result.output.as_str(),
+            format!(
+                "Search results for: {query} (via DeepSeek)\n1. First\n   https://example.com/one\n   First description\n2. Second\n   https://example.com/two\n   Second description"
+            )
+        );
+
+        std::fs::write(
+            &config.config_path,
+            "[web_search]\ndeepseek_api_key = \"rotated-key\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            tool.resolve_deepseek_api_key().await.unwrap(),
+            "rotated-key"
+        );
+        std::fs::write(&config.config_path, "[web_search]\n").unwrap();
+        assert!(tool.resolve_deepseek_api_key().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn deepseek_checks_unicode_query_bounds_and_uses_tool_count_limits() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _proxy_guard = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        let mut config = Config::default();
+        config.web_search.search_provider = "  DeepSeek  ".into();
+        config.web_search.deepseek_api_key = Some("override-key".into());
+        config
+            .env_overridden_paths
+            .insert("web_search.deepseek_api_key".into());
+        let server = MockServer::start().await;
+        let query = "界".repeat(128);
+        for (configured_count, expected_count) in [(0, 1), (50, 10)] {
+            config.web_search.max_results = configured_count;
+            let tool = configured_deepseek_tool(&config);
+            Mock::given(method("POST"))
+                .and(path("/v1/tools/search"))
+                .and(header("authorization", "Bearer override-key"))
+                .and(body_json(json!({"query": query, "count": expected_count})))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"results": []})))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let result = tool
+                .execute_with_deepseek_origin(json!({"query": format!(" {query} ")}), &server.uri())
+                .await
+                .unwrap();
+            assert_eq!(result.output.as_str(), no_results_message(&query));
+        }
+
+        let tool = configured_deepseek_tool(&config);
+        let too_long = tool
+            .execute_with_deepseek_origin(json!({"query": format!("{query}界")}), &server.uri())
+            .await
+            .unwrap_err();
+        assert!(too_long.to_string().contains("128"));
+        assert!(
+            tool.execute_with_deepseek_origin(json!({"query": " \u{3000}\t"}), &server.uri())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be empty")
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn deepseek_rejects_blank_override_and_redacts_malformed_credentials() {
+        let _proxy_guard = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        let server = wiremock::MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.web_search.search_provider = "deepseek".into();
+        config.config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config.config_path,
+            "[web_search]\ndeepseek_api_key = \"stored-key\"\n",
+        )
+        .unwrap();
+        config
+            .env_overridden_paths
+            .insert("web_search.deepseek_api_key".into());
+        let error = configured_deepseek_tool(&config)
+            .execute_with_deepseek_origin(json!({"query": "rust"}), &server.uri())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            get_required_tool_string("tool-web-search-tool-error-deepseek-key-missing")
+        );
+
+        config.env_overridden_paths.clear();
+        let tool = configured_deepseek_tool(&config);
+        for (contents, message) in [
+            (
+                "[web_search]\ndeepseek_api_key = \"private-marker\n",
+                "tool-web-search-tool-error-deepseek-config-parse",
+            ),
+            (
+                "[web_search]\ndeepseek_api_key = \"op://private-marker\"\n",
+                "tool-web-search-tool-error-deepseek-key-resolve",
+            ),
+        ] {
+            std::fs::write(&config.config_path, contents).unwrap();
+            let error = tool
+                .execute_with_deepseek_origin(json!({"query": "rust"}), &server.uri())
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), get_required_tool_string(message));
+            assert!(!format!("{error:#}").contains("private-marker"));
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deepseek_reports_http_and_body_failures_without_echoing_the_response() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let _proxy_guard = crate::test_support::RuntimeProxyStateGuard::acquire().await;
+        let mut config = Config::default();
+        config.web_search.search_provider = "deepseek".into();
+        config.web_search.deepseek_api_key = Some("fixture-key".into());
+        config
+            .env_overridden_paths
+            .insert("web_search.deepseek_api_key".into());
+        let tool = configured_deepseek_tool(&config);
+        let server = MockServer::start().await;
+        for (response, expected_error) in [
+            (
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/redirected", server.uri())),
+                "http=307",
+            ),
+            (
+                ResponseTemplate::new(401).set_body_string("fixture-key"),
+                "http=401",
+            ),
+            (
+                ResponseTemplate::new(200).set_body_string("fixture-key"),
+                "transport=decode",
+            ),
+            (
+                ResponseTemplate::new(200)
+                    .set_body_bytes(vec![b'x'; DEEPSEEK_RESPONSE_LIMIT_BYTES + 1]),
+                "transport=oversized",
+            ),
+        ] {
+            server.reset().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/tools/search"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let error = tool
+                .execute_with_deepseek_origin(json!({"query": "rust"}), &server.uri())
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(expected_error), "{error}");
+            assert!(!format!("{error:#}").contains("fixture-key"));
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        }
+    }
 
     #[test]
     fn test_tool_name() {
@@ -3547,21 +3952,17 @@ mod tests {
 
     #[test]
     fn test_resolve_searxng_instance_url_from_boot() {
-        let tool = WebSearchTool {
-            model_provider: "searxng".into(),
-            boot_brave_api_key: None,
-            boot_tavily_api_key: None,
-            boot_jina_api_key: None,
-            anysearch_api_key_override: None,
-            serply_api_key_override: None,
-            searxng_instance_url: Some("https://searx.example.com".to_string()),
-            max_results: 5,
-            timeout_secs: 15,
-            config_path: PathBuf::new(),
-            secrets_encrypt: false,
-            keenable_api_key_override: None,
-            firecrawl_api_key_override: None,
-        };
+        let tool = WebSearchTool::new_with_config(
+            "searxng".into(),
+            None,
+            None,
+            None,
+            Some("https://searx.example.com".into()),
+            5,
+            15,
+            PathBuf::new(),
+            false,
+        );
         let url = tool.resolve_searxng_instance_url().unwrap();
         assert_eq!(url, "https://searx.example.com");
     }

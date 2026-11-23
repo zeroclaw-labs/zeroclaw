@@ -141,7 +141,7 @@ The following built-in capabilities are available when compiled and selected, wh
 | `glob_search` | List files matching a glob pattern within the workspace, or under an allowed root with an absolute pattern |
 | `content_search` | Search file contents by regex within the workspace (ripgrep with grep fallback) |
 | `http_request` | HTTP GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS to allowlisted domains |
-| `web_search_tool` | Web search. Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, Bocha, AnySearch, Serply, Keenable (no key required; optional key lifts rate limits), or Firecrawl |
+| `web_search_tool` | Web search. Providers include DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, Bocha, AnySearch, Serply, Keenable (optional key), Firecrawl, and DeepSeek |
 | `web_fetch` | Fetch a page and return clean plain text |
 | `browser` | Headless-browser automation. Opt-in: requires `[browser] automation_enabled = true`. See [Browser automation](./browser.md) |
 | `memory_recall` | Search long-term memory for relevant facts, preferences, or context |
@@ -186,6 +186,19 @@ fallback is configured separately under `[web_fetch.firecrawl]` and uses its own
 key. Selecting this provider
 sends search queries to a third-party service. It does not change the default
 provider and is not used as an automatic fallback.
+
+### DeepSeek provider
+
+Select the provider in `config.toml`. If you list optional tools individually, include `web_search_tool` in `[tools].optional`.
+
+```toml
+[web_search]
+search_provider = "deepseek"
+```
+
+Set `[web_search].deepseek_api_key` through ZeroClaw's secret configuration or inject it with `ZEROCLAW_web_search__deepseek_api_key`. Reload a running daemon to apply the provider selection.
+
+ZeroClaw sends search queries of up to 128 Unicode characters to DeepSeek, which charges for successful searches that return results. See the [DeepSeek Search and Fetch guide](https://api-docs.deepseek.com/guides/search/) for billing details.
 
 Additional first-party built-ins, included in full but not in minimal:
 
