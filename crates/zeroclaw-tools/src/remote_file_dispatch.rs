@@ -376,7 +376,7 @@ mod tests {
         let path = fixture.path().join("config.toml");
         let mut config = Config::default();
         config.secrets.encrypt = true;
-        let record = serde_json::json!({
+        let mut record = serde_json::json!({
             "origin": "https://example.test",
             "http_allowed": false,
             "remote_files_grants": [{
@@ -443,6 +443,27 @@ mod tests {
                 }
             ),
             Err(ReadDispatchError::Denied)
+        ));
+        record["remote_files_grants"][0]["rights"]["require_human_approval"] =
+            serde_json::Value::Bool(true);
+        let value = SecretStore::new(fixture.path(), true)
+            .encrypt(&record.to_string())
+            .unwrap();
+        config
+            .http_request
+            .scoped_credentials
+            .insert("REPORT_LOGIN".into(), value);
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        assert!(matches!(
+            resolve_local_webdav_header(
+                &path,
+                "REPORT_LOGIN",
+                "reports",
+                &root,
+                Right::ListDirectory,
+                || true,
+            ),
+            Err(ReadDispatchError::ApprovalRequired)
         ));
     }
 
