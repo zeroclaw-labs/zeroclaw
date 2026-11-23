@@ -3,7 +3,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
-use zeroclaw::providers::traits::{ChatMessage, TokenUsage};
+use zeroclaw::providers::traits::{
+    ChatMessage, GenerationAttemptBudget, TokenUsage, ToolRoundPolicy,
+};
 use zeroclaw::providers::{ChatRequest, ChatResponse, ModelProvider, ToolCall};
 
 use super::trace::{LlmTrace, TraceResponse};
@@ -23,6 +25,19 @@ impl MockModelProvider {
 
 #[async_trait]
 impl ModelProvider for MockModelProvider {
+    async fn chat_with_attempt_budget(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: ToolRoundPolicy,
+        budget: &GenerationAttemptBudget,
+    ) -> Result<ChatResponse> {
+        budget.try_spend()?;
+        self.chat_with_tool_round_policy(request, model, temperature, policy)
+            .await
+    }
+
     async fn chat_with_system(
         &self,
         _system_prompt: Option<&str>,
