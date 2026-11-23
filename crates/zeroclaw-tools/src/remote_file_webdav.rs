@@ -7,7 +7,7 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -25,6 +25,8 @@ pub enum WebDavError {
     Status(StatusCode),
     #[error("remote_files_byte_limit")]
     ByteLimit,
+    #[error("remote_files_webdav_staging_size_mismatch")]
+    StagingSizeMismatch,
     #[error("remote_files_webdav_destination_io")]
     DestinationIo(#[source] io::Error),
 }
@@ -102,7 +104,7 @@ impl WebDavRead {
         source: impl AsyncRead + Unpin + Send + 'static,
         size: Option<u64>,
         limit: Option<u64>,
-    ) -> Result<(), WebDavError> {
+    ) -> Result<u64, WebDavError> {
         let url = resource_url(&self.root, path)?;
         if let (Some(size), Some(limit)) = (size, limit)
             && size > limit
@@ -129,7 +131,50 @@ impl WebDavRead {
         if !progress.finished.load(Ordering::Acquire) {
             return Err(WebDavError::Transport);
         }
-        Ok(())
+        Ok(progress.written.load(Ordering::Acquire))
+    }
+
+    /// Relay a file between two separately authorized endpoints. The staging
+    /// pathname belongs to the executor; publication remains a separate step.
+    pub async fn stage_from(
+        &self,
+        source: &Self,
+        source_path: &str,
+        source_authorization: Option<HeaderValue>,
+        staging_path: &str,
+        destination_authorization: Option<HeaderValue>,
+        limit: Option<u64>,
+    ) -> Result<u64, WebDavError> {
+        use futures_util::TryStreamExt;
+
+        // Validate both paths before initiating the source request.
+        resource_url(&self.root, staging_path)?;
+        let response = source
+            .request(Method::GET, source_path, source_authorization)
+            .await?;
+        let size = response.content_length();
+        let reader = tokio_util::io::StreamReader::new(
+            response
+                .bytes_stream()
+                .map_err(|_| io::Error::other("remote_files_source_read")),
+        );
+        let written = self
+            .upload_new_staging_file(
+                staging_path,
+                destination_authorization.clone(),
+                reader,
+                size,
+                limit,
+            )
+            .await?;
+        if self
+            .file_size(staging_path, destination_authorization)
+            .await?
+            != Some(written)
+        {
+            return Err(WebDavError::StagingSizeMismatch);
+        }
+        Ok(written)
     }
 
     /// Create exactly one directory. Parent creation and authorization are
@@ -242,11 +287,14 @@ impl WebDavRead {
         destination: Option<Url>,
         depth: Option<&'static str>,
     ) -> Result<Response, WebDavError> {
+        let is_download = method == Method::GET;
         let mut request = self
             .client
             .request(method, url)
-            .timeout(Duration::from_secs(60))
             .header(ACCEPT_ENCODING, "identity");
+        if !is_download {
+            request = request.timeout(Duration::from_secs(60));
+        }
         if let Some(destination) = destination {
             request = request
                 .header("Destination", destination.as_str())
@@ -264,6 +312,7 @@ impl WebDavRead {
 
 #[derive(Default)]
 struct UploadProgress {
+    written: AtomicU64,
     limit_reached: AtomicBool,
     finished: AtomicBool,
 }
@@ -301,6 +350,7 @@ fn upload_stream<R: AsyncRead + Unpin>(
                 ));
             }
             if count == 0 {
+                progress.written.store(total, Ordering::Release);
                 progress.finished.store(true, Ordering::Release);
                 return Ok(None);
             }
@@ -629,6 +679,103 @@ mod tests {
                     expected
                 );
             }
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_isolates_origin_credentials_and_verifies_staging_size() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let source_addr = source.local_addr().unwrap();
+        let destination_addr = destination.local_addr().unwrap();
+        let certificate = rcgen::generate_simple_self_signed(vec!["files.test".into()]).unwrap();
+        let trust = reqwest::Certificate::from_der(certificate.cert.der()).unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certificate.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            for (listener, method, path, identity, response) in [
+                (
+                    &source,
+                    "GET",
+                    "report.txt",
+                    "source-fixture",
+                    "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndemo",
+                ),
+                (
+                    &destination,
+                    "PUT",
+                    "staging.tmp",
+                    "destination-fixture",
+                    "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ),
+                (
+                    &destination,
+                    "HEAD",
+                    "staging.tmp",
+                    "destination-fixture",
+                    "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n",
+                ),
+            ] {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut tls = acceptor.accept(tcp).await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(request.len() < 8192);
+                    request.push(tls.read_u8().await.unwrap());
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(request.starts_with(&format!("{method} /dav/{path} HTTP/1.1\r\n")));
+                let request = request.to_ascii_lowercase();
+                assert!(request.contains(&format!("\r\nauthorization: bearer {identity}\r\n")));
+                assert_eq!(request.matches("\r\nauthorization:").count(), 1);
+                if method == "PUT" {
+                    let mut body = [0; 14];
+                    tls.read_exact(&mut body).await.unwrap();
+                    assert_eq!(&body, b"4\r\ndemo\r\n0\r\n\r\n");
+                }
+                tls.write_all(response.as_bytes()).await.unwrap();
+                tls.shutdown().await.unwrap();
+            }
+        });
+        let adapter = |address: SocketAddr| {
+            let root = Url::parse(&format!("https://files.test:{}/dav/", address.port())).unwrap();
+            let client = build_client(&root, &[address])
+                .unwrap()
+                .add_root_certificate(trust.clone())
+                .build()
+                .unwrap();
+            WebDavRead { root, client }
+        };
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let transferred = adapter(destination_addr)
+                .stage_from(
+                    &adapter(source_addr),
+                    "report.txt",
+                    Some(HeaderValue::from_static("Bearer source-fixture")),
+                    "staging.tmp",
+                    Some(HeaderValue::from_static("Bearer destination-fixture")),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(transferred, 4);
             server.await.unwrap();
         })
         .await
