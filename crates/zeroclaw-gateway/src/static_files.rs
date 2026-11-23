@@ -38,11 +38,9 @@ pub async fn handle_static(State(state): State<AppState>, uri: Uri) -> Response 
 
 /// SPA fallback: serve index.html for any non-API, non-static GET request.
 /// Injects `window.__ZEROCLAW_BASE__` so the frontend knows the path prefix.
-pub async fn handle_spa_fallback(
+pub(crate) async fn handle_spa_fallback(
     State(state): State<AppState>,
-    cutover: Option<
-        axum::Extension<std::sync::Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
-    >,
+    cutover: crate::dashboard_core::Cutover,
     uri: Uri,
 ) -> Response {
     if let Some(path) = api_fallback_path(uri.path(), &state.path_prefix) {

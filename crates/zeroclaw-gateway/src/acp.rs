@@ -1053,6 +1053,14 @@ mod tests {
         let mut cfg = front_door_config(install_root);
         std::fs::create_dir_all(&cfg.data_dir).unwrap();
         cfg.gateway.acp_webchat_cutover = cutover;
+        let web_dist = tmp.path().join("web-dist");
+        std::fs::create_dir_all(&web_dist).unwrap();
+        std::fs::write(
+            web_dist.join("index.html"),
+            "<!doctype html><html><head></head><body>dashboard</body></html>",
+        )
+        .unwrap();
+        cfg.gateway.web_dist_dir = Some(web_dist.display().to_string());
         let provider = if cutover {
             use wiremock::matchers::method;
             use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1138,6 +1146,20 @@ mod tests {
         })
         .await
         .expect("gateway should accept connections");
+
+        let dashboard = reqwest::get(format!("http://{addr}/chat"))
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(
+            dashboard.contains(r#"<meta name="zeroclaw-chat-transport" content="acp">"#),
+            cutover,
+            "served dashboard must select the transport mounted by the gateway",
+        );
 
         let url = format!("ws://127.0.0.1:{port}/acp");
         if cutover {

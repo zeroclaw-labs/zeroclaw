@@ -1705,7 +1705,7 @@ pub(crate) struct CutoverWebChat {
     pub(crate) turns: Arc<crate::acp::AcpTurnHub>,
 }
 
-type Cutover = Option<Extension<CutoverWebChat>>;
+pub(crate) type Cutover = Option<Extension<CutoverWebChat>>;
 
 async fn operator_webchat_id(
     store: &Arc<AcpSessionStore>,

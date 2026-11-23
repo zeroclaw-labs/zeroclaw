@@ -3333,7 +3333,7 @@ fn public_health_snapshot() -> serde_json::Value {
 /// GET /health — always public (no secrets leaked)
 async fn handle_health(
     State(state): State<AppState>,
-    cutover: Option<axum::Extension<dashboard_core::CutoverWebChat>>,
+    cutover: dashboard_core::Cutover,
 ) -> impl IntoResponse {
     let body = serde_json::json!({
         "status": "ok",
