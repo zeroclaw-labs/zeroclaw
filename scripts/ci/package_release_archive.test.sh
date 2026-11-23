@@ -257,6 +257,19 @@ archiver_failure_case
 printf 'PASS archive baseline: %s / %s / 7 cases / source blob %s\n' \
   "$package_step" "$package_ext" "$archive_baseline_blob"
 
+# Repack in the same checkout after a frontend rebuild and a companion removal.
+# The second archive must describe current inputs, including deletions.
+repeat_fixture="$archive_test_tmp/repeated packaging"
+seed_fixture "$repeat_fixture" both
+printf 'obsolete frontend asset\n' > "$repeat_fixture/web/dist/assets/obsolete.js"
+run_packager shared "$repeat_fixture" > "$repeat_fixture/first-package.log" 2>&1
+rm "$repeat_fixture/web/dist/assets/obsolete.js" \
+  "$repeat_fixture/target/fixture-target/release/$code_name"
+printf 'rebuilt frontend asset\n' > "$repeat_fixture/web/dist/assets/app.js"
+run_packager shared "$repeat_fixture" > "$repeat_fixture/second-package.log" 2>&1
+assert_roundtrip "$repeat_fixture" relay
+echo "PASS archive repack: current payloads only, no removed assets or nested dist"
+
 verification_fixture="$archive_test_tmp/positive both/shared"
 verification_archive="$verification_fixture/zeroclaw-fixture-target.$package_ext"
 verification_manifest="$verification_fixture/input-manifest.json"
