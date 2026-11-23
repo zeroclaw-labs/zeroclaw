@@ -7,10 +7,15 @@ use base64::Engine as _;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     sync::{mpsc, oneshot, watch},
+    task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::channel::{Channel, ChannelControl, ChannelMessage, ProgressEvent, SendMessage};
@@ -18,6 +23,8 @@ use zeroclaw_config::live::LiveConfigHandle;
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME: u64 = 8 * 1024 * 1024;
+const MAX_CONCURRENT_BATCH_TRANSCRIPTIONS: usize = 2;
+const MAX_PENDING_ORDERED_MESSAGES: usize = 32;
 
 fn bridge_result(value: Value) -> Result<()> {
     if value["ok"] == true {
@@ -47,6 +54,10 @@ struct Inner {
     /// neither durable chat history nor a policy snapshot; only the assembled
     /// turn enters shared dispatch, once silence closes it.
     transcripts: Mutex<HashMap<String, String>>,
+    /// Invalidates queued or running call transcription after call control.
+    /// Entries exist only for active calls; ordinary text and notes use local
+    /// tokens and never allocate here.
+    call_transcriptions: Mutex<HashMap<(String, String), CancellationToken>>,
     cancel: Mutex<CancellationToken>,
 }
 /// Owns the backend connection and its event pump for one call, not policy.
@@ -80,6 +91,7 @@ impl SimplexChannel {
                 drafts: Mutex::new(HashMap::new()),
                 recognition: Mutex::new(HashMap::new()),
                 transcripts: Mutex::new(HashMap::new()),
+                call_transcriptions: Mutex::new(HashMap::new()),
                 cancel: Mutex::new(CancellationToken::new()),
             }),
         }
@@ -237,6 +249,39 @@ impl SimplexChannel {
         }
         Ok(drafts.remove(id))
     }
+    fn take_draft_for_delivery(&self, recipient: &str, id: &str) -> Result<VoiceDraft> {
+        let mut drafts = self.inner.drafts.lock();
+        let Some(draft) = drafts.get(id) else {
+            return Err(zeroclaw_api::channel::FinalizeUndelivered {
+                reason: "simplex_draft_not_owned".into(),
+            }
+            .into());
+        };
+        ensure!(draft.contact == recipient, "simplex_draft_scope_mismatch");
+        ensure!(!draft.cancelled, "simplex_draft_cancelled");
+        drafts.remove(id).context("simplex_draft_not_owned")
+    }
+    async fn cancel_call_drafts(&self, contact: &str, call_id: &str) -> Result<()> {
+        let ids: Vec<_> = self
+            .inner
+            .drafts
+            .lock()
+            .iter()
+            .filter(|(_, draft)| {
+                draft.contact == contact && draft.scope.split('/').next() == Some(call_id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut first_error = None;
+        for id in ids {
+            if let Err(error) = self.cancel_draft(contact, &id).await
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
     fn manager(&self, contact: &str, call: bool) -> Result<crate::tts::TtsManager> {
         ensure!(self.allowed(contact, call), "simplex_voice_not_authorized");
         let config = self.inner.config.read();
@@ -256,6 +301,40 @@ impl SimplexChannel {
                 .any(|peer| zeroclaw_config::schema::peer_grant_identity(peer) == Some(contact))
         };
         !matches(OutputModality::Text) && (force || matches(OutputModality::Voice))
+    }
+    fn call_transcription_generation(&self, contact: &str, call_id: &str) -> CancellationToken {
+        self.inner
+            .call_transcriptions
+            .lock()
+            .entry((contact.to_string(), call_id.to_string()))
+            .or_default()
+            .clone()
+    }
+    fn invalidate_call_transcription(&self, contact: &str, call_id: &str) {
+        if let Some(generation) = self
+            .inner
+            .call_transcriptions
+            .lock()
+            .remove(&(contact.to_string(), call_id.to_string()))
+        {
+            generation.cancel();
+        }
+    }
+    async fn report_event_failure(&self, contact: &str, voice: bool, error: anyhow::Error) {
+        if voice && let Err(notice_error) = self.voice_notice(contact, false).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_attrs(json!({"error": notice_error.to_string()})),
+                "simplex_voice_note_failure_notice_failed"
+            );
+        }
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(json!({"error": error.to_string()})),
+            "SimpleX event processing failed"
+        );
     }
     async fn voice_notice(&self, contact: &str, outgoing: bool) -> Result<()> {
         if !self.allowed(contact, false) {
@@ -284,6 +363,7 @@ impl SimplexChannel {
         );
         if let Some(draft) = &draft {
             ensure!(draft.contact == recipient, "simplex_draft_scope_mismatch");
+            ensure!(!draft.cancelled, "simplex_draft_cancelled");
         }
         let is_call = draft.as_ref().is_some_and(|d| !d.scope.is_empty());
         let live_text = draft.as_mut().and_then(|draft| draft.text.as_mut());
@@ -447,7 +527,6 @@ impl SimplexChannel {
                     match event["type"].as_str() {
                         Some("speech_start") => {
                             let utterance = event["utteranceId"].as_str().context("simplex_live_utterance_missing")?;
-                            channel.inner.drafts.lock().retain(|_, draft| draft.contact != contact || !draft.scope.starts_with(&format!("{call}/")));
                             let reply = channel.request_reply(json!({"type":"speech_start","contact":contact,"call_id":call,"utterance_id":utterance})).await?;
                             // The same producer sends the observation before its final transcript.
                             // A backlogged PCM reader must not reorder these two session events.
@@ -455,13 +534,25 @@ impl SimplexChannel {
                             ensure!(observation["contact"] == contact && observation["call_id"] == call
                                 && observation["scope"] == format!("{call}/{utterance}"), "simplex_playback_scope_mismatch");
                             channel.playback_observation(observation, &tx, true).await?;
+                            // Shared dispatch has already received the interrupt. Keep
+                            // each native draft until the bridge confirms its terminal
+                            // text edit, so this path cannot strand a live placeholder.
+                            if let Err(error) = channel.cancel_call_drafts(&contact, &call).await {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                        .with_attrs(json!({"error": error.to_string()})),
+                                    "simplex_live_draft_cancel_failed"
+                                );
+                            }
                         }
                         Some("final") => {
                             let utterance = event["utteranceId"].as_str().context("simplex_live_utterance_missing")?;
                             let message = json!({"contact":contact,"call_id":call,
                                 "scope":format!("{call}/{utterance}"),"id":format!("{call}/{utterance}")});
+                            let generation = channel.call_transcription_generation(&contact, &call);
                             channel.dispatch_message(&message,
-                                event["text"].as_str().context("simplex_live_text_missing")?.to_string(), true, true, &tx).await?;
+                                event["text"].as_str().context("simplex_live_text_missing")?.to_string(), true, true, &generation, &tx).await?;
                         }
                         _ => anyhow::bail!("simplex_live_recognition_failed"),
                     }
@@ -571,6 +662,11 @@ impl SimplexChannel {
     async fn event(&self, event: Value, tx: &mpsc::Sender<ChannelMessage>) -> Result<()> {
         let kind = event["type"].as_str().unwrap_or("");
         let contact = event["contact"].as_str().unwrap_or("");
+        if matches!(kind, "interrupted" | "call_ended") {
+            // Only this call's batch work is stale. Ordinary text and notes
+            // from the same contact retain their own order and token.
+            self.invalidate_call_transcription(contact, event["call_id"].as_str().unwrap_or(""));
+        }
         if kind == "live_orphan" {
             if self.allowed(contact, false) {
                 self.request(json!({"type":"live_recover","contact":contact,
@@ -588,19 +684,7 @@ impl SimplexChannel {
             // The reader cancels speech immediately. Settle text here, where
             // awaiting an edit ACK cannot block the reader that receives it.
             let call_id = event["call_id"].as_str().unwrap_or("");
-            let ids: Vec<_> = self
-                .inner
-                .drafts
-                .lock()
-                .iter()
-                .filter(|(_, draft)| {
-                    draft.contact == contact && draft.scope.split('/').next() == Some(call_id)
-                })
-                .map(|(id, _)| id.clone())
-                .collect();
-            for id in ids {
-                self.cancel_draft(contact, &id).await?;
-            }
+            self.cancel_call_drafts(contact, call_id).await?;
         }
         if kind == "interrupted" {
             return Ok(());
@@ -719,6 +803,30 @@ impl SimplexChannel {
         }
         let call = kind == "utterance";
         let voice = call || kind == "voice_note";
+        let generation = if call {
+            self.call_transcription_generation(
+                contact,
+                event["call_id"]
+                    .as_str()
+                    .context("simplex_call_id_missing")?,
+            )
+        } else {
+            CancellationToken::new()
+        };
+        self.message_event(event, voice, call, generation, tx).await
+    }
+    async fn message_event(
+        &self,
+        event: Value,
+        voice: bool,
+        call: bool,
+        generation: CancellationToken,
+        tx: &mpsc::Sender<ChannelMessage>,
+    ) -> Result<()> {
+        ensure!(!generation.is_cancelled(), "simplex_message_cancelled");
+        let contact = event["contact"]
+            .as_str()
+            .context("simplex_contact_missing")?;
         let mut text = if voice {
             let prepare_started = std::time::Instant::now();
             let bytes = base64::engine::general_purpose::STANDARD
@@ -759,7 +867,11 @@ impl SimplexChannel {
                     .context("simplex_voice_filename_missing")?
             };
             let transcription_started = std::time::Instant::now();
-            let transcription = manager.transcribe(&bytes, filename).await;
+            let transcription = tokio::select! {
+                biased;
+                () = generation.cancelled() => return Ok(()),
+                result = manager.transcribe(&bytes, filename) => result,
+            };
             if !call {
                 ::zeroclaw_log::record!(
                     INFO,
@@ -785,7 +897,10 @@ impl SimplexChannel {
                 .to_string()
         };
         // Speech recognition is asynchronous. Recheck policy after it returns.
-        if (!voice && text.trim().is_empty()) || !self.allowed(contact, call) {
+        if generation.is_cancelled()
+            || (!voice && text.trim().is_empty())
+            || !self.allowed(contact, call)
+        {
             return Ok(());
         }
         if call {
@@ -802,7 +917,9 @@ impl SimplexChannel {
         if text.trim().is_empty() {
             return Ok(());
         }
-        self.dispatch_message(&event, text, voice, call, tx).await
+        ensure!(!generation.is_cancelled(), "simplex_message_cancelled");
+        self.dispatch_message(&event, text, voice, call, &generation, tx)
+            .await
     }
     async fn dispatch_message(
         &self,
@@ -810,6 +927,7 @@ impl SimplexChannel {
         text: String,
         voice: bool,
         call: bool,
+        generation: &CancellationToken,
         tx: &mpsc::Sender<ChannelMessage>,
     ) -> Result<()> {
         let contact = event["contact"]
@@ -818,7 +936,7 @@ impl SimplexChannel {
         if !self.allowed(contact, call) || text.trim().is_empty() {
             return Ok(());
         }
-        tx.send(ChannelMessage {
+        let message = ChannelMessage {
             id: event["id"]
                 .as_str()
                 .map(str::to_owned)
@@ -838,9 +956,12 @@ impl SimplexChannel {
             voice_origin: voice,
             explicitly_addressed: true,
             ..Default::default()
-        })
-        .await
-        .context("simplex_dispatch_closed")
+        };
+        tokio::select! {
+            biased;
+            () = generation.cancelled() => Ok(()),
+            result = tx.send(message) => result.context("simplex_dispatch_closed"),
+        }
     }
     fn assemble_transcript(
         &self,
@@ -869,6 +990,197 @@ impl SimplexChannel {
         } else {
             None
         })
+    }
+}
+
+/// Runs batch-capable ingress away from the transport control task. At most
+/// one task per contact runs, so transcriptions may execute concurrently
+/// across contacts without reordering a contact's messages.
+struct OrderedMessageIngress {
+    channel: SimplexChannel,
+    tx: mpsc::Sender<ChannelMessage>,
+    max_concurrency: usize,
+    workers: JoinSet<(String, bool, Result<()>)>,
+    active: HashSet<String>,
+    pending: HashMap<String, VecDeque<OrderedMessage>>,
+    pending_events: usize,
+}
+
+struct OrderedMessage {
+    event: Value,
+    contact: String,
+    voice: bool,
+    call: bool,
+    generation: CancellationToken,
+}
+
+impl OrderedMessageIngress {
+    fn new(
+        channel: SimplexChannel,
+        tx: mpsc::Sender<ChannelMessage>,
+        max_concurrency: usize,
+    ) -> Self {
+        Self {
+            channel,
+            tx,
+            max_concurrency: max_concurrency.max(1),
+            workers: JoinSet::new(),
+            active: HashSet::new(),
+            pending: HashMap::new(),
+            pending_events: 0,
+        }
+    }
+
+    fn accepts(event: &Value) -> bool {
+        matches!(
+            event["type"].as_str(),
+            Some("message" | "utterance" | "voice_note")
+        )
+    }
+
+    fn submit(&mut self, event: Value) -> Result<()> {
+        let kind = event["type"]
+            .as_str()
+            .context("simplex_event_type_missing")?;
+        let contact = event["contact"]
+            .as_str()
+            .context("simplex_contact_missing")?;
+        let call = kind == "utterance";
+        if !self.channel.allowed(contact, call) {
+            return Ok(());
+        }
+        if self.pending_events >= MAX_PENDING_ORDERED_MESSAGES {
+            anyhow::bail!("simplex_ordered_message_limit");
+        }
+        let generation = if call {
+            self.channel.call_transcription_generation(
+                contact,
+                event["call_id"]
+                    .as_str()
+                    .context("simplex_call_id_missing")?,
+            )
+        } else {
+            CancellationToken::new()
+        };
+        let contact = contact.to_string();
+        let voice = call || kind == "voice_note";
+        let message = OrderedMessage {
+            event,
+            contact,
+            voice,
+            call,
+            generation,
+        };
+        if self.active.contains(&message.contact) || self.active.len() >= self.max_concurrency {
+            self.pending_events += 1;
+            self.pending
+                .entry(message.contact.clone())
+                .or_default()
+                .push_back(message);
+        } else {
+            self.start(message)?;
+        }
+        Ok(())
+    }
+
+    fn start(&mut self, message: OrderedMessage) -> Result<()> {
+        ensure!(
+            self.active.len() < self.max_concurrency,
+            "simplex_ordered_worker_limit"
+        );
+        ensure!(
+            !self.active.contains(&message.contact),
+            "simplex_ordered_contact_active"
+        );
+        self.active.insert(message.contact.clone());
+        let channel = self.channel.clone();
+        let tx = self.tx.clone();
+        self.workers.spawn(async move {
+            let result = channel
+                .message_event(
+                    message.event,
+                    message.voice,
+                    message.call,
+                    message.generation,
+                    &tx,
+                )
+                .await;
+            (message.contact, message.voice, result)
+        });
+        Ok(())
+    }
+
+    fn has_workers(&self) -> bool {
+        !self.workers.is_empty()
+    }
+
+    async fn join_next(
+        &mut self,
+    ) -> Option<std::result::Result<(String, bool, Result<()>), tokio::task::JoinError>> {
+        self.workers.join_next().await
+    }
+
+    fn pop_ready(&mut self) -> Option<OrderedMessage> {
+        loop {
+            let contact = self
+                .pending
+                .iter()
+                .find(|(contact, pending)| !self.active.contains(*contact) && !pending.is_empty())
+                .map(|(contact, _)| contact.clone())?;
+            let next = self.pending.get_mut(&contact).and_then(VecDeque::pop_front);
+            let Some(message) = next else {
+                self.pending.remove(&contact);
+                continue;
+            };
+            self.pending_events -= 1;
+            if message.generation.is_cancelled() {
+                continue;
+            }
+            if self.pending.get(&contact).is_some_and(VecDeque::is_empty) {
+                self.pending.remove(&contact);
+            }
+            return Some(message);
+        }
+    }
+
+    fn fill_slots(&mut self) -> Result<()> {
+        while self.active.len() < self.max_concurrency {
+            let Some(message) = self.pop_ready() else {
+                return Ok(());
+            };
+            self.start(message)?;
+        }
+        Ok(())
+    }
+
+    async fn complete(
+        &mut self,
+        joined: std::result::Result<(String, bool, Result<()>), tokio::task::JoinError>,
+    ) -> Result<()> {
+        let (contact, voice, result) = joined.context("simplex_ordered_message_worker_failed")?;
+        self.active.remove(&contact);
+        self.fill_slots()?;
+        if let Err(error) = result {
+            self.channel
+                .report_event_failure(&contact, voice, error)
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn drain(&mut self) -> Result<()> {
+        while self.has_workers() {
+            let joined = self
+                .join_next()
+                .await
+                .context("simplex_ordered_message_worker_missing")?;
+            self.complete(joined).await?;
+        }
+        ensure!(
+            self.pending_events == 0,
+            "simplex_ordered_message_worker_missing"
+        );
+        Ok(())
     }
 }
 
@@ -961,26 +1273,29 @@ impl Channel for SimplexChannel {
                     {
                         continue; // the request owner already cancelled
                     }
-                } else if matches!(value["type"].as_str(), Some("interrupted" | "call_ended")) {
-                    // Drop synthesis immediately, even while STT is pending.
-                    let contact = value["contact"].as_str().unwrap_or("");
-                    let call_id = value["call_id"].as_str().unwrap_or("");
-                    for draft in channel.inner.drafts.lock().values() {
-                        if draft.contact == contact
-                            && draft.scope.split('/').next() == Some(call_id)
-                        {
-                            draft.cancel.cancel();
+                } else {
+                    if matches!(value["type"].as_str(), Some("interrupted" | "call_ended")) {
+                        // Drop synthesis immediately, even while STT is pending.
+                        let contact = value["contact"].as_str().unwrap_or("");
+                        let call_id = value["call_id"].as_str().unwrap_or("");
+                        for draft in channel.inner.drafts.lock().values() {
+                            if draft.contact == contact
+                                && draft.scope.split('/').next() == Some(call_id)
+                            {
+                                draft.cancel.cancel();
+                            }
                         }
                     }
-                    events
-                        .send(value)
-                        .await
-                        .context("simplex_event_loop_closed")?;
-                } else {
-                    events
-                        .send(value)
-                        .await
-                        .context("simplex_event_loop_closed")?;
+                    // Never block the only bridge reply reader on its own event consumer.
+                    // Reconnect on overload rather than silently dropping ordered audio.
+                    events.try_send(value).map_err(|error| match error {
+                        mpsc::error::TrySendError::Full(_) => {
+                            anyhow::anyhow!("simplex_bridge_event_overflow")
+                        }
+                        mpsc::error::TrySendError::Closed(_) => {
+                            anyhow::anyhow!("simplex_event_loop_closed")
+                        }
+                    })?;
                 }
             }
         });
@@ -989,19 +1304,40 @@ impl Channel for SimplexChannel {
             channel
                 .request(json!({"type": "init", "websocket_url": settings.websocket_url}))
                 .await?;
-            while let Some(event) = reads.recv().await {
-                let note = matches!(event["type"].as_str(), Some("voice_note" | "voice_invitation"));
-                let contact = event["contact"].as_str().unwrap_or("").to_string();
-                if let Err(error) = channel.event(event, &tx).await {
-                    if note { channel.voice_notice(&contact, false).await?; }
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(json!({"error": if note { "simplex_voice_note_failed".to_string() } else { error.to_string() }})),
-                        "SimpleX event processing failed"
-                    );
+            let mut ingress = OrderedMessageIngress::new(
+                channel.clone(),
+                tx.clone(),
+                MAX_CONCURRENT_BATCH_TRANSCRIPTIONS,
+            );
+            loop {
+                tokio::select! {
+                    event = reads.recv() => {
+                        let Some(event) = event else {
+                            break;
+                        };
+                        let note = matches!(
+                            event["type"].as_str(),
+                            Some("utterance" | "voice_note" | "voice_invitation")
+                        );
+                        let contact = event["contact"].as_str().unwrap_or("").to_string();
+                        if OrderedMessageIngress::accepts(&event) {
+                            if let Err(error) = ingress.submit(event) {
+                                channel
+                                    .report_event_failure(&contact, note, error)
+                                    .await;
+                            }
+                        } else if let Err(error) = channel.event(event, &tx).await {
+                            channel
+                                .report_event_failure(&contact, note, error)
+                                .await;
+                        }
+                    }
+                    Some(joined) = ingress.join_next(), if ingress.has_workers() => {
+                        ingress.complete(joined).await?;
+                    }
                 }
             }
+            ingress.drain().await?;
             Ok::<(), anyhow::Error>(())
         });
         let cancel = self.inner.cancel.lock().clone();
@@ -1017,6 +1353,7 @@ impl Channel for SimplexChannel {
         self.inner.pending.lock().clear();
         self.inner.drafts.lock().clear();
         self.inner.transcripts.lock().clear();
+        self.inner.call_transcriptions.lock().clear();
         self.inner.recognition.lock().clear();
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
@@ -1099,6 +1436,9 @@ impl Channel for SimplexChannel {
         let drafts = self.inner.drafts.lock();
         if let Some(draft) = drafts.get(id) {
             ensure!(draft.contact == recipient, "simplex_draft_scope_mismatch");
+            if draft.cancelled {
+                return Ok(());
+            }
             if let Some(live) = &draft.text {
                 let phase = text
                     .strip_prefix(&draft.narration_delivered)
@@ -1124,6 +1464,9 @@ impl Channel for SimplexChannel {
         let drafts = self.inner.drafts.lock();
         if let Some(draft) = drafts.get(id) {
             ensure!(draft.contact == recipient, "simplex_draft_scope_mismatch");
+            if draft.cancelled {
+                return Ok(());
+            }
             if let Some(live) = &draft.text {
                 live.update(
                     &simplex_progress(match event {
@@ -1152,6 +1495,9 @@ impl Channel for SimplexChannel {
                 return Ok(());
             };
             ensure!(draft.contact == recipient, "simplex_draft_scope_mismatch");
+            if draft.cancelled {
+                return Ok(());
+            }
             text.strip_prefix(&draft.narration_delivered)
                 .context("simplex_narration_prefix_mismatch")?
                 .trim()
@@ -1205,6 +1551,9 @@ impl Channel for SimplexChannel {
         let mut drafts = self.inner.drafts.lock();
         if let Some(draft) = drafts.get_mut(id) {
             ensure!(draft.contact == recipient, "simplex_draft_scope_mismatch");
+            if draft.cancelled {
+                return Ok(());
+            }
             if draft.scope.is_empty() && self.wants_note(recipient, draft.force_voice) {
                 if draft.note.is_none() {
                     let manager = Arc::new(self.manager(recipient, false)?);
@@ -1231,11 +1580,7 @@ impl Channel for SimplexChannel {
         suppress_voice: bool,
         force_voice: bool,
     ) -> Result<()> {
-        let draft = self.take_draft(recipient, id)?.ok_or_else(|| {
-            anyhow::Error::new(zeroclaw_api::channel::FinalizeUndelivered {
-                reason: "simplex_draft_not_owned".into(),
-            })
-        })?;
+        let draft = self.take_draft_for_delivery(recipient, id)?;
         self.finish_reply(
             recipient,
             Some(draft),
@@ -1260,6 +1605,9 @@ impl Channel for SimplexChannel {
         );
         if let Some(draft) = self.inner.drafts.lock().get_mut(id) {
             ensure!(draft.contact == recipient, "simplex_draft_scope_mismatch");
+            if draft.cancelled {
+                return Ok(());
+            }
             if !draft.scope.is_empty() {
                 draft.update(phase, text, finished);
             }
@@ -1273,11 +1621,7 @@ impl Channel for SimplexChannel {
         text: &str,
         suppress_voice: bool,
     ) -> Result<()> {
-        let draft = self.take_draft(recipient, id)?.ok_or_else(|| {
-            anyhow::Error::new(zeroclaw_api::channel::FinalizeUndelivered {
-                reason: "simplex_draft_not_owned".into(),
-            })
-        })?;
+        let draft = self.take_draft_for_delivery(recipient, id)?;
         self.finish_reply(
             recipient,
             Some(draft),
@@ -1290,27 +1634,53 @@ impl Channel for SimplexChannel {
     }
     async fn cancel_draft(&self, recipient: &str, id: &str) -> Result<()> {
         let mut draft = self.take_draft(recipient, id)?;
-        let text_result = if let Some(text) = draft.as_mut().and_then(|draft| draft.text.as_mut()) {
-            let stopped = text.stop().await;
-            if stopped.is_err() {
-                stopped
-            } else if self.allowed(recipient, false) {
-                self.request(json!({"type":"live_cancel","contact":recipient,"draft":id,
-                    "interrupted":simplex_progress("interrupted")}))
-                    .await
-            } else {
-                Ok(())
-            }
-        } else {
-            Ok(())
+        let Some(draft_ref) = draft.as_mut() else {
+            return Ok(());
         };
-        if let Some(draft) = draft
-            && !draft.scope.is_empty()
-        {
-            self.request(json!({"type": "stop_audio", "contact": recipient, "scope": draft.scope}))
-                .await?;
+        draft_ref.cancelled = true;
+        draft_ref.cancel.cancel();
+        let mut first_error = None;
+        let mut text_cleanup_pending = false;
+        if let Some(text) = draft_ref.text.as_mut() {
+            if let Err(error) = text.stop().await {
+                first_error = Some(error);
+            }
+            // Cleanup remains safe after a live grant is revoked: the command
+            // targets only the bridge-owned item previously created for this
+            // validated draft. Keep the native owner until this terminal ACK.
+            if let Err(error) = self
+                .request(json!({"type":"live_cancel","contact":recipient,"draft":id,
+                    "interrupted":simplex_progress("interrupted")}))
+                .await
+            {
+                text_cleanup_pending = true;
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
         }
-        text_result
+        if !draft_ref.scope.is_empty()
+            && let Err(error) = self
+                .request(
+                    json!({"type": "stop_audio", "contact": recipient, "scope": draft_ref.scope}),
+                )
+                .await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        if text_cleanup_pending {
+            let mut drafts = self.inner.drafts.lock();
+            ensure!(
+                !drafts.contains_key(id),
+                "simplex_draft_cancel_owner_conflict"
+            );
+            drafts.insert(
+                id.to_string(),
+                draft.context("simplex_draft_cancel_owner_missing")?,
+            );
+        }
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -1441,6 +1811,7 @@ struct VoiceDraft {
     updates: watch::Sender<SpeechSnapshot>,
     worker: Option<tokio::task::JoinHandle<Result<()>>>,
     cancel: CancellationToken,
+    cancelled: bool,
 }
 impl Drop for VoiceDraft {
     fn drop(&mut self) {
@@ -1465,6 +1836,7 @@ impl VoiceDraft {
             updates,
             worker: None,
             cancel: CancellationToken::new(),
+            cancelled: false,
         }
     }
     fn update(&mut self, phase: usize, text: &str, phase_finished: bool) {
@@ -1667,6 +2039,64 @@ mod tests {
         .await
         .unwrap();
     }
+    fn allow_contacts(live: &LiveConfig, contacts: &[&str]) {
+        let mut config = live.snapshot();
+        config
+            .peer_groups
+            .get_mut("owner")
+            .unwrap()
+            .external_peers
+            .extend(
+                contacts
+                    .iter()
+                    .map(|contact| PeerUsername((*contact).into())),
+            );
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+    }
+    fn configure_batch_transcription(live: &LiveConfig, uri: String) {
+        use zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig;
+        let mut config = live.snapshot();
+        config.transcription.enabled = true;
+        config.transcription.max_duration_secs = 600;
+        config
+            .agents
+            .get_mut("assistant")
+            .unwrap()
+            .transcription_provider = "local_whisper.fixture".into();
+        config.providers.transcription.local_whisper.insert(
+            "fixture".into(),
+            LocalWhisperTranscriptionProviderConfig {
+                uri,
+                ..Default::default()
+            },
+        );
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+    }
+    fn batch_voice_event(contact: &str, id: &str, filename: &str) -> Value {
+        json!({
+            "type": "voice_note",
+            "contact": contact,
+            "id": id,
+            "audio": base64::engine::general_purpose::STANDARD.encode(b"audio"),
+            "filename": filename,
+            "duration": 2,
+        })
+    }
+    async fn wait_for_started_requests(started: &Mutex<Vec<String>>, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while started.lock().len() < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    async fn drain_ingress(ingress: &mut OrderedMessageIngress) {
+        while let Some(joined) = ingress.join_next().await {
+            ingress.complete(joined).await.unwrap();
+        }
+        assert_eq!(ingress.pending_events, 0);
+    }
     #[tokio::test]
     async fn live_text_waits_in_processing_until_reasoning_is_observed() {
         let (channel, _) = fixture();
@@ -1792,6 +2222,16 @@ mod tests {
             input.try_recv().unwrap().control,
             Some(ChannelControl::Interrupt)
         );
+        let error = channel
+            .finalize_draft("17", &id, "stale finalization", true)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<zeroclaw_api::channel::FinalizeUndelivered>()
+                .is_some(),
+            "finalization must be rejected while cancellation owns the draft"
+        );
         channel
             .inner
             .pending
@@ -1816,6 +2256,129 @@ mod tests {
         event.await.unwrap().unwrap();
         worker.abort();
         assert!(!channel.inner.drafts.lock().contains_key(&id));
+    }
+    #[tokio::test]
+    async fn speech_onset_cancels_live_draft_after_delivering_interrupt() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        use zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("ws://{}/stream", listener.local_addr().unwrap());
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"type":"ready","sampleRate":16000,"streaming":true})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            while !matches!(socket.next().await, Some(Ok(Message::Binary(_)))) {}
+            socket
+                .send(Message::Text(
+                    json!({"type":"speech_start","utteranceId":"u1"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            let _ = socket.next().await;
+        });
+        let (channel, live) = fixture();
+        let mut config = live.snapshot();
+        config.transcription.enabled = true;
+        config
+            .agents
+            .get_mut("assistant")
+            .unwrap()
+            .transcription_provider = "local_whisper.fixture".into();
+        config.providers.transcription.local_whisper.insert(
+            "fixture".into(),
+            LocalWhisperTranscriptionProviderConfig {
+                stream_uri: Some(uri),
+                ..Default::default()
+            },
+        );
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+        let (_, initial_worker) = record_bridge(&channel);
+        let id = channel
+            .send_draft(&SendMessage::new("", "17").in_thread(Some("call/old".into())))
+            .await
+            .unwrap()
+            .unwrap();
+        let (writer, mut requests) = mpsc::channel::<Value>(4);
+        *channel.inner.writer.lock() = Some(writer);
+        let observer = channel.clone();
+        let draft_id = id.clone();
+        let bridge = zeroclaw_spawn::spawn!(async move {
+            let speech = requests.recv().await.unwrap();
+            assert_eq!(speech["type"], "speech_start");
+            observer
+                .inner
+                .pending
+                .lock()
+                .remove(speech["id"].as_str().unwrap())
+                .unwrap()
+                .send(json!({"ok":true, "observation":{
+                    "contact":"17","call_id":"call","scope":"call/u1",
+                    "playback":{"interrupted":false}
+                }}))
+                .unwrap();
+            let cancel = requests.recv().await.unwrap();
+            assert_eq!(cancel["type"], "live_cancel");
+            let error = observer
+                .finalize_draft("17", &draft_id, "stale finalization", true)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<zeroclaw_api::channel::FinalizeUndelivered>()
+                    .is_some(),
+                "finalization must be rejected while cancellation owns the draft"
+            );
+            observer
+                .inner
+                .pending
+                .lock()
+                .remove(cancel["id"].as_str().unwrap())
+                .unwrap()
+                .send(json!({"ok":true}))
+                .unwrap();
+            let audio = requests.recv().await.unwrap();
+            assert_eq!(audio["type"], "stop_audio");
+            observer
+                .inner
+                .pending
+                .lock()
+                .remove(audio["id"].as_str().unwrap())
+                .unwrap()
+                .send(json!({"ok":true}))
+                .unwrap();
+        });
+        let (tx, mut rx) = mpsc::channel(4);
+        assert!(channel.start_recognition("17", "call", &tx).await.unwrap());
+        channel
+            .event(
+                json!({"type":"call_audio","contact":"17","call_id":"call","audio":"AAAAAA=="}),
+                &tx,
+            )
+            .await
+            .unwrap();
+        let interrupt = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(interrupt.control, Some(ChannelControl::Interrupt));
+        bridge.await.unwrap();
+        assert!(!channel.inner.drafts.lock().contains_key(&id));
+        channel.inner.recognition.lock().clear();
+        initial_worker.abort();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
     #[tokio::test]
     async fn live_text_rechecks_permission_when_coalesced_frame_reaches_delivery() {
@@ -2034,6 +2597,248 @@ mod tests {
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
         assert!(channel.event(json!({"type":"voice_note","contact":"17","id":"43","audio":audio,"filename":"voice.m4a","duration":601}), &tx).await.is_err());
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_transcription_bounds_active_and_pending_workers() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let responder_started = started.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/transcribe"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&request.body);
+                let filename = ["one.m4a", "two.m4a", "three.m4a"]
+                    .into_iter()
+                    .find(|filename| body.contains(filename))
+                    .unwrap_or("unknown")
+                    .to_string();
+                responder_started.lock().push(filename.clone());
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(400))
+                    .set_body_json(json!({"text":format!("heard {filename}")}))
+            })
+            .mount(&server)
+            .await;
+        let (channel, live) = fixture();
+        allow_contacts(&live, &["18", "19"]);
+        configure_batch_transcription(&live, format!("{}/transcribe", server.uri()));
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut ingress =
+            OrderedMessageIngress::new(channel, tx, MAX_CONCURRENT_BATCH_TRANSCRIPTIONS);
+        for (contact, id, filename) in [
+            ("17", "1", "one.m4a"),
+            ("18", "2", "two.m4a"),
+            ("19", "3", "three.m4a"),
+        ] {
+            ingress
+                .submit(batch_voice_event(contact, id, filename))
+                .unwrap();
+        }
+        assert_eq!(ingress.workers.len(), 2);
+        assert_eq!(ingress.active.len(), 2);
+        assert_eq!(ingress.pending_events, 1);
+        wait_for_started_requests(&started, 2).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            started.lock().len(),
+            2,
+            "the third contact must wait for an active worker slot"
+        );
+        drain_ingress(&mut ingress).await;
+        assert_eq!(started.lock().len(), 3);
+        assert!(ingress.active.is_empty());
+        assert!(ingress.pending.is_empty());
+        assert!(ingress.channel.inner.call_transcriptions.lock().is_empty());
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            received.push(rx.recv().await.unwrap().content);
+        }
+        received.sort();
+        assert_eq!(
+            received,
+            vec![
+                "heard one.m4a".to_string(),
+                "heard three.m4a".to_string(),
+                "heard two.m4a".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn ordered_ingress_rejects_more_than_the_pending_limit() {
+        let (channel, _) = fixture();
+        let (tx, mut rx) = mpsc::channel(MAX_PENDING_ORDERED_MESSAGES + 4);
+        let mut ingress = OrderedMessageIngress::new(channel, tx, 1);
+        ingress
+            .submit(json!({"type":"message","contact":"17","id":"0","text":"first"}))
+            .unwrap();
+        for id in 1..=MAX_PENDING_ORDERED_MESSAGES {
+            ingress
+                .submit(json!({
+                    "type":"message","contact":"17","id":id.to_string(),
+                    "text":format!("queued {id}")
+                }))
+                .unwrap();
+        }
+        assert_eq!(ingress.workers.len(), 1);
+        assert_eq!(ingress.active.len(), 1);
+        assert_eq!(ingress.pending_events, MAX_PENDING_ORDERED_MESSAGES);
+        let error = ingress
+            .submit(json!({"type":"message","contact":"17","id":"overflow","text":"reject"}))
+            .unwrap_err();
+        assert!(error.to_string().contains("simplex_ordered_message_limit"));
+        drain_ingress(&mut ingress).await;
+        for index in 0..=MAX_PENDING_ORDERED_MESSAGES {
+            let expected = if index == 0 {
+                "first".to_string()
+            } else {
+                format!("queued {index}")
+            };
+            assert_eq!(rx.recv().await.unwrap().content, expected);
+        }
+        assert!(rx.try_recv().is_err());
+        assert!(ingress.active.is_empty());
+        assert!(ingress.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_ingress_keeps_one_ordered_lane_per_contact() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let started = Arc::new(Mutex::new(0usize));
+        let responder_started = started.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/transcribe"))
+            .respond_with(move |_: &wiremock::Request| {
+                *responder_started.lock() += 1;
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(300))
+                    .set_body_json(json!({"text":"transcribed first"}))
+            })
+            .mount(&server)
+            .await;
+        let (channel, live) = fixture();
+        configure_batch_transcription(&live, format!("{}/transcribe", server.uri()));
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut ingress =
+            OrderedMessageIngress::new(channel, tx, MAX_CONCURRENT_BATCH_TRANSCRIPTIONS);
+        ingress
+            .submit(batch_voice_event("17", "1", "first.m4a"))
+            .unwrap();
+        ingress
+            .submit(json!({"type":"message","contact":"17","id":"2","text":"text after note"}))
+            .unwrap();
+        assert_eq!(ingress.workers.len(), 1);
+        assert_eq!(ingress.pending_events, 1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while *started.lock() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*started.lock(), 1);
+        assert!(rx.try_recv().is_err());
+        drain_ingress(&mut ingress).await;
+        assert_eq!(*started.lock(), 1);
+        assert_eq!(rx.recv().await.unwrap().content, "transcribed first");
+        assert_eq!(rx.recv().await.unwrap().content, "text after note");
+        assert!(ingress.channel.inner.call_transcriptions.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn call_interruption_only_cancels_that_call_and_not_same_contact_ingress() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let responder_started = started.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/transcribe"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&request.body);
+                if body.contains("call.wav") {
+                    responder_started.lock().push("call".into());
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_millis(600))
+                        .set_body_json(json!({"text":"stale call transcript"}))
+                } else {
+                    responder_started.lock().push("note".into());
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_millis(20))
+                        .set_body_json(json!({"text":"unrelated note transcript"}))
+                }
+            })
+            .mount(&server)
+            .await;
+        let (channel, live) = fixture();
+        configure_batch_transcription(&live, format!("{}/transcribe", server.uri()));
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut ingress = OrderedMessageIngress::new(
+            channel.clone(),
+            tx.clone(),
+            MAX_CONCURRENT_BATCH_TRANSCRIPTIONS,
+        );
+        ingress
+            .submit(json!({
+                "type":"utterance","contact":"17","call_id":"call","scope":"call/old",
+                "finished":true,
+                "audio":base64::engine::general_purpose::STANDARD.encode(b"RIFF0000WAVE"),
+            }))
+            .unwrap();
+        ingress
+            .submit(batch_voice_event("17", "note", "note.m4a"))
+            .unwrap();
+        ingress
+            .submit(json!({"type":"message","contact":"17","id":"text","text":"fresh text"}))
+            .unwrap();
+        wait_for_started_requests(&started, 1).await;
+        assert_eq!(started.lock().len(), 1);
+        assert_eq!(started.lock().first().map(String::as_str), Some("call"));
+        let control = tokio::spawn({
+            let channel = channel.clone();
+            async move {
+                channel
+                    .event(
+                        json!({"type":"interrupted","contact":"17","call_id":"call",
+                            "scope":"call/next","playback":{"interrupted":false}}),
+                        &tx,
+                    )
+                    .await
+            }
+        });
+        let interrupt = tokio::time::timeout(Duration::from_millis(150), rx.recv())
+            .await
+            .expect("call control must not wait for batch transcription")
+            .unwrap();
+        assert_eq!(interrupt.control, Some(ChannelControl::Interrupt));
+        control.await.unwrap().unwrap();
+        assert!(channel.inner.call_transcriptions.lock().is_empty());
+        drain_ingress(&mut ingress).await;
+        let note = rx.recv().await.unwrap();
+        let text = rx.recv().await.unwrap();
+        assert!(!note.content.contains("stale call transcript"));
+        assert_eq!(note.content, "unrelated note transcript");
+        assert_eq!(text.content, "fresh text");
+        assert!(
+            !channel
+                .inner
+                .call_transcriptions
+                .lock()
+                .contains_key(&("17".to_string(), "call".to_string()))
+        );
+        assert!(ingress.active.is_empty());
+        assert!(ingress.pending.is_empty());
     }
 
     #[tokio::test]
