@@ -112,12 +112,12 @@ beforeEach(() => {
 // WebSocket
 // ---------------------------------------------------------------------------
 
-test("pairing mode puts the token on the chat socket, as before", () => {
+test("pairing mode authenticates by subprotocol without a token in the URL", () => {
   auth.setToken("tok");
   const client = newClient();
   client.connect();
   const socket = lastSocket();
-  assert.match(socket.url, /[?&]token=tok(&|$)/);
+  assert.doesNotMatch(socket.url, /[?&]token=/);
   assert.deepEqual(socket.protocols, ["zeroclaw.v1", "bearer.tok"]);
   client.disconnect();
 });
@@ -209,6 +209,35 @@ test("a gateway reload (1001) reconnects", async () => {
   events.stop();
   assert.ok(FakeWebSocket.instances.length >= 2);
   assert.equal(events.sessionEnded + events.accessLost + events.reauth, 0);
+  client.disconnect();
+});
+
+test("conversation limit (4409): no automatic reconnect; connect() tries again", async () => {
+  auth.setOidcSession(session);
+  const events = countEvents();
+  const client = newClient();
+  client.connect();
+  lastSocket().serverClose(4409);
+  await settle();
+  events.stop();
+  assert.equal(FakeWebSocket.instances.length, 1);
+  assert.equal(events.sessionEnded + events.accessLost + events.reauth + events.unauthorized, 0);
+  // A resume (or anything else) doesn't reopen it; only the owner does.
+  fakeWindow.dispatchEvent(new Event(auth.AUTH_EVENTS.resumed));
+  assert.equal(FakeWebSocket.instances.length, 1);
+  client.connect();
+  assert.equal(FakeWebSocket.instances.length, 2);
+  client.disconnect();
+});
+
+test("conversation closed (4410): reconnects on the same id for a fresh conversation", async () => {
+  auth.setOidcSession(session);
+  const client = newClient();
+  client.connect();
+  lastSocket().serverClose(4410);
+  await settle();
+  assert.ok(FakeWebSocket.instances.length >= 2);
+  assert.match(lastSocket().url, /[?&]session_id=s1(&|$)/);
   client.disconnect();
 });
 
@@ -342,4 +371,29 @@ test("signed in: a reload's 503 gateway_restarting reconnects the stream, with n
   events.stop();
   assert.ok(sseRequests.length >= 2);
   assert.equal(events.unauthorized + events.reauth + events.sessionEnded + events.accessLost, 0);
+});
+
+test("a socket without auto-reconnect still reports 4401 and 4403, but reconnects for nothing", async () => {
+  // A chat socket that is one conversation: what ends it, ends it for good.
+  for (const code of [WS_CLOSE_SESSION_ENDED, WS_CLOSE_ACCESS_LOST, 1001]) {
+    FakeWebSocket.instances = [];
+    auth.setOidcSession(session);
+    const events = countEvents();
+    const client = new WebSocketClient({
+      agentAlias: "main",
+      sessionId: "s1",
+      reconnectDelay: 1,
+      autoReconnect: false,
+    });
+    client.connect();
+    lastSocket().serverClose(code);
+    await settle();
+    fakeWindow.dispatchEvent(new Event(auth.AUTH_EVENTS.resumed));
+    await settle();
+    events.stop();
+    assert.equal(FakeWebSocket.instances.length, 1, String(code));
+    assert.equal(events.sessionEnded, code === WS_CLOSE_SESSION_ENDED ? 1 : 0);
+    assert.equal(events.accessLost, code === WS_CLOSE_ACCESS_LOST ? 1 : 0);
+    client.disconnect();
+  }
 });

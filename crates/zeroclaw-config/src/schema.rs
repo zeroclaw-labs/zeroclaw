@@ -121,6 +121,7 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, RuntimeProxyC
 
 struct RuntimeProxyCachedClient {
     generation: u64,
+    runtime_id: tokio::runtime::Id,
     client: reqwest::Client,
 }
 
@@ -892,11 +893,24 @@ impl WireApi {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolResultImagePolicy {
-    /// Send declared tool-result images as structured `image_url` parts.
-    #[default]
+    /// Send declared tool-result images as structured `image_url` parts, kept
+    /// inside the `role = "tool"` message. Several OpenAI-compatible endpoints
+    /// reject image parts in a tool result (HTTP 400), so this is opt-in.
     ImageUrl,
     /// Drop declared tool-result images and leave a fixed notice for the model.
     Omit,
+    /// Keep declared tool-result images but move each `image_url` part out of
+    /// the `role = "tool"` message into a following `role = "user"` message
+    /// (merged into an adjacent user message when present). Endpoints that
+    /// reject image parts in a tool result accept them in a user message, so
+    /// this delivers the image to the model without the tool-result 400 and
+    /// without discarding it the way `omit` does. The default, verified against
+    /// opencode zen (mimo-v2.5) and llama.cpp. Relocation does place a user
+    /// message directly after a tool message; if a backend's chat template
+    /// rejects that order, set `image_url` to keep the image in the tool
+    /// message, or `omit` to drop it.
+    #[default]
+    Relocate,
 }
 
 fn is_default_tool_result_image_policy(value: &ToolResultImagePolicy) -> bool {
@@ -923,14 +937,16 @@ pub enum AuthMode {
 /// Prompt-cache entry lifetime to request for this provider's Anthropic
 /// cache markers. `"5m"` is the API default; `"1h"` extends the cache
 /// entry lifetime to one hour so a pause longer than five minutes does
-/// not force a full-price rewrite of the cached prefix. Meaningful only
-/// where Anthropic-shaped `cache_control` markers reach the API: the
-/// native Anthropic provider always places them, compatible providers
-/// only behind `cache_passthrough` (with passthrough off the setting is
-/// inert). One TTL applies to every marker this implementation places;
-/// operator-supplied `cache_control` (via `provider_extra` or raw tool
-/// JSON) sits outside that guarantee and must order 1h before 5m when
-/// mixing lifetimes in one request.
+/// not force a full-price rewrite of the cached prefix; `"off"` places no
+/// markers at all, for a workload that never reuses a prefix and would
+/// otherwise pay the write premium with no read to amortise it.
+/// Meaningful only where Anthropic-shaped `cache_control` markers reach
+/// the API: the native Anthropic provider always places them, compatible
+/// providers only behind `cache_passthrough` (with passthrough off the
+/// setting is inert). One TTL applies to every marker this implementation
+/// places; operator-supplied `cache_control` (via `provider_extra` or raw
+/// tool JSON) sits outside that guarantee and must order 1h before 5m
+/// when mixing lifetimes in one request.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
 )]
@@ -943,6 +959,9 @@ pub enum CacheTtl {
     /// 1-hour cache lifetime; cache writes bill at a premium write rate.
     #[serde(rename = "1h")]
     OneHour,
+    /// Place no prompt-cache breakpoints at all.
+    #[serde(rename = "off")]
+    Off,
 }
 
 /// Named model_provider profile definition.
@@ -1162,9 +1181,12 @@ pub struct ModelProviderConfig {
     pub vision: Option<bool>,
     /// How native compatible chat-completions providers handle images a
     /// role=`tool` result declared in its `attachments` array. `image_url`
-    /// sends them as structured image parts; `omit` drops them and appends a
-    /// fixed notice, keeping the result text verbatim. Legacy tool results
-    /// (no array key) pass verbatim under both settings: they declare
+    /// preserves them as structured image parts inside the tool message;
+    /// `omit` removes their payloads and appends a fixed notice, keeping the
+    /// result text verbatim; `relocate` preserves the image but moves it into
+    /// a following user message, so endpoints that reject images in a tool
+    /// result still receive the image without discarding it. Legacy tool
+    /// results (no array key) pass verbatim under all settings: they declare
     /// nothing and their bodies are text, so literal marker syntax in a
     /// tool's output never drives this policy. This does not affect direct
     /// user image content or OpenAI Responses providers.
@@ -2678,6 +2700,78 @@ pub struct AtlasCloudModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── Cheaper Inference ──
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CheaperInferenceEndpoint {
+    #[default]
+    Default,
+}
+
+impl CheaperInferenceEndpoint {
+    /// Canonical Cheaper Inference endpoint. Single source of truth:
+    /// `CompatFamilySpec::DEFAULT_URL` for `CheaperInferenceModelProviderConfig`
+    /// references this const so the schema and factory surfaces never drift.
+    pub const DEFAULT_URI: &'static str = "https://api.cheaperinference.com/v1";
+}
+
+impl ModelEndpoint for CheaperInferenceEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => Self::DEFAULT_URI,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.cheaperinference"]
+pub struct CheaperInferenceModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+#[cfg(test)]
+mod cheaperinference_tests {
+    use super::*;
+
+    #[test]
+    fn cheaperinference_endpoint_uri() {
+        assert_eq!(
+            CheaperInferenceEndpoint::Default.uri(),
+            "https://api.cheaperinference.com/v1"
+        );
+    }
+
+    #[test]
+    fn cheaperinference_config_defaults_empty() {
+        let cfg = CheaperInferenceModelProviderConfig::default();
+        assert!(cfg.base.api_key.is_none());
+        assert!(cfg.base.model.is_none());
+    }
+
+    #[test]
+    fn cheaperinference_alias_round_trips_through_config() {
+        let toml = r#"
+[providers.models.cheaperinference.default]
+model = "gpt-5.4-mini"
+"#;
+        let config: Config = toml::from_str(toml).expect("cheaperinference alias deserializes");
+        let alias = config
+            .providers
+            .models
+            .cheaperinference
+            .get("default")
+            .expect("cheaperinference.default present");
+        assert_eq!(alias.base.model.as_deref(), Some("gpt-5.4-mini"));
+    }
+}
+
 // ── OVH ──
 
 #[derive(
@@ -3784,6 +3878,7 @@ impl_default_family_endpoint! {
     VercelModelProviderConfig,
     CloudflareModelProviderConfig,
     AtlasCloudModelProviderConfig,
+    CheaperInferenceModelProviderConfig,
     OvhModelProviderConfig,
     CopilotModelProviderConfig,
     DoubaoModelProviderConfig,
@@ -4908,6 +5003,13 @@ impl Config {
     }
 
     #[must_use]
+    pub fn effective_tool_elicitation(&self, agent_alias: &str) -> bool {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.tool_elicitation)
+            .unwrap_or(false)
+    }
+
+    #[must_use]
     pub fn effective_tool_dispatcher(&self, agent_alias: &str) -> String {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.tool_dispatcher.as_ref())
@@ -5149,6 +5251,66 @@ impl Config {
             0 => CronJobClaim::Unclaimed,
             1 => CronJobClaim::Sole(enabled[0]),
             _ => CronJobClaim::Contested(enabled),
+        }
+    }
+
+    /// One warning per agent whose explicit `delegates` roster can never fire:
+    /// the resolved risk profile forbids delegation, or its tool policy
+    /// blocks `delegate` (a closed `allowed_tools` list without it,
+    /// `deny_all_tools = true`, or `excluded_tools` naming it). The
+    /// configuration is coherent but inert, and operators otherwise only
+    /// discover that at the first delegation attempt.
+    fn collect_dead_delegate_grant_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for (alias, agent) in &self.agents {
+            if !agent.enabled || agent.delegates.is_empty() {
+                continue;
+            }
+            let Some(profile) = self.risk_profile_for_agent(alias) else {
+                continue;
+            };
+            let profile_alias = agent.risk_profile.trim();
+            let grant_count = agent.delegates.len();
+            let policy_blocks = !profile.delegation_policy.permits();
+            // `effective_allowed_tools()` folds in `deny_all_tools` and the
+            // legacy deny-all sentinel: `Some([])` denies every tool, `None`
+            // is unrestricted.
+            let allowlist_blocks = profile
+                .effective_allowed_tools()
+                .is_some_and(|allowed| !allowed.iter().any(|name| name == "delegate"));
+            let excluded = profile.excluded_tools.iter().any(|name| name == "delegate");
+            let tools_block = allowlist_blocks || excluded;
+            if !policy_blocks && !tools_block {
+                continue;
+            }
+            let tool_reason = if profile.deny_all_tools {
+                "sets deny_all_tools"
+            } else if excluded {
+                "lists `delegate` in excluded_tools"
+            } else {
+                "has an allowed_tools list that omits `delegate`"
+            };
+            let reason = match (policy_blocks, tools_block) {
+                (true, true) => format!(
+                    "risk profile `{profile_alias}` has a delegation_policy.mode that does not \
+                     permit delegation and {tool_reason}"
+                ),
+                (true, false) => format!(
+                    "risk profile `{profile_alias}` has a delegation_policy.mode that does not \
+                     permit delegation"
+                ),
+                (false, _) => format!("risk profile `{profile_alias}` {tool_reason}"),
+            };
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                crate::validation_warnings::DEAD_DELEGATE_GRANTS,
+                format!(
+                    "agents.{alias} has {grant_count} delegate grant(s) but {reason}, so the \
+                     grants are unreachable at runtime"
+                ),
+                format!("agents.{alias}.delegates"),
+            ));
         }
     }
 
@@ -7955,6 +8117,11 @@ pub struct GatewayConfig {
     #[serde(default = "default_gateway_websocket_ping_interval_secs")]
     pub websocket_ping_interval_secs: u64,
 
+    /// Global browser dictation silence timeout in seconds. 0 disables automatic sending.
+    /// Applies to every paired device; accepted range: 0..=300. Default: 15.
+    #[serde(default = "default_voice_silence_timeout_secs")]
+    pub voice_silence_timeout_secs: u64,
+
     /// Pairing-code generation policy (`[gateway.pairing_code]`). The one
     /// source of truth for the length and character family of every code
     /// the gateway issues.
@@ -8025,6 +8192,10 @@ fn default_gateway_long_running_request_timeout_secs() -> u64 {
     600
 }
 
+fn default_voice_silence_timeout_secs() -> u64 {
+    15
+}
+
 fn default_gateway_websocket_ping_interval_secs() -> u64 {
     30
 }
@@ -8089,6 +8260,7 @@ impl Default for GatewayConfig {
             session_persistence: true,
             session_ttl_hours: 0,
             websocket_ping_interval_secs: default_gateway_websocket_ping_interval_secs(),
+            voice_silence_timeout_secs: default_voice_silence_timeout_secs(),
             pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
             dashboard_sign_in: DashboardSignInConfig::default(),
@@ -8495,6 +8667,85 @@ pub struct RelayConfig {
     /// applies when `node_id` is empty (an operator-pinned id is never rotated).
     #[serde(default)]
     pub node_id_rotation_days: u64,
+    /// Serve this daemon's web dashboard through the relay at a per-daemon
+    /// HTTPS host (`[relay.dashboard]`). Off by default.
+    #[serde(default)]
+    #[nested]
+    pub dashboard: RelayDashboardConfig,
+}
+
+/// The web dashboard through the relay (`[relay.dashboard]`).
+///
+/// When enabled, the relay serves this daemon's dashboard at
+/// `https://<label>.<domain>/`, where `<label>` is derived from the daemon's
+/// relay registration key (the daemon logs the full address at startup).
+///
+/// TRUST: unlike every other relay route, this one is NOT end-to-end. The
+/// relay ends the browser's TLS, so its operator can read and change the
+/// dashboard traffic of everyone who uses this address - pages, session
+/// cookies and CSRF tokens - and act as a signed-in user for that session,
+/// with an administrator's session as an administrator. Native clients
+/// through the same relay stay end-to-end encrypted. Use zerocode, or a
+/// direct HTTPS connection, when the relay must not be trusted, and to
+/// administer the daemon.
+///
+/// The gateway serves these connections as the browser's, never as a local
+/// peer, and builds every URL it hands them from this origin. It refuses
+/// pairing and paired tokens on them, which the relay would see, so people
+/// sign in through `[gateway.dashboard_sign_in]`. Requires `[relay]` enabled
+/// with a verified relay certificate, `gateway.require_pairing = true`,
+/// dashboard sign-in with at least one provider, and no `gateway.path_prefix`.
+/// The relay must list this daemon in its own `[dashboard] allow`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "relay.dashboard"]
+pub struct RelayDashboardConfig {
+    /// Serve the dashboard through the relay (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// The relay's dashboard domain: the dashboard is served at
+    /// `https://<label>.<domain>/`. Must match the relay's `[dashboard] domain`.
+    #[serde(default)]
+    pub domain: String,
+    /// The HTTPS port browsers use to reach the relay (default 443).
+    #[serde(default = "default_relay_dashboard_port")]
+    pub port: u16,
+}
+
+fn default_relay_dashboard_port() -> u16 {
+    443
+}
+
+impl Default for RelayDashboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            domain: String::new(),
+            port: default_relay_dashboard_port(),
+        }
+    }
+}
+
+/// Whether `name` is a DNS host name of at least two labels: each 1 to 63
+/// lower-case letters, digits or interior hyphens, at most 253 bytes in all,
+/// and not ending in a numeric label (so an IPv4 address is not taken for a
+/// name). The one rule for relay dashboard domains and hosts.
+pub fn is_dns_host_name(name: &str) -> bool {
+    let labels: Vec<&str> = name.split('.').collect();
+    name.len() <= 253
+        && labels.len() >= 2
+        && !labels
+            .last()
+            .is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit()))
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
 }
 
 fn default_wss_bind() -> String {
@@ -8829,6 +9080,11 @@ pub struct BrowserConfig {
     /// Browser automation backend: "agent_browser" | "rust_native" | "computer_use" | "auto"
     #[serde(default = "default_browser_backend")]
     pub backend: String,
+    /// Timeout in seconds for agent-browser CLI commands (default: 60).
+    /// Bounds every `browser` tool action on the `agent_browser` backend so a
+    /// wedged CLI cannot hang an agent turn indefinitely.
+    #[serde(default = "default_browser_timeout_secs")]
+    pub timeout_secs: u64,
     /// Show browser window for agent_browser backend. When unset, inherits AGENT_BROWSER_HEADED.
     #[serde(default)]
     pub headed: Option<bool>,
@@ -8865,6 +9121,10 @@ fn default_browser_backend() -> String {
     "agent_browser".into()
 }
 
+fn default_browser_timeout_secs() -> u64 {
+    60
+}
+
 fn default_browser_webdriver_url() -> String {
     "http://127.0.0.1:9515".into()
 }
@@ -8891,6 +9151,7 @@ impl Default for BrowserConfig {
             allowed_domains: vec!["*".into()],
             session_name: None,
             backend: default_browser_backend(),
+            timeout_secs: default_browser_timeout_secs(),
             headed: None,
             native_headless: default_true(),
             native_webdriver_url: default_browser_webdriver_url(),
@@ -11932,21 +12193,28 @@ fn runtime_proxy_cache_key(
 }
 
 fn runtime_proxy_cached_client(cache_key: &str) -> Option<reqwest::Client> {
+    let runtime_id = tokio::runtime::Handle::try_current().ok()?.id();
     let generation = runtime_proxy_current_generation();
     match runtime_proxy_client_cache().read() {
         Ok(guard) => guard
             .get(cache_key)
-            .filter(|entry| entry.generation == generation)
+            .filter(|entry| entry.generation == generation && entry.runtime_id == runtime_id)
             .map(|entry| entry.client.clone()),
         Err(poisoned) => poisoned
             .into_inner()
             .get(cache_key)
-            .filter(|entry| entry.generation == generation)
+            .filter(|entry| entry.generation == generation && entry.runtime_id == runtime_id)
             .map(|entry| entry.client.clone()),
     }
 }
 
 fn set_runtime_proxy_cached_client(cache_key: String, generation: u64, client: reqwest::Client) {
+    // A pooled client's dispatcher belongs to the Tokio runtime that first
+    // uses it. Never hand that client to another runtime after its owner exits.
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let runtime_id = runtime.id();
     if generation != runtime_proxy_current_generation() {
         return;
     }
@@ -11954,13 +12222,27 @@ fn set_runtime_proxy_cached_client(cache_key: String, generation: u64, client: r
     match runtime_proxy_client_cache().write() {
         Ok(mut guard) => {
             if generation == runtime_proxy_config_generation() {
-                guard.insert(cache_key, RuntimeProxyCachedClient { generation, client });
+                guard.insert(
+                    cache_key,
+                    RuntimeProxyCachedClient {
+                        generation,
+                        runtime_id,
+                        client,
+                    },
+                );
             }
         }
         Err(poisoned) => {
             let mut guard = poisoned.into_inner();
             if generation == runtime_proxy_config_generation() {
-                guard.insert(cache_key, RuntimeProxyCachedClient { generation, client });
+                guard.insert(
+                    cache_key,
+                    RuntimeProxyCachedClient {
+                        generation,
+                        runtime_id,
+                        client,
+                    },
+                );
             }
         }
     }
@@ -14098,7 +14380,7 @@ impl RiskProfileConfig {
     }
 }
 
-fn parse_sandbox_backend(name: &str) -> SandboxBackend {
+pub(crate) fn parse_sandbox_backend(name: &str) -> SandboxBackend {
     match name.to_ascii_lowercase().as_str() {
         "auto" => SandboxBackend::Auto,
         "landlock" => SandboxBackend::Landlock,
@@ -14198,12 +14480,30 @@ pub struct OidcConfig {
     /// was issued TO. Empty = no restriction; non-empty = the token must carry
     /// an `azp` claim listed here or authentication fails closed.
     pub allowed_authorized_parties: Vec<String>,
+    /// OAuth scopes requested by the interactive flows ZeroClaw starts with
+    /// this issuer: the device grant (`zerocode login`, `zeroclaw oidc
+    /// login`) and browser Authorization Code with PKCE (including dashboard
+    /// sign-in). Sent space-separated in order. Empty = `["openid"]`. When
+    /// set, must include `openid`, because browser sign-in validates an ID
+    /// token. Some issuers derive the access token's audience from the
+    /// requested scope (Entra ID: `api://<app>/<scope>`); none of them are
+    /// added implicitly, including `offline_access`, whose meaning varies by
+    /// issuer.
+    pub scopes: Vec<String>,
+    /// OAuth scopes requested by `client_credentials` service enrollment.
+    /// Sent space-separated in order. Empty = `["openid"]`. Kept separate
+    /// from `scopes` because some issuers accept only a resource scope here
+    /// (Entra ID: `api://<app>/.default`, without `openid`).
+    pub service_scopes: Vec<String>,
     /// Client identities whose tokens are ALWAYS service principals
     /// (`client_credentials` callers), matched against the token's
-    /// verified `client_id` claim. Service principals are keyed by
-    /// issuer + client identity and never inherit human-user assumptions,
-    /// whatever provider-specific shape their `sub` takes (`<client>@clients`,
-    /// a service-account user id, or the client id itself).
+    /// verified `client_id` claim. Service tokens always need `client_id`:
+    /// in JWKS mode a token with no `client_id` whose signed `azp` names one
+    /// of these clients is refused, never treated as a service. Service
+    /// principals are keyed by issuer + client identity and never inherit
+    /// human-user assumptions, whatever provider-specific shape their
+    /// `sub` takes (`<client>@clients`, a service-account user id, or the
+    /// client id itself).
     ///
     /// Actor classification is declarative, never inferred from the
     /// `sub`/`client_id` relationship: a token is a service because its
@@ -14214,7 +14514,8 @@ pub struct OidcConfig {
     pub service_clients: Vec<String>,
     /// Client identities whose tokens are ALWAYS human principals
     /// (authorization-code / device-code clients), matched against the
-    /// verified `client_id` claim. Their tokens must carry a nonblank `sub`
+    /// verified `client_id` claim, or in JWKS mode the signed `azp` when
+    /// `client_id` is absent. Their tokens must carry a nonblank `sub`
     /// and resolve through `profile_map`. A client may appear in only one of
     /// `service_clients` and `interactive_clients`.
     pub interactive_clients: Vec<String>,
@@ -14264,6 +14565,8 @@ impl std::fmt::Debug for OidcConfig {
                 "allowed_authorized_parties",
                 &self.allowed_authorized_parties,
             )
+            .field("scopes", &self.scopes)
+            .field("service_scopes", &self.service_scopes)
             .field("service_clients", &self.service_clients)
             .field("interactive_clients", &self.interactive_clients)
             .field("actor_claim", &self.actor_claim)
@@ -14297,6 +14600,8 @@ impl Default for OidcConfig {
             require_mfa: false,
             required_acr: Vec::new(),
             allowed_authorized_parties: Vec::new(),
+            scopes: Vec::new(),
+            service_scopes: Vec::new(),
             service_clients: Vec::new(),
             interactive_clients: Vec::new(),
             actor_claim: String::new(),
@@ -14520,6 +14825,79 @@ impl Config {
         }
         Ok(())
     }
+
+    /// `[relay.dashboard]`: the dashboard is put on the internet through the
+    /// relay, so it is refused wherever that would expose more than the
+    /// dashboard's own sign-in, or weaken the one link that protects it.
+    fn validate_relay_dashboard(&self) -> Result<()> {
+        let dashboard = &self.relay.dashboard;
+        if !dashboard.enabled {
+            return Ok(());
+        }
+        if !self.relay.enabled {
+            validation_bail!(
+                ValidationFailed,
+                "relay.dashboard.enabled",
+                "[relay.dashboard] needs [relay] enabled = true: the dashboard is served through the relay link",
+            );
+        }
+        if !is_dns_host_name(&dashboard.domain) {
+            validation_bail!(
+                ValidationFailed,
+                "relay.dashboard.domain",
+                "relay.dashboard.domain must be the relay's dashboard domain, a lower-case DNS name such as relay.example.com, got {:?}",
+                dashboard.domain
+            );
+        }
+        if dashboard.port == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "relay.dashboard.port",
+                "relay.dashboard.port must be the HTTPS port browsers reach the relay on (default 443), not 0",
+            );
+        }
+        // With pairing off every dashboard route is open to whoever reaches
+        // the gateway, and through the relay that is the internet.
+        if !self.gateway.require_pairing {
+            validation_bail!(
+                ValidationFailed,
+                "gateway.require_pairing",
+                "[relay.dashboard] needs gateway.require_pairing = true: with pairing off the dashboard would be open to anyone who reaches the relay address",
+            );
+        }
+        // Pairing and paired tokens are refused through the relay, which
+        // would see the code or token, so sign-in is the only way in.
+        if !self.gateway.dashboard_sign_in.enabled() {
+            validation_bail!(
+                ValidationFailed,
+                "gateway.dashboard_sign_in.oidc",
+                "[relay.dashboard] needs [gateway.dashboard_sign_in] with at least one provider: pairing and paired tokens are refused through the relay, which would see them, so dashboard sign-in is the only way in",
+            );
+        }
+        // `__Host-` cookies need the root path.
+        if self
+            .gateway
+            .path_prefix
+            .as_deref()
+            .is_some_and(|prefix| !prefix.is_empty())
+        {
+            validation_bail!(
+                ValidationFailed,
+                "gateway.path_prefix",
+                "[relay.dashboard] serves the dashboard at the root of its own host; unset gateway.path_prefix",
+            );
+        }
+        // For native clients the inner mTLS protects the traffic past the
+        // relay; dashboard traffic has only the daemon's link to the relay.
+        if self.relay.relay_insecure {
+            validation_bail!(
+                ValidationFailed,
+                "relay.relay_insecure",
+                "[relay.dashboard] needs a verified relay certificate: dashboard traffic between the relay and this daemon is protected only by that link. Unset relay.relay_insecure and use public roots, relay_ca_path or tofu",
+            );
+        }
+        Ok(())
+    }
 }
 
 impl OidcConfig {
@@ -14624,6 +15002,30 @@ impl OidcConfig {
                 anyhow::bail!("oidc.{alias}.{field} must not contain a blank client id");
             }
         }
+        for (field, scopes) in [
+            ("scopes", &self.scopes),
+            ("service_scopes", &self.service_scopes),
+        ] {
+            let mut seen = std::collections::HashSet::new();
+            for scope in scopes {
+                if !is_scope_token(scope) {
+                    anyhow::bail!(
+                        "oidc.{alias}.{field} contains {scope:?}, which is not an OAuth scope: \
+                         each entry is one nonblank scope of printable ASCII without spaces, \
+                         `\"`, or `\\` (RFC 6749 section 3.3)"
+                    );
+                }
+                if !seen.insert(scope.as_str()) {
+                    anyhow::bail!("oidc.{alias}.{field} lists {scope:?} more than once");
+                }
+            }
+        }
+        if !self.scopes.is_empty() && !self.scopes.iter().any(|scope| scope == "openid") {
+            anyhow::bail!(
+                "oidc.{alias}.scopes must include \"openid\": browser sign-in validates an \
+                 ID token, which the issuer returns only for that scope"
+            );
+        }
         if let Some(shared) = self
             .service_clients
             .iter()
@@ -14651,6 +15053,37 @@ impl OidcConfig {
             &self.client_id
         }
     }
+
+    /// The `scope` parameter for the interactive flows (device grant and
+    /// browser Authorization Code): `scopes` space-joined, or `openid`.
+    #[must_use]
+    pub fn effective_scope(&self) -> String {
+        join_scopes(&self.scopes)
+    }
+
+    /// The `scope` parameter for `client_credentials`: `service_scopes`
+    /// space-joined, or `openid`.
+    #[must_use]
+    pub fn effective_service_scope(&self) -> String {
+        join_scopes(&self.service_scopes)
+    }
+}
+
+fn join_scopes(scopes: &[String]) -> String {
+    if scopes.is_empty() {
+        "openid".to_string()
+    } else {
+        scopes.join(" ")
+    }
+}
+
+/// RFC 6749 §3.3: `scope-token = 1*( %x21 / %x23-5B / %x5D-7E )`, i.e.
+/// nonblank printable ASCII other than space, `"`, and `\`.
+fn is_scope_token(scope: &str) -> bool {
+    !scope.is_empty()
+        && scope
+            .bytes()
+            .all(|b| matches!(b, 0x21 | 0x23..=0x5B | 0x5D..=0x7E))
 }
 
 /// One local roster identity (`[users.<name>]`) for the local auth
@@ -14997,6 +15430,9 @@ pub struct RuntimeProfileConfig {
     pub parallel_tools: Option<bool>,
     /// Request one native tool call per provider response when supported. Default off.
     pub single_tool_rounds: Option<bool>,
+    /// Enable pre-turn tool-elicitation hints (prefilter + ephemeral hint).
+    /// `None` inherits (default off).
+    pub tool_elicitation: Option<bool>,
     /// Tool dispatch strategy (e.g. `"auto"`). `None` inherits.
     pub tool_dispatcher: Option<String>,
     /// Tools exempt from within-turn dedup check.
@@ -15065,6 +15501,7 @@ impl Default for RuntimeProfileConfig {
             compact_context: None,
             parallel_tools: None,
             single_tool_rounds: None,
+            tool_elicitation: None,
             tool_dispatcher: None,
             tool_call_dedup_exempt: Vec::new(),
             deferred_builtin_tools: false,
@@ -17942,6 +18379,9 @@ pub struct MatrixConfig {
     #[serde(default)]
     pub device_id: Option<String>,
     /// Allowed Matrix room IDs. Empty = allow all rooms the bot has joined.
+    /// Also gates room invites: an invite from an allowed peer is accepted
+    /// only for a listed room. When empty, an invite is accepted into any
+    /// room, but only from a peer named explicitly (not just via `*`).
     /// Entries are matched literally against the canonical room ID
     /// (`!abc:server`) of each incoming message; `#room:server` aliases are
     /// not resolved for this allowlist (they are resolved only for outbound
@@ -19045,10 +19485,19 @@ pub struct FilesystemConfig {
     #[serde(default = "default_filesystem_max_content_bytes")]
     pub max_content_bytes: Option<usize>,
     /// Watch broad system roots (`/`, `/home`, `/etc`, `/var`, `/proc`,
-    /// `/sys`, `/dev`, `/tmp`) despite the deny-broad-roots default. The
-    /// pseudo-filesystems `/proc` and `/sys` would surface kernel object
-    /// paths in SOP payloads and flood the watcher with events. Off unless
-    /// explicitly enabled.
+    /// `/sys`, `/dev`, `/tmp`) despite the deny-broad-roots default. On macOS
+    /// this also covers `/Users` and each folder in it (its home directories
+    /// and `Shared`), `/Volumes` and each mounted volume in it, `/private`,
+    /// and `/private/etc`, `/private/tmp`, and `/private/var`. On Windows this
+    /// also covers every drive, volume, and network share root, any device
+    /// path that names something else, and, beneath a drive root, `Windows`,
+    /// `Windows\Temp`, `Users`, each profile in `Users`, `Program Files`,
+    /// `Program Files (x86)`, and `ProgramData`. A path is refused when it
+    /// names one of these as written, resolves to one on disk, or cannot be
+    /// resolved. A home directory elsewhere, such as root's `/var/root` on
+    /// macOS, is not recognized. The pseudo-filesystems `/proc` and `/sys`
+    /// would surface kernel object paths in SOP payloads and flood the
+    /// watcher with events. Off unless explicitly enabled.
     #[tab(Advanced)]
     #[serde(default)]
     pub allow_broad_roots: bool,
@@ -19082,16 +19531,194 @@ const FILESYSTEM_BROAD_ROOTS: [&str; 8] = [
     "/", "/home", "/etc", "/var", "/proc", "/sys", "/dev", "/tmp",
 ];
 
+/// macOS broad roots, refused along with the Unix roots and compared
+/// case-insensitively. `*` matches any one name, so `/Users/*` covers each
+/// home directory in `/Users` and `/Volumes/*` every mounted volume,
+/// including the startup disk's entry, which links to `/`. `/etc`, `/tmp`,
+/// and `/var` link to the directories in `/private`.
+const FILESYSTEM_MACOS_BROAD_ROOTS: [&str; 8] = [
+    "/Users",
+    "/Users/*",
+    "/Volumes",
+    "/Volumes/*",
+    "/private",
+    "/private/etc",
+    "/private/tmp",
+    "/private/var",
+];
+
+/// Windows broad roots, written relative to a drive or volume root and
+/// compared case-insensitively. The empty entry is the root itself, and `*`
+/// matches any one name, so `Users\*` covers every user profile root.
+const FILESYSTEM_WINDOWS_BROAD_ROOTS: [&str; 8] = [
+    "",
+    "Windows",
+    r"Windows\Temp",
+    "Users",
+    r"Users\*",
+    "Program Files",
+    "Program Files (x86)",
+    "ProgramData",
+];
+
+/// Whether the filesystem listener refuses to watch `path` unless
+/// `allow_broad_roots` is set. The Unix roots are checked on every platform
+/// exactly as they always were; macOS and Windows refuse their own roots as
+/// well.
+fn is_filesystem_broad_root(path: &str) -> bool {
+    let trimmed = path.trim_end_matches('/');
+    let normalized = if trimmed.is_empty() { "/" } else { trimmed };
+    FILESYSTEM_BROAD_ROOTS.contains(&normalized)
+        || (cfg!(target_os = "macos") && is_macos_filesystem_broad_root(path))
+        || (cfg!(windows) && is_windows_filesystem_broad_root(path))
+}
+
+/// Whether `path` names a Unix or macOS broad root, read the way a default
+/// macOS volume resolves it: repeated and trailing `/` are ignored and names
+/// compare case-insensitively, so `/TMP` and `//Users` match. Only an
+/// absolute path can match. The match is lexical, like the Unix check: `.`
+/// and `..` segments and links are not resolved. It is plain string logic, so
+/// tests on every platform cover it.
+fn is_macos_filesystem_broad_root(path: &str) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+    let names: Vec<&str> = macos_path_names(path).collect();
+    FILESYSTEM_BROAD_ROOTS
+        .iter()
+        .chain(&FILESYSTEM_MACOS_BROAD_ROOTS)
+        .any(|root| broad_root_names_match(macos_path_names(root), &names))
+}
+
+/// The non-empty names of a slash-separated macOS path.
+fn macos_path_names(path: &str) -> impl Iterator<Item = &str> {
+    path.split('/').filter(|name| !name.is_empty())
+}
+
+/// Whether `path` names a Windows broad root, read the way Windows resolves
+/// it. `/` and `\` both separate names, repeated and trailing separators are
+/// ignored, and names compare case-insensitively. Unless the path starts
+/// with `\\?\`, which turns Windows path normalization off, `.` and `..`
+/// segments resolve and trailing dots and spaces are trimmed, as Windows
+/// does. A `\\?\` or `\\.\` device prefix resolves to the drive, `Volume{…}`
+/// GUID, or `UNC` share it names; any other device name, such as
+/// `GLOBALROOT`, counts as a broad root because the check cannot tell what it
+/// opens. A drive-relative spelling (`C:`, `C:Windows`) is read from the
+/// drive's root, since the check cannot know that drive's current folder.
+/// The current drive's root (`\`) and a network share root (`\\server\share`)
+/// count as roots. This reads the path as written; the listener also checks
+/// where the path resolves on disk with
+/// [`FilesystemConfig::validate_resolved_path`]. It is plain string logic, so
+/// tests on every platform cover it.
+fn is_windows_filesystem_broad_root(path: &str) -> bool {
+    // Windows normalizes every path that does not start exactly with `\\?\`.
+    let normalize = !path.starts_with(r"\\?\");
+    let path = path.replace('/', "\\");
+    if let Some(device_path) = path.strip_prefix(r"\\?\").or(path.strip_prefix(r"\\.\")) {
+        let mut names = windows_path_names(device_path);
+        return match names.next() {
+            None => true,
+            Some(link) if link.eq_ignore_ascii_case("UNC") => {
+                is_windows_share_root(names, normalize)
+            }
+            Some(volume) if is_windows_volume_name(volume) => {
+                matches_windows_broad_root(names, normalize)
+            }
+            // `GLOBALROOT` and other device links can open a whole volume.
+            Some(_) => true,
+        };
+    }
+    if let Some(share_path) = path.strip_prefix(r"\\") {
+        return is_windows_share_root(windows_path_names(share_path), normalize);
+    }
+    let mut chars = path.chars();
+    if let (Some(letter), Some(':')) = (chars.next(), chars.next())
+        && letter.is_ascii_alphabetic()
+    {
+        return matches_windows_broad_root(windows_path_names(chars.as_str()), normalize);
+    }
+    // A leading `\` starts at the current drive's root; other paths are relative.
+    path.starts_with('\\') && matches_windows_broad_root(windows_path_names(&path), normalize)
+}
+
+/// Whether `name`, the first name after a device prefix, is a drive (`C:`) or
+/// a volume GUID (`Volume{…}`).
+fn is_windows_volume_name(name: &str) -> bool {
+    let is_drive =
+        name.len() == 2 && name.as_bytes()[0].is_ascii_alphabetic() && name.ends_with(':');
+    let is_volume_guid = name.ends_with('}')
+        && name
+            .get(..7)
+            .is_some_and(|start| start.eq_ignore_ascii_case("Volume{"));
+    is_drive || is_volume_guid
+}
+
+/// Whether a share path's `names`, starting at the server name, stop at the
+/// share's root. The server and share names together form that root, which
+/// `..` cannot climb above, and an incomplete `\\server` counts as one.
+fn is_windows_share_root<'a>(names: impl Iterator<Item = &'a str>, normalize: bool) -> bool {
+    windows_names_below_root(names.skip(2), normalize).is_empty()
+}
+
+/// Whether `names`, read down from a drive or volume root, match an entry of
+/// [`FILESYSTEM_WINDOWS_BROAD_ROOTS`].
+fn matches_windows_broad_root<'a>(names: impl Iterator<Item = &'a str>, normalize: bool) -> bool {
+    let names = windows_names_below_root(names, normalize);
+    FILESYSTEM_WINDOWS_BROAD_ROOTS
+        .iter()
+        .any(|root| broad_root_names_match(windows_path_names(root), &names))
+}
+
+/// `names` below a root as Windows resolves them when `normalize` is set: `.`
+/// drops out, `..` drops the name before it but never climbs above the root,
+/// and trailing dots and spaces are trimmed. Windows trims them from fewer
+/// names than this does, so the extra trimming can only refuse more.
+fn windows_names_below_root<'a>(
+    names: impl Iterator<Item = &'a str>,
+    normalize: bool,
+) -> Vec<&'a str> {
+    let mut resolved = Vec::new();
+    for name in names {
+        if !normalize {
+            resolved.push(name);
+        } else if name == ".." {
+            resolved.pop();
+        } else {
+            let trimmed = name.trim_end_matches(['.', ' ']);
+            if !trimmed.is_empty() {
+                resolved.push(trimmed);
+            }
+        }
+    }
+    resolved
+}
+
+/// The non-empty names of a backslash-separated Windows path.
+fn windows_path_names(path: &str) -> impl Iterator<Item = &str> {
+    path.split('\\').filter(|name| !name.is_empty())
+}
+
+/// Whether `names` match a broad root's `root_names` one for one, ignoring
+/// ASCII case, where a `*` root name matches any one name.
+fn broad_root_names_match<'a>(root_names: impl Iterator<Item = &'a str>, names: &[&str]) -> bool {
+    let root_names: Vec<&str> = root_names.collect();
+    root_names.len() == names.len()
+        && root_names
+            .iter()
+            .zip(names)
+            .all(|(root_name, name)| *root_name == "*" || root_name.eq_ignore_ascii_case(name))
+}
+
 impl FilesystemConfig {
-    /// Validate the filesystem listener configuration.
+    /// Validate the filesystem listener configuration. This reads each path
+    /// as written; [`Self::validate_resolved_path`] also checks where a path
+    /// resolves on disk.
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.paths.is_empty() {
             anyhow::bail!("at least one path must be configured");
         }
         for path in &self.paths {
-            let trimmed = path.trim_end_matches('/');
-            let normalized = if trimmed.is_empty() { "/" } else { trimmed };
-            if !self.allow_broad_roots && FILESYSTEM_BROAD_ROOTS.contains(&normalized) {
+            if !self.allow_broad_roots && is_filesystem_broad_root(path) {
                 anyhow::bail!(
                     "path '{path}' is a broad system root; set allow_broad_roots = true to watch it"
                 );
@@ -19106,6 +19733,29 @@ impl FilesystemConfig {
                     "event '{kind}' is invalid; expected created, modified, deleted, or renamed"
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// Refuse `path` when it resolves on disk to a broad root, so `..`
+    /// segments, symlinks, junctions, substituted drives, and short names
+    /// cannot reach one without `allow_broad_roots`. A path that cannot be
+    /// resolved, such as one that does not exist, is refused too. The
+    /// listener calls this before it watches a path, and it keeps watching
+    /// the path as written.
+    pub fn validate_resolved_path(&self, path: &str) -> anyhow::Result<()> {
+        if self.allow_broad_roots {
+            return Ok(());
+        }
+        let resolved = match std::fs::canonicalize(path) {
+            Ok(resolved) => resolved,
+            Err(err) => anyhow::bail!("path '{path}' cannot be resolved: {err}"),
+        };
+        if is_filesystem_broad_root(&resolved.to_string_lossy()) {
+            anyhow::bail!(
+                "path '{path}' resolves to broad system root '{}'; set allow_broad_roots = true to watch it",
+                resolved.display()
+            );
         }
         Ok(())
     }
@@ -19785,7 +20435,8 @@ pub struct SecurityConfig {
     #[nested]
     pub otp: OtpConfig,
 
-    /// Emergency-stop state machine configuration.
+    /// Emergency-stop configuration. Not enforced: no runtime path reads the
+    /// estop state, so these settings do not stop anything.
     #[serde(default)]
     #[nested]
     pub estop: EstopConfig,
@@ -20001,15 +20652,17 @@ impl Default for OtpConfig {
 #[prefix = "security.estop"]
 #[serde(deny_unknown_fields)]
 pub struct EstopConfig {
-    /// Enable emergency stop controls.
+    /// Emergency stop switch. Not enforced: no runtime path reads the estop
+    /// state, so enabling it does not stop anything.
     #[serde(default)]
     pub enabled: bool,
 
-    /// File path used to persist estop state.
+    /// File path reserved for estop state. Not enforced: nothing reads its contents.
     #[serde(default = "default_estop_state_file")]
     pub state_file: String,
 
-    /// Require a valid OTP before resume operations.
+    /// Require a valid OTP before resume operations. Not enforced: the resume
+    /// command refuses to run.
     #[serde(default = "default_true")]
     pub require_otp_to_resume: bool,
 }
@@ -23564,6 +24217,7 @@ impl Config {
         self.collect_verifiable_intent_warnings(&mut warnings);
         self.collect_cron_claim_warnings(&mut warnings);
         self.collect_compiled_out_tool_warnings(&mut warnings);
+        self.collect_dead_delegate_grant_warnings(&mut warnings);
         warnings.extend(validate_memory_semantics(&self.memory));
         for (alias, wa) in &self.channels.whatsapp {
             warnings.extend(validate_whatsapp_semantics(alias, wa));
@@ -23714,6 +24368,24 @@ impl Config {
                      checked. Use a build that includes `{feature}`, or disable the section."
                 ),
                 format!("{section}.enabled"),
+            ));
+        }
+        // Web search defaults to enabled, so unlike the sections above its
+        // absence in a lean build is the norm, not a config written for a
+        // fuller build — report it the same way rather than dropping it
+        // silently. It stands outside `OptInTool::ALL` because the inventory
+        // files `web_search_tool` under `External`; see the variant's note.
+        let web_search = crate::opt_in_tools::OptInTool::WebSearch;
+        if !web_search.compiled() && web_search.enabled_in(self) {
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                crate::validation_warnings::TOOL_COMPILED_OUT,
+                format!(
+                    "[web_search] is enabled, but this build was compiled without the \
+                     `tools-external` feature, so the tool is unavailable and its settings \
+                     are not checked. Use a build that includes `tools-external` (the \
+                     `tools-compat` bundle), or disable the section."
+                ),
+                "web_search.enabled".to_string(),
             ));
         }
     }
@@ -24309,6 +24981,10 @@ impl Config {
             }
         }
 
+        if self.gateway.voice_silence_timeout_secs > 300 {
+            let path = "gateway.voice_silence_timeout_secs";
+            validation_bail!(InvalidNumericRange, path, "{path} must be 0..=300");
+        }
         let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
         if websocket_ping_interval_secs > GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS {
             let path = "gateway.websocket_ping_interval_secs";
@@ -24862,6 +25538,7 @@ impl Config {
         }
 
         self.validate_dashboard_sign_in()?;
+        self.validate_relay_dashboard()?;
 
         // Security OTP / estop
         if self.security.otp.challenge_max_attempts == 0 {
@@ -29477,6 +30154,17 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
+    fn cache_ttl_off_is_a_known_lifetime_that_round_trips() {
+        let off: ModelProviderConfig = toml::from_str("cache_ttl = \"off\"").unwrap();
+        assert_eq!(off.cache_ttl, Some(CacheTtl::Off));
+        assert_eq!(
+            toml::to_string(&off).unwrap(),
+            "cache_ttl = \"off\"\n",
+            "off must round-trip its wire string"
+        );
+    }
+
+    #[::core::prelude::v1::test]
     fn cache_ttl_rejects_unknown_lifetime() {
         let parsed = toml::from_str::<ModelProviderConfig>("cache_ttl = \"2h\"");
         assert!(
@@ -30715,6 +31403,102 @@ zeroclaw-operators = "operator"
     }
 
     #[::core::prelude::v1::test]
+    fn relay_dashboard_is_off_by_default_and_parses() {
+        let config = Config::default();
+        assert!(!config.relay.dashboard.enabled);
+        assert_eq!(config.relay.dashboard.port, 443);
+        let parsed: Config = toml::from_str(
+            "[relay]\nenabled = true\nurl = \"relay.example.com:443\"\n\
+             [relay.dashboard]\nenabled = true\ndomain = \"relay.example.com\"\n",
+        )
+        .unwrap();
+        assert!(parsed.relay.dashboard.enabled);
+        assert_eq!(parsed.relay.dashboard.domain, "relay.example.com");
+        assert_eq!(parsed.relay.dashboard.port, 443);
+    }
+
+    #[::core::prelude::v1::test]
+    fn relay_dashboard_refuses_what_would_expose_or_weaken_it() {
+        let ready = || {
+            let mut config = auth_config();
+            config.relay.enabled = true;
+            config.relay.url = "relay.example.com:443".into();
+            config.relay.dashboard.enabled = true;
+            config.relay.dashboard.domain = "relay.example.com".into();
+            config.gateway.dashboard_sign_in.oidc = vec!["corp".into()];
+            config
+        };
+        ready()
+            .validate()
+            .expect("a complete [relay.dashboard] validates");
+
+        let refused = |change: fn(&mut Config), expected: &str| {
+            let mut config = ready();
+            change(&mut config);
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains(expected), "expected {expected:?}, got: {err}");
+        };
+        refused(|c| c.relay.enabled = false, "needs [relay] enabled");
+        refused(
+            |c| c.relay.dashboard.domain = String::new(),
+            "relay.dashboard.domain",
+        );
+        refused(
+            |c| c.relay.dashboard.domain = "Relay.Example.com".into(),
+            "relay.dashboard.domain",
+        );
+        refused(
+            |c| c.relay.dashboard.domain = "localhost".into(),
+            "relay.dashboard.domain",
+        );
+        refused(
+            |c| c.relay.dashboard.domain = "203.0.113.7".into(),
+            "relay.dashboard.domain",
+        );
+        refused(|c| c.relay.dashboard.port = 0, "relay.dashboard.port");
+        refused(
+            |c| c.gateway.require_pairing = false,
+            "require_pairing = true",
+        );
+        // Without a sign-in provider nobody could use it: pairing is
+        // refused through the relay.
+        refused(
+            |c| c.gateway.dashboard_sign_in.oidc.clear(),
+            "needs [gateway.dashboard_sign_in] with at least one provider",
+        );
+        refused(
+            |c| c.gateway.path_prefix = Some("/zc".into()),
+            "unset gateway.path_prefix",
+        );
+        refused(
+            |c| c.relay.relay_insecure = true,
+            "verified relay certificate",
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn dns_host_names_are_lower_case_multi_label_names() {
+        for name in ["relay.example.com", "a.b", "abc-1.relay.example", "x2.y3"] {
+            assert!(is_dns_host_name(name), "{name}");
+        }
+        for name in [
+            "",
+            "localhost",
+            "Relay.example.com",
+            "relay..example",
+            "-relay.example",
+            "relay-.example",
+            "relay.example.",
+            "relay_x.example",
+            "relay.example:443",
+            "203.0.113.7",
+        ] {
+            assert!(!is_dns_host_name(name), "{name}");
+        }
+        assert!(!is_dns_host_name(&format!("{}.example", "a".repeat(64))));
+    }
+
+    #[::core::prelude::v1::test]
     fn dashboard_sign_in_offers_only_configured_providers_once() {
         let mut config = auth_config();
         config.gateway.dashboard_sign_in.oidc = vec!["corp".into()];
@@ -30893,6 +31677,111 @@ zeroclaw-operators = "operator"
     }
 
     #[::core::prelude::v1::test]
+    fn oidc_request_scopes_default_to_openid_for_every_flow() {
+        let defaults = OidcConfig::default();
+        assert!(defaults.scopes.is_empty());
+        assert!(defaults.service_scopes.is_empty());
+        assert_eq!(defaults.effective_scope(), "openid");
+        assert_eq!(defaults.effective_service_scope(), "openid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_request_scopes_roundtrip_from_toml_and_join_in_order() {
+        // Entra ID shape: the API scope sets the access token's audience, and
+        // client_credentials accepts only the `.default` scope (no `openid`).
+        let toml_src = r#"
+[permission_profiles.operator]
+allowed_agents = ["*"]
+
+[oidc.entra]
+issuer = "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0"
+audience = "11111111-1111-1111-1111-111111111111"
+claim_path = "roles"
+scopes = ["openid", "offline_access", "api://zeroclaw/zeroclaw.access"]
+service_scopes = ["api://zeroclaw/.default"]
+
+[oidc.entra.profile_map]
+"ZeroClaw.Operator" = "operator"
+"#;
+        let config: Config = toml::from_str(toml_src).expect("scopes parse");
+        config.validate().expect("scopes validate");
+        let oidc = &config.oidc["entra"];
+        assert_eq!(
+            oidc.effective_scope(),
+            "openid offline_access api://zeroclaw/zeroclaw.access"
+        );
+        assert_eq!(oidc.effective_service_scope(), "api://zeroclaw/.default");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_interactive_scopes_must_include_openid() {
+        // Browser sign-in validates an ID token, which only `openid` yields.
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().scopes = vec!["offline_access".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("oidc.corp.scopes") && err.contains("openid"),
+            "got: {err}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_service_scopes_do_not_require_openid() {
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().service_scopes =
+            vec!["api://zeroclaw/.default".to_string()];
+        config
+            .validate()
+            .expect("client_credentials scopes need not include openid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_request_scopes_must_be_rfc6749_scope_tokens() {
+        // RFC 6749 §3.3: scope-token = 1*( %x21 / %x23-5B / %x5D-7E ).
+        // Blank, whitespace (which would split one entry into two scopes),
+        // `"`, `\`, control, and non-ASCII characters are all refused.
+        for bad in [
+            "",
+            " ",
+            "openid profile",
+            "a\"b",
+            "a\\b",
+            "tab\there",
+            "naïve",
+        ] {
+            for field in ["scopes", "service_scopes"] {
+                let mut config = auth_config();
+                {
+                    let oidc = config.oidc.get_mut("corp").unwrap();
+                    let list = vec!["openid".to_string(), bad.to_string()];
+                    if field == "scopes" {
+                        oidc.scopes = list;
+                    } else {
+                        oidc.service_scopes = list;
+                    }
+                }
+                let err = config.validate().unwrap_err().to_string();
+                assert!(
+                    err.contains(&format!("oidc.corp.{field}")),
+                    "{field} = {bad:?} must be refused; got: {err}"
+                );
+            }
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_request_scopes_refuse_duplicates() {
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().scopes =
+            vec!["openid".to_string(), "openid".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("oidc.corp.scopes") && err.contains("openid"),
+            "got: {err}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
     fn oidc_debug_redacts_client_secret() {
         let mut config = auth_config();
         config.oidc.get_mut("corp").unwrap().client_secret = Some("super-secret-value".to_string());
@@ -30924,7 +31813,10 @@ zeroclaw-operators = "operator"
 
     #[test]
     async fn filesystem_validate_rejects_broad_root_by_default() {
-        for root in ["/etc", "/proc", "/sys", "/dev", "/tmp"] {
+        // The Unix roots are refused on every platform, Windows included.
+        for root in [
+            "/", "/home", "/etc", "/var", "/proc", "/sys", "/dev", "/tmp", "//", "/etc/", "/tmp//",
+        ] {
             let cfg = FilesystemConfig {
                 enabled: true,
                 paths: vec![root.into()],
@@ -30936,6 +31828,360 @@ zeroclaw-operators = "operator"
                 "root {root} must be rejected by default"
             );
         }
+    }
+
+    /// Spellings of Windows broad roots. Each one needs `allow_broad_roots`
+    /// on Windows.
+    const WINDOWS_BROAD_ROOT_SPELLINGS: &[&str] = &[
+        // Drive roots and the current drive's root.
+        r"C:\",
+        "C:/",
+        "d:/",
+        r"C:\\",
+        r"\",
+        // Drive-relative spellings, read from the drive's root because the
+        // check cannot know that drive's current folder.
+        "C:",
+        "d:",
+        "C:Windows",
+        // System, profile, program, and machine-wide data directories on any
+        // drive or the current one, in any case, with any separators.
+        r"C:\Windows",
+        r"c:\windows\",
+        "C:/WINDOWS/",
+        r"C:\\Windows",
+        r"C:\Windows\Temp",
+        r"C:\Users",
+        r"C:\Users\tester",
+        r"c:\users\TESTER\",
+        r"C:\Users\Public",
+        r"C:\Program Files",
+        r"C:\Program Files (x86)",
+        r"C:\ProgramData",
+        r"D:\Users\tester",
+        r"\Windows",
+        "/Users/tester",
+        // Trailing dots and spaces, and `.` and `..` segments, which Windows
+        // resolves away outside `\\?\` paths.
+        r"C:\Windows.",
+        r"C:\Windows ",
+        r"C:\Users\tester.",
+        r"C:\Program Files. ",
+        r"c:\windows\temp.\",
+        r"C:\Windows\.",
+        r"C:\inbox\..",
+        r"C:\Users\tester\Inbox\..",
+        r"\\.\C:\inbox\..\Windows",
+        r"\\server\share\inbox\..",
+        // Device-path and network-share spellings.
+        r"\\?\C:\",
+        r"\\?\C:",
+        r"\\?\C:\Windows\",
+        r"\\.\C:\Users",
+        r"\\?\Volume{00000000-0000-0000-0000-000000000000}\",
+        r"\\server\share",
+        r"\\server\share\",
+        "//server/share",
+        r"\\?\UNC\server\share",
+        r"\\.\unc\server\share\",
+        // Device names other than a drive, volume, or share, which can open
+        // a whole volume, at any depth.
+        r"\\?\GLOBALROOT\Device\HarddiskVolume3\",
+        r"\\.\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\inbox",
+        r"\\?\BootPartition\",
+        r"\\?\",
+    ];
+
+    /// Windows paths scoped below the broad roots. None of them needs
+    /// `allow_broad_roots`.
+    const WINDOWS_SCOPED_PATHS: &[&str] = &[
+        r"C:\Users\tester\Inbox",
+        r"C:\ProgramData\ZeroClaw\inbox",
+        r"C:\Windows\Temp\inbox",
+        r"C:\Users\Public\..\tester\Inbox.",
+        r"D:\inbox",
+        r"\inbox",
+        r"\\?\C:\Users\tester\Inbox",
+        r"\\server\share\inbox",
+        r"\\?\UNC\server\share\inbox",
+        // `\\?\` turns Windows path normalization off, so this names a folder
+        // called `Windows.` rather than `C:\Windows`.
+        r"\\?\C:\Windows.",
+        "inbox",
+    ];
+
+    #[test]
+    async fn filesystem_windows_broad_root_matcher_classifies_spellings() {
+        // `validate` consults this matcher only on Windows; checking it
+        // directly keeps the Windows rules covered on every platform.
+        for root in WINDOWS_BROAD_ROOT_SPELLINGS.iter().copied() {
+            assert!(
+                is_windows_filesystem_broad_root(root),
+                "{root} must be a Windows broad root"
+            );
+        }
+        for path in WINDOWS_SCOPED_PATHS.iter().copied() {
+            assert!(
+                !is_windows_filesystem_broad_root(path),
+                "{path} must not be a Windows broad root"
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    async fn filesystem_validate_off_windows_accepts_windows_spellings() {
+        // Off Windows a backslash is an ordinary file name character, so these
+        // are ordinary paths, accepted as before.
+        for path in [
+            r"C:\",
+            "C:/",
+            r"C:\Windows",
+            r"\\?\C:\",
+            r"\\server\share",
+            "//server/share",
+            r"\etc",
+        ] {
+            let cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![path.into()],
+                ..FilesystemConfig::default()
+            };
+            assert!(
+                cfg.validate().is_ok(),
+                "path {path} must stay accepted off Windows"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    async fn filesystem_validate_rejects_windows_broad_roots_by_default() {
+        for root in WINDOWS_BROAD_ROOT_SPELLINGS.iter().copied() {
+            let mut cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![root.into()],
+                ..FilesystemConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("broad system root"),
+                "root {root} must be rejected by default"
+            );
+            cfg.allow_broad_roots = true;
+            assert!(
+                cfg.validate().is_ok(),
+                "root {root} must be allowed with allow_broad_roots"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    async fn filesystem_validate_accepts_scoped_windows_paths() {
+        for path in WINDOWS_SCOPED_PATHS.iter().copied() {
+            let cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![path.into()],
+                ..FilesystemConfig::default()
+            };
+            assert!(cfg.validate().is_ok(), "path {path} must be accepted");
+        }
+    }
+
+    /// Spellings of macOS broad roots that the exact Unix check accepts. Each
+    /// one needs `allow_broad_roots` on macOS.
+    const MACOS_BROAD_ROOT_SPELLINGS: &[&str] = &[
+        // Home directories in `/Users`, the shared folder, and their parent.
+        "/Users",
+        "/Users/",
+        "/Users/tester",
+        "/Users/tester/",
+        "/Users/Shared",
+        // Every mounted volume, including the startup disk's entry, which
+        // links to `/`, and their parent.
+        "/Volumes",
+        "/Volumes/Macintosh HD",
+        "/Volumes/Backup/",
+        // The directories `/etc`, `/tmp`, and `/var` link to, and their parent.
+        "/private",
+        "/private/etc",
+        "/private/tmp/",
+        "/private/var",
+        // Other cases and repeated separators, which a default macOS volume
+        // resolves to the same directories, the Unix roots included.
+        "/USERS/tester",
+        "//Users",
+        "/Private//Tmp",
+        "/TMP",
+        "/Etc/",
+        "//var",
+    ];
+
+    /// macOS paths scoped below the broad roots. None of them needs
+    /// `allow_broad_roots`.
+    const MACOS_SCOPED_PATHS: &[&str] = &[
+        "/Users/tester/Inbox",
+        "/Users/Shared/inbox",
+        "/Volumes/Backup/inbox",
+        "/private/tmp/inbox",
+        "/private/var/folders",
+        "Users",
+        "Users/tester",
+        "inbox",
+    ];
+
+    #[test]
+    async fn filesystem_macos_broad_root_matcher_classifies_spellings() {
+        // `validate` consults this matcher only on macOS; checking it
+        // directly keeps the macOS rules covered on every platform.
+        for root in MACOS_BROAD_ROOT_SPELLINGS.iter().copied() {
+            assert!(
+                is_macos_filesystem_broad_root(root),
+                "{root} must be a macOS broad root"
+            );
+        }
+        for path in MACOS_SCOPED_PATHS.iter().copied() {
+            assert!(
+                !is_macos_filesystem_broad_root(path),
+                "{path} must not be a macOS broad root"
+            );
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    #[test]
+    async fn filesystem_validate_off_macos_and_windows_accepts_macos_spellings() {
+        // Elsewhere these are ordinary paths, and the Unix roots match only
+        // exactly, so every macOS spelling stays accepted as before.
+        for path in MACOS_BROAD_ROOT_SPELLINGS.iter().copied() {
+            let cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![path.into()],
+                ..FilesystemConfig::default()
+            };
+            assert!(
+                cfg.validate().is_ok(),
+                "path {path} must stay accepted off macOS and Windows"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    async fn filesystem_validate_rejects_macos_broad_roots_by_default() {
+        for root in MACOS_BROAD_ROOT_SPELLINGS.iter().copied() {
+            let mut cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![root.into()],
+                ..FilesystemConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("broad system root"),
+                "root {root} must be rejected by default"
+            );
+            cfg.allow_broad_roots = true;
+            assert!(
+                cfg.validate().is_ok(),
+                "root {root} must be allowed with allow_broad_roots"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    async fn filesystem_validate_rejects_resolved_unix_roots_on_macos() {
+        // macOS links `/etc`, `/tmp`, and `/var` elsewhere, and the watcher
+        // follows a watched path's links, so the directories they resolve to
+        // must be refused like the links themselves.
+        for root in ["/etc", "/tmp", "/var"] {
+            let resolved = std::fs::canonicalize(root).expect("Unix root resolves on macOS");
+            let resolved = resolved.to_str().expect("resolved root is UTF-8");
+            assert_ne!(resolved, root, "{root} must be a link on macOS");
+            let cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![resolved.into()],
+                ..FilesystemConfig::default()
+            };
+            let err = cfg.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("broad system root"),
+                "{resolved}, where {root} resolves, must be rejected by default"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    async fn filesystem_validate_accepts_scoped_macos_paths() {
+        for path in MACOS_SCOPED_PATHS.iter().copied() {
+            let cfg = FilesystemConfig {
+                enabled: true,
+                paths: vec![path.into()],
+                ..FilesystemConfig::default()
+            };
+            assert!(cfg.validate().is_ok(), "path {path} must be accepted");
+        }
+    }
+
+    #[test]
+    async fn filesystem_resolved_path_accepts_scoped_folder() {
+        let dir = TempDir::new().unwrap();
+        let cfg = FilesystemConfig::default();
+        assert!(
+            cfg.validate_resolved_path(&dir.path().to_string_lossy())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    async fn filesystem_resolved_path_refuses_unresolvable_path() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("missing").to_string_lossy().into_owned();
+        let mut cfg = FilesystemConfig::default();
+        let err = cfg.validate_resolved_path(&missing).unwrap_err();
+        assert!(err.to_string().contains("cannot be resolved"), "got: {err}");
+        // The opt-in skips resolution; the watcher reports a missing path.
+        cfg.allow_broad_roots = true;
+        assert!(cfg.validate_resolved_path(&missing).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    async fn filesystem_resolved_path_refuses_link_to_broad_root() {
+        let dir = TempDir::new().unwrap();
+        let link = dir.path().join("whole-disk");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        let link = link.to_string_lossy().into_owned();
+        // As written the link is an ordinary path; on disk it resolves to `/`.
+        assert!(!is_filesystem_broad_root(&link));
+        let mut cfg = FilesystemConfig::default();
+        let err = cfg.validate_resolved_path(&link).unwrap_err();
+        assert!(
+            err.to_string().contains("resolves to broad system root"),
+            "got: {err}"
+        );
+        cfg.allow_broad_roots = true;
+        assert!(cfg.validate_resolved_path(&link).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    async fn filesystem_resolved_path_refuses_alias_of_drive_root() {
+        // `canonicalize` returns a `\\?\` path such as `\\?\C:\`, which the
+        // Windows matcher reads as the drive root.
+        let windows = std::env::var_os("SystemRoot")
+            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        let alias = windows.join("..").to_string_lossy().into_owned();
+        let mut cfg = FilesystemConfig::default();
+        let err = cfg.validate_resolved_path(&alias).unwrap_err();
+        assert!(
+            err.to_string().contains("resolves to broad system root"),
+            "got: {err}"
+        );
+        cfg.allow_broad_roots = true;
+        assert!(cfg.validate_resolved_path(&alias).is_ok());
     }
 
     #[test]
@@ -32151,6 +33397,18 @@ enabled = true
             msg.contains("channels.telegram.default.reply_min_interval_secs"),
             "error must name the offending path; got: {msg}"
         );
+    }
+
+    #[test]
+    async fn validate_global_voice_silence_timeout_bounds() {
+        let mut config = Config::default();
+        assert_eq!(config.gateway.voice_silence_timeout_secs, 15);
+        for seconds in [0, 1, 15, 300] {
+            config.gateway.voice_silence_timeout_secs = seconds;
+            config.validate().expect("valid voice timeout");
+        }
+        config.gateway.voice_silence_timeout_secs = 301;
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -33873,7 +35131,7 @@ auto_save = true
         let parsed: ModelProviderConfig = toml::from_str("").unwrap();
         assert_eq!(
             parsed.tool_result_image_policy,
-            ToolResultImagePolicy::ImageUrl
+            ToolResultImagePolicy::Relocate
         );
         let serialized = toml::to_string(&parsed).unwrap();
         assert!(
@@ -33886,6 +35144,15 @@ auto_save = true
         assert_eq!(parsed.tool_result_image_policy, ToolResultImagePolicy::Omit);
         let serialized = toml::to_string(&parsed).unwrap();
         assert!(serialized.contains("tool_result_image_policy = \"omit\""));
+
+        let parsed: ModelProviderConfig =
+            toml::from_str("tool_result_image_policy = \"image_url\"").unwrap();
+        assert_eq!(
+            parsed.tool_result_image_policy,
+            ToolResultImagePolicy::ImageUrl
+        );
+        let serialized = toml::to_string(&parsed).unwrap();
+        assert!(serialized.contains("tool_result_image_policy = \"image_url\""));
     }
 
     #[::core::prelude::v1::test]
@@ -34961,6 +36228,30 @@ runtime_profile = "missing"
         assert!(!parsed.effective_single_tool_rounds("enabled"));
         let serialized = toml::to_string(&parsed.runtime_profiles["batch"]).unwrap();
         assert!(serialized.contains("single_tool_rounds = false"));
+    }
+
+    #[test]
+    async fn runtime_profile_tool_elicitation_is_honored() {
+        let raw = r#"
+[runtime_profiles.hinted]
+tool_elicitation = true
+
+[agents.default]
+runtime_profile = "hinted"
+"#;
+        let parsed = parse_test_config(raw);
+        assert!(parsed.effective_tool_elicitation("default"));
+    }
+
+    #[test]
+    async fn tool_elicitation_defaults_off() {
+        let parsed = parse_test_config(
+            r#"
+[agents.default]
+runtime_profile = "default"
+"#,
+        );
+        assert!(!parsed.effective_tool_elicitation("default"));
     }
 
     #[test]
@@ -37306,6 +38597,7 @@ allowed_numbers = ["+1", "+2"]
             session_persistence: true,
             session_ttl_hours: 0,
             websocket_ping_interval_secs: 30,
+            voice_silence_timeout_secs: 15,
             pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
             dashboard_sign_in: DashboardSignInConfig::default(),
@@ -37504,6 +38796,7 @@ default_temperature = 0.7
         );
         assert_eq!(b.allowed_domains, vec!["*".to_string()]);
         assert_eq!(b.backend, "agent_browser");
+        assert_eq!(b.timeout_secs, 60);
         assert_eq!(b.headed, None);
         assert!(b.native_headless);
         assert_eq!(b.native_webdriver_url, "http://127.0.0.1:9515");
@@ -37524,6 +38817,7 @@ default_temperature = 0.7
             allowed_domains: vec!["example.com".into(), "docs.example.com".into()],
             session_name: None,
             backend: "auto".into(),
+            timeout_secs: 45,
             headed: Some(true),
             native_headless: false,
             native_webdriver_url: "http://localhost:4444".into(),
@@ -37546,6 +38840,7 @@ default_temperature = 0.7
         assert_eq!(parsed.allowed_domains.len(), 2);
         assert_eq!(parsed.allowed_domains[0], "example.com");
         assert_eq!(parsed.backend, "auto");
+        assert_eq!(parsed.timeout_secs, 45);
         assert_eq!(parsed.headed, Some(true));
         assert!(!parsed.native_headless);
         assert_eq!(parsed.native_webdriver_url, "http://localhost:4444");
@@ -39625,8 +40920,13 @@ runtime_profile = "default"
     )))]
     #[test]
     async fn a_lean_build_validates_enabled_sections_for_tools_it_lacks() {
+        let mut quiet = Config::default();
+        // `[web_search]` defaults to enabled and reports compiled out in a
+        // build without `tools-external`; this assertion is about the
+        // sections enabled below, so keep the default noise out.
+        quiet.web_search.enabled = false;
         assert!(
-            !Config::default()
+            !quiet
                 .collect_warnings()
                 .iter()
                 .any(|warning| warning.code == crate::validation_warnings::TOOL_COMPILED_OUT),
@@ -39634,6 +40934,7 @@ runtime_profile = "default"
         );
 
         let mut config = Config::default();
+        config.web_search.enabled = false;
         config.microsoft365.enabled = true;
         config.project_intel.enabled = true;
         config.project_intel.templates_dir = Some("/nonexistent/zeroclaw-templates".into());
@@ -39670,6 +40971,10 @@ runtime_profile = "default"
     async fn google_workspace_allowlist_is_checked_only_where_the_tool_is_compiled() {
         use crate::opt_in_tools::OptInTool;
         let mut config = Config::default();
+        // `[web_search]` defaults to enabled and stands outside this test's
+        // focus; it reports compiled out in any build without
+        // `tools-external`, which the assertion below is not about.
+        config.web_search.enabled = false;
         config.google_workspace.enabled = true;
         config.google_workspace.allowed_services = vec!["drive".into()];
         config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
@@ -39701,6 +41006,28 @@ runtime_profile = "default"
         }
     }
 
+    /// `web_search` defaults to enabled, so a build without `tools-external`
+    /// must say the tool is compiled out instead of silently dropping it;
+    /// a build that carries the feature reports nothing.
+    #[test]
+    async fn web_search_section_reports_compiled_out_without_tools_external() {
+        use crate::opt_in_tools::OptInTool;
+        let mut config = Config::default();
+        config.web_search.enabled = true;
+
+        let compiled_out: Vec<String> = config
+            .collect_warnings()
+            .into_iter()
+            .filter(|warning| warning.code == crate::validation_warnings::TOOL_COMPILED_OUT)
+            .map(|warning| warning.path)
+            .collect();
+        if OptInTool::WebSearch.compiled() {
+            assert!(compiled_out.is_empty(), "{compiled_out:?}");
+        } else {
+            assert_eq!(compiled_out, ["web_search.enabled"]);
+        }
+    }
+
     /// The counterpart in a build that carries the tools: their settings are
     /// still checked, and nothing is reported as compiled out.
     #[cfg(all(
@@ -39723,6 +41050,10 @@ runtime_profile = "default"
         ];
         for (field, enable) in cases {
             let mut config = Config::default();
+            // `[web_search]` defaults to enabled and stands outside this
+            // test's focus; in a build without `tools-external` it would
+            // report compiled out and trip the assertion below.
+            config.web_search.enabled = false;
             enable(&mut config);
             let err = config
                 .validate()
@@ -40151,6 +41482,118 @@ api_token = "tok"
         assert!(err.contains("sub_resource contains invalid characters"));
     }
 
+    #[test]
+    async fn runtime_proxy_client_cache_survives_owner_runtime_shutdown() {
+        let _guard = env_override_lock().await;
+        struct RestoreProxyBypass(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreProxyBypass {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    // SAFETY: the environment test lock outlives this guard.
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(key, value),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let _bypass = RestoreProxyBypass(
+            ["NO_PROXY", "no_proxy"]
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        );
+        for key in ["NO_PROXY", "no_proxy"] {
+            set_or_clear_env(key, Some("127.0.0.1"));
+        }
+        let previous = runtime_proxy_config();
+        set_runtime_proxy_config(ProxyConfig::default());
+        let result = tokio::task::spawn_blocking(|| {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+                let mut connections: Vec<(std::net::TcpStream, Vec<u8>)> = Vec::new();
+                let mut served_on = Vec::new();
+                while served_on.len() < 4 && std::time::Instant::now() < deadline {
+                    loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => {
+                                socket.set_nonblocking(true).unwrap();
+                                connections.push((socket, Vec::new()));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(error) => panic!("fixture accept: {error}"),
+                        }
+                    }
+                    for (index, (socket, buffered)) in connections.iter_mut().enumerate() {
+                        let mut chunk = [0u8; 4096];
+                        match socket.read(&mut chunk) {
+                            Ok(count) => buffered.extend_from_slice(&chunk[..count]),
+                            Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionReset) => {},
+                            Err(error) => panic!("fixture read: {error}"),
+                        }
+                        while let Some(end) = buffered.windows(4).position(|part| part == b"\r\n\r\n") {
+                            buffered.drain(..end + 4);
+                            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok").unwrap();
+                            served_on.push(index);
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                served_on
+            });
+            let service = format!("runtime-owner-{}", uuid::Uuid::new_v4());
+            fn request_on(runtime: &tokio::runtime::Runtime, service: &str, endpoint: &str, count: usize) -> Vec<reqwest::Result<String>> {
+                runtime.block_on(async {
+                    let mut results = Vec::new();
+                    for _ in 0..count {
+                        let client = build_runtime_proxy_client_with_timeouts(service, 2, 2);
+                        results.push(async {client.get(endpoint).send().await?.text().await}.await);
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    results
+                })
+            }
+            let runtime = || tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let first_owner = runtime();
+            let mut results = request_on(&first_owner, &service, &endpoint, 2);
+            // Keep the first owner's live pool, but stop driving its reactor.
+            // A runtime-blind hit now dispatches into that paused owner and times out.
+            let second_owner = runtime();
+            results.extend(request_on(&second_owner, &service, &endpoint, 1));
+            drop(first_owner);
+            drop(second_owner);
+            // Also exercise cache lookup after its last owner has shut down.
+            let after_shutdown = runtime();
+            results.extend(request_on(&after_shutdown, &service, &endpoint, 1));
+            drop(after_shutdown);
+            (results, server.join().unwrap())
+        }).await;
+        set_runtime_proxy_config(previous);
+        let (results, served_on) = result.unwrap();
+        for result in results {
+            assert_eq!(result.unwrap(), "ok");
+        }
+        assert_eq!(served_on.len(), 4);
+        assert_eq!(
+            served_on[0], served_on[1],
+            "warm requests must reuse a live pooled connection"
+        );
+        assert_ne!(
+            served_on[1], served_on[2],
+            "a new runtime needs its own connection"
+        );
+        assert_ne!(
+            served_on[2], served_on[3],
+            "a shut-down owner cannot supply the next pool"
+        );
+    }
+
     fn runtime_proxy_cache_contains(cache_key: &str) -> bool {
         runtime_proxy_cached_client(cache_key).is_some()
     }
@@ -40260,6 +41703,7 @@ api_token = "tok"
                     cache_key.clone(),
                     RuntimeProxyCachedClient {
                         generation: stale_generation,
+                        runtime_id: tokio::runtime::Handle::current().id(),
                         client: reqwest::Client::new(),
                     },
                 );
@@ -40270,6 +41714,7 @@ api_token = "tok"
                     cache_key.clone(),
                     RuntimeProxyCachedClient {
                         generation: stale_generation,
+                        runtime_id: tokio::runtime::Handle::current().id(),
                         client: reqwest::Client::new(),
                     },
                 );
@@ -42562,6 +44007,163 @@ group_policy = "disabled"
 
         let config: Config = toml::from_str("").expect("empty TOML loads with defaults");
         assert!(config.security.audit.enabled);
+    }
+
+    #[test]
+    async fn collect_warnings_flags_dead_delegate_grants_under_forbidden_policy() {
+        let mut config: Config = toml::from_str(
+            r#"
+[risk_profiles.worker_project]
+[risk_profiles.worker_project.delegation_policy]
+mode = "forbidden"
+
+[agents.projects_assistant]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[[agents.projects_assistant.delegates]]
+agent = "demiurge"
+mode = "independent"
+
+[agents.demiurge]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[providers.models.openai.gpt]
+model = "gpt-4o-mini"
+"#,
+        )
+        .expect("dead-grant fixture loads");
+        suppress_semantic_memory_warning(&mut config);
+
+        let warnings =
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let w = &warnings[0];
+        assert_eq!(w.path, "agents.projects_assistant.delegates");
+        assert!(
+            w.message.contains("delegation_policy.mode")
+                && w.message.contains("projects_assistant")
+                && w.message.contains("unreachable"),
+            "unexpected message: {}",
+            w.message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_silent_when_delegate_grants_match_allow_policy() {
+        let mut config: Config = toml::from_str(
+            r#"
+[risk_profiles.worker_project]
+[risk_profiles.worker_project.delegation_policy]
+mode = "allow"
+
+[agents.projects_assistant]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[[agents.projects_assistant.delegates]]
+agent = "demiurge"
+mode = "independent"
+
+[agents.demiurge]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[providers.models.openai.gpt]
+model = "gpt-4o-mini"
+"#,
+        )
+        .expect("reachable-grant fixture loads");
+        suppress_semantic_memory_warning(&mut config);
+
+        assert!(
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS)
+                .is_empty()
+        );
+    }
+
+    fn dead_grant_fixture(profile_body: &str) -> Config {
+        let mut config: Config = toml::from_str(&format!(
+            r#"
+[risk_profiles.worker_project]
+{profile_body}
+[risk_profiles.worker_project.delegation_policy]
+mode = "allow"
+
+[agents.projects_assistant]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[[agents.projects_assistant.delegates]]
+agent = "demiurge"
+mode = "independent"
+
+[agents.demiurge]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[providers.models.openai.gpt]
+model = "gpt-4o-mini"
+"#
+        ))
+        .expect("dead-grant fixture loads");
+        suppress_semantic_memory_warning(&mut config);
+        config
+    }
+
+    #[test]
+    async fn collect_warnings_flags_dead_delegate_grants_under_deny_all_tools() {
+        let config = dead_grant_fixture("deny_all_tools = true");
+        let warnings =
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.contains("deny_all_tools"),
+            "unexpected message: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_dead_delegate_grants_when_delegate_excluded() {
+        let config = dead_grant_fixture(r#"excluded_tools = ["delegate"]"#);
+        let warnings =
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.contains("excluded_tools"),
+            "unexpected message: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_dead_delegate_grants_when_allowlist_omits_delegate() {
+        let config = dead_grant_fixture(r#"allowed_tools = ["shell"]"#);
+        let warnings =
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.contains("allowed_tools") && !warnings[0].message.contains("  "),
+            "unexpected message: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_silent_when_allowlist_admits_delegate() {
+        let config = dead_grant_fixture(r#"allowed_tools = ["shell", "delegate"]"#);
+        assert!(
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS)
+                .is_empty()
+        );
     }
 
     // Disabling the section silently stops the certificate trail:
@@ -47580,6 +49182,80 @@ stream_tool_arguments = [
             mx.set_prop("channels.matrix.draft_update_interval_ms", "abc")
                 .is_err()
         );
+    }
+
+    /// `config set`, RPC `config/set`, the gateway PATCH and env overrides
+    /// all reach `set_prop`. Text that reads as infinity or NaN is refused
+    /// for a plain float field and for an optional one, and the value already
+    /// set is kept. Finite edge values still store exactly.
+    #[test]
+    async fn set_prop_float_refuses_non_finite_text_and_keeps_the_stored_value() {
+        let mut config = Config::default();
+        let vector_weight = config.memory.vector_weight;
+        config
+            .set_prop_persistent("runtime.docker.cpu_limit", "2.5")
+            .unwrap();
+        for text in [
+            "inf", "+inf", "-inf", "Infinity", "infinity", "NaN", "nan", "1e999", "-1e999",
+        ] {
+            for prop in ["memory.vector_weight", "runtime.docker.cpu_limit"] {
+                let err = config.set_prop_persistent(prop, text).expect_err(text);
+                assert!(
+                    format!("{err:#}").contains("Invalid float value"),
+                    "{prop} {text}: {err:#}"
+                );
+            }
+            assert_eq!(
+                config.memory.vector_weight.to_bits(),
+                vector_weight.to_bits(),
+                "{text}"
+            );
+            assert_eq!(config.runtime.docker.cpu_limit, Some(2.5), "{text}");
+        }
+        for (text, want) in [
+            ("-0.0", -0.0_f64),
+            ("5e-324", 5e-324),
+            ("1.7976931348623157e308", f64::MAX),
+            ("5", 5.0),
+        ] {
+            config
+                .set_prop_persistent("memory.vector_weight", text)
+                .unwrap();
+            assert_eq!(
+                config.memory.vector_weight.to_bits(),
+                want.to_bits(),
+                "{text}"
+            );
+            config
+                .set_prop_persistent("runtime.docker.cpu_limit", text)
+                .unwrap();
+            assert_eq!(
+                config.runtime.docker.cpu_limit.map(f64::to_bits),
+                Some(want.to_bits()),
+                "{text}"
+            );
+        }
+    }
+
+    /// `energy_threshold` is an `f32`: `1e39` is finite as an `f64` but
+    /// would be stored as infinity, so it is refused too.
+    #[test]
+    async fn set_prop_f32_refuses_a_value_too_large_for_the_field() {
+        let mut wake = VoiceWakeConfig::default();
+        let before = wake.energy_threshold;
+        for text in ["1e39", "-1e39", "inf", "NaN"] {
+            let err = wake
+                .set_prop("voice_wake.energy_threshold", text)
+                .expect_err(text);
+            assert!(
+                format!("{err:#}").contains("Invalid float value"),
+                "{text}: {err:#}"
+            );
+            assert_eq!(wake.energy_threshold.to_bits(), before.to_bits(), "{text}");
+        }
+        wake.set_prop("voice_wake.energy_threshold", "0.05")
+            .unwrap();
+        assert_eq!(wake.energy_threshold, 0.05_f32);
     }
 
     #[test]
@@ -53189,6 +54865,9 @@ group_policy = "all"
 
     fn suppress_semantic_memory_warning(config: &mut Config) {
         config.memory.search_mode = SearchMode::Bm25;
+        // Default-on `[web_search]` reports TOOL_COMPILED_OUT in builds
+        // without `tools-external`; these tests count unrelated warnings.
+        config.web_search.enabled = false;
     }
 
     #[test]

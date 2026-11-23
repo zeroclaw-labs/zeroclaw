@@ -720,6 +720,19 @@ impl MattermostChannel {
         serde_json::from_str(post).ok()
     }
 
+    /// Whether a `posted` event comes from a DM or group DM that discovery
+    /// would list. The settings that gate discovery gate this too, so an
+    /// explicit `channel_ids` scope or `discover_dms = false` keeps it out.
+    fn is_discoverable_dm_event(&self, auto_discover: bool, event: &serde_json::Value) -> bool {
+        auto_discover
+            && self.discover_dms
+            && event
+                .get("data")
+                .and_then(|data| data.get("channel_type"))
+                .and_then(|channel_type| channel_type.as_str())
+                .is_some_and(is_direct_channel)
+    }
+
     async fn authenticate_websocket<S>(
         write: &mut SplitSink<WebSocketStream<S>, WsMessage>,
         read: &mut SplitStream<WebSocketStream<S>>,
@@ -1353,13 +1366,37 @@ impl Channel for MattermostChannel {
     }
 }
 
+/// Wall-clock milliseconds since the Unix epoch, the unit of Mattermost's `since`.
+#[allow(clippy::cast_possible_truncation)]
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
 impl MattermostChannel {
     async fn listen_polling(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+        self.run_polling_loop(tx, POLL_INTERVAL, DISCOVERY_REFRESH)
+            .await
+    }
+
+    /// The polling listener, with its two cadences as parameters so tests can
+    /// drive the real loop without waiting out a discovery interval.
+    async fn run_polling_loop(
+        &self,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        poll_interval: Duration,
+        discovery_refresh: Duration,
+    ) -> Result<()> {
         // Resolve auth up front so misconfiguration fails fast at listen-time.
         let initial_token = self.token().await?.to_string();
         let (bot_user_id, bot_username) = self.require_bot_identity().await?;
 
         let auto_discover = self.scoped_channel_ids().is_none();
+        // Read before the request: a DM missing from the listing that comes
+        // back did not exist yet at this time.
+        let listening_since_ms = unix_now_ms();
         let mut target_channels = self.list_target_channels().await?;
         self.refresh_room_purposes(&target_channels);
         let mut last_discovery = Instant::now();
@@ -1380,14 +1417,14 @@ impl MattermostChannel {
         );
 
         loop {
-            tokio::time::sleep(POLL_INTERVAL).await;
+            tokio::time::sleep(poll_interval).await;
 
             // Runs for auto-discovery *or* purpose tracking. Gating this on
             // `auto_discover` alone meant an alias with explicit `channel_ids`
             // read each room's purpose once at startup and never again, so an
             // edited purpose needed a daemon restart to take effect.
             let refresh_due = (auto_discover || self.purpose_as_instructions)
-                && last_discovery.elapsed() >= DISCOVERY_REFRESH;
+                && last_discovery.elapsed() >= discovery_refresh;
             if refresh_due {
                 match self.list_target_channels().await {
                     Ok(refreshed) => {
@@ -1412,6 +1449,19 @@ impl MattermostChannel {
                                 })),
                                 "Mattermost auto-discovery refreshed channel list"
                             );
+                            // A DM without a cursor was missing from the startup
+                            // listing, so it holds nothing older than that and
+                            // a cursor from then replays no history. It does
+                            // cover every post written before this refresh
+                            // found the room, which `poll_channel`'s default,
+                            // the first poll, would skip. Team channels keep
+                            // that default: one the bot just joined can hold
+                            // older posts that were never addressed to it.
+                            for target in refreshed.iter().filter(|target| target.is_direct) {
+                                last_create_at_by_channel
+                                    .entry(target.id.clone())
+                                    .or_insert(listening_since_ms);
+                            }
                             target_channels = refreshed;
                         }
                     }
@@ -1438,11 +1488,7 @@ impl MattermostChannel {
                 continue;
             }
 
-            #[allow(clippy::cast_possible_truncation)]
-            let bootstrap_ms = (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()) as i64;
+            let bootstrap_ms = unix_now_ms();
 
             for target in target_channels.clone() {
                 if self
@@ -1673,8 +1719,19 @@ impl MattermostChannel {
                         .get("channel_id")
                         .and_then(|value| value.as_str())
                         .unwrap_or("");
-                    let Some(&is_direct) = channel_direct_map.get(channel_id) else {
-                        continue;
+                    // A new DM's first post arrives here before discovery can
+                    // have listed its channel, and the event is not sent again.
+                    // Other unlisted channels wait for discovery, which is what
+                    // applies `team_ids` to them.
+                    let is_direct = match channel_direct_map.get(channel_id) {
+                        Some(&is_direct) => is_direct,
+                        None if !channel_id.is_empty()
+                            && self.is_discoverable_dm_event(auto_discover, &event) =>
+                        {
+                            channel_direct_map.insert(channel_id.to_string(), true);
+                            true
+                        }
+                        None => continue,
                     };
 
                     if self
@@ -6454,5 +6511,468 @@ mod channel_purpose_freshness_tests {
             "data": {"channel": json!({"purpose": "no id"}).to_string()}
         }));
         assert!(ch.room_purposes.lock().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod new_dm_delivery_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    const NEW_DM: &str = "new_dm";
+    const NEW_GROUP_DM: &str = "new_group_dm";
+    const LISTED_ROOM: &str = "listed_room";
+    const SENTINEL: &str = "posted last, in a listed room";
+    const POLL_EVERY: Duration = Duration::from_millis(10);
+    const DISCOVER_EVERY: Duration = Duration::from_millis(40);
+    /// Only a failing run waits this long; a passing one takes milliseconds.
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    fn channel_at(
+        base_url: String,
+        channel_ids: Vec<String>,
+        mention_only: bool,
+    ) -> MattermostChannel {
+        let channel = MattermostChannel::new(
+            base_url,
+            Some("token".into()),
+            None,
+            None,
+            channel_ids,
+            "new_dm_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+            mention_only,
+        );
+        channel
+            .bot_identity
+            .set(("bot_user".to_string(), "zerobot".to_string()))
+            .expect("a new channel has no cached identity");
+        channel
+    }
+
+    fn room(id: &str, channel_type: &str) -> serde_json::Value {
+        json!({"id": id, "type": channel_type, "team_id": ""})
+    }
+
+    fn listing(rooms: &[(&str, &str)]) -> ResponseTemplate {
+        let rooms: Vec<_> = rooms.iter().map(|(id, ty)| room(id, ty)).collect();
+        ResponseTemplate::new(200).set_body_json(rooms)
+    }
+
+    /// The server state a test scripts and the polling listener observes.
+    #[derive(Default)]
+    struct FakeMattermost {
+        discovery_calls: AtomicUsize,
+        posts: Mutex<HashMap<String, Vec<serde_json::Value>>>,
+        /// The `since` of every poll, per channel, in arrival order.
+        polls: Mutex<HashMap<String, Vec<i64>>>,
+    }
+
+    impl FakeMattermost {
+        fn add_post(&self, channel: &str, message: &str, create_at: i64) {
+            self.posts
+                .lock()
+                .entry(channel.to_string())
+                .or_default()
+                .push(json!({
+                    "id": format!("{channel}_{create_at}"),
+                    "channel_id": channel,
+                    "user_id": "peer_user",
+                    "message": message,
+                    "root_id": "",
+                    "create_at": create_at,
+                    "update_at": create_at,
+                }));
+        }
+
+        fn polls_of(&self, channel: &str) -> Vec<i64> {
+            self.polls.lock().get(channel).cloned().unwrap_or_default()
+        }
+
+        /// Each channel's post times and first `since`, for failure output.
+        fn timeline(&self) -> String {
+            let polls = self.polls.lock();
+            self.posts
+                .lock()
+                .iter()
+                .map(|(channel, posts)| {
+                    let created: Vec<_> = posts.iter().map(|post| &post["create_at"]).collect();
+                    let first_since = polls.get(channel).and_then(|since| since.first());
+                    format!("{channel}: create_at {created:?}, first since {first_since:?}")
+                })
+                .collect::<Vec<_>>()
+                .join("; ")
+        }
+    }
+
+    /// `GET /users/me/channels`, answering each call from the test's script.
+    struct Discovery<F> {
+        server: Arc<FakeMattermost>,
+        script: F,
+    }
+
+    impl<F> Respond for Discovery<F>
+    where
+        F: Fn(usize) -> ResponseTemplate + Send + Sync,
+    {
+        fn respond(&self, _request: &Request) -> ResponseTemplate {
+            (self.script)(self.server.discovery_calls.fetch_add(1, Ordering::SeqCst))
+        }
+    }
+
+    /// `GET /channels/{id}/posts`, which like the real server returns only the
+    /// posts updated strictly after `since`.
+    struct PostsSince(Arc<FakeMattermost>);
+
+    impl Respond for PostsSince {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let channel = request.url.path().split('/').nth(4).unwrap_or_default();
+            let since: i64 = request
+                .url
+                .query_pairs()
+                .find(|(key, _)| key == "since")
+                .and_then(|(_, value)| value.parse().ok())
+                .expect("every poll sends a numeric since");
+            self.0
+                .polls
+                .lock()
+                .entry(channel.to_string())
+                .or_default()
+                .push(since);
+            let newer: serde_json::Map<String, serde_json::Value> = self
+                .0
+                .posts
+                .lock()
+                .get(channel)
+                .into_iter()
+                .flatten()
+                .filter(|post| post["update_at"].as_i64().unwrap_or(0) > since)
+                .map(|post| (post["id"].as_str().unwrap_or("").to_string(), post.clone()))
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({"posts": newer}))
+        }
+    }
+
+    /// The real polling loop, running against a fake server on short cadences.
+    struct PollingListener {
+        server: Arc<FakeMattermost>,
+        delivered: tokio::sync::mpsc::Receiver<ChannelMessage>,
+        _mock: MockServer,
+    }
+
+    impl PollingListener {
+        async fn start(
+            server: Arc<FakeMattermost>,
+            mention_only: bool,
+            script: impl Fn(usize) -> ResponseTemplate + Send + Sync + 'static,
+        ) -> Self {
+            let mock = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/api/v4/users/me/channels"))
+                .respond_with(Discovery {
+                    server: Arc::clone(&server),
+                    script,
+                })
+                .mount(&mock)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"^/api/v4/channels/[^/]+/posts$"))
+                .respond_with(PostsSince(Arc::clone(&server)))
+                .mount(&mock)
+                .await;
+
+            let channel = channel_at(mock.uri(), Vec::new(), mention_only);
+            let (tx, delivered) = tokio::sync::mpsc::channel(8);
+            let _listener = zeroclaw_spawn::spawn!(async move {
+                channel
+                    .run_polling_loop(tx, POLL_EVERY, DISCOVER_EVERY)
+                    .await
+            });
+            Self {
+                server,
+                delivered,
+                _mock: mock,
+            }
+        }
+
+        async fn next_delivery(&mut self) -> ChannelMessage {
+            match tokio::time::timeout(PATIENCE, self.delivered.recv()).await {
+                Ok(Some(message)) => message,
+                outcome => panic!(
+                    "expected a delivery, got {outcome:?}; {}",
+                    self.server.timeline()
+                ),
+            }
+        }
+
+        async fn await_more_polls(&self, channel: &str, count: usize) {
+            let target = self.server.polls_of(channel).len() + count;
+            self.wait_until(|| self.server.polls_of(channel).len() >= target)
+                .await;
+        }
+
+        async fn await_discovery_calls(&self, count: usize) {
+            self.wait_until(|| self.server.discovery_calls.load(Ordering::SeqCst) >= count)
+                .await;
+        }
+
+        async fn wait_until(&self, condition: impl Fn() -> bool) {
+            tokio::time::timeout(PATIENCE, async {
+                while !condition() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the listener should keep polling");
+        }
+
+        fn assert_nothing_more_delivered(&mut self, why: &str) {
+            let outcome = self.delivered.try_recv();
+            assert!(outcome.is_err(), "{why}: {outcome:?}");
+        }
+    }
+
+    /// The reported loss: a DM created between two discovery runs, whose first
+    /// post already exists when the refresh that lists it returns. The post is
+    /// stamped while that listing is served, so it is older than any cursor
+    /// taken after the listing, whatever the scheduling.
+    #[tokio::test]
+    async fn first_post_of_a_dm_found_after_startup_is_delivered_exactly_once() {
+        let server = Arc::new(FakeMattermost::default());
+        let script_server = Arc::clone(&server);
+        let new_rooms = [(NEW_DM, "D"), (NEW_GROUP_DM, "G")];
+        let mut listener = PollingListener::start(server, true, move |call| match call {
+            0 => listing(&[]),
+            1 => {
+                script_server.add_post(NEW_DM, "first dm post", unix_now_ms());
+                script_server.add_post(NEW_GROUP_DM, "first group post", unix_now_ms());
+                listing(&new_rooms)
+            }
+            2 => listing(&new_rooms),
+            // The room list changing again must not rewind those cursors.
+            _ => listing(&[new_rooms[0], new_rooms[1], (LISTED_ROOM, "O")]),
+        })
+        .await;
+
+        assert_eq!(listener.next_delivery().await.content, "first dm post");
+        assert_eq!(listener.next_delivery().await.content, "first group post");
+
+        listener.await_discovery_calls(5).await;
+        listener.await_more_polls(NEW_DM, 3).await;
+        listener.assert_nothing_more_delivered("each post must be delivered exactly once");
+    }
+
+    /// The earliest post a late-listed DM can hold: one written just after the
+    /// startup listing was served. A refresh failing in between changes nothing.
+    #[tokio::test]
+    async fn dm_created_right_after_the_startup_listing_survives_a_failed_refresh() {
+        let server = Arc::new(FakeMattermost::default());
+        let script_server = Arc::clone(&server);
+        let mut listener = PollingListener::start(server, true, move |call| match call {
+            0 => {
+                // One millisecond ahead makes it newer than a clock reading
+                // taken before this listing was requested; the delayed response
+                // makes it older than a reading taken after.
+                script_server.add_post(NEW_DM, "first dm post", unix_now_ms() + 1);
+                listing(&[]).set_delay(Duration::from_millis(5))
+            }
+            1 => ResponseTemplate::new(500),
+            _ => listing(&[(NEW_DM, "D")]),
+        })
+        .await;
+
+        assert_eq!(listener.next_delivery().await.content, "first dm post");
+    }
+
+    /// The other half of the contract: a DM that exists at startup keeps the
+    /// no-history-replay rule, and later refreshes do not rewind its cursor.
+    #[tokio::test]
+    async fn dm_history_is_not_replayed_at_startup_or_by_a_refresh() {
+        const OLD_DM: &str = "old_dm";
+        let started_ms = unix_now_ms();
+        let server = Arc::new(FakeMattermost::default());
+        server.add_post(OLD_DM, "an hour old", started_ms - 3_600_000);
+        let mut listener =
+            PollingListener::start(server, true, |_| listing(&[(OLD_DM, "D")])).await;
+
+        listener.await_discovery_calls(3).await;
+        listener.await_more_polls(OLD_DM, 3).await;
+
+        let polls = listener.server.polls_of(OLD_DM);
+        assert!(
+            polls.iter().all(|since| *since >= started_ms),
+            "a DM listed at startup must not look back past startup: {polls:?}"
+        );
+        listener.assert_nothing_more_delivered("old history must not be replayed");
+    }
+
+    /// Only DMs look back. A team channel the bot was just added to can hold
+    /// posts nobody addressed to it, so it still starts at its first poll.
+    #[tokio::test]
+    async fn team_channel_found_after_startup_starts_at_its_first_poll() {
+        const NEW_TEAM_ROOM: &str = "new_team_room";
+        let server = Arc::new(FakeMattermost::default());
+        let script_server = Arc::clone(&server);
+        let mut listener = PollingListener::start(server, false, move |call| match call {
+            0 => listing(&[]),
+            1 => {
+                script_server.add_post(NEW_TEAM_ROOM, "before the bot looked", unix_now_ms());
+                listing(&[(NEW_TEAM_ROOM, "O")])
+            }
+            _ => listing(&[(NEW_TEAM_ROOM, "O")]),
+        })
+        .await;
+
+        listener.await_more_polls(NEW_TEAM_ROOM, 3).await;
+        listener.assert_nothing_more_delivered("a late team channel must not look back");
+    }
+
+    /// A `posted` event in the shape Mattermost broadcasts it.
+    fn posted(channel_id: &str, channel_type: &str, message: &str) -> serde_json::Value {
+        json!({
+            "event": "posted",
+            "data": {
+                "channel_type": channel_type,
+                "post": json!({
+                    "id": format!("post_{channel_id}"),
+                    "channel_id": channel_id,
+                    "user_id": "peer_user",
+                    "message": message,
+                    "root_id": "",
+                    "create_at": unix_now_ms(),
+                })
+                .to_string(),
+            },
+            "broadcast": {"channel_id": channel_id},
+        })
+    }
+
+    /// Run the real WebSocket listener through one session and return what it
+    /// delivered, in order. The last event must carry [`SENTINEL`]: events are
+    /// handled in order, so once it arrives every earlier one has been decided.
+    ///
+    /// REST and WebSocket both derive from `base_url`, so one socket has to
+    /// serve both, which wiremock cannot do.
+    async fn delivered_over_websocket(
+        build_channel: impl FnOnce(String) -> MattermostChannel,
+        rest_response: serde_json::Value,
+        events: Vec<serde_json::Value>,
+    ) -> Vec<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let socket = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a local port");
+        let base_url = format!("http://{}", socket.local_addr().expect("local address"));
+
+        let _server = zeroclaw_spawn::spawn!(async move {
+            loop {
+                let (mut stream, _) = socket.accept().await.expect("accept a connection");
+                let mut request = [0u8; 2048];
+                let peeked = stream.peek(&mut request).await.expect("peek the request");
+                if request[..peeked].starts_with(b"GET /api/v4/websocket") {
+                    let mut session = tokio_tungstenite::accept_async(stream)
+                        .await
+                        .expect("upgrade to WebSocket");
+                    let _authentication_challenge = session.next().await;
+                    let handshake = [
+                        json!({"status": "OK", "seq_reply": 1}),
+                        json!({"event": "hello", "data": {"server_version": "10.8.0"}}),
+                    ];
+                    for frame in handshake.iter().chain(&events) {
+                        session
+                            .send(WsMessage::Text(frame.to_string().into()))
+                            .await
+                            .expect("send a frame");
+                    }
+                    // Hold the session open until the test is done with it.
+                    let _ = session.next().await;
+                    return;
+                }
+                let _ = stream.read(&mut request).await;
+                let body = rest_response.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write the response");
+            }
+        });
+
+        let channel = build_channel(base_url);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let _listener = zeroclaw_spawn::spawn!(async move { channel.listen_websocket(tx).await });
+
+        let mut delivered = Vec::new();
+        while delivered.last().map(String::as_str) != Some(SENTINEL) {
+            match tokio::time::timeout(PATIENCE, rx.recv()).await {
+                Ok(Some(message)) => delivered.push(message.content),
+                outcome => panic!("expected the sentinel, got {outcome:?} after {delivered:?}"),
+            }
+        }
+        delivered
+    }
+
+    /// A new DM's first post reaches the WebSocket before its channel can be
+    /// listed, and is never sent again. `mention_only` is on, as in the
+    /// reported setup, so this also pins that the room is treated as direct.
+    #[tokio::test]
+    async fn websocket_delivers_posts_from_dms_discovery_has_not_listed() {
+        let delivered = delivered_over_websocket(
+            |base_url| channel_at(base_url, Vec::new(), true),
+            json!([room(LISTED_ROOM, "D")]),
+            vec![
+                posted(NEW_DM, "D", "first dm post"),
+                posted(NEW_GROUP_DM, "G", "first group post"),
+                posted("unlisted_public", "O", "@zerobot public"),
+                posted("unlisted_private", "P", "@zerobot private"),
+                posted("", "D", "no channel id"),
+                posted(LISTED_ROOM, "D", SENTINEL),
+            ],
+        )
+        .await;
+
+        assert_eq!(delivered, ["first dm post", "first group post", SENTINEL]);
+    }
+
+    /// `discover_dms = false` is the operator's choice, and it covers DMs that
+    /// discovery has not listed yet as much as the ones it has.
+    #[tokio::test]
+    async fn websocket_keeps_unlisted_dms_out_when_dm_discovery_is_off() {
+        let delivered = delivered_over_websocket(
+            |base_url| channel_at(base_url, Vec::new(), false).with_discover_dms(false),
+            json!([room(LISTED_ROOM, "O")]),
+            vec![
+                posted(NEW_DM, "D", "first dm post"),
+                posted(LISTED_ROOM, "O", SENTINEL),
+            ],
+        )
+        .await;
+
+        assert_eq!(delivered, [SENTINEL]);
+    }
+
+    /// An explicit `channel_ids` scope is never widened, not even for a DM.
+    #[tokio::test]
+    async fn websocket_keeps_unlisted_dms_out_of_an_explicit_scope() {
+        let delivered = delivered_over_websocket(
+            |base_url| channel_at(base_url, vec![LISTED_ROOM.to_string()], false),
+            room(LISTED_ROOM, "O"),
+            vec![
+                posted(NEW_DM, "D", "first dm post"),
+                posted(LISTED_ROOM, "O", SENTINEL),
+            ],
+        )
+        .await;
+
+        assert_eq!(delivered, [SENTINEL]);
     }
 }

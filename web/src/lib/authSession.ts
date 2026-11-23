@@ -15,6 +15,7 @@ import {
   type OidcSession,
 } from './auth';
 import { apiOrigin, basePath } from './basePath';
+import { generateUUID } from './uuid';
 
 // ---------------------------------------------------------------------------
 // Contract types
@@ -31,6 +32,11 @@ export interface OidcMethod {
 export interface AuthMethods {
   pairing_required: boolean;
   oidc: OidcMethod[];
+  /**
+   * Present (true) when this dashboard is reached through a relay that ends
+   * the browser's TLS, so the relay's operator can read the session.
+   */
+  via_relay?: true;
 }
 
 /** The `reason` of a 401/403 body from a cookie-authenticated request. */
@@ -38,6 +44,8 @@ export type AuthFailureReason =
   | 'session_expired'
   | 'session_invalid'
   | 'operator_required'
+  | 'not_permitted'
+  | 'agent_not_allowed'
   | 'csrf'
   | 'origin';
 
@@ -45,9 +53,18 @@ const FAILURE_REASONS: readonly AuthFailureReason[] = [
   'session_expired',
   'session_invalid',
   'operator_required',
+  'not_permitted',
+  'agent_not_allowed',
   'csrf',
   'origin',
 ];
+
+/** 403 reasons that mean "this account may not do that", shown as not available. */
+export const NOT_AVAILABLE_REASONS: ReadonlySet<AuthFailureReason> = new Set([
+  'operator_required',
+  'not_permitted',
+  'agent_not_allowed',
+]);
 
 /** Name of the BroadcastChannel sign-in, re-auth and sign-out talk on. */
 export const AUTH_CHANNEL = 'zeroclaw-auth';
@@ -78,7 +95,7 @@ export function failureReason(body: string): AuthFailureReason | null {
 
 export function parseAuthMethods(value: unknown): AuthMethods | null {
   if (!value || typeof value !== 'object') return null;
-  const raw = value as { pairing_required?: unknown; oidc?: unknown };
+  const raw = value as { pairing_required?: unknown; oidc?: unknown; via_relay?: unknown };
   const oidc = Array.isArray(raw.oidc)
     ? raw.oidc.flatMap((entry: unknown): OidcMethod[] => {
         if (!entry || typeof entry !== 'object') return [];
@@ -91,6 +108,7 @@ export function parseAuthMethods(value: unknown): AuthMethods | null {
   return {
     pairing_required: raw.pairing_required !== false,
     oidc,
+    ...(raw.via_relay === true ? { via_relay: true as const } : {}),
   };
 }
 
@@ -134,6 +152,7 @@ export function parseOidcSession(value: unknown): OidcSession | null {
     features: {
       chat: flags.chat === true,
       operator_pages: flags.operator_pages === true,
+      core_sessions: flags.core_sessions === true,
       config: flags.config === true,
     },
   };
@@ -184,8 +203,8 @@ export async function fetchThroughRestart(
 }
 
 /**
- * `GET /api/auth/methods`. Null when the gateway doesn't answer it, which the
- * caller treats as "no sign-in providers".
+ * `GET /api/auth/methods`. Null when the gateway doesn't answer it: the
+ * methods are then unknown, and the caller must not offer pairing.
  */
 export async function fetchAuthMethods(
   fetchImpl: FetchLike = fetch,
@@ -258,16 +277,56 @@ export function currentReturnPath(
 /** `/auth/sign-in/{alias}`: a full-page start, or the re-auth popup. */
 export function signInUrl(
   alias: string,
-  options: { returnPath?: string; popup?: boolean } = {},
+  options: { returnPath?: string; popup?: boolean; notice?: string } = {},
 ): string {
   const params = new URLSearchParams();
   if (options.popup) {
     params.set('popup', '1');
   } else if (options.returnPath) {
     params.set('return', options.returnPath);
+    if (options.notice) params.set('notice', options.notice);
   }
   const query = params.toString();
   return gatewayUrl(`/auth/sign-in/${encodeURIComponent(alias)}${query ? `?${query}` : ''}`);
+}
+
+// The gateway echoes this tab's nonce in the successful callback redirect.
+const SIGN_IN_NOTICE_KEY = 'zeroclaw_sign_in_notice';
+
+export function fullPageSignInUrl(alias: string): string {
+  // A new sign-in replaces an earlier completion awaiting a session check.
+  takeSignInNotice();
+  const returnPath = currentReturnPath() + window.location.hash;
+  try {
+    const notice = generateUUID();
+    sessionStorage.setItem(SIGN_IN_NOTICE_KEY, notice);
+    return signInUrl(alias, { returnPath, notice });
+  } catch {
+    return signInUrl(alias, { returnPath });
+  }
+}
+
+/** Consume a matched callback and restore its return URL. */
+export function takeSignInNotice(mode: 'consume' | 'retry' | 'supersede' = 'consume'): boolean {
+  try {
+    const notice = sessionStorage.getItem(SIGN_IN_NOTICE_KEY);
+    if (!notice) return false;
+    const suffix = `#zeroclaw-signed-in=${notice}`;
+    const { pathname, search, hash } = window.location;
+    const matched = hash.endsWith(suffix);
+    // Retry a verified completion, but discard an abandoned attempt on startup.
+    if (matched && mode === 'retry') return false;
+    // A broadcast may supersede a completed callback while its probe is pending.
+    // It must leave a sign-in that hasn't returned from the provider alone.
+    if (!matched && mode === 'supersede') return false;
+    sessionStorage.removeItem(SIGN_IN_NOTICE_KEY);
+    if (!matched) return false;
+    const originalUrl = pathname + search + hash.slice(0, -suffix.length);
+    window.history.replaceState(window.history.state, '', originalUrl);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -299,7 +358,18 @@ export type InitialAuth =
   | { kind: 'paired' }
   | { kind: 'open' }
   | { kind: 'signed-in'; session: OidcSession; clockOffsetMs: number; providers: OidcMethod[] }
-  | { kind: 'signed-out'; providers: OidcMethod[] };
+  | {
+      kind: 'signed-out';
+      providers: OidcMethod[];
+      /**
+       * The gateway answered how to sign in (always, in the desktop app).
+       * Without that answer the page can't tell whether pairing is allowed:
+       * through a relay it isn't, and only the answer says so.
+       */
+      methodsKnown: boolean;
+      /** The cookie check could not tell whether the callback established a session. */
+      sessionCheckFailed?: true;
+    };
 
 export interface InitialAuthDeps {
   /** A pairing token is stored. */
@@ -317,7 +387,9 @@ export interface InitialAuthDeps {
  * - A stored pairing token wins without a request, exactly as before.
  * - A gateway that doesn't require pairing is open, exactly as before.
  * - Only when the gateway lists sign-in providers is the session cookie
- *   checked; otherwise the result is today's pairing dialog.
+ *   checked; otherwise the result is today's pairing dialog, once the
+ *   gateway has said how to sign in. Without that answer the methods are
+ *   unknown, and the caller must not offer pairing.
  */
 export async function resolveInitialAuth(deps: InitialAuthDeps): Promise<InitialAuth> {
   if (deps.hasToken) return { kind: 'paired' };
@@ -337,8 +409,11 @@ export async function resolveInitialAuth(deps: InitialAuthDeps): Promise<Initial
         providers,
       };
     }
+    if (probe.kind === 'error') {
+      return { kind: 'signed-out', providers, methodsKnown: true, sessionCheckFailed: true };
+    }
   }
-  return { kind: 'signed-out', providers };
+  return { kind: 'signed-out', providers, methodsKnown: deps.desktop || methods !== null };
 }
 
 // ---------------------------------------------------------------------------

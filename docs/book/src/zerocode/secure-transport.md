@@ -86,7 +86,20 @@ log line that the WSS listener is up on `0.0.0.0:9781`.
 
 The client now needs a certificate. There are two ways to get one.
 
-### 1b. Client side - option A: enrollment (recommended)
+### OIDC first contact (no pairing)
+
+For a configured OIDC deployment, start with
+`zerocode login <alias> wss://<host>:9781 --gateway-url https://<gateway>`.
+The client can have an empty config directory, and the daemon need not know
+its user or device or have any pairing code pending. After OIDC approval,
+the gateway verifies the bearer and session-creation authority (or
+`system:execute`) and signs the
+client's locally generated CSR. The returned CA bootstraps WSS trust, while
+WSS remains mandatory mTLS plus per-connection bearer authentication. This
+path does not use `[enroll]`, port 9782, or a SAS prompt. See
+[OIDC remote login](./remote.md#sign-in-with-oidc-recommended-for-oidc-deployments).
+
+### 1b. Client side - option A: pairing-based enrollment
 
 Enrollment gives a certless client its first certificate over a pairing-gated,
 server-authenticated endpoint, with no manual cert handling. Turn it on:
@@ -155,7 +168,8 @@ if `uri` is in config) needs no more flags.
 Enrollment endpoint defaults: `--enroll-host` defaults to `--connect`'s host;
 `--enroll-port` defaults to `9782`.
 
-The first release intentionally requires a pairing code for every enrollment.
+The dedicated enrollment listener requires a pairing code for every request.
+OIDC first contact instead uses the authenticated gateway route above.
 The reserved `allow_unpaired_enrollment` knob is rejected at daemon startup until
 the client has an explicit no-code trust anchor such as a pinned daemon CA
 fingerprint. This keeps the provisional enrollment TLS path from turning into
@@ -477,13 +491,11 @@ The relay can serve a browser enrollment page (the "frontdoor"): open the relay
 URL, enter the node id and a pairing code, compare the short-auth-string against
 the daemon console, and the browser is issued a client certificate.
 
-**It enrolls only.** There is no browser session tier: once enrolled, the page
-hands you the certificate and private key and points you at `zerocode`. The
-daemon's RPC plane requires mTLS, which a browser cannot present through the
-native WebSocket API, so a browser session would need either a TLS
-implementation in page JavaScript (deliberately not shipped, see below) or a
-relay-terminated session mode on the daemon. That is an open design question,
-not a missing feature.
+**It enrolls only.** Once enrolled, the page hands you the certificate and
+private key and points you at `zerocode`. The daemon's RPC plane requires mTLS,
+which a browser cannot present through the native WebSocket API, so the page
+opens no session itself. To use the web dashboard through a relay, see 3e,
+which is relay-terminated in the same disclosed way.
 
 It is **off by default**, because it narrows the blind-forwarder guarantee for
 the browsers that use it, in two distinct ways:
@@ -562,6 +574,175 @@ successful enrollment and expires at most ten minutes after it is minted, so the
 link is spent or dead. Treat a link that carries an unused code like the code
 itself, and prefer enrolling promptly after minting.
 
+### 3e. The web dashboard through the relay (opt-in, relay-terminated)
+
+A relay can serve a daemon's web dashboard at a host of its own,
+`https://<label>.<domain>/`, so a browser anywhere reaches it with no VPN
+and no port opened on the daemon's side. People then sign in to the
+dashboard as themselves (dashboard sign-in, see
+[Authentication](../security/authentication.md)), each with their own grants.
+Sign-in is the only way in: pairing and paired tokens are refused through the
+relay (see below).
+
+**This route is not end-to-end.** The relay ends the browser's TLS, with
+its operator's wildcard certificate, and forwards the dashboard's HTTP to
+the daemon over the daemon's own relay link. Anyone who can modify the
+relay can read and change that traffic for everyone who uses the address:
+pages, session cookies and CSRF tokens, and so act as a signed-in user for
+that session.
+Both ends say so at startup, and the dashboard's sign-in screen shows a
+notice while it is reached this way. **`zerocode` and other native clients
+through the same relay stay end-to-end**, and a direct HTTPS connection to the
+gateway (or a VPN such as Tailscale) keeps the relay out entirely. Use those
+when the relay must not be trusted.
+
+**An administrator's session gives the relay administrator power.** Acting
+for someone signed in as an administrator, the relay can make any change an
+administrator can, including changes that outlast the session: adding
+scheduled jobs, writing credentials into the config, or adding a sign-in
+provider or identity mapping that it controls and then signing in with it
+later. Sign in as an administrator through the relay only if you trust the
+relay that far. Otherwise administer the daemon over a direct connection or
+with `zerocode`.
+
+What the relay does not get, even so:
+
+- **Identity-provider passwords.** The browser talks to the identity
+  provider directly, so the relay sees the authorization code in the
+  callback, which is useless without the PKCE verifier that stays in the
+  gateway. A hostile relay could still put a fake sign-in form on the
+  dashboard's page, so check the provider's address before typing a
+  password.
+- **Anything but the dashboard.** The daemon hands these connections to its
+  gateway in process. It never dials a local port with them, so the relay
+  cannot reach the RPC plane, enrollment, or any other listener.
+- **This machine's standing.** The gateway serves each connection as the
+  browser at the address the relay reports. That address is never a loopback
+  one, so the admin routes, the pairing limits' local exemption and every
+  other "on this machine" rule treat it as remote. Forwarded headers
+  (`X-Forwarded-*`, `X-Real-IP`, `Forwarded`) are dropped from these requests
+  whatever `trust_forwarded_headers` says.
+- **A pairing code or a paired token.** The relay sees everything a browser
+  sends through it. A pairing code it saw could be redeemed first for a
+  lasting operator token, and a token sent through it could be kept and used
+  after the browser leaves. So on these connections the gateway refuses
+  pairing (`POST /pair`, `POST /api/pair`, and minting a code) before it reads
+  the code or counts the attempt, and refuses any request that presents a
+  token or secret: in `Authorization`, in `X-Webhook-Secret`, in a `bearer.`
+  WebSocket subprotocol, or in a `token` query parameter. OIDC enrollment (`/oidc/login/{alias}` and the
+  device grant) is refused too, because it hands the browser an access token.
+  Pair or enroll on a direct connection to the gateway instead.
+  A token sent through the relay anyway is refused, but the relay has still
+  seen it, so revoke or rotate it on a direct connection. This covers what
+  the gateway hands out or accepts. An administrator's session can still
+  write a credential into the config, as described above.
+- **More than the signed-in user may do.** Authorization stays at the
+  gateway.
+- **Another daemon's dashboard.** Each dashboard is its own origin. The
+  label comes from the daemon's relay registration key, which the relay
+  verifies when the daemon registers, so only that daemon is served under
+  it.
+
+#### The address
+
+The label is the first 26 characters of the base32 of a SHA-256 of the
+daemon's relay registration public key. The daemon logs the whole address,
+and the redirect URI to register, when the relay bridge starts:
+
+```text
+relay dashboard: serving the dashboard through the relay ... dashboard=https://<label>.relay.example.com/ redirect_uri=https://<label>.relay.example.com/oidc/callback
+```
+
+It does not change when the node-id rotates, so bookmarks and the identity
+provider's registration keep working. It changes only if the daemon's
+registration key does. It is an address, not a secret: it appears in DNS
+lookups and in the TLS server name. Access is controlled by dashboard sign-in,
+and the node-id never appears in it.
+
+#### On the relay
+
+The relay needs:
+
+- **Wildcard DNS:** `*.relay.example.com` resolving to the relay. Use a
+  name of its own, not your main domain's wildcard.
+- **A publicly trusted wildcard certificate** for `*.relay.example.com`.
+  Certificate authorities issue wildcards through the DNS challenge only, so
+  this needs DNS API access or a manual renewal. One certificate per host
+  would publish every label in the public Certificate Transparency logs.
+  The relay presents it for names under the domain, and its own certificate
+  for everything else, so daemons and zerocode clients are unaffected.
+- **Port 443** is recommended. Otherwise the port is in every dashboard
+  address and redirect URI.
+
+```toml
+# relay.toml
+[dashboard]
+enabled = true
+domain = "relay.example.com"
+cert = "/etc/zerorelay/wildcard-fullchain.pem"
+key = "/etc/zerorelay/wildcard-privkey.pem"
+# The daemons whose dashboards this relay serves: their registration-key
+# fingerprints, the same values `[admission] allow` takes. Required.
+allow = ["<daemon fingerprint>"]
+```
+
+The allowlist is required in every admission mode, and an empty one refuses
+to start. On an open relay, without it, any daemon that registers would get a
+trusted HTTPS host under the relay's domain. A daemon that is listed but has
+not enabled the dashboard, or that is enabled but not listed, gets no host.
+
+The relay routes by the TLS server name alone and never parses the
+forwarded HTTP. It offers browsers HTTP/1.1 only, so a browser never reuses
+one connection for two dashboard hosts. Each daemon gets its own cap on
+dashboard connections, separate from its native clients' slots, and each
+browser address gets a cap as well. Every browser connection also counts
+against the relay's existing per-address handshake limit
+(`[limits] accept_burst_per_ip`, `accept_rate_per_ip`): a browser opens
+several connections per page, so raise it if many people reach the relay
+from one address (one office NAT, for example), or their new connections are
+dropped before TLS. A browser the relay sees at a loopback
+address is refused by the daemon. That includes a proxy on the relay's own
+host forwarding to it: the daemon would see the proxy's loopback address,
+not the browser's.
+
+#### On the daemon
+
+```toml
+[relay]
+enabled = true
+url = "relay.example.com:443"
+
+[relay.dashboard]
+enabled = true
+domain = "relay.example.com"   # the relay's [dashboard] domain
+# port = 443                   # if the relay listens elsewhere
+```
+
+The daemon refuses `[relay.dashboard]`:
+
+- without `[relay]` enabled;
+- with `gateway.require_pairing = false`, which would leave the dashboard
+  open to anyone who reaches the address;
+- without `[gateway.dashboard_sign_in]` offering at least one provider,
+  because sign-in is the only way in through the relay;
+- with a `gateway.path_prefix`, because the dashboard is served at the root of
+  its own host so its cookies can use the `__Host-` prefix;
+- with `relay.relay_insecure = true`, because the daemon's link to the relay
+  is the only encryption past the relay for this traffic. For native clients,
+  the inner mTLS covers it.
+
+The gateway answers these connections only for the dashboard's own host
+(anything else gets `421`), treats them as HTTPS, and builds the sign-in
+redirect URI and its own origin from the dashboard's address, never from the
+request's `Host`.
+
+#### The identity provider
+
+The relay carries only the dashboard. Browsers reach the identity provider
+directly, so it needs a public HTTPS address of its own, and the daemon uses
+the same issuer URL for discovery, keys and the token exchange. Register the
+exact redirect URI the daemon logs, with no wildcard.
+
 ---
 
 ## Configuration reference
@@ -610,6 +791,14 @@ itself, and prefer enrolling promptly after minting.
 | `outer_client_key` | (empty) | Key for `outer_client_cert` |
 | `node_id_rotation_days` | `0` | Auto-rotate the auto-minted node-id every N days (0 = never) |
 
+### Daemon `[relay.dashboard]` (see 3e: relay-terminated)
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Serve the web dashboard through the relay at `https://<label>.<domain>/` |
+| `domain` | (empty) | The relay's `[dashboard]` domain; required when enabled |
+| `port` | `443` | The HTTPS port browsers reach the relay on |
+
 ### Relay `relay.toml`
 
 | Section.key | Default | Description |
@@ -633,6 +822,12 @@ itself, and prefer enrolling promptly after minting.
 | `[limits].max_pending_handshakes` | `256` | Sockets past accept but not yet classified |
 | `[limits].handshake_timeout_secs` | `10` | One deadline over TLS, WS upgrade and signed registration |
 | `[limits].max_registered_nodes` | `1024` | Simultaneously registered daemons (N+1 gets `registry_full`) |
+| `[dashboard].enabled` | `false` | Serve listed daemons' web dashboards at `https://<label>.<domain>/` (see 3e: relay-terminated) |
+| `[dashboard].domain` | (none) | Dashboard domain; `*.<domain>` must resolve to the relay |
+| `[dashboard].cert` / `.key` | (none) | Publicly trusted certificate for `*.<domain>`; required when enabled |
+| `[dashboard].allow` | `[]` | Daemon registration-key fingerprints whose dashboards are served; required when enabled |
+| `[dashboard].max_conns_per_node` | `64` | Concurrent dashboard connections to one daemon |
+| `[dashboard].max_conns_per_ip` | `16` | Concurrent dashboard connections from one browser address |
 
 ### zerorelay CLI (overrides `relay.toml`)
 

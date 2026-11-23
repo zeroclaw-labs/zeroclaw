@@ -485,6 +485,47 @@ mod native_effort {
     }
 
     #[tokio::test]
+    async fn profile_effort_coexists_with_model_specific_responses_prompts() {
+        let server = CapturedOpenAi::start().await;
+        let provider = server.provider(zeroclaw_config::schema::WireApi::Responses);
+        let messages = [
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("inspect"),
+        ];
+        let tools = tool_fixture();
+        for stream in [false, true] {
+            for model in ["gpt-5.4", "gpt-6.2-sol"] {
+                let request = ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                    thinking_level: Some(ThinkingLevel::High),
+                };
+                if stream {
+                    let mut events =
+                        provider.stream_chat(request, model, None, StreamOptions::new(true));
+                    while let Some(event) = events.next().await {
+                        event.unwrap();
+                    }
+                } else {
+                    provider.chat(request, model, None).await.unwrap();
+                }
+            }
+        }
+        let bodies = server.bodies();
+        assert_eq!(bodies.len(), 4);
+        for pair in bodies.chunks_exact(2) {
+            assert_eq!(pair[0]["reasoning"]["effort"], "high");
+            assert_eq!(pair[0]["instructions"], "system prompt");
+            assert_eq!(pair[1]["reasoning"]["effort"], "medium");
+            assert!(pair[1].get("instructions").is_none());
+            assert_eq!(pair[1]["input"][0]["role"], "developer");
+            assert_eq!(pair[1]["input"][0]["content"][0]["text"], "system prompt");
+            assert_eq!(pair[1]["tools"][0]["name"], "inspect_value");
+        }
+    }
+
+    #[tokio::test]
     async fn all_levels_reach_both_wire_formats_and_opt_out_preserves_each_existing_body() {
         let messages = [ChatMessage::user("inspect")];
         let tools = tool_fixture();

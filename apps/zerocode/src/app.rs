@@ -2405,8 +2405,8 @@ pub async fn run(
                     &dispatch_state,
                     reload_confirm || help_overlay.is_some() || sidebar.picker_open(),
                     mode,
-                    &chat_pane,
-                    &acp_pane,
+                    &mut chat_pane,
+                    &mut acp_pane,
                     &key,
                 ) {
                     continue;
@@ -3020,8 +3020,8 @@ fn copy_disconnected_composer(
     dispatch_state: &PostPollDispatchState,
     app_modal_owns_keys: bool,
     mode: Mode,
-    chat: &chat::Chat,
-    acp: &acp::Acp,
+    chat: &mut chat::Chat,
+    acp: &mut acp::Acp,
     key: &KeyEvent,
 ) -> bool {
     !app_modal_owns_keys
@@ -3811,7 +3811,7 @@ fn draw_reload_status_toast(frame: &mut ratatui::Frame, area: Rect, msg: &str) {
     );
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::VecDeque;
 
@@ -5415,7 +5415,7 @@ mod tests {
     /// the final terminal cells a user sees. Reaches the outermost TUI
     /// boundary for the context meter, not a component snapshot.
     #[cfg(test)]
-    fn render_status_bar_cells(ctx: CtxBar, width: u16) -> String {
+    pub(crate) fn render_status_bar_cells(ctx: CtxBar, width: u16) -> String {
         use ratatui::{Terminal, backend::TestBackend};
 
         let backend = TestBackend::new(width, 1);
@@ -5865,7 +5865,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
         let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
         let client = Arc::new(crate::client::RpcClient::with_rpc(outbound));
-        let chat = chat::Chat::new(client.clone(), chat::PaneKind::Chat);
+        let mut chat = chat::Chat::new(client.clone(), chat::PaneKind::Chat);
         let mut pane = acp::Acp::new(client);
         pane.activate_session_for_test("editor-test");
         pane.handle_paste("selected draft");
@@ -5900,20 +5900,59 @@ mod tests {
             &disconnected,
             false,
             Mode::Acp,
-            &chat,
-            &pane,
+            &mut chat,
+            &mut pane,
             &copy
         ));
+        let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer rejected copy");
+        let expected = crate::clipboard::copy_failure_notice(&error);
+        crate::clipboard::with_copy_result(Err(error), || {
+            assert!(
+                copy_disconnected_composer(
+                    &disconnected,
+                    false,
+                    Mode::Acp,
+                    &mut chat,
+                    &mut pane,
+                    &copy,
+                ),
+                "known copy failure must not fall through to global quit"
+            );
+        });
+        assert_eq!(pane.info_message().unwrap().text, expected);
         assert!(
-            !copy_disconnected_composer(&disconnected, true, Mode::Acp, &chat, &pane, &copy,),
+            pane.wants_quit_chord(&copy),
+            "failed copy retains the selected draft"
+        );
+        let outcome = crate::clipboard::CopyOutcome::TerminalRequested;
+        crate::clipboard::with_copy_result(Ok(outcome), || {
+            assert!(copy_disconnected_composer(
+                &disconnected,
+                false,
+                Mode::Acp,
+                &mut chat,
+                &mut pane,
+                &copy,
+            ));
+        });
+        assert_eq!(pane.info_message().unwrap().text, outcome.notice());
+        assert!(
+            !copy_disconnected_composer(
+                &disconnected,
+                true,
+                Mode::Acp,
+                &mut chat,
+                &mut pane,
+                &copy,
+            ),
             "an app-level overlay must exclude hidden composer copy"
         );
         assert!(!copy_disconnected_composer(
             &disconnected,
             false,
             Mode::Acp,
-            &chat,
-            &pane,
+            &mut chat,
+            &mut pane,
             &KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)
         ));
         assert!(
@@ -5930,8 +5969,8 @@ mod tests {
             &disconnected,
             false,
             Mode::Acp,
-            &chat,
-            &pane,
+            &mut chat,
+            &mut pane,
             &copy
         ));
         assert!(should_handle_global_quit(
@@ -6388,6 +6427,214 @@ mod tests {
                 .is_err(),
             "a blurred Chat pane must not continue into session creation"
         );
+    }
+
+    #[tokio::test]
+    async fn startup_agent_flags_open_target_chat_once_after_connect() {
+        use clap::Parser;
+
+        for flag in ["-a", "--agent"] {
+            let cli = crate::Cli::parse_from(["zerocode", flag, "startup-target"]);
+            let reconnect_state = cli.initial_reconnect_state();
+            let (tx, mut rx) = mpsc::channel::<String>(16);
+            let rpc_out = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+            let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc_out)));
+            let mut chat = chat::Chat::new(rpc, chat::PaneKind::Chat);
+            let mut mode = Mode::Dashboard;
+
+            consume_pending_quickstart_chat(
+                &PostPollDispatchState::new(ConnectionState::Disconnected {
+                    reason: "startup fixture disconnect".to_string(),
+                }),
+                &reconnect_state,
+                &mut mode,
+                &mut chat,
+            )
+            .await;
+            assert_eq!(mode, Mode::Dashboard);
+            assert!(
+                rx.try_recv().is_err(),
+                "disconnected startup must not send RPC"
+            );
+
+            let state_for_start = Arc::clone(&reconnect_state);
+            let mut start = tokio::spawn(async move {
+                consume_pending_quickstart_chat(
+                    &PostPollDispatchState::new(ConnectionState::Connected),
+                    &state_for_start,
+                    &mut mode,
+                    &mut chat,
+                )
+                .await;
+                (mode, chat)
+            });
+            let request = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::select! {
+                    request = rx.recv() => request.expect("startup RPC channel stays open"),
+                    finished = &mut start => {
+                        let (mode, _) = finished.expect("startup task completes");
+                        assert_eq!(mode, Mode::Chat, "parsed agent must reach Chat startup");
+                        panic!("startup completed without requesting the target session");
+                    }
+                }
+            })
+            .await
+            .expect("startup should request its selected session");
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["method"], crate::client::method::SESSION_NEW);
+            assert_eq!(request["params"]["agent_alias"], "startup-target");
+            assert!(request["params"]["session_id"].is_null());
+            assert_eq!(request["params"]["keep_siblings"], true);
+            rpc_out.dispatch_response(
+                request["id"].as_str().unwrap(),
+                Some(serde_json::json!({
+                    "session_id": "startup-session",
+                    "workspace_dir": "/startup-workspace"
+                })),
+                None,
+            );
+
+            let request = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("session start resolves model identity")
+                .expect("RPC channel stays open");
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["method"], crate::client::method::CONFIG_LIST);
+            rpc_out.dispatch_response(
+                request["id"].as_str().unwrap(),
+                Some(serde_json::json!([])),
+                None,
+            );
+            let (mut mode, mut chat) = tokio::time::timeout(Duration::from_secs(2), start)
+                .await
+                .expect("startup completes after the RPC responses")
+                .expect("startup task succeeds");
+            assert_eq!(mode, Mode::Chat);
+            assert_eq!(chat.current_session_id(), Some("startup-session"));
+            let sessions = chat.session_summaries();
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].agent_alias, "startup-target");
+            assert!(sessions[0].focused);
+            assert!(
+                reconnect_state
+                    .lock()
+                    .unwrap()
+                    .pending_quickstart_chat
+                    .is_none()
+            );
+
+            consume_pending_quickstart_chat(
+                &PostPollDispatchState::new(ConnectionState::Connected),
+                &reconnect_state,
+                &mut mode,
+                &mut chat,
+            )
+            .await;
+            assert!(
+                rx.try_recv().is_err(),
+                "a consumed startup must not reopen a session"
+            );
+            assert_eq!(chat.current_session_id(), Some("startup-session"));
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_without_agent_keeps_dashboard_and_sends_no_session_request() {
+        use clap::Parser;
+
+        let cli = crate::Cli::parse_from(["zerocode"]);
+        let reconnect_state = cli.initial_reconnect_state();
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc_out = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(rpc_out));
+        let mut chat = chat::Chat::new(rpc, chat::PaneKind::Chat);
+        let mut mode = Mode::Dashboard;
+
+        consume_pending_quickstart_chat(
+            &PostPollDispatchState::new(ConnectionState::Connected),
+            &reconnect_state,
+            &mut mode,
+            &mut chat,
+        )
+        .await;
+
+        assert_eq!(mode, Mode::Dashboard);
+        assert_eq!(chat.current_session_id(), None);
+        assert!(chat.session_summaries().is_empty());
+        assert!(
+            reconnect_state
+                .lock()
+                .unwrap()
+                .pending_quickstart_chat
+                .is_none()
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "omitted alias must not initiate an RPC"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_agent_rpc_rejection_uses_existing_chat_error() {
+        use clap::Parser;
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let cli = crate::Cli::parse_from(["zerocode", "--agent", "unknown-startup-agent"]);
+        let reconnect_state = cli.initial_reconnect_state();
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc_out = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc_out)));
+        let mut chat = chat::Chat::new(rpc, chat::PaneKind::Chat);
+        let start = tokio::spawn(async move {
+            let mut mode = Mode::Dashboard;
+            consume_pending_quickstart_chat(
+                &PostPollDispatchState::new(ConnectionState::Connected),
+                &reconnect_state,
+                &mut mode,
+                &mut chat,
+            )
+            .await;
+            (mode, chat)
+        });
+        let request = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("startup should request the supplied alias")
+            .expect("RPC channel stays open");
+        let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+        assert_eq!(request["method"], crate::client::method::SESSION_NEW);
+        assert_eq!(request["params"]["agent_alias"], "unknown-startup-agent");
+        rpc_out.dispatch_response(
+            request["id"].as_str().unwrap(),
+            None,
+            Some(crate::jsonrpc::JsonRpcError {
+                code: crate::jsonrpc::error_codes::INTERNAL_ERROR,
+                message: "unknown-startup-agent".to_string(),
+                data: None,
+            }),
+        );
+        let (mode, mut chat) = tokio::time::timeout(Duration::from_secs(2), start)
+            .await
+            .expect("rejected startup should return")
+            .expect("startup task succeeds");
+        assert_eq!(mode, Mode::Chat);
+        assert_eq!(chat.current_session_id(), None);
+        assert!(
+            rx.try_recv().is_err(),
+            "rejection must not start another session"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal
+            .draw(|frame| chat.draw(frame, frame.area()))
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("unknown-startup-agent"));
     }
 
     #[test]
