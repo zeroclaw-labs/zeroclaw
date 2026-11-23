@@ -2634,6 +2634,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn call_ended_cleanup_preserves_new_generation_and_other_contact() {
+        let (channel, _) = fixture();
+        let ending = channel.call_transcription_generation("17", "call");
+        channel
+            .assemble_transcript("17", "call/old", "abandoned", false, &ending)
+            .unwrap();
+        let other_contact = channel.call_transcription_generation("18", "call");
+        channel
+            .assemble_transcript("18", "call/old", "other contact", false, &other_contact)
+            .unwrap();
+
+        // Fill the control channel so call_ended pauses after its single
+        // invalidation and before completion, opening the replacement race.
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(ChannelMessage::default()).await.unwrap();
+        let event_channel = channel.clone();
+        let event_tx = tx.clone();
+        let event = zeroclaw_spawn::spawn!(async move {
+            event_channel
+                .event(
+                    json!({
+                        "type":"call_ended","contact":"17","call_id":"call",
+                        "playback":{"interrupted":true,"completed":[],
+                            "partial":{"text":"partial","played_ms":1,"duration_ms":2}}
+                    }),
+                    &event_tx,
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !ending.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let fresh = channel.call_transcription_generation("17", "call");
+        channel
+            .assemble_transcript("17", "call/new", "replacement", false, &fresh)
+            .unwrap();
+        rx.recv().await.unwrap();
+        event.await.unwrap().unwrap();
+
+        let transcripts = channel.inner.transcripts.lock();
+        assert!(
+            transcripts.contains_key(&("17".into(), "call/new".into())),
+            "call_ended must not purge a replacement generation"
+        );
+        assert!(
+            transcripts.contains_key(&("18".into(), "call/old".into())),
+            "another contact sharing call_id must be isolated"
+        );
+        drop(transcripts);
+        assert!(!fresh.is_cancelled());
+        assert!(!other_contact.is_cancelled());
+    }
+
+    #[tokio::test]
     async fn private_messages_use_stable_contact_ids_and_live_denies() {
         let (channel, live) = fixture();
         let (tx, mut rx) = mpsc::channel(4);
