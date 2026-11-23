@@ -3312,6 +3312,22 @@ fn apply_model_ref(
     }
 }
 
+/// The credential a model-issued switch to `model` on `provider_ref` carries:
+/// that of a route targeting exactly that profile and declaring exactly that
+/// model, compared as stored, the way a chat command matches a route's model.
+/// A model id that only equals a route's hint is a literal model on the
+/// profile, not that route, so the profile's own credential applies.
+fn route_api_key_for_switch<'a>(
+    model_routes: &'a [zeroclaw_config::schema::ModelRouteConfig],
+    provider_ref: &str,
+    model: &str,
+) -> Option<&'a str> {
+    model_routes
+        .iter()
+        .find(|route| route.model_provider == provider_ref && route.model == model)
+        .and_then(|route| route.api_key.as_deref())
+}
+
 fn apply_model_issued_route_switch(
     route: &mut ChannelRouteSelection,
     model_provider: String,
@@ -6172,9 +6188,10 @@ async fn resolve_classifier_route(
         }
     };
 
-    let model = model_cfg.model.clone().unwrap_or_default();
     let temperature = model_cfg.temperature;
-    if model.is_empty() {
+    let Some(model) = configured_profile_model(defaults_snapshot.config.as_ref(), provider_str)
+        .map(ToString::to_string)
+    else {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -6183,7 +6200,7 @@ async fn resolve_classifier_route(
             "classifier_provider points to a [providers.models] entry without a `model` field; falling back to main agent"
         );
         return None;
-    }
+    };
 
     let provider = match get_or_create_provider(
         ctx,
@@ -10858,7 +10875,7 @@ async fn process_channel_message_body(
                     }
                 };
 
-                let resolved_api_key = zeroclaw_config::schema::ModelRouteConfig::switch_api_key(
+                let resolved_api_key = route_api_key_for_switch(
                     &ctx.model_routes,
                     &resolved_model_provider,
                     &new_model,
@@ -11633,8 +11650,10 @@ async fn process_channel_message_body(
                     started_at.elapsed().as_millis(),
                 );
 
-                // Evict cached model_provider on auth errors so the next request
-                // re-creates it with fresh OAuth credentials.
+                // On an auth error, remove the cache entry while it still holds the
+                // provider that failed, so a later turn builds that provider again
+                // instead of reusing it. The cold startup fast path can still serve
+                // the original startup provider for the default selection.
                 if context_window_exceeded.is_none()
                     && zeroclaw_providers::reliable::is_auth_error(&e)
                 {
@@ -11656,7 +11675,7 @@ async fn process_channel_message_body(
                             .with_attrs(
                                 ::serde_json::json!({"model_provider": route.model_provider})
                             ),
-                            "Evicted cached model_provider after auth error; next request will re-create with fresh credentials"
+                            "Removed the cache entry holding the model_provider that failed authentication"
                         );
                     }
                 }
@@ -33882,6 +33901,37 @@ uri = "{base_uri}/nomodel/v1"
                 .collect()
         }
 
+        /// The same runtime, but the agent's default provider asks on its first
+        /// chat to switch the sender to `custom.other` with `model`, and the
+        /// `model_switch` tool is available and approved.
+        fn with_switch_to(self, model: &'static str) -> Self {
+            let switching: Arc<dyn ModelProvider> =
+                Arc::new(OtherProfileSwitchRequestProvider::to(model));
+            let ctx = Arc::new(ChannelRuntimeContext {
+                model_provider: Arc::clone(&switching),
+                provider_cache: Arc::new(Mutex::new(startup_profile_cache(HashMap::from([(
+                    "custom.caller".to_string(),
+                    switching,
+                )])))),
+                tools_registry: Arc::new(
+                    zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                        Box::new(zeroclaw_runtime::tools::ModelSwitchTool::new(
+                            Arc::clone(&self.ctx.security),
+                            Arc::clone(&self.ctx.prompt_config),
+                        )),
+                    ]),
+                ),
+                approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                    &zeroclaw_config::schema::RiskProfileConfig {
+                        auto_approve: vec!["model_switch".into()],
+                        ..Default::default()
+                    },
+                )),
+                ..(*self.ctx).clone()
+            });
+            Self { ctx, ..self }
+        }
+
         fn selected_keys(&self) -> Vec<ProviderCacheKey> {
             self.ctx
                 .provider_cache
@@ -34088,11 +34138,20 @@ uri = "{base_uri}/nomodel/v1"
         );
     }
 
-    /// On its first chat, asks to move the sender to `custom.other` with a model
-    /// that profile does not pin; answers in text afterwards.
-    #[derive(Default)]
+    /// On its first chat, asks to move the sender to `custom.other` with
+    /// `model`; answers in text afterwards.
     struct OtherProfileSwitchRequestProvider {
+        model: &'static str,
         call_count: AtomicUsize,
+    }
+
+    impl OtherProfileSwitchRequestProvider {
+        fn to(model: &'static str) -> Self {
+            Self {
+                model,
+                call_count: AtomicUsize::new(0),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -34120,7 +34179,7 @@ uri = "{base_uri}/nomodel/v1"
                     arguments: serde_json::json!({
                         "action": "set",
                         "model_provider": "custom.other",
-                        "model": "switched-model"
+                        "model": self.model
                     })
                     .to_string(),
                     extra_content: None,
@@ -34659,34 +34718,143 @@ model = "other-model"
         );
     }
 
+    fn calls_of(call: [WireCall; 2], count: usize) -> Vec<WireCall> {
+        vec![call[0].clone(); count]
+    }
+
     #[tokio::test]
-    async fn channel_model_issued_switch_requests_the_switched_model() {
-        let fixture = ModelSelectionWireFixture::new(Vec::new()).await;
-        let switching: Arc<dyn ModelProvider> =
-            Arc::new(OtherProfileSwitchRequestProvider::default());
-        let ctx = Arc::new(ChannelRuntimeContext {
-            model_provider: Arc::clone(&switching),
-            provider_cache: Arc::new(Mutex::new(startup_profile_cache(HashMap::from([(
-                "custom.caller".to_string(),
-                switching,
-            )])))),
-            tools_registry: Arc::new(
-                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
-                    Box::new(zeroclaw_runtime::tools::ModelSwitchTool::new(
-                        Arc::clone(&fixture.ctx.security),
-                        Arc::clone(&fixture.ctx.prompt_config),
-                    )),
-                ]),
-            ),
-            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::RiskProfileConfig {
-                    auto_approve: vec!["model_switch".into()],
-                    ..Default::default()
+    async fn channel_model_issued_switch_to_a_hint_name_uses_profile_credential() {
+        let fixture = keyed_route_fixture().await.with_switch_to("fast");
+
+        fixture.send("alice", "switch please").await;
+        fixture.send("alice", "hello").await;
+
+        // The retry of the switched turn, then both requests of the next one.
+        assert_eq!(
+            fixture.calls().await,
+            calls_of(
+                WireCall::per_turn("other", "fast", Some("Bearer other-key")),
+                3
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_model_issued_switch_to_a_route_model_uses_route_credential() {
+        let fixture = keyed_route_fixture().await.with_switch_to("fast-model");
+
+        fixture.send("alice", "switch please").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            calls_of(
+                WireCall::per_turn("other", "fast-model", Some("Bearer route-key")),
+                3
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_model_issued_switch_credential_needs_exact_profile_and_model() {
+        // Each decoy route differs from the switch target only by letter case:
+        // one in its profile alias, one in its model id.
+        let fixture = ModelSelectionWireFixture::with_config(
+            vec![
+                zeroclaw_config::schema::ModelRouteConfig {
+                    hint: "upper-profile".into(),
+                    model_provider: "custom.Other".into(),
+                    model: "fast-model".into(),
+                    api_key: Some("profile-case-key".into()),
                 },
-            )),
+                zeroclaw_config::schema::ModelRouteConfig {
+                    hint: "upper-model".into(),
+                    model_provider: "custom.other".into(),
+                    model: "Fast-Model".into(),
+                    api_key: Some("model-case-key".into()),
+                },
+            ],
+            true,
+            |config| {
+                let uri = config
+                    .providers
+                    .models
+                    .find("custom", "other")
+                    .and_then(|other| other.uri.clone())
+                    .map(|uri| uri.replace("/other/", "/Other/"));
+                let upper = config
+                    .providers
+                    .models
+                    .ensure("custom", "Other")
+                    .expect("custom profile slot");
+                upper.uri = uri;
+                upper.model = Some("upper-model".into());
+                upper.api_key = Some("upper-key".into());
+                config
+                    .providers
+                    .models
+                    .ensure("custom", "other")
+                    .expect("custom profile slot")
+                    .api_key = Some("other-key".into());
+            },
+        )
+        .await
+        .with_switch_to("fast-model");
+
+        fixture.send("alice", "switch please").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            calls_of(
+                WireCall::per_turn("other", "fast-model", Some("Bearer other-key")),
+                3
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_whitespace_precheck_profile_falls_back_to_main_precheck_provider() {
+        let fixture = ModelSelectionWireFixture::with_config(Vec::new(), true, |config| {
+            let uri = config
+                .providers
+                .models
+                .find("custom", "caller")
+                .and_then(|caller| caller.uri.clone())
+                .map(|uri| uri.replace("/caller/", "/precheck/"));
+            let precheck = config
+                .providers
+                .models
+                .ensure("custom", "precheck")
+                .expect("custom profile slot");
+            precheck.uri = uri;
+            precheck.model = Some("   ".into());
+        })
+        .await;
+        let ctx = Arc::new(ChannelRuntimeContext {
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig {
+                classifier_provider: zeroclaw_config::providers::ModelProviderRef::from(
+                    "custom.precheck",
+                ),
+                ..Default::default()
+            }),
             ..(*fixture.ctx).clone()
         });
         let fixture = ModelSelectionWireFixture { ctx, ..fixture };
+
+        fixture.send("bob", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            WireCall::per_turn("caller", "caller-model", None)
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_model_issued_switch_requests_the_switched_model() {
+        let fixture = ModelSelectionWireFixture::new(Vec::new())
+            .await
+            .with_switch_to("switched-model");
 
         fixture.send("alice", "switch please").await;
         fixture.send("alice", "hello").await;
