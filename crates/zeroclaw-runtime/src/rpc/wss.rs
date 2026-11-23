@@ -2348,7 +2348,10 @@ mod accept_error_tests {
             // connection leaves its turn task unwinding. Gate on the daemon's
             // own reload drain, which is what production waits on.
             assert_eq!(
-                crate::daemon::await_rpc_connection_drain(&count1_for_gen2).await,
+                crate::daemon::await_rpc_connection_drain_with(
+                    || count1_for_gen2.load(std::sync::atomic::Ordering::Relaxed)
+                )
+                .await,
                 crate::daemon::RpcDrain::Complete,
                 "the retiring generation must finish draining within the reload budget"
             );

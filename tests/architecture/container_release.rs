@@ -459,6 +459,146 @@ fn plugin_enabled_container_variants_stage_wit_and_have_source_build_coverage() 
     }
 }
 
+/// The builder stage up to its dependency pre-fetch build.
+fn dependency_prefetch<'a>(builder: &'a str, name: &str) -> &'a str {
+    let dependency_build = builder
+        .find("$ZEROCLAW_CARGO_FLAGS;")
+        .unwrap_or_else(|| panic!("{name} must expose its dependency build"));
+    &builder[..dependency_build]
+}
+
+/// Docker matches `COPY` sources one path segment at a time: `*` never
+/// crosses `/`.
+fn docker_glob_matches(pattern: &str, path: &str) -> bool {
+    fn segment_matches(pattern: &[u8], text: &[u8]) -> bool {
+        match pattern.split_first() {
+            None => text.is_empty(),
+            Some((b'*', rest)) => (0..=text.len()).any(|skip| segment_matches(rest, &text[skip..])),
+            Some((byte, rest)) => text.first() == Some(byte) && segment_matches(rest, &text[1..]),
+        }
+    }
+    let pattern: Vec<_> = pattern.split('/').collect();
+    let path: Vec<_> = path.split('/').collect();
+    pattern.len() == path.len()
+        && pattern
+            .iter()
+            .zip(&path)
+            .all(|(pattern, text)| segment_matches(pattern.as_bytes(), text.as_bytes()))
+}
+
+/// Whether a `COPY` from the build context (not `--from` another stage) puts
+/// the context file `path` at the same path in the image.
+fn copy_stages_path(stage: &str, path: &str) -> bool {
+    stage
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("COPY "))
+        .any(|args| {
+            let words: Vec<_> = args.split_whitespace().collect();
+            if words.iter().any(|word| word.starts_with("--from")) {
+                return false;
+            }
+            let parents = words.contains(&"--parents");
+            let operands: Vec<_> = words
+                .iter()
+                .copied()
+                .filter(|word| !word.starts_with("--"))
+                .collect();
+            let Some((dest, sources)) = operands.split_last() else {
+                return false;
+            };
+            let into_root = matches!(*dest, "." | "./");
+            sources.iter().any(|source| {
+                let source = source.trim_start_matches("./");
+                if let Some(dir) = source.strip_suffix('/') {
+                    let depth = dir.split('/').count();
+                    let segments: Vec<_> = path.split('/').collect();
+                    segments.len() > depth
+                        && docker_glob_matches(dir, &segments[..depth].join("/"))
+                        && ((parents && into_root) || dest.trim_end_matches('/') == dir)
+                } else if parents {
+                    into_root && docker_glob_matches(source, path)
+                } else if into_root {
+                    !source.contains('/') && docker_glob_matches(source, path)
+                } else {
+                    source == path && *dest == path
+                }
+            })
+        })
+}
+
+#[test]
+fn source_containerfiles_stage_every_workspace_member_manifest_during_prefetch() {
+    let workspace: toml::Value = toml::from_str(&repository_file("Cargo.toml"))
+        .expect("root Cargo.toml must contain valid TOML");
+    let manifests: Vec<_> = workspace["workspace"]["members"]
+        .as_array()
+        .expect("root Cargo.toml must define workspace members")
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .map(|member| match member {
+            "." => "Cargo.toml".to_string(),
+            member => format!("{member}/Cargo.toml"),
+        })
+        .collect();
+
+    // Cargo refuses to load the workspace when any member manifest is missing,
+    // so a member the pre-fetch does not stage breaks every source image build.
+    for name in ["Dockerfile", "Dockerfile.alpine", "Dockerfile.debian"] {
+        let containerfile = repository_file(name);
+        let prefetch = dependency_prefetch(builder_stage(&containerfile, name), name);
+        let missing: Vec<_> = manifests
+            .iter()
+            .filter(|manifest| !copy_stages_path(prefetch, manifest))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{name} must stage every workspace member manifest before its dependency pre-fetch; missing: {missing:?}"
+        );
+    }
+}
+
+#[test]
+fn workspace_manifest_guard_reads_globs_parents_and_destinations() {
+    let stage = "\
+COPY Cargo.toml Cargo.lock ./
+COPY *.rs .
+COPY --parents crates/*/Cargo.toml ./
+COPY --parents tests/fixtures/*/Cargo.toml ./
+COPY --parents crates/zeroclaw-macros/src/ ./
+COPY vendor/ vendor/
+COPY xtask/Cargo.toml xtask/Cargo.toml
+COPY apps/tauri/Cargo.toml apps/elsewhere/Cargo.toml
+COPY --from=web-builder /app/tools/x/Cargo.toml tools/x/Cargo.toml
+";
+    for staged in [
+        "Cargo.toml",
+        "build.rs",
+        "crates/zeroclaw-api/Cargo.toml",
+        "tests/fixtures/consumer/Cargo.toml",
+        "crates/zeroclaw-macros/src/lib.rs",
+        "vendor/crossterm/Cargo.toml",
+        "xtask/Cargo.toml",
+    ] {
+        assert!(copy_stages_path(stage, staged), "{staged} is staged");
+    }
+    for unstaged in [
+        // `*` does not cross `/`: the single-level crate glob misses fixtures.
+        "crates/zeroclaw-log/tests/fixtures/consumer/Cargo.toml",
+        "tests/fixtures/consumer/src/lib.rs",
+        "src/main.rs",
+        // Copied, but to another path.
+        "apps/tauri/Cargo.toml",
+        // Copied from another stage, not from the build context.
+        "tools/x/Cargo.toml",
+        "apps/zerocode/Cargo.toml",
+    ] {
+        assert!(
+            !copy_stages_path(stage, unstaged),
+            "{unstaged} is not staged"
+        );
+    }
+}
+
 #[test]
 fn source_containerfiles_stage_nested_workspace_members_during_prefetch() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -467,39 +607,44 @@ fn source_containerfiles_stage_nested_workspace_members_during_prefetch() {
     let members = workspace["workspace"]["members"]
         .as_array()
         .expect("root Cargo.toml must define workspace members");
-    let nested_crate_members: Vec<_> = members
+    let nested_members: Vec<_> = members
         .iter()
         .filter_map(toml::Value::as_str)
-        .filter(|member| member.starts_with("crates/") && member.split('/').count() > 2)
+        .filter(|member| {
+            (member.starts_with("crates/") && member.split('/').count() > 2)
+                || member.starts_with("tests/fixtures/")
+        })
         .collect();
 
     assert!(
-        !nested_crate_members.is_empty(),
+        !nested_members.is_empty(),
         "workspace fixture must exercise nested crate-member staging"
     );
 
     for name in ["Dockerfile", "Dockerfile.alpine", "Dockerfile.debian"] {
         let containerfile = repository_file(name);
-        let builder = builder_stage(&containerfile, name);
-        let dependency_build = builder
-            .find("$ZEROCLAW_CARGO_FLAGS;")
-            .unwrap_or_else(|| panic!("{name} must expose its dependency build"));
-        let prefetch = &builder[..dependency_build];
-        let generic_fixture_manifests =
+        let prefetch = dependency_prefetch(builder_stage(&containerfile, name), name);
+        let lib_stub = prefetch.contains("printf '' > \"${d}src/lib.rs\"");
+        let crate_fixture_manifests =
             prefetch.contains("COPY --parents crates/*/tests/fixtures/*/Cargo.toml ./");
-        let generic_fixture_lib_stubs = prefetch.contains("for d in crates/*/tests/fixtures/*/")
-            && prefetch.contains("printf '' > \"${d}src/lib.rs\"");
+        let crate_fixture_lib_stubs =
+            prefetch.contains("for d in crates/*/tests/fixtures/*/") && lib_stub;
+        let test_fixture_manifests =
+            prefetch.contains("COPY --parents tests/fixtures/*/Cargo.toml ./");
+        let test_fixture_lib_stubs = prefetch.contains("for d in tests/fixtures/*/") && lib_stub;
 
-        for member in &nested_crate_members {
+        for member in &nested_members {
             let member_segments: Vec<_> = member.split('/').collect();
-            let generic_fixture_member = matches!(
-                member_segments.as_slice(),
-                ["crates", _, "tests", "fixtures", _]
-            );
+            let (generic_manifests, generic_lib_stubs) = match member_segments.as_slice() {
+                ["crates", _, "tests", "fixtures", _] => {
+                    (crate_fixture_manifests, crate_fixture_lib_stubs)
+                }
+                ["tests", "fixtures", _] => (test_fixture_manifests, test_fixture_lib_stubs),
+                _ => (false, false),
+            };
             let manifest_copy = format!("COPY --parents {member}/Cargo.toml ./");
             assert!(
-                prefetch.contains(&manifest_copy)
-                    || (generic_fixture_member && generic_fixture_manifests),
+                prefetch.contains(&manifest_copy) || generic_manifests,
                 "{name} must stage nested workspace manifest {member}/Cargo.toml before prefetch"
             );
 
@@ -509,10 +654,7 @@ fn source_containerfiles_stage_nested_workspace_members_during_prefetch() {
                     found_target = true;
                     let stub = format!("{member}/{target}");
                     assert!(
-                        prefetch.contains(&stub)
-                            || (generic_fixture_member
-                                && target == "src/lib.rs"
-                                && generic_fixture_lib_stubs),
+                        prefetch.contains(&stub) || (target == "src/lib.rs" && generic_lib_stubs),
                         "{name} must stub nested workspace target {stub} before prefetch"
                     );
                 }
