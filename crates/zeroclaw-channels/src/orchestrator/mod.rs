@@ -3313,8 +3313,9 @@ fn apply_model_ref(
 }
 
 /// The credential a model-issued switch to `model` on `provider_ref` carries:
-/// that of a route targeting exactly that profile and declaring exactly that
-/// model, compared as stored, the way a chat command matches a route's model.
+/// that of a route whose stored profile reference and stored model both equal
+/// the switch target exactly. A chat command's route lookup is looser: it
+/// folds case and accepts a hint.
 /// A model id that only equals a route's hint is a literal model on the
 /// profile, not that route, so the profile's own credential applies.
 fn route_api_key_for_switch<'a>(
@@ -4950,27 +4951,40 @@ fn configured_profile_model<'a>(
 }
 
 /// The primary model the shared builder must be given for `provider_ref` so
-/// that it serves `model`. Built without one, a profile serves its stored
-/// `model` exactly as stored; a profile without one passes the requested model
-/// through but leaves its `fallback_models` unbuilt, which the CLI and session
-/// RPC build around their explicit model. `None` when that default build
-/// already serves `model` the same way: the stored model is `model`, or the
-/// profile stores none and has no `fallback_models`.
+/// that it serves the selected `model`, which callers pass as given. Built
+/// without one, a profile serves its stored `model` exactly as stored; a
+/// profile without one passes the requested model through but leaves its
+/// `fallback_models` unbuilt, which the CLI and session RPC build around their
+/// explicit model. The shared builder trims an explicit primary model, so the
+/// pin returned is the trimmed selection.
+///
+/// `None`, so the profile's own build serves the selection, when:
+/// - the selection is blank;
+/// - the stored model equals the selection as given, or equals it trimmed, so
+///   it already serves the id the selection asks for;
+/// - the profile stores no model and either has no `fallback_models` or the
+///   selection has surrounding whitespace. A padded selection then passes
+///   through as given, with no fallback chain built around it, because a
+///   chain needs an explicit primary and that one would be trimmed.
+///
+/// Otherwise a stored model that differs gets the trimmed selection as the
+/// pin, and an unpadded selection on a profile with `fallback_models` gets
+/// itself as the primary its fallback chain is built around.
 fn provider_model_override<'a>(
     config: &zeroclaw_config::schema::Config,
     provider_ref: &str,
     model: &'a str,
 ) -> Option<&'a str> {
-    let model = model.trim();
-    if model.is_empty() {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
         return None;
     }
     let (_, entry) = model_provider_entry_for_ref(config, provider_ref).ok()?;
     let needs_own_primary = match entry.model.as_deref() {
-        Some(stored) => stored != model,
-        None => !entry.fallback_models.is_empty(),
+        Some(stored) => stored != model && stored != trimmed,
+        None => model == trimmed && !entry.fallback_models.is_empty(),
     };
-    needs_own_primary.then_some(model)
+    needs_own_primary.then_some(trimmed)
 }
 
 fn provider_credentials_for_ref(
@@ -23689,6 +23703,28 @@ temperature = 0.3
             Some(0.0),
             "alias temperature must be returned, not runtime_defaults.temperature"
         );
+
+        // A configured model with surrounding whitespace still names a model:
+        // the dedicated route resolves with the trimmed id.
+        let mut padded = ctx.prompt_config.as_ref().clone();
+        if let Some(classifier) = padded.providers.models.ensure("openai", "my-classifier") {
+            classifier.model = Some("  gpt-4o-mini  ".to_string());
+            classifier.temperature = Some(0.3);
+        }
+        let ctx = Arc::new(ChannelRuntimeContext {
+            prompt_config: Arc::new(padded.clone()),
+            live_config: zeroclaw_config::live::LiveConfig::new(padded).handle(),
+            ..(*ctx).clone()
+        });
+        let (_, model, temp) = resolve_classifier_route(
+            ctx.as_ref(),
+            &alias_ref,
+            &runtime_defaults_snapshot(ctx.as_ref()),
+        )
+        .await
+        .expect("a padded configured model must resolve to the alias");
+        assert_eq!(model, "gpt-4o-mini");
+        assert_eq!(temp, Some(0.3));
     }
 
     #[test]
@@ -34476,6 +34512,142 @@ model = "pinned"
         );
         let cached = fixture.cached_providers();
         assert_eq!(cached.len(), 1);
+        assert!(Arc::ptr_eq(&cached[0], &fixture.startup_provider));
+    }
+
+    fn padded_route() -> Vec<zeroclaw_config::schema::ModelRouteConfig> {
+        vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "pad".into(),
+            model_provider: "custom.other".into(),
+            model: "  pad-model  ".into(),
+            api_key: None,
+        }]
+    }
+
+    #[tokio::test]
+    async fn channel_route_model_matching_its_target_pin_is_requested_as_declared() {
+        let fixture = ModelSelectionWireFixture::with_config(padded_route(), true, |config| {
+            config
+                .providers
+                .models
+                .ensure("custom", "other")
+                .expect("custom profile slot")
+                .model = Some("  pad-model  ".into());
+        })
+        .await;
+
+        fixture.send("alice", "/model pad").await;
+        assert!(
+            fixture.last_reply().await.contains(
+                &zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "channel-runtime-model-switched",
+                    &[("model", "  pad-model  "), ("provider", "custom.other")],
+                )
+            ),
+            "unexpected reply: {}",
+            fixture.last_reply().await
+        );
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            WireCall::per_turn("other", "  pad-model  ", None)
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_padded_route_model_over_a_different_pin_is_requested_trimmed() {
+        let fixture = ModelSelectionWireFixture::new(padded_route()).await;
+
+        fixture.send("alice", "/model pad").await;
+        assert!(
+            fixture.last_reply().await.contains(
+                &zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "channel-runtime-model-switched",
+                    &[("model", "  pad-model  "), ("provider", "custom.other")],
+                )
+            ),
+            "unexpected reply: {}",
+            fixture.last_reply().await
+        );
+        fixture.send("alice", "hello").await;
+
+        // The selection needs its own pin, and the shared builder trims an
+        // explicit pin.
+        assert_eq!(
+            fixture.calls().await,
+            WireCall::per_turn("other", "pad-model", None)
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_padded_route_model_on_unpinned_profile_with_fallbacks_passes_through() {
+        let fixture = ModelSelectionWireFixture::with_config(
+            vec![zeroclaw_config::schema::ModelRouteConfig {
+                hint: "pad".into(),
+                model_provider: "custom.nomodel".into(),
+                model: "  pad-model  ".into(),
+                api_key: None,
+            }],
+            true,
+            |config| {
+                config
+                    .providers
+                    .models
+                    .ensure("custom", "nomodel")
+                    .expect("custom profile slot")
+                    .fallback_models = vec!["backup-model".into()];
+            },
+        )
+        .await;
+
+        fixture.send("alice", "/model pad").await;
+        assert!(
+            fixture.last_reply().await.contains(
+                &zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "channel-runtime-model-switched",
+                    &[("model", "  pad-model  "), ("provider", "custom.nomodel")],
+                )
+            ),
+            "unexpected reply: {}",
+            fixture.last_reply().await
+        );
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            WireCall::per_turn("nomodel", "  pad-model  ", None)
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_padded_route_model_matching_trimmed_pin_reuses_the_profile_provider() {
+        let fixture =
+            ModelSelectionWireFixture::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+                hint: "padcaller".into(),
+                model_provider: "custom.caller".into(),
+                model: "  caller-model  ".into(),
+                api_key: None,
+            }])
+            .await;
+
+        fixture.send("alice", "hello").await;
+        fixture.send("alice", "/model padcaller").await;
+        fixture.send("alice", "hello again").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            ModelSelectionWireFixture::per_turn(&["caller-model", "caller-model"])
+                .into_iter()
+                .map(|model| WireCall {
+                    profile: "caller".into(),
+                    model,
+                    authorization: None,
+                })
+                .collect::<Vec<_>>()
+        );
+        let cached = fixture.cached_providers();
+        assert_eq!(cached.len(), 1, "no second provider for the same profile");
         assert!(Arc::ptr_eq(&cached[0], &fixture.startup_provider));
     }
 
