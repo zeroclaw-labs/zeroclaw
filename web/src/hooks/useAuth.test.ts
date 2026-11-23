@@ -89,10 +89,10 @@ let providers: string[] = [];
 let viaRelay = false;
 // How `/api/auth/methods` fails, when a test makes it fail.
 let methodsFailure: null | "network" | number = null;
-let sessionResponse: () => Response = () => new Response("", { status: 401 });
+let sessionResponse: () => Response | Promise<Response> = () => new Response("", { status: 401 });
 // Paths whose next request meets a gateway generation that is stopping for a reload.
 let restartingOnce = new Set<string>();
-// Other API paths a test answers itself.
+// Routes a test answers instead of the default response.
 let routes = new Map<string, () => Response | Promise<Response>>();
 
 const json = (status: number, body: unknown) =>
@@ -111,6 +111,9 @@ globalThis.fetch = async (input, init) => {
       });
     }
   }
+  for (const [path, respond] of routes) {
+    if (url.endsWith(path)) return respond();
+  }
   if (url.endsWith("/health")) return json(200, health);
   if (url.endsWith("/api/auth/methods")) {
     if (methodsFailure === "network") throw new TypeError("Failed to fetch");
@@ -123,9 +126,6 @@ globalThis.fetch = async (input, init) => {
   }
   if (url.endsWith("/api/auth/session")) return sessionResponse();
   if (url.endsWith("/auth/sign-out")) return new Response(null, { status: 204 });
-  for (const [path, respond] of routes) {
-    if (url.endsWith(path)) return respond();
-  }
   return json(404, {});
 };
 
@@ -478,6 +478,83 @@ test("sign-out ends the session, tells other tabs, and names the provider", asyn
   assert.equal(state().isAuthenticated, false);
   assert.deepEqual(state().signOutNotice, { kind: "signed-out", provider: "corp" });
   assert.deepEqual(heard, [{ type: "signed-out" }]);
+});
+
+test("a session check from before sign-out cannot dismiss the sign-out notice", async () => {
+  providers = ["corp"];
+  sessionResponse = () => json(200, session());
+  await mountScreen();
+  assert.equal(state().isAuthenticated, true);
+  let deliver!: (response: Response) => void;
+  const pending = new Promise<Response>((resolve) => {
+    deliver = resolve;
+  });
+  let probes = 0;
+  sessionResponse = () => {
+    probes += 1;
+    return pending;
+  };
+  await fire("accessLost");
+  assert.equal(probes, 1);
+  await act(async () => {
+    await state().signOut();
+  });
+
+  await act(async () => {
+    deliver(json(200, session()));
+  });
+  assert.equal(auth.getOidcSession(), null);
+  assert.equal(state().isAuthenticated, false);
+  const notices = renderer!.root.findAllByProps({ role: "status" });
+  assert.ok(notices.some((node) =>
+    node.children.includes("You're signed out of ZeroClaw. You may still be signed in at corp."),
+  ));
+
+  sessionResponse = () => json(200, session({ csrf_token: "csrf-fresh" }));
+  await broadcast({ type: "signed-in" });
+  assert.equal(state().session?.csrf_token, "csrf-fresh");
+});
+
+test("a sign-out broadcast invalidates the pending session check during startup", async () => {
+  providers = ["corp"];
+  let deliver!: (response: Response) => void;
+  const pending = new Promise<Response>((resolve) => {
+    deliver = resolve;
+  });
+  let probes = 0;
+  sessionResponse = () => {
+    probes += 1;
+    return pending;
+  };
+  await mount();
+  assert.equal(probes, 1);
+  await broadcast({ type: "signed-out" });
+  await act(async () => {
+    deliver(json(200, session()));
+  });
+  assert.equal(state().loading, false);
+  assert.equal(state().isAuthenticated, false);
+  assert.equal(auth.getOidcSession(), null);
+});
+
+test("startup picks up a new sign-in before its session check begins", async () => {
+  providers = ["corp"];
+  let finishHealth!: (response: Response) => void;
+  const pendingHealth = new Promise<Response>((resolve) => { finishHealth = resolve; });
+  routes.set("/health", () => pendingHealth);
+  await mountScreen();
+  assert.equal(state().loading, true);
+  await broadcast({ type: "signed-out" });
+  sessionResponse = () => json(200, session({ display_name: "New session" }));
+  await broadcast({ type: "signed-in" });
+  assert.equal(requests.some((r) => r.url.endsWith("/api/auth/session")), false);
+
+  await act(async () => {
+    finishHealth(json(200, health));
+  });
+  assert.equal(state().loading, false);
+  assert.equal(state().session?.display_name, "New session");
+  assert.equal(rendered("data-signin-provider"), 0);
 });
 
 test("sign-out in another tab signs this tab out too", async () => {

@@ -16,6 +16,7 @@ import {
   isAuthenticated as checkAuth,
   getClockOffsetMs,
   getOidcSession,
+  getSignOutGeneration,
   providerAlias,
   markReauthPending,
   setOidcSession,
@@ -190,6 +191,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         cancelled = true;
       };
     }
+    let sessionGeneration: number | undefined;
     resolveInitialAuth({
       hasToken: false,
       desktop: isTauri(),
@@ -199,7 +201,10 @@ export function AuthProvider({ children }: AuthProviderProps) {
           if (methods?.via_relay) setViaRelay(true);
           return methods;
         }),
-      getSession: () => fetchAuthSession(),
+      getSession: () => {
+        sessionGeneration = getSignOutGeneration();
+        return fetchAuthSession();
+      },
     })
       .then((initial) => {
         if (cancelled) return;
@@ -213,7 +218,11 @@ export function AuthProvider({ children }: AuthProviderProps) {
           case 'signed-in':
             setProviders(initial.providers);
             setProvidersKnown(true);
-            setOidcSession(initial.session, initial.clockOffsetMs);
+            if (sessionGeneration === getSignOutGeneration()) {
+              setOidcSession(initial.session, initial.clockOffsetMs);
+            } else if (!getOidcSession()) {
+              setPhase('signed-out');
+            }
             break;
           case 'signed-out':
             setProviders(initial.providers);
@@ -310,7 +319,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     const onSessionEnded = () => {
       if (phaseRef.current !== 'oidc') return;
       void refreshOidcSession().then((outcome) => {
-        if (phaseRef.current !== 'oidc') return;
+        if (phaseRef.current !== 'oidc' || outcome === 'superseded') return;
         if (outcome !== 'resumed' && outcome !== 'reloading') setReauthRequired(true);
       });
     };
@@ -349,6 +358,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
             ? { kind: 'signed-out', provider: providerAlias(held.provider) }
             : { kind: 'session-ended' },
         );
+      } else if (current === 'loading' || current === 'signed-out') {
+        // A startup probe or another tab's sign-in may still be in flight.
+        setOidcSession(null);
       }
     };
     return () => {
@@ -436,6 +448,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       // A stale CSRF token (the session was replaced in another tab) is
       // refused; re-read the session and try once more with the new one.
       const outcome = await refreshOidcSession();
+      if (outcome === 'superseded') return;
       const fresh = getOidcSession();
       if (outcome === 'resumed' && fresh) {
         await postSignOut(fresh.csrf_token);

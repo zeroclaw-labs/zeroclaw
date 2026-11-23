@@ -11,6 +11,7 @@ import {
   CSRF_HEADER,
   getLastPrincipalId,
   getOidcSession,
+  getSignOutGeneration,
   setOidcSession,
   type OidcSession,
 } from './auth';
@@ -408,7 +409,7 @@ export function decideSignedIn(
   return current ? 'resume' : 'adopt';
 }
 
-export type RefreshOutcome = 'resumed' | 'reloading' | 'expired' | 'signed-out' | 'error';
+export type RefreshOutcome = 'resumed' | 'reloading' | 'expired' | 'signed-out' | 'superseded' | 'error';
 
 /**
  * Re-read the cookie session and apply it: adopt or resume (and tell stopped
@@ -422,7 +423,9 @@ export async function refreshOidcSession(
     reload?: () => void;
   } = {},
 ): Promise<RefreshOutcome> {
-  const probe = await (deps.probe ?? (() => fetchAuthSession()))();
+  const generation = getSignOutGeneration();
+  const probe = await (deps.probe ?? fetchAuthSession)();
+  if (generation !== getSignOutGeneration()) return 'superseded';
   switch (probe.kind) {
     case 'oidc': {
       if (decideSignedIn(getOidcSession(), probe.session, getLastPrincipalId()) === 'reload') {
@@ -440,7 +443,7 @@ export async function refreshOidcSession(
   }
 }
 
-export type SessionRefusal = 'resumed' | 'reauth' | 'reloading' | 'signed-out';
+export type SessionRefusal = 'resumed' | 'reauth' | 'reloading' | 'signed-out' | 'superseded';
 
 /**
  * Route a signed-in request's 401. An expired session asks for re-auth and
@@ -453,7 +456,7 @@ export type SessionRefusal = 'resumed' | 'reauth' | 'reloading' | 'signed-out';
 export async function routeSessionRefusal(body: string): Promise<SessionRefusal> {
   if (failureReason(body) !== 'session_expired') {
     const outcome = await refreshOidcSession();
-    if (outcome === 'resumed' || outcome === 'reloading') return outcome;
+    if (outcome === 'resumed' || outcome === 'reloading' || outcome === 'superseded') return outcome;
     if (outcome !== 'expired') {
       window.dispatchEvent(new Event(AUTH_EVENTS.unauthorized));
       return 'signed-out';
