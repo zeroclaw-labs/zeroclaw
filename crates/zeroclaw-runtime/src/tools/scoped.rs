@@ -1224,16 +1224,10 @@ impl ScopedToolRegistry {
                                 "MCP deferred: pre-activated tool(s) via tool_filter_groups mode=always"
                             );
                         }
-                        // Build the prompt section AFTER pre-activation and
-                        // exclude the just-activated names: the section tells
-                        // the model listed tools are "NOT yet loaded" and MUST
-                        // be fetched via tool_search — advertising a live tool
-                        // there would burn the exact first-turn round-trip
-                        // `mode = "always"` pre-activation exists to remove.
-                        deferred_section = tools::build_deferred_tools_section_excluding(
+                        // Pre-activated tools stay listed so activation never changes the prompt.
+                        deferred_section = tools::build_deferred_tools_section_filtered(
                             &filtered_deferred,
                             mcp_policy.as_ref(),
-                            &preactivated_names,
                         );
                         #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
                         tools::late_tool_search_observer::record(

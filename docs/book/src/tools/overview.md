@@ -189,7 +189,7 @@ Selected tools also retain these prerequisites:
 
 Enable `deferred_builtin_tools` on the agent's runtime profile through the ZeroCode Config editor to reduce the built-in tool catalog sent to the model. It defaults to `false`, which preserves eager schema loading. The setting is independent of MCP's `deferred_loading` option.
 
-When enabled, permitted `shell`, `file_read`, `file_write`, `file_edit`, `memory_recall`, and `memory_store` schemas remain visible. Other enabled built-ins appear in a compact discovery list. The model uses `tool_search` with keywords or `select:<tool_name>` to retrieve full definitions. Selected schemas appear in subsequent native-tool requests; text providers receive the definition in the search result.
+When enabled, permitted `shell`, `file_read`, `file_write`, `file_edit`, `memory_recall`, and `memory_store` schemas remain visible. Other enabled built-ins appear in a compact discovery list. The model uses `tool_search` with keywords or `select:<tool_name>` to retrieve full definitions. Selected schemas appear in subsequent native-tool requests; text providers receive the definition in the search result. A selected tool stays in the discovery list, so selection alone does not change the system prompt; the list changes only when the admitted catalog or access policy changes.
 
 Discovery never grants permission or changes tool approval. Agent policy, principal restrictions, and caller allowlists still apply, including after a session narrows its tools. Built-in executables stay in the existing scoped registry, so memory routing does not retain a separate stale tool instance. If policy does not admit `tool_search`, remaining built-in schemas stay eager. Tool-listing endpoints still list the complete admitted registry.
 

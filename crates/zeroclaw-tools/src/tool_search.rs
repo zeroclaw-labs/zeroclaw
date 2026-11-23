@@ -131,16 +131,14 @@ impl ToolSearchTool {
             .retain_allowed(allowed);
     }
 
-    /// Advertise only still-loadable, not-yet-activated tools, from the same
-    /// registry used by both keyword search and exact selection.
+    /// Advertise every still-loadable tool the access policy admits, from
+    /// the same registry used by both keyword search and exact selection.
+    /// Activation does not remove a tool from the list: the section changes
+    /// only when the catalog or access changes, so activating a tool leaves
+    /// the cached system-prompt prefix intact.
     pub fn deferred_prompt_section(&self) -> String {
         let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
         let activated = self.activated.lock().unwrap_or_else(|e| e.into_inner());
-        let names = activated
-            .tool_names()
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
         let mut section = match self.access_policy.as_ref() {
             Some(policy) => {
                 crate::mcp_deferred::build_deferred_builtin_tools_section(&activated, Some(policy))
@@ -148,13 +146,10 @@ impl ToolSearchTool {
             None => activated.deferred_builtin_prompt_section(),
         };
         if let Some(deferred) = deferred.as_ref() {
-            section.push_str(
-                &crate::mcp_deferred::build_deferred_tools_section_excluding(
-                    deferred,
-                    self.access_policy.as_ref(),
-                    &names,
-                ),
-            );
+            section.push_str(&crate::mcp_deferred::build_deferred_tools_section_filtered(
+                deferred,
+                self.access_policy.as_ref(),
+            ));
         }
         section
     }
@@ -547,7 +542,7 @@ mod tests {
         assert!(guard.tool_specs().is_empty());
         drop(guard);
         assert!(seen.lock().unwrap().is_empty());
-        assert!(tool.deferred_prompt_section().is_empty());
+        assert_eq!(tool.deferred_prompt_section(), prompt);
     }
 
     #[tokio::test]
@@ -567,6 +562,7 @@ mod tests {
             .is_err()
         );
         let tool = ToolSearchTool::for_builtin_schemas(Arc::clone(&activated));
+        let prompt = tool.deferred_prompt_section();
         let result = tool
             .execute(serde_json::json!({
                 "query": "select:calendar,calendar,weather", "max_results": 1
@@ -580,13 +576,13 @@ mod tests {
             assert!(guard.is_builtin_schema_exposed("weather"));
             assert!(guard.tool_specs().is_empty());
         }
-        assert!(tool.deferred_prompt_section().is_empty());
+        assert_eq!(tool.deferred_prompt_section(), prompt);
         let result = tool
             .execute(serde_json::json!({"query": "select:weather"}))
             .await
             .unwrap();
         assert_eq!(returned_schemas(&result)[0]["name"], "weather");
-        assert!(tool.deferred_prompt_section().is_empty());
+        assert_eq!(tool.deferred_prompt_section(), prompt);
     }
 
     #[tokio::test]
@@ -634,7 +630,7 @@ mod tests {
         assert_eq!(returned_schemas(&result).len(), 3);
         assert_eq!(returned_schemas(&result)[0]["name"], "weather");
         assert_eq!(seen.lock().unwrap().as_slice(), ["remote__calendar"]);
-        assert!(tool.deferred_prompt_section().is_empty());
+        assert_eq!(tool.deferred_prompt_section(), prompt);
     }
 
     #[tokio::test]
@@ -757,7 +753,7 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .is_activated("mcp__keep")
         );
-        assert!(tool.deferred_prompt_section().is_empty());
+        assert_eq!(tool.deferred_prompt_section(), prompt);
     }
 
     #[tokio::test]
