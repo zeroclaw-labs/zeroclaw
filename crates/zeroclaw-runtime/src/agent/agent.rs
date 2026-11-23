@@ -5806,15 +5806,11 @@ pub(crate) fn config_switch_provider(
     let default_api_key = target_or_current.and_then(|entry| entry.api_key.as_deref());
     let default_base_url = target_or_current.and_then(|entry| entry.uri.as_deref());
 
-    let route_api_key = config
-        .model_routes
-        .iter()
-        .find(|r| {
-            r.model_provider.eq_ignore_ascii_case(new_model_provider)
-                && (r.model.eq_ignore_ascii_case(new_model)
-                    || r.hint.eq_ignore_ascii_case(new_model))
-        })
-        .and_then(|r| r.api_key.as_deref());
+    let route_api_key = zeroclaw_config::schema::ModelRouteConfig::switch_api_key(
+        &config.model_routes,
+        new_model_provider,
+        new_model,
+    );
     let api_key = route_api_key.or(default_api_key);
 
     let runtime_options = switch_runtime_options(config, new_model_provider);

@@ -15802,6 +15802,28 @@ pub struct ModelRouteConfig {
     pub api_key: Option<String>,
 }
 
+impl ModelRouteConfig {
+    /// The route credential a live model switch to `model_provider` and
+    /// `model` uses: that of the first route in `routes` that targets the same
+    /// profile and names `model` as its model or its hint, compared ASCII
+    /// case-insensitively.
+    #[must_use]
+    pub fn switch_api_key<'a>(
+        routes: &'a [Self],
+        model_provider: &str,
+        model: &str,
+    ) -> Option<&'a str> {
+        routes
+            .iter()
+            .find(|route| {
+                route.model_provider.eq_ignore_ascii_case(model_provider)
+                    && (route.model.eq_ignore_ascii_case(model)
+                        || route.hint.eq_ignore_ascii_case(model))
+            })
+            .and_then(|route| route.api_key.as_deref())
+    }
+}
+
 // ── Model cache (shared between CLI refresh and channel reader) ──
 
 /// Canonical on-disk model cache schema. Written by `zeroclaw models refresh`
@@ -29208,6 +29230,45 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    #[::core::prelude::v1::test]
+    fn model_route_switch_api_key_matches_target_profile_and_model_or_hint() {
+        let routes = [
+            ModelRouteConfig {
+                hint: "fast".into(),
+                model_provider: "custom.other".into(),
+                model: "fast-model".into(),
+                api_key: Some("route-key".into()),
+            },
+            ModelRouteConfig {
+                hint: "plain".into(),
+                model_provider: "custom.other".into(),
+                model: "plain-model".into(),
+                api_key: None,
+            },
+        ];
+
+        assert_eq!(
+            ModelRouteConfig::switch_api_key(&routes, "custom.other", "fast-model"),
+            Some("route-key")
+        );
+        assert_eq!(
+            ModelRouteConfig::switch_api_key(&routes, "CUSTOM.OTHER", "Fast"),
+            Some("route-key")
+        );
+        assert_eq!(
+            ModelRouteConfig::switch_api_key(&routes, "custom.caller", "fast-model"),
+            None
+        );
+        assert_eq!(
+            ModelRouteConfig::switch_api_key(&routes, "custom.other", "literal-model"),
+            None
+        );
+        assert_eq!(
+            ModelRouteConfig::switch_api_key(&routes, "custom.other", "plain-model"),
+            None
+        );
+    }
+
     #[::core::prelude::v1::test]
     fn config_application_semantic_changed_paths_detects_unmasked_credentials() {
         let mut previous = Config::default();

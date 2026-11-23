@@ -3299,7 +3299,10 @@ fn apply_model_ref(
         sel.model = route.model.clone();
         sel.api_key = route.api_key.clone();
     } else {
+        // A model outside the route table is not that route's selection, so a
+        // credential left by an earlier route no longer applies.
         sel.model = model.to_string();
+        sel.api_key = None;
     }
 }
 
@@ -5422,9 +5425,14 @@ async fn handle_runtime_command_for_delivery(
                     .await
                     {
                         Ok(_) => {
-                            current.model_provider = provider_ref.clone();
-                            current.model = model;
-                            current.automatic = false;
+                            // A plain profile selection carries no route
+                            // credential; the profile's own one applies.
+                            current = ChannelRouteSelection {
+                                model_provider: provider_ref.clone(),
+                                model,
+                                automatic: false,
+                                api_key: None,
+                            };
                             set_route_selection(
                                 ctx,
                                 &sender_key,
@@ -10731,15 +10739,12 @@ async fn process_channel_message_body(
                     }
                 };
 
-                let resolved_api_key = ctx
-                    .model_routes
-                    .iter()
-                    .find(|r| {
-                        r.model_provider.eq_ignore_ascii_case(&new_model_provider)
-                            && (r.model.eq_ignore_ascii_case(&new_model)
-                                || r.hint.eq_ignore_ascii_case(&new_model))
-                    })
-                    .and_then(|r| r.api_key.clone());
+                let resolved_api_key = zeroclaw_config::schema::ModelRouteConfig::switch_api_key(
+                    &ctx.model_routes,
+                    &resolved_model_provider,
+                    &new_model,
+                )
+                .map(ToString::to_string);
 
                 match get_or_create_provider(
                     ctx.as_ref(),
@@ -33514,13 +33519,34 @@ BTC is currently around $65,000 based on latest tool output."#
     /// a test reads the model each turn actually requests on the wire.
     ///
     /// `custom.caller` is the agent's profile and pins `caller-model`;
-    /// `custom.other` pins `other-model`; `custom.nomodel` pins nothing.
+    /// `custom.other` pins `other-model`; `custom.nomodel` pins nothing. Each
+    /// profile has its own path prefix on the endpoint, so a request also shows
+    /// which profile sent it.
     struct ModelSelectionWireFixture {
         server: wiremock::MockServer,
         ctx: Arc<ChannelRuntimeContext>,
         channel: Arc<TelegramRecordingChannel>,
         startup_provider: Arc<dyn ModelProvider>,
         next_id: AtomicUsize,
+    }
+
+    /// One chat request as the provider endpoint received it: the profile path
+    /// it was sent to, the model it asked for and its `Authorization` header.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct WireCall {
+        profile: String,
+        model: String,
+        authorization: Option<String>,
+    }
+
+    impl WireCall {
+        fn per_turn(profile: &str, model: &str, authorization: Option<&str>) -> [Self; 2] {
+            std::array::from_fn(|_| Self {
+                profile: profile.to_string(),
+                model: model.to_string(),
+                authorization: authorization.map(ToString::to_string),
+            })
+        }
     }
 
     impl ModelSelectionWireFixture {
@@ -33532,44 +33558,54 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Vec<zeroclaw_config::schema::ModelRouteConfig>,
             seed_startup_provider: bool,
         ) -> Self {
-            use wiremock::matchers::{method, path};
+            Self::with_config(model_routes, seed_startup_provider, |_| {}).await
+        }
+
+        async fn with_config(
+            model_routes: Vec<zeroclaw_config::schema::ModelRouteConfig>,
+            seed_startup_provider: bool,
+            customize: impl FnOnce(&mut Config),
+        ) -> Self {
+            use wiremock::matchers::{method, path_regex};
             use wiremock::{Mock, MockServer, ResponseTemplate};
 
             let server = MockServer::start().await;
             Mock::given(method("POST"))
-                .and(path("/v1/chat/completions"))
+                .and(path_regex(r"/v1/chat/completions$"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                     "choices": [{"message": {"role": "assistant", "content": "ok"}}]
                 })))
                 .mount(&server)
                 .await;
 
-            let uri = format!("{}/v1", server.uri());
+            let base_uri = server.uri();
             let mut config: Config = toml::from_str(&format!(
                 r#"
 [providers.models.custom.caller]
-uri = "{uri}"
+uri = "{base_uri}/caller/v1"
 model = "caller-model"
 
 [providers.models.custom.other]
-uri = "{uri}"
+uri = "{base_uri}/other/v1"
 model = "other-model"
 
 [providers.models.custom.nomodel]
-uri = "{uri}"
+uri = "{base_uri}/nomodel/v1"
 "#
             ))
             .expect("fixture config must parse");
             config.model_routes = model_routes.clone();
+            customize(&mut config);
 
             // Built and cached the way channel startup builds and caches the
             // agent's provider.
+            let (startup_key, startup_uri) = provider_credentials_for_ref(&config, "custom.caller");
             let startup_provider: Arc<dyn ModelProvider> = Arc::from(
                 create_resilient_model_provider_nonblocking(
                     Arc::new(config.clone()),
                     "custom.caller",
-                    None,
-                    Some(uri.clone()),
+                    startup_key,
+                    startup_uri,
                     config.reliability.clone(),
                     zeroclaw_providers::ModelProviderRuntimeOptions::default(),
                     None,
@@ -33632,19 +33668,41 @@ uri = "{uri}"
         /// A turn sends two through its provider: the reply-intent precheck,
         /// then the reply; [`Self::per_turn`] spells that out.
         async fn requested_models(&self) -> Vec<String> {
+            self.calls()
+                .await
+                .into_iter()
+                .map(|call| call.model)
+                .collect()
+        }
+
+        /// Each chat request the endpoint received, in order.
+        async fn calls(&self) -> Vec<WireCall> {
             self.server
                 .received_requests()
                 .await
                 .expect("mock endpoint records requests")
                 .iter()
-                .filter(|request| request.url.path() == "/v1/chat/completions")
-                .map(|request| {
-                    request
+                .filter(|request| request.url.path().ends_with("/v1/chat/completions"))
+                .map(|request| WireCall {
+                    profile: request
+                        .url
+                        .path()
+                        .trim_start_matches('/')
+                        .split('/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string(),
+                    model: request
                         .body_json::<serde_json::Value>()
                         .expect("chat request body is JSON")["model"]
                         .as_str()
                         .unwrap_or_default()
-                        .to_string()
+                        .to_string(),
+                    authorization: request
+                        .headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .map(ToString::to_string),
                 })
                 .collect()
         }
@@ -33836,12 +33894,12 @@ uri = "{uri}"
 
     #[tokio::test]
     async fn channel_auth_error_evicts_the_provider_that_served_the_override() {
-        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::matchers::{body_partial_json, method, path_regex};
         use wiremock::{Mock, ResponseTemplate};
 
         let fixture = ModelSelectionWireFixture::new(Vec::new()).await;
         Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
+            .and(path_regex(r"/v1/chat/completions$"))
             .and(body_partial_json(
                 serde_json::json!({"model": "other-model"}),
             ))
@@ -33955,27 +34013,10 @@ uri = "{uri}"
         fixture.send("bob", "hello").await;
 
         let requests: Vec<(String, Option<String>)> = fixture
-            .server
-            .received_requests()
+            .calls()
             .await
-            .expect("mock endpoint records requests")
-            .iter()
-            .filter(|request| request.url.path() == "/v1/chat/completions")
-            .map(|request| {
-                (
-                    request
-                        .body_json::<serde_json::Value>()
-                        .expect("chat request body is JSON")["model"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    request
-                        .headers
-                        .get("authorization")
-                        .and_then(|value| value.to_str().ok())
-                        .map(ToString::to_string),
-                )
-            })
+            .into_iter()
+            .map(|call| (call.model, call.authorization))
             .collect();
         let route_auth = Some("Bearer route-key".to_string());
         assert_eq!(
@@ -33987,6 +34028,79 @@ uri = "{uri}"
                 ("fast-model".to_string(), route_auth),
             ],
             "selecting the profile must not pick up the credential of a route that targets it"
+        );
+    }
+
+    /// Profiles with their own credentials plus a `fast` route to `custom.other`
+    /// that carries a different one, for following one sender's credential
+    /// across selections.
+    async fn keyed_route_fixture() -> ModelSelectionWireFixture {
+        ModelSelectionWireFixture::with_config(
+            vec![zeroclaw_config::schema::ModelRouteConfig {
+                hint: "fast".into(),
+                model_provider: "custom.other".into(),
+                model: "fast-model".into(),
+                api_key: Some("route-key".into()),
+            }],
+            true,
+            |config| {
+                for (alias, key) in [("caller", "caller-key"), ("other", "other-key")] {
+                    config
+                        .providers
+                        .models
+                        .ensure("custom", alias)
+                        .expect("custom profile slot")
+                        .api_key = Some(key.into());
+                }
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn channel_literal_model_after_keyed_route_uses_profile_credential() {
+        let fixture = keyed_route_fixture().await;
+
+        fixture.send("alice", "/model fast").await;
+        fixture.send("alice", "hello").await;
+        fixture.send("alice", "/model literal-model").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            [
+                WireCall::per_turn("other", "fast-model", Some("Bearer route-key")),
+                WireCall::per_turn("other", "literal-model", Some("Bearer other-key")),
+            ]
+            .concat()
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_models_reselecting_keyed_route_profile_uses_profile_credential() {
+        let fixture = keyed_route_fixture().await;
+
+        fixture.send("alice", "/model fast").await;
+        fixture.send("alice", "/models custom.other").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            WireCall::per_turn("other", "other-model", Some("Bearer other-key"))
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_models_selecting_another_profile_drops_route_credential() {
+        let fixture = keyed_route_fixture().await;
+
+        fixture.send("alice", "/model fast").await;
+        fixture.send("alice", "/models custom.caller").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            WireCall::per_turn("caller", "caller-model", Some("Bearer caller-key"))
         );
     }
 
