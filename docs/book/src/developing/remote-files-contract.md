@@ -117,3 +117,28 @@ This slice supports local encrypted username/password, Bearer and Token credenti
 Remote Files grants now live inside the existing encrypted credential entry. The operator-only credential mutation endpoint validates the registered resource, exact HTTPS root, and credential alias. Grant-list edits require the current revision. The ordinary credential create path clears supplied grants, while compatible secret rotation can preserve existing bindings. Before network use, the dispatcher requires a persisted grant as well as the runtime's live operation authorization. The registered agent entry point remains pending. Until that integration is available, saving a grant only records operator policy.
 
 In the dashboard, the existing Add authorization action offers Remote Files (WebDAV) for compatible credentials with a registered resource. Selecting it replaces the generic URL field with the matching resource list, operation checkboxes and an optional human approval checkbox. Edit and Remove use the same revision-checked credential endpoint; edits to a WebDAV grant preserve the other consumer grants.
+
+## Shared approval contract for credential consumers
+
+The per-grant **Require human approval** setting is intended for every use in
+the authorization editor, including WebDAV, HTTP Request, Browser, SSH, and
+plugin credentials. Enabling a consumer requires an approval integration for
+its actual execution path. An unsupported consumer must reject a grant that
+requires approval rather than silently ignore the setting.
+
+Before accessing a secret, the consumer prepares a canonical request describing
+its tool, operation, credential alias, destination, and grant revision. The
+runtime sends the operator a prompt with those fields and no secret material.
+Operations involving two endpoints require a decision covering both bindings.
+For a browser authentication flow, the consumer must validate the actual origin
+of the credential submission, including the frame origin if applicable.
+
+Approval applies once to the prepared invocation. A denial, timeout, or missing
+approval channel prevents credential use. After approval, the consumer must
+reload the applicable grant and reject an invocation whose binding or revision
+changed. Tool-wide approval and auto-approval do not satisfy the per-grant
+requirement. The model cannot provide or override the approval decision.
+
+The WebDAV prototype currently holds these calls at the credential boundary.
+Sending the prompt and resuming the approved invocation, and extending this
+policy to the other consumers, are pending.
