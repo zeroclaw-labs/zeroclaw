@@ -182,6 +182,9 @@ jobs:
       - name: Test release tool installer mappings
         run: bash scripts/ci/install_release_tool.test.sh
 
+      - name: Test binary size safeguard
+        run: python3 scripts/ci/check_binary_size_test.py
+
       - name: Test crates.io publish ordering and preflight
         run: python3 scripts/release/publish_crates_test.py
 
@@ -216,6 +219,13 @@ jobs:
       - name: Test docs stable metadata promotion
         run: python3 scripts/docs/promote_stable_test.py
 
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: '.nvmrc'
+
+      - name: Test docs version selector and root 404 redirect
+        run: node --test scripts/docs/version_selector_test.mjs scripts/docs/root_404_test.mjs
+
   relay-container-smoke-changes:
     name: Detect Relay Container Smoke changes
     # Ordering note: this detector only runs `git diff` and never compiles, so it
@@ -228,8 +238,6 @@ jobs:
       run: ${{ steps.changed.outputs.run }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
       - name: Detect relay container smoke changes
         id: changed
         shell: bash
@@ -240,6 +248,8 @@ jobs:
 
           case "${{ github.event_name }}" in
             pull_request)
+              # Shallow checkout: fetch only the base commit. A two-dot diff needs no merge base.
+              git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
               git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed_files"
               ;;
             push|merge_group)
@@ -353,8 +363,6 @@ jobs:
       run: ${{ steps.changed.outputs.run }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
       - name: Detect targeted Windows Clippy changes
         id: changed
         shell: bash
@@ -365,6 +373,8 @@ jobs:
 
           case "${{ github.event_name }}" in
             pull_request)
+              # Shallow checkout: fetch only the base commit. A two-dot diff needs no merge base.
+              git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
               git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed_files"
               ;;
             push|merge_group)
@@ -426,8 +436,6 @@ jobs:
       windows_service: ${{ steps.select.outputs.windows_service }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
       - name: Test Windows scope contracts
         run: |
           bash scripts/ci/windows_recovery_change_filter.test.sh
@@ -447,7 +455,9 @@ jobs:
           changed_files="$(mktemp)"
           metadata_file="$(mktemp)"
           if [[ "$EVENT_NAME" == pull_request ]]; then
-            if ! git diff --name-only "$BASE_SHA" HEAD > "$changed_files"; then
+            # Shallow checkout: fetch only the base commit. A two-dot diff needs no merge base.
+            if ! git fetch --no-tags --depth=1 origin "$BASE_SHA" \
+              || ! git diff --name-only "$BASE_SHA" HEAD > "$changed_files"; then
               # Discard partial evidence so it cannot authorize a skip.
               : > "$changed_files"
             fi
@@ -612,6 +622,12 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Test Windows prebuilt verification (PowerShell 5.1)
+        shell: powershell
+        run: ./scripts/ci/windows_prebuilt.test.ps1
+      - name: Test Windows prebuilt verification (PowerShell 7)
+        shell: pwsh
+        run: ./scripts/ci/windows_prebuilt.test.ps1
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.98.0
@@ -1563,6 +1579,13 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # The root package enables runtime/test-util in its dev-dependencies.
+      # Select only the external consumer to exercise its public API contract.
+      - name: Test runtime composition as an external consumer
+        run: cargo test --locked -p runtime-composition-consumer
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
       # The crate's default feature set excludes the host-side hardware
       # modules. Compile-only `ci-all` coverage cannot exercise their process,
       # timeout, cleanup, and validation regressions.
@@ -1812,8 +1835,6 @@ jobs:
       scope: ${{ steps.changed.outputs.scope }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
       - name: Test parallel runtime scope classifier
         run: bash scripts/ci/parallel_runtime_test_scope.test.sh
       - name: Detect parallel runtime test changes
@@ -1825,6 +1846,8 @@ jobs:
           case "${{ github.event_name }}" in
             pull_request)
               changed_files="$(mktemp)"
+              # Shallow checkout: fetch only the base commit. A two-dot diff needs no merge base.
+              git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
               git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed_files"
               if scope="$(bash scripts/ci/parallel_runtime_test_scope.sh < "$changed_files")"; then
                 echo "run=true" >> "$GITHUB_OUTPUT"
@@ -1976,8 +1999,6 @@ jobs:
       web: ${{ steps.filter.outputs.web }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
       - name: Classify changed paths
         id: filter
         shell: bash
@@ -2000,6 +2021,8 @@ jobs:
           esac
 
           changed="$(mktemp)"
+          # Shallow checkout: fetch only the base commit. A two-dot diff needs no merge base.
+          git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
           git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed"
 
           emit() {
@@ -2130,6 +2153,8 @@ jobs:
         run: cargo generate installers --check
       - name: Check source-backed SOP syntax reference
         run: cargo generate sop-syntax --check
+      - name: Check the OpenRPC contract matches zeroclaw-rpc-proto
+        run: cargo generate openrpc --check
       - name: Resolve canonical all-feature selection
         id: all_features
         run: |
@@ -2179,6 +2204,12 @@ jobs:
       - name: Run SOP editor regressions
         working-directory: web
         run: npm run test:sop-editor
+      - name: Voice tests
+        working-directory: web
+        run: npm run test:voice
+      - name: Run dashboard sign-in regressions
+        working-directory: web
+        run: npm run test:auth
 
   # ── Required gate ─────────────────────────────────────────────────────────
   # Branch protection requires only this single job — internal structure

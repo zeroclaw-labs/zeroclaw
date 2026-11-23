@@ -1,6 +1,7 @@
 use crate::security::SecurityPolicy;
 use anyhow::{Result, bail};
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
+use zeroclaw_config::policy::{CommandShell, ShellTarget};
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
 mod schedule;
@@ -15,9 +16,6 @@ pub mod scheduler;
 pub use schedule::{
     next_run_for_schedule, normalize_expression, schedule_cron_expression, validate_schedule,
 };
-pub(crate) use store::finish_agent_claim;
-#[cfg(test)]
-pub(crate) use store::force_release_failure_for_tests;
 #[allow(unused_imports)]
 pub use store::{
     RunOutcomes, RunProvenance, add_agent_job, all_overdue_jobs, claim_job, claim_job_for_agent,
@@ -27,6 +25,12 @@ pub use store::{
     remove_job_for_agent, remove_jobs_by_agent, rename_jobs_by_agent, reschedule_after_run,
     reschedule_after_run_with_status, resolve_job_id_or_name, skip_missed_run,
     sync_declarative_jobs, update_job, update_job_for_agent,
+};
+pub(crate) use store::{finish_agent_claim, update_job_authorized};
+#[cfg(test)]
+pub(crate) use store::{
+    force_release_failure_for_tests, notify_patch_writer_wait_for_test,
+    reset_write_connection_count_for_tests, write_connection_count_for_tests,
 };
 pub use types::{
     CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
@@ -85,7 +89,11 @@ pub fn validate_shell_command(
 }
 
 /// Validate a shell command using an existing `SecurityPolicy` instance.
-/// Preferred when the caller already holds a `SecurityPolicy` (e.g. scheduler).
+/// Preferred when the caller already holds a `SecurityPolicy`.
+///
+/// This is the check made when a job is written, not run, so a POSIX command
+/// is read in the grammar every POSIX shell shares. The scheduler rechecks a
+/// job about to run in the grammar of the shell that will run it.
 pub fn validate_shell_command_with_security(
     runtime: &dyn RuntimeAdapter,
     security: &SecurityPolicy,
@@ -95,16 +103,35 @@ pub fn validate_shell_command_with_security(
     security
         .validate_command_execution_for_shell(command, approved, runtime.shell_dialect())
         .map(|_| ())
-        .map_err(|reason| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"reason": reason.to_string()})),
-                "cron shell command rejected by security policy"
-            );
-            anyhow::Error::msg(format!("blocked by security policy: {reason}"))
-        })
+        .map_err(rejected_shell_command)
+}
+
+/// Recheck a shell job the scheduler is about to run, in the grammar of the
+/// program `runtime` will resolve on the daemon's `PATH`. Nothing is built.
+/// The returned grammar is the one to scan paths in and to hold the built
+/// program to.
+pub(crate) fn validate_shell_command_for_run(
+    runtime: &dyn RuntimeAdapter,
+    security: &SecurityPolicy,
+    command: &str,
+    approved: bool,
+) -> Result<CommandShell> {
+    let shell = security.command_shell(ShellTarget::of(runtime, None));
+    security
+        .validate_command_execution_in(command, approved, shell)
+        .map(|_| shell)
+        .map_err(rejected_shell_command)
+}
+
+fn rejected_shell_command(reason: String) -> anyhow::Error {
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({"reason": reason.to_string()})),
+        "cron shell command rejected by security policy"
+    );
+    anyhow::Error::msg(format!("blocked by security policy: {reason}"))
 }
 
 pub(crate) fn add_shell_job_with_runtime(
@@ -118,34 +145,7 @@ pub(crate) fn add_shell_job_with_runtime(
     delivery: Option<DeliveryConfig>,
     approved: bool,
 ) -> Result<CronJob> {
-    add_shell_job_with_runtime_and_format(
-        config,
-        runtime,
-        security,
-        agent_alias,
-        name,
-        schedule,
-        command,
-        delivery,
-        approved,
-        CronShellOutputFormat::default(),
-    )
-}
-
-fn add_shell_job_with_runtime_and_format(
-    config: &Config,
-    runtime: &dyn RuntimeAdapter,
-    security: &SecurityPolicy,
-    agent_alias: &str,
-    name: Option<String>,
-    schedule: Schedule,
-    command: &str,
-    delivery: Option<DeliveryConfig>,
-    approved: bool,
-    shell_output_format: CronShellOutputFormat,
-) -> Result<CronJob> {
     validate_shell_command_with_security(runtime, security, command, approved)?;
-    validate_delivery_config(delivery.as_ref())?;
     store::add_shell_job_with_format(
         config,
         agent_alias,
@@ -153,7 +153,8 @@ fn add_shell_job_with_runtime_and_format(
         schedule,
         command,
         delivery,
-        shell_output_format,
+        CronShellOutputFormat::default(),
+        || Ok(()),
     )
 }
 
@@ -218,12 +219,8 @@ pub fn add_shell_job_with_approval_and_format(
     approved: bool,
     shell_output_format: CronShellOutputFormat,
 ) -> Result<CronJob> {
-    let security = SecurityPolicy::for_agent(config, agent_alias)?;
-    let runtime = crate::platform::create_runtime(&config.runtime)?;
-    add_shell_job_with_runtime_and_format(
+    add_shell_job_authorized(
         config,
-        runtime.as_ref(),
-        &security,
         agent_alias,
         name,
         schedule,
@@ -231,6 +228,33 @@ pub fn add_shell_job_with_approval_and_format(
         delivery,
         approved,
         shell_output_format,
+        || Ok(()),
+    )
+}
+
+/// Check the shell policy before opening storage and acquire the caller's
+/// authority after SQLite grants the writer. The guard spans the insert and commit.
+pub(crate) fn add_shell_job_authorized<G>(
+    config: &Config,
+    agent_alias: &str,
+    name: Option<String>,
+    schedule: Schedule,
+    command: &str,
+    delivery: Option<DeliveryConfig>,
+    approved: bool,
+    shell_output_format: CronShellOutputFormat,
+    authorize: impl FnOnce() -> Result<G>,
+) -> Result<CronJob> {
+    validate_shell_command(config, agent_alias, command, approved)?;
+    store::add_shell_job_with_format(
+        config,
+        agent_alias,
+        name,
+        schedule,
+        command,
+        delivery,
+        shell_output_format,
+        authorize,
     )
 }
 

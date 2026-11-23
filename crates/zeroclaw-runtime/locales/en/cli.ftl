@@ -2,6 +2,9 @@ cli-about = The fastest, smallest AI assistant.
 cli-no-command-provided = No command provided.
 cli-try-quickstart = Try `zeroclaw quickstart` to create your first agent.
 
+cli-tool-file-read-directory = Cannot read a directory as a file. Specify a file path.
+cli-tool-file-read-failed = Failed to read file: {$error}
+
 cli-quickstart-about = Create your first agent end-to-end
 cli-agent-about = Start the AI agent loop
 cli-gateway-about = Manage the gateway server (webhooks, websockets)
@@ -10,7 +13,7 @@ cli-daemon-about = Start the long-running autonomous daemon
 cli-service-about = Manage OS service lifecycle (launchd/systemd user service)
 cli-doctor-about = Run diagnostics for daemon/scheduler/channel freshness
 cli-status-about = Show system status (full details)
-cli-estop-about = Engage, inspect, and resume emergency-stop states
+cli-estop-about = Emergency stop (not enforced: every form of this command refuses to run)
 cli-cron-about = Configure and manage scheduled tasks
 cli-models-about = Manage provider model catalogs
 cli-providers-about = List supported AI providers
@@ -181,6 +184,7 @@ cli-oidc-token-expiry = The token expires in { $seconds } seconds.
 cli-oidc-browser-open = Opening your browser to sign in. If nothing opens, visit:
     { $uri }
 cli-oidc-browser-waiting = Waiting for the browser sign-in to complete...
+cli-oidc-browser-start-failed = could not start sign-in
 cli-auth-list-about = List auth profiles
 cli-auth-status-about = Show auth status with active profile and token expiry info
 
@@ -190,8 +194,8 @@ cli-memory-stats-about = Show memory backend statistics and health
 cli-memory-clear-about = Clear memories by category, by key, or clear all
 cli-memory-clear-unsupported-backend = memory clear is unsupported for append-only backend '{$backend}'; switch to a deletable backend (sqlite, lucid, or postgres)
 
-cli-estop-status-about = Print current estop status
-cli-estop-resume-about = Resume from an engaged estop level
+cli-estop-status-about = Not enforced: refuses to run
+cli-estop-resume-about = Not enforced: refuses to run
 
 cli-models-refresh-about = Refresh and cache provider models
 cli-models-list-about = List cached models for a provider
@@ -709,7 +713,7 @@ cli-quickstart-terminal-too-narrow = Quickstart needs a terminal at least {$min_
 cli-quickstart-terminal-too-short = Quickstart needs a terminal at least {$min_height} rows tall; the current terminal is {$height} rows. Make the terminal taller and try again.
 cli-quickstart-terminal-resized = The terminal changed from {$initial_width}x{$initial_height} to {$current_width}x{$current_height} while the Quickstart checklist was open. Reopen the checklist to continue.
 cli-quickstart-empty-checklist = Quickstart cannot open an empty checklist.
-cli-quickstart-cancelled = Quickstart cancelled. No config written.
+cli-quickstart-cancelled = Quickstart cancelled. Nothing was configured.
 cli-quickstart-incomplete = {"  "}Not all selectors are filled yet.
 cli-quickstart-create-agent = ── Create agent
 cli-quickstart-create-agent-locked = ── Create agent (locked — fill every selector first)
@@ -1031,7 +1035,7 @@ cli-status-spent-today = {"  "}Spent today:       ${$spent} / ${$limit}
 cli-status-spent-month = {"  "}Spent this month:  ${$spent} / ${$limit}
 cli-status-pricing-unavailable = {"  "}⚠ Pricing unavailable for {$count} model(s) ({$tokens} tokens uncosted): {$models}. Recorded spend is understated and daily/monthly caps CANNOT be enforced for these. Add pricing to the active provider profile or supply a catalog entry.
 cli-status-otp = {"  "}OTP enabled:       {$v}
-cli-status-estop = {"  "}E-stop enabled:    {$v}
+cli-status-estop = {"  "}E-stop enabled:    {$v} (not enforced)
 cli-status-peripherals-enabled = {"  "}Enabled:   {$v}
 cli-status-boards = {"  "}Boards:    {$v}
 cli-status-word-enabled = enabled
@@ -1111,8 +1115,28 @@ cli-config-section-degraded-executable = warning: config section `{$section}` in
 cli-plugin-list-entry-loads = {$name} v{$version} — {$description} [loads]
 cli-plugin-list-entry-failed = {$name} v{$version} — {$description} [does not load: {$error}]
 cli-plugin-list-entry-no-component = {$name} v{$version} — {$description} [no component to load]
-cli-config-section-retired-wati = warning: retired WATI channel config section `{$section}` is ignored because WATI support was removed. Migrate to `[channels.whatsapp.<alias>]` using the Cloud API or WhatsApp Web, then revoke the unused WATI API token.
-cli-config-section-retired-node-transport = warning: retired `[node_transport]` config is ignored because the legacy HMAC node transport was removed. Delete the section from config.toml.
+cli-config-migration-assumed-v1 = warning: {$path} has no `schema_version`, so it was read as schema V1 and migrated from there. The V1 migration reshapes sections written for a newer version: provider entries can end up nested one level too deep, and channel sections are merged into a `default` alias. If this file was written for a newer ZeroClaw, add `schema_version` at the top with the version it was written for (restore the `.backup` copy first if `zeroclaw config migrate` already rewrote it).
+cli-config-retired-key-removed = warning: dropped retired config key `{$key}` from {$path}: {$reason}
+cli-config-capped-key-lowered = warning: lowered config key `{$key}` in {$path} to its maximum: {$reason}
+cli-config-capped-reason-pairing-code-ttl = a pairing code stays redeemable for at most 600 seconds (10 minutes)
+cli-config-retired-reason-nevis = the Nevis IAM integration was removed; configure `[oidc.<alias>]` with `[users]` and `[permission_profiles]` instead
+cli-config-retired-reason-agent-tunable = agent-inline runtime tunables are no longer read; runtime profiles are authoritative, so set this key on the agent's `[runtime_profiles.<profile>]` instead
+cli-config-retired-reason-summary-model = the deprecated bare model id had no provider identity and was never read; `summary_provider` replaced it (context compression itself is not currently implemented in the runtime)
+cli-config-retired-reason-node-transport = the legacy HMAC node transport was removed
+cli-config-retired-reason-wati = WATI support was removed; migrate to `[channels.whatsapp.<alias>]` using the Cloud API or WhatsApp Web, then revoke the unused WATI API token
+cli-config-retired-reason-twitter = a top-level `[twitter]` section is not read; configure the Twitter channel as `[channels.twitter.<alias>]`
+cli-config-retired-reason-reddit = a top-level `[reddit]` section is not read; configure the Reddit channel as `[channels.reddit.<alias>]`
+cli-config-retired-reason-notion = a `[channels.notion]` table is not read; Notion is configured in the top-level `[notion]` section, whose database poller is the `notion` channel
+cli-config-retired-reason-pairing-code-length = the dashboard no longer has its own pairing-code length; `[gateway.pairing_code]` `length` sets it for every pairing surface
+cli-config-retired-reason-swarms = swarms were removed in V3
+cli-config-retired-reason-global-fallback = the global fallback lists were removed in V3; set `fallback` on each `[providers.models.<type>.<alias>]` instead
+cli-config-retired-reason-tts-default = there is no global default TTS provider; set `tts_provider` on each `[agents.<alias>]` instead
+cli-config-retired-reason-global-transcription = there is no global default transcription provider; set `transcription_provider` on each `[agents.<alias>]` instead
+cli-config-retired-reason-identity = identity is set per agent; move it to `[agents.<alias>.identity]`
+cli-config-retired-reason-pairing-max-pending = the gateway keeps one pending pairing code at a time, and issuing a new code cancels the previous one
+cli-config-migration-inferred-v3 = warning: {$path} has no `schema_version`, but its sections are in the V3 format, so it was read as schema V3 and migrated from there. Run `zeroclaw config migrate` to write the current `schema_version` into the file.
+cli-config-env-override-retired = warning: ignored `{$variable}`, which sets a retired config key: {$reason}
+cli-config-migration-pending = warning: these changes apply to this run only. Run `zeroclaw config migrate` to write them to {$path}.
 cli-plugin-removed = Plugin '{$name}' removed.
 cli-plugin-removed-grant-kept = Its config entry '{$key}' is kept, with its egress grant ({$grants}): a package installed later as '{$name}' inherits it. Delete the [[plugins.entries]] row named '{$key}' to drop the grant.
 cli-plugin-removed-binding-kept = The channel binding plugin.{$alias} still names '{$name}'. It stays inert until a package of that name is installed again; remove the {$table} table to drop it.
@@ -1191,6 +1215,7 @@ cli-plugin-update-restart = Restart the daemon so plugin instances it has alread
 cli-plugin-update-failed-exit = {$count} plugin(s) not updated.
 cli-estop-resume-done = Estop resume completed.
 cli-estop-engaged = Estop engaged.
+cli-estop-not-enforced = `zeroclaw estop` is not enforced: no running agent, daemon, or tool reads the estop state file, so engaging it would not stop anything. The estop state was not changed. To halt the agent now, stop the ZeroClaw process itself.
 cli-estop-status = Estop status:
 cli-auth-none = No auth profiles configured.
 cli-auth-active = Active profiles:
@@ -1211,6 +1236,7 @@ model-switch-catalog-failed = Could not load catalog for configured provider pro
 model-switch-provider-not-allowed = Model switch to {$provider} is not allowed by the active effort-routing policy.
 model-switch-route-selector-not-allowed = Model ID cannot be a route selector; provide a provider-local model ID.
 cli-config-backed-up = Backed up to {$path}
+cli-config-kept-original = Kept the schema V{$version} original as {$path}, readable only by you. It is never replaced, and it still holds any secrets the migration removed; delete it once you no longer need to go back to an older ZeroClaw.
 cli-plugin-name-version = Plugin: {$name} v{$version}
 cli-plugin-description = Description: {$desc}
 cli-plugin-capabilities = Capabilities: {$v}
@@ -1292,6 +1318,9 @@ cli-channels-build-hint = {"  "}Build from source with `./install.sh --source --
 cli-channels-start-hint = To start channels: zeroclaw channel start
 cli-channels-doctor-hint = To check health:    zeroclaw channel doctor
 cli-channels-configure-hint = To configure:      zeroclaw config set channels.<name>.<field>=<value>
+# Refusal when a cron announcement or one-off send names a channel instance
+# whose `enabled` is false. `table` is the config table (`lark` for Feishu).
+cli-channels-delivery-disabled = [channels.{$table}.{$alias}] is disabled; set enabled = true to deliver
 
 cli-models-set-ok = Default model set to "{ $model }" on { $provider }.
 cli-models-status-current = Default model: { $model } (provider: { $provider })
@@ -1549,6 +1578,8 @@ cli-daemon-started-stop = Ctrl+C or SIGTERM to stop
 cli-relay-rotation-requested = Requested a relay node-id rotation. A running daemon will rotate within ~{$secs}s; the new id reaches clients in-band on their next certificate renewal.
 cli-relay-claim-ok = Daemon claimed as node-id {$node_id} on relay {$relay}. Wrote [relay] to your config; start (or restart) the daemon to register against the relay.
 cli-relay-claim-wss-disabled = Note: [wss] is disabled, and the relay refuses registration until it is enabled. The claim above is saved and stays valid - enable the WSS listener (see the secure-transport guide) and the binding takes effect on the next start.
+cli-relay-dashboard-no-gateway = [relay.dashboard] is enabled, but this build has no gateway to serve the dashboard. Use a build with the `gateway` feature, or disable [relay.dashboard].
+cli-relay-dashboard-bad-origin = [relay.dashboard] domain and port must form the dashboard's HTTPS origin
 cli-mtls-issued-client-cert = Issued client certificate for '{$name}':
 cli-mtls-issued-cert-path = {"  "}cert: {$path}
 cli-mtls-issued-key-path = {"  "}key:  {$path}
@@ -1625,10 +1656,12 @@ cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is inv
 cli-doctor-degraded-section = config section `{$path}` is malformed and was reset to defaults; values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-doctor-verifiable-intent-tool-withheld = verifiable_intent.enabled is set, but the vi_verify tool is withheld from the model-visible registry until a credential chain verifier exists. Enabling the section does not enable credential verification on commerce tool calls. The issuance and verification library paths are unaffected.
 cli-doctor-security-audit-disabled-drops-certificate-record = security.audit.enabled=false: certificates are issued and renewed with no audit record. Command execution is not audited either way, because no production path records tool commands. Leave the section enabled to keep the certificate trail, and use an external supervisor or logging wrapper that observes the ZeroClaw process, or OS-level process accounting, if you need a record of what ran.
+cli-doctor-dead-delegate-grants = Delegate grants at {$path} can never run: the agent's risk profile forbids delegation (delegation_policy.mode) or blocks the `delegate` tool (allowed_tools, deny_all_tools or excluded_tools). Allow delegation in that profile or remove the grants.
 sop-approval-deferred-at-capacity = Approval could not resume run {$run_id}: execution slots are full. The gate remains waiting; retry after a slot frees.
 sop-approval-policy-unavailable = Approval failed because the parked SOP step is unavailable: {$reason}. The run remains waiting.
 sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current state.
 sop-rpc-decision-unauthorized = The RPC principal is not authorized to resolve this SOP step.
+sop-rpc-principal-ceiling-required = Procedure execution requires an administrator until headless steps preserve the caller's principal restrictions.
 sop-rpc-policy-missing = SOP approval policy '{$name}' is not configured.
 sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
 
@@ -1636,6 +1669,12 @@ sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
 tool-runtime-command-build-failed = Failed to build runtime command: {$error}
 tool-runtime-command-docker-workspace-path = Failed to build runtime command: Failed to canonicalize Docker workspace path {$path}: {$cause}
 tool-runtime-command-docker-allowed-root = Failed to build runtime command: Failed to canonicalize Docker workspace root {$path}: {$cause}
+
+# ── Shell tool failure labels (user-facing ToolComplete.error) ──
+tool-shell-exit-status = exit status { $code }
+tool-shell-killed-by-signal = killed by signal { $signal }
+tool-shell-exited-unsuccessfully = exited unsuccessfully
+tool-shell-failure-with-detail = { $status }: { $detail }
 
 # ── Terminal tool approval ──
 # The ASCII shortcut tokens stay aligned with the Rust-owned response parser.
@@ -1709,18 +1748,30 @@ rpc-auth-alias-not-entitled = Principal is not entitled to the requested agent
 rpc-auth-misconfigured = Authentication is misconfigured on this daemon (fail closed)
 rpc-auth-local-roster-required = A local user roster is configured: connect from a mapped uid or present auth_token in initialize
 rpc-auth-remote-token-required = Remote connections must present auth_token in initialize
+rpc-auth-inproc-token-required = In-process connections must present auth_token in initialize
 rpc-auth-first-call-initialize = First call must be 'initialize'
 rpc-auth-revalidation-due = Credential revalidation due: re-initialize to revalidate
 rpc-auth-pairing-revoked = Pairing token revoked: re-pair and re-initialize
 
 cron-agent-job-failed = The scheduled task could not be completed. Please try again or ask an administrator to check the logs.
 
+# Principal-owned delegation
+delegate-owned-background-unavailable = Background delegation and task management are unavailable in principal-owned sessions until task results enforce principal ownership. Use synchronous delegation instead.
+
 # Atomic RPC configuration batches
 rpc-config-set-many-empty = config/set-many requires at least one entry in `sets`
 rpc-config-set-many-limit = config/set-many accepts at most { $limit } entries in `sets`; got { $count }
 rpc-config-set-many-entry-rejected = config/set-many entry { $index } (`{ $prop }`) rejected; nothing was saved: { $reason }
+rpc-cron-agent-principal-required = Agent cron jobs do not carry principal restrictions; only administrators may modify or trigger them.
+cron-rpc-requested-agent-forbidden = The principal is not entitled to the requested agent.
 
 skill-http-request-timeout = HTTP request timed out
+sop-store-busy = SOP storage is busy or unavailable; retry the request.
+sop-store-nonblocking-unavailable = SOP storage cannot provide immediate access; this request was refused.
+sop-rpc-definition-unavailable = The procedure definition is no longer available.
+cli-sop-run-unavailable = SOP run unavailable in this session.
+cli-sop-step-owner-principal-mismatch = SOP step refused: this run belongs to a different principal than the one this turn's capabilities act for.
+cli-sop-step-owner-memory-unavailable = SOP step failed: the memory of this run's owner is unavailable ({ $error }).
 
 # Result-aware Agent loop recovery
 turn-repeated-success-advisory = The same tool call returned the same successful result repeatedly. Reconsider whether another call will help. Polling may continue when needed.

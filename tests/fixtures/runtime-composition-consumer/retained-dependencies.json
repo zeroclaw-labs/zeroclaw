@@ -25,6 +25,10 @@
       "owner": "crates/zeroclaw-runtime/src/relay.rs",
       "reason": "Existing daemon relay bridge imports control/data framing, connection-window and rate-limit types at crates/zeroclaw-runtime/src/relay.rs:34. The relay bridge and its connection/cancellation lifecycle remain runtime-owned."
     },
+    "zeroclaw-rpc-proto": {
+      "owner": "crates/zeroclaw-runtime/src/rpc/types.rs",
+      "reason": "The daemon RPC wire contract moved out of the runtime: rpc/types.rs:12 re-exports its request, response and notification types, and rpc/dispatch.rs:42 re-exports Method, RPC_PROTOCOL_VERSION and the notification names, so runtime::rpc paths keep resolving. The crate is serde data with no runtime dependency; dispatch, method authorization, transports and session state stay runtime-owned, and the edge supplies no adapter selection authority."
+    },
     "zeroclaw-commands": {
       "owner": "crates/zeroclaw-runtime/src/rpc/dispatch.rs",
       "reason": "Existing RPC command catalogue imports CommandSurface and commands_for_surface at crates/zeroclaw-runtime/src/rpc/dispatch.rs:34 and projects the TUI catalogue into InitializeResult at :3707. This catalogue owner is distinct from provider/memory/tool selection."

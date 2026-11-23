@@ -29,7 +29,7 @@ async fn relay_claim_binary_writes_config_on_success() {
     let config_dir = tempfile::tempdir().expect("temporary config directory");
     std::fs::write(
         config_dir.path().join("config.toml"),
-        "schema_version = 3\n",
+        "schema_version = 4\n",
     )
     .expect("seed config");
 
@@ -95,7 +95,7 @@ async fn relay_claim_binary_refuses_cleartext_non_loopback_control() {
     let config_dir = tempfile::tempdir().expect("temporary config directory");
     std::fs::write(
         config_dir.path().join("config.toml"),
-        "schema_version = 3\n",
+        "schema_version = 4\n",
     )
     .expect("seed config");
     let before = std::fs::read_to_string(config_dir.path().join("config.toml")).unwrap();
