@@ -278,3 +278,6 @@ pub mod task_ssh_broker;
 pub fn unsupported_task_ssh_message() -> String {
     i18n::get_required_tool_string("tool-ssh-task-unsupported")
 }
+
+#[cfg(feature = "portable-ssh")]
+pub mod portable_ssh_auth;

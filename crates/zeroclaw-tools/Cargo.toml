@@ -46,6 +46,7 @@ serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 sha2 = "0.10"
 ring = "0.17"
+russh = { version = "=0.65.4", optional = true, default-features = false, features = ["ring", "rsa"] }
 data-encoding = "2"
 sys-locale.workspace = true
 tempfile = "3.26"
@@ -75,6 +76,7 @@ libc = "0.2"
 
 [features]
 default = []
+portable-ssh = ["dep:russh"]
 browser-native = ["tools-external", "dep:fantoccini"]
 tools-external = ["zeroclaw-config/tools-external"]
 probe = ["dep:probe-rs"]
