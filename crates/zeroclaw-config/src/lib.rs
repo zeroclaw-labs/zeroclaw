@@ -70,3 +70,4 @@ pub(crate) fn capture_log_events() -> tokio::sync::broadcast::Receiver<serde_jso
 }
 
 pub mod ssh_auth_profile;
+pub mod ssh_auth_sequence;
