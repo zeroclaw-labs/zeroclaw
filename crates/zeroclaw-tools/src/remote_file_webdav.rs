@@ -98,12 +98,46 @@ impl WebDavRead {
         authorization: Option<HeaderValue>,
     ) -> Result<WebDavResourceKind, WebDavError> {
         let url = resource_url(&self.root, path)?;
+        let body = self.properties(url.clone(), "0", authorization).await?;
+        parse_resource_kind(&body, &url)
+    }
+
+    /// List immediate children of an authorized directory. None selects the
+    /// registered root. Results are bounded and never followed as URLs.
+    pub async fn list_directory(
+        &self,
+        path: Option<&str>,
+        authorization: Option<HeaderValue>,
+        limit: usize,
+    ) -> Result<WebDavDirectoryListing, WebDavError> {
+        if !(1..=1024).contains(&limit) {
+            return Err(WebDavError::InvalidProperties);
+        }
+        let mut url = match path {
+            Some(path) => resource_url(&self.root, path)?,
+            None => self.root.clone(),
+        };
+        if !url.path().ends_with('/') {
+            url.path_segments_mut()
+                .map_err(|()| WebDavError::InvalidEndpoint)?
+                .push("");
+        }
+        let body = self.properties(url.clone(), "1", authorization).await?;
+        parse_directory_listing(&body, &url, limit)
+    }
+
+    async fn properties(
+        &self,
+        url: Url,
+        depth: &'static str,
+        authorization: Option<HeaderValue>,
+    ) -> Result<Vec<u8>, WebDavError> {
         let method = Method::from_bytes(b"PROPFIND").map_err(|_| WebDavError::Transport)?;
         let request = self
             .client
-            .request(method, url.clone())
+            .request(method, url)
             .timeout(Duration::from_secs(30))
-            .header("Depth", "0")
+            .header("Depth", depth)
             .header(
                 reqwest::header::CONTENT_TYPE,
                 "application/xml; charset=utf-8",
@@ -122,7 +156,7 @@ impl WebDavRead {
             }
             body.extend_from_slice(&chunk);
         }
-        parse_resource_kind(&body, &url)
+        Ok(body)
     }
 
     pub async fn file_size(
@@ -538,7 +572,96 @@ pub enum WebDavResourceKind {
 
 /// Parse the narrow Depth: 0 response profile used by the adapter. Refuse
 /// ambiguous resources, foreign properties, and extra propstat results.
+#[derive(Debug, Eq, PartialEq)]
+pub struct WebDavDirectoryEntry {
+    pub name: String,
+    pub kind: WebDavResourceKind,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct WebDavDirectoryListing {
+    pub entries: Vec<WebDavDirectoryEntry>,
+    pub truncated: bool,
+}
+
+fn parse_directory_listing(
+    xml: &[u8],
+    directory: &Url,
+    limit: usize,
+) -> Result<WebDavDirectoryListing, WebDavError> {
+    let mut names = std::collections::BTreeSet::new();
+    let mut entries = Vec::new();
+    let mut found_directory = false;
+    let mut truncated = false;
+    for (href, kind) in parse_property_responses(xml)? {
+        let url = directory
+            .join(&href)
+            .map_err(|_| WebDavError::InvalidProperties)?;
+        if url.origin() != directory.origin()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(WebDavError::InvalidProperties);
+        }
+        let path = url.path();
+        let base = directory.path();
+        if path == base || path == base.trim_end_matches('/') {
+            if found_directory || kind != WebDavResourceKind::Collection {
+                return Err(WebDavError::InvalidProperties);
+            }
+            found_directory = true;
+            continue;
+        }
+        let child = path
+            .strip_prefix(base)
+            .ok_or(WebDavError::InvalidProperties)?;
+        let child = if kind == WebDavResourceKind::Collection {
+            child.strip_suffix('/').unwrap_or(child)
+        } else {
+            child
+        };
+        // The common path contract supports portable ASCII names and spaces.
+        let name = child.replace("%20", " ");
+        if child.contains('/') || !is_relative_resource_path(&name) || !names.insert(name.clone()) {
+            return Err(WebDavError::InvalidProperties);
+        }
+        if entries.len() == limit {
+            truncated = true;
+        } else {
+            entries.push(WebDavDirectoryEntry { name, kind });
+        }
+    }
+    if !found_directory {
+        return Err(WebDavError::InvalidProperties);
+    }
+    Ok(WebDavDirectoryListing { entries, truncated })
+}
+
 fn parse_resource_kind(xml: &[u8], target: &Url) -> Result<WebDavResourceKind, WebDavError> {
+    let responses = parse_property_responses(xml)?;
+    let [(href, kind)] = responses.as_slice() else {
+        return Err(WebDavError::InvalidProperties);
+    };
+    let resolved = target
+        .join(href)
+        .map_err(|_| WebDavError::InvalidProperties)?;
+    // Servers commonly append a slash to a collection's href.
+    let mut expected = target.clone();
+    if *kind == WebDavResourceKind::Collection && resolved.path().ends_with('/') {
+        expected
+            .path_segments_mut()
+            .map_err(|()| WebDavError::InvalidProperties)?
+            .push("");
+    }
+    if resolved != expected {
+        return Err(WebDavError::InvalidProperties);
+    }
+    Ok(*kind)
+}
+
+fn parse_property_responses(xml: &[u8]) -> Result<Vec<(String, WebDavResourceKind)>, WebDavError> {
     use quick_xml::{NsReader, events::Event, name::ResolveResult};
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -559,7 +682,7 @@ fn parse_resource_kind(xml: &[u8], target: &Url) -> Result<WebDavResourceKind, W
     reader.config_mut().expand_empty_elements = true;
     let mut stack = Vec::new();
     let mut completed = false;
-    let mut saw_response = false;
+    let mut responses = Vec::new();
     let mut saw_propstat = false;
     let mut href = None;
     let mut status = None;
@@ -576,10 +699,7 @@ fn parse_resource_kind(xml: &[u8], target: &Url) -> Result<WebDavResourceKind, W
                 }
                 let next = match (stack.last(), tag.local_name().as_ref()) {
                     (None, b"multistatus") if !completed => MultiStatus,
-                    (Some(MultiStatus), b"response") if !saw_response => {
-                        saw_response = true;
-                        Response
-                    }
+                    (Some(MultiStatus), b"response") => Response,
                     (Some(Response), b"href") if href.is_none() => Href,
                     (Some(Response), b"propstat") if !saw_propstat => {
                         saw_propstat = true;
@@ -604,6 +724,17 @@ fn parse_resource_kind(xml: &[u8], target: &Url) -> Result<WebDavResourceKind, W
                         WebDavResourceKind::File
                     })
                 }
+                Response => {
+                    if status.take() != Some(true) {
+                        return Err(WebDavError::InvalidProperties);
+                    }
+                    responses.push((
+                        href.take().ok_or(WebDavError::InvalidProperties)?,
+                        kind.take().ok_or(WebDavError::InvalidProperties)?,
+                    ));
+                    collection = false;
+                    saw_propstat = false;
+                }
                 MultiStatus => completed = true,
                 _ => {}
             },
@@ -627,23 +758,10 @@ fn parse_resource_kind(xml: &[u8], target: &Url) -> Result<WebDavResourceKind, W
         }
     }
 
-    let kind = kind.ok_or(WebDavError::InvalidProperties)?;
-    let href = href.ok_or(WebDavError::InvalidProperties)?;
-    let resolved = target
-        .join(&href)
-        .map_err(|_| WebDavError::InvalidProperties)?;
-    // Servers commonly append a slash to a collection's href.
-    let mut expected = target.clone();
-    if kind == WebDavResourceKind::Collection && resolved.path().ends_with('/') {
-        expected
-            .path_segments_mut()
-            .map_err(|()| WebDavError::InvalidProperties)?
-            .push("");
-    }
-    if !completed || !stack.is_empty() || status != Some(true) || resolved != expected {
+    if !completed || !stack.is_empty() || responses.is_empty() {
         return Err(WebDavError::InvalidProperties);
     }
-    Ok(kind)
+    Ok(responses)
 }
 
 fn with_authorization(
@@ -1207,6 +1325,38 @@ mod tests {
         assert!(stream.next().await.unwrap().is_err());
         assert!(progress.limit_reached.load(Ordering::Acquire));
         assert!(!progress.finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn directory_listing_rejects_non_children_and_reports_truncation() {
+        let root = Url::parse("https://files.test/dav/dir/").unwrap();
+        let response = |href: &str, resource_type: &str| {
+            format!(
+                "<d:response><d:href>{href}</d:href><d:propstat><d:prop>{resource_type}</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"
+            )
+        };
+        let collection = "<d:resourcetype><d:collection/></d:resourcetype>";
+        let file = "<d:resourcetype/>";
+        let xml = |href: &str| {
+            format!(
+                r#"<d:multistatus xmlns:d="DAV:">{}{}{}</d:multistatus>"#,
+                response("/dav/dir/", collection),
+                response("/dav/dir/May%20report.txt", file),
+                response(href, collection),
+            )
+        };
+        let listing =
+            parse_directory_listing(xml("/dav/dir/archive/").as_bytes(), &root, 1).unwrap();
+        assert!(listing.truncated);
+        assert_eq!(listing.entries[0].name, "May report.txt");
+        for bad in [
+            "/dav/outside/",
+            "/dav/dir/nested/child/",
+            "https://other.test/dav/dir/side/",
+            "/dav/dir/a%2fb/",
+        ] {
+            assert!(parse_directory_listing(xml(bad).as_bytes(), &root, 5).is_err());
+        }
     }
 
     #[test]
