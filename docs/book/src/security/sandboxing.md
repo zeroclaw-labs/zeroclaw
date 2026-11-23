@@ -77,6 +77,22 @@ The sandbox passes through only the env vars listed in `[risk_profiles.<alias>].
 
 Per-tool wall-time timeouts live on the tool's own config block (`[shell_tool].timeout_secs`, etc.). Docker-specific limits (memory, CPU) live on `[runtime.docker]` when the agent's runtime kind is set to `docker`:
 
+#### Background processes a command leaves behind
+
+On Unix every `shell` command runs in its own session, so its process group is its own. A timeout or a cancelled turn already tears that whole group down. A command that *returns* while a child it backgrounded (`sleep 300 &`, `yes > /dev/null &`) is still alive is the remaining case: the tool has already answered the model, the timeout no longer applies to that child, and the process is reparented to init, so it outlives the turn, the job, and any daemon restart.
+
+`[shell_tool].reap_background_on_return` (default `true`) closes that gap. After the command returns, the tool sends `SIGTERM` to the command's own process group, waits `[shell_tool].reap_grace_secs` (default `2`) for a cooperative child to exit, then sends `SIGKILL` to whatever is left, and logs how many processes it swept. Nothing outside that one group is signalled, so the sweep cannot reach the daemon. Signalling is also safe after the command's own shell has been reaped: a process group is addressed by its leader's PID, and Linux only returns that number to the pool once nothing references it any more, so a group that still has members keeps its id however long ago the leader exited. The group is checked for members immediately before each signal, and a descendant that calls `setsid()` or `setpgid()` itself leaves the group and escapes, exactly as it does on the timeout and cancellation paths.
+
+The sweep runs before the tool reads the command's output. A background child inherits the command's stdout and stderr, so draining first would wait on a pipe that only the process being terminated can close; killing the group first lets the drain finish on end-of-file instead of on its timeout.
+
+Set it to `false` when the `shell` tool is deliberately used to start detached daemons that must outlive the command that started them; run those from a service manager instead, where nothing is left unbounded. Timeout and cancellation cleanup is unaffected either way:
+
+```toml
+[shell_tool]
+reap_background_on_return = false   # keep backgrounded daemons alive
+reap_grace_secs = 5                 # longer SIGTERM -> SIGKILL grace
+```
+
 ### Shell binary
 
 When `[runtime].shell` is unset, the native runtime detects a platform default. Windows tries `pwsh`, then `powershell`, then `cmd.exe`. macOS first uses the current user's passwd login shell, then tries `zsh`, `bash`, and `/bin/sh`. Linux first uses the passwd login shell, then tries `bash`, `zsh`, and `/bin/sh`. Android remains pinned to `/system/bin/sh`. Set `[runtime].shell` to choose an interpreter explicitly:
