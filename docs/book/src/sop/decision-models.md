@@ -112,11 +112,10 @@ each ask the model whether to start.
 - A skipped step is recorded with status `skipped` and the reason, and the run
   continues with the next step in order. The next step receives the input the
   skipped step would have received.
-- When the model cannot answer, or answers a step's question with a malformed
-  value, that step runs. Skipping is never the fail-safe. The same holds for
-  the whole answer set when the gate answer is missing or malformed, or when
-  the mode answer (with `modes` set) is missing, rejected, or below
-  `min_confidence`: none of its step answers is used and every step runs.
+- `decide` and `unless_decided` can skip a step only on a usable answer.
+  The run ignores all step answers when the model is unavailable, the gate
+  answer is missing or malformed, or the mode answer (with `modes` set) is
+  missing, rejected, or below `min_confidence`.
 - Routing guards can read the answers: `$.decisions.2` is step 2's "yes"
   probability in a `when:` condition. A guard that reads an answer that is not
   there is false, so when answers are missing or ignored (see above), a
