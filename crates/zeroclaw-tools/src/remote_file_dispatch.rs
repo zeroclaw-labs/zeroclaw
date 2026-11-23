@@ -210,14 +210,13 @@ fn check_stored_grant(
     resource: &str,
     root: &Url,
     right: Right,
-) -> Result<(), ReadDispatchError> {
+) -> Result<Decision, ReadDispatchError> {
     let rights = credential
         .remote_files_grant(resource, root)
         .ok_or(ReadDispatchError::Denied)?;
     match rights.check(&[right]) {
-        Decision::Allowed => Ok(()),
         Decision::Denied => Err(ReadDispatchError::Denied),
-        Decision::RequireHumanApproval => Err(ReadDispatchError::ApprovalRequired),
+        decision => Ok(decision),
     }
 }
 
@@ -231,6 +230,7 @@ pub(crate) fn resolve_local_webdav_header(
     root: &Url,
     right: Right,
     authorized: impl Fn() -> bool,
+    approved_revision: Option<&str>,
 ) -> Result<HeaderValue, ReadDispatchError> {
     use base64::Engine;
     use zeroclaw_config::schema::{ScopedApiKeyHeader, ScopedCredentialSource, ScopedHttpAuth};
@@ -241,7 +241,14 @@ pub(crate) fn resolve_local_webdav_header(
     let (credential, revision) =
         crate::scoped_credentials::load_scoped_credential_snapshot(Some(config_path), alias)
             .map_err(|_| ReadDispatchError::CredentialUnavailable)?;
-    check_stored_grant(&credential, resource, root, right)?;
+    if approved_revision.is_some_and(|approved| revision != approved) {
+        return Err(ReadDispatchError::Denied);
+    }
+    if check_stored_grant(&credential, resource, root, right)? == Decision::RequireHumanApproval
+        && approved_revision.is_none()
+    {
+        return Err(ReadDispatchError::ApprovalRequired);
+    }
     if !matches!(credential.source, ScopedCredentialSource::Local) {
         return Err(ReadDispatchError::CredentialUnavailable);
     }
@@ -307,10 +314,9 @@ pub async fn dispatch_vault_webdav_read<'a>(
         .ok_or(ReadDispatchError::Denied)?;
     let rights = live_rights(&canonical_alias, resource.root(), resource.identity())
         .ok_or(ReadDispatchError::Denied)?;
-    match rights.check(&[right]) {
-        Decision::Denied => return Err(ReadDispatchError::Denied),
-        Decision::RequireHumanApproval => return Err(ReadDispatchError::ApprovalRequired),
-        Decision::Allowed => {}
+    let live_decision = rights.check(&[right]);
+    if live_decision == Decision::Denied {
+        return Err(ReadDispatchError::Denied);
     }
     if !matches!(availability, BackendAvailability::Available(operations) if operations.contains(&right))
     {
@@ -323,41 +329,79 @@ pub async fn dispatch_vault_webdav_read<'a>(
     else {
         return Err(ReadDispatchError::CredentialUnavailable);
     };
-    let (credential, _) = crate::scoped_credentials::load_scoped_credential_snapshot(
+    let (credential, revision) = crate::scoped_credentials::load_scoped_credential_snapshot(
         Some(config_path),
         credential_alias,
     )
     .map_err(|_| ReadDispatchError::CredentialUnavailable)?;
-    check_stored_grant(&credential, &canonical_alias, resource.root(), right)?;
+    let stored_decision =
+        check_stored_grant(&credential, &canonical_alias, resource.root(), right)?;
     if !credential.supports_local_webdav() {
         return Err(ReadDispatchError::CredentialUnavailable);
     }
     drop(credential);
 
-    dispatch_catalog_webdav_read(
+    let requires_approval =
+        [live_decision, stored_decision].contains(&Decision::RequireHumanApproval);
+    let approved_revision = if requires_approval {
+        use zeroclaw_api::tool::{CredentialApprovalRequest, ToolExecutionContext};
+
+        let operation = match request {
+            RemoteFilesRequest::ListDirectory { path, .. } => {
+                format!("List directory {:?}", path.as_deref().unwrap_or("."))
+            }
+            RemoteFilesRequest::GetFileInfo { path, .. } => format!("Get file info {path:?}"),
+            _ => return Err(ReadDispatchError::UnsupportedOperation),
+        };
+        let approval = CredentialApprovalRequest {
+            credential_alias: credential_alias.to_string(),
+            destination: resource.root().to_string(),
+            operation,
+        };
+        if !ToolExecutionContext::request_credential_approval(&approval).await {
+            return Err(ReadDispatchError::ApprovalRequired);
+        }
+        Some(revision.as_str())
+    } else {
+        None
+    };
+    let is_authorized = || {
+        live_rights(&canonical_alias, resource.root(), resource.identity()).is_some_and(|current| {
+            match current.check(&[right]) {
+                Decision::Allowed => true,
+                Decision::Denied => false,
+                Decision::RequireHumanApproval => approved_revision.is_some(),
+            }
+        })
+    };
+    if !is_authorized() {
+        return Err(ReadDispatchError::Denied);
+    }
+
+    let approved_rights = Rights {
+        operations: [right].into_iter().collect(),
+        require_human_approval: false,
+    };
+    dispatch_webdav_read(
         request,
-        catalog,
-        &live_rights,
-        availability,
-        network,
-        async |root, identity| {
-            let RemoteIdentity::Vault {
-                credential_alias,
-                totp_alias: None,
-            } = identity
-            else {
-                return Err(ReadDispatchError::CredentialUnavailable);
-            };
+        |_| {
+            Some(WebDavReadGrant {
+                root: resource.root(),
+                identity: resource.identity(),
+                rights: &approved_rights,
+                availability,
+            })
+        },
+        async |root| network.resolve(root).await,
+        async |root, _| {
             resolve_local_webdav_header(
                 config_path,
                 credential_alias,
                 &canonical_alias,
                 root,
                 right,
-                || {
-                    live_rights(&canonical_alias, root, identity)
-                        .is_some_and(|rights| rights.check(&[right]) == Decision::Allowed)
-                },
+                is_authorized,
+                approved_revision,
             )
         },
     )
@@ -402,6 +446,7 @@ mod tests {
             &root,
             Right::ListDirectory,
             || true,
+            None,
         )
         .unwrap();
         assert_eq!(header, "Basic Zml4dHVyZTpkZW1v");
@@ -413,7 +458,8 @@ mod tests {
                 "reports",
                 &root,
                 Right::ListDirectory,
-                || false
+                || false,
+                None,
             ),
             Err(ReadDispatchError::Denied)
         ));
@@ -425,7 +471,8 @@ mod tests {
                 "reports",
                 &other_root,
                 Right::ListDirectory,
-                || true
+                || true,
+                None,
             ),
             Err(ReadDispatchError::Denied)
         ));
@@ -440,7 +487,8 @@ mod tests {
                 || {
                     calls.set(calls.get() + 1);
                     calls.get() == 1
-                }
+                },
+                None,
             ),
             Err(ReadDispatchError::Denied)
         ));
@@ -462,9 +510,29 @@ mod tests {
                 &root,
                 Right::ListDirectory,
                 || true,
+                None,
             ),
             Err(ReadDispatchError::ApprovalRequired)
         ));
+        let (_, revision) =
+            crate::scoped_credentials::load_scoped_credential_snapshot(Some(&path), "REPORT_LOGIN")
+                .unwrap();
+        for (approved_revision, expected) in [(revision.as_str(), true), ("obsolete", false)] {
+            let result = resolve_local_webdav_header(
+                &path,
+                "REPORT_LOGIN",
+                "reports",
+                &root,
+                Right::ListDirectory,
+                || true,
+                Some(approved_revision),
+            );
+            if expected {
+                assert!(result.unwrap().is_sensitive());
+            } else {
+                assert!(matches!(result, Err(ReadDispatchError::Denied)));
+            }
+        }
     }
 
     use std::collections::BTreeSet;

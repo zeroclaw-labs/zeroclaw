@@ -139,6 +139,8 @@ reload the applicable grant and reject an invocation whose binding or revision
 changed. Tool-wide approval and auto-approval do not satisfy the per-grant
 requirement. The model cannot provide or override the approval decision.
 
-The WebDAV prototype currently holds these calls at the credential boundary.
-Sending the prompt and resuming the approved invocation, and extending this
-policy to the other consumers, are pending.
+The vault-backed WebDAV read dispatcher can request a one-time approval in
+the originating WebUI conversation. It rechecks the live operation right and
+the approved credential revision before sending the authorization header.
+A missing approval channel or a denied request prevents the operation.
+Agent tool registration, live verification, and other consumers remain pending.
