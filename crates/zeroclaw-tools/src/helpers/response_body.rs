@@ -135,6 +135,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn text_reader_reassembles_split_codepoints_before_applying_byte_caps() {
+        let original = "a🦀中e\u{301}";
+        let chunks: Vec<&[u8]> = original.as_bytes().chunks(1).collect();
+        for (limit, expected, expected_overflow) in [
+            (Some(0), "", true),
+            (Some(4), "a", true),
+            (Some(8), "a🦀中", true),
+            (Some(11), original, false),
+            (None, original, false),
+        ] {
+            let response = chunked_response(&chunks).await;
+            let (text, overflowed) = read_text(response, limit).await.unwrap();
+
+            assert_eq!(text, expected, "byte limit {limit:?}");
+            assert_eq!(overflowed, expected_overflow, "byte limit {limit:?}");
+            assert!(!text.contains('\u{fffd}'));
+        }
+    }
+
+    #[tokio::test]
     async fn truncated_text_drops_an_incomplete_final_codepoint() {
         let response = chunked_response(&["abcéz".as_bytes()]).await;
         let (text, overflowed) = read_text(response, Some(4)).await.unwrap();
