@@ -501,7 +501,8 @@ fn valid_rename(from: &str, to: &str) -> bool {
 
 /// Operator-managed WebDAV endpoint. The credential field is a catalog alias,
 /// never a credential value. Rights are read from the live grant service.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct WebDavResourceConfig {
     pub alias: String,
@@ -549,7 +550,7 @@ impl WebDavResource {
 
 impl WebDavCatalog {
     pub fn from_resources(
-        resources: Vec<WebDavResourceConfig>,
+        resources: impl IntoIterator<Item = WebDavResourceConfig>,
     ) -> Result<Self, WebDavCatalogError> {
         let mut catalog = Self::default();
         for resource in resources {
@@ -594,6 +595,27 @@ pub fn valid_webdav_root(root: &url::Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_config_loads_webdav_catalog_and_rejects_invalid_roots() {
+        use crate::schema::Config;
+
+        let fixture = r#"
+            [[remote_files.webdav]]
+            alias = "REPORTS"
+            root = "https://files.test/dav/"
+            credential_alias = "REPORT_LOGIN"
+        "#;
+        let config: Config = toml::from_str(fixture).unwrap();
+        let catalog = config.remote_files.webdav_catalog().unwrap();
+        assert_eq!(
+            catalog.resource("reports").unwrap().root().as_str(),
+            "https://files.test/dav/"
+        );
+        let invalid: Config = toml::from_str(&fixture.replace("https:", "http:")).unwrap();
+        assert!(invalid.remote_files.webdav_catalog().is_err());
+        assert!(Config::default().remote_files.is_empty());
+    }
 
     #[test]
     fn webdav_catalog_keeps_destinations_separate_from_credential_aliases() {

@@ -720,6 +720,11 @@ pub struct Config {
     #[nested]
     pub file_download: FileDownloadConfig,
 
+    /// Operator-managed Remote Files resources. Configuring an endpoint grants no access.
+    #[serde(default, skip_serializing_if = "RemoteFilesConfig::is_empty")]
+    #[nested]
+    pub remote_files: RemoteFilesConfig,
+
     /// Plugin system configuration (`[plugins]`).
     #[serde(default)]
     #[nested]
@@ -10879,6 +10884,29 @@ pub struct FileDownloadConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub headers: HashMap<String, String>,
+}
+
+/// Endpoint metadata for the draft Remote Files tool.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "remote-files"]
+#[serde(deny_unknown_fields)]
+pub struct RemoteFilesConfig {
+    /// Operator-managed HTTPS WebDAV endpoints and credential aliases.
+    #[serde(default)]
+    pub webdav: Vec<crate::remote_files::WebDavResourceConfig>,
+}
+
+impl RemoteFilesConfig {
+    pub fn is_empty(&self) -> bool {
+        self.webdav.is_empty()
+    }
+
+    pub fn webdav_catalog(&self) -> Result<crate::remote_files::WebDavCatalog> {
+        Ok(crate::remote_files::WebDavCatalog::from_resources(
+            self.webdav.iter().cloned(),
+        )?)
+    }
 }
 
 fn default_file_download_max_size_bytes() -> u64 {
@@ -22022,6 +22050,7 @@ impl Default for Config {
             file_upload: FileUploadConfig::default(),
             file_upload_bundle: FileUploadBundleConfig::default(),
             file_download: FileDownloadConfig::default(),
+            remote_files: RemoteFilesConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
@@ -24854,6 +24883,13 @@ impl Config {
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
+        if let Err(error) = self.remote_files.webdav_catalog() {
+            validation_bail!(
+                InvalidFormat,
+                "remote_files.webdav",
+                "invalid remote_files.webdav configuration: {error}"
+            );
+        }
         self.cost.rates.validate()?;
 
         for (profile_alias, profile) in &self.runtime_profiles {
@@ -35313,6 +35349,7 @@ auto_save = true
             file_upload: FileUploadConfig::default(),
             file_upload_bundle: FileUploadBundleConfig::default(),
             file_download: FileDownloadConfig::default(),
+            remote_files: RemoteFilesConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
@@ -36778,6 +36815,7 @@ default_temperature = 0.7
             file_upload: FileUploadConfig::default(),
             file_upload_bundle: FileUploadBundleConfig::default(),
             file_download: FileDownloadConfig::default(),
+            remote_files: RemoteFilesConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),

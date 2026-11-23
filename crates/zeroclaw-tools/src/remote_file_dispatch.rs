@@ -111,11 +111,12 @@ pub async fn dispatch_webdav_read<'a>(
 }
 
 /// Use operator-configured endpoint metadata with the runtime's current
-/// resource rights. The caller must key its live grants by canonical alias.
+/// resource rights. The caller must check the canonical alias, exact root,
+/// and credential identity against the live grant, so edits cannot retarget it.
 pub async fn dispatch_catalog_webdav_read<'a>(
     request: &RemoteFilesRequest,
     catalog: &'a WebDavCatalog,
-    live_rights: impl FnOnce(&str) -> Option<&'a Rights>,
+    live_rights: impl FnOnce(&str, &Url, RemoteIdentity<'a>) -> Option<&'a Rights>,
     availability: &'a BackendAvailability,
     verify_egress: impl AsyncFnOnce(&Url) -> Result<Vec<SocketAddr>, ReadDispatchError>,
     resolve_authorization: impl AsyncFnOnce(
@@ -127,7 +128,11 @@ pub async fn dispatch_catalog_webdav_read<'a>(
         request,
         |alias| {
             let resource = catalog.resource(alias)?;
-            let rights = live_rights(&alias.to_ascii_lowercase())?;
+            let rights = live_rights(
+                &alias.to_ascii_lowercase(),
+                resource.root(),
+                resource.identity(),
+            )?;
             Some(WebDavReadGrant {
                 root: resource.root(),
                 identity: resource.identity(),
@@ -164,8 +169,16 @@ mod tests {
         let result = dispatch_catalog_webdav_read(
             &request,
             &catalog,
-            |canonical| {
+            |canonical, root, identity| {
                 assert_eq!(canonical, "reports");
+                assert_eq!(root.as_str(), "https://files.test/dav/");
+                assert!(matches!(
+                    identity,
+                    RemoteIdentity::Vault {
+                        credential_alias: "DEMO",
+                        ..
+                    }
+                ));
                 None
             },
             &availability,

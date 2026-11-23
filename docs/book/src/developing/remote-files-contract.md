@@ -93,4 +93,15 @@ The configuration crate defines the strict tagged request format for all propose
 
 The draft WebDAV read dispatcher resolves the operator's resource alias and checks the requested right and shared platform capability before invoking network or vault services. A grant requiring human approval returns a hold. The runtime still needs to wire the live catalog, approval service and credential resolver into this boundary. Only list and metadata requests are routed by this dispatcher.
 
-The WebDAV resource catalog accepts operator-supplied aliases, HTTPS roots, and credential aliases. It rejects aliases that collide across letter case, and rejects URLs carrying authentication, query parameters, or fragments. Endpoint lookup uses a case-insensitive alias. The read dispatcher looks up live rights separately using the canonical alias. A registered resource by itself grants no access. Runtime configuration loading and the WebUI still need to provide the catalog and live grants.
+The WebDAV resource catalog accepts operator-supplied aliases, HTTPS roots, and credential aliases. It rejects aliases that collide across letter case, and rejects URLs carrying authentication, query parameters, or fragments. Endpoint lookup uses a case-insensitive alias. The read dispatcher looks up live rights separately using the canonical alias. A registered resource by itself grants no access. The WebUI and runtime dispatch still need to provide live grants.
+
+An operator can provision endpoint metadata in the main configuration file:
+
+```toml
+[[remote_files.webdav]]
+alias = "REPORTS"
+root = "https://files.example.test/dav/reports/"
+credential_alias = "REPORT_LOGIN"
+```
+
+Config validation compiles the catalog without network access. The default is an empty catalog. Requests must still match a live grant for the canonical alias, exact root, and credential binding. Editing an endpoint does not extend an existing grant to its new destination. The tool is not registered by this setting alone.
