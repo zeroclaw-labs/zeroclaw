@@ -2184,6 +2184,12 @@ fn runtime_work_is_busy(state: &AppState) -> bool {
     })
 }
 
+/// GET /api/config/activity — scoped configuration clients can observe live
+/// runtime work without borrowing the pairing-only sessions endpoint.
+pub async fn handle_config_activity(State(state): State<AppState>) -> impl IntoResponse {
+    Json(serde_json::json!({"busy": runtime_work_is_busy(&state)}))
+}
+
 /// Request projection; activity comes from the live admission coordinator,
 /// never from persisted session metadata.
 #[derive(Default, Deserialize)]

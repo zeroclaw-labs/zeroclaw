@@ -223,6 +223,17 @@ pub type PerToolChannelHandle =
 /// additions. It is not a continuously filtered view or a native-origin proof.
 pub type DelegateParentToolsHandle = Arc<RwLock<Vec<Arc<dyn Tool>>>>;
 
+/// Clone the authoritative config for a delegated agent, removing MCP servers
+/// that opted out of delegate inheritance before any tool assembly occurs.
+pub(crate) fn config_for_delegated_agent(config: &Config) -> Config {
+    let mut delegated = config.clone();
+    delegated
+        .mcp
+        .servers
+        .retain(|server| !server.deny_delegate_inheritance);
+    delegated
+}
+
 /// Thin wrapper that makes an `Arc<dyn Tool>` usable as `Box<dyn Tool>`.
 pub struct ArcToolRef(pub Arc<dyn Tool>);
 // ArcToolRef is the public constructor name for ArcToolWrapper
@@ -4147,8 +4158,41 @@ mod tests {
     use tempfile::TempDir;
     use zeroclaw_config::schema::{
         ApprovalGroupConfig, ApprovalPolicyConfig, BrowserConfig, Config, FileDownloadConfig,
-        MemoryConfig, SopApprovalConfig,
+        McpServerConfig, MemoryConfig, SopApprovalConfig,
     };
+
+    #[test]
+    fn delegated_config_removes_only_withheld_mcp_servers() {
+        let mut config = Config::default();
+        config.mcp.servers = vec![
+            McpServerConfig {
+                name: "authority".into(),
+                deny_delegate_inheritance: true,
+                ..McpServerConfig::default()
+            },
+            McpServerConfig {
+                name: "ordinary".into(),
+                ..McpServerConfig::default()
+            },
+        ];
+
+        let delegated = config_for_delegated_agent(&config);
+
+        assert_eq!(
+            config.mcp.servers.len(),
+            2,
+            "the source config is unchanged"
+        );
+        assert_eq!(
+            delegated
+                .mcp
+                .servers
+                .iter()
+                .map(|server| server.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ordinary"]
+        );
+    }
 
     #[test]
     fn git_write_boundary_rejects_docker_runtime_writes() {

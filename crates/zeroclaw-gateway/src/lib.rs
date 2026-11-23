@@ -962,6 +962,7 @@ fn config_admin_router(route_auth: principal_gate::ConfigRouteAuth) -> Router<Ap
             "/api/config/reload-status",
             get(api_config::handle_reload_status),
         )
+        .route("/api/config/activity", get(api::handle_config_activity))
         .route("/api/config/templates", get(api_config::handle_templates))
         .route("/api/config/map-keys", get(api_config::handle_get_map_keys))
         .route(

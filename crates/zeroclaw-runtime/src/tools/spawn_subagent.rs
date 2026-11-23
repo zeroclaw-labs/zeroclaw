@@ -244,6 +244,7 @@ impl Tool for SpawnSubagentTool {
             .as_ref()
             .map(|admission| admission.config())
             .unwrap_or_else(|| Arc::clone(&self.config));
+        let config = Arc::new(crate::tools::config_for_delegated_agent(config.as_ref()));
         let risk_profile = config.risk_profile_for_agent(&self.parent_alias);
         if let Some(rp) = risk_profile {
             let excluded = rp.excluded_tools.iter().any(|t| t == "spawn_subagent");

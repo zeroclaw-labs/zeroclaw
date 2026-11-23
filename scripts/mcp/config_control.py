@@ -37,7 +37,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class Gateway:
-    def __init__(self, url, token_file):
+    def __init__(self, url, token_file, auth_provider):
         parsed = urllib.parse.urlsplit(url)
         try:
             local = ipaddress.ip_address(parsed.hostname or "").is_loopback
@@ -47,8 +47,12 @@ class Gateway:
         if (not local or parsed.scheme != "http" or not port or parsed.username
                 or parsed.password or parsed.query or parsed.fragment):
             raise BridgeError("gateway_must_be_an_explicit_loopback_http_url")
+        if (not isinstance(auth_provider, str)
+                or re.fullmatch(r"oidc\.[A-Za-z0-9][A-Za-z0-9_-]{0,63}", auth_provider) is None):
+            raise BridgeError("gateway_auth_provider_must_be_oidc")
         self.url = url.rstrip("/")
         self.token_file = Path(token_file)
+        self.auth_provider = auth_provider
         self.http = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
     def token(self):
@@ -71,7 +75,9 @@ class Gateway:
             raise BridgeError("request_too_large")
         request = urllib.request.Request(
             self.url + path, data=payload, method=method,
-            headers={"Authorization": "Bearer " + self.token(), "Content-Type": "application/json"},
+            headers={"Authorization": "Bearer " + self.token(),
+                     "X-ZeroClaw-Auth-Provider": self.auth_provider,
+                     "Content-Type": "application/json"},
         )
         try:
             with self.http.open(request, timeout=30) as response:
@@ -114,16 +120,15 @@ TOOLS = [
           "limit": {"type": "integer", "minimum": 1, "maximum": 100}}, read_only=True),
     tool("get", "Read one configuration property by its dotted path. Secret values are never returned.",
          {"path": {"type": "string", "minLength": 1}}, ["path"], True),
-    tool("create_alias", "Create a named configuration entry. During an active conversation the request is queued, not saved yet; finish your reply so the worker can apply it after idle. Check status in a later turn before setting fields on a queued new alias.",
+    tool("create_alias", "Create a named configuration entry. While runtime work is active, the request is queued, not saved yet; finish your reply so the worker can apply it after an idle observation. Check status in a later turn before setting fields on a queued new alias.",
          {"path": {"type": "string", "minLength": 1}, "key": {"type": "string", "minLength": 1}}, ["path", "key"]),
-    tool("set", "Set one typed leaf configuration property discovered with list. For named entries such as MCP servers, use create_alias first, then set individual fields; do not assign a whole server object or JSON string to its alias path. If any native conversation is running, this returns queued=true, saved=false and a job id: finish your reply so the change can run after idle. Do not wait or poll for it inside the same turn. Check status/read back in a later turn. Request reload separately if needed. Never blindly repeat an uncertain write.",
+    tool("set", "Set one typed leaf configuration property discovered with list. For named entries such as MCP servers, use create_alias first, then set individual fields; do not assign a whole server object or JSON string to its alias path. If runtime work is active, this returns queued=true, saved=false and a job id: finish your reply so the change can run after an idle observation. Do not wait or poll for it inside the same turn. Check status/read back in a later turn. Request reload separately if needed. Never blindly repeat an uncertain write.",
          {"path": {"type": "string", "minLength": 1}, "value": {}}, ["path", "value"]),
-    tool("patch", "Submit an atomic configuration patch. Paths may be dotted or JSON Pointer; use test operations for concurrency protection. During an active conversation this returns queued=true, saved=false: finish your reply and inspect status in a later turn. Do not poll inside the requesting turn. Validation occurs when the queued patch runs; rejected batches change nothing. Never blindly retry an uncertain write.",
+    tool("patch", "Submit an atomic configuration patch. Paths may be dotted or JSON Pointer; use test operations for concurrency protection. While runtime work is active this returns queued=true, saved=false: finish your reply and inspect status in a later turn. Do not poll inside the requesting turn. Validation occurs when the queued patch runs; rejected batches change nothing. Never blindly retry an uncertain write.",
          {"operations": {"type": "array", "minItems": 1, "maxItems": 256, "items": {
              "type": "object", "properties": {"op": {"type": "string", "enum": ["add", "replace", "remove", "test"]},
              "path": {"type": "string", "minLength": 1}, "value": {}}, "required": ["op", "path"], "additionalProperties": False}}}, ["operations"]),
-    tool("status", "Inspect canonical application status and recent queued writes/reloads. A queued write is not saved yet. Finish the requesting turn before checking its completion in a later turn. An accepted reload does not prove every setting has been applied.", read_only=True),
-    tool("reload", "Queue a daemon reload after all native sessions have been idle for 15 seconds. Return your final reply; the worker waits outside this tool call, then requests the same reload as the dashboard. Requests expire after five minutes if idle cannot be established. Connections may reconnect. Check status for the outcome."),
+    tool("status", "Inspect canonical application status and recent queued writes. A queued write is not saved yet. Finish the requesting turn before checking its completion in a later turn. Authorization scope is still enforced by the gateway.", read_only=True),
 ]
 
 
@@ -142,13 +147,13 @@ def write_job(path, body):
         Path(temporary).unlink(missing_ok=True)
 
 
-def sessions_busy(gateway):
-    running = gateway.request("GET", "/api/sessions/running?activity_only=true")
-    # Missing on older daemons: their session list only covers WebSocket
-    # persistence and cannot establish idle for channel or RPC callers.
-    if not isinstance(running, dict) or type(running.get("busy")) is not bool:
-        raise BridgeError("native_session_idle_detection_unavailable")
-    return running["busy"]
+def runtime_busy(gateway):
+    activity = gateway.request("GET", "/api/config/activity")
+    # Missing on older daemons: their projection cannot establish idle for
+    # channel, Web and RPC turns.
+    if not isinstance(activity, dict) or type(activity.get("busy")) is not bool:
+        raise BridgeError("runtime_idle_detection_unavailable")
+    return activity["busy"]
 
 
 def job_records(directory):
@@ -190,11 +195,12 @@ def run_write(gateway, job_path, request, idle_seconds=15, deadline_seconds=300)
     """Payload stays in the worker's memory, never in job files or argv."""
     job = json.loads(Path(job_path).read_text())
     deadline, idle_since = time.monotonic() + deadline_seconds, None
+    mutation_acknowledged = False
     try:
         while time.monotonic() < deadline:
             earlier = pending_writes(Path(job_path).parent, (job["requested_at"], job["id"]))
             try:
-                busy = sessions_busy(gateway)
+                busy = runtime_busy(gateway)
             except BridgeError as error:
                 if error.details["error"] != "gateway_request_failed" and error.details.get("status") != 503:
                     raise
@@ -209,6 +215,7 @@ def run_write(gateway, job_path, request, idle_seconds=15, deadline_seconds=300)
                 job.update(state="applying")
                 write_job(job_path, job)
                 gateway.request(request["method"], request["path"], request["body"])
+                mutation_acknowledged = True
                 job.update(state="saved", completed_at=time.time())
                 write_job(job_path, job)
                 return
@@ -218,34 +225,19 @@ def run_write(gateway, job_path, request, idle_seconds=15, deadline_seconds=300)
         job.update(state="failed", completed_at=time.time(), **error.details)
         write_job(job_path, job)
     except (OSError, ValueError):
-        job.update(state="failed", completed_at=time.time(), error="write_worker_io_failed")
-        write_job(job_path, job)
-
-
-def run_reload(gateway, job_path, idle_seconds=15, deadline_seconds=300):
-    """The job records a request; daemon application status remains authoritative."""
-    job = json.loads(Path(job_path).read_text())
-    deadline = time.monotonic() + deadline_seconds
-    idle_since = None
-    try:
-        while time.monotonic() < deadline:
-            if sessions_busy(gateway) or pending_writes(Path(job_path).parent):
-                idle_since = None
-            elif idle_since is None:
-                idle_since = time.monotonic()
-            elif time.monotonic() - idle_since >= idle_seconds:
-                gateway.request("POST", "/admin/reload")
-                job.update(state="reload_requested", completed_at=time.time())
-                write_job(job_path, job)
-                return
-            time.sleep(1)
-        raise BridgeError("reload_idle_deadline_expired")
-    except BridgeError as error:
-        job.update(state="failed", completed_at=time.time(), **error.details)
-        write_job(job_path, job)
-    except (OSError, ValueError):
-        job.update(state="failed", completed_at=time.time(), error="reload_worker_io_failed")
-        write_job(job_path, job)
+        job.update(
+            state="outcome_unknown" if mutation_acknowledged else "failed",
+            completed_at=time.time(),
+            error="write_completion_record_io_failed" if mutation_acknowledged
+            else "write_worker_io_failed",
+        )
+        try:
+            write_job(job_path, job)
+        except (OSError, ValueError):
+            # The gateway acknowledged the mutation. Never overwrite that
+            # fact with a generic failure merely because local bookkeeping
+            # also failed.
+            pass
 
 
 class Control:
@@ -267,7 +259,9 @@ class Control:
         try:
             worker = subprocess.Popen(
                 [sys.executable, str(Path(__file__).resolve()), "--gateway-url", self.gateway.url,
-                 "--token-file", str(self.gateway.token_file.resolve()), "--state-dir", str(self.state_dir.resolve()),
+                 "--auth-provider", self.gateway.auth_provider,
+                 "--token-file", str(self.gateway.token_file.resolve()),
+                 "--state-dir", str(self.state_dir.resolve()),
                  "--write-job", str(job_path.resolve())], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
             worker.stdin.write(payload)
@@ -304,7 +298,7 @@ class Control:
             return self.gateway.request("GET", "/api/config/prop?" + urllib.parse.urlencode(arguments))
         if name == "create_alias":
             path = "/api/config/map-key?" + urllib.parse.urlencode(arguments)
-            if sessions_busy(self.gateway) or pending_writes(self.state_dir):
+            if runtime_busy(self.gateway) or pending_writes(self.state_dir):
                 return self.queue_write("POST", path, None, [arguments["path"] + "." + arguments["key"]])
             self.gateway.request("POST", path)
             return {"created": True, "path": arguments["path"], "key": arguments["key"]}
@@ -322,7 +316,7 @@ class Control:
                         or (entry["op"] != "remove" and "value" not in entry)):
                     raise BridgeError("invalid_patch")
             paths = [entry["path"] for entry in operations]
-            if sessions_busy(self.gateway) or pending_writes(self.state_dir):
+            if runtime_busy(self.gateway) or pending_writes(self.state_dir):
                 return self.queue_write("PATCH", "/api/config", operations, paths)
             self.gateway.request("PATCH", "/api/config", operations)
             # Never echo submitted values, even if a gateway response does.
@@ -338,22 +332,6 @@ class Control:
                           key=lambda job: job.get("requested_at", 0), reverse=True)[:20]
             return {"application": self.gateway.request("GET", "/api/config/reload-status"),
                     "requests": jobs}
-        if name == "reload":
-            self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-            job = {"id": uuid.uuid4().hex, "state": "waiting_for_idle", "requested_at": time.time()}
-            path = self.state_dir / ("reload-" + job["id"] + ".json")
-            write_job(path, job)
-            try:
-                subprocess.Popen([sys.executable, str(Path(__file__).resolve()),
-                                  "--gateway-url", self.gateway.url, "--token-file", str(self.gateway.token_file.resolve()),
-                                  "--state-dir", str(self.state_dir.resolve()), "--reload-job", str(path.resolve())],
-                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 start_new_session=True, close_fds=True)
-            except OSError:
-                job.update(state="failed", error="reload_worker_start_failed")
-                write_job(path, job)
-                raise BridgeError("reload_worker_start_failed") from None
-            return job
         raise BridgeError("unknown_tool")
 
 
@@ -412,21 +390,20 @@ def serve(control, source=sys.stdin.buffer, target=sys.stdout):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gateway-url", required=True, help="Explicit loopback gateway URL, including any path prefix")
-    parser.add_argument("--token-file", required=True, help="Owner-only file containing a dedicated paired-device token")
+    parser.add_argument("--auth-provider", required=True,
+                        help="Scoped OIDC provider selection, for example oidc.config_control")
+    parser.add_argument("--token-file", required=True,
+                        help="Owner-only file containing that provider's access token")
     parser.add_argument("--state-dir", required=True, help="Private directory for deferred reload request records")
-    workers = parser.add_mutually_exclusive_group()
-    workers.add_argument("--reload-job", help=argparse.SUPPRESS)
-    workers.add_argument("--write-job", help=argparse.SUPPRESS)
+    parser.add_argument("--write-job", help=argparse.SUPPRESS)
     args = parser.parse_args()
     os.umask(0o077)
-    gateway = Gateway(args.gateway_url, args.token_file)
+    gateway = Gateway(args.gateway_url, args.token_file, args.auth_provider)
     if args.write_job:
         data = sys.stdin.buffer.read(MAX_MESSAGE + 1)
         if len(data) > MAX_MESSAGE:
             raise BridgeError("request_too_large")
         run_write(gateway, args.write_job, json.loads(data))
-    elif args.reload_job:
-        run_reload(gateway, args.reload_job)
     else:
         serve(Control(gateway, args.state_dir))
 

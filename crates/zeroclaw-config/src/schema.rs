@@ -6071,6 +6071,15 @@ pub struct McpServerConfig {
     /// parsing, not this wire cap.
     #[serde(default)]
     pub max_response_bytes: Option<u64>,
+    /// Prevent this server's tools from being exposed to delegated agents and
+    /// subagents. Direct turns of an agent granted this server are unchanged.
+    ///
+    /// This covers every delegated execution mode, including bounded tool
+    /// inheritance and independently assembled targets. Use it for MCP servers
+    /// whose tools cross an authority boundary that a delegated model must not
+    /// inherit.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deny_delegate_inheritance: bool,
     /// Resource URIs to read once at agent startup and inject into the system
     /// prompt as untrusted, server-origin context. Each is read via
     /// `resources/read` on this server; pins on a server that does not advertise

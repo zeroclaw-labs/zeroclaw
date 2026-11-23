@@ -20,6 +20,7 @@ class Fixture:
     def __init__(self):
         self.calls = []
         self.token = "fixture-private-token"
+        self.auth_provider = "oidc.fixture"
         self.fail_status = False
         self.reject_patch = False
         self.patch_status = 200
@@ -48,6 +49,8 @@ class Fixture:
                 fixture.calls.append((self.command, self.path, body))
                 if self.headers.get("Authorization") != "Bearer " + fixture.token:
                     self.reply(401, {"error": "unauthorized"})
+                elif self.headers.get("X-ZeroClaw-Auth-Provider") != fixture.auth_provider:
+                    self.reply(401, {"error": "wrong_auth_provider"})
                 elif fixture.redirect:
                     self.send_response(302)
                     self.send_header("Location", "/redirect-destination")
@@ -60,11 +63,9 @@ class Fixture:
                         self.reply(fixture.patch_status, {"value": fixture.token})
                 elif self.path == "/api/config/reload-status":
                     self.reply(503 if fixture.fail_status else 200, {"pending_reload": True})
-                elif self.path == "/api/sessions/running?activity_only=true":
-                    data = ({"sessions": [], "busy": True} if fixture.active
-                            else fixture.running.pop(0) if fixture.running else {"sessions": [], "busy": False})
-                    if "message" not in data and "busy" not in data:
-                        data["busy"] = bool(data["sessions"])
+                elif self.path == "/api/config/activity":
+                    data = ({"busy": True} if fixture.active
+                            else fixture.running.pop(0) if fixture.running else {"busy": False})
                     self.reply(200, data)
                 elif self.path == "/admin/reload":
                     self.reply(200, {"success": True})
@@ -107,7 +108,9 @@ class ConfigControlTest(unittest.TestCase):
         self.token_file = self.root / "token"
         self.token_file.write_text(self.fixture.token)
         self.token_file.chmod(0o600)
-        self.gateway = bridge.Gateway(self.fixture.url, self.token_file)
+        self.gateway = bridge.Gateway(
+            self.fixture.url, self.token_file, self.fixture.auth_provider
+        )
         self.control = bridge.Control(self.gateway, self.root / "jobs")
 
     def tearDown(self):
@@ -121,6 +124,11 @@ class ConfigControlTest(unittest.TestCase):
         self.assertEqual(self.fixture.patches, [operations])
         self.assertTrue(result["saved"])
         self.assertNotIn(self.fixture.token, json.dumps(result))
+
+    def test_reload_is_not_exposed_by_the_narrow_bridge(self):
+        self.assertNotIn("reload", {item["name"] for item in bridge.TOOLS})
+        with self.assertRaises(bridge.BridgeError):
+            self.control.call("reload", {})
 
     def test_rejected_patch_returns_only_safe_metadata(self):
         self.fixture.reject_patch = True
@@ -173,13 +181,16 @@ class ConfigControlTest(unittest.TestCase):
         link = self.root / "token-link"
         link.symlink_to(self.token_file)
         with self.assertRaises(OSError):
-            bridge.Gateway(self.fixture.url, link).token()
+            bridge.Gateway(self.fixture.url, link, self.fixture.auth_provider).token()
 
     def test_redirects_and_non_loopback_targets_are_refused(self):
         for url in ("https://127.0.0.1:1234", "http://example.invalid:1234", "http://127.0.0.1:1234/?x=1",
                     "http://user:password@127.0.0.1:1234", "http://0.0.0.0:1234"):
             with self.assertRaises(bridge.BridgeError):
-                bridge.Gateway(url, self.token_file)
+                bridge.Gateway(url, self.token_file, self.fixture.auth_provider)
+        for provider in ("native", "OIDC.fixture", "oidc.", "oidc.bad value", ""):
+            with self.assertRaises(bridge.BridgeError):
+                bridge.Gateway(self.fixture.url, self.token_file, provider)
         self.fixture.redirect = True
         with self.assertRaises(bridge.BridgeError):
             self.control.call("get", {"path": "fixture.api_key"})
@@ -193,7 +204,7 @@ class ConfigControlTest(unittest.TestCase):
         self.assertTrue(caught.exception.details["outcome_unknown"])
 
     def test_in_turn_writes_return_queued_without_calling_the_mutating_endpoint(self):
-        self.fixture.running = [{"sessions": [{"session_id": "calling-turn"}]}]
+        self.fixture.running = [{"busy": True}]
         secret_value = "fixture-value-must-stay-out-of-job-files"
         with patch.object(bridge.subprocess, "Popen") as spawn:
             result = self.control.call("set", {"path": "fixture.setting", "value": secret_value})
@@ -210,7 +221,7 @@ class ConfigControlTest(unittest.TestCase):
             ("create_alias", {"path": "mcp.servers", "key": "fixture"}),
             ("patch", {"operations": [{"op": "add", "path": "fixture.limit", "value": 200}]}),
         ]:
-            self.fixture.running = [{"sessions": [{"session_id": "calling-turn"}]}]
+            self.fixture.running = [{"busy": True}]
             with patch.object(bridge.subprocess, "Popen"):
                 self.assertTrue(self.control.call(name, arguments)["queued"])
         self.assertTrue(all(call[0] == "GET" for call in self.fixture.calls))
@@ -218,13 +229,35 @@ class ConfigControlTest(unittest.TestCase):
     def test_write_worker_waits_for_turn_completion_then_saves(self):
         job = self.root / "write-fixture.json"
         bridge.write_job(job, {"id": "fixture", "requested_at": time.time(), "state": "waiting_for_idle"})
-        self.fixture.running = [{"sessions": [{"session_id": "caller"}]}, {"sessions": []}, {"sessions": []}]
+        self.fixture.running = [{"busy": True}, {"busy": False}, {"busy": False}]
         request = {"method": "PATCH", "path": "/api/config", "body": [{"op": "add", "path": "fixture.limit", "value": 200}]}
         with patch.object(bridge.time, "sleep"):
             bridge.run_write(self.gateway, job, request, idle_seconds=0)
         methods = [call[0] for call in self.fixture.calls]
         self.assertEqual(methods, ["GET", "GET", "GET", "PATCH"])
         self.assertEqual(json.loads(job.read_text())["state"], "saved")
+
+    def test_completion_record_failure_reports_an_acknowledged_write_as_unknown(self):
+        job = self.root / "write-fixture.json"
+        bridge.write_job(job, {"id": "fixture", "requested_at": time.time(), "state": "waiting_for_idle"})
+        request = {"method": "PATCH", "path": "/api/config",
+                   "body": [{"op": "add", "path": "fixture.limit", "value": 200}]}
+        real_write_job = bridge.write_job
+        writes = 0
+
+        def flaky_write(path, body):
+            nonlocal writes
+            writes += 1
+            if writes == 2:
+                raise OSError("completion record unavailable")
+            real_write_job(path, body)
+
+        with patch.object(bridge, "write_job", side_effect=flaky_write), patch.object(bridge.time, "sleep"):
+            bridge.run_write(self.gateway, job, request, idle_seconds=0)
+        completed = json.loads(job.read_text())
+        self.assertEqual(completed["state"], "outcome_unknown")
+        self.assertEqual(completed["error"], "write_completion_record_io_failed")
+        self.assertEqual(len(self.fixture.patches), 1, "the acknowledged mutation must not replay")
 
     def test_write_worker_preserves_queued_request_order(self):
         job = self.root / "write-fixture.json"
@@ -234,49 +267,18 @@ class ConfigControlTest(unittest.TestCase):
             bridge.run_write(self.gateway, job, request, idle_seconds=0)
         self.assertEqual([call[0] for call in self.fixture.calls], ["GET", "GET", "GET", "PATCH"])
 
-    def test_reload_cannot_overtake_queued_writes(self):
-        job = self.root / "reload-fixture.json"
-        bridge.write_job(job, {"requested_at": time.time(), "state": "waiting_for_idle"})
-        with patch.object(bridge, "pending_writes", side_effect=[True, False, False]), patch.object(bridge.time, "sleep"):
-            bridge.run_reload(self.gateway, job, idle_seconds=0)
-        self.assertEqual([call[1] for call in self.fixture.calls], ["/api/sessions/running?activity_only=true"] * 3 + ["/admin/reload"])
-
     def test_write_worker_retries_read_probe_but_not_the_mutation(self):
         job = self.root / "write-fixture.json"
         bridge.write_job(job, {"id": "fixture", "requested_at": time.time(), "state": "waiting_for_idle"})
         request = {"method": "PATCH", "path": "/api/config", "body": []}
         with patch.object(self.gateway, "request", side_effect=[
             bridge.BridgeError("gateway_request_failed", outcome_unknown=False),
-            {"sessions": [], "busy": False}, {"sessions": [], "busy": False},
+            {"busy": False}, {"busy": False},
             bridge.BridgeError("gateway_request_failed", outcome_unknown=True),
         ]) as send, patch.object(bridge.time, "sleep"):
             bridge.run_write(self.gateway, job, request, idle_seconds=0)
         self.assertEqual(sum(call.args[0] == "PATCH" for call in send.call_args_list), 1)
         self.assertTrue(json.loads(job.read_text())["outcome_unknown"])
-
-    def test_reload_waits_for_idle_and_records_only_request_acceptance(self):
-        job = self.root / "job.json"
-        bridge.write_job(job, {"requested_at": time.time(), "state": "waiting_for_idle"})
-        self.fixture.running = [{"sessions": [{"session_id": "fixture"}]}, {"sessions": []}, {"sessions": []}]
-        with patch.object(bridge.time, "sleep"):
-            bridge.run_reload(self.gateway, job, idle_seconds=0)
-        self.assertEqual(self.fixture.calls[-1][1], "/admin/reload")
-        self.assertEqual(json.loads(job.read_text())["state"], "reload_requested")
-
-    def test_reload_fails_closed_without_native_idle_evidence(self):
-        job = self.root / "job.json"
-        bridge.write_job(job, {"requested_at": time.time(), "state": "waiting_for_idle"})
-        self.fixture.running = [{"sessions": [], "message": "Session persistence is disabled"}]
-        bridge.run_reload(self.gateway, job, idle_seconds=0)
-        self.assertEqual(json.loads(job.read_text())["state"], "failed")
-        self.assertFalse(any(call[1] == "/admin/reload" for call in self.fixture.calls))
-
-    def test_reload_returns_before_worker_and_never_passes_the_token(self):
-        with patch.object(bridge.subprocess, "Popen") as spawn:
-            result = self.control.call("reload", {})
-        self.assertEqual(result["state"], "waiting_for_idle")
-        self.assertNotIn(self.fixture.token, json.dumps(spawn.call_args.args))
-        self.assertEqual(list((self.root / "jobs").glob("*.json"))[0].stat().st_mode & 0o777, 0o600)
 
     def test_real_stdio_process_discovers_tools_and_reaches_gateway(self):
         requests = [
@@ -286,13 +288,14 @@ class ConfigControlTest(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "set", "arguments": {"path": "fixture.limit", "value": 200}}},
         ]
         result = subprocess.run([sys.executable, str(Path(bridge.__file__)), "--gateway-url", self.fixture.url,
+                                 "--auth-provider", self.fixture.auth_provider,
                                  "--token-file", str(self.token_file), "--state-dir", str(self.root / "jobs")],
                                 input="".join(json.dumps(value) + "\n" for value in requests),
                                 capture_output=True, text=True, timeout=10, check=True)
         replies = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertEqual([reply["id"] for reply in replies], [1, 2, 3])
         self.assertEqual(replies[0]["result"]["protocolVersion"], "2025-03-26")
-        self.assertEqual(len(replies[1]["result"]["tools"]), 7)
+        self.assertEqual(len(replies[1]["result"]["tools"]), 6)
         self.assertFalse(replies[2]["result"]["isError"])
         self.assertEqual(len(self.fixture.patches), 1)
         self.assertNotIn(self.fixture.token, result.stdout + result.stderr)
@@ -306,6 +309,7 @@ class ConfigControlTest(unittest.TestCase):
         ]
         started = time.monotonic()
         result = subprocess.run([sys.executable, str(Path(bridge.__file__)), "--gateway-url", self.fixture.url,
+                                 "--auth-provider", self.fixture.auth_provider,
                                  "--token-file", str(self.token_file), "--state-dir", str(self.root / "jobs")],
                                 input="".join(json.dumps(value) + "\n" for value in requests),
                                 capture_output=True, text=True, timeout=10, check=True)
@@ -347,25 +351,24 @@ class ConfigControlTest(unittest.TestCase):
             ("patch", {"operations": [{"op": "add", "path": "fixture.limit", "value": 200}]}),
             ("create_alias", {"path": "mcp.servers", "key": "fixture"}),
         ]:
-            self.fixture.running = [{"sessions": [], "busy": True}]
+            self.fixture.running = [{"busy": True}]
             with patch.object(bridge.subprocess, "Popen"):
                 self.assertTrue(self.control.call(name, arguments)["queued"])
         self.assertEqual(self.fixture.patches, [])
 
     def test_workers_wait_for_runtime_activity_without_a_websocket_session(self):
-        for reload in (False, True):
-            job = self.root / ("reload-runtime.json" if reload else "write-runtime.json")
-            bridge.write_job(job, {"id": "runtime", "requested_at": time.time(), "state": "waiting_for_idle"})
-            self.fixture.running = [{"sessions": [], "busy": True},
-                                    {"sessions": [], "busy": False}, {"sessions": [], "busy": False}]
-            self.fixture.calls.clear()
-            with patch.object(bridge.time, "sleep"):
-                if reload:
-                    bridge.run_reload(self.gateway, job, idle_seconds=0)
-                else:
-                    bridge.run_write(self.gateway, job, {"method": "PATCH", "path": "/api/config", "body": []}, idle_seconds=0)
-            self.assertEqual([call[0] for call in self.fixture.calls[:3]], ["GET"] * 3)
-            self.assertEqual(self.fixture.calls[-1][0], "POST" if reload else "PATCH")
+        job = self.root / "write-runtime.json"
+        bridge.write_job(job, {"id": "runtime", "requested_at": time.time(), "state": "waiting_for_idle"})
+        self.fixture.running = [{"busy": True}, {"busy": False}, {"busy": False}]
+        with patch.object(bridge.time, "sleep"):
+            bridge.run_write(
+                self.gateway,
+                job,
+                {"method": "PATCH", "path": "/api/config", "body": []},
+                idle_seconds=0,
+            )
+        self.assertEqual([call[0] for call in self.fixture.calls[:3]], ["GET"] * 3)
+        self.assertEqual(self.fixture.calls[-1][0], "PATCH")
 
     def test_missing_or_malformed_runtime_activity_fails_closed(self):
         for data in ({"sessions": []}, {"busy": None}, {"busy": 0}, [], None):
@@ -374,14 +377,12 @@ class ConfigControlTest(unittest.TestCase):
                     self.control.call("set", {"path": "fixture.limit", "value": 200})
         self.assertEqual(self.fixture.patches, [])
 
-    def test_activity_probe_ignores_stale_persisted_running_sessions(self):
-        # Old daemons may ignore the projection query and include a stale list.
-        # Only the live coordinator's typed busy signal decides idle.
-        self.fixture.running = [{"sessions": [{"session_id": "stale"}], "busy": False}]
-        self.assertFalse(bridge.sessions_busy(self.gateway))
-        self.assertEqual(self.fixture.calls[-1][1], "/api/sessions/running?activity_only=true")
+    def test_activity_probe_uses_only_the_typed_busy_signal(self):
+        self.fixture.running = [{"busy": False, "unrelated": [{"session_id": "ignored"}]}]
+        self.assertFalse(bridge.runtime_busy(self.gateway))
+        self.assertEqual(self.fixture.calls[-1][1], "/api/config/activity")
         self.fixture.active = True
-        self.assertTrue(bridge.sessions_busy(self.gateway))
+        self.assertTrue(bridge.runtime_busy(self.gateway))
 
     def test_completed_retention_is_bounded_and_preserves_all_active_jobs(self):
         directory = self.root / "jobs"
