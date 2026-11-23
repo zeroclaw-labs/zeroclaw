@@ -22644,10 +22644,52 @@ temperature = 0.3
             },
         );
 
+        // A predecessor still serving `first`: an instance that is cancelled
+        // or fails before publishing must neither replace nor remove it.
+        struct PredecessorOwner;
+        impl zeroclaw_api::conversation_binding::ConversationBindingOwner for PredecessorOwner {
+            fn load(
+                &self,
+                _binding: &zeroclaw_api::conversation_binding::ConversationBinding,
+            ) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ChatMessage>> {
+                Ok(Vec::new())
+            }
+            fn append(
+                &self,
+                _binding: &zeroclaw_api::conversation_binding::ConversationBinding,
+                _messages: &[zeroclaw_api::model_provider::ChatMessage],
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        let first_owner = || {
+            zeroclaw_infra::conversation_owners::conversation_owner(
+                zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+                "first",
+            )
+        };
+        let same_owner = |a: &Arc<
+            dyn zeroclaw_api::conversation_binding::ConversationBindingOwner,
+        >,
+                          b: &Arc<
+            dyn zeroclaw_api::conversation_binding::ConversationBindingOwner,
+        >| {
+            std::ptr::eq(Arc::as_ptr(a).cast::<()>(), Arc::as_ptr(b).cast::<()>())
+        };
+
         // Exercise preparation cancellation, cancellation at the writer wait,
         // a later agent's failure, and a clean retry through the same entrypoint.
         for scenario in ["preparing", "writer-wait", "later-agent-failure", "retry"] {
             prepare_live_channel_registry(true);
+            let predecessor: Arc<dyn zeroclaw_api::conversation_binding::ConversationBindingOwner> =
+                Arc::new(PredecessorOwner);
+            let mut predecessor_lease = Some(
+                zeroclaw_infra::conversation_owners::publish_conversation_owner(
+                    zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+                    "first",
+                    Arc::clone(&predecessor),
+                ),
+            );
             let mut attempt_config = config.clone();
             if scenario == "later-agent-failure" {
                 let mut invalid = attempt_config.agents["first"].clone();
@@ -22701,6 +22743,10 @@ temperature = 0.3
                 0,
                 "{scenario}: listener started during preparation"
             );
+            assert!(
+                first_owner().is_some_and(|owner| same_owner(&owner, &predecessor)),
+                "{scenario}: conversation owner replaced during preparation"
+            );
             if scenario == "preparing" || scenario == "writer-wait" {
                 let lock = zeroclaw_config::write_lock::shared_config_write_lock();
                 let guard = lock.lock().await;
@@ -22722,6 +22768,10 @@ temperature = 0.3
                     .unwrap();
                 assert!(live_channel_map().is_empty());
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
+                assert!(
+                    first_owner().is_some_and(|owner| same_owner(&owner, &predecessor)),
+                    "{scenario}: a cancelled instance replaced or removed the serving owner"
+                );
                 drop(guard);
             } else if scenario == "later-agent-failure" {
                 probe.release.notify_one();
@@ -22733,6 +22783,10 @@ temperature = 0.3
                 assert!(format!("{error:#}").contains("second"));
                 assert!(live_channel_map().is_empty());
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
+                assert!(
+                    first_owner().is_some_and(|owner| same_owner(&owner, &predecessor)),
+                    "{scenario}: a failed instance replaced or removed the serving owner"
+                );
             } else {
                 probe.release.notify_one();
                 tokio::time::timeout(Duration::from_secs(5), async {
@@ -22744,6 +22798,18 @@ temperature = 0.3
                 .unwrap();
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
                 assert!(live_channel_map().contains_key("startup-probe.startup-probe"));
+                assert!(
+                    first_owner().is_some_and(|owner| !same_owner(&owner, &predecessor)),
+                    "a published instance serves `first` itself"
+                );
+                // The order that matters in production: the successor is
+                // serving when the replaced instance shuts down and drops its
+                // lease. The successor must stay published.
+                drop(predecessor_lease.take());
+                assert!(
+                    first_owner().is_some_and(|owner| !same_owner(&owner, &predecessor)),
+                    "the replaced instance's lease removed its successor"
+                );
                 cancel.cancel();
                 tokio::time::timeout(Duration::from_secs(5), task)
                     .await
@@ -22751,7 +22817,18 @@ temperature = 0.3
                     .unwrap()
                     .unwrap();
                 assert!(live_channel_map().is_empty());
+                assert!(
+                    first_owner().is_none(),
+                    "a stopped instance leaves no owner behind"
+                );
             }
+            // Cleanup: where the stand-in was never replaced, its still-current
+            // lease removes it, so no owner leaks into the next scenario.
+            drop(predecessor_lease.take());
+            assert!(
+                first_owner().is_none(),
+                "{scenario}: an owner was left published"
+            );
         }
     }
 
