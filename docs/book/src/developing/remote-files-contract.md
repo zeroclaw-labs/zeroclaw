@@ -1,0 +1,50 @@
+# Remote Files tool contract
+
+Design proposal for [RFC #12690](https://github.com/zeroclaw-labs/zeroclaw/issues/12690) and the credential grants in [RFC #12422](https://github.com/zeroclaw-labs/zeroclaw/issues/12422). The proposed tool is a native, opt-in ZeroClaw capability. The language model calls typed operations using configured resource aliases and relative paths.
+
+## Operations
+
+| Operation | Scope and behavior |
+| --- | --- |
+| List directory | List a bounded page of entries, with metadata and a scoped continuation token where supported. |
+| Copy files | Copy one or more explicitly named files between an authorized remote root and the workspace, or between two authorized remote roots. Require read and destination create permissions. |
+| Move files | Require source move and removal rights and destination create rights. A streamed move also requires source read. Verify the destination before attempting source removal. |
+| Delete files | Delete one or more explicitly named regular files. |
+| Rename files | Rename one or more files within their parent directories. Validate both names, reject duplicate destinations before starting and report outcomes per item. |
+| Create directory | Create one directory. Creating missing parents requires explicit permission. |
+| Rename directory | Rename within its parent. Require rights over the affected subtree for nonempty directories. |
+| Delete directory | Remove an empty directory by default. Recursion requires a separate grant and a bounded traversal. |
+| Copy or move directory | Support scoped directory transfers with separate recursive copy and move permissions. Check both trees and report partial results. |
+| Get file info | Return available size, kind and timestamps; include owner, mode or checksum only where supported and authorized. Fetching a checksum may require reading the file. |
+| Set file info | Grant metadata writes separately. Start with modification time where supported. Ownership, ACLs, executable bits and privilege-bearing metadata require a separate design. |
+| Login | Establish or validate a task-scoped connection to an authorized resource. For a host-managed mount, verify the configured mount identity and access. Never mount or escalate privileges. |
+| Logout | Close task-owned sessions and discard ephemeral handles. For host-managed mounts, release tool-owned handles without unmounting the operator's volume. |
+
+Batches have bounded item counts and per-item results. No silent overwrite, wildcard mutation or implicit recursion. Use a backend-native atomic move only where its semantics are guaranteed inside the authorized resource. Otherwise stage and verify the destination, publish it, then recheck source removal authorization. If removal fails, report that both copies remain.
+
+## Backend boundaries
+
+- **SMB3 over TCP or QUIC** uses a verified mount, native platform API, or in-process host-client binding. QUIC is offered only when the host supports that transport. An explicit QUIC selection cannot fall back to TCP.
+- **NFS** uses the host client through a verified mount. The host manages its own identity and authentication.
+- **SFTP** uses Rust protocol code and can reuse reviewed SSH authentication and host-key verification primitives. An SSH command grant confers no SFTP file access.
+- **FTPS** uses an in-process Rust client with peer verification and TLS on both control and data connections. No FTP plaintext fallback.
+- **WebDAV** uses Rust HTTP and WebDAV handling over HTTPS, with exact-origin checks and no automatic cross-origin credential forwarding.
+
+The Rust implementation uses platform APIs or narrowly scoped FFI where necessary. It needs no shell, subprocess, Python, or MCP server. Dependencies require license, maintenance and security review before selection. Logout ends a logical task session for stateless backends and does not imply a wire-level logout request to servers that lack one.
+
+## Vault and WebUI rights
+
+The operator registers a resource alias, protocol, verified remote identity, and allowed root. The resource grant controls list, copy, move, delete, rename, directory creation, metadata operations and session opening. In **Secrets → Usage permissions**, the operator binds compatible credential aliases to the Remote Files consumer and exact registered destination. Host-managed identities still require a resource grant. Grants are read-only by default if the operator selects a read-only preset; no remote root is granted implicitly.
+
+The **Require human approval** checkbox can be selected on each relevant grant. The approval describes the exact operation, source and destination, affected tree, overwrite or delete effects, and credential alias. A checked grant on either endpoint requires approval before connection or credential use. Global approval rules also apply. Recheck the live grant revision before dispatch and destructive phases; revocation invalidates cached authorization. Always allow cleanup of handles owned by the requesting task.
+
+Before a stat, canonicalization, DNS request or any network I/O, authorize both endpoint aliases, operation and lexical paths. Access beneath authorized roots uses handle-relative or equivalent containment. Reject ambiguous paths and escapes. Verify peer identity before releasing credentials. Log scope and outcome with path redaction; secrets and file contents remain outside model context and ordinary audit output.
+
+## Implementation and acceptance
+
+1. Register the opt-in Rust tool and connect its typed requests to the existing tool dispatch, approval, and vault boundaries. Use the authoritative grant state.
+2. Implement verified SMB/NFS mounts and in-process SFTP. Verify bounded list/stat, copy, move, delete and cancellation; add the WebUI editor and test grant, denial and revocation against disposable servers.
+3. Add WebDAV, FTPS and platform-native SMB options. Report unsupported operations or transports explicitly. Validate Linux, Windows and macOS capabilities separately.
+4. Exercise task cleanup, same-resource rename, streamed cross-resource moves, rotation, stale approvals, and both endpoint grants. Include zero-I/O regressions for denied destinations, link escapes and unapproved UNC paths.
+
+This document defines the proposed contract. It does not enable a runtime capability.
