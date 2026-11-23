@@ -31,6 +31,8 @@ mod gateway;
 mod gateway_get_paircode_cli;
 mod gemini_capabilities;
 mod hardware_probe_feature_graph;
+#[cfg(feature = "agent-runtime")]
+mod migrate_session_ownership_cli;
 mod oidc_enrollment_cli;
 mod otel_dependency_feature_regression;
 mod plugin_feature_graph;
