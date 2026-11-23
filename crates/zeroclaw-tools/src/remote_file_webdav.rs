@@ -1,6 +1,6 @@
 //! Read-side transport for operator-registered WebDAV resources.
 
-use reqwest::header::{ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, HeaderValue};
+use reqwest::header::{ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, HeaderValue, IF_NONE_MATCH};
 use reqwest::{Client, Method, Response, StatusCode, Url};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -88,6 +88,29 @@ impl WebDavRead {
         Ok(written)
     }
 
+    /// Create a staging file chosen by the executor. No existing file is
+    /// overwritten. This buffered variant has a fixed upper bound and does
+    /// not publish the final destination or retry an uncertain write.
+    pub async fn upload_new_staging_file(
+        &self,
+        path: &str,
+        authorization: Option<HeaderValue>,
+        bytes: Vec<u8>,
+        limit: usize,
+    ) -> Result<(), WebDavError> {
+        const MAX_BUFFERED_UPLOAD: usize = 8 * 1024 * 1024;
+        let url = resource_url(&self.root, path)?;
+        if bytes.len() > limit.min(MAX_BUFFERED_UPLOAD) {
+            return Err(WebDavError::ByteLimit);
+        }
+        let request = self.client.put(url).header(IF_NONE_MATCH, "*").body(bytes);
+        let response = with_authorization(request, authorization)
+            .send()
+            .await
+            .map_err(|_| WebDavError::Transport)?;
+        require_status(response, StatusCode::CREATED).map(|_| ())
+    }
+
     /// Create exactly one directory. Parent creation and authorization are
     /// handled separately by the caller.
     pub async fn create_directory(
@@ -156,11 +179,23 @@ impl WebDavRead {
                 .header("Destination", destination.as_str())
                 .header("Overwrite", "F");
         }
-        if let Some(mut authorization) = authorization {
-            authorization.set_sensitive(true);
-            request = request.header(AUTHORIZATION, authorization);
+        with_authorization(request, authorization)
+            .send()
+            .await
+            .map_err(|_| WebDavError::Transport)
+    }
+}
+
+fn with_authorization(
+    request: reqwest::RequestBuilder,
+    authorization: Option<HeaderValue>,
+) -> reqwest::RequestBuilder {
+    match authorization {
+        Some(mut value) => {
+            value.set_sensitive(true);
+            request.header(AUTHORIZATION, value)
         }
-        request.send().await.map_err(|_| WebDavError::Transport)
+        None => request,
     }
 }
 
@@ -286,6 +321,16 @@ mod tests {
                     "docs/new.txt",
                     "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 ),
+                (
+                    "PUT",
+                    "docs/staging.tmp",
+                    "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ),
+                (
+                    "PUT",
+                    "docs/staging.tmp",
+                    "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ),
             ] {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut tls = acceptor.accept(stream).await.unwrap();
@@ -313,6 +358,14 @@ mod tests {
                         "\r\ndestination: https://files.test:{}/dav/docs/{target}\r\n",
                         addr.port()
                     )));
+                }
+                if method == "PUT" {
+                    let request = request.to_ascii_lowercase();
+                    assert!(request.contains("\r\nif-none-match: *\r\n"));
+                    assert!(request.contains("\r\ncontent-length: 4\r\n"));
+                    let mut body = [0; 4];
+                    tls.read_exact(&mut body).await.unwrap();
+                    assert_eq!(&body, b"demo");
                 }
                 tls.write_all(response.as_bytes()).await.unwrap();
                 tls.shutdown().await.unwrap();
@@ -375,6 +428,32 @@ mod tests {
             assert!(matches!(
                 adapter
                     .rename("docs/new.txt", "docs/existing.txt", authorization())
+                    .await,
+                Err(WebDavError::Status(StatusCode::PRECONDITION_FAILED))
+            ));
+            assert!(matches!(
+                adapter
+                    .upload_new_staging_file(
+                        "docs/too-large.tmp",
+                        authorization(),
+                        b"large".to_vec(),
+                        4
+                    )
+                    .await,
+                Err(WebDavError::ByteLimit)
+            ));
+            adapter
+                .upload_new_staging_file("docs/staging.tmp", authorization(), b"demo".to_vec(), 4)
+                .await
+                .unwrap();
+            assert!(matches!(
+                adapter
+                    .upload_new_staging_file(
+                        "docs/staging.tmp",
+                        authorization(),
+                        b"demo".to_vec(),
+                        4
+                    )
                     .await,
                 Err(WebDavError::Status(StatusCode::PRECONDITION_FAILED))
             ));
