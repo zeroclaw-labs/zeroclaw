@@ -270,6 +270,21 @@ test("403 operator_required is a typed error the pages show as not available", a
   await assert.rejects(api.apiFetch("/api/tools"), api.OperatorRequiredError);
 });
 
+test("403 not_permitted and agent_not_allowed read as not available too", async () => {
+  auth.setOidcSession(session({ admin: false }));
+  for (const reason of ["not_permitted", "agent_not_allowed"]) {
+    responder = () => json(403, { error: "no", reason });
+    await assert.rejects(api.apiFetch("/api/status?agent=secret"), (err: unknown) => {
+      assert.ok(err instanceof api.OperatorRequiredError, reason);
+      assert.equal(err.reason, reason);
+      return true;
+    });
+  }
+  // An unknown reason stays a plain HTTP error.
+  responder = () => json(403, { error: "no", reason: "something_else" });
+  await assert.rejects(api.apiFetch("/api/x"), api.HttpError);
+});
+
 test("403 csrf re-reads the session once and retries with its new token", async () => {
   auth.setOidcSession(session());
   let posts = 0;

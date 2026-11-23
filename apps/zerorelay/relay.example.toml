@@ -107,3 +107,35 @@ connect_rate_per_node = 20.0
 # The blind-forwarder guarantee is unchanged for the RPC plane and for
 # zerocode/native enrollment whether this is on or off.
 # enabled = false
+
+[dashboard]
+# Serve listed daemons' web dashboards at https://<label>.<domain>/, where
+# <label> is derived from each daemon's registration key (the daemon logs its
+# address). DEFAULT OFF. The daemon must also enable [relay.dashboard].
+#
+# TRUST IMPLICATION - read before enabling. This route is RELAY-TERMINATED:
+# the relay ends those browsers' TLS and forwards their dashboard traffic to
+# the daemon in plaintext over the daemon's relay link. Anyone who can modify
+# this relay can read and change that traffic - pages, session cookies, CSRF
+# tokens - and act as a signed-in user, with an administrator's session as an
+# administrator, including changes that outlast the session. Browsers still
+# sign in to the identity provider directly; the daemon serves these
+# connections as the remote browser they are, routes them only to its own
+# dashboard, and never to a local port.
+#
+# The blind-forwarder guarantee is unchanged for the RPC plane and for
+# zerocode/native clients whether this is on or off.
+#
+# Requires wildcard DNS for *.<domain> pointing here and a publicly trusted
+# certificate for *.<domain> (wildcards are issued by DNS challenge only).
+# Port 443 keeps the port out of every dashboard address.
+# enabled = false
+# domain = "relay.example.com"
+# cert = "/etc/zerorelay/wildcard-fullchain.pem"
+# key = "/etc/zerorelay/wildcard-privkey.pem"
+# The daemons whose dashboards are served (registration-key fingerprints, as
+# in [admission] allow). Required, in open mode too: without it any daemon
+# that registers would get a trusted HTTPS host under this relay's domain.
+# allow = []
+# max_conns_per_node = 64
+# max_conns_per_ip = 16
