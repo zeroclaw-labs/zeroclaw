@@ -1290,10 +1290,10 @@ impl Channel for SimplexChannel {
                     // Reconnect on overload rather than silently dropping ordered audio.
                     events.try_send(value).map_err(|error| match error {
                         mpsc::error::TrySendError::Full(_) => {
-                            anyhow::anyhow!("simplex_bridge_event_overflow")
+                            anyhow::Error::msg("simplex_bridge_event_overflow")
                         }
                         mpsc::error::TrySendError::Closed(_) => {
-                            anyhow::anyhow!("simplex_event_loop_closed")
+                            anyhow::Error::msg("simplex_event_loop_closed")
                         }
                     })?;
                 }
@@ -2263,7 +2263,10 @@ mod tests {
         use tokio_tungstenite::tungstenite::Message;
         use zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let uri = format!("ws://{}/stream", listener.local_addr().unwrap());
+        let uri = format!(
+            "ws://127.0.0.1:{}/stream",
+            listener.local_addr().unwrap().port()
+        );
         let server = zeroclaw_spawn::spawn!(async move {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
@@ -2805,7 +2808,7 @@ mod tests {
         wait_for_started_requests(&started, 1).await;
         assert_eq!(started.lock().len(), 1);
         assert_eq!(started.lock().first().map(String::as_str), Some("call"));
-        let control = tokio::spawn({
+        let control = zeroclaw_spawn::spawn!({
             let channel = channel.clone();
             async move {
                 channel
