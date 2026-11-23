@@ -53362,6 +53362,251 @@ mod tests {
         (ctx, backend, workspace)
     }
 
+    /// The `sessions_prompt` runner's checks, driven through the dispatcher:
+    /// a live `test-agent` session owned by Alice, and a config whose
+    /// `caller` agent gets `delegation` and a delegate entry for `test-agent`.
+    mod injected_session_prompt {
+        use super::*;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, DelegateExecutionMode, DelegateTargetConfig, RiskProfileConfig,
+        };
+        use zeroclaw_tools::sessions_prompt::SessionPromptRefusal;
+
+        const SID: &str = "s-injected-target";
+
+        struct Fixture {
+            ctx: Arc<RpcContext>,
+            handles: RecordingHandles,
+            _tmp: tempfile::TempDir,
+        }
+
+        async fn fixture(
+            caller_delegation: Option<(
+                zeroclaw_config::autonomy::DelegationMode,
+                DelegateExecutionMode,
+            )>,
+            owner_tui_id: Option<&str>,
+            gated: bool,
+        ) -> Fixture {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = session_cwd_config(&tmp, 4242, None);
+            if let Some((mode, target_mode)) = caller_delegation {
+                config.risk_profiles.insert(
+                    "caller-profile".into(),
+                    RiskProfileConfig {
+                        delegation_policy: zeroclaw_config::autonomy::DelegationPolicy { mode },
+                        ..Default::default()
+                    },
+                );
+                config.agents.insert(
+                    "caller".into(),
+                    AliasedAgentConfig {
+                        enabled: true,
+                        risk_profile: "caller-profile".into(),
+                        delegates: vec![DelegateTargetConfig {
+                            agent: "test-agent".into(),
+                            mode: target_mode,
+                        }],
+                        ..Default::default()
+                    },
+                );
+            }
+            let workspace = config
+                .agent_workspace_dir("test-agent")
+                .canonicalize()
+                .unwrap();
+            let (ctx, backend, _acp_store) = persistence_enforcement_ctx(config);
+            let handles = install_recording_session_with(
+                &ctx,
+                &backend,
+                SID,
+                "user:alice",
+                &workspace,
+                Vec::new(),
+                gated,
+                SessionExtras {
+                    owner_tui_id: owner_tui_id.map(str::to_string),
+                    ..SessionExtras::default()
+                },
+            )
+            .await;
+            Fixture {
+                ctx,
+                handles,
+                _tmp: tmp,
+            }
+        }
+
+        async fn connection(ctx: &Arc<RpcContext>, tui_id: Option<&str>) -> RpcDispatcher {
+            let (mut dispatcher, _rx) = roster_peer(ctx, 4242).await;
+            dispatcher.set_tui_id_for_test(tui_id.map(str::to_string));
+            dispatcher
+        }
+
+        async fn inject(
+            dispatcher: &RpcDispatcher,
+            session_id: &str,
+            caller_alias: &str,
+        ) -> Result<zeroclaw_tools::sessions_prompt::SessionPromptOutcome, SessionPromptRefusal>
+        {
+            dispatcher
+                .run_agent_injected_session_prompt(
+                    session_id.to_string(),
+                    "[from agent caller, session s-caller]\nstatus?".to_string(),
+                    caller_alias.to_string(),
+                )
+                .await
+        }
+
+        #[tokio::test]
+        async fn an_unknown_session_is_not_found() {
+            let fixture = fixture(None, None, false).await;
+            let dispatcher = connection(&fixture.ctx, None).await;
+            let refusal = inject(&dispatcher, "s-missing", "test-agent").await;
+            assert!(matches!(refusal, Err(SessionPromptRefusal::NotFound)));
+            assert!(fixture.handles.calls().await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_same_alias_session_on_this_connection_runs_the_turn() {
+            let fixture = fixture(None, None, false).await;
+            let dispatcher = connection(&fixture.ctx, None).await;
+            let outcome = inject(&dispatcher, SID, "test-agent").await;
+            assert!(outcome.is_ok(), "{:?}", outcome.err().map(|_| ()));
+            let calls = fixture.handles.calls().await;
+            assert_eq!(calls.len(), 1);
+            assert!(calls[0].0.contains("status?"), "{}", calls[0].0);
+        }
+
+        #[tokio::test]
+        async fn an_agent_with_no_delegate_entry_cannot_reach_the_session() {
+            let fixture = fixture(None, None, false).await;
+            let dispatcher = connection(&fixture.ctx, None).await;
+            let refusal = inject(&dispatcher, SID, "stranger").await;
+            assert!(matches!(
+                refusal,
+                Err(SessionPromptRefusal::NotReachable { ref target_alias }) if target_alias == "test-agent"
+            ));
+            assert!(fixture.handles.calls().await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_independent_delegate_target_is_reached_when_delegation_is_allowed() {
+            let fixture = fixture(
+                Some((
+                    zeroclaw_config::autonomy::DelegationMode::Allow,
+                    DelegateExecutionMode::Independent,
+                )),
+                None,
+                false,
+            )
+            .await;
+            let dispatcher = connection(&fixture.ctx, None).await;
+            assert!(inject(&dispatcher, SID, "caller").await.is_ok());
+            assert_eq!(fixture.handles.calls().await.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_caller_whose_policy_forbids_delegation_cannot_reach_the_session() {
+            let fixture = fixture(
+                Some((
+                    zeroclaw_config::autonomy::DelegationMode::Forbidden,
+                    DelegateExecutionMode::Independent,
+                )),
+                None,
+                false,
+            )
+            .await;
+            let dispatcher = connection(&fixture.ctx, None).await;
+            assert!(matches!(
+                inject(&dispatcher, SID, "caller").await,
+                Err(SessionPromptRefusal::NotReachable { .. })
+            ));
+            assert!(fixture.handles.calls().await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_bounded_delegate_target_cannot_be_prompted_in_its_own_session() {
+            let fixture = fixture(
+                Some((
+                    zeroclaw_config::autonomy::DelegationMode::Allow,
+                    DelegateExecutionMode::Bounded,
+                )),
+                None,
+                false,
+            )
+            .await;
+            let dispatcher = connection(&fixture.ctx, None).await;
+            assert!(matches!(
+                inject(&dispatcher, SID, "caller").await,
+                Err(SessionPromptRefusal::NotReachable { .. })
+            ));
+            assert!(fixture.handles.calls().await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_session_attached_to_another_tui_is_refused() {
+            let fixture = fixture(None, Some("tui-owner"), false).await;
+            let dispatcher = connection(&fixture.ctx, Some("tui-second")).await;
+            assert!(matches!(
+                inject(&dispatcher, SID, "test-agent").await,
+                Err(SessionPromptRefusal::OtherConnection)
+            ));
+            assert!(fixture.handles.calls().await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_session_running_a_turn_is_busy() {
+            let mut fixture = fixture(None, None, true).await;
+            let owner = connection(&fixture.ctx, None).await;
+            let running = zeroclaw_spawn::spawn!(async move {
+                owner
+                    .handle_session_prompt(&json!({"session_id": SID, "prompt": "long task"}))
+                    .await
+            });
+            fixture.handles.await_start().await;
+            let dispatcher = connection(&fixture.ctx, None).await;
+            assert!(matches!(
+                inject(&dispatcher, SID, "test-agent").await,
+                Err(SessionPromptRefusal::Busy)
+            ));
+            fixture.handles.release();
+            tokio::time::timeout(std::time::Duration::from_secs(10), running)
+                .await
+                .expect("the owner's turn finishes")
+                .expect("the owner's turn does not panic")
+                .expect("the owner's turn succeeds");
+            assert_eq!(fixture.handles.calls().await.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn two_injected_prompts_racing_for_an_idle_session_admit_one() {
+            let mut fixture = fixture(None, None, true).await;
+            let first = connection(&fixture.ctx, None).await;
+            let second = connection(&fixture.ctx, None).await;
+            let a = zeroclaw_spawn::spawn!(async move { inject(&first, SID, "test-agent").await });
+            let b = zeroclaw_spawn::spawn!(async move { inject(&second, SID, "test-agent").await });
+            fixture.handles.await_start().await;
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !(a.is_finished() || b.is_finished()) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the losing prompt is refused without waiting");
+            fixture.handles.release();
+            let a = a.await.unwrap();
+            let b = b.await.unwrap();
+            let busy = [&a, &b]
+                .iter()
+                .filter(|r| matches!(r, Err(SessionPromptRefusal::Busy)))
+                .count();
+            let ran = [&a, &b].iter().filter(|r| r.is_ok()).count();
+            assert_eq!((ran, busy), (1, 1));
+            assert_eq!(fixture.handles.calls().await.len(), 1);
+        }
+    }
+
     const STEER_TEXT: &str = "please also check the second file";
 
     /// Alice's turn on her own session is parked at its first model call; a

@@ -235,6 +235,13 @@ impl PipelineTool {
 
         let mut join_set = JoinSet::new();
         let context = ToolExecutionContext::current().unwrap_or_default();
+        // Task-locals do not cross spawn: carry the turn's session key and
+        // the sessions_prompt runner into each parallel step.
+        let prompt_scope = crate::sessions_prompt::SessionPromptScope::capture();
+        let session_key = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
 
         for (i, step) in steps.iter().enumerate() {
             let tool_arc = self
@@ -247,8 +254,15 @@ impl PipelineTool {
             zeroclaw_api::tool::clear_runtime_approval(tool_arc.name(), &mut args);
 
             let context = context.clone();
+            let prompt_scope = prompt_scope.clone();
+            let session_key = session_key.clone();
             join_set.spawn(async move {
-                let result = tool_arc.execute_with_context(args, &context).await;
+                let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+                    .scope(
+                        session_key,
+                        prompt_scope.scope(tool_arc.execute_with_context(args, &context)),
+                    )
+                    .await;
                 (i, tool_name, result)
             });
         }
@@ -575,6 +589,75 @@ mod tests {
     #[tokio::test]
     async fn tool_context_pipeline_parallel_steps_inherit_token() {
         assert_steps_inherit_context(true).await;
+    }
+
+    /// Whether a step saw the runner, and the session key it saw.
+    type ScopeObservations = Arc<std::sync::Mutex<Vec<(bool, Option<String>)>>>;
+
+    struct SessionScopeProbe {
+        seen: ScopeObservations,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(SessionScopeProbe);
+
+    #[async_trait]
+    impl Tool for SessionScopeProbe {
+        fn name(&self) -> &str {
+            "session_scope_probe"
+        }
+        fn description(&self) -> &str {
+            "Records the session task-locals a pipeline step sees"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+            let runner = crate::sessions_prompt::current_session_prompt_runner().is_some();
+            let key = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+                .try_with(Clone::clone)
+                .ok()
+                .flatten();
+            self.seen.lock().unwrap().push((runner, key));
+            Ok(ToolResult::ok("probed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_steps_keep_the_session_prompt_runner_and_session_key() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tool = PipelineTool::new(
+            PipelineConfig {
+                enabled: true,
+                max_steps: 2,
+                allowed_tools: vec!["session_scope_probe".into()],
+            },
+            vec![Arc::new(SessionScopeProbe { seen: seen.clone() })],
+        );
+        let runner: Arc<crate::sessions_prompt::SessionPromptFn> = Arc::new(Box::new(|_, _, _| {
+            Box::pin(async { Err(crate::sessions_prompt::SessionPromptRefusal::Busy) })
+                as crate::sessions_prompt::SessionPromptFuture
+        }));
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(
+                Some("caller".into()),
+                crate::sessions_prompt::scope_session_prompt_runner(
+                    Some(runner),
+                    tool.execute(serde_json::json!({
+                        "steps": [
+                            {"tool": "session_scope_probe", "args": {}},
+                            {"tool": "session_scope_probe", "args": {}}
+                        ],
+                        "parallel": true
+                    })),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(true, Some("caller".to_string())); 2]
+        );
     }
 
     // ── Interpolation ──────────────────────────────────────

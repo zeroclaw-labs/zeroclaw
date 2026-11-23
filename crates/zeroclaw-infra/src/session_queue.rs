@@ -256,6 +256,38 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn try_acquire_claims_only_an_idle_session() {
+        let queue = Arc::new(SessionActorQueue::new(4, 5, 600));
+        let held = queue.acquire("s1").await.unwrap();
+        assert!(queue.try_acquire("s1").await.unwrap().is_none(), "held");
+
+        let waiter = queue.clone();
+        let queued = zeroclaw_spawn::spawn!(async move { waiter.acquire("s1").await });
+        while queue.queue_depth("s1").await < 2 {
+            tokio::task::yield_now().await;
+        }
+        drop(held);
+        let next = queued.await.unwrap().unwrap();
+        assert!(
+            queue.try_acquire("s1").await.unwrap().is_none(),
+            "the queued waiter owns it now"
+        );
+        drop(next);
+        assert!(
+            queue.try_acquire("s1").await.unwrap().is_some(),
+            "idle again"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_try_acquire_admits_exactly_one() {
+        let queue = Arc::new(SessionActorQueue::new(4, 5, 600));
+        let (a, b) = tokio::join!(queue.try_acquire("s1"), queue.try_acquire("s1"));
+        let claims = [a.unwrap(), b.unwrap()];
+        assert_eq!(claims.iter().filter(|c| c.is_some()).count(), 1);
+    }
+
+    #[tokio::test]
     async fn serializes_same_session() {
         let queue = SessionActorQueue::new(8, 5, 600);
 
