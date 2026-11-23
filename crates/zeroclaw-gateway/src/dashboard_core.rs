@@ -1697,7 +1697,35 @@ pub(crate) fn agent_not_allowed() -> Response {
 // serves goes to the core, anything else (an administrator's session
 // included) to the handler unchanged.
 
-type CutoverStore = Option<Extension<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>>;
+use zeroclaw_infra::acp_session_store::AcpSessionStore;
+
+#[derive(Clone)]
+pub(crate) struct CutoverWebChat {
+    pub(crate) store: Arc<AcpSessionStore>,
+    pub(crate) turns: Arc<crate::acp::AcpTurnHub>,
+}
+
+type Cutover = Option<Extension<CutoverWebChat>>;
+
+async fn operator_webchat_id(
+    store: &Arc<AcpSessionStore>,
+    id: String,
+) -> Result<Option<String>, Response> {
+    let store = Arc::clone(store);
+    match tokio::task::spawn_blocking(move || store.operator_webchat_id(&id)).await {
+        Ok(Ok(id)) => Ok(id),
+        Ok(Err(e)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":e.to_string()})),
+        )
+            .into_response()),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":e.to_string()})),
+        )
+            .into_response()),
+    }
+}
 
 async fn webchat_store_result(
     state: &AppState,
@@ -1729,9 +1757,9 @@ async fn webchat_store_result(
 }
 
 /// `GET /api/sessions`.
-pub async fn sessions_list(
+pub(crate) async fn sessions_list(
     State(state): State<AppState>,
-    cutover: CutoverStore,
+    cutover: Cutover,
     core: Option<Extension<CoreRpc>>,
     dashboard: Option<Extension<Arc<DashboardAuth>>>,
     headers: HeaderMap,
@@ -1741,7 +1769,7 @@ pub async fn sessions_list(
         cutover,
     ) {
         (Some(caller), _) => caller.sessions_list(),
-        (None, Some(Extension(store))) => {
+        (None, Some(Extension(CutoverWebChat { store, .. }))) => {
             webchat_store_result(&state, &headers, store, move |s| {
                 let sessions = s
                     .operator_webchats()?
@@ -1770,9 +1798,9 @@ pub async fn sessions_list(
 
 /// `GET /api/sessions/{id}/messages`. A scoped session's conversation ends
 /// with its chat and is never reopened, so it has no transcript to load.
-pub async fn session_messages(
+pub(crate) async fn session_messages(
     State(state): State<AppState>,
-    cutover: CutoverStore,
+    cutover: Cutover,
     core: Option<Extension<CoreRpc>>,
     dashboard: Option<Extension<Arc<DashboardAuth>>>,
     headers: HeaderMap,
@@ -1783,7 +1811,7 @@ pub async fn session_messages(
         cutover,
     ) {
         (Some(_), _) => CoreFailure::NotFound.into_response(),
-        (None, Some(Extension(store))) => {
+        (None, Some(Extension(CutoverWebChat { store, .. }))) => {
             webchat_store_result(&state, &headers, store, move |s| {
                 let messages = s
                     .operator_webchat_history(&id)?
@@ -1809,9 +1837,9 @@ pub async fn session_messages(
 }
 
 /// `PUT /api/sessions/{id}`. Not offered for a scoped session's chats.
-pub async fn session_rename(
+pub(crate) async fn session_rename(
     State(state): State<AppState>,
-    cutover: CutoverStore,
+    cutover: Cutover,
     core: Option<Extension<CoreRpc>>,
     dashboard: Option<Extension<Arc<DashboardAuth>>>,
     headers: HeaderMap,
@@ -1823,7 +1851,7 @@ pub async fn session_rename(
         cutover,
     ) {
         (Some(_), _) => CoreFailure::NotFound.into_response(),
-        (None, Some(Extension(store))) => {
+        (None, Some(Extension(CutoverWebChat { store, .. }))) => {
             let Some(name) = body["name"]
                 .as_str()
                 .map(str::trim)
@@ -1848,9 +1876,9 @@ pub async fn session_rename(
 
 /// `DELETE /api/sessions/{id}`. Not offered for a scoped session's chats,
 /// whose conversations close when the chat does.
-pub async fn session_delete(
+pub(crate) async fn session_delete(
     State(state): State<AppState>,
-    cutover: CutoverStore,
+    cutover: Cutover,
     core: Option<Extension<CoreRpc>>,
     dashboard: Option<Extension<Arc<DashboardAuth>>>,
     headers: HeaderMap,
@@ -1861,16 +1889,22 @@ pub async fn session_delete(
         cutover,
     ) {
         (Some(_), _) => CoreFailure::NotFound.into_response(),
-        (None, Some(Extension(store))) => {
+        (None, Some(Extension(CutoverWebChat { store, turns }))) => {
             if let Err(e) = crate::api::require_auth(&state, &headers) {
                 return e.into_response();
             }
-            let Ok(_permit) = state.session_queue.acquire(&id).await else {
+            let id = match operator_webchat_id(&store, id).await {
+                Ok(Some(id)) => id,
+                Ok(None) => return CoreFailure::NotFound.into_response(),
+                Err(response) => return response,
+            };
+            let Ok(permit) = turns.acquire_for_webchat_delete(&id).await else {
                 return StatusCode::CONFLICT.into_response();
             };
             let queue = Arc::clone(&state.session_queue);
             webchat_store_result(&state, &headers, store, move |s| {
                 Ok(s.delete_operator_webchat(&id)?.then(|| {
+                    turns.forget_deleted_webchat(&permit);
                     queue.advance_generation(&id);
                     json!({"session_id":id,"deleted":true})
                 }))
@@ -1883,20 +1917,162 @@ pub async fn session_delete(
     }
 }
 
-/// `POST /api/sessions/{id}/abort`.
-pub async fn session_abort(
+/// `POST /api/sessions/{id}/messages`.
+pub(crate) async fn session_message_post(
     State(state): State<AppState>,
+    cutover: Cutover,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<crate::api::SessionMessagePostBody>,
+) -> Response {
+    let Some(Extension(CutoverWebChat { store, .. })) = cutover else {
+        return crate::api::handle_api_session_message_post(
+            State(state),
+            headers,
+            Path(id),
+            Json(body),
+        )
+        .await
+        .into_response();
+    };
+    if let Err(denied) = crate::api::require_auth(&state, &headers) {
+        return denied.into_response();
+    }
+    if body.content.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"content is required"})),
+        )
+            .into_response();
+    }
+    let id = match operator_webchat_id(&store, id).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return CoreFailure::NotFound.into_response(),
+        Err(response) => return response,
+    };
+    let permit = match state.session_queue.acquire(&id).await {
+        Ok(permit) => permit,
+        Err(e) => {
+            let status = match e {
+                crate::session_queue::SessionQueueError::QueueFull { .. } => {
+                    StatusCode::TOO_MANY_REQUESTS
+                }
+                crate::session_queue::SessionQueueError::Timeout { .. } => {
+                    StatusCode::REQUEST_TIMEOUT
+                }
+            };
+            return (status, Json(json!({"error":e.to_string()}))).into_response();
+        }
+    };
+    let queue = Arc::clone(&state.session_queue);
+    let events = state.event_tx.clone();
+    webchat_store_result(&state, &headers, store, move |store| {
+        let _permit = permit;
+        if !store.append_operator_webchat_message(&id, &body.content)? {
+            return Ok(None);
+        }
+        queue.advance_generation(&id);
+        let _ = events.send(json!({
+            "type": "message",
+            "session_id": id,
+            "role": "assistant",
+            "content": body.content,
+            "source": "api",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        }));
+        Ok(Some(json!({
+            "status": "ok",
+            "session_id": id,
+            "message": {"role": "assistant", "content": body.content},
+            "session_persistence": true,
+        })))
+    })
+    .await
+}
+
+/// `GET /api/sessions/running`.
+pub(crate) async fn sessions_running(
+    State(state): State<AppState>,
+    cutover: Cutover,
+    headers: HeaderMap,
+) -> Response {
+    let Some(Extension(CutoverWebChat { store, turns })) = cutover else {
+        return crate::api::handle_api_sessions_running(State(state), headers)
+            .await
+            .into_response();
+    };
+    webchat_store_result(&state, &headers, store, move |store| {
+        let sessions: Vec<_> = store
+            .operator_webchats()?
+            .into_iter()
+            .filter(|(session, _)| turns.operator_running_turn(&session.session_uuid).is_some())
+            .map(|(session, _)| {
+                json!({
+                    "session_id": session.session_uuid,
+                    "created_at": session.created_at,
+                    "last_activity": session.last_activity,
+                    "message_count": session.message_count,
+                })
+            })
+            .collect();
+        Ok(Some(json!({"sessions": sessions})))
+    })
+    .await
+}
+
+/// `GET /api/sessions/{id}/state`.
+pub(crate) async fn session_state(
+    State(state): State<AppState>,
+    cutover: Cutover,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(Extension(CutoverWebChat { store, turns })) = cutover else {
+        return crate::api::handle_api_session_state(State(state), headers, Path(id))
+            .await
+            .into_response();
+    };
+    webchat_store_result(&state, &headers, store, move |store| {
+        let Some(session_id) = store.operator_webchat_id(&id)? else { return Ok(None); };
+        Ok(Some(match turns.operator_running_turn(&session_id) {
+            Some((turn_id, started_at)) => json!({
+                "session_id": id, "state": "running", "turn_id": turn_id.to_string(), "turn_started_at": started_at.to_rfc3339(),
+            }),
+            None => json!({"session_id": id, "state": "idle"}),
+        }))
+    })
+    .await
+}
+
+/// `POST /api/sessions/{id}/abort`.
+pub(crate) async fn session_abort(
+    State(state): State<AppState>,
+    cutover: Cutover,
     core: Option<Extension<CoreRpc>>,
     dashboard: Option<Extension<Arc<DashboardAuth>>>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    match core_caller(&state, &headers, core, dashboard, Reach::ScopedOnly) {
-        Some(caller) => caller.session_abort(&id).await,
-        None => crate::api::handle_api_session_abort(State(state), headers, Path(id))
-            .await
-            .into_response(),
+    if let Some(caller) = core_caller(&state, &headers, core, dashboard, Reach::ScopedOnly) {
+        return caller.session_abort(&id).await;
     }
+    let Some(Extension(CutoverWebChat { store, turns })) = cutover else {
+        return crate::api::handle_api_session_abort(State(state), headers, Path(id))
+            .await
+            .into_response();
+    };
+    webchat_store_result(&state, &headers, store, move |store| {
+        let aborted = store
+            .operator_webchat_id(&id)?
+            .is_some_and(|id| turns.cancel_turn(&id, None) == Ok(true));
+        let status = if aborted {
+            "aborted"
+        } else {
+            "no_active_response"
+        };
+        Ok(Some(json!({"status": status})))
+    })
+    .await
 }
 
 /// `GET /api/status`.

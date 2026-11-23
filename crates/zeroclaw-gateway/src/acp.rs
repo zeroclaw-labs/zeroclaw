@@ -39,6 +39,7 @@ struct ActiveAcpTurn {
     principal_id: Option<String>,
     events: VecDeque<AcpTurnEventFrame>,
     identity: uuid::Uuid,
+    started_at: chrono::DateTime<chrono::Utc>,
     server: Weak<AcpServer>,
     pending: HashMap<String, AcpTurnEventFrame>,
     next_seq: u64,
@@ -136,6 +137,7 @@ impl AcpTurnAttachment {
 pub(crate) struct AcpTurnHub {
     queue: Arc<SessionActorQueue>,
     turns: StdMutex<HashMap<String, ActiveAcpTurn>>,
+    turn_started: tokio::sync::Notify,
 }
 
 impl AcpTurnHub {
@@ -143,6 +145,7 @@ impl AcpTurnHub {
         Self {
             queue,
             turns: StdMutex::new(HashMap::new()),
+            turn_started: tokio::sync::Notify::new(),
         }
     }
 
@@ -164,6 +167,7 @@ impl AcpTurnHub {
                 principal_id,
                 events: VecDeque::new(),
                 identity: uuid::Uuid::new_v4(),
+                started_at: chrono::Utc::now(),
                 server,
                 pending: HashMap::new(),
                 next_seq: 1,
@@ -173,6 +177,7 @@ impl AcpTurnHub {
                 guard: Some(permit),
             },
         );
+        self.turn_started.notify_waiters();
         Ok(())
     }
 
@@ -347,6 +352,41 @@ impl AcpTurnHub {
         turn.server.upgrade()
     }
 
+    /// Return the live turn metadata for the operator session APIs.
+    pub(crate) fn operator_running_turn(
+        &self,
+        session_id: &str,
+    ) -> Option<(uuid::Uuid, chrono::DateTime<chrono::Utc>)> {
+        let turns = self.turns.lock().unwrap_or_else(|e| e.into_inner());
+        let turn = turns.get(session_id)?;
+        (!turn.completed && turn.principal_id.is_none()).then_some((turn.identity, turn.started_at))
+    }
+
+    /// Cancel matching turns while waiting for the operator's delete permit.
+    /// Queued prompts ahead of the delete can acquire the permit after the
+    /// first turn exits. Cancel those too as soon as they register.
+    pub(crate) async fn acquire_for_webchat_delete(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionGuard, SessionQueueError> {
+        let acquire = self.queue.acquire(session_id);
+        tokio::pin!(acquire);
+        loop {
+            let started = self.turn_started.notified();
+            let _ = self.cancel_turn(session_id, None);
+            tokio::select! {
+                permit = &mut acquire => return permit,
+                () = started => {}
+            }
+        }
+    }
+
+    /// Forget the replay buffer after deleting the conversation under its queue permit.
+    pub(crate) fn forget_deleted_webchat(&self, permit: &SessionGuard) {
+        let mut turns = self.turns.lock().unwrap_or_else(|e| e.into_inner());
+        turns.remove(permit.session_id());
+    }
+
     /// Cancel an active turn if owned by `principal_id`.
     pub(crate) fn cancel_turn(
         &self,
@@ -359,6 +399,9 @@ impl AcpTurnHub {
         };
         if turn.principal_id.as_deref() != principal_id {
             return Err(FORBIDDEN);
+        }
+        if turn.completed {
+            return Ok(false);
         }
         turn.cancel.cancel();
         Ok(true)
@@ -496,6 +539,8 @@ async fn handle_socket(
     let mut shutdown_rx = state.shutdown_tx.subscribe();
 
     let config = state.config.read().clone();
+    let relay_api_messages = config.gateway.acp_webchat_cutover && principal_id.is_none();
+    let mut events = state.event_tx.subscribe();
     let acp_config = AcpServerConfig {
         max_sessions: config.acp.max_sessions,
         session_timeout_secs: config.acp.session_timeout_secs,
@@ -666,6 +711,24 @@ async fn handle_socket(
                         Some((1012, "gateway shutting down"));
                     close_signal.notify_one();
                     break;
+                }
+            }
+            event = events.recv(), if relay_api_messages => {
+                if let Ok(event) = event
+                    && event["type"] == "message"
+                    && event["source"] == "api"
+                    && let Some(sid) = event["session_id"].as_str()
+                    && server.has_gateway_session(sid).await
+                    && crate::dashboard_session::session_admits_now(&mut session_watch, &state).await.is_ok()
+                {
+                    let frame = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "_zeroclaw/session/message",
+                        "params": {"sessionId": sid, "content": event["content"]},
+                    });
+                    if wire_tx.send(frame.to_string()).await.is_err() {
+                        break;
+                    }
                 }
             }
             maybe_msg = receiver.next() => {
@@ -990,7 +1053,31 @@ mod tests {
         let mut cfg = front_door_config(install_root);
         std::fs::create_dir_all(&cfg.data_dir).unwrap();
         cfg.gateway.acp_webchat_cutover = cutover;
-        if cutover {
+        let provider = if cutover {
+            use wiremock::matchers::method;
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+            use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig};
+            let provider = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(45)),
+                )
+                .mount(&provider)
+                .await;
+            cfg.providers.models.custom.insert(
+                "cutover-test".into(),
+                CustomModelProviderConfig {
+                    base: ModelProviderConfig {
+                        uri: Some(format!("{}/v1", provider.uri())),
+                        api_key: Some("fixture-key".into()),
+                        model: Some("fixture-model".into()),
+                        ..Default::default()
+                    },
+                },
+            );
+            cfg.agents.get_mut("test-agent").unwrap().model_provider = "custom.cutover-test".into();
+            cfg.memory.backend = "none".into();
+            cfg.memory.auto_save = false;
             use zeroclaw_api::model_provider::ChatMessage;
             cfg.channels.session_backend = "sqlite".into();
             let legacy = zeroclaw_infra::make_session_backend(&cfg.data_dir, "sqlite").unwrap();
@@ -1003,7 +1090,10 @@ mod tests {
             legacy
                 .set_session_agent_alias("gw_team_alpha", "test-agent")
                 .unwrap();
-        }
+            Some(provider)
+        } else {
+            None
+        };
         let expected_ws = cfg
             .agent_workspace_dir("test-agent")
             .to_string_lossy()
@@ -1153,13 +1243,105 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(list["sessions"][0]["name"], "Restored chat");
-            client
-                .delete(&session_url)
+
+            let appended = client
+                .post(format!("{sessions_url}/gw_team_alpha/messages"))
+                .json(&serde_json::json!({"content":"REST notification"}))
                 .send()
                 .await
                 .unwrap()
                 .error_for_status()
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
                 .unwrap();
+            assert_eq!(appended["session_id"], "team_alpha");
+            assert_eq!(appended["message"]["content"], "REST notification");
+            let pushed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    let Message::Text(frame) = ws.next().await.unwrap().unwrap() else {
+                        continue;
+                    };
+                    let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                    if frame["method"] == "_zeroclaw/session/message" {
+                        break frame;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(pushed["params"]["content"], "REST notification");
+            let history = get_json(&client, &format!("{session_url}/messages")).await;
+            assert_eq!(history["messages"][2]["content"], "REST notification");
+            let state_url = format!("{sessions_url}/gw_team_alpha/state");
+            assert_eq!(get_json(&client, &state_url).await["state"], "idle");
+
+            let provider = provider.as_ref().unwrap();
+            for (request_id, delete) in [(3, false), (4, true)] {
+                let prior = provider.received_requests().await.unwrap().len();
+                ws.send(Message::Text(serde_json::json!({
+                    "jsonrpc":"2.0", "id": request_id, "method":"session/prompt",
+                    "params": {"sessionId":"team_alpha", "prompt":[{"type":"text", "text":"Wait for cancellation"}]},
+                }).to_string().into())).await.unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while provider.received_requests().await.unwrap().len() <= prior {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("turn should reach the stalled provider");
+                let status = get_json(&client, &state_url).await;
+                assert_eq!(status["state"], "running");
+                assert!(status["turn_id"].is_string());
+                assert!(status["turn_started_at"].is_string());
+                let running = get_json(&client, &format!("{sessions_url}/running")).await;
+                assert_eq!(running["sessions"][0]["session_id"], "team_alpha");
+
+                if delete {
+                    let deleted = client
+                        .delete(format!("{sessions_url}/gw_team_alpha"))
+                        .timeout(std::time::Duration::from_secs(3))
+                        .send()
+                        .await
+                        .unwrap()
+                        .error_for_status()
+                        .unwrap()
+                        .json::<serde_json::Value>()
+                        .await
+                        .unwrap();
+                    assert_eq!(deleted["deleted"], true);
+                } else {
+                    let aborted = client
+                        .post(format!("{session_url}/abort"))
+                        .send()
+                        .await
+                        .unwrap()
+                        .error_for_status()
+                        .unwrap()
+                        .json::<serde_json::Value>()
+                        .await
+                        .unwrap();
+                    assert_eq!(aborted["status"], "aborted");
+                }
+                let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    loop {
+                        let Message::Text(frame) = ws.next().await.unwrap().unwrap() else {
+                            continue;
+                        };
+                        let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                        if frame["id"] == request_id {
+                            break frame;
+                        }
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(result["result"]["stopReason"], "cancelled", "{result}");
+                let running = get_json(&client, &format!("{sessions_url}/running")).await;
+                assert_eq!(running["sessions"], serde_json::json!([]));
+            }
+            let response = client.get(&state_url).send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
             let list: serde_json::Value = client
                 .get(&sessions_url)
                 .send()
@@ -1185,6 +1367,19 @@ mod tests {
             "omitted-cwd session/new over the real /acp WebSocket route must \
              return the per-agent workspace, not the daemon CWD"
         );
+    }
+
+    async fn get_json(client: &reqwest::Client, url: &str) -> serde_json::Value {
+        client
+            .get(url)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
     }
 
     #[tokio::test]

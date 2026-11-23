@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Window } from 'happy-dom';
+import type { WsMessage } from '@/types/api';
 
 Object.defineProperty(globalThis, 'window', { value: new Window({ url: 'http://localhost' }) });
 
 const {
+  AcpChatSocket,
   acpNotificationToWsMessage,
   acpPermissionToWsMessage,
   acpPromptResultToWsMessage,
@@ -130,4 +132,92 @@ test('permission requests count down to the server deadline across replay', () =
   assert.equal(acpPermissionToWsMessage(request, issued).timeout_secs, 3600);
   assert.equal(acpPermissionToWsMessage(request, issued + 300_000).timeout_secs, 3300);
   assert.equal(acpPermissionToWsMessage(request, issued + 4_000_000).timeout_secs, 0);
+});
+
+test('ACP reconnect requests the turn cursor and keeps a single tool card', async (t) => {
+  const sockets: TestSocket[] = [];
+  class TestSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    readyState = TestSocket.CONNECTING;
+    onopen?: () => void;
+    onclose?: (event: { code: number }) => void;
+    onmessage?: (event: { data: string }) => void;
+    readonly sent: Array<{ id: string | number; method: string; params: unknown }> = [];
+
+    constructor() { sockets.push(this); }
+    open() {
+      this.readyState = TestSocket.OPEN;
+      this.onopen?.();
+    }
+    close() {
+      this.readyState = 3;
+      this.onclose?.({ code: 1006 });
+    }
+    send(json: string) { this.sent.push(JSON.parse(json)); }
+    receive(frame: object) { this.onmessage?.({ data: JSON.stringify({ jsonrpc: '2.0', ...frame }) }); }
+    reply(method: string, result: object) {
+      const request = this.sent.find((frame) => frame.method === method);
+      assert.ok(request, method);
+      this.receive({ id: request.id, result });
+      return request.params;
+    }
+  }
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'WebSocket');
+  Object.defineProperty(globalThis, 'WebSocket', { configurable: true, value: TestSocket });
+  t.after(() => {
+    if (original) Object.defineProperty(globalThis, 'WebSocket', original);
+    else Reflect.deleteProperty(globalThis, 'WebSocket');
+  });
+
+  const chat = new AcpChatSocket({ agentAlias: 'test', sessionId: 'conversation', autoReconnect: false });
+  const updates: WsMessage[] = [];
+  chat.onMessage = (message) => updates.push(message);
+  t.after(() => chat.disconnect());
+
+  async function connect(turnId: string) {
+    chat.connect();
+    const socket = sockets[sockets.length - 1];
+    assert.ok(socket);
+    socket.open();
+    socket.reply('initialize', { protocolVersion: 1 });
+    await Promise.resolve();
+    socket.reply('session/resume', { messageCount: 1 });
+    await Promise.resolve();
+    const cursor = socket.reply('_zeroclaw/session/reattach', { inFlight: true, turnId });
+    await Promise.resolve();
+    return { socket, cursor };
+  }
+
+  const first = await connect('turn-one');
+  const toolCall = {
+    method: 'session/update',
+    params: { sessionId: 'conversation', update: { sessionUpdate: 'tool_call', toolCallId: 'tool', title: 'test' } },
+    _meta: { zeroclawTurn: { sessionId: 'conversation', turnId: 'turn-one', seq: 3 } },
+  };
+  first.socket.receive(toolCall);
+  first.socket.close();
+
+  const second = await connect('turn-one');
+  assert.deepEqual(second.cursor, {
+    sessionId: 'conversation', turnId: 'turn-one', afterSeq: 3, activeOnly: false, acceptPartial: true,
+  });
+  second.socket.receive(toolCall);
+  second.socket.receive({
+    ...toolCall,
+    params: { ...toolCall.params, update: { ...toolCall.params.update, sessionUpdate: 'tool_call_update', body: 'done' } },
+    _meta: { zeroclawTurn: { sessionId: 'conversation', turnId: 'turn-one', seq: 4 } },
+  });
+  assert.deepEqual(updates.filter((message) => message.type.startsWith('tool_')).map((message) => message.type),
+    ['tool_call', 'tool_result']);
+
+  assert.equal(updates.filter((message) => message.type === 'turn_reset').length, 0);
+  second.socket.close();
+  const third = await connect('turn-two');
+  assert.equal(updates.filter((message) => message.type === 'turn_reset').length, 1);
+  third.socket.receive({
+    ...toolCall,
+    _meta: { zeroclawTurn: { sessionId: 'conversation', turnId: 'turn-two', seq: 1 } },
+  });
+  assert.equal(updates.filter((message) => message.type === 'tool_call').length, 2);
 });

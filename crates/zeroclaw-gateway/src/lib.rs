@@ -2778,13 +2778,13 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/api/health", get(api::handle_api_health))
         .route("/api/tuis", get(api::handle_api_tuis))
         .route("/api/sessions", get(dashboard_core::sessions_list))
-        .route("/api/sessions/running", get(api::handle_api_sessions_running))
+        .route("/api/sessions/running", get(dashboard_core::sessions_running))
         .route(
             "/api/sessions/{id}/messages",
-            get(dashboard_core::session_messages).post(api::handle_api_session_message_post),
+            get(dashboard_core::session_messages).post(dashboard_core::session_message_post),
         )
         .route("/api/sessions/{id}", delete(dashboard_core::session_delete).put(dashboard_core::session_rename))
-        .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
+        .route("/api/sessions/{id}/state", get(dashboard_core::session_state))
         .route("/api/sessions/{id}/abort", post(dashboard_core::session_abort))
         .route("/api/agents/available", get(dashboard_core::agents_available))
         // ── Pairing + Device management API ──
@@ -2868,12 +2868,13 @@ pub async fn run_gateway_with_plugin_webhooks(
         inner.route("/ws/chat", get(ws::handle_ws_chat))
     };
 
+    let acp_turns = Arc::new(acp::AcpTurnHub::new(Arc::clone(&state.session_queue)));
     let inner = inner
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
         .route("/api/events/history", get(sse::handle_events_history))
         // ── ACP client bridge ──
-        .route("/acp", get(acp::handle_ws_acp).layer(axum::Extension(Arc::new(acp::AcpTurnHub::new(Arc::clone(&state.session_queue))))))
+        .route("/acp", get(acp::handle_ws_acp).layer(axum::Extension(Arc::clone(&acp_turns))))
         // ── WebSocket SOP runs feed ──
         .route("/ws/sops/runs", get(ws_sop_runs::handle_ws_sop_runs))
         // ── WebSocket canvas updates ──
@@ -2892,7 +2893,10 @@ pub async fn run_gateway_with_plugin_webhooks(
         ));
 
     let inner = if let Some(store) = cutover_store {
-        inner.layer(axum::Extension(store))
+        inner.layer(axum::Extension(dashboard_core::CutoverWebChat {
+            store,
+            turns: acp_turns,
+        }))
     } else {
         inner
     };
@@ -3329,7 +3333,7 @@ fn public_health_snapshot() -> serde_json::Value {
 /// GET /health — always public (no secrets leaked)
 async fn handle_health(
     State(state): State<AppState>,
-    cutover: Option<axum::Extension<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>>,
+    cutover: Option<axum::Extension<dashboard_core::CutoverWebChat>>,
 ) -> impl IntoResponse {
     let body = serde_json::json!({
         "status": "ok",

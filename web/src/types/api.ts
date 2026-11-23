@@ -225,6 +225,8 @@ export interface SSEEvent {
 export interface WsMessage {
   type:
     | "message"
+    | "session_message"
+    | "turn_reset"
     | "chunk"
     | "chunk_reset"
     | "thinking"

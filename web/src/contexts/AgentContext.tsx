@@ -577,6 +577,27 @@ export function AgentProvider({
         setStreamingThinking('');
         break;
 
+      case 'session_message': {
+        if (!msg.content) break;
+        localMessageMutationVersionRef.current += 1;
+        setMessages((previous) => [...previous, {
+          id: generateUUID(),
+          role: 'agent',
+          content: msg.content ?? '',
+          timestamp: msg.timestamp ? new Date(msg.timestamp) : new Date(),
+          markdown: true,
+        }]);
+        break;
+      }
+
+      case 'turn_reset':
+        foldTurnStream({ type: 'reset' });
+        setStreamingContent('');
+        setStreamingThinking('');
+        setTyping(false);
+        resyncOnOpenRef.current = true;
+        break;
+
       case 'message':
       case 'done': {
         const { completion: outcome } = foldTurnStream({
@@ -896,7 +917,9 @@ export function AgentProvider({
       // reloaded, the network dropped). The turn can still finish on the
       // server, but not on this socket: stop showing it as running, and
       // reload the transcript once a socket opens again.
-      if (typingRef.current) {
+      // ACP resumes after the last delivered frame. Keep its partial output
+      // until reattach completes or tells us the original turn is gone.
+      if (typingRef.current && (!(ws instanceof AcpChatSocket) || perSocket)) {
         setTyping(false);
         setStreamingContent('');
         setStreamingThinking('');
@@ -1404,9 +1427,8 @@ export function AgentProvider({
   }, [agentAlias, onSessionChange, resetTranscriptState, abortLiveSession]);
 
   const clearAllMessages = useCallback(() => {
-    resetTranscriptState();
-
     if (perSocket) {
+      resetTranscriptState();
       // A new conversation: close this one (the gateway closes it with its
       // socket) and wait for the message that starts the next. Nothing is
       // deleted.
@@ -1434,7 +1456,26 @@ export function AgentProvider({
     // delete is in flight, a session switch (or another rebuild) has taken over
     // and this closure must not resurrect a connection for the old session.
     const wsAtClear = wsRef.current;
+    if (wsAtClear instanceof AcpChatSocket) {
+      void (async () => {
+        try {
+          await sessionRuntimeRef.current.delete(sid);
+        } catch (err) {
+          const status = err instanceof ApiError || err instanceof HttpError ? err.status : undefined;
+          if (status !== 404) {
+            if (activeSessionIdRef.current === sid) setError(t('agent.session_delete_failed'));
+            return;
+          }
+        }
+        removeChatHistory(sid);
+        if (activeSessionIdRef.current === sid) {
+          transitionToSession(sessionRuntimeRef.current.mintId(), true);
+        }
+      })();
+      return;
+    }
 
+    resetTranscriptState();
     // The live WebSocket Agent holds the full conversation in memory for the
     // life of the connection, and the gateway persists each turn to the
     // session backend. Clearing only React state leaves both intact, so the
@@ -1450,13 +1491,6 @@ export function AgentProvider({
         // session persistence is disabled, or any transport failure, must not
         // block the local clear or the reconnect below.
         await sessionRuntimeRef.current.delete(sid);
-        if (wsAtClear instanceof AcpChatSocket) {
-          removeChatHistory(sid);
-          if (wsRef.current === wsAtClear && activeSessionIdRef.current === sid) {
-            transitionToSession(sessionRuntimeRef.current.mintId(), true);
-          }
-          return;
-        }
       } catch {
         // Persistence disabled or request failed — proceed with the reconnect
         // so the live in-memory context is reset regardless.

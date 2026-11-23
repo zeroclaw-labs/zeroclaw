@@ -1491,6 +1491,50 @@ impl AcpSessionStore {
         self.list_live_sessions(Some(None), Some("webchat"))
     }
 
+    /// Resolve an operator WebChat by its ACP ID or its former gateway key.
+    pub fn operator_webchat_id(&self, id: &str) -> Result<Option<String>> {
+        let legacy_id = id.strip_prefix("gw_").unwrap_or(id);
+        Ok(self
+            .conn
+            .lock()
+            .query_row(
+                "SELECT session_uuid FROM acp_sessions
+             WHERE session_uuid IN (?1, ?2) AND principal_id IS NULL
+               AND killed_at IS NULL AND interaction_surface = 'webchat'
+             ORDER BY (session_uuid = ?1) DESC LIMIT 1",
+                params![id, legacy_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Append an operator's assistant notification under the WebChat scope
+    /// predicate in the same transaction as the transcript update.
+    pub fn append_operator_webchat_message(&self, id: &str, content: &str) -> Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row = tx
+            .query_row(
+                "SELECT id FROM acp_sessions WHERE session_uuid = ?1 AND principal_id IS NULL
+             AND killed_at IS NULL AND interaction_surface = 'webchat'",
+                [id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        Self::append_messages(
+            &tx,
+            id,
+            row,
+            &[ConversationMessage::Chat(ChatMessage::assistant(content))],
+            &Utc::now().to_rfc3339(),
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Read the visible dashboard transcript in persistence order with its original timestamps.
     pub fn operator_webchat_history(
         &self,

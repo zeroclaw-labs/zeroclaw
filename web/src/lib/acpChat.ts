@@ -2,6 +2,7 @@ import type { ApprovalDecision, WsMessage } from '@/types/api';
 import {
   AcpError,
   AcpWebSocketClient,
+  type AcpFrame,
   type AcpNotification,
   type AcpInitializeResult,
   type AcpRequest,
@@ -88,6 +89,10 @@ export function acpNotificationToWsMessage(notification: AcpNotification): WsMes
   }
   const params = record(notification.params);
   if (!params) return null;
+  if (notification.method === '_zeroclaw/session/message') {
+    const content = stringValue(params.content);
+    return content === undefined ? null : { type: 'session_message', content, timestamp: stringValue(params.timestamp) };
+  }
   if (notification.method === '_zeroclaw/history_trimmed') {
     return {
       type: 'history_trimmed',
@@ -184,6 +189,7 @@ export class AcpChatSocket {
   private generation = 0;
   private activePrompt = false;
   private interruptedPrompt = false;
+  private cursor: { turnId: string; afterSeq: number } | null = null;
   private readonly permissions = new Map<string, PendingPermission>();
   private readonly agentAlias: string;
   private readonly sessionId: string;
@@ -234,8 +240,14 @@ export class AcpChatSocket {
       onError: (event) => {
         if (this.generation === generation) this.onError?.(event);
       },
+      onFrame: (frame) => {
+        if (this.generation === generation && !('method' in frame)) {
+          this.recordTurnFrame(frame);
+        }
+      },
       onNotification: (notification) => {
-        if (this.generation !== generation || !this.matchesSession(notification.params)) return;
+        if (this.generation !== generation || !this.matchesSession(notification.params)
+          || !this.recordTurnFrame(notification)) return;
         if (notification.method === '_zeroclaw/turn_complete') {
           this.activePrompt = false;
           const params = record(notification.params);
@@ -260,7 +272,10 @@ export class AcpChatSocket {
         if (message) this.onMessage?.(message);
       },
       onRequest: (request) => {
-        if (this.generation === generation) this.handleRequest(client, request);
+        if (this.generation !== generation) return;
+        // Unanswered permissions must be offered again, even behind the cursor.
+        if (this.matchesSession(request.params)) this.recordTurnFrame(request);
+        this.handleRequest(client, request);
       },
     });
     this.client = client;
@@ -388,16 +403,25 @@ export class AcpChatSocket {
       }
       if (this.generation !== generation) return;
       if (resumedExisting) {
-        const attachment = await client.request<{ inFlight: boolean }>('_zeroclaw/session/reattach', {
+        const attachment = await client.request<{ inFlight: boolean; turnId?: string }>('_zeroclaw/session/reattach', {
           sessionId: this.sessionId,
           afterSeq: 0,
+          ...this.cursor,
           activeOnly: !this.interruptedPrompt,
           acceptPartial: true,
         });
         if (this.generation !== generation) return;
+        if ((this.cursor && this.cursor.turnId !== attachment.turnId)
+          || (this.interruptedPrompt && !attachment.turnId)) {
+          this.cursor = null;
+          this.onMessage?.({ type: 'turn_reset' });
+        }
         this.activePrompt = attachment.inFlight;
-        this.interruptedPrompt = false;
+      } else if (this.interruptedPrompt) {
+        this.cursor = null;
+        this.onMessage?.({ type: 'turn_reset' });
       }
+      this.interruptedPrompt = false;
       this.ready = true;
       this.onOpen?.();
       this.onMessage?.({
@@ -424,6 +448,18 @@ export class AcpChatSocket {
       });
       this.client?.disconnect();
     }
+  }
+
+  private recordTurnFrame(frame: AcpFrame): boolean {
+    const turn = record(record(record(frame)?._meta)?.zeroclawTurn);
+    if (!turn) return true;
+    if (turn.sessionId !== this.sessionId) return false;
+    const turnId = stringValue(turn.turnId);
+    const seq = numberValue(turn.seq);
+    if (!turnId || seq === undefined || !Number.isSafeInteger(seq) || seq < 1) return false;
+    if (this.cursor?.turnId === turnId && seq <= this.cursor.afterSeq) return false;
+    this.cursor = { turnId, afterSeq: seq };
+    return true;
   }
 
   private matchesSession(params: unknown): boolean {
