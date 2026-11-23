@@ -153,7 +153,7 @@ export default function CredentialPermissions() {
               options={consumers(row).map(consumer => ({ value: consumer, label: consumerLabel[consumer] }))} />}
           </label>
           <label className="block space-y-1">
-            <span>{t(draft.consumer === "ssh" ? "http_credentials.ssh_destinations" : "http_credentials.origin")}</span>
+            <span>{t(draft.consumer === "ssh" ? "ssh_authorization.destinations" : "http_credentials.origin")}</span>
             {draft.consumer === "ssh" ? <textarea className={field} required rows={3}
               placeholder={row.kind === "ssh_key" ? "operator@server.example.com:22" : "server.example.com"}
               value={draft.destination} onChange={event => setDraft({ ...draft, destination: event.target.value })} />
