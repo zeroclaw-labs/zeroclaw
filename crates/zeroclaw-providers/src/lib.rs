@@ -1,6 +1,7 @@
 #![allow(clippy::to_string_in_format_args)]
 //! ModelProvider subsystem for model inference backends.
 
+pub(crate) mod acp_cli;
 pub mod anthropic;
 pub mod auth;
 pub mod azure_openai;
