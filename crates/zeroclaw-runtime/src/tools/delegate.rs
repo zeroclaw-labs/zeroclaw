@@ -2954,9 +2954,10 @@ impl Tool for DelegateTool {
         // The schema is closed. Refuse an undeclared key before action
         // dispatch or admission of the requested target, so a caller learns
         // that an option it sent was not applied.
-        if let Some(refusal) =
-            zeroclaw_api::tool::refuse_undeclared_arguments(&self.parameters_schema(), &args)
-        {
+        if let Some(refusal) = crate::tools::undeclared_arguments::refuse_undeclared_arguments(
+            &self.parameters_schema(),
+            &args,
+        ) {
             return Ok(refusal);
         }
 
@@ -16327,7 +16328,7 @@ target = "memory_recall"
         assert!(!advertised.is_empty());
 
         assert!(
-            zeroclaw_api::tool::refuse_undeclared_arguments(
+            crate::tools::undeclared_arguments::refuse_undeclared_arguments(
                 &schema,
                 &serde_json::Value::Object(advertised)
             )

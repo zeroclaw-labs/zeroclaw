@@ -41,6 +41,7 @@ pub mod sop_status;
 pub mod sop_workshop;
 pub mod spawn_subagent;
 pub mod todo_write;
+pub(crate) mod undeclared_arguments;
 pub mod verifiable_intent;
 
 // Tool types from zeroclaw-tools (direct imports, no shims)
