@@ -1528,6 +1528,12 @@ fn localized_validation_warning_message(
                 "cli-doctor-security-audit-disabled-drops-certificate-record",
             )
         }
+        zeroclaw_config::validation_warnings::DEAD_DELEGATE_GRANTS => {
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-doctor-dead-delegate-grants",
+                &[("path", warning.path.as_str())],
+            )
+        }
         _ => warning.message.clone(),
     }
 }
@@ -3712,6 +3718,27 @@ mod tests {
         // The diagnostic path is what an operator edits, so it stays the
         // config key rather than being folded into the localized sentence.
         assert_eq!(warning.path, "verifiable_intent.enabled");
+    }
+
+    #[test]
+    fn dead_delegate_grants_warning_uses_fluent() {
+        let structured_message = "structured API fallback";
+        let warning = zeroclaw_config::validation_warnings::ValidationWarning::new(
+            zeroclaw_config::validation_warnings::DEAD_DELEGATE_GRANTS,
+            structured_message,
+            "agents.projects_assistant.delegates",
+        );
+
+        let localized = localized_validation_warning_message(&warning);
+        assert_ne!(localized, structured_message);
+        assert!(
+            !localized.starts_with("{cli-doctor-dead-delegate-grants"),
+            "the Fluent key must resolve: {localized}"
+        );
+        assert!(
+            localized.contains("agents.projects_assistant.delegates"),
+            "the localized line must name the config path: {localized}"
+        );
     }
 
     #[test]

@@ -293,6 +293,9 @@ export interface WsMessage {
   // Emitted as JSON null when the accepted call reports no usage (stale
   // route protection); consumers must branch on null, not undefined.
   last_input_tokens?: number | null;
+  /** Display-only retained-context estimate after a real trim; never measured usage. */
+  context_input_tokens?: number;
+  context_input_tokens_source?: string;
 }
 
 export type ApprovalDecision = "approve" | "deny" | "always";

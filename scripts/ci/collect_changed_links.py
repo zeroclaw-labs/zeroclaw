@@ -61,10 +61,9 @@ def infer_docs_files(base_sha: str, provided: list[str]) -> list[str]:
         return provided
     if not base_sha:
         return []
-    diff = run_git(["diff", "--name-only", base_sha, "HEAD"])
+    diff = run_git(["diff", "--name-only", "-z", base_sha, "HEAD"])
     files: list[str] = []
-    for line in diff.stdout.splitlines():
-        path = line.strip()
+    for path in diff.stdout.split("\0"):
         if not path:
             continue
         if DOC_PATH_RE.search(path) or path in {"LICENSE", ".github/pull_request_template.md"}:

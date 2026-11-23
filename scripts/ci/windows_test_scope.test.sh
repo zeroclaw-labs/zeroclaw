@@ -383,6 +383,7 @@ run(["apps/zerocode/Cargo.toml"], (False, False, False, False))
 run(["apps/zerocode/build.rs"], (False, False, False, False))
 run(["docs/README.md"], (False, False, False, False))
 run(["src/main.rs"], (True, False, False, False))
+run(["scripts/install_windows_prebuilt.ps1"], (True, False, False, False))
 run(["crates/zeroclaw-runtime/src/sop/engine.rs", "src/main.rs"], (True, False, False, False))
 run(["crates/zeroclaw-gateway/Cargo.toml"], (True, False, False, False))
 run(["crates/zeroclaw-gateway/build.rs"], (True, False, False, False))
@@ -534,6 +535,11 @@ for target in ("channel_plugin_e2e", "tool_plugin_timeout_e2e", "reference_plugi
     assert f"--test {target}" in windows_job
 assert plugin_root_command in windows_job
 assert "--test plugin_channel_runtime_e2e" in plugin_backend_job
+for gateway_command in (
+    "cargo test --locked -p zeroclaw-gateway --features plugins-wasm --lib plugin_webhook",
+    "cargo test --locked -p zeroclaw-gateway --features plugins-wasm --test golden_frames plugin_webhook",
+):
+    assert gateway_command in plugin_backend_job
 assert 'plugin_components_status=${PIPESTATUS[0]}' in windows_job
 assert 'plugin_lib_status=${PIPESTATUS[0]}' in windows_job
 assert 'plugin_runtime_config_status=${PIPESTATUS[0]}' in windows_job
