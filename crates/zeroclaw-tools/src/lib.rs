@@ -4,6 +4,7 @@ pub mod attribution;
 #[cfg(target_os = "linux")]
 pub mod remote_file_mount;
 pub mod remote_file_transfer;
+pub mod remote_file_webdav;
 pub mod helpers;
 pub(crate) mod i18n;
 pub mod inventory;

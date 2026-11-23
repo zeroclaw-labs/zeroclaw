@@ -72,3 +72,9 @@ Caller integration still needs to acquire or refresh the handle from the registe
 ## Identical capabilities across host platforms
 
 The public operation set for each backend is the intersection of what the shared contract verifies on Linux, Windows and macOS. A backend with missing host facilities remains unavailable on that host. An implementation present on one or two platforms is experimental until the same behavior is verified on all three. The same rule applies to operations, errors and approval semantics. The Linux mount adapter is not advertised by itself.
+
+## WebDAV over HTTPS read adapter
+
+The draft uses one portable Reqwest transport for HEAD size lookup and bounded GET into a staging writer. It accepts an operator-managed HTTPS directory URL and addresses already checked against the deployment's egress policy. DNS addresses are pinned for the client, TLS authenticates the peer, redirects are disabled, and the request URL is built beneath that root from validated path components. The adapter receives the authorization header from its caller and marks it sensitive.
+
+Runtime integration must resolve live grants and verify the permitted egress addresses before authorizing use of a vault reference. The current tests cover URL and address validation. HTTPS server fixtures and Windows/macOS execution remain pending. WebDAV listing and mutation methods are not enabled by this adapter.
