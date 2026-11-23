@@ -967,6 +967,7 @@ cli-config-retired-reason-tts-default = il n’y a pas de fournisseur TTS global
 cli-config-retired-reason-global-transcription = il n’y a pas de fournisseur de transcription global par défaut ; définissez plutôt `transcription_provider` sur chaque `[agents.<alias>]`
 cli-config-retired-reason-identity = l’identité se définit par agent ; déplacez-la vers `[agents.<alias>.identity]`
 cli-config-retired-reason-pairing-max-pending = la passerelle ne garde qu’un seul code d’appairage en attente à la fois, et émettre un nouveau code annule le précédent
+cli-config-retired-reason-response-cache = le cache local des réponses du LLM a été supprimé ; la mise en cache des prompts par le fournisseur s’applique toujours
 cli-config-migration-inferred-v3 = avertissement : {$path} n’a pas de `schema_version`, mais ses sections sont au format V3 ; il a donc été lu comme schéma V3 et migré à partir de là. Exécutez `zeroclaw config migrate` pour écrire le `schema_version` actuel dans le fichier.
 cli-config-env-override-retired = avertissement : `{$variable}` a été ignorée, car elle définit une clé de configuration obsolète : {$reason}
 cli-config-migration-pending = avertissement : ces modifications ne s’appliquent qu’à cette exécution. Lancez `zeroclaw config migrate` pour les écrire dans {$path}.

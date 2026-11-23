@@ -139,7 +139,7 @@ What to back up:
 
 A plain `tar czf zeroclaw-$(date +%F).tar.gz ~/.zeroclaw` covers everything. Restic, borg, or Duplicacy work fine for incremental backups.
 
-`~/.zeroclaw/data/memory/response_cache.db` is a regenerable LLM response cache; it's safe to include in a full-directory backup or to exclude to save space. Tool receipts are in-band HMAC tokens in the conversation history (see [Tool receipts](../security/tool-receipts.md)), not an on-disk log, so there is nothing separate to back up for them.
+An older install may also have `~/.zeroclaw/data/memory/response_cache.db`, left by the removed LLM response cache. Nothing reads it, so you can delete it. Tool receipts are in-band HMAC tokens in the conversation history (see [Tool receipts](../security/tool-receipts.md)), not an on-disk log, so there is nothing separate to back up for them.
 
 ## Updates
 

@@ -1551,9 +1551,9 @@ fn is_legacy_kimi_code_alias(name: &str) -> bool {
     matches!(name, "kimi-code" | "kimi_coding" | "kimi_for_coding")
 }
 
-/// Mark a freshly constructed provider as a known leaf and apply its optional
-/// config `vision` capability override. Called at every exit of
-/// `create_model_provider_inner`, before Reliable/Router composition.
+/// Apply the optional config `vision` capability override to a freshly
+/// constructed provider. Called at every exit of `create_model_provider_inner`,
+/// before Reliable/Router composition.
 fn apply_factory_leaf_metadata(
     provider: Box<dyn ModelProvider>,
     vision: Option<bool>,
@@ -3057,25 +3057,6 @@ mod tests {
                 provider.supports_vision(),
                 "{name}: no override should keep the family default"
             );
-        }
-    }
-
-    #[test]
-    fn factory_leaves_have_stable_request_identity() {
-        for name in ["llamacpp", "custom:http://localhost:8080/v1"] {
-            for vision in [None, Some(false)] {
-                let options = ModelProviderRuntimeOptions {
-                    vision,
-                    ..Default::default()
-                };
-                let provider =
-                    create_model_provider_inner(None, name, "default", None, None, &options)
-                        .unwrap();
-                assert!(
-                    provider.has_stable_request_identity("model"),
-                    "{name}: factory-created leaves must attest to a stable request identity"
-                );
-            }
         }
     }
 

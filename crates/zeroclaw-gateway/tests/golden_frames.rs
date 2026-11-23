@@ -272,7 +272,6 @@ fn fixture_config(root: &Path, provider_url: &str) -> Config {
     config.gateway.require_pairing = false;
     config.memory.backend = "none".to_string();
     config.memory.auto_save = false;
-    config.memory.response_cache_enabled = false;
     config.reliability.provider_retries = 0;
     config.reliability.provider_backoff_ms = 0;
     config.providers.models.custom.insert(

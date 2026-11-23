@@ -475,10 +475,6 @@ min_relevance_score = 0.4
 purge_after_days = 30
 rerank_enabled = false
 rerank_threshold = 5
-response_cache_enabled = false
-response_cache_hot_entries = 256
-response_cache_max_entries = 5000
-response_cache_ttl_minutes = 60
 retrieval_stages = [
     "cache",
     "fts",

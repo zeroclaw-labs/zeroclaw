@@ -963,6 +963,7 @@ cli-config-retired-reason-tts-default = 没有全局默认的 TTS 提供商；�
 cli-config-retired-reason-global-transcription = 没有全局默认的转写提供商；请改为在每个 `[agents.<alias>]` 上设置 `transcription_provider`
 cli-config-retired-reason-identity = 身份按代理设置；请将其移至 `[agents.<alias>.identity]`
 cli-config-retired-reason-pairing-max-pending = 网关同一时间只保留一个待用配对码，签发新码会使之前的配对码失效
+cli-config-retired-reason-response-cache = 本地 LLM 响应缓存已移除；提供商的提示词缓存仍然有效
 cli-config-migration-inferred-v3 = 警告：{$path} 没有 `schema_version`，但其配置段为 V3 格式，因此按 V3 架构读取并从 V3 开始迁移。请运行 `zeroclaw config migrate`，将当前的 `schema_version` 写入文件。
 cli-config-env-override-retired = 警告：已忽略 `{$variable}`，因为它设置的是已停用的配置键：{$reason}
 cli-config-migration-pending = 警告：这些更改仅对本次运行生效。运行 `zeroclaw config migrate` 将其写入 {$path}。

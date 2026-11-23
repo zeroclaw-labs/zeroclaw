@@ -671,4 +671,18 @@ mod tests {
             "an ignored variable is not a change to write"
         );
     }
+
+    #[tokio::test]
+    async fn an_env_override_for_a_retired_response_cache_key_is_ignored() {
+        let _lock = env_test_lock().await;
+        let _var = EnvVarGuard::set("ZEROCLAW_memory__response_cache_enabled", "true");
+        let mut config = Config::default();
+        let applied = apply_env_overrides(&mut config).expect("a retired key does not fail");
+        assert!(applied.paths.is_empty());
+        assert!(config.migration_notices.iter().any(|notice| matches!(
+            notice,
+            crate::migration::MigrationNotice::IgnoredEnvOverride { variable, .. }
+                if variable == "ZEROCLAW_memory__response_cache_enabled"
+        )));
+    }
 }

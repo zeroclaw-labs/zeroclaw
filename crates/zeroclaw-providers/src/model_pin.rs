@@ -82,10 +82,6 @@ impl ModelProvider for ModelPinnedProvider {
             .supports_exact_request_replay(request, &self.pinned_model)
     }
 
-    fn has_stable_request_identity(&self, model: &str) -> bool {
-        model == self.pinned_model && self.inner.has_stable_request_identity(&self.pinned_model)
-    }
-
     fn supports_single_tool_rounds(&self, _model: &str) -> bool {
         self.inner.supports_single_tool_rounds(&self.pinned_model)
     }
