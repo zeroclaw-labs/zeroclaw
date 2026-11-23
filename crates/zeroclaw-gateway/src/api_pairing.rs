@@ -180,9 +180,10 @@ impl DeviceRegistry {
     fn save_voice_preferences_authorized<G, R>(
         &self,
         key: VoiceDeviceKey<'_>,
-        preferences: &VoicePreferences,
+        update: VoicePreferencesUpdate,
         authorize: impl FnOnce() -> Result<G, R>,
     ) -> anyhow::Result<Result<bool, R>> {
+        use rusqlite::OptionalExtension;
         let (column, value) = key.column_and_value();
         let mut conn = self.open_db()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -190,9 +191,25 @@ impl DeviceRegistry {
             Ok(authorization) => authorization,
             Err(refusal) => return Ok(Err(refusal)),
         };
+        // Read and merge under the writer lock, so a field another screen saved
+        // in the meantime is kept rather than replaced by this caller's copy.
+        let stored: Option<Option<String>> = tx
+            .query_row(
+                &format!("SELECT voice_preferences FROM devices WHERE {column} = ?1"),
+                [value],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(stored) = stored else {
+            return Ok(Ok(false));
+        };
+        let stored = match stored {
+            Some(json) => serde_json::from_str(&json)?,
+            None => VoicePreferences::default(),
+        };
         let updated = tx.execute(
             &format!("UPDATE devices SET voice_preferences = ?1 WHERE {column} = ?2"),
-            rusqlite::params![serde_json::to_string(preferences)?, value],
+            rusqlite::params![serde_json::to_string(&update.apply_to(stored))?, value],
         )? == 1;
         tx.commit()?;
         Ok(Ok(updated))
@@ -899,20 +916,54 @@ impl Default for VoicePreferences {
     }
 }
 
-impl VoicePreferences {
+/// A voice preferences write. Fields left out keep their saved value, so a
+/// screen that changes one setting cannot revert another that was changed
+/// elsewhere since it last loaded the record.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoicePreferencesUpdate {
+    pub dictation: Option<bool>,
+    pub reading: Option<bool>,
+    pub automatic: Option<bool>,
+    pub language: Option<String>,
+    pub recognition: Option<RecognitionMode>,
+    pub voice: Option<String>,
+    pub rate: Option<f64>,
+}
+
+impl VoicePreferencesUpdate {
+    /// Saved values were checked when they were written, so only the fields
+    /// present in this update need checking.
     fn valid(&self) -> bool {
-        let mut parts = self.language.split('-');
-        let first = parts.next().unwrap_or_default();
-        (2..=3).contains(&first.len())
-            && first.bytes().all(|b| b.is_ascii_alphabetic())
-            && self.language.len() <= 64
-            && parts.all(|part| {
-                (2..=8).contains(&part.len()) && part.bytes().all(|b| b.is_ascii_alphanumeric())
-            })
-            && self.voice.len() <= 1024
-            && self.rate.is_finite()
-            && (0.5..=2.0).contains(&self.rate)
+        self.language.as_deref().is_none_or(valid_language)
+            && self.voice.as_ref().is_none_or(|voice| voice.len() <= 1024)
+            && self
+                .rate
+                .is_none_or(|rate| rate.is_finite() && (0.5..=2.0).contains(&rate))
     }
+
+    fn apply_to(self, stored: VoicePreferences) -> VoicePreferences {
+        VoicePreferences {
+            dictation: self.dictation.unwrap_or(stored.dictation),
+            reading: self.reading.unwrap_or(stored.reading),
+            automatic: self.automatic.unwrap_or(stored.automatic),
+            language: self.language.unwrap_or(stored.language),
+            recognition: self.recognition.unwrap_or(stored.recognition),
+            voice: self.voice.unwrap_or(stored.voice),
+            rate: self.rate.unwrap_or(stored.rate),
+        }
+    }
+}
+
+fn valid_language(language: &str) -> bool {
+    let mut parts = language.split('-');
+    let first = parts.next().unwrap_or_default();
+    (2..=3).contains(&first.len())
+        && first.bytes().all(|b| b.is_ascii_alphabetic())
+        && language.len() <= 64
+        && parts.all(|part| {
+            (2..=8).contains(&part.len()) && part.bytes().all(|b| b.is_ascii_alphanumeric())
+        })
 }
 
 #[derive(Serialize)]
@@ -924,7 +975,7 @@ struct DeviceVoicePreferences {
 fn device_voice_preferences(
     state: &AppState,
     headers: &HeaderMap,
-    preferences: Option<VoicePreferences>,
+    preferences: Option<VoicePreferencesUpdate>,
 ) -> axum::response::Response {
     let Some(token) = extract_bearer_token(headers) else {
         return (
@@ -969,14 +1020,14 @@ fn device_voice_preferences(
 fn registry_voice_preferences_authorized<G>(
     registry: &DeviceRegistry,
     key: VoiceDeviceKey<'_>,
-    preferences: Option<VoicePreferences>,
+    preferences: Option<VoicePreferencesUpdate>,
     authorize: impl FnOnce() -> Result<G, Box<axum::response::Response>>,
 ) -> axum::response::Response {
     if let Some(preferences) = preferences {
         if !preferences.valid() {
             return (StatusCode::BAD_REQUEST, "Invalid voice preferences").into_response();
         }
-        match registry.save_voice_preferences_authorized(key, &preferences, authorize) {
+        match registry.save_voice_preferences_authorized(key, preferences, authorize) {
             Ok(Err(refusal)) => return *refusal,
             Ok(Ok(true)) => {}
             Ok(Ok(false)) => {
@@ -1032,7 +1083,7 @@ pub async fn get_my_voice_preferences(
 pub async fn put_my_voice_preferences(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(preferences): Json<VoicePreferences>,
+    Json(preferences): Json<VoicePreferencesUpdate>,
 ) -> impl IntoResponse {
     device_voice_preferences(&state, &headers, Some(preferences))
 }
@@ -1044,7 +1095,7 @@ fn managed_voice_preferences(
     state: &AppState,
     headers: &HeaderMap,
     device_id: &str,
-    preferences: Option<VoicePreferences>,
+    preferences: Option<VoicePreferencesUpdate>,
 ) -> axum::response::Response {
     managed_voice_preferences_authorized(state, headers, device_id, preferences, || Ok(()))
 }
@@ -1053,7 +1104,7 @@ fn managed_voice_preferences_authorized(
     state: &AppState,
     headers: &HeaderMap,
     device_id: &str,
-    preferences: Option<VoicePreferences>,
+    preferences: Option<VoicePreferencesUpdate>,
     authorize: impl FnOnce() -> Result<(), Box<axum::response::Response>>,
 ) -> axum::response::Response {
     if let Err(error) = require_auth(state, headers) {
@@ -1102,7 +1153,7 @@ async fn current_operator_voice_preferences(
     state: &AppState,
     headers: &HeaderMap,
     device_id: &str,
-    preferences: Option<VoicePreferences>,
+    preferences: Option<VoicePreferencesUpdate>,
     dashboard: Option<&DashboardAuth>,
 ) -> axum::response::Response {
     let Some(DashboardCaller::Session(mut session)) = crate::dashboard_session::current_caller()
@@ -1180,7 +1231,7 @@ pub async fn put_device_voice_preferences(
     dashboard: Option<Extension<Arc<DashboardAuth>>>,
     headers: HeaderMap,
     axum::extract::Path(device_id): axum::extract::Path<String>,
-    Json(preferences): Json<VoicePreferences>,
+    Json(preferences): Json<VoicePreferencesUpdate>,
 ) -> impl IntoResponse {
     current_operator_voice_preferences(
         &state,
@@ -1204,6 +1255,100 @@ mod tests {
     use zeroclaw_config::pairing::PairingGuard;
     use zeroclaw_config::schema::Config;
 
+    /// A full record as a write that sets every field, the way older dashboards save.
+    impl From<VoicePreferences> for VoicePreferencesUpdate {
+        fn from(full: VoicePreferences) -> Self {
+            Self {
+                dictation: Some(full.dictation),
+                reading: Some(full.reading),
+                automatic: Some(full.automatic),
+                language: Some(full.language),
+                recognition: Some(full.recognition),
+                voice: Some(full.voice),
+                rate: Some(full.rate),
+            }
+        }
+    }
+
+    fn update(json: serde_json::Value) -> VoicePreferencesUpdate {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_partial_voice_write_keeps_fields_another_screen_saved() {
+        let (_dir, state, a, _) = voice_state();
+        let (_, own) = response_json(device_voice_preferences(&state, &a, None)).await;
+        let id = own["device_id"].as_str().unwrap().to_owned();
+        let start = VoicePreferences {
+            dictation: true,
+            recognition: RecognitionMode::Browser,
+            ..Default::default()
+        };
+        assert_eq!(
+            device_voice_preferences(&state, &a, Some(start.into())).status(),
+            StatusCode::OK
+        );
+        // An operator on another computer switches the device to on-device recognition.
+        assert_eq!(
+            managed_voice_preferences(
+                &state,
+                &a,
+                &id,
+                Some(update(serde_json::json!({"recognition": "local"})))
+            )
+            .status(),
+            StatusCode::OK
+        );
+        // A screen that loaded the record before that change saves only the rate.
+        let (status, after) = response_json(device_voice_preferences(
+            &state,
+            &a,
+            Some(update(serde_json::json!({"rate": 1.5}))),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(after["preferences"]["rate"], 1.5);
+        assert_eq!(after["preferences"]["recognition"], "local");
+        assert_eq!(after["preferences"]["dictation"], true);
+        // A write that names every field still replaces the whole record.
+        let (_, replaced) = response_json(device_voice_preferences(
+            &state,
+            &a,
+            Some(VoicePreferences::default().into()),
+        ))
+        .await;
+        assert_eq!(
+            replaced["preferences"],
+            serde_json::to_value(VoicePreferences::default()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_partial_voice_write_changes_nothing() {
+        let (_dir, state, a, _) = voice_state();
+        let saved = VoicePreferences {
+            reading: true,
+            language: "pt-BR".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            device_voice_preferences(&state, &a, Some(saved.clone().into())).status(),
+            StatusCode::OK
+        );
+        for bad in [
+            serde_json::json!({"rate": 99.0}),
+            serde_json::json!({"language": "../../etc"}),
+            serde_json::json!({"voice": "v".repeat(1025)}),
+        ] {
+            assert_eq!(
+                device_voice_preferences(&state, &a, Some(update(bad))).status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let (_, after) = response_json(device_voice_preferences(&state, &a, None)).await;
+        assert_eq!(after["preferences"], serde_json::to_value(saved).unwrap());
+    }
+
     #[tokio::test]
     async fn selected_device_voice_settings_are_isolated_from_the_calling_device() {
         let (_dir, state, a, b) = voice_state();
@@ -1223,14 +1368,14 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            managed_voice_preferences(&state, &a, own_id, Some(first.clone())).status(),
+            managed_voice_preferences(&state, &a, own_id, Some(first.clone().into())).status(),
             StatusCode::OK
         );
         let (status, saved) = response_json(managed_voice_preferences(
             &state,
             &a,
             other_id,
-            Some(second.clone()),
+            Some(second.clone().into()),
         ))
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -1302,8 +1447,12 @@ mod tests {
 
         let writer_state = state.clone();
         let writer = std::thread::spawn(move || {
-            device_voice_preferences(&writer_state, &headers, Some(VoicePreferences::default()))
-                .status()
+            device_voice_preferences(
+                &writer_state,
+                &headers,
+                Some(VoicePreferences::default().into()),
+            )
+            .status()
         });
         std::thread::sleep(Duration::from_millis(300));
         let revoker_state = state.clone();
@@ -1353,7 +1502,7 @@ mod tests {
             language: "pt-BR".into(),
             ..Default::default()
         };
-        let response = device_voice_preferences(&state, &a, Some(prefs.clone()));
+        let response = device_voice_preferences(&state, &a, Some(prefs.clone().into()));
         let (status, body) = response_json(response).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["preferences"]["reading"], true);
@@ -1398,16 +1547,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            device_voice_preferences(&state, &a, Some(bad)).status(),
+            device_voice_preferences(&state, &a, Some(bad.into())).status(),
             StatusCode::BAD_REQUEST
         );
         let bad = VoicePreferences {
             language: "../../etc".into(),
             ..Default::default()
         };
-        assert!(!bad.valid());
+        assert!(!VoicePreferencesUpdate::from(bad).valid());
         assert!(
-            serde_json::from_value::<VoicePreferences>(
+            serde_json::from_value::<VoicePreferencesUpdate>(
                 serde_json::json!({"device_id":"someone-else"})
             )
             .is_err()

@@ -43,6 +43,31 @@ class InternalDocsLinksTest(unittest.TestCase):
         self.assertIn("index.md:1", result.stdout)
         self.assertIn("missing.md", result.stdout)
 
+    def test_resolves_percent_encoded_local_paths(self) -> None:
+        result = self.run_checker(
+            {
+                "index.md": (
+                    "[Guide](guide%20notes.md#intro)\n"
+                    "[Unicode][unicode]\n"
+                    "[unicode]: %E6%8C%87%E5%8D%97.md\n"
+                    "[Punctuation](hash%23name.md?view=1#intro)\n"
+                    "[Literal percent](literal%2520.md)\n"
+                ),
+                "guide notes.md": "# Guide\n",
+                "指南.md": "# Guide\n",
+                "hash#name.md": "# Guide\n",
+                "literal%20.md": "# Guide\n",
+            }
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_reports_missing_percent_encoded_target(self) -> None:
+        result = self.run_checker({"index.md": "[Missing](missing%20guide.md)\n"})
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("index.md:1", result.stdout)
+        self.assertIn("missing guide.md", result.stdout)
+
     def test_ignores_generated_reference_targets(self) -> None:
         result = self.run_checker(
             {

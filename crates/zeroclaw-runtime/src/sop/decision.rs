@@ -48,7 +48,7 @@ fn default_threshold() -> f64 {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum GateOnError {
-    /// Start the run anyway, in the strictest listed mode, so a human sees it.
+    /// Start the run in its fail-closed mode.
     #[default]
     RunStrict,
     /// Do not start the run. The event is recorded as skipped.
@@ -81,7 +81,7 @@ pub struct SopDecisionSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode_instructions: Option<String>,
     /// A mode choice below this confidence falls back to the fail-closed mode,
-    /// and the model's step answers are ignored so every step runs.
+    /// and the run ignores the model's step answers.
     #[serde(default = "default_threshold")]
     pub min_confidence: f64,
     /// Minimum "yes" probability for a step's `decide` question to include
@@ -564,7 +564,11 @@ fn resolve(
             _ => {
                 gate_failed = true;
                 let run = spec.gate_on_error == GateOnError::RunStrict;
-                let outcome = if run { "using strictest" } else { "skipping" };
+                let outcome = if run {
+                    format!("using {}", strict.unwrap_or(authored))
+                } else {
+                    "skipping".to_string()
+                };
                 notes.push(format!("gate answer missing or malformed; {outcome}"));
                 run
             }
@@ -606,7 +610,11 @@ fn resolve(
 
     let answered_steps: &[u32] = if trusted { part_steps } else { &[] };
     if start && !trusted && !part_steps.is_empty() {
-        notes.push("step answers ignored; every step runs".to_string());
+        notes.push(
+            "step answers ignored (decide and unless_decided do not skip steps, and a switch \
+             with no matching port ends the run)"
+                .to_string(),
+        );
     }
     let mut parts = BTreeMap::new();
     for step in answered_steps {
@@ -859,7 +867,7 @@ mod tests {
         assert_eq!(d.mode, Some(SopExecutionMode::StepByStep));
         assert!(
             d.rationale
-                .contains("gate answer missing or malformed; using strictest"),
+                .contains("gate answer missing or malformed; using step_by_step"),
             "{}",
             d.rationale
         );
@@ -884,7 +892,8 @@ mod tests {
         );
         assert!(d.parts.is_empty(), "{:?} / {}", d.parts, d.rationale);
         assert!(
-            d.rationale.contains("step answers ignored"),
+            d.rationale
+                .contains("a switch with no matching port ends the run"),
             "{}",
             d.rationale
         );
@@ -1084,6 +1093,11 @@ mod tests {
         );
         assert!(d.start);
         assert_eq!(d.mode, None);
+        assert!(
+            d.rationale.contains("using priority_based"),
+            "{}",
+            d.rationale
+        );
     }
 
     #[test]
@@ -1118,6 +1132,11 @@ mod tests {
         );
         assert!(d.start);
         assert_eq!(d.mode, None);
+        assert!(
+            d.rationale.contains("using deterministic"),
+            "{}",
+            d.rationale
+        );
     }
 
     #[test]
@@ -1153,7 +1172,7 @@ mod tests {
             d.rationale
         );
         assert!(
-            !d.rationale.contains("using strictest"),
+            !d.rationale.contains("using "),
             "a run that does not start has no mode: {}",
             d.rationale
         );
