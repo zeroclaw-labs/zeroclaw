@@ -233,7 +233,11 @@ impl AcpSessionStore {
                     }),
                 "Legacy transcript changed or could not be read for session {id}"
             );
-            let breadcrumb = legacy.get_session_trim_breadcrumb(&metadata.key)?;
+            // Legacy WebChat restores an unrecorded flag as false. ACP reserves NULL
+            // for old ACP rows whose provenance must be inferred from message text.
+            let breadcrumb = legacy
+                .get_session_trim_breadcrumb(&metadata.key)?
+                .unwrap_or(false);
             for row in timestamped {
                 let timestamp = row
                     .created_at
@@ -4340,6 +4344,36 @@ mod tests {
         );
         assert_eq!(legacy.try_load("gw_team_alpha").unwrap().len(), 2);
         assert!(store.load_session("discord_other").unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_gateway_import_preserves_trim_breadcrumb_provenance() {
+        use crate::session_backend::SessionBackend;
+
+        let (dir, store) = open_store();
+        let legacy = crate::session_sqlite::SqliteSessionBackend::new(dir.path()).unwrap();
+        let cases = [
+            ("absent", None),
+            ("user", Some(false)),
+            ("trim", Some(true)),
+        ];
+        for (id, flag) in cases {
+            let key = format!("gw_{id}");
+            legacy
+                .append(&key, &ChatMessage::user(HISTORY_TRIM_BREADCRUMB_CANONICAL))
+                .unwrap();
+            if let Some(flag) = flag {
+                legacy.set_session_trim_breadcrumb(&key, flag).unwrap();
+            }
+        }
+
+        store
+            .import_legacy_gateway_sessions(&legacy, |_| ("alpha".into(), dir.path().into()))
+            .unwrap();
+        for (id, flag) in cases {
+            let session = store.load_session(id).unwrap().unwrap();
+            assert_eq!(session.trim_breadcrumb, flag.unwrap_or(false), "{id}");
+        }
     }
 
     #[test]
