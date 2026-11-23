@@ -2808,17 +2808,15 @@ mod tests {
         wait_for_started_requests(&started, 1).await;
         assert_eq!(started.lock().len(), 1);
         assert_eq!(started.lock().first().map(String::as_str), Some("call"));
-        let control = zeroclaw_spawn::spawn!({
-            let channel = channel.clone();
-            async move {
-                channel
-                    .event(
-                        json!({"type":"interrupted","contact":"17","call_id":"call",
+        let control_channel = channel.clone();
+        let control = zeroclaw_spawn::spawn!(async move {
+            control_channel
+                .event(
+                    json!({"type":"interrupted","contact":"17","call_id":"call",
                             "scope":"call/next","playback":{"interrupted":false}}),
-                        &tx,
-                    )
-                    .await
-            }
+                    &tx,
+                )
+                .await
         });
         let interrupt = tokio::time::timeout(Duration::from_millis(150), rx.recv())
             .await
