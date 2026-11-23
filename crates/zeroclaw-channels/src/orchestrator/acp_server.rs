@@ -874,33 +874,9 @@ impl AcpServer {
 
     // ── Method handlers ──────────────────────────────────────────
 
-    fn validate_protocol_version(params: &Value) -> std::result::Result<(), RpcError> {
-        let Some(version) = params.get("protocolVersion") else {
-            return Ok(());
-        };
-        let supported = match version {
-            Value::Null => true,
-            Value::Number(n) => n.as_u64() == Some(ACP_PROTOCOL_VERSION),
-            Value::String(s) => matches!(s.trim(), "1" | "1.0"),
-            _ => false,
-        };
-        if supported {
-            Ok(())
-        } else {
-            Err(RpcError {
-                code: VERSION_MISMATCH,
-                message: format!(
-                    "Unsupported ACP protocolVersion: expected ACP v{ACP_PROTOCOL_VERSION}"
-                ),
-                data: Some(serde_json::json!({
-                    "supportedProtocolVersion": ACP_PROTOCOL_VERSION,
-                })),
-            })
-        }
-    }
-
     fn handle_initialize(&self, params: &Value) -> RpcResult {
-        Self::validate_protocol_version(params)?;
+        // ACP negotiation returns the latest supported version when the
+        // client's requested version is unavailable. This server supports v1.
         let elicitation = params
             .get("clientCapabilities")
             .and_then(|c| c.get("elicitation"));
@@ -1170,8 +1146,9 @@ impl AcpServer {
         .to_string_lossy()
         .into_owned();
 
-        let session_id = Self::requested_webchat_session_id(params, session_policy)?
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let requested_id = Self::requested_webchat_session_id(params, session_policy)?;
+        let client_chose_id = requested_id.is_some();
+        let session_id = requested_id.unwrap_or_else(|| Uuid::new_v4().to_string());
 
         {
             let sessions = self.sessions.lock().await;
@@ -1312,16 +1289,30 @@ impl AcpServer {
             .await;
             let error = match created {
                 Ok(Ok(_)) => None,
-                Ok(Err(e)) => Some(e.to_string()),
-                Err(join) => Some(join.to_string()),
-            };
-            if let Some(detail) = error {
-                self.loading_sessions.lock().await.remove(&session_id);
-                return Err(RpcError {
+                Ok(Err(e))
+                    if client_chose_id
+                        && e.is::<zeroclaw_infra::acp_session_store::AcpSessionIdConflict>() =>
+                {
+                    Some(RpcError {
+                        code: INVALID_PARAMS,
+                        message: "Requested WebChat session ID is unavailable".into(),
+                        data: None,
+                    })
+                }
+                Ok(Err(e)) => Some(RpcError {
                     code: INTERNAL_ERROR,
-                    message: format!("Failed to persist session: {detail}"),
+                    message: format!("Failed to persist session: {e}"),
                     data: None,
-                });
+                }),
+                Err(join) => Some(RpcError {
+                    code: INTERNAL_ERROR,
+                    message: format!("Failed to persist session: {join}"),
+                    data: None,
+                }),
+            };
+            if let Some(error) = error {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(error);
             }
         }
 
@@ -4452,8 +4443,7 @@ struct RpcError {
     ///
     /// - `Value::String(_)` is reserved for internal diagnostics (never sent
     ///   over the wire, read by [`Self::diagnostic`] for structured logs).
-    /// - `Value::Object(_)` carries safe, explicit wire metadata (e.g.
-    ///   `supportedProtocolVersion` on `VERSION_MISMATCH` or `code` on
+    /// - `Value::Object(_)` carries safe wire metadata (such as `code` on
     ///   steering failures) serialized as JSON-RPC `error.data`.
     data: Option<Value>,
 }
@@ -11649,39 +11639,20 @@ mod tests {
     }
 
     #[test]
-    fn handle_initialize_pins_acp_v1_and_rejects_mismatched_versions() {
-        let server = AcpServer::new(Config::default(), AcpServerConfig::default());
-
-        for accepted in [
-            serde_json::json!({}),
-            serde_json::json!({ "protocolVersion": null }),
-            serde_json::json!({ "protocolVersion": 1 }),
-            serde_json::json!({ "protocolVersion": "1" }),
-            serde_json::json!({ "protocolVersion": "1.0" }),
-        ] {
-            let res = server
-                .handle_initialize(&accepted)
-                .unwrap_or_else(|err| panic!("expected {accepted} to succeed, got {err:?}"));
-            assert_eq!(res["protocolVersion"], ACP_PROTOCOL_VERSION);
-        }
-
-        for rejected in [
-            serde_json::json!({ "protocolVersion": 0 }),
-            serde_json::json!({ "protocolVersion": 2 }),
-            serde_json::json!({ "protocolVersion": "2.0" }),
-            serde_json::json!({ "protocolVersion": "2024-11-05" }),
-            serde_json::json!({ "protocolVersion": true }),
-        ] {
-            let err = server.handle_initialize(&rejected).expect_err(&format!(
-                "expected {rejected} to fail with VERSION_MISMATCH"
-            ));
-            assert_eq!(err.code, VERSION_MISMATCH);
-            assert_eq!(
-                err.wire_data(),
-                Some(serde_json::json!({
-                    "supportedProtocolVersion": ACP_PROTOCOL_VERSION,
-                }))
-            );
+    fn handle_initialize_negotiates_acp_v1() {
+        let standalone = AcpServer::new(Config::default(), AcpServerConfig::default());
+        let gateway = AcpServer::new(Config::default(), AcpServerConfig::default())
+            .with_allow_webchat_policy(true);
+        for server in [standalone, gateway] {
+            for params in [
+                serde_json::json!({}),
+                serde_json::json!({ "protocolVersion": 0 }),
+                serde_json::json!({ "protocolVersion": 1 }),
+                serde_json::json!({ "protocolVersion": 2 }),
+            ] {
+                let response = server.handle_initialize(&params).unwrap();
+                assert_eq!(response["protocolVersion"], ACP_PROTOCOL_VERSION);
+            }
         }
     }
 
@@ -11741,6 +11712,101 @@ mod tests {
             gateway.resolve_restored_session_policy(None),
             AcpSessionPolicy::default()
         );
+    }
+
+    #[tokio::test]
+    async fn webchat_session_new_reports_a_persisted_id_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(dir.path()).unwrap());
+        let session_id = Uuid::new_v4().to_string();
+        store
+            .create_session(&session_id, "other-agent", "/original", Some("owner"))
+            .unwrap();
+        let (writer_tx, _rx) = mpsc::channel(1);
+        let server = AcpServer::new_with_writer_and_store(
+            make_test_config(dir.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        )
+        .with_allow_webchat_policy(true);
+
+        let error = server
+            .handle_session_new(&serde_json::json!({
+                "interactionSurface": "webchat",
+                "_meta": { "zeroclaw": { "sessionId": session_id } },
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert_eq!(error.message, "Requested WebChat session ID is unavailable");
+        assert!(server.loading_sessions.lock().await.is_empty());
+        assert_eq!(
+            store
+                .load_session(&session_id)
+                .unwrap()
+                .unwrap()
+                .agent_alias,
+            "other-agent"
+        );
+    }
+
+    #[cfg(feature = "channel-webhook")]
+    #[tokio::test]
+    async fn webchat_session_new_seeds_only_the_agents_bound_channels() {
+        use super::super::tests::{CronChannelRegistryRestore, STARTUP_REGISTRY_TEST_LOCK};
+
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
+        let previous = super::super::CRON_CHANNEL_REGISTRY
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let _restore = CronChannelRegistryRestore(previous);
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = make_test_config(dir.path());
+        cfg.agents.get_mut("test-agent").unwrap().channels = vec!["webhook.sales".into()];
+        let mut other = dispatchable_test_agent("anthropic.default");
+        other.channels = vec!["webhook.support".into()];
+        cfg.agents.insert("other".into(), other);
+        for alias in ["sales", "support"] {
+            cfg.channels.webhook.insert(
+                alias.into(),
+                zeroclaw_config::schema::WebhookConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let server =
+            AcpServer::new(cfg, AcpServerConfig::default()).with_allow_webchat_policy(true);
+        for (agent, selected, foreign) in [
+            ("test-agent", "webhook.sales", "webhook.support"),
+            ("other", "webhook.support", "webhook.sales"),
+        ] {
+            let created = server
+                .handle_session_new(&serde_json::json!({
+                    "agentAlias": agent,
+                    "interactionSurface": "webchat",
+                }))
+                .await
+                .unwrap();
+            let sessions = server.sessions.lock().await;
+            let session = sessions
+                .get(created["sessionId"].as_str().unwrap())
+                .unwrap()
+                .lock()
+                .await;
+            let channels = session.agent.channel_handles();
+            let admitted = channels.get_channel(selected).expect("bound channel");
+            assert!(Arc::ptr_eq(
+                &admitted,
+                &channels.get_channel("webhook").unwrap()
+            ));
+            assert!(channels.get_channel(foreign).is_none());
+        }
     }
 
     #[tokio::test]
