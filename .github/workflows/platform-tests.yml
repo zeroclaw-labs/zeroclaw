@@ -80,7 +80,9 @@ jobs:
         run: cargo test --locked -p zeroclaw-tools --features portable-ssh --test portable_ssh_auth
       - name: Install cargo-nextest
         shell: bash
-        run: curl -LsSf "https://get.nexte.st/latest/${{ matrix.nextest-platform }}" | tar zxf - -C "$HOME/.cargo/bin"
+        run: |
+          mkdir -p "$HOME/.cargo/bin"
+          curl -LsSf "https://get.nexte.st/latest/${{ matrix.nextest-platform }}" | tar zxf - -C "$HOME/.cargo/bin"
       - name: Run tests
         shell: bash
         run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast
