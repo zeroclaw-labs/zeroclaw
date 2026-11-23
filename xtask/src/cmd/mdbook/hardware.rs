@@ -63,7 +63,6 @@ fn render_transports() -> String {
             "Newline-delimited JSON over USB CDC serial",
         ),
         (TransportKind::Swd, "SWD debug probe (probe-rs)"),
-        (TransportKind::Uf2, "UF2 mass-storage firmware flashing"),
         (
             TransportKind::Native,
             "Direct Linux GPIO/I2C/SPI (rppal, sysfs)",
