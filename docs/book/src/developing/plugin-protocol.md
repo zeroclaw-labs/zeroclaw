@@ -250,7 +250,7 @@ Registry entries use this shape:
   "plugins": [
     {
       "name": "team-calendar",
-      "version": "0.8.6",
+      "version": "0.9.0",
       "description": "Schedule meetings on a team calendar",
       "author": "Example Team",
       "capabilities": ["tool"],
@@ -852,7 +852,7 @@ loaded depends on the build's execution backend:
 Both backend features pull in `plugins-wasmtime`; the load path keys off whether
 the cranelift compiler is in the build, not off pulley.
 
-### Per-call execution limits
+### Execution and allocation limits
 
 Every guest export runs under per-call resource limits the host applies to the
 store. The engine enables fuel metering, and each call is given a fresh fuel
@@ -863,10 +863,14 @@ yields ensure uninterrupted guest computation cannot starve that timer, and
 guest-reachable host imports never block the executor (log records are handed
 to a bounded queue and written by a dedicated host thread), so the deadline
 stays observable while host work runs. A
-`StoreLimits` ceiling bounds linear memory, table elements, and instance count.
-The tool world gets a fresh store per execute; the warm channel and memory
-stores are refueled before each call so a long-lived plugin gets a fresh budget
-rather than draining over its lifetime.
+store-wide limiter bounds the sum of linear memory bytes, the sum of table
+elements, and the instance count. Allocation budgets last for the store's
+lifetime and are shared by all its memories and tables, including initial
+allocations. Reservations remain charged if the allocator subsequently fails.
+These limits do not cover host allocations, Wasmtime bookkeeping, or virtual
+address reservations. The tool world gets a fresh store per execute. Warm
+channel and memory stores receive fresh fuel before each call, while retaining
+their allocation budgets.
 
 The five bounds are operator-tunable and every value is validated as non-zero:
 `plugins.limits.call_fuel` (default 1,000,000,000 instruction units),
@@ -1135,14 +1139,24 @@ update displaced open that root and its lock, so a host that only discovers
 plugins, such as one the daemon keeps, holds nothing in the plugins directory. On Windows an open root pins the plugins directory and
 its ancestors against rename until its host drops. A process that cannot take
 the lock within 60 seconds gives up and names the lock file. Any account that
-can read that file can hold the lock, and where the operating system or
-filesystem offers no file locking, install, update and remove refuse. New
+can read that file can hold the lock, so the plugins directory is treated as
+one account's state: on Unix the lock and each transaction lease are created
+readable and writable by their owner only (mode `0600`). A lock another
+account created, for example with `sudo`, cannot be opened, so install,
+update and remove fail at once and name it; remove that file while nothing is
+installing. Where the operating
+system or filesystem offers no file locking, install, update and remove refuse. New
 staging directories use unique generations and an OS-held lease, rather than a
 PID as ownership evidence. Recovery cleans an abandoned protocol stage only
 while recovering an actual final package, or while finishing the delete of one
-an earlier remove had judged. Legacy PID-only stages without proof of
-abandonment are retained and their paths are printed; they do not prevent a new
-install from using fresh staging.
+an earlier remove had judged. An install cleans the abandoned protocol stages
+of the package it installs before it stages its own, skipping any it cannot
+clear. It first refuses a source that lies inside one of that package's
+stages, compared by directory identity rather than path spelling, because the
+source's `skills/` tree is copied after the clean; nothing is cleaned then.
+Legacy PID-only stages without proof of abandonment are retained, and
+`plugin remove` prints their paths; they do not prevent a new install from
+using fresh staging.
 
 A refused claimed package is restored without overwriting a concurrent
 occupant. If restoration cannot complete, the error names its retained hidden

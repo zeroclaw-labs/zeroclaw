@@ -354,11 +354,17 @@ fn late_owned_read(path: &std::path::Path, limit: u64) -> Vec<u8> {
     bytes
 }
 
+/// An input the runtime plugin admission step in `.github/workflows/ci.yml`
+/// prepares for the `late_tool_search_*` tests.
+fn late_ci_input(name: &str) -> std::path::PathBuf {
+    let Some(path) = std::env::var_os(name) else {
+        panic!("{name} is unset; see the runtime plugin admission step in ci.yml");
+    };
+    std::path::PathBuf::from(path)
+}
+
 fn late_inputs() -> (Vec<u8>, Vec<u8>, LateValue) {
-    let receipt_path = std::path::PathBuf::from(
-        std::env::var_os("ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT")
-            .expect("explicit fixture receipt required"),
-    );
+    let receipt_path = late_ci_input("ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT");
     let receipt: LateValue =
         serde_json::from_slice(&late_owned_read(&receipt_path, 32 * 1024)).unwrap();
     assert_eq!(receipt["schema"], 1);
@@ -449,9 +455,7 @@ fn late_inputs() -> (Vec<u8>, Vec<u8>, LateValue) {
         );
     }
     let load = |kind: &str, env_name: &str| {
-        let path = std::path::PathBuf::from(
-            std::env::var_os(env_name).expect("explicit generated component required"),
-        );
+        let path = late_ci_input(env_name);
         assert!(path.is_absolute());
         let raw_meta = std::fs::symlink_metadata(&path).unwrap();
         assert!(raw_meta.is_file() && !raw_meta.file_type().is_symlink());
@@ -547,10 +551,7 @@ where
         "events":events, "test_executable":late_executable(), "runtime_source_sha256":late_digest(include_bytes!("scoped.rs")), "fixture_receipt_sha256":late_digest(&late_owned_read(&std::path::PathBuf::from(std::env::var_os("ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT").unwrap()), 32768)) });
     let bytes = serde_json::to_vec(&receipt).unwrap();
     assert!(bytes.len() <= 512 * 1024);
-    let dir = std::path::PathBuf::from(
-        std::env::var_os("ZEROCLAW_LATE_TOOL_SEARCH_CASE_RECEIPTS")
-            .expect("explicit private receipt directory"),
-    );
+    let dir = late_ci_input("ZEROCLAW_LATE_TOOL_SEARCH_CASE_RECEIPTS");
     let meta = std::fs::symlink_metadata(&dir).unwrap();
     assert!(meta.is_dir() && !meta.file_type().is_symlink());
     #[cfg(unix)]
@@ -1042,6 +1043,7 @@ async fn late_activate(run: &LateRun, out: &ScopedAssembled, server: &LateServer
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_real_guest_metadata_preflight() {
     late_run(
         "late_tool_search_real_guest_metadata_preflight",
@@ -1064,6 +1066,7 @@ async fn late_tool_search_real_guest_metadata_preflight() {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_deferred_mcp_registry_owner() {
     late_run(
         "late_tool_search_deferred_mcp_registry_owner",
@@ -1087,6 +1090,7 @@ async fn late_tool_search_deferred_mcp_registry_owner() {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_deferred_mcp_delegate_retirement() {
     late_run(
         "late_tool_search_deferred_mcp_delegate_retirement",
@@ -1192,6 +1196,7 @@ async fn late_tool_search_deferred_mcp_delegate_retirement() {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_deferred_mcp_pipeline_retirement() {
     late_run(
         "late_tool_search_deferred_mcp_pipeline_retirement",
@@ -1220,6 +1225,7 @@ async fn late_tool_search_deferred_mcp_pipeline_retirement() {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_deferred_mcp_skill_direct_retirement() {
     late_run(
         "late_tool_search_deferred_mcp_skill_direct_retirement",
@@ -1255,6 +1261,7 @@ async fn late_tool_search_deferred_mcp_skill_direct_retirement() {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_deferred_mcp_skill_pipeline_retirement() {
     late_run(
         "late_tool_search_deferred_mcp_skill_pipeline_retirement",
@@ -1389,6 +1396,7 @@ async fn late_tool_search_deferred_mcp_skill_pipeline_retirement() {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_mcp_search_select_activation() {
     late_run(
         "late_tool_search_mcp_search_select_activation",
@@ -1543,6 +1551,7 @@ async fn late_last_winner(run: &LateRun) {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_builtin_only_views() {
     late_run("late_tool_search_builtin_only_views", |run| async move {
         let mut case = late_build(
@@ -1623,6 +1632,7 @@ async fn late_tool_search_builtin_only_views() {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_builtin_only_schema_selection() {
     late_run(
         "late_tool_search_builtin_only_schema_selection",
@@ -1712,6 +1722,7 @@ async fn late_no_host_case(run: LateRun, row: usize) {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_no_host_disabled_mcp_keeps_real_guest() {
     late_run(
         "late_tool_search_no_host_disabled_mcp_keeps_real_guest",
@@ -1721,6 +1732,7 @@ async fn late_tool_search_no_host_disabled_mcp_keeps_real_guest() {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_no_host_connect_disabled_keeps_real_guest() {
     late_run(
         "late_tool_search_no_host_connect_disabled_keeps_real_guest",
@@ -1730,6 +1742,7 @@ async fn late_tool_search_no_host_connect_disabled_keeps_real_guest() {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_no_host_ungranted_mcp_keeps_real_guest() {
     late_run(
         "late_tool_search_no_host_ungranted_mcp_keeps_real_guest",
@@ -1739,6 +1752,7 @@ async fn late_tool_search_no_host_ungranted_mcp_keeps_real_guest() {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_no_host_eager_mcp_keeps_real_guest() {
     late_run(
         "late_tool_search_no_host_eager_mcp_keeps_real_guest",
@@ -1748,6 +1762,7 @@ async fn late_tool_search_no_host_eager_mcp_keeps_real_guest() {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_no_host_listing_mcp_keeps_real_guest() {
     late_run(
         "late_tool_search_no_host_listing_mcp_keeps_real_guest",
@@ -1757,6 +1772,7 @@ async fn late_tool_search_no_host_listing_mcp_keeps_real_guest() {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_no_host_empty_mcp_keeps_real_guest() {
     late_run(
         "late_tool_search_no_host_empty_mcp_keeps_real_guest",
@@ -1766,6 +1782,7 @@ async fn late_tool_search_no_host_empty_mcp_keeps_real_guest() {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_no_host_filtered_mcp_keeps_real_guest() {
     late_run(
         "late_tool_search_no_host_filtered_mcp_keeps_real_guest",
@@ -1775,6 +1792,7 @@ async fn late_tool_search_no_host_filtered_mcp_keeps_real_guest() {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_no_host_empty_builtin_catalog_keeps_real_guest() {
     late_run(
         "late_tool_search_no_host_empty_builtin_catalog_keeps_real_guest",
@@ -1784,6 +1802,7 @@ async fn late_tool_search_no_host_empty_builtin_catalog_keeps_real_guest() {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_helper_denied_keeps_no_guest_recovery() {
     late_run(
         "late_tool_search_helper_denied_keeps_no_guest_recovery",
@@ -1829,6 +1848,7 @@ async fn late_tool_search_helper_denied_keeps_no_guest_recovery() {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_caller_principal_context() {
     late_run("late_tool_search_caller_principal_context", |run| async move {
         let mut case=late_build(&run,&["calculator","execute_pipeline","deliver_file"],true,true,false,|config,_| { config.pipeline.allowed_tools.extend(["memory_recall".into(),"deliver_file".into()]); }).await;
@@ -1848,7 +1868,12 @@ async fn late_tool_search_caller_principal_context() {
         config.skill_bundles.insert("late-principal".into(),zeroclaw_config::schema::SkillBundleConfig { directory:Some(bundle_dir.display().to_string()),..Default::default() });
         config.agents.get_mut("namespace").unwrap().skill_bundles=vec!["late-principal".into()];
         let loaded=crate::skills::load_skills_for_agent_from_config(&config,"namespace");
-        assert_eq!(loaded.len(),1); assert_eq!(loaded[0].name,"nested");
+        assert!(loaded.iter().any(|skill| skill.name == "zeroclaw-docs"));
+        assert_eq!(
+            loaded.iter().filter(|skill| skill.name == "nested").count(),
+            1,
+            "the configured bundle skill must remain available alongside built-ins",
+        );
         let mut unrestricted=crate::agent::Agent::from_live_config_with_tui_env_and_principal_tools(zeroclaw_config::live::LiveConfig::new(config.clone()).handle(),"namespace",None,false,true,None,None,None,None).await.unwrap();
         assert!(unrestricted.tool_names().contains(&"execute_pipeline"));
         assert!(unrestricted.tool_names().contains(&skill_tool::composed_tool_name("nested","invoke").as_str()));
@@ -1865,6 +1890,7 @@ async fn late_tool_search_caller_principal_context() {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_recovery_cannot_reintroduce_guest() {
     late_run(
         "late_tool_search_recovery_cannot_reintroduce_guest",
@@ -1936,6 +1962,7 @@ async fn late_tool_search_recovery_cannot_reintroduce_guest() {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_shared_registry_no_reconnect() {
     late_run(
         "late_tool_search_shared_registry_no_reconnect",
@@ -1975,6 +2002,7 @@ async fn late_tool_search_shared_registry_no_reconnect() {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_minimal_full_compiled_semantics() {
     late_run(
         "late_tool_search_minimal_full_compiled_semantics",
@@ -2025,6 +2053,7 @@ async fn late_tool_search_minimal_full_compiled_semantics() {
 }
 
 #[tokio::test]
+#[ignore = "requires ZEROCLAW_LATE_TOOL_SEARCH_FIXTURE_RECEIPT, which the runtime plugin admission step in .github/workflows/ci.yml prepares"]
 async fn late_tool_search_registration_order_and_hidden_specs() {
     late_run(
         "late_tool_search_registration_order_and_hidden_specs",

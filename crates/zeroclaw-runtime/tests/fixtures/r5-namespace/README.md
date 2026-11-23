@@ -9,6 +9,14 @@ install it as an ordinary plugin package to check that a guest cannot take a
 native tool's name. Those tests enable and discover only that package; plugin
 defaults and authority are unchanged.
 
+The `late_tool_search_*` tests in the same file also need two components built
+from `crates/zeroclaw-plugins/tests/fixtures/tool-fixture` and a fixture receipt
+that records those builds, passed in through the
+`ZEROCLAW_LATE_TOOL_SEARCH_*` variables, so they are ignored by default. The
+runtime plugin admission step in `.github/workflows/ci.yml` builds the
+components and the receipt and runs the tests with `--include-ignored`; it is
+the reference for running them anywhere else.
+
 The checked-in file is 52,176 bytes, SHA-256
 `ee072a30a4624317cfeed4b759f4afae70088194209c37c9d80dddce937e4d65`, built for
 `wasm32-wasip2` with Rust 1.98.0.

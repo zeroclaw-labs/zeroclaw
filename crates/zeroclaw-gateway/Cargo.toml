@@ -11,6 +11,8 @@ publish = true
 [dependencies]
 # Internal workspace crates
 zeroclaw-api.workspace = true
+zeroclaw-rpc-client.workspace = true
+zeroclaw-rpc-proto.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-config.workspace = true
 zeroclaw-tls.workspace = true
@@ -69,6 +71,8 @@ directories = "6.0"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+# Dashboard sign-in access tokens are wiped from memory when dropped.
+zeroize.workspace = true
 
 # Database (session queue)
 rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
@@ -79,6 +83,8 @@ parking_lot = "0.12"
 toml = "1.0"
 toml_edit = "0.25"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
+# Dashboard sign-in session and CSRF tokens.
+rand = "0.10"
 
 # Unix-only: self-signal SIGTERM to trigger the daemon's graceful shutdown for
 # supervised post-upgrade restart (version.rs).
@@ -86,8 +92,9 @@ uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 libc = "0.2"
 
 [dev-dependencies]
+# A plain HTTP/2 (h2c) client for the connection-drain tests.
+h2 = "0.4"
 zeroclaw-config = { workspace = true, features = ["test-helpers"] }
-rand = "0.10"
 rcgen = "0.13"
 tempfile = "3.26"
 # Enables deterministic clock and shared-authority helpers for gateway fixtures;

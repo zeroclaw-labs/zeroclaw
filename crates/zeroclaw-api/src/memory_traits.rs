@@ -21,7 +21,7 @@ pub struct ExportFilter {
 /// principal permitted only a non-default agent stores and reads under that
 /// agent. `None` for a dimension means the backend's default for it (the
 /// default agent, the default namespace, no tenant), not "any".
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrincipalScope {
     /// The durable owner identity (the canonical principal id).
     pub principal_id: String,
@@ -300,10 +300,26 @@ pub enum MemoryPolicyDecision {
 }
 
 /// Core memory trait — implement for any persistence backend
+///
+/// Some wrappers forward every method to another `Memory`, such as the
+/// runtime's native memory binding, which routes a session's memory tools to
+/// its owner's private plane. A new method with a default body that does not
+/// call another method must be forwarded there too, or calls to it skip the
+/// wrapper's routing.
 #[async_trait]
 pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// Backend name
     fn name(&self) -> &str;
+
+    /// The principal scope every operation through this handle is routed to,
+    /// when it is a principal-plane view (the memory of a session pinned to
+    /// its owner). `None` for a shared-plane handle.
+    ///
+    /// Code that builds new tools or a new run over a handle it was given
+    /// reads this to keep that work on the same owner's plane.
+    fn principal_scope(&self) -> Option<PrincipalScope> {
+        None
+    }
 
     /// Store a memory entry, optionally scoped to a session
     async fn store(

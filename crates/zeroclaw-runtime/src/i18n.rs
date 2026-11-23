@@ -1250,7 +1250,7 @@ mod tests {
         /// the substrings the rendered value must contain.
         type QuickstartPluginCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
 
-        let cases: [QuickstartPluginCase<'_>; 47] = [
+        let cases: [QuickstartPluginCase<'_>; 46] = [
             // Any failure to fetch the registry index is printed as it reads.
             (
                 "cli-quickstart-plugins-registry-unavailable",
@@ -1366,23 +1366,6 @@ mod tests {
                     ("command", grant_to_complete.as_str()),
                 ],
                 &["weather-tool", grant_to_complete.as_str()],
-            ),
-            // Destinations declared for a transport the tool row is not
-            // seeded for are named with the command that grants them, and
-            // the line names the permission the row is seeded for.
-            (
-                "cli-quickstart-plugins-declared-hosts-not-granted",
-                &[
-                    ("name", "weather-tool"),
-                    ("hosts", "api.example.com"),
-                    ("command", grant.as_str()),
-                ],
-                &[
-                    "weather-tool",
-                    "api.example.com",
-                    "http_client",
-                    grant.as_str(),
-                ],
             ),
             // An installed package missing its row gets the fresh-install
             // decision; skipping it leaves no row. The command that creates
@@ -2590,6 +2573,8 @@ mod tests {
         const VERSION: &str = "0.0.0";
         const DESCRIPTION: &str = "a tool";
         const ERROR: &str = "failed to instantiate: type mismatch (hint: rebuild against wit/v0)";
+        const CONFIG_ERROR: &str = "invalid plugin config: plugin 'tool-fixture' has configured values but declares no config_schema";
+        const KEY: &str = "zpi1_WyJ0b29sLWZpeHR1cmUiLCJ0b29sIiwidG9vbC1maXh0dXJlIl0";
 
         let row = [
             ("name", NAME),
@@ -2605,7 +2590,7 @@ mod tests {
         /// One parity case: the Fluent key, its arguments, and the substrings
         /// every locale's rendering must contain.
         type ParityCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
-        let cases: [ParityCase; 7] = [
+        let cases: [ParityCase; 8] = [
             (
                 "cli-plugin-list-entry-loads",
                 &row,
@@ -2623,6 +2608,11 @@ mod tests {
             ),
             ("cli-plugin-info-load-ok", &[], &["WIT"]),
             ("cli-plugin-info-load-failed", &[("error", ERROR)], &[ERROR]),
+            (
+                "cli-plugin-info-load-config-refused",
+                &[("error", CONFIG_ERROR), ("key", KEY)],
+                &["WIT", CONFIG_ERROR, KEY, "config_schema"],
+            ),
             ("cli-plugin-info-load-not-applicable", &[], &[]),
             (
                 "cli-plugin-info-load-failed-exit",
@@ -2653,6 +2643,74 @@ mod tests {
                     assert!(
                         value.contains(expected),
                         "{key} in {locale} should preserve {expected:?}; got: {value:?}"
+                    );
+                }
+                if locale != "en" {
+                    assert_ne!(
+                        value, english,
+                        "{key} in {locale} is the English string verbatim, so that catalogue was never translated"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `zeroclaw estop` refuses to run because nothing enforces it, so every
+    /// catalogue must say so in its own language, name the command in the
+    /// refusal, and carry the `--help` and status wording that matches it. A
+    /// catalogue that copies English fails as untranslated.
+    #[test]
+    fn estop_not_enforced_strings_are_translated_in_every_locale() {
+        let cases: [(&str, &[(&str, &str)]); 5] = [
+            ("cli-estop-not-enforced", &[]),
+            ("cli-estop-about", &[]),
+            ("cli-estop-status-about", &[]),
+            ("cli-estop-resume-about", &[]),
+            ("cli-status-estop", &[("v", "true")]),
+        ];
+
+        // The phrase each locale uses to say the command is not enforced.
+        // Without it a catalogue could go back to describing `estop` as
+        // engaging or resuming a stop and still be a translated string.
+        let not_enforced = |locale: &str, key: &str| -> &'static str {
+            match (locale, key) {
+                ("en", _) => "not enforced",
+                ("es", _) => "no se hace cumplir",
+                ("fr", "cli-estop-not-enforced") => "pas appliqué",
+                ("fr", _) => "non appliqué",
+                ("ja", "cli-estop-not-enforced") => "適用されていません",
+                ("ja", _) => "未適用",
+                ("zh-CN", _) => "未生效",
+                _ => unreachable!("unexpected locale {locale}"),
+            }
+        };
+
+        let english_source = include_str!("../locales/en/cli.ftl");
+        for (key, args) in cases {
+            let english = format_ftl_message(english_source, "en", key, args)
+                .unwrap_or_else(|| panic!("{key} should format in en"));
+
+            for (source, locale) in [
+                (include_str!("../locales/en/cli.ftl"), "en"),
+                (include_str!("../locales/es/cli.ftl"), "es"),
+                (include_str!("../locales/fr/cli.ftl"), "fr"),
+                (include_str!("../locales/ja/cli.ftl"), "ja"),
+                (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+            ] {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                assert!(
+                    !value.trim().is_empty(),
+                    "{key} must not be empty in {locale}"
+                );
+                assert!(
+                    value.to_lowercase().contains(not_enforced(locale, key)),
+                    "{key} in {locale} should say the command is not enforced; got: {value:?}"
+                );
+                if key == "cli-estop-not-enforced" {
+                    assert!(
+                        value.contains("zeroclaw estop"),
+                        "{key} in {locale} should name the command; got: {value:?}"
                     );
                 }
                 if locale != "en" {

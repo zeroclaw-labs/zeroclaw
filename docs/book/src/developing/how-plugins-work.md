@@ -201,14 +201,24 @@ one twice:
    after plugin tools. That refusal carries `error_key`
    `plugin_tool_name_reserved`.
 
-The names checked are the tools that registry build has already registered,
-including plugin tools accepted earlier in the same pass, plus
-`execute_pipeline` when `[pipeline] enabled = true`. This is not a fixed list
-of every built-in name: a built-in that a build does not register, for example
-because its config section is disabled, is not reserved in that build. Apart
-from the MCP namespace, tools that join the registry after plugin registration
-are outside this check. Give plugin packages and tools names that are unique
-outright rather than relying on it.
+The names checked are the host's built-in tools, including ones the current
+tool selection leaves out of the agent, plus plugin tools accepted earlier in
+the same pass. Some host tools are only added later in setup; their names are
+reserved up front, for example `mcp_resources` and `mcp_prompts` always, even
+on a host with no MCP servers, and `execute_pipeline` when
+`[pipeline] enabled = true`. The set still depends on the build and its
+config, so do not treat it as a fixed list of every built-in name: a name that
+loads on one host can be refused on another.
+
+Tools that a connected peripheral or a skill contributes join the registry
+later, when the agent's tool set is assembled. They own their names too: a
+plugin tool with such a name is dropped at that point, and the host logs a
+`WARN` event with `error_key` `plugin_tool_name_conflict` naming the tool.
+A peripheral's tool names are known only once its board is connected, so
+while a board is absent, and wherever tools are assembled without connecting
+hardware, such as tool listings, a plugin tool with one of those names can
+still appear. Give plugin packages and tools names that are unique outright
+rather than relying on these checks.
 
 ## Capabilities and permissions
 

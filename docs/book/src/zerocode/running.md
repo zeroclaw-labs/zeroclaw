@@ -63,6 +63,7 @@ In the **Chat** and **Code** panes you can load or switch existing sessions with
 - Use the list-navigation keys to move the selection (defaults: Up/Down).
 - **Enter** switches to the highlighted session.
 - **New session** opens the same add-agent picker as the sidebar `[+]` and adds a session for the agent you choose, leaving the focused session tracked (default chord: Ctrl+N; rebindable).
+- **`/load-session [name|id]`** resumes a saved session from the pane's own store without opening the list. It matches, in order: the exact session id, the exact name, the name ignoring case, then a unique id prefix. If several sessions match, the list opens showing only those; with no argument, it opens the full list, like **Switch session**. The command never starts a new session. Code sessions don't have names yet, so in the **Code** pane only id and id-prefix matching work today.
 
 Clicking a session row's body focuses it; clicking its right-edge `✕` closes that specific session without focusing it first.
 Use the Sessions header `[+]` to add a sibling session and `[-]` to close the focused session in the active pane.
@@ -105,7 +106,9 @@ Undo history belongs to the current draft and retains at most 100 edit groups. C
 
 Selection shortcuts act on the focused composer, not the queue sidebar. Copying selected input does not cancel a running turn or quit; with no input selection, Control+C retains its cancel/quit behavior. Dialogs and transcript browsing keep their own shortcuts. Use `/attach` to browse files; the configurable **browse files** action has no default shortcut because Primary+A now selects text. The Help overlay shows the current configured bindings.
 
-Terminal or operating-system shortcuts may intercept Command, Control, or clipboard events before zerocode sees them. Clipboard copy uses the terminal's OSC 52 support; bracketed paste remains available.
+Terminal or operating-system shortcuts may intercept Command, Control, or clipboard events before zerocode sees them. On a local Linux desktop, text copy uses `wl-copy` for Wayland or `xclip` for X11 when the corresponding display is available and the tool is installed. Ubuntu users can install the optional writer with `sudo apt install wl-clipboard` or `sudo apt install xclip`. A successful local writer reports `Copied`; a writer error preserves the selection and reports the failure.
+
+SSH sessions, other platforms, and sessions without an available local writer use the terminal's OSC 52 support. Feedback says `Requested` because sending the sequence cannot confirm that the terminal changed the clipboard. Unsupported terminals can ignore that request; an OSC 52-capable terminal is a workaround. Composer Cut still removes the selected text after an emitted terminal request, and Undo restores it if delivery failed. A known write failure leaves the draft intact. Bracketed paste remains available.
 
 ## CLI flags
 

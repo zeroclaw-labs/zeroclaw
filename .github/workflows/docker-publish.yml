@@ -9,6 +9,14 @@ name: Docker Publish
 # Images are pushed with the canonical platform matrix first, signed by digest,
 # then the pinned tag is scanned in report-only mode (exit-code: 0). Enforcement
 # flips in a follow-up after the baseline is triaged.
+#
+# A manual dispatch builds without pushing unless `push` is set, so it doubles
+# as a dry run of the release legs. To rebuild one variant of a published
+# release with this workflow, dispatch from master with `release_ref` set to the
+# tag and `stems` naming the variant; other pinned tags are left untouched.
+# Floating tags (`<stem>` and the relay's `latest`) move on a tag push and on
+# the release call. A dispatch leaves them alone unless `floating` is set, so a
+# rebuild of an older release cannot move them back to that release.
 
 on:
   push:
@@ -20,10 +28,43 @@ on:
         description: "Immutable release tag to build (vX.Y.Z)"
         required: true
         type: string
+      push:
+        description: "Push and sign the images"
+        required: false
+        type: boolean
+        default: true
+      floating:
+        description: "Also move the floating tags (<stem>, relay latest)"
+        required: false
+        type: boolean
+        default: true
   workflow_dispatch:
+    inputs:
+      release_ref:
+        description: "Release tag to build (vX.Y.Z); empty builds the dispatch ref"
+        required: false
+        type: string
+      stems:
+        description: "Comma-separated docker-tags.toml stems (e.g. dist); empty builds every stem and the relay"
+        required: false
+        type: string
+      push:
+        description: "Push and sign the images; leave off for a dry run"
+        required: false
+        type: boolean
+        default: false
+      floating:
+        description: "Also move the floating tags (<stem>, relay latest); only for the newest release"
+        required: false
+        type: boolean
+        default: false
 
+# A dry run gets a group of its own, so it can neither queue behind a publish
+# nor, as the newer pending entry, cancel a pending one. Publishes of the same
+# release ref stay serialized; the tag push and the release call name the same
+# release the same way.
 concurrency:
-  group: docker-publish-${{ github.ref }}
+  group: ${{ (inputs.push || github.event_name == 'push') && format('docker-publish-{0}', inputs.release_ref || github.ref_name) || format('docker-publish-dry-run-{0}', github.run_id) }}
   cancel-in-progress: false
 
 permissions:
@@ -47,10 +88,33 @@ jobs:
           ref: ${{ inputs.release_ref || github.ref }}
       - name: Read generated docker-tags.toml into a build matrix
         id: read
+        env:
+          STEMS: ${{ inputs.stems }}
         run: |
           # Convert the canonical TOML matrix to the JSON the Actions matrix
           # consumes. yq ships on ubuntu-latest runners.
           include="$(yq -o=json -I=0 '.tags' dev/ci/docker-tags.toml)"
+          if [ -n "${STEMS}" ]; then
+            want="$(jq -cn --arg stems "${STEMS}" \
+              '$stems | split(",") | map(gsub("^\\s+|\\s+$"; "") | select(. != ""))')"
+            # Fail on any unknown name, not only when all are unknown, so a
+            # typo can't drop a variant from a green run. The names are
+            # JSON-quoted and % escaped to keep user input on one line.
+            unknown="$(jq -r --argjson want "${want}" \
+              'map(.stem) as $known
+               | [$want[] | select(. as $w | $known | index($w) | not) | @json]
+               | join(", ") | gsub("%"; "%25")' <<< "${include}")"
+            if [ -n "${unknown}" ]; then
+              echo "::error title=Unknown stem::No docker-tags.toml stem named ${unknown}"
+              exit 1
+            fi
+            include="$(jq -c --argjson want "${want}" \
+              'map(select(.stem as $s | $want | index($s)))' <<< "${include}")"
+            if [ "${include}" = "[]" ]; then
+              echo "::error title=Unknown stem::stems lists no stem name"
+              exit 1
+            fi
+          fi
           echo "include=${include}" >> "$GITHUB_OUTPUT"
 
   publish:
@@ -58,7 +122,10 @@ jobs:
     if: github.repository == 'zeroclaw-labs/zeroclaw'
     needs: [matrix]
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # A multi-platform leg builds amd64 and arm64 one after the other (see the
+    # Buildx setup below), and the all-features Containerfile leg alone takes
+    # 41-64 min in docker-image-pr.yml with a warm cache.
+    timeout-minutes: 120
     permissions:
       contents: read
       packages: write
@@ -89,7 +156,40 @@ jobs:
       - name: Install cosign
         uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
 
+      # The arm64 cross-build of the dist feature set exhausts the hosted
+      # runner's memory in its final fat-LTO link: the same Dockerfile leg in
+      # docker-image-pr.yml fails with ResourceExhausted. Add the bounded swap
+      # the release workflow gives its Linux ARM64 build, and let BuildKit run
+      # one step at a time so the amd64 and arm64 links never overlap.
+      # The helper comes from this workflow's own revision, because a
+      # release_ref can predate it. It goes to RUNNER_TEMP, outside the build
+      # context, so the image source stays exactly release_ref.
+      - name: Fetch the build memory helper
+        id: memory_helper
+        if: contains(matrix.platforms, 'linux/arm64')
+        shell: bash
+        run: |
+          git fetch --no-tags --depth=1 origin "${GITHUB_WORKFLOW_SHA}"
+          git show "${GITHUB_WORKFLOW_SHA}:scripts/ci/dist_runner_memory.sh" \
+            > "${RUNNER_TEMP}/dist_runner_memory.sh"
+
+      - name: Prepare bounded build memory
+        id: dist_memory
+        if: contains(matrix.platforms, 'linux/arm64')
+        timeout-minutes: 5
+        shell: bash
+        run: bash "${RUNNER_TEMP}/dist_runner_memory.sh" prepare
+
+      - name: Set up Buildx (one step at a time)
+        if: contains(matrix.platforms, 'linux/arm64')
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 1
+
       - name: Set up Buildx
+        if: ${{ !contains(matrix.platforms, 'linux/arm64') }}
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Build and push pinned + floating tags
@@ -98,7 +198,7 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
-          push: true
+          push: ${{ inputs.push || github.event_name == 'push' }}
           # Platforms are resolved per tag from the generated matrix: Dockerfile
           # tags build amd64+arm64 (the Dockerfile cross-compiles to arm64 on the
           # native amd64 builder), Containerfile tags stay amd64-only.
@@ -106,11 +206,14 @@ jobs:
           build-args: |
             ZEROCLAW_CARGO_FLAGS=${{ matrix.flags }}
             ZEROCLAW_BUILD_ID=${{ steps.srcsha.outputs.sha }}
+          # The floating tag moves only on a tag push, the release call, or a
+          # dispatch with `floating` set; an empty line adds no tag.
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.pinned_tag }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ matrix.floating_tag }}
+            ${{ (inputs.floating || github.event_name == 'push') && format('{0}/{1}:{2}', env.REGISTRY, env.IMAGE, matrix.floating_tag) || '' }}
 
       - name: Sign container image (keyless / Rekor)
+        if: ${{ inputs.push || github.event_name == 'push' }}
         # Signs by digest so the signature is immutable regardless of tag mutations.
         # Consumers verify with:
         #   cosign verify --certificate-oidc-issuer https://token.actions.githubusercontent.com \
@@ -122,13 +225,23 @@ jobs:
           cosign sign --yes \
             "${{ env.REGISTRY }}/${{ env.IMAGE }}@${DIGEST}"
 
+      - name: Report and release owned build memory
+        if: always() && contains(matrix.platforms, 'linux/arm64') && steps.memory_helper.outcome == 'success'
+        timeout-minutes: 5
+        shell: bash
+        env:
+          ZC_DIST_SWAP_FILE: ${{ steps.dist_memory.outputs.swap_file }}
+          ZC_DIST_SWAP_IDENTITY: ${{ steps.dist_memory.outputs.swap_identity }}
+        run: bash "${RUNNER_TEMP}/dist_runner_memory.sh" cleanup
+
   # The nominated relay (zerorelay) ships as its OWN distroless image from
   # apps/zerorelay/Dockerfile (it holds no keys and is deployed independently of
   # any daemon). It is not part of the install-spec tag matrix above, so it gets a
   # dedicated job: a version-pinned tag on a release and a floating `latest`.
   publish-relay:
     name: Build & push zerorelay
-    if: github.repository == 'zeroclaw-labs/zeroclaw'
+    # A dispatch that names stems rebuilds only those image variants.
+    if: github.repository == 'zeroclaw-labs/zeroclaw' && !inputs.stems
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -186,14 +299,15 @@ jobs:
         with:
           context: .
           file: apps/zerorelay/Dockerfile
-          push: true
+          push: ${{ inputs.push || github.event_name == 'push' }}
           build-args: |
             ZEROCLAW_BUILD_ID=${{ steps.srcsha.outputs.sha }}
           tags: |
             ${{ steps.tags.outputs.pinned }}
-            ${{ steps.tags.outputs.floating }}
+            ${{ (inputs.floating || github.event_name == 'push') && steps.tags.outputs.floating || '' }}
 
       - name: Sign relay container image (keyless / Rekor)
+        if: ${{ inputs.push || github.event_name == 'push' }}
         env:
           DIGEST: ${{ steps.build-push.outputs.digest }}
         run: |
@@ -202,7 +316,7 @@ jobs:
 
   scan:
     name: Scan ${{ matrix.stem }}
-    if: github.repository == 'zeroclaw-labs/zeroclaw'
+    if: github.repository == 'zeroclaw-labs/zeroclaw' && (inputs.push || github.event_name == 'push')
     needs: [matrix, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -242,7 +356,7 @@ jobs:
 
   scan-relay:
     name: Scan zerorelay
-    if: github.repository == 'zeroclaw-labs/zeroclaw'
+    if: github.repository == 'zeroclaw-labs/zeroclaw' && (inputs.push || github.event_name == 'push')
     needs: [publish-relay]
     runs-on: ubuntu-latest
     timeout-minutes: 30
