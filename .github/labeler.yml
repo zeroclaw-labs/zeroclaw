@@ -283,13 +283,11 @@
 "health":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/health/**"
           - "crates/zeroclaw-runtime/src/health/**"
 
 "heartbeat":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/heartbeat/**"
           - "crates/zeroclaw-runtime/src/heartbeat/**"
 
 "integration":

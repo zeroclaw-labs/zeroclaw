@@ -946,8 +946,6 @@ mod agent;
 #[cfg(feature = "agent-runtime")]
 mod alias_cli;
 #[cfg(feature = "agent-runtime")]
-mod approval;
-#[cfg(feature = "agent-runtime")]
 mod auth;
 #[cfg(feature = "agent-runtime")]
 mod channels;
@@ -974,10 +972,6 @@ mod gateway;
 #[cfg(feature = "agent-runtime")]
 mod hardware;
 #[cfg(feature = "agent-runtime")]
-mod health;
-#[cfg(feature = "agent-runtime")]
-mod heartbeat;
-#[cfg(feature = "agent-runtime")]
 mod hooks;
 #[cfg(feature = "agent-runtime")]
 mod i18n;
@@ -990,13 +984,9 @@ mod memory;
 #[cfg(feature = "agent-runtime")]
 mod migration;
 #[cfg(feature = "agent-runtime")]
-mod multimodal;
-#[cfg(feature = "agent-runtime")]
 mod observability;
 #[cfg(feature = "agent-runtime")]
 mod peripherals;
-#[cfg(feature = "agent-runtime")]
-mod platform;
 #[cfg(feature = "plugins-wasm")]
 mod plugin_catalog;
 #[cfg(feature = "plugins-wasm")]
@@ -1026,8 +1016,6 @@ mod trust;
 mod tunnel;
 #[cfg(feature = "agent-runtime")]
 mod util;
-#[cfg(feature = "agent-runtime")]
-mod verifiable_intent;
 
 use config::Config;
 

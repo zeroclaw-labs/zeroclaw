@@ -6,6 +6,7 @@ pub mod cli;
 #[cfg(test)]
 mod battle_tests;
 
-// Re-declare traits as a file module so its #[cfg(test)] block compiles.
+// Keep `zeroclaw::memory::traits` importable as a module path, including its
+// `async_trait` re-export, which `zeroclaw_memory::traits` does not provide.
 #[path = "traits.rs"]
 pub mod traits;
