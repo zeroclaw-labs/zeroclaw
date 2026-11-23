@@ -1869,7 +1869,9 @@ async fn run_inner(
         // (peripherals -> built-in filter -> MCP scope+gate -> skills), identical
         // to the behavior this path hand-rolled. `caller_allowed` carries the
         // run() per-run allowlist; connect_peripherals is true (execution path).
-        let assembled = scoped::ScopedToolRegistry::assemble_prepared(
+        // The assembly future owns the full MCP/skill construction pipeline.
+        // Keep it out of this already-deep turn future's stack state.
+        let assembled = Box::pin(scoped::ScopedToolRegistry::assemble_prepared(
             scoped::ScopedAssembly {
                 config: &config,
                 agent_alias,
@@ -1896,7 +1898,7 @@ async fn run_inner(
             },
             construction,
             supplied_tail,
-        )
+        ))
         .await;
         // run injects one combined MCP prompt block: deferred tool-search listing +
         // pinned resources, composed by the harness.
