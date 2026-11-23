@@ -205,12 +205,31 @@ pub async fn dispatch_catalog_webdav_read<'a>(
     .await
 }
 
+fn check_stored_grant(
+    credential: &zeroclaw_config::schema::ScopedHttpCredential,
+    resource: &str,
+    root: &Url,
+    right: Right,
+) -> Result<(), ReadDispatchError> {
+    let rights = credential
+        .remote_files_grant(resource, root)
+        .ok_or(ReadDispatchError::Denied)?;
+    match rights.check(&[right]) {
+        Decision::Allowed => Ok(()),
+        Decision::Denied => Err(ReadDispatchError::Denied),
+        Decision::RequireHumanApproval => Err(ReadDispatchError::ApprovalRequired),
+    }
+}
+
 /// Resolve a WebDAV credential using the same encrypted records as the
 /// existing managed HTTP and browser consumers. The authorization closure
 /// must check a dedicated Remote Files grant, not an HTTP or browser grant.
 pub(crate) fn resolve_local_webdav_header(
     config_path: &std::path::Path,
     alias: &str,
+    resource: &str,
+    root: &Url,
+    right: Right,
     authorized: impl Fn() -> bool,
 ) -> Result<HeaderValue, ReadDispatchError> {
     use base64::Engine;
@@ -222,6 +241,7 @@ pub(crate) fn resolve_local_webdav_header(
     let (credential, revision) =
         crate::scoped_credentials::load_scoped_credential_snapshot(Some(config_path), alias)
             .map_err(|_| ReadDispatchError::CredentialUnavailable)?;
+    check_stored_grant(&credential, resource, root, right)?;
     if !matches!(credential.source, ScopedCredentialSource::Local) {
         return Err(ReadDispatchError::CredentialUnavailable);
     }
@@ -272,12 +292,47 @@ pub async fn dispatch_vault_webdav_read<'a>(
     availability: &'a BackendAvailability,
     network: &WebDavNetworkPolicy<'_>,
 ) -> Result<WebDavReadResult, ReadDispatchError> {
+    if !request.validate() {
+        return Err(ReadDispatchError::InvalidRequest);
+    }
     let (alias, right) = match request {
         RemoteFilesRequest::ListDirectory { resource, .. } => (resource, Right::ListDirectory),
         RemoteFilesRequest::GetFileInfo { resource, .. } => (resource, Right::GetFileInfo),
         _ => return Err(ReadDispatchError::UnsupportedOperation),
     };
     let canonical_alias = alias.to_ascii_lowercase();
+
+    let resource = catalog
+        .resource(&canonical_alias)
+        .ok_or(ReadDispatchError::Denied)?;
+    let rights = live_rights(&canonical_alias, resource.root(), resource.identity())
+        .ok_or(ReadDispatchError::Denied)?;
+    match rights.check(&[right]) {
+        Decision::Denied => return Err(ReadDispatchError::Denied),
+        Decision::RequireHumanApproval => return Err(ReadDispatchError::ApprovalRequired),
+        Decision::Allowed => {}
+    }
+    if !matches!(availability, BackendAvailability::Available(operations) if operations.contains(&right))
+    {
+        return Err(ReadDispatchError::UnsupportedOperation);
+    }
+    let RemoteIdentity::Vault {
+        credential_alias,
+        totp_alias: None,
+    } = resource.identity()
+    else {
+        return Err(ReadDispatchError::CredentialUnavailable);
+    };
+    let (credential, _) = crate::scoped_credentials::load_scoped_credential_snapshot(
+        Some(config_path),
+        credential_alias,
+    )
+    .map_err(|_| ReadDispatchError::CredentialUnavailable)?;
+    check_stored_grant(&credential, &canonical_alias, resource.root(), right)?;
+    if !credential.supports_local_webdav() {
+        return Err(ReadDispatchError::CredentialUnavailable);
+    }
+    drop(credential);
 
     dispatch_catalog_webdav_read(
         request,
@@ -293,10 +348,17 @@ pub async fn dispatch_vault_webdav_read<'a>(
             else {
                 return Err(ReadDispatchError::CredentialUnavailable);
             };
-            resolve_local_webdav_header(config_path, credential_alias, || {
-                live_rights(&canonical_alias, root, identity)
-                    .is_some_and(|rights| rights.check(&[right]) == Decision::Allowed)
-            })
+            resolve_local_webdav_header(
+                config_path,
+                credential_alias,
+                &canonical_alias,
+                root,
+                right,
+                || {
+                    live_rights(&canonical_alias, root, identity)
+                        .is_some_and(|rights| rights.check(&[right]) == Decision::Allowed)
+                },
+            )
         },
     )
     .await
@@ -317,6 +379,10 @@ mod tests {
         let record = serde_json::json!({
             "origin": "https://example.test",
             "http_allowed": false,
+            "remote_files_grants": [{
+                "resource": "REPORTS", "root": "https://files.test/dav/",
+                "rights": {"operations": ["list_directory"]}
+            }],
             "auth": {"kind": "user_password", "username": "fixture", "password": "demo"}
         });
         let value = SecretStore::new(fixture.path(), true)
@@ -328,19 +394,54 @@ mod tests {
             .insert("REPORT_LOGIN".into(), value);
         std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
 
-        let header = resolve_local_webdav_header(&path, "REPORT_LOGIN", || true).unwrap();
+        let root = Url::parse("https://files.test/dav/").unwrap();
+        let header = resolve_local_webdav_header(
+            &path,
+            "REPORT_LOGIN",
+            "reports",
+            &root,
+            Right::ListDirectory,
+            || true,
+        )
+        .unwrap();
         assert_eq!(header, "Basic Zml4dHVyZTpkZW1v");
         assert!(header.is_sensitive());
         assert!(matches!(
-            resolve_local_webdav_header(&path, "REPORT_LOGIN", || false),
+            resolve_local_webdav_header(
+                &path,
+                "REPORT_LOGIN",
+                "reports",
+                &root,
+                Right::ListDirectory,
+                || false
+            ),
+            Err(ReadDispatchError::Denied)
+        ));
+        let other_root = Url::parse("https://files.test/other/").unwrap();
+        assert!(matches!(
+            resolve_local_webdav_header(
+                &path,
+                "REPORT_LOGIN",
+                "reports",
+                &other_root,
+                Right::ListDirectory,
+                || true
+            ),
             Err(ReadDispatchError::Denied)
         ));
         let calls = Cell::new(0);
         assert!(matches!(
-            resolve_local_webdav_header(&path, "REPORT_LOGIN", || {
-                calls.set(calls.get() + 1);
-                calls.get() == 1
-            }),
+            resolve_local_webdav_header(
+                &path,
+                "REPORT_LOGIN",
+                "reports",
+                &root,
+                Right::ListDirectory,
+                || {
+                    calls.set(calls.get() + 1);
+                    calls.get() == 1
+                }
+            ),
             Err(ReadDispatchError::Denied)
         ));
     }

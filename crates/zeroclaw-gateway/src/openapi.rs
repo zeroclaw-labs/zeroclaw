@@ -235,7 +235,27 @@ pub fn build_spec() -> serde_json::Value {
         }
     });
 
-    let http_credentials_get = serde_json::json!({
+    let remote_files_grant_list = serde_json::json!({
+        "type": "array", "maxItems": 32,
+        "items": {
+            "type": "object",
+            "required": ["resource", "root", "rights"],
+            "additionalProperties": false,
+            "properties": {
+                "resource": {"type": "string"},
+                "root": {"type": "string", "format": "uri"},
+                "rights": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "operations": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+                        "require_human_approval": {"type": "boolean", "default": false}
+                    }
+                }
+            }
+        }
+    });
+    let mut http_credentials_get = serde_json::json!({
         "tags": ["config"],
         "summary": "List scoped credential metadata",
         "responses": {
@@ -277,7 +297,10 @@ pub fn build_spec() -> serde_json::Value {
             "503": {"description": "Credential catalog unavailable"}
         }
     });
-    let http_credentials_post = serde_json::json!({
+    http_credentials_get["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
+        ["credentials"]["items"]["properties"]["remote_files_grants"] =
+        remote_files_grant_list.clone();
+    let mut http_credentials_post = serde_json::json!({
         "tags": ["config"],
         "summary": "Create, replace or remove a scoped credential or update its grant",
         "description": "New aliases have no HTTP grant. Grant changes use a separate replace request with permissions.",
@@ -314,7 +337,7 @@ pub fn build_spec() -> serde_json::Value {
                     "permissions": {
                         "type": "object",
                         "properties": {
-                            "expected_revision": {"type": "string", "description": "Use the permission_revision from GET. Required when replacing http_origins, browser.origins, or destinations. A missing required or stale revision returns 409."},
+                            "expected_revision": {"type": "string", "description": "Use the permission_revision from GET. Required when replacing http_origins, browser.origins, destinations, or remote_files_grants. A missing required or stale revision returns 409."},
                             "http_allowed": {"type": "boolean"},
                             "http_origins": {"type": "array", "maxItems": 32, "items": {"type": "string"}},
                             "browser": {
@@ -339,6 +362,9 @@ pub fn build_spec() -> serde_json::Value {
             "412": {"description": "Initialized encryption required"}
         }
     });
+    http_credentials_post["requestBody"]["content"]["application/json"]["schema"]["properties"]["permissions"]
+        ["properties"]["remote_files_grants"] = remote_files_grant_list;
+
     let http_credentials = serde_json::json!({
         "get": http_credentials_get,
         "post": http_credentials_post

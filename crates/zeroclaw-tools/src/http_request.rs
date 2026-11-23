@@ -1477,6 +1477,7 @@ mod tests {
         tool.scoped_credential_fixture(
             dir.path(),
             ScopedHttpCredential {
+                remote_files_grants: Vec::new(),
                 origin: "https://example.com".into(),
                 http_allowed: true,
                 http_origins: None,
@@ -1522,6 +1523,7 @@ mod tests {
         tool.scoped_credential_fixture(
             dir.path(),
             ScopedHttpCredential {
+                remote_files_grants: Vec::new(),
                 origin: "https://example.com".into(),
                 http_allowed: false,
                 http_origins: None,

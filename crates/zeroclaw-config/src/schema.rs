@@ -9235,6 +9235,8 @@ pub struct ScopedHttpCredential {
     pub browser_origin: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub browser_origins: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_files_grants: Vec<crate::remote_files::RemoteFilesGrant>,
     #[serde(default)]
     pub source: ScopedCredentialSource,
     pub auth: ScopedHttpAuth,
@@ -9452,6 +9454,31 @@ mod scoped_credential_source_tests {
 }
 
 impl ScopedHttpCredential {
+    pub fn supports_local_webdav(&self) -> bool {
+        matches!(self.source, ScopedCredentialSource::Local)
+            && matches!(
+                self.auth,
+                ScopedHttpAuth::UserPassword { .. }
+                    | ScopedHttpAuth::ApiKey {
+                        header: ScopedApiKeyHeader::Bearer | ScopedApiKeyHeader::Token,
+                        ..
+                    }
+            )
+    }
+
+    pub fn remote_files_grant(
+        &self,
+        alias: &str,
+        root: &url::Url,
+    ) -> Option<&crate::remote_files::Rights> {
+        let mut matching = self
+            .remote_files_grants
+            .iter()
+            .filter(|grant| grant.matches(alias, root));
+        let first = matching.next()?;
+        matching.next().is_none().then_some(&first.rights)
+    }
+
     /// A browser grant is independent from HTTP Request and SSH permissions.
     pub fn accepts_browser_origin(&self, origin: &str) -> bool {
         if !Self::is_https_grant_origin(origin) {

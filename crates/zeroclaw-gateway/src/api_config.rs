@@ -1375,6 +1375,7 @@ struct HttpCredentialPermissions {
     http_allowed: Option<bool>,
     http_origins: Option<Vec<String>>,
     browser: Option<BrowserCredentialPermission>,
+    remote_files_grants: Option<Vec<zeroclaw_config::remote_files::RemoteFilesGrant>>,
     destinations: Option<Vec<zeroclaw_config::schema::SshCredentialDestination>>,
 }
 
@@ -1410,6 +1411,7 @@ fn permission_revision(record: &zeroclaw_config::schema::ScopedHttpCredential) -
         record.http_allowed,
         record.http_grants(),
         record.browser_grants().collect::<Vec<_>>(),
+        record.remote_files_grants,
         destinations,
     ]);
     format!("{:x}", Sha256::digest(public_state.to_string().as_bytes()))
@@ -1430,6 +1432,25 @@ fn permission_revision_changes_after_browser_grant_revocation() {
     assert_eq!(initial, permission_revision(&record));
     record.browser_origins.clear();
     assert_ne!(initial, permission_revision(&record));
+}
+
+#[cfg(test)]
+#[test]
+fn permission_revision_changes_after_remote_files_grant_revocation() {
+    let mut record: zeroclaw_config::schema::ScopedHttpCredential =
+        serde_json::from_value(serde_json::json!({
+            "origin": "https://files.test",
+            "remote_files_grants": [{
+                "resource": "REPORTS",
+                "root": "https://files.test/dav/",
+                "rights": {"operations": ["list_directory"]}
+            }],
+            "auth": {"kind": "user_password", "username": "fixture", "password": "demo"}
+        }))
+        .unwrap();
+    let prior = permission_revision(&record);
+    record.remote_files_grants.clear();
+    assert_ne!(prior, permission_revision(&record));
 }
 
 struct ScopedCredentialAudit {
@@ -1508,7 +1529,7 @@ pub async fn list_http_credentials(
                 rows.push((
                     name,
                     serde_json::json!({
-                        "name": name, "permission_revision": permission_revision(&record), "origin": record.origin, "kind": kind, "source": record.source, "destinations": destinations, "header": header, "http_allowed": http_allowed, "http_origins": record.http_grants(), "browser_origin": record.browser_origin, "browser_origins": record.browser_grants().collect::<Vec<_>>()
+                        "name": name, "permission_revision": permission_revision(&record), "origin": record.origin, "kind": kind, "source": record.source, "destinations": destinations, "header": header, "http_allowed": http_allowed, "http_origins": record.http_grants(), "browser_origin": record.browser_origin, "browser_origins": record.browser_grants().collect::<Vec<_>>(), "remote_files_grants": record.remote_files_grants
                     }),
                 ));
             }
@@ -1556,6 +1577,7 @@ pub async fn mutate_http_credential(
             {
                 return StatusCode::BAD_REQUEST.into_response();
             }
+            let webdav_catalog = config.remote_files.webdav_catalog();
             let credentials = &mut config.http_request.scoped_credentials;
             let present = credentials.contains_key(&mutation.name);
             if let Some(permissions) = mutation.permissions {
@@ -1578,7 +1600,8 @@ pub async fn mutate_http_credential(
                 }) else {
                     return StatusCode::SERVICE_UNAVAILABLE.into_response();
                 };
-                let replaces_list = permissions.http_origins.is_some()
+                let replaces_list = permissions.remote_files_grants.is_some()
+                    || permissions.http_origins.is_some()
                     || permissions.destinations.is_some()
                     || permissions
                         .browser
@@ -1596,8 +1619,26 @@ pub async fn mutate_http_credential(
                     "http_origin_count": permissions.http_origins.as_ref().map(Vec::len),
                     "browser_grant": permissions.browser.as_ref().map(|value| value.origin.is_some() || value.origins.as_ref().is_some_and(|origins| !origins.is_empty())),
                     "ssh_destination_count": permissions.destinations.as_ref().map(Vec::len),
+                    "remote_files_grant_count": permissions.remote_files_grants.as_ref().map(Vec::len),
                 });
-                if let Some(requested) = permissions.http_origins {
+                if let Some(requested) = permissions.remote_files_grants {
+                    let Ok(catalog) = &webdav_catalog else {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    };
+                    let mut seen = std::collections::BTreeSet::new();
+                    if permissions.http_origins.is_some() || permissions.browser.is_some()
+                        || permissions.http_allowed.is_some() || permissions.destinations.is_some()
+                        || requested.len() > 32
+                        || (!requested.is_empty() && !record.supports_local_webdav())
+                        || requested.iter().any(|grant| {
+                            !grant.belongs_to(catalog, &mutation.name)
+                                || !seen.insert(grant.resource.to_ascii_lowercase())
+                        })
+                    {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                    record.remote_files_grants = requested;
+                } else if let Some(requested) = permissions.http_origins {
                     if permissions.browser.is_some() || permissions.http_allowed.is_some()
                         || permissions.destinations.is_some()
                         || !matches!(&record.auth, ScopedHttpAuth::UserPassword { .. } | ScopedHttpAuth::ApiKey { .. })
@@ -1717,6 +1758,7 @@ pub async fn mutate_http_credential(
                 credential.http_origins = None;
                 credential.browser_origin = None;
                 credential.browser_origins.clear();
+                credential.remote_files_grants.clear();
                 if let Some(previous) = credentials.get(&mutation.name) {
                     let store = SecretStore::new(dir, true);
                     let decoded = if previous.starts_with("enc2:") {
@@ -1739,6 +1781,9 @@ pub async fn mutate_http_credential(
                     }
                     credential.browser_origin = previous.browser_origin;
                     credential.browser_origins = previous.browser_origins;
+                    if credential.supports_local_webdav() {
+                        credential.remote_files_grants = previous.remote_files_grants;
+                    }
                     if let (
                         ScopedHttpAuth::SshKey {
                             destinations: current,

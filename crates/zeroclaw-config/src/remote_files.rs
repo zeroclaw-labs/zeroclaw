@@ -499,6 +499,34 @@ fn valid_rename(from: &str, to: &str) -> bool {
         && parent(from) == parent(to)
 }
 
+/// Persistent consent for one WebDAV resource in a shared credential record.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteFilesGrant {
+    pub resource: String,
+    pub root: String,
+    pub rights: Rights,
+}
+
+impl RemoteFilesGrant {
+    pub fn matches(&self, resource: &str, root: &url::Url) -> bool {
+        self.resource.eq_ignore_ascii_case(resource) && self.root == root.as_str()
+    }
+
+    pub fn belongs_to(&self, catalog: &WebDavCatalog, credential_alias: &str) -> bool {
+        valid_resource_alias(&self.resource)
+            && !self.rights.operations.is_empty()
+            && catalog.resource(&self.resource).is_some_and(|resource| {
+                self.root == resource.root().as_str()
+                    && resource.identity()
+                        == RemoteIdentity::Vault {
+                            credential_alias,
+                            totp_alias: None,
+                        }
+            })
+    }
+}
+
 /// Operator-managed WebDAV endpoint. The credential field is a catalog alias,
 /// never a credential value. Rights are read from the live grant service.
 #[derive(Debug, Clone, Deserialize, Serialize)]
