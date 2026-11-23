@@ -18335,6 +18335,14 @@ pub struct MatrixConfig {
     #[tab(Behavior)]
     #[serde(default = "default_channel_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
+    /// When true (default), approval prompts that offer reactions also show
+    /// the typed `<TOKEN> approve` / `<TOKEN> deny` / `<TOKEN> always`
+    /// commands. When false, they show only the reaction instruction, and the
+    /// typed commands follow in a separate message if any reaction cannot be
+    /// added. Typed replies are accepted either way.
+    #[tab(Behavior)]
+    #[serde(default = "default_true")]
+    pub approval_typed_instructions: bool,
     /// When true (default), replies are sent as thread replies. Starts a new thread from the
     /// incoming message when none exists. When false, only continues existing threads.
     #[tab(Behavior)]
@@ -37357,6 +37365,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            approval_typed_instructions: true,
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
@@ -37397,6 +37406,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            approval_typed_instructions: true,
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
@@ -37480,6 +37490,17 @@ allowed_users = ["@u:matrix.org"]
 "#;
         let parsed: MatrixConfig = toml::from_str(toml).unwrap();
         assert!(parsed.reply_in_thread);
+    }
+
+    #[test]
+    async fn matrix_config_approval_typed_instructions_defaults_to_true() {
+        let toml = r#"
+homeserver = "https://matrix.org"
+access_token = "tok"
+"#;
+        let parsed: MatrixConfig = toml::from_str(toml).unwrap();
+        assert!(parsed.approval_typed_instructions);
+        assert!(MatrixConfig::default().approval_typed_instructions);
     }
 
     #[test]
@@ -37583,6 +37604,7 @@ allowed_users = ["@u:matrix.org"]
                     mention_only: false,
                     password: None,
                     approval_timeout_secs: 300,
+                    approval_typed_instructions: true,
                     reply_in_thread: true,
                     ack_reactions: Some(true),
                     excluded_tools: vec![],
@@ -47840,6 +47862,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            approval_typed_instructions: true,
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
@@ -47891,6 +47914,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            approval_typed_instructions: true,
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
@@ -47923,6 +47947,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            approval_typed_instructions: true,
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
@@ -47956,6 +47981,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            approval_typed_instructions: true,
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
@@ -48000,6 +48026,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 mention_only: false,
                 password: None,
                 approval_timeout_secs: 300,
+                approval_typed_instructions: true,
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
@@ -48043,6 +48070,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 mention_only: false,
                 password: None,
                 approval_timeout_secs: 300,
+                approval_typed_instructions: true,
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
@@ -48091,6 +48119,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 recovery_key: None,
                 password: None,
                 approval_timeout_secs: 300,
+                approval_typed_instructions: true,
                 reply_in_thread: true,
                 ack_reactions: Some(true),
                 excluded_tools: vec![],
@@ -48207,6 +48236,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            approval_typed_instructions: true,
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
@@ -48251,6 +48281,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            approval_typed_instructions: true,
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
@@ -48291,6 +48322,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            approval_typed_instructions: true,
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
@@ -48338,6 +48370,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mention_only: false,
             password: None,
             approval_timeout_secs: 300,
+            approval_typed_instructions: true,
             reply_in_thread: true,
             ack_reactions: Some(true),
             excluded_tools: vec![],
