@@ -3683,6 +3683,16 @@ impl OpenAiCompatibleModelProvider {
                 // request when `role=tool` arrives without `tool_call_id`. Read
                 // the id out of the leading JSON envelope, ignoring trailing
                 // bytes, and fall back to the most recent assistant tool call.
+                // Groq native tool calling also requires the tool `name` on
+                // every role-tool message. Resolve it with the same
+                // `tool_name_map` lookup the whole-envelope branch uses, keyed
+                // by the raw id recovered from the leading envelope.
+                let recovered_tool_name = if message.role == "tool" {
+                    recover_leading_tool_call_id(&message.content)
+                        .and_then(|raw_id| tool_name_map.get(raw_id.as_str()).cloned())
+                } else {
+                    None
+                };
                 let recovered_tool_call_id = (message.role == "tool").then(|| {
                     let recovered = recover_leading_tool_call_id(&message.content)
                         .map(|raw_id| {
@@ -3727,7 +3737,7 @@ impl OpenAiCompatibleModelProvider {
                     reasoning_content: None,
                     reasoning: None,
                     thinking_blocks: None,
-                    name: None,
+                    name: recovered_tool_name,
                 }
             })
             .collect();
@@ -11594,6 +11604,43 @@ mod tests {
             converted[2].tool_call_id.as_deref(),
             Some(call_id.as_str()),
             "a recovered result id must be resolved through the same map as the call"
+        );
+    }
+
+    /// A recovered tool result must also carry the paired assistant
+    /// tool-call's `name`: Groq requires it on every role-tool message, so
+    /// leaving it unset would keep replaying damaged envelopes failing there
+    /// even after the id is restored.
+    #[test]
+    fn convert_messages_for_native_recovers_tool_result_name_from_tool_name_map() {
+        let input = vec![
+            ChatMessage::user("run it"),
+            ChatMessage::assistant(
+                r#"{"content":null,"tool_calls":[{"id":"call_1","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(
+                "{\"tool_call_id\":\"call_1\",\"content\":\"out\",\"attachments\":[]}\n\ngo again",
+            ),
+        ];
+        let provider = make_model_provider("test", "https://example.com", None);
+        let converted = provider.convert_messages_for_native(&input, true);
+
+        let carrier_call_id = converted[1]
+            .tool_calls
+            .as_ref()
+            .expect("the assistant turn keeps its tool call")[0]
+            .id
+            .clone()
+            .expect("the assistant call carries an id");
+        assert_eq!(
+            converted[2].tool_call_id.as_deref(),
+            Some(carrier_call_id.as_str()),
+            "a recovered result id must be resolved through the same map as the call"
+        );
+        assert_eq!(
+            converted[2].name.as_deref(),
+            Some("shell"),
+            "a recovered result must carry the paired assistant tool-call's name"
         );
     }
 
