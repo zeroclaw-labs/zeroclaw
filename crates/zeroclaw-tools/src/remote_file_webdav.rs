@@ -4,8 +4,12 @@ use reqwest::header::{ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, HeaderValu
 use reqwest::{Client, Method, Response, StatusCode, Url};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroclaw_config::remote_files::is_relative_resource_path;
 
 #[derive(Debug, thiserror::Error)]
@@ -88,27 +92,43 @@ impl WebDavRead {
         Ok(written)
     }
 
-    /// Create a staging file chosen by the executor. No existing file is
-    /// overwritten. This buffered variant has a fixed upper bound and does
-    /// not publish the final destination or retry an uncertain write.
+    /// Stream a new staging object. The executor owns publication and cleanup.
+    /// Size is an optional source observation, not an allocation request.
     pub async fn upload_new_staging_file(
         &self,
         path: &str,
         authorization: Option<HeaderValue>,
-        bytes: Vec<u8>,
-        limit: usize,
+        source: impl AsyncRead + Unpin + Send + 'static,
+        size: Option<u64>,
+        limit: Option<u64>,
     ) -> Result<(), WebDavError> {
-        const MAX_BUFFERED_UPLOAD: usize = 8 * 1024 * 1024;
         let url = resource_url(&self.root, path)?;
-        if bytes.len() > limit.min(MAX_BUFFERED_UPLOAD) {
+        if let (Some(size), Some(limit)) = (size, limit)
+            && size > limit
+        {
             return Err(WebDavError::ByteLimit);
         }
-        let request = self.client.put(url).header(IF_NONE_MATCH, "*").body(bytes);
-        let response = with_authorization(request, authorization)
-            .send()
-            .await
-            .map_err(|_| WebDavError::Transport)?;
-        require_status(response, StatusCode::CREATED).map(|_| ())
+
+        let progress = Arc::new(UploadProgress::default());
+        let stream = upload_stream(source, size, limit, Arc::clone(&progress));
+        let request = self
+            .client
+            .put(url)
+            .header(IF_NONE_MATCH, "*")
+            .body(reqwest::Body::wrap_stream(stream));
+        let result = with_authorization(request, authorization).send().await;
+        if progress.limit_reached.load(Ordering::Acquire) {
+            return Err(WebDavError::ByteLimit);
+        }
+        let response = require_status(
+            result.map_err(|_| WebDavError::Transport)?,
+            StatusCode::CREATED,
+        )?;
+        drop(response);
+        if !progress.finished.load(Ordering::Acquire) {
+            return Err(WebDavError::Transport);
+        }
+        Ok(())
     }
 
     /// Create exactly one directory. Parent creation and authorization are
@@ -173,6 +193,7 @@ impl WebDavRead {
         let mut request = self
             .client
             .request(method, url)
+            .timeout(Duration::from_secs(60))
             .header(ACCEPT_ENCODING, "identity");
         if let Some(destination) = rename_destination {
             request = request
@@ -184,6 +205,54 @@ impl WebDavRead {
             .await
             .map_err(|_| WebDavError::Transport)
     }
+}
+
+#[derive(Default)]
+struct UploadProgress {
+    limit_reached: AtomicBool,
+    finished: AtomicBool,
+}
+
+fn upload_stream<R: AsyncRead + Unpin>(
+    source: R,
+    expected_size: Option<u64>,
+    limit: Option<u64>,
+    progress: Arc<UploadProgress>,
+) -> impl futures_util::Stream<Item = io::Result<Vec<u8>>> {
+    const CHUNK_SIZE: usize = 64 * 1024;
+    futures_util::stream::try_unfold((source, 0_u64), move |(mut source, sent)| {
+        let progress = Arc::clone(&progress);
+        async move {
+            let remaining = limit.map_or(u64::MAX, |limit| limit.saturating_sub(sent));
+            let capacity = remaining.saturating_add(1).min(CHUNK_SIZE as u64) as usize;
+            let mut buffer = vec![0; capacity];
+            let count = tokio::time::timeout(Duration::from_secs(30), source.read(&mut buffer))
+                .await
+                .map_err(|_| io::ErrorKind::TimedOut)??;
+            if count as u64 > remaining {
+                progress.limit_reached.store(true, Ordering::Release);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "remote_files_byte_limit",
+                ));
+            }
+            let total = sent
+                .checked_add(count as u64)
+                .ok_or(io::ErrorKind::InvalidData)?;
+            if expected_size.is_some_and(|size| total > size || (count == 0 && total != size)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "remote_files_source_size_changed",
+                ));
+            }
+            if count == 0 {
+                progress.finished.store(true, Ordering::Release);
+                return Ok(None);
+            }
+            buffer.truncate(count);
+            Ok(Some((buffer, (source, total))))
+        }
+    })
 }
 
 fn with_authorization(
@@ -216,7 +285,7 @@ fn build_client(
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(60));
+        .read_timeout(Duration::from_secs(30));
     if host.parse::<IpAddr>().is_err() {
         debug_assert!(addresses.iter().all(|address| address.port() == port));
         builder = builder.resolve_to_addrs(&host, addresses);
@@ -362,10 +431,10 @@ mod tests {
                 if method == "PUT" {
                     let request = request.to_ascii_lowercase();
                     assert!(request.contains("\r\nif-none-match: *\r\n"));
-                    assert!(request.contains("\r\ncontent-length: 4\r\n"));
-                    let mut body = [0; 4];
+                    assert!(request.contains("\r\ntransfer-encoding: chunked\r\n"));
+                    let mut body = [0; 14];
                     tls.read_exact(&mut body).await.unwrap();
-                    assert_eq!(&body, b"demo");
+                    assert_eq!(&body, b"4\r\ndemo\r\n0\r\n\r\n");
                 }
                 tls.write_all(response.as_bytes()).await.unwrap();
                 tls.shutdown().await.unwrap();
@@ -436,14 +505,21 @@ mod tests {
                     .upload_new_staging_file(
                         "docs/too-large.tmp",
                         authorization(),
-                        b"large".to_vec(),
-                        4
+                        &b"large"[..],
+                        Some(5),
+                        Some(4)
                     )
                     .await,
                 Err(WebDavError::ByteLimit)
             ));
             adapter
-                .upload_new_staging_file("docs/staging.tmp", authorization(), b"demo".to_vec(), 4)
+                .upload_new_staging_file(
+                    "docs/staging.tmp",
+                    authorization(),
+                    &b"demo"[..],
+                    None,
+                    None,
+                )
                 .await
                 .unwrap();
             assert!(matches!(
@@ -451,8 +527,9 @@ mod tests {
                     .upload_new_staging_file(
                         "docs/staging.tmp",
                         authorization(),
-                        b"demo".to_vec(),
-                        4
+                        &b"demo"[..],
+                        Some(4),
+                        Some(4)
                     )
                     .await,
                 Err(WebDavError::Status(StatusCode::PRECONDITION_FAILED))
@@ -461,6 +538,30 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn upload_reads_fixed_blocks_and_checks_optional_limit() {
+        use futures_util::{StreamExt, pin_mut};
+        let data = vec![7_u8; 256 * 1024];
+        let progress = Arc::new(UploadProgress::default());
+        let stream = upload_stream(data.as_slice(), None, None, Arc::clone(&progress));
+        pin_mut!(stream);
+        let mut count = 0;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            assert!(chunk.len() <= 64 * 1024);
+            count += chunk.len();
+        }
+        assert_eq!(count, data.len());
+        assert!(progress.finished.load(Ordering::Acquire));
+
+        let progress = Arc::new(UploadProgress::default());
+        let stream = upload_stream(&b"large"[..], None, Some(4), Arc::clone(&progress));
+        pin_mut!(stream);
+        assert!(stream.next().await.unwrap().is_err());
+        assert!(progress.limit_reached.load(Ordering::Acquire));
+        assert!(!progress.finished.load(Ordering::Acquire));
     }
 
     #[test]
