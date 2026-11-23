@@ -1219,12 +1219,14 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Finalization remains authoritative: adapters must discard speculative
     /// audio that does not match the approved final text. Draft cancellation
     /// must also cancel preparation. Status, reasoning and tool events never
-    /// enter this method. Default: no audio preparation.
+    /// enter this method. A forced voice turn bypasses the adapter's ordinary
+    /// chat preference. Default: no audio preparation.
     async fn prepare_voice_draft(
         &self,
         _recipient: &str,
         _message_id: &str,
         _text: &str,
+        _force_voice: bool,
     ) -> anyhow::Result<()> {
         Ok(())
     }

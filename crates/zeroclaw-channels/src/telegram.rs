@@ -8081,8 +8081,9 @@ impl Channel for TelegramChannel {
         recipient: &str,
         message_id: &str,
         text: &str,
+        force_voice: bool,
     ) -> anyhow::Result<()> {
-        if !self.is_voice_chat(recipient)
+        if (!force_voice && !self.is_voice_chat(recipient))
             || text.is_empty()
             || crate::util::voice_reply_skip_reason(text)
                 .is_some_and(|reason| reason != "too_short")

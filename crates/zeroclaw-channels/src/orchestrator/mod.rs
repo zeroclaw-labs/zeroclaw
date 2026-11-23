@@ -6488,7 +6488,7 @@ async fn run_draft_updater_with_leak_detection(
     turn_flush_narration: bool,
     outbound_hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
     outbound_channel: String,
-    turn_routing: Option<tools::TurnRoutingHandle>,
+    turn_routing: Option<(tools::TurnRoutingHandle, Option<bool>)>,
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::DraftEvent>,
 ) {
     use zeroclaw_runtime::agent::loop_::StreamDelta;
@@ -6593,20 +6593,32 @@ async fn run_draft_updater_with_leak_detection(
                 // Hooks can make non-idempotent decisions about a completed
                 // response. Do not disclose speculative text to a TTS provider
                 // before that decision; finalization will synthesize it instead.
-                let prepare_voice = turn_routing.as_ref().is_none_or(|routing| {
+                // No route uses the sender verdict; an explicit mirror route instead
+                // falls back to the adapter's chat preference, just as final delivery does.
+                use zeroclaw_config::multi_agent::OutputModality;
+                let voice_override = turn_routing.as_ref().and_then(|(routing, sender_voice)| {
                     let routes = routing.lock().unwrap_or_else(|error| error.into_inner());
-                    routes.last().is_none_or(|route| {
-                        route.modality != zeroclaw_config::multi_agent::OutputModality::Text
-                            && route.channel.as_deref().is_none_or(str::is_empty)
-                            && route
-                                .recipient
-                                .as_deref()
-                                .is_none_or(|recipient| recipient == reply_target)
-                    })
+                    match routes.last() {
+                        None => *sender_voice,
+                        Some(route)
+                            if route.channel.as_deref().is_some_and(|ch| !ch.is_empty())
+                                || route
+                                    .recipient
+                                    .as_deref()
+                                    .is_some_and(|r| r != reply_target) =>
+                        {
+                            Some(false)
+                        }
+                        Some(route) => match route.modality {
+                            OutputModality::Text => Some(false),
+                            OutputModality::Voice => Some(true),
+                            OutputModality::Mirror => None,
+                        },
+                    }
                 });
                 if outbound_hooks.is_none() {
                     let phase = &accumulated[speech_phase_start..];
-                    let mut speech = if prepare_voice {
+                    let mut speech = if voice_override != Some(false) {
                         redact_channel_outbound_leaks(
                             &sanitize_streaming_draft_text(phase, &known_tool_names),
                             &leak_detection,
@@ -6625,7 +6637,12 @@ async fn run_draft_updater_with_leak_detection(
                         speech.push_str(&phase[phase.trim_end().len()..]);
                     }
                     if let Err(error) = channel
-                        .prepare_voice_draft(&reply_target, &draft_id, &speech)
+                        .prepare_voice_draft(
+                            &reply_target,
+                            &draft_id,
+                            &speech,
+                            voice_override == Some(true),
+                        )
                         .await
                     {
                         ::zeroclaw_log::record!(
@@ -10279,6 +10296,7 @@ async fn process_channel_message_body(
     let turn_routing: tools::TurnRoutingHandle =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
+    let sender_voice = sender_prefers_voice(&ctx, &msg);
     let draft_updater = if use_draft_streaming {
         // Partial: accumulate text and edit a single draft message.
         if let (Some(rx), Some(draft_id_ref), Some(channel_ref)) = (
@@ -10326,7 +10344,7 @@ async fn process_channel_message_body(
                 let streamed_draft_text = Arc::clone(&streamed_draft_text);
                 let leak_detection = ctx.prompt_config.security.leak_detection.clone();
                 let content_format = outbound_content_format_for_channel(&msg.channel);
-                let draft_routing = Arc::clone(&turn_routing);
+                let draft_routing = (Arc::clone(&turn_routing), sender_voice);
                 Some(zeroclaw_spawn::spawn!(async move {
                     let _lease = draft_lease;
                     run_draft_updater_with_leak_detection(
@@ -11143,8 +11161,7 @@ async fn process_channel_message_body(
                 // verdict follows the message's `voice_origin`. `None` (no
                 // groups configured, or a non-Matrix channel) keeps that
                 // membership fallback intact.
-                let (suppress, force_voice) =
-                    voice_override_from_sender_verdict(sender_prefers_voice(&ctx, &msg));
+                let (suppress, force_voice) = voice_override_from_sender_verdict(sender_voice);
                 (
                     target_channel.clone(),
                     msg.reply_target.clone(),
@@ -25908,7 +25925,7 @@ api_key = "anthropic-key"
         /// Text handed to `update_draft`, in order, so a test can assert on
         /// what the transport actually received rather than on a sanitizer it
         /// called itself. Progress text lands in `progress_messages`.
-        voice_preparations: tokio::sync::Mutex<Vec<String>>,
+        voice_preparations: tokio::sync::Mutex<Vec<(String, bool)>>,
         draft_updates: tokio::sync::Mutex<Vec<String>>,
         /// When set, `update_draft`/`finalize_draft` faithfully model the real
         /// Discord/Matrix MultiMessage confirmed-prefix bookkeeping: each
@@ -26461,8 +26478,12 @@ api_key = "anthropic-key"
             _recipient: &str,
             _message_id: &str,
             text: &str,
+            force_voice: bool,
         ) -> anyhow::Result<()> {
-            self.voice_preparations.lock().await.push(text.to_owned());
+            self.voice_preparations
+                .lock()
+                .await
+                .push((text.to_owned(), force_voice));
             Ok(())
         }
 
@@ -55988,8 +56009,33 @@ Done."#;
     /// `update_draft_progress`. Unlike the per-frame tests above, this one
     /// fails if the sanitizer call is ever dropped from the wiring.
     #[cfg(feature = "channel-telegram")]
+    #[derive(Clone, Copy)]
+    enum SpeechReplyRoutingFixture {
+        ChatAddressVoicePeer,
+        SenderVoicePeer,
+        ExplicitVoiceRoute,
+    }
+
+    /// Production-boundary proof for Telegram streaming voice preparation.
+    /// The sender-voice case keeps the configured peer distinct from the group
+    /// reply address, while the explicit-route case starts from a text peer and
+    /// routes through the real `send_via` tool.
+    #[cfg(feature = "channel-telegram")]
     struct SpeechReplyModelProvider {
         continue_reply: Arc<tokio::sync::Notify>,
+        explicit_voice_route: bool,
+        stream_calls: AtomicUsize,
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    impl SpeechReplyModelProvider {
+        fn new(continue_reply: Arc<tokio::sync::Notify>, explicit_voice_route: bool) -> Self {
+            Self {
+                continue_reply,
+                explicit_voice_route,
+                stream_calls: AtomicUsize::new(0),
+            }
+        }
     }
 
     #[cfg(feature = "channel-telegram")]
@@ -56014,8 +56060,17 @@ Done."#;
         ) -> anyhow::Result<String> {
             anyhow::bail!("speech fixture requires the streaming path")
         }
+        fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+            zeroclaw_api::model_provider::ProviderCapabilities {
+                native_tool_calling: self.explicit_voice_route,
+                ..Default::default()
+            }
+        }
         fn supports_streaming(&self) -> bool {
             true
+        }
+        fn supports_streaming_tool_events(&self) -> bool {
+            self.explicit_voice_route
         }
         fn stream_chat(
             &self,
@@ -56028,7 +56083,24 @@ Done."#;
             zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamEvent>,
         > {
             use futures_util::StreamExt as _;
-            use zeroclaw_api::model_provider::{StreamChunk, StreamEvent};
+            use zeroclaw_api::model_provider::{StreamChunk, StreamEvent, ToolCall};
+            if self.explicit_voice_route
+                && self
+                    .stream_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    == 0
+            {
+                return futures_util::stream::iter([
+                    Ok(StreamEvent::ToolCall(ToolCall {
+                        id: "speech-route-1".to_string(),
+                        name: "send_via".to_string(),
+                        arguments: r#"{"modality":"voice"}"#.to_string(),
+                        extra_content: None,
+                    })),
+                    Ok(StreamEvent::Final),
+                ])
+                .boxed();
+            }
             let ready = self.continue_reply.clone();
             Box::pin(futures_util::stream::once(async { Ok(StreamEvent::TextDelta(StreamChunk::delta(
                 "The opening sentence is long enough to synthesize before generation has finished. ")))
@@ -56043,25 +56115,74 @@ Done."#;
     #[tokio::test]
     #[ignore = "requires ffmpeg with libopus; run explicitly for voice deployment"]
     async fn speech_stream_reaches_tts_before_final_and_uploads_one_telegram_voice_note() {
-        assert_speech_reply_through_routing(false, false).await;
+        assert_speech_reply_through_routing(
+            false,
+            false,
+            SpeechReplyRoutingFixture::ChatAddressVoicePeer,
+        )
+        .await;
     }
 
     #[cfg(feature = "channel-telegram")]
     #[tokio::test]
     #[ignore = "requires ffmpeg with libopus; run explicitly for voice deployment"]
     async fn speech_stream_recovers_after_speculative_tts_failure() {
-        assert_speech_reply_through_routing(true, false).await;
+        assert_speech_reply_through_routing(
+            true,
+            false,
+            SpeechReplyRoutingFixture::ChatAddressVoicePeer,
+        )
+        .await;
     }
 
     #[cfg(feature = "channel-telegram")]
     #[tokio::test]
     #[ignore = "requires ffmpeg with libopus; run explicitly for voice deployment"]
     async fn speech_final_reply_survives_preview_deletion_timeout() {
-        assert_speech_reply_through_routing(false, true).await;
+        assert_speech_reply_through_routing(
+            false,
+            true,
+            SpeechReplyRoutingFixture::ChatAddressVoicePeer,
+        )
+        .await;
+    }
+
+    /// Regression for #12276: Telegram peer groups name senders, while a group
+    /// reply is addressed to the chat. A sender configured for voice must still
+    /// start synthesis from the opening stream chunk before generation resumes.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    #[ignore = "requires ffmpeg with libopus; run explicitly for voice deployment"]
+    async fn speech_stream_group_sender_voice_peer_synthesizes_before_paused_generation() {
+        assert_speech_reply_through_routing(
+            false,
+            false,
+            SpeechReplyRoutingFixture::SenderVoicePeer,
+        )
+        .await;
+    }
+
+    /// Regression for #12276: an explicit voice route can target an otherwise
+    /// text peer, so preparation must honor that route before generation pauses.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    #[ignore = "requires ffmpeg with libopus; run explicitly for voice deployment"]
+    async fn speech_stream_explicit_voice_route_to_text_peer_synthesizes_before_paused_generation()
+    {
+        assert_speech_reply_through_routing(
+            false,
+            false,
+            SpeechReplyRoutingFixture::ExplicitVoiceRoute,
+        )
+        .await;
     }
 
     #[cfg(feature = "channel-telegram")]
-    async fn assert_speech_reply_through_routing(fail_first: bool, fail_cleanup: bool) {
+    async fn assert_speech_reply_through_routing(
+        fail_first: bool,
+        fail_cleanup: bool,
+        routing_fixture: SpeechReplyRoutingFixture,
+    ) {
         use wiremock::{
             Mock, MockServer, Request, ResponseTemplate,
             matchers::{method, path, path_regex},
@@ -56136,6 +56257,17 @@ Done."#;
                 },
             },
         );
+        let explicit_voice_route = matches!(
+            routing_fixture,
+            SpeechReplyRoutingFixture::ExplicitVoiceRoute
+        );
+        let voice_peers = match routing_fixture {
+            SpeechReplyRoutingFixture::ChatAddressVoicePeer => {
+                vec!["-1001234567890".to_string()]
+            }
+            SpeechReplyRoutingFixture::SenderVoicePeer => vec!["111".to_string()],
+            SpeechReplyRoutingFixture::ExplicitVoiceRoute => Vec::new(),
+        };
         let telegram = Arc::new(
             crate::telegram::TelegramChannel::new(
                 "fixture".into(),
@@ -56153,25 +56285,52 @@ Done."#;
                 0,
             )
             .with_fixture_timeout(Duration::from_secs(10))
-            .with_voice_peer_resolver(Arc::new(|| vec!["-1001234567890".into()]))
+            .with_voice_peer_resolver(Arc::new({
+                let voice_peers = voice_peers.clone();
+                move || voice_peers.clone()
+            }))
             .with_tts(&config),
         );
         let continue_reply = Arc::new(tokio::sync::Notify::new());
+        let tools: Vec<Box<dyn Tool>> = if explicit_voice_route {
+            vec![Box::new(tools::SendViaTool::new(
+                Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+                Arc::new(parking_lot::RwLock::new(
+                    HashMap::<String, Arc<dyn Channel>>::new(),
+                )),
+                Arc::new(HashMap::<String, zeroclaw_config::multi_agent::PeerGroupConfig>::new),
+            ))]
+        } else {
+            Vec::new()
+        };
         let mut ctx = telegram_voice_delivery_ctx(
             telegram.clone(),
-            Arc::new(SpeechReplyModelProvider {
-                continue_reply: continue_reply.clone(),
-            }),
-            Vec::new(),
+            Arc::new(SpeechReplyModelProvider::new(
+                continue_reply.clone(),
+                explicit_voice_route,
+            )),
+            tools,
         );
         assert!(
             config.hooks.enabled,
             "exercise the default enabled hook configuration"
         );
         Arc::get_mut(&mut ctx).unwrap().hooks = channel_hook_runner(&config);
+        let (sender, platform_sender_id) = match routing_fixture {
+            SpeechReplyRoutingFixture::ChatAddressVoicePeer
+            | SpeechReplyRoutingFixture::SenderVoicePeer => ("@alice", "111"),
+            SpeechReplyRoutingFixture::ExplicitVoiceRoute => ("@bob", "222"),
+        };
+        let message = telegram_group_message(sender, platform_sender_id);
+        if matches!(routing_fixture, SpeechReplyRoutingFixture::SenderVoicePeer) {
+            assert!(
+                voice_peers.iter().all(|peer| peer != &message.reply_target),
+                "the configured voice sender must remain distinct from the group reply address"
+            );
+        }
         let process = zeroclaw_spawn::spawn!(process_channel_message(
             ctx,
-            telegram_group_message("@alice", "111"),
+            message,
             CancellationToken::new(),
         ));
         let opener =
@@ -56182,6 +56341,10 @@ Done."#;
                 .unwrap()
                 .unwrap(),
             opener
+        );
+        assert!(
+            !process.is_finished(),
+            "generation must still be paused when synthesis receives the opening sentence"
         );
         assert!(
             voice_rx.try_recv().is_err(),
@@ -56252,17 +56415,18 @@ Done."#;
             false,
             None,
             "telegram".into(),
-            Some(draft_routing),
+            Some((draft_routing, None)),
             rx,
         ));
-        for (arguments, allowed) in [
-            (None, true),
-            (Some(serde_json::json!({"modality": "text"})), false),
+        for (arguments, allowed, forced) in [
+            (None, true, false),
+            (Some(serde_json::json!({"modality": "text"})), false, false),
             (
                 Some(serde_json::json!({"target": "other", "modality": "voice"})),
                 false,
+                false,
             ),
-            (Some(serde_json::json!({"modality": "voice"})), true),
+            (Some(serde_json::json!({"modality": "voice"})), true, true),
         ] {
             routing.lock().unwrap().clear();
             if let Some(arguments) = arguments {
@@ -56281,7 +56445,8 @@ Done."#;
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
                     let prepared = recording.voice_preparations.lock().await;
-                    if let Some(text) = prepared.get(before) {
+                    if let Some((text, force_voice)) = prepared.get(before) {
+                        assert_eq!(*force_voice, forced);
                         assert_eq!(!text.is_empty(), allowed);
                         break;
                     }
@@ -56338,10 +56503,10 @@ Done."#;
                 );
             } else {
                 assert_eq!(prepared.len(), 2);
-                assert_eq!(prepared[0], "First narration.");
-                assert!(prepared[1].contains("Safe final response."));
-                assert!(!prepared[1].contains("private"));
-                assert!(!prepared[1].contains("First narration"));
+                assert_eq!(prepared[0].0, "First narration.");
+                assert!(prepared[1].0.contains("Safe final response."));
+                assert!(!prepared[1].0.contains("private"));
+                assert!(!prepared[1].0.contains("First narration"));
             }
         }
     }

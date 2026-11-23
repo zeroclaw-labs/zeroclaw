@@ -440,9 +440,10 @@ impl Channel for PacedChannel {
         recipient: &str,
         message_id: &str,
         text: &str,
+        force_voice: bool,
     ) -> Result<()> {
         self.inner
-            .prepare_voice_draft(recipient, message_id, text)
+            .prepare_voice_draft(recipient, message_id, text, force_voice)
             .await
     }
 
