@@ -6520,7 +6520,20 @@ async fn run_draft_updater_with_leak_detection(
     // the raw accumulation) so a later turn cannot re-guard or rewrite an earlier
     // one.
     let mut owned_guarded = String::new();
+    let mut reasoning_reported = false;
     while let Some(event) = rx.recv().await {
+        use zeroclaw_api::channel::ProgressEvent;
+        let event = match event {
+            StreamDelta::Lifecycle(ProgressEvent::WaitingOnModel) => {
+                reasoning_reported = false;
+                StreamDelta::Lifecycle(ProgressEvent::WaitingOnModel)
+            }
+            StreamDelta::Reasoning(_) if outbound_channel == "simplex" && !reasoning_reported => {
+                reasoning_reported = true;
+                StreamDelta::Lifecycle(ProgressEvent::Reasoning)
+            }
+            other => other,
+        };
         match event {
             // A lifecycle event is a typed signal, not assistant text, so it
             // carries nothing to sanitize and passes straight through.
@@ -6590,17 +6603,6 @@ async fn run_draft_updater_with_leak_detection(
             // Matrix has its own disclosure policy in
             // `run_matrix_single_message_draft_updater`.
             event @ (StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. }) => {
-                if outbound_hooks.is_none() {
-                    deliver_live_voice_phase(
-                        &channel,
-                        &reply_target,
-                        &draft_id,
-                        speech_phase_start,
-                        "",
-                        true,
-                    )
-                    .await;
-                }
                 if outbound_hooks.is_none() {
                     deliver_live_voice_phase(
                         &channel,
@@ -10580,6 +10582,9 @@ async fn process_channel_message_body(
     let mut loop_knobs = LoopKnobs::default();
     if matrix_single_message_streaming {
         loop_knobs.draft_reasoning = matrix_stream_reasoning(ctx.as_ref(), &msg);
+    } else if msg.channel == "simplex" && draft_updater.is_some() {
+        // The channel consumes only the presence of a delta; its text never reaches the bridge.
+        loop_knobs.draft_reasoning = zeroclaw_config::schema::StreamReasoningMode::Full;
     }
     let turn_id = uuid::Uuid::new_v4().to_string();
     // This frame owns the turn id and the model-switch retry below, so it
@@ -26061,6 +26066,7 @@ api_key = "anthropic-key"
         sent_messages: tokio::sync::Mutex<Vec<String>>,
         draft_messages: tokio::sync::Mutex<Vec<String>>,
         progress_messages: tokio::sync::Mutex<Vec<String>>,
+        finished_voice_phases: std::sync::atomic::AtomicUsize,
         lifecycle_events: tokio::sync::Mutex<Vec<zeroclaw_runtime::agent::loop_::ProgressEvent>>,
         finalized_messages: tokio::sync::Mutex<Vec<String>>,
         cancelled_drafts: tokio::sync::Mutex<Vec<String>>,
@@ -26117,6 +26123,7 @@ api_key = "anthropic-key"
                 sent_messages: tokio::sync::Mutex::new(Vec::new()),
                 draft_messages: tokio::sync::Mutex::new(Vec::new()),
                 progress_messages: tokio::sync::Mutex::new(Vec::new()),
+                finished_voice_phases: 0.into(),
                 lifecycle_events: tokio::sync::Mutex::new(Vec::new()),
                 finalized_messages: tokio::sync::Mutex::new(Vec::new()),
                 cancelled_drafts: tokio::sync::Mutex::new(Vec::new()),
@@ -26798,6 +26805,21 @@ api_key = "anthropic-key"
             text: &str,
         ) -> anyhow::Result<()> {
             self.progress_messages.lock().await.push(text.to_string());
+            Ok(())
+        }
+
+        async fn stream_voice_draft(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            _phase: usize,
+            _text: &str,
+            finished: bool,
+        ) -> anyhow::Result<()> {
+            if finished {
+                self.finished_voice_phases
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             Ok(())
         }
 
@@ -57669,6 +57691,47 @@ Done."#;
     }
 
     #[tokio::test]
+    async fn simplex_reports_reasoning_once_per_request_without_forwarding_content() {
+        use zeroclaw_runtime::agent::loop_::{ProgressEvent, StreamDelta};
+        let channel = Arc::new(DraftRecordingChannel::new(false, false));
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        for event in [
+            StreamDelta::Lifecycle(ProgressEvent::WaitingOnModel),
+            StreamDelta::Reasoning("private".into()),
+            StreamDelta::Reasoning("more".into()),
+            StreamDelta::Lifecycle(ProgressEvent::WaitingOnModel),
+            StreamDelta::Reasoning("private".into()),
+        ] {
+            tx.send(event).await.unwrap();
+        }
+        drop(tx);
+        run_draft_updater(
+            channel.clone(),
+            "peer".into(),
+            "draft".into(),
+            no_tools(),
+            false,
+            None,
+            Default::default(),
+            "simplex".into(),
+            rx,
+        )
+        .await;
+        assert_eq!(
+            channel.lifecycle_events.lock().await.as_slice(),
+            [
+                ProgressEvent::WaitingOnModel,
+                ProgressEvent::Reasoning,
+                ProgressEvent::WaitingOnModel,
+                ProgressEvent::Reasoning,
+            ]
+        );
+        assert!(channel.progress_messages.lock().await.is_empty());
+        assert!(channel.draft_updates.lock().await.is_empty());
+        assert!(channel.voice_preparations.lock().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn draft_updater_uses_legacy_tool_status_and_ignores_reasoning() {
         use zeroclaw_runtime::agent::loop_::StreamDelta;
 
@@ -57710,6 +57773,12 @@ Done."#;
         )
         .await;
 
+        assert_eq!(
+            channel_impl
+                .finished_voice_phases
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
         assert_eq!(
             channel_impl.progress_messages.lock().await.as_slice(),
             ["⏳ shell: pwd".to_string(), "✅ shell (2s)".to_string()],
