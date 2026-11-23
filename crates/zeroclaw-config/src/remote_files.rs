@@ -274,9 +274,73 @@ pub fn plan_streamed_transfer<'a>(
     }
 }
 
+/// Operations verified with the shared contract on each supported host OS.
+/// A backend may only advertise operations present in all three sets.
+#[derive(Debug, Default)]
+pub struct PlatformOperations {
+    pub linux: BTreeSet<Right>,
+    pub windows: BTreeSet<Right>,
+    pub macos: BTreeSet<Right>,
+}
+
+impl PlatformOperations {
+    pub fn portable_operations(&self) -> BTreeSet<Right> {
+        self.linux
+            .intersection(&self.windows)
+            .copied()
+            .filter(|operation| self.macos.contains(operation))
+            .collect()
+    }
+}
+
+/// Installed host facilities are checked separately from parity. A missing
+/// prerequisite must not trigger a downgrade to another backend or transport.
+#[derive(Debug, Eq, PartialEq)]
+pub enum BackendAvailability {
+    MissingHostPrerequisite,
+    AwaitingPlatformParity,
+    Available(BTreeSet<Right>),
+}
+
+impl PlatformOperations {
+    pub fn availability(&self, host_ready: bool) -> BackendAvailability {
+        if !host_ready {
+            return BackendAvailability::MissingHostPrerequisite;
+        }
+        let operations = self.portable_operations();
+        if operations.is_empty() {
+            BackendAvailability::AwaitingPlatformParity
+        } else {
+            BackendAvailability::Available(operations)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn availability_requires_host_prerequisites_and_all_three_platforms() {
+        use Right::*;
+        let mut operations = PlatformOperations {
+            linux: BTreeSet::from([ListDirectory, GetFileInfo, DeleteFiles]),
+            windows: BTreeSet::from([ListDirectory, GetFileInfo]),
+            ..PlatformOperations::default()
+        };
+        assert_eq!(
+            operations.availability(true),
+            BackendAvailability::AwaitingPlatformParity
+        );
+        operations.macos = BTreeSet::from([ListDirectory, DeleteFiles]);
+        assert_eq!(
+            operations.availability(true),
+            BackendAvailability::Available(BTreeSet::from([ListDirectory]))
+        );
+        assert_eq!(
+            operations.availability(false),
+            BackendAvailability::MissingHostPrerequisite
+        );
+    }
 
     #[test]
     fn route_preserves_endpoint_bindings_even_when_aliases_match() {
