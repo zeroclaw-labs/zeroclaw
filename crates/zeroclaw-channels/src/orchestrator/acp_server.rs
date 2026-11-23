@@ -1440,6 +1440,14 @@ impl AcpServer {
                 data: None,
             });
         };
+        use zeroclaw_api::session_keys::MAX_SESSION_NAME_CHARS;
+        if name.chars().count() > MAX_SESSION_NAME_CHARS {
+            return Err(RpcError {
+                code: INVALID_PARAMS,
+                message: format!("session name exceeds {MAX_SESSION_NAME_CHARS} characters"),
+                data: None,
+            });
+        }
         let store = self.store.clone().ok_or_else(|| RpcError {
             code: INTERNAL_ERROR,
             message: "ACP session storage is unavailable".into(),
@@ -12115,6 +12123,15 @@ mod tests {
                 FORBIDDEN
             );
         }
+        let too_long = serde_json::json!({"sessionId": "live", "name": "å".repeat(201)});
+        assert_eq!(
+            server
+                .handle_session_rename(&too_long)
+                .await
+                .unwrap_err()
+                .code,
+            INVALID_PARAMS
+        );
         let params = serde_json::json!({"sessionId": "live", "name": " Project "});
         assert_eq!(
             server.handle_session_rename(&params).await.unwrap(),
