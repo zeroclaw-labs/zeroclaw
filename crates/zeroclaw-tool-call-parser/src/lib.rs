@@ -492,9 +492,14 @@ fn starts_with_tool_name_fence_lower(lower: &str) -> bool {
     matches!(rest.chars().next(), Some(c) if c.is_whitespace() && c != '\n' && c != '\r')
 }
 
+/// Opening delimiter for special-token text tool calls.
+pub const SPECIAL_TOKEN_TOOL_CALL_OPEN: &str = "<|tool_call_start|>";
+const SPECIAL_TOKEN_TOOL_CALL_CLOSE: &str = "<|tool_call_end|>";
+
 fn contains_tool_protocol_tag_marker(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    lower.contains("<tool_call")
+    lower.contains(SPECIAL_TOKEN_TOOL_CALL_OPEN)
+        || lower.contains("<tool_call")
         || lower.contains("<toolcall")
         || lower.contains("<tool-call")
         || lower.contains("<tools>")
@@ -827,6 +832,9 @@ pub fn malformed_tagged_invocation_mentions_known_tool(
         }
     }
     let lower = content.to_ascii_lowercase();
+    if special_token_invocation_mentions_known_tool(content, known_tool_names) {
+        return true;
+    }
     TOOL_CALL_OPEN_TAGS.iter().any(|tag| {
         let prefix = tag.trim_end_matches('>');
         lower.match_indices(prefix).any(|(start, _)| {
@@ -854,6 +862,9 @@ pub fn malformed_tagged_invocation_mentions_known_tool(
                         })
                 });
             }
+            if function_invocation_mentions_known_tool(body, known_tool_names) {
+                return true;
+            }
             if body.starts_with('[') {
                 return looks_like_malformed_json_tool_invocation(body, known_tool_names);
             }
@@ -875,6 +886,155 @@ pub fn malformed_tagged_invocation_mentions_known_tool(
             })
         })
     })
+}
+
+/// Recover an outer tool identity from a complete or incomplete envelope.
+pub fn special_token_invocation_mentions_known_tool(
+    text: &str,
+    known_tool_names: &HashSet<String>,
+) -> bool {
+    if !text.contains(SPECIAL_TOKEN_TOOL_CALL_OPEN) {
+        return false;
+    }
+    // Honor accepted calls before using enclosing carriers to classify damaged
+    // syntax. A fallback carrier cannot override the execution parser's result.
+    if parse_tool_calls(text)
+        .1
+        .iter()
+        .any(|call| known_tool_names.contains(&call.name.to_ascii_lowercase()))
+    {
+        return true;
+    }
+    let mut text = text;
+    while let Some((prefix, tail)) = text.split_once(SPECIAL_TOKEN_TOOL_CALL_OPEN) {
+        if let Some(end) = enclosing_carrier_end(text, prefix) {
+            text = &text[end..];
+            continue;
+        }
+        let mut quote = None;
+        let mut escaped = false;
+        let mut boundary = tail.len();
+        let mut closed = false;
+        for (index, ch) in tail.char_indices() {
+            if let Some(active) = quote {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == active {
+                    quote = None;
+                }
+            } else if matches!(ch, '\'' | '"') {
+                quote = Some(ch);
+            } else if ch == '<' {
+                if tail[index..].starts_with(SPECIAL_TOKEN_TOOL_CALL_CLOSE) {
+                    boundary = index;
+                    closed = true;
+                    break;
+                }
+                if tail[index..].starts_with(SPECIAL_TOKEN_TOOL_CALL_OPEN) {
+                    boundary = index;
+                    break;
+                }
+            }
+        }
+        let body = tail[..boundary].trim_start();
+        let body = body.strip_prefix('[').unwrap_or(body).trim_start();
+        if split_top_level_function_calls(body)
+            .into_iter()
+            .any(|call| function_invocation_mentions_known_tool(call, known_tool_names))
+        {
+            return true;
+        }
+        text = &tail[boundary
+            + if closed {
+                SPECIAL_TOKEN_TOOL_CALL_CLOSE.len()
+            } else {
+                0
+            }..];
+    }
+    false
+}
+
+// Find a parsed carrier that starts before the candidate and owns it.
+// An anchored value parse cannot attach a later sibling's end to this start.
+fn enclosing_carrier_end(text: &str, prefix: &str) -> Option<usize> {
+    let candidate = prefix.len();
+    let json_end = prefix.match_indices(['{', '[']).find_map(|(start, _)| {
+        let mut stream =
+            serde_json::Deserializer::from_str(&text[start..]).into_iter::<serde_json::Value>();
+        stream.next()?.ok()?;
+        let end = start + stream.byte_offset();
+        (end > candidate).then_some(end)
+    });
+    if json_end.is_some() {
+        return json_end;
+    }
+    // Attributed MiniMax invocations use the same matcher as the execution parser.
+    if let Some(end) = MINIMAX_INVOKE_RE
+        .captures_iter(text)
+        .take_while(|capture| capture.get(0).is_some_and(|span| span.start() < candidate))
+        .find_map(|capture| {
+            let body = capture.get(3)?;
+            let span = capture.get(0)?;
+            (body.start() <= candidate && candidate < body.end()).then_some(span.end())
+        })
+    {
+        return Some(end);
+    }
+    if let Some(span) = PERL_RE.find_iter(text).find(|span| {
+        span.start() < candidate
+            && candidate < span.end()
+            && !parse_perl_style_tool_calls(span.as_str()).is_empty()
+    }) {
+        return Some(span.end());
+    }
+
+    let line_start = prefix.rfind('\n').map_or(0, |newline| newline + 1);
+    let line_end = candidate
+        + text[candidate..]
+            .find('\n')
+            .unwrap_or(text.len() - candidate);
+    if prefix[line_start..]
+        .split_once('/')
+        .is_some_and(|(_, args)| args.contains('>'))
+        && !parse_glm_style_tool_calls(&text[line_start..line_end]).is_empty()
+    {
+        return Some(line_end);
+    }
+
+    TOOL_CALL_OPEN_TAGS
+        .iter()
+        .zip(TOOL_CALL_CLOSE_TAGS)
+        .filter_map(|(open, close)| {
+            let start = prefix.rfind(open)?;
+            let body_start = start + open.len();
+            let end = body_start + text[body_start..].find(close)? + close.len();
+            (end > candidate && !parse_tool_calls(&text[start..end]).1.is_empty()).then_some(end)
+        })
+        .max()
+}
+
+// Arguments can be incomplete. Identify the outer name from the syntax
+// that follows it, without looking for names inside the arguments.
+fn function_invocation_mentions_known_tool(body: &str, known: &HashSet<String>) -> bool {
+    let body = body.trim_start();
+    let end = body
+        .bytes()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        .count();
+    if end == 0 || !known.contains(&map_tool_name_alias(&body[..end]).to_ascii_lowercase()) {
+        return false;
+    }
+    let rest = body[end..].trim_start();
+    if rest.starts_with(['(', '>']) {
+        return true;
+    }
+    let attribute_len = rest
+        .bytes()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        .count();
+    attribute_len > 0 && rest[attribute_len..].trim_start().starts_with('=')
 }
 
 fn has_unterminated_sensitive_name_prefix(
@@ -1781,15 +1941,102 @@ fn parse_xml_attribute_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     calls
 }
 
+/// LFM / chat-template tool calls wrapped in special tokens, e.g.
+/// `<|tool_call_start|>[file_read(path='/tmp/x')]<|tool_call_end|>`.
+/// Models emit this when tools were described in the prompt rather than as a
+/// native `tools` array; the text-fallback path must still execute them.
+fn parse_special_token_tool_calls(response: &str) -> Vec<ParsedToolCall> {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?s)<\|tool_call_start\|>(.*?)<\|tool_call_end\|>")
+            .expect("SPECIAL_TOKEN_TOOL_CALL_RE regex must compile")
+    });
+    let mut calls = Vec::new();
+    for cap in RE.captures_iter(response) {
+        let mut inner = cap.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+        if inner.starts_with('[') && inner.ends_with(']') && inner.len() >= 2 {
+            inner = inner[1..inner.len() - 1].trim();
+        }
+        let segments = split_top_level_function_calls(inner);
+        let mut segment_calls = Vec::with_capacity(segments.len());
+        let mut ok = true;
+        for segment in segments {
+            match parse_glm_shortened_body(segment) {
+                Some(call) => segment_calls.push(call),
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        // Only consume the envelope when every listed call parsed cleanly.
+        if ok && !segment_calls.is_empty() {
+            calls.extend(segment_calls);
+        }
+    }
+    calls
+}
+
+/// Split `file_read(...), file_read(...)` on top-level commas outside quotes
+/// and parentheses so a list envelope yields every call, not only the first.
+fn split_top_level_function_calls(inner: &str) -> Vec<&str> {
+    let trimmed = inner.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, ch) in trimmed.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                let part = trimmed[start..i].trim();
+                if !part.is_empty() {
+                    parts.push(part);
+                }
+                start = i + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let tail = trimmed[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
+    if parts.is_empty() {
+        vec![trimmed]
+    } else {
+        parts
+    }
+}
+
+// Regex to find TOOL_CALL blocks - handle double closing braces }}
+// Matches both `TOOL_CALL { ... }} /TOOL_CALL` and `[TOOL_CALL]{ ... }}[/TOOL_CALL]`
+static PERL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)(?:\[TOOL_CALL\]|TOOL_CALL)\s*\{(.+?)\}\}\s*(?:\[/TOOL_CALL\]|/TOOL_CALL)")
+        .expect("PERL_RE regex must compile")
+});
+
 fn parse_perl_style_tool_calls(response: &str) -> Vec<ParsedToolCall> {
     let mut calls = Vec::new();
-
-    // Regex to find TOOL_CALL blocks - handle double closing braces }}
-    // Matches both `TOOL_CALL { ... }} /TOOL_CALL` and `[TOOL_CALL]{ ... }}[/TOOL_CALL]`
-    static PERL_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?s)(?:\[TOOL_CALL\]|TOOL_CALL)\s*\{(.+?)\}\}\s*(?:\[/TOOL_CALL\]|/TOOL_CALL)")
-            .expect("PERL_RE regex must compile")
-    });
 
     // Regex to find tool => "name" in the content
     static TOOL_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -2020,6 +2267,108 @@ fn default_param_for_tool(tool: &str) -> &'static str {
     }
 }
 
+/// Parse `key="value"` / `key='value'` / `key=bare` pairs from a function-style
+/// argument list. Escaped quotes inside strings are preserved. Bare values keep
+/// JSON types (`10` stays a number). Incomplete or malformed input returns
+/// `None` instead of a partial argument object.
+fn parse_function_style_kwargs(
+    value_part: &str,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut args = serde_json::Map::new();
+    let mut rest = value_part.trim();
+    while !rest.is_empty() {
+        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+        if rest.is_empty() {
+            break;
+        }
+        let Some(eq_pos) = rest.find('=') else {
+            // Trailing junk after a complete arg list is a parse failure.
+            return None;
+        };
+        let key = rest[..eq_pos]
+            .trim()
+            .trim_matches(|c: char| c == ',' || c == ';');
+        if key.is_empty() || !key.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return None;
+        }
+        let after_eq = rest[eq_pos + 1..].trim_start();
+        let (value, consumed) =
+            if let Some(quote) = after_eq.chars().next().filter(|c| *c == '"' || *c == '\'') {
+                let body = &after_eq[quote.len_utf8()..];
+                let mut out = String::new();
+                let mut chars = body.char_indices();
+                let mut end_byte = None;
+                while let Some((i, ch)) = chars.next() {
+                    if ch == '\\' {
+                        match chars.next() {
+                            Some((_, '"')) => out.push('"'),
+                            Some((_, '\'')) => out.push('\''),
+                            Some((_, '\\')) => out.push('\\'),
+                            Some((_, '/')) => out.push('/'),
+                            Some((_, 'b')) => out.push('\u{0008}'),
+                            Some((_, 'f')) => out.push('\u{000c}'),
+                            Some((_, 'n')) => out.push('\n'),
+                            Some((_, 'r')) => out.push('\r'),
+                            Some((_, 't')) => out.push('\t'),
+                            Some((_, other)) => {
+                                // Preserve unknown escapes instead of dropping the slash.
+                                out.push('\\');
+                                out.push(other);
+                            }
+                            None => return None, // dangling backslash
+                        }
+                        continue;
+                    }
+                    if ch == quote {
+                        end_byte = Some(i);
+                        break;
+                    }
+                    out.push(ch);
+                }
+                let Some(end) = end_byte else {
+                    return None; // unclosed quote
+                };
+                (
+                    serde_json::Value::String(out),
+                    quote.len_utf8() + end + quote.len_utf8(),
+                )
+            } else {
+                let end = after_eq.find(',').unwrap_or(after_eq.len());
+                let raw = after_eq[..end].trim();
+                if raw.is_empty() {
+                    return None;
+                }
+                let value = parse_bare_kwarg_value(raw);
+                (value, end)
+            };
+        args.insert(key.to_string(), value);
+        // Attribute style uses spaces between pairs (`channel="a" message="b"`);
+        // function style uses commas. Both are fine — the next loop iteration
+        // trims whitespace/commas, and non-key junk fails the key=/`=` checks.
+        rest = after_eq[consumed..].trim_start();
+    }
+    if args.is_empty() { None } else { Some(args) }
+}
+
+fn parse_bare_kwarg_value(raw: &str) -> serde_json::Value {
+    match raw {
+        "true" => serde_json::Value::Bool(true),
+        "false" => serde_json::Value::Bool(false),
+        "null" => serde_json::Value::Null,
+        _ => {
+            if let Ok(n) = raw.parse::<i64>() {
+                serde_json::Value::Number(n.into())
+            } else if let Ok(n) = raw.parse::<f64>() {
+                serde_json::Number::from_f64(n)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or_else(|| serde_json::Value::String(raw.to_string()))
+            } else {
+                serde_json::Value::String(raw.to_string())
+            }
+        }
+    }
+}
+
 fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
     let body = body.trim();
     if body.is_empty() {
@@ -2037,8 +2386,11 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
     // Check attribute-style FIRST: `tool_name key="value" />`
     // Must come before `>` check because `/>` contains `>` and would
     // misparse the tool name in the first branch.
-    let (tool_raw, value_part) = if let Some((tool, args)) = function_style {
-        (tool, args)
+    // `allow_kwargs`: parenthesized function style and attribute style may use
+    // key=value pairs. The raw `tool>value` form must stay on the single-value
+    // path even when the value contains `=` (e.g. `shell>FOO=bar env`).
+    let (tool_raw, value_part, allow_kwargs) = if let Some((tool, args)) = function_style {
+        (tool, args, true)
     } else if body.contains("=\"") {
         // Attribute-style: split at first whitespace to get tool name
         let split_pos = body.find(|c: char| c.is_whitespace()).unwrap_or(body.len());
@@ -2049,7 +2401,7 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
             .trim_end_matches('>')
             .trim_end_matches('/')
             .trim();
-        (tool, attrs)
+        (tool, attrs, true)
     } else {
         let gt_pos = body.find('>')?;
         // GLM shortened: `tool_name>value`
@@ -2057,7 +2409,7 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
         let value = body[gt_pos + 1..].trim();
         // Strip trailing self-close markers that some models emit
         let value = value.trim_end_matches("/>").trim_end_matches('/').trim();
-        (tool, value)
+        (tool, value, false)
     };
 
     // Validate tool name: must be alphanumeric + underscore only
@@ -2068,40 +2420,15 @@ fn parse_glm_shortened_body(body: &str) -> Option<ParsedToolCall> {
 
     let tool_name = map_tool_name_alias(tool_raw);
 
-    // Try attribute-style: `key="value" key2="value2"`
-    if value_part.contains("=\"") {
-        let mut args = serde_json::Map::new();
-        // Simple attribute parser: key="value" pairs
-        let mut rest = value_part;
-        while let Some(eq_pos) = rest.find("=\"") {
-            let key_start = rest[..eq_pos]
-                .rfind(|c: char| c.is_whitespace())
-                .map(|p| p + 1)
-                .unwrap_or(0);
-            let key = rest[key_start..eq_pos]
-                .trim()
-                .trim_matches(|c: char| c == ',' || c == ';');
-            let after_quote = &rest[eq_pos + 2..];
-            if let Some(end_quote) = after_quote.find('"') {
-                let value = &after_quote[..end_quote];
-                if !key.is_empty() {
-                    args.insert(
-                        key.to_string(),
-                        serde_json::Value::String(value.to_string()),
-                    );
-                }
-                rest = &after_quote[end_quote + 1..];
-            } else {
-                break;
-            }
-        }
-        if !args.is_empty() {
-            return Some(ParsedToolCall {
-                name: tool_name.to_string(),
-                arguments: serde_json::Value::Object(args),
-                tool_call_id: None,
-            });
-        }
+    // Try attribute / kwargs style: key="value", key='value', or key=bare.
+    // When the call looks like named arguments, a parse failure must reject the
+    // whole call — do not reinterpret broken kwargs as a raw single value.
+    if allow_kwargs && value_part.contains('=') {
+        return parse_function_style_kwargs(value_part).map(|args| ParsedToolCall {
+            name: tool_name.to_string(),
+            arguments: serde_json::Value::Object(args),
+            tool_call_id: None,
+        });
     }
 
     // Try YAML-style multi-line: each line is `key: value`
@@ -2769,6 +3096,23 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
                     }
                 }
             }
+            if !cleaned_text.trim().is_empty() {
+                text_parts.push(cleaned_text.trim().to_string());
+            }
+            remaining = "";
+        }
+    }
+
+    if calls.is_empty() {
+        let special_calls = parse_special_token_tool_calls(remaining);
+        if !special_calls.is_empty() {
+            // Drop every special-token envelope from the visible text.
+            static STRIP_RE: LazyLock<Regex> = LazyLock::new(|| {
+                Regex::new(r"(?s)<\|tool_call_start\|>.*?<\|tool_call_end\|>")
+                    .expect("SPECIAL_TOKEN_STRIP_RE regex must compile")
+            });
+            let cleaned_text = STRIP_RE.replace_all(remaining, "").to_string();
+            calls.extend(special_calls);
             if !cleaned_text.trim().is_empty() {
                 text_parts.push(cleaned_text.trim().to_string());
             }
@@ -4062,6 +4406,159 @@ I will now call the tool with this payload:
         assert_eq!(
             calls[0].arguments.get("message").unwrap().as_str().unwrap(),
             "Hello! How can I assist you today?"
+        );
+    }
+
+    #[test]
+    fn malformed_function_envelopes_recover_only_outer_identity() {
+        let known = HashSet::from(["fixture_tool".to_owned()]);
+        for opener in [SPECIAL_TOKEN_TOOL_CALL_OPEN, "<tool_call>"] {
+            let candidate = format!("{opener}fixture_tool(");
+            assert!(malformed_tagged_invocation_mentions_known_tool(
+                &candidate, &known
+            ));
+            let ordinary = format!("{opener}other_tool(fixture_tool");
+            assert!(!malformed_tagged_invocation_mentions_known_tool(
+                &ordinary, &known
+            ));
+        }
+        for body in [
+            "fixture_tool value=\"unfinished",
+            "fixture_tool>fixture value",
+        ] {
+            assert!(special_token_invocation_mentions_known_tool(
+                &format!("{SPECIAL_TOKEN_TOOL_CALL_OPEN}{body}"),
+                &known
+            ));
+        }
+        let quoted = format!(
+            "{SPECIAL_TOKEN_TOOL_CALL_OPEN}other_tool(value='{SPECIAL_TOKEN_TOOL_CALL_OPEN}fixture_tool('){SPECIAL_TOKEN_TOOL_CALL_CLOSE}"
+        );
+        assert!(!special_token_invocation_mentions_known_tool(
+            &quoted, &known
+        ));
+    }
+
+    #[test]
+    fn enclosing_carrier_recognizes_ordinary_literal_arguments() {
+        let marker = SPECIAL_TOKEN_TOOL_CALL_OPEN;
+        for carrier in [
+            format!(
+                r#"[TOOL_CALL]{{tool => "fixture", args => {{--value "text {marker}"}}}}[/TOOL_CALL]"#
+            ),
+            format!("fixture/value>text {marker}"),
+        ] {
+            let response = format!("{carrier}\n{marker}");
+            let (prefix, _) = response.split_once(marker).unwrap();
+            assert_eq!(
+                enclosing_carrier_end(&response, prefix),
+                Some(carrier.len())
+            );
+            let sibling_start = carrier.len() + 1;
+            assert_eq!(
+                enclosing_carrier_end(&response, &response[..sibling_start]),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_lfm_special_token_function_style() {
+        // Regression: LFM2.5 (and similar chat-template models) emit
+        // special-token envelopes with Python-like kwargs when the request did
+        // not carry a native tools array. Text fallback must still execute them.
+        let response = "<|tool_call_start|>[file_read(path='/root/zc-repro/data/estado.txt')]<|tool_call_end|>";
+        let (text, calls) = parse_tool_calls(response);
+        assert!(
+            text.is_empty(),
+            "envelope must not leak as visible text: {text:?}"
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(
+            calls[0].arguments.get("path").and_then(|v| v.as_str()),
+            Some("/root/zc-repro/data/estado.txt")
+        );
+    }
+
+    #[test]
+    fn parse_function_style_kwargs_accepts_single_and_double_quotes() {
+        let double = parse_function_style_kwargs(r#"path="/tmp/a", mode="r""#).expect("double");
+        assert_eq!(double.get("path").and_then(|v| v.as_str()), Some("/tmp/a"));
+        assert_eq!(double.get("mode").and_then(|v| v.as_str()), Some("r"));
+        let single = parse_function_style_kwargs("path='/tmp/b'").expect("single");
+        assert_eq!(single.get("path").and_then(|v| v.as_str()), Some("/tmp/b"));
+    }
+
+    #[test]
+    fn parse_function_style_kwargs_keeps_escaped_quotes_and_bare_types() {
+        let args = parse_function_style_kwargs(r"path='it\'s.txt', offset=10, limit=2")
+            .expect("escaped quote + bare ints");
+        assert_eq!(args.get("path").and_then(|v| v.as_str()), Some("it's.txt"));
+        assert_eq!(args.get("offset").and_then(|v| v.as_i64()), Some(10));
+        assert_eq!(args.get("limit").and_then(|v| v.as_i64()), Some(2));
+    }
+
+    #[test]
+    fn parse_function_style_kwargs_rejects_incomplete_quoted_value() {
+        assert!(
+            parse_function_style_kwargs(r"path='it\'s.txt").is_none(),
+            "unclosed / truncated quote must not yield a partial object"
+        );
+    }
+
+    #[test]
+    fn parse_function_style_kwargs_decodes_common_escapes_and_keeps_unknown() {
+        let args = parse_function_style_kwargs(r"path='a.txt', content='first\nsecond\qtail'")
+            .expect("escapes");
+        assert_eq!(
+            args.get("content").and_then(|v| v.as_str()),
+            Some("first\nsecond\\qtail")
+        );
+    }
+
+    #[test]
+    fn parse_glm_shortened_body_rejects_broken_named_arguments() {
+        assert!(
+            parse_glm_shortened_body("file_read(path='a', limit=)").is_none(),
+            "empty bare value after = must not fall through to raw path"
+        );
+        assert!(
+            parse_glm_shortened_body("shell(command='echo hi', broken)").is_none(),
+            "trailing junk must not become the shell command string"
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_preserves_shell_env_assignment_on_single_value_path() {
+        // Regression: value containing `=` must stay on the single-value path.
+        let response = "<tool_call>shell>FOO=bar env</tool_call>";
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty(), "{text:?}");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(
+            calls[0].arguments.get("command").and_then(|v| v.as_str()),
+            Some("FOO=bar env")
+        );
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_lfm_special_token_call_list() {
+        let response =
+            "<|tool_call_start|>[file_read(path='a'), file_read(path='b')]<|tool_call_end|>";
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty(), "{text:?}");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "file_read");
+        assert_eq!(
+            calls[0].arguments.get("path").and_then(|v| v.as_str()),
+            Some("a")
+        );
+        assert_eq!(calls[1].name, "file_read");
+        assert_eq!(
+            calls[1].arguments.get("path").and_then(|v| v.as_str()),
+            Some("b")
         );
     }
 

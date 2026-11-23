@@ -2,8 +2,9 @@
 
 use std::collections::HashSet;
 use zeroclaw_tool_call_parser::{
-    ParsedToolCall, ToolProtocolEnvelopeKind, classify_tool_protocol_envelope,
-    contains_tool_protocol_tag_call, looks_like_malformed_tool_protocol_envelope,
+    ParsedToolCall, SPECIAL_TOKEN_TOOL_CALL_OPEN, ToolProtocolEnvelopeKind,
+    classify_tool_protocol_envelope, contains_tool_protocol_tag_call,
+    looks_like_malformed_tool_protocol_envelope,
     looks_like_malformed_tool_protocol_envelope_for_known_tools, looks_like_tool_protocol_envelope,
     looks_like_tool_protocol_example, tool_protocol_envelope_mentions_known_tool,
 };
@@ -20,6 +21,7 @@ pub(crate) fn find_embedded_protocol_candidate_start(text: &str) -> Option<usize
     let mut earliest: Option<usize> = None;
 
     for pattern in [
+        SPECIAL_TOKEN_TOOL_CALL_OPEN,
         "<tool_call",
         "<toolcall",
         "<tool-call",
@@ -47,7 +49,8 @@ pub(crate) fn find_embedded_protocol_candidate_start(text: &str) -> Option<usize
 
 pub(crate) fn find_incomplete_protocol_candidate_start(text: &str) -> Option<usize> {
     let lower = text.to_ascii_lowercase();
-    let mut earliest: Option<usize> = None;
+    let partial = longest_suffix_matching_prefix(&lower, SPECIAL_TOKEN_TOOL_CALL_OPEN);
+    let mut earliest = (partial > 0).then_some(text.len() - partial);
 
     for pattern in [
         "<tool",
@@ -86,6 +89,7 @@ pub(crate) fn starts_suspicious_protocol_prefix(text: &str) -> bool {
     let lower = trimmed.to_ascii_lowercase();
     lower.starts_with('{')
         || lower.starts_with('[')
+        || lower.starts_with(SPECIAL_TOKEN_TOOL_CALL_OPEN)
         || lower.starts_with("<tool")
         || lower.starts_with("<invoke")
         || lower.starts_with("<function")

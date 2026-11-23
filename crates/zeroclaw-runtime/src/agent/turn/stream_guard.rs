@@ -39,6 +39,9 @@ pub(crate) struct StreamTextGuard {
     pending_candidate_start: Option<usize>,
     known_tool_names: HashSet<String>,
     has_active_tools: bool,
+    private_special_tokens_only: bool,
+    special_token_example: bool,
+    special_token_private: Option<bool>,
     // Text already delivered to the caller before the current candidate
     // was established: it is part of the message, not protocol, and it
     // positions any later candidate past the start of the message.
@@ -224,9 +227,35 @@ impl StreamTextGuard {
         }
     }
 
+    pub(crate) fn for_strict_text() -> Self {
+        Self {
+            private_special_tokens_only: true,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn push(&mut self, chunk: &str) -> Option<String> {
         if self.suppress_forwarding || chunk.is_empty() {
             return None;
+        }
+
+        if self.private_special_tokens_only {
+            let opener = zeroclaw_tool_call_parser::SPECIAL_TOKEN_TOOL_CALL_OPEN;
+            self.pending.push_str(chunk);
+            if let Some(start) = self.pending.find(opener) {
+                self.pending_candidate_start = Some(start);
+                return None;
+            }
+            let suffix = longest_suffix_matching_prefix(&self.pending, opener);
+            let release_end = self.pending.len() - suffix;
+            self.pending_candidate_start = None;
+            if release_end == 0 {
+                return None;
+            }
+            let retained = self.pending.split_off(release_end);
+            let release = std::mem::replace(&mut self.pending, retained);
+            self.note_released(&release);
+            return Some(release);
         }
 
         // A chunk carrying a full protocol pattern (a key, tag, or fence) is
@@ -259,6 +288,18 @@ impl StreamTextGuard {
             return None;
         }
         self.evaluate_pending(false)
+    }
+
+    pub(crate) fn finish_with_context(&mut self, response: &str) -> Option<String> {
+        if self
+            .pending
+            .contains(zeroclaw_tool_call_parser::SPECIAL_TOKEN_TOOL_CALL_OPEN)
+        {
+            self.special_token_example = looks_like_tool_protocol_example(response);
+            self.special_token_private =
+                Some(crate::agent::prompt::special_token_session_prompt_invocation(response));
+        }
+        self.finish()
     }
 
     pub(crate) fn finish(&mut self) -> Option<String> {
@@ -349,6 +390,29 @@ impl StreamTextGuard {
             && self.releases_as_quoted_result(candidate, body)
         {
             return self.release_through(candidate_start + end, finalizing);
+        }
+
+        if candidate.contains(zeroclaw_tool_call_parser::SPECIAL_TOKEN_TOOL_CALL_OPEN) {
+            if !finalizing {
+                return None;
+            }
+            if self.special_token_private.unwrap_or_else(|| {
+                crate::agent::prompt::special_token_session_prompt_invocation(candidate)
+            }) {
+                return self.suppress_protocol("tagged");
+            }
+            if self.private_special_tokens_only || self.special_token_example {
+                return Some(self.release_pending());
+            }
+            if !looks_like_tool_protocol_example(candidate)
+                && contains_tool_protocol_tag_call(candidate)
+            {
+                return self.suppress_protocol("tagged");
+            }
+        }
+
+        if self.private_special_tokens_only {
+            return Some(self.release_pending());
         }
 
         if !finalizing && starts_suspicious_tag_or_fence_prefix(candidate) {
@@ -1117,7 +1181,7 @@ mod stream_text_guard_tests {
                 forwarded.push_str(&text);
             }
         }
-        if let Some(tail) = guard.finish() {
+        if let Some(tail) = guard.finish_with_context(&chunks.concat()) {
             forwarded.push_str(&tail);
         }
         forwarded
@@ -1128,6 +1192,32 @@ mod stream_text_guard_tests {
     /// and whole-delta outcomes can be compared for equality.
     fn guard_outcome(chunks: &[&str]) -> (String, bool, Option<ProtocolSuppressionDiagnostic>) {
         guard_outcome_with(chunks, guard_with_tool)
+    }
+
+    #[test]
+    fn special_token_opening_delimiter_is_buffered_at_each_split() {
+        let opener = zeroclaw_tool_call_parser::SPECIAL_TOKEN_TOOL_CALL_OPEN;
+        for split in 0..=opener.len() {
+            let first = format!("Ordinary prose. {}", &opener[..split]);
+            let second = format!(
+                "{}fixture_tool(value='neutral')<|tool_call_end|>",
+                &opener[split..]
+            );
+            let (visible, suppressed, _) = guard_outcome(&[&first, &second]);
+            assert_eq!(visible, "Ordinary prose. ", "split {split}");
+            assert!(suppressed, "split {split}");
+        }
+        assert_eq!(guard_outcome(&["Value <", " 10"]).0, "Value < 10");
+        let literal = format!("The delimiter `{opener}` marks a tool call.");
+        assert_eq!(guard_outcome(&[&literal]).0, literal);
+    }
+
+    #[test]
+    fn strict_text_releases_a_disproved_delimiter_before_finish() {
+        let mut guard = StreamTextGuard::for_strict_text();
+        assert_eq!(guard.push("Value <").as_deref(), Some("Value "));
+        assert_eq!(guard.push(" 10").as_deref(), Some("< 10"));
+        assert!(!guard.suppressed_protocol);
     }
 
     /// The same scenario through a differently constructed guard, so

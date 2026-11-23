@@ -76,20 +76,17 @@ pub(crate) fn resolve_display_text(
     has_tool_calls: bool,
     has_native_tool_calls: bool,
 ) -> String {
-    if has_tool_calls {
-        if !parsed_text.is_empty() {
-            return parsed_text.to_string();
-        }
-        if has_native_tool_calls {
-            return response_text.to_string();
-        }
-        return String::new();
-    }
-
-    if parsed_text.is_empty() {
-        response_text.to_string()
+    let narration = if !parsed_text.is_empty() {
+        parsed_text
+    } else if !has_tool_calls || has_native_tool_calls {
+        response_text
     } else {
-        parsed_text.to_string()
+        ""
+    };
+    if crate::agent::prompt::special_token_session_prompt_invocation(narration) {
+        redact_session_prompt_text_protocol_for_export(narration).into_owned()
+    } else {
+        narration.to_string()
     }
 }
 
@@ -252,7 +249,11 @@ pub(crate) async fn interpret_chat_response(
         }
     }
 
-    let parse_issue = if ctx.strict_tool_parsing {
+    let parse_issue = if calls.is_empty()
+        && crate::agent::prompt::special_token_session_prompt_invocation(&response_text)
+    {
+        Some("response contained an incomplete private tool invocation".to_string())
+    } else if ctx.strict_tool_parsing {
         None
     } else if specs.tool_specs.is_empty() {
         // Knob-gated (embedders return model text verbatim); a live stream
