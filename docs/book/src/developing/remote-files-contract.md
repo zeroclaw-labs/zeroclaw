@@ -47,4 +47,8 @@ Before a stat, canonicalization, DNS request or any network I/O, authorize both 
 3. Add WebDAV, FTPS and platform-native SMB options. Report unsupported operations or transports explicitly. Validate Linux, Windows and macOS capabilities separately.
 4. Exercise task cleanup, same-resource rename, streamed cross-resource moves, rotation, stale approvals, and both endpoint grants. Include zero-I/O regressions for denied destinations, link escapes and unapproved UNC paths.
 
-This document defines the proposed contract. It does not enable a runtime capability.
+The draft Rust policy evaluates a resolved pair of resource grants and rejects ambiguous lexical paths without I/O. Runtime registration, live grant resolution, backend containment and the WebUI are separate implementation steps. The draft does not enable remote access.
+
+## Transfer destinations and identities
+
+For a remote source, the destination is one of three kinds. A path on the same registered remote resource uses the source connection and credential, with independent rights checks on both paths. The ZeroClaw workspace uses the service's operating-system identity; files created there belong to the service account and remain subject to workspace policy. A different remote server requires its own destination grant and separately authorized credential reference (or an explicitly configured destination OS identity for a host-managed mount). Never reuse or forward a source credential to another server. Any different registered resource on the same server requires its own scope check and may reuse a connection only when both grants resolve to the same peer, account and credential binding. Uploading from the workspace uses the destination's credential or configured identity. The tool takes aliases and relative paths, never raw credentials from the model.
