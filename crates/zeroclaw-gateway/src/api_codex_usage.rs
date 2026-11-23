@@ -162,7 +162,11 @@ mod tests {
         let token = String::from("synthetic-operator");
         let operator_hash = PairingGuard::token_hash(&token);
         let scoped_hash = PairingGuard::token_hash("synthetic-scoped-bearer");
-        let paired = PairingGuard::new(true, &[token.clone()], PairingCodePolicy::default());
+        let paired = PairingGuard::new(
+            true,
+            std::slice::from_ref(&token),
+            PairingCodePolicy::default(),
+        );
         let open = PairingGuard::new(false, &[token], PairingCodePolicy::default());
         assert!(operator(&paired, Some(&operator_hash), false));
         paired.revoke_token_hash(&operator_hash);

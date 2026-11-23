@@ -602,6 +602,13 @@ struct SocketCaller {
     codex_usage_lookup: Option<Arc<dyn usage::CodexUsageLookup>>,
 }
 
+#[derive(Clone, Copy)]
+struct InstalledUsageRoute<'a> {
+    route: Option<(&'a zeroclaw_config::schema::Config, &'a str)>,
+    revision: zeroclaw_config::live::ConfigRevision,
+    generation: u64,
+}
+
 /// A check on a cold socket uses the configured primary; a warm socket must
 /// use its actual Agent and may not fall back to the configured default.
 #[allow(clippy::too_many_arguments)]
@@ -614,11 +621,7 @@ async fn send_codex_usage(
     auth_subject: Option<&str>,
     agent_alias: &str,
     id: u64,
-    installed: Option<(
-        Option<(&zeroclaw_config::schema::Config, &str)>,
-        zeroclaw_config::live::ConfigRevision,
-        u64,
-    )>,
+    installed: Option<InstalledUsageRoute<'_>>,
     lookup: &dyn usage::CodexUsageLookup,
 ) -> bool {
     if let Err(code) = crate::dashboard_session::session_admits_now(session, state).await {
@@ -636,11 +639,11 @@ async fn send_codex_usage(
             .is_none()
             .then(|| state.config.snapshot_with_revision());
         let revision = installed
-            .map(|(_, revision, _)| revision)
+            .map(|route| route.revision)
             .or_else(|| cold_config.as_ref().map(|(_, revision)| *revision));
         let generation = installed.map_or_else(
             || state.agent_lifecycle.alias_generation(agent_alias),
-            |(_, _, generation)| generation,
+            |route| route.generation,
         );
         let route_is_current = || {
             if state.agent_lifecycle.alias_generation(agent_alias) != generation {
@@ -656,8 +659,8 @@ async fn send_codex_usage(
             if !route_is_current() {
                 return None;
             }
-            if let Some((route, _, _)) = installed {
-                return route;
+            if let Some(installed) = installed {
+                return installed.route;
             }
             let (config, _) = cold_config.as_ref()?;
             zeroclaw_runtime::agent::Agent::configured_fixed_primary_route(config, agent_alias)
@@ -1255,7 +1258,11 @@ async fn handle_socket(
                         auth_subject.as_deref(),
                         &agent_alias,
                         id,
-                        Some((agent.fixed_primary_route(), route_revision, turn_generation)),
+                        Some(InstalledUsageRoute {
+                            route: agent.fixed_primary_route(),
+                            revision: route_revision,
+                            generation: turn_generation,
+                        }),
                         codex_usage_lookup,
                     ).await {
                         break;
@@ -4318,15 +4325,12 @@ data: {\"type\":\"message_stop\"}\n\n",
                 serde_json::from_str::<serde_json::Value>(frame).unwrap()["type"] != "codex_usage"
             }));
 
-            use tokio_tungstenite::tungstenite::{Error, client::IntoClientRequest as _};
+            use tokio_tungstenite::tungstenite::Error;
             let bearer_request = |bearer: &str| {
-                // This URL connects only to the test's loopback listener.
-                let mut req = format!(
-                    "ws://{}/ws/chat?agent=web&session_id=codex-usage-paired",
-                    fixture.gateway_addr
-                ) // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
-                .into_client_request()
-                .unwrap();
+                let mut req = crate::dashboard_session::test_support::loopback_ws_request(
+                    fixture.gateway_addr,
+                    "/ws/chat?agent=web&session_id=codex-usage-paired",
+                );
                 req.headers_mut().insert(
                     header::AUTHORIZATION,
                     format!("Bearer {bearer}").parse().unwrap(),
