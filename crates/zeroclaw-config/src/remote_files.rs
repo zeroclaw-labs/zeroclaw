@@ -499,9 +499,134 @@ fn valid_rename(from: &str, to: &str) -> bool {
         && parent(from) == parent(to)
 }
 
+/// Operator-managed WebDAV endpoint. The credential field is a catalog alias,
+/// never a credential value. Rights are read from the live grant service.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebDavResourceConfig {
+    pub alias: String,
+    pub root: String,
+    pub credential_alias: String,
+}
+
+#[derive(Debug, Eq, PartialEq, thiserror::Error)]
+pub enum WebDavCatalogError {
+    #[error("remote_files_invalid_resource_alias")]
+    InvalidResourceAlias,
+    #[error("remote_files_invalid_credential_alias")]
+    InvalidCredentialAlias,
+    #[error("remote_files_invalid_webdav_root")]
+    InvalidRoot,
+    #[error("remote_files_duplicate_resource_alias")]
+    DuplicateAlias,
+}
+
+/// Catalog compiled from operator configuration. It owns endpoint metadata,
+/// while permission and secret state stay with their existing owners.
+#[derive(Debug, Default)]
+pub struct WebDavCatalog {
+    resources: std::collections::BTreeMap<String, WebDavResource>,
+}
+
+#[derive(Debug)]
+pub struct WebDavResource {
+    root: url::Url,
+    credential_alias: String,
+}
+
+impl WebDavResource {
+    pub fn root(&self) -> &url::Url {
+        &self.root
+    }
+
+    pub fn identity(&self) -> RemoteIdentity<'_> {
+        RemoteIdentity::Vault {
+            credential_alias: &self.credential_alias,
+            totp_alias: None,
+        }
+    }
+}
+
+impl WebDavCatalog {
+    pub fn from_resources(
+        resources: Vec<WebDavResourceConfig>,
+    ) -> Result<Self, WebDavCatalogError> {
+        let mut catalog = Self::default();
+        for resource in resources {
+            if !valid_resource_alias(&resource.alias) {
+                return Err(WebDavCatalogError::InvalidResourceAlias);
+            }
+            if !valid_resource_alias(&resource.credential_alias) {
+                return Err(WebDavCatalogError::InvalidCredentialAlias);
+            }
+            let root =
+                url::Url::parse(&resource.root).map_err(|_| WebDavCatalogError::InvalidRoot)?;
+            if !valid_webdav_root(&root) {
+                return Err(WebDavCatalogError::InvalidRoot);
+            }
+            let key = resource.alias.to_ascii_lowercase();
+            let entry = WebDavResource {
+                root,
+                credential_alias: resource.credential_alias,
+            };
+            if catalog.resources.insert(key, entry).is_some() {
+                return Err(WebDavCatalogError::DuplicateAlias);
+            }
+        }
+        Ok(catalog)
+    }
+
+    pub fn resource(&self, alias: &str) -> Option<&WebDavResource> {
+        self.resources.get(&alias.to_ascii_lowercase())
+    }
+}
+
+pub fn valid_webdav_root(root: &url::Url) -> bool {
+    root.scheme() == "https"
+        && root.host_str().is_some()
+        && root.username().is_empty()
+        && root.password().is_none()
+        && root.query().is_none()
+        && root.fragment().is_none()
+        && root.path().ends_with('/')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webdav_catalog_keeps_destinations_separate_from_credential_aliases() {
+        let make = |alias: &str, root: &str| WebDavResourceConfig {
+            alias: alias.into(),
+            root: root.into(),
+            credential_alias: "SHARED_LOGIN".into(),
+        };
+        let catalog = WebDavCatalog::from_resources(vec![
+            make("ORIGIN", "https://first.test/dav/"),
+            make("TARGET", "https://second.test/dav/"),
+        ])
+        .unwrap();
+        let origin = catalog.resource("origin").unwrap();
+        let target = catalog.resource("TARGET").unwrap();
+        assert_ne!(origin.root(), target.root());
+        assert_eq!(origin.identity(), target.identity());
+        assert!(matches!(
+            WebDavCatalog::from_resources(vec![
+                make("ORIGIN", "https://first.test/dav/"),
+                make("origin", "https://second.test/dav/")
+            ]),
+            Err(WebDavCatalogError::DuplicateAlias)
+        ));
+        assert!(matches!(
+            WebDavCatalog::from_resources(vec![make(
+                "ORIGIN",
+                "https://fixture:secret@first.test/dav/"
+            )]),
+            Err(WebDavCatalogError::InvalidRoot)
+        ));
+    }
+
     #[test]
     fn model_arguments_accept_aliases_and_reject_connection_parameters() {
         let request = serde_json::json!({

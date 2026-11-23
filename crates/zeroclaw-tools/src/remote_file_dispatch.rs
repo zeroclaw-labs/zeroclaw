@@ -7,7 +7,7 @@ use crate::remote_file_webdav::{
 use reqwest::{Url, header::HeaderValue};
 use std::net::SocketAddr;
 use zeroclaw_config::remote_files::{
-    BackendAvailability, Decision, RemoteFilesRequest, RemoteIdentity, Right, Rights,
+    BackendAvailability, Decision, RemoteFilesRequest, RemoteIdentity, Right, Rights, WebDavCatalog,
 };
 
 pub struct WebDavReadGrant<'a> {
@@ -110,10 +110,71 @@ pub async fn dispatch_webdav_read<'a>(
     }
 }
 
+/// Use operator-configured endpoint metadata with the runtime's current
+/// resource rights. The caller must key its live grants by canonical alias.
+pub async fn dispatch_catalog_webdav_read<'a>(
+    request: &RemoteFilesRequest,
+    catalog: &'a WebDavCatalog,
+    live_rights: impl FnOnce(&str) -> Option<&'a Rights>,
+    availability: &'a BackendAvailability,
+    verify_egress: impl AsyncFnOnce(&Url) -> Result<Vec<SocketAddr>, ReadDispatchError>,
+    resolve_authorization: impl AsyncFnOnce(
+        &Url,
+        RemoteIdentity<'a>,
+    ) -> Result<HeaderValue, ReadDispatchError>,
+) -> Result<WebDavReadResult, ReadDispatchError> {
+    dispatch_webdav_read(
+        request,
+        |alias| {
+            let resource = catalog.resource(alias)?;
+            let rights = live_rights(&alias.to_ascii_lowercase())?;
+            Some(WebDavReadGrant {
+                root: resource.root(),
+                identity: resource.identity(),
+                rights,
+                availability,
+            })
+        },
+        verify_egress,
+        resolve_authorization,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[tokio::test]
+    async fn catalog_lookup_accepts_case_variants_but_requires_a_live_grant() {
+        use zeroclaw_config::remote_files::WebDavResourceConfig;
+
+        let catalog = WebDavCatalog::from_resources(vec![WebDavResourceConfig {
+            alias: "REPORTS".into(),
+            root: "https://files.test/dav/".into(),
+            credential_alias: "DEMO".into(),
+        }])
+        .unwrap();
+        let availability = BackendAvailability::Available(BTreeSet::from([Right::ListDirectory]));
+        let request = RemoteFilesRequest::ListDirectory {
+            resource: "Reports".into(),
+            path: None,
+        };
+        let result = dispatch_catalog_webdav_read(
+            &request,
+            &catalog,
+            |canonical| {
+                assert_eq!(canonical, "reports");
+                None
+            },
+            &availability,
+            async |_| panic!("network must not be called"),
+            async |_, _| panic!("vault must not be called"),
+        )
+        .await;
+        assert!(matches!(result, Err(ReadDispatchError::Denied)));
+    }
 
     #[tokio::test]
     async fn authorization_and_parity_precede_network_and_vault() {

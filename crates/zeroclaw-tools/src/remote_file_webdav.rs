@@ -830,13 +830,7 @@ pub(crate) fn validate_webdav_root(root: &Url) -> Result<(String, u16), WebDavEr
     let port = root
         .port_or_known_default()
         .ok_or(WebDavError::InvalidEndpoint)?;
-    if root.scheme() != "https"
-        || !root.username().is_empty()
-        || root.password().is_some()
-        || root.query().is_some()
-        || root.fragment().is_some()
-        || !root.path().ends_with('/')
-    {
+    if !zeroclaw_config::remote_files::valid_webdav_root(root) {
         return Err(WebDavError::InvalidEndpoint);
     }
     Ok((host.trim_matches(['[', ']']).to_owned(), port))
