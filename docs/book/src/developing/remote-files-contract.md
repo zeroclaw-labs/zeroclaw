@@ -65,6 +65,6 @@ The shared Rust transfer coordinator copies to an adapter-owned staging destinat
 
 ## Linux mounted-resource read adapter
 
-The draft includes a read-only adapter for an operator-provisioned SMB 3 or NFS mount on Linux. It accepts a directory handle acquired from an authorized resource and checks the handle's mount ID, filesystem, and source against kernel mount information. SMB requires a reported SMB 3 dialect. Descendant opens use Linux openat2 with no symlinks and no mount crossing. Only regular files are opened for reading. Kernels without those primitives return an error.
+The draft includes a read-only adapter for an operator-provisioned SMB 3 or NFS mount on Linux. It accepts a directory handle acquired from an authorized resource and checks the handle's mount ID, filesystem, and source against kernel mount information. SMB requires a reported SMB 3 dialect. Descendant opens use Linux openat2 with no symlinks and no mount crossing. The adapter rechecks the recorded mount before each operation. Directory listing returns a bounded sample and signals truncation. Only regular files are opened for reading. Kernels without those primitives return an error.
 
 Caller integration still needs to acquire or refresh the handle from the registered mount, apply live authorization, and schedule blocking filesystem work outside the async executor. This adapter does not mount shares, write remote data, expose a tool, or implement Windows/macOS mounting. Tests use synthetic mount information and a local filesystem fixture; real SMB/NFS coverage remains pending.

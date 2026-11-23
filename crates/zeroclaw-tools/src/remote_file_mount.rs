@@ -14,6 +14,15 @@ pub enum MountedProtocol {
 
 pub struct MountedRoot {
     root: OwnedFd,
+    mount_id: String,
+    protocol: MountedProtocol,
+    expected_source: String,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct DirectoryListing {
+    pub names: Vec<String>,
+    pub truncated: bool,
 }
 
 impl MountedRoot {
@@ -39,32 +48,102 @@ impl MountedRoot {
             .find_map(|line| line.strip_prefix("mnt_id:"))
             .map(str::trim)
             .ok_or(io::ErrorKind::InvalidData)?;
+        let bound = Self {
+            root,
+            mount_id: mount_id.to_owned(),
+            protocol,
+            expected_source: expected_source.to_owned(),
+        };
+        bound.verify_mount()?;
+        Ok(bound)
+    }
+
+    fn verify_mount(&self) -> io::Result<()> {
         let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")?;
-        if !matches_mount(&mountinfo, mount_id, protocol, expected_source) {
+        if !matches_mount(
+            &mountinfo,
+            &self.mount_id,
+            self.protocol,
+            &self.expected_source,
+        ) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "mount identity mismatch",
             ));
         }
-        Ok(Self { root })
+        Ok(())
     }
 
     pub fn metadata(&self, path: &str) -> io::Result<Metadata> {
-        Ok(File::from(open_beneath(&self.root, path, OFlags::PATH)?).metadata()?)
+        self.verify_mount()?;
+        File::from(open_beneath(&self.root, path, OFlags::PATH)?).metadata()
     }
 
-    /// Open an ordinary file without activating special files. Reopen the
-    /// verified inode through its process-owned descriptor, not its name.
     pub fn open_regular(&self, path: &str) -> io::Result<File> {
-        let handle = File::from(open_beneath(&self.root, path, OFlags::PATH)?);
-        if !handle.metadata()?.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "not a regular file",
-            ));
-        }
-        File::open(format!("/proc/self/fd/{}", handle.as_raw_fd()))
+        self.verify_mount()?;
+        open_regular(&self.root, path)
     }
+
+    /// List a bounded sample. None lists the authorized root. Unsupported
+    /// file names are skipped but still count against the scan limit.
+    pub fn list(&self, path: Option<&str>, limit: usize) -> io::Result<DirectoryListing> {
+        self.verify_mount()?;
+        list_beneath(&self.root, path, limit)
+    }
+}
+
+fn open_regular(root: impl AsFd, path: &str) -> io::Result<File> {
+    let handle = File::from(open_beneath(root, path, OFlags::PATH)?);
+    if !handle.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    // Reopen the verified inode through the process-owned descriptor.
+    File::open(format!("/proc/self/fd/{}", handle.as_raw_fd()))
+}
+
+fn list_beneath(root: impl AsFd, path: Option<&str>, limit: usize) -> io::Result<DirectoryListing> {
+    if !(1..=1024).contains(&limit) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid listing limit",
+        ));
+    }
+    let root = root.as_fd();
+    let directory = match path {
+        Some(path) => open_beneath(root, path, OFlags::RDONLY | OFlags::DIRECTORY)?,
+        None => fs::openat(
+            root,
+            ".",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?,
+    };
+    let mut listing = DirectoryListing {
+        names: Vec::new(),
+        truncated: false,
+    };
+    let mut scanned = 0;
+    for entry in fs::Dir::read_from(&directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        if scanned == limit {
+            listing.truncated = true;
+            break;
+        }
+        scanned += 1;
+        if let Ok(name) = name.to_str()
+            && is_relative_resource_path(name)
+        {
+            listing.names.push(name.to_owned());
+        }
+    }
+    Ok(listing)
 }
 
 fn open_beneath(root: impl AsFd, path: &str, flags: OFlags) -> io::Result<OwnedFd> {
@@ -145,17 +224,11 @@ mod tests {
         std::fs::write(root.path().join("report.txt"), "demo")?;
         std::os::unix::fs::symlink("/proc", root.path().join("escape"))?;
         let root_dir = File::open(root.path())?;
-        // Bind directly for the containment fixture, which is not an SMB/NFS mount.
-        let adapter = MountedRoot {
-            root: root_dir.try_clone()?.into(),
-        };
         let mut value = String::new();
-        adapter
-            .open_regular("report.txt")?
-            .read_to_string(&mut value)?;
+        open_regular(&root_dir, "report.txt")?.read_to_string(&mut value)?;
         assert_eq!(value, "demo");
-        assert!(adapter.metadata("escape/self").is_err());
-        assert!(adapter.metadata("../outside").is_err());
+        assert!(open_beneath(&root_dir, "escape/self", OFlags::PATH).is_err());
+        assert!(open_beneath(&root_dir, "../outside", OFlags::PATH).is_err());
         assert!(
             MountedRoot::bind(
                 root_dir.into(),
@@ -163,6 +236,32 @@ mod tests {
                 "//files.test/reports"
             )
             .is_err()
+        );
+        Ok(())
+    }
+    #[test]
+    fn listing_is_bounded_and_fails_when_mount_binding_disappears() -> io::Result<()> {
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir(root.path().join("reports"))?;
+        std::fs::write(root.path().join("reports/a"), "")?;
+        std::fs::write(root.path().join("reports/b"), "")?;
+        std::os::unix::fs::symlink("reports", root.path().join("link"))?;
+        let handle = File::open(root.path())?;
+        let listing = list_beneath(&handle, Some("reports"), 1)?;
+        assert_eq!(listing.names.len(), 1);
+        assert!(listing.truncated);
+        assert!(list_beneath(&handle, Some("link"), 1).is_err());
+        assert!(list_beneath(&handle, None, 0).is_err());
+
+        let unavailable = MountedRoot {
+            root: handle.into(),
+            mount_id: String::from("0"),
+            protocol: MountedProtocol::Smb,
+            expected_source: String::from("//files.test/reports"),
+        };
+        assert_eq!(
+            unavailable.list(None, 1).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
         );
         Ok(())
     }
