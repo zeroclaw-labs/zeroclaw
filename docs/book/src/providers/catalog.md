@@ -604,7 +604,7 @@ api_key = "..."
 **bf16.ai**: slot `bf16`. An OpenAI-compatible uncensored LLM API serving
 open-weight models (refusal behavior removed from the weights rather than
 papered over with system prompts) with 1M context windows, vision, structured
-tool calling, and ultra-low false-positive refusal rates — suited for
+tool calling, and ultra-low false-positive refusal rates, suited for
 autonomous SOP and multi-step tool workflows governed by ZeroClaw's own OS
 sandboxes and risk profiles. Current models and prices are on
 [bf16.ai/models](https://bf16.ai/models). The endpoint is
@@ -614,12 +614,16 @@ include `deepseek/deepseek-v4.1-flash-uncensored`,
 `moonshotai/kimi-k3.1-pro-uncensored`, and smart routers such as `bf16/auto`.
 The `/v1/models` endpoint is public (no key required to list models). Create a
 key at [bf16.ai/dashboard/keys](https://bf16.ai/dashboard/keys). Use the
-canonical `bf16` slot only.
+canonical `bf16` slot only. Set `vision = true` on aliases using multimodal
+models (`deepseek/deepseek-v4.1-flash-uncensored`,
+`zai-org/glm-5.3-flash-uncensored`, `moonshotai/kimi-k3.1-pro-uncensored`);
+omit it for text-only models like `zai-org/glm-5.3-uncensored`.
 
 ```toml
 [providers.models.bf16.default]
 model = "deepseek/deepseek-v4.1-flash-uncensored"
 api_key = "..."
+vision = true
 ```
 
 To bridge an existing `BF16_API_KEY` shell variable into ZeroClaw's
