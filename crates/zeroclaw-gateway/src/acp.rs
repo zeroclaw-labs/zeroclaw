@@ -51,11 +51,84 @@ struct ActiveAcpTurn {
 /// Snapshot + live receiver returned when a reconnected socket reattaches to
 /// an in-flight ACP turn.
 pub(crate) struct AcpTurnAttachment {
+    origin: Weak<AcpServer>,
     pub(crate) replay: Vec<AcpTurnEventFrame>,
     pub(crate) live: broadcast::Receiver<AcpTurnEventFrame>,
     pub(crate) completed: bool,
     pub(crate) turn_id: uuid::Uuid,
     pub(crate) truncated: bool,
+}
+
+impl AcpTurnAttachment {
+    /// Replace this socket's previous reader before acknowledging the new cursor.
+    async fn send_to_socket(
+        self,
+        sid: &str,
+        after_seq: u64,
+        request_id: serde_json::Value,
+        reader: &mut Option<tokio::task::JoinHandle<()>>,
+        wire: &mpsc::Sender<String>,
+        socket_server: &Arc<AcpServer>,
+    ) {
+        if let Some(old) = reader.take() {
+            old.abort();
+            let _ = old.await;
+        }
+        let ack = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "sessionId": sid,
+                "inFlight": !self.completed,
+                "replayed": self.replay.len(),
+                "truncated": self.truncated,
+                "turnId": self.turn_id.to_string(),
+            }
+        });
+        if wire.send(ack.to_string()).await.is_err() {
+            return;
+        }
+        // The originating socket already receives live output, including the
+        // JSON-RPC response with its original prompt id, from its output bridge.
+        let needs_live = !self.completed && !self.origin.ptr_eq(&Arc::downgrade(socket_server));
+        if self.replay.is_empty() && !needs_live {
+            return;
+        }
+        let sid = sid.to_owned();
+        let wire = wire.clone();
+        *reader = Some(zeroclaw_spawn::spawn!(async move {
+            let mut last_seq = after_seq;
+            for event in self.replay {
+                last_seq = last_seq.max(event.seq);
+                let done = event.is_terminal;
+                if wire.send(replay_payload(&sid, event)).await.is_err() || done {
+                    return;
+                }
+            }
+            if !needs_live {
+                return;
+            }
+            let mut rx = self.live;
+            loop {
+                match rx.recv().await {
+                    Ok(event) if event.seq > last_seq => {
+                        last_seq = event.seq;
+                        let done = event.is_terminal;
+                        if wire.send(replay_payload(&sid, event)).await.is_err() || done {
+                            break;
+                        }
+                    }
+                    Ok(_) => (),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let gap = serde_json::json!({"jsonrpc":"2.0","method":"_zeroclaw/replay_gap","params":{"sessionId":sid,"afterSeq":last_seq}});
+                        let _ = wire.send(gap.to_string()).await;
+                        break;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }));
+    }
 }
 
 /// Gateway-shared registry of in-flight ACP turns, backed by [`SessionActorQueue`]
@@ -251,6 +324,7 @@ impl AcpTurnHub {
         );
         replay.sort_by_key(|e| e.seq);
         Ok(Some(AcpTurnAttachment {
+            origin: turn.server.clone(),
             replay,
             live: turn.tx.subscribe(),
             completed: turn.completed,
@@ -565,7 +639,8 @@ async fn handle_socket(
 
     let revoked_token = CancellationToken::new();
     let disconnected = CancellationToken::new();
-    let mut attached_sessions = std::collections::HashSet::<String>::new();
+    // A socket has at most one replay reader per admitted session.
+    let mut attached_sessions = HashMap::<String, Option<tokio::task::JoinHandle<()>>>::new();
 
     let mut revoked = false;
     loop {
@@ -640,7 +715,7 @@ async fn handle_socket(
                 if let Ok(reply) = serde_json::from_str::<serde_json::Value>(&text)
                     && (reply.get("result").is_some() || reply.get("error").is_some())
                     && let Some(id) = reply["id"].as_str()
-                    && attached_sessions.iter().any(|sid| turn_hub.answer(sid,principal_id.as_deref(),id,&reply)) {
+                    && attached_sessions.keys().any(|sid| turn_hub.answer(sid,principal_id.as_deref(),id,&reply)) {
                     continue;
                 }
                 // Intercept gateway-level turn coordination frames:
@@ -666,60 +741,13 @@ async fn handle_socket(
                             let _ = wire_tx.send(serde_json::json!({"jsonrpc":"2.0","id":req_id,"error":{"code":FORBIDDEN,"message":"Restore the session before reattaching"}}).to_string()).await;
                             continue;
                         }
-                        attached_sessions.insert(sid.to_owned());
+                        let reader = attached_sessions.entry(sid.to_owned()).or_default();
                         let params = &parsed["params"];
                         let active_only = params["activeOnly"].as_bool().unwrap_or(false);
                         let accept_partial = params["acceptPartial"].as_bool().unwrap_or(false);
                         match turn_hub.reattach(sid, principal_id.as_deref(), after_seq, active_only, accept_partial) {
                             Ok(Some(attachment)) => {
-                                let ack = serde_json::json!({
-                                    "jsonrpc": "2.0",
-                                    "id": req_id,
-                                    "result": {
-                                        "sessionId": sid,
-                                        "inFlight": !attachment.completed,
-                                        "replayed": attachment.replay.len(),
-                                        "truncated": attachment.truncated,
-                                        "turnId": attachment.turn_id.to_string(),
-                                    }
-                                });
-                                let _ = wire_tx.send(ack.to_string()).await;
-                                let wire_tx_sub = wire_tx.clone();
-                                let sid = sid.to_string();
-                                zeroclaw_spawn::spawn!(async move {
-                                    let mut last_seq = after_seq;
-                                    for ev in attachment.replay {
-                                        last_seq = ev.seq;
-                                        if wire_tx_sub.send(replay_payload(&sid,ev.clone())).await.is_err() {
-                                            return;
-                                        }
-                                        if ev.is_terminal {
-                                            return;
-                                        }
-                                    }
-                                    if attachment.completed {
-                                        return;
-                                    }
-                                    let mut rx = attachment.live;
-                                    loop {
-                                        let ev = match rx.recv().await {
-                                            Ok(ev) => ev,
-                                            Err(broadcast::error::RecvError::Lagged(_)) => {
-                                                let _ = wire_tx_sub.send(serde_json::json!({"jsonrpc":"2.0","method":"_zeroclaw/replay_gap","params":{"sessionId":sid,"afterSeq":last_seq}}).to_string()).await;
-                                                break;
-                                            }
-                                            Err(broadcast::error::RecvError::Closed) => break,
-                                        };
-                                        if ev.seq <= last_seq {
-                                            continue;
-                                        }
-                                        last_seq = ev.seq;
-                                        let done = ev.is_terminal;
-                                        if wire_tx_sub.send(replay_payload(&sid,ev.clone())).await.is_err() || done {
-                                            break;
-                                        }
-                                    }
-                                });
+                                attachment.send_to_socket(sid, after_seq, req_id, reader, &wire_tx, &server).await;
                             }
                             Ok(None) => {
                                 let ack = serde_json::json!({
@@ -743,7 +771,7 @@ async fn handle_socket(
                     if method == "_zeroclaw/session/steer"
                         && parsed["jsonrpc"] == "2.0"
                         && let Some(sid) = parsed["params"].get("sessionId").or_else(|| parsed["params"].get("session_id")).and_then(serde_json::Value::as_str)
-                        && attached_sessions.contains(sid)
+                        && attached_sessions.contains_key(sid)
                         && server.has_gateway_session(sid).await
                         && let Some(owner) = turn_hub.running_server(sid, principal_id.as_deref())
                     {
@@ -775,7 +803,7 @@ async fn handle_socket(
                             continue;
                         }
                         let sid = sid.to_owned();
-                        attached_sessions.insert(sid.clone());
+                        attached_sessions.entry(sid.clone()).or_default();
                         let params = parsed["params"].clone();
                         let turn_cancel = revoked_token.child_token();
                         let hub = Arc::clone(&turn_hub);
@@ -812,6 +840,9 @@ async fn handle_socket(
         }
     }
 
+    for reader in attached_sessions.into_values().flatten() {
+        reader.abort();
+    }
     disconnected.cancel();
     close_signal.notify_one();
     drop(input_tx);
@@ -1163,6 +1194,80 @@ mod tests {
                 .unwrap()
                 .is_some_and(|a| a.completed),
             "terminal replay must survive completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn reattach_retry_delivers_live_frames_once_only_to_non_origin_reader() {
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let hub = super::AcpTurnHub::new(queue);
+        let origin = Arc::new(super::AcpServer::new(
+            Default::default(),
+            Default::default(),
+        ));
+        let observer = Arc::new(super::AcpServer::new(
+            Default::default(),
+            Default::default(),
+        ));
+        let sid = "reattach-retry";
+        hub.start_turn(sid, None, Default::default(), Arc::downgrade(&origin))
+            .await
+            .unwrap();
+        hub.record_frame(sid, serde_json::json!({"data": "first"}).to_string(), false)
+            .unwrap();
+
+        let attach_twice = async |server: &Arc<super::AcpServer>| {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+            let mut reader = None;
+            for cursor in [0, 1] {
+                let attachment = hub
+                    .reattach(sid, None, cursor, false, false)
+                    .unwrap()
+                    .unwrap();
+                attachment
+                    .send_to_socket(sid, cursor, cursor.into(), &mut reader, &tx, server)
+                    .await;
+                let ack: serde_json::Value =
+                    serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                assert_eq!(ack["result"]["replayed"], 1 - cursor);
+                if cursor == 0 {
+                    let replay: serde_json::Value =
+                        serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                    assert_eq!(replay["data"], "first");
+                }
+            }
+            rx
+        };
+        let mut origin_wire = attach_twice(&origin).await;
+        let mut observer_wire = attach_twice(&observer).await;
+
+        hub.record_frame(
+            sid,
+            serde_json::json!({"data": "second"}).to_string(),
+            false,
+        )
+        .unwrap();
+        hub.record_frame(
+            sid,
+            serde_json::json!({"id": 42, "result": {}}).to_string(),
+            true,
+        )
+        .unwrap();
+        assert!(
+            origin_wire.recv().await.is_none(),
+            "origin already has the direct output bridge"
+        );
+        let update: serde_json::Value =
+            serde_json::from_str(&observer_wire.recv().await.unwrap()).unwrap();
+        assert_eq!(update["data"], "second");
+        let terminal: serde_json::Value =
+            serde_json::from_str(&observer_wire.recv().await.unwrap()).unwrap();
+        assert_eq!(terminal["method"], "_zeroclaw/turn_complete");
+        assert!(
+            observer_wire.recv().await.is_none(),
+            "old reader must not send duplicates"
         );
     }
 
