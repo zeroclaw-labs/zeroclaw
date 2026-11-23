@@ -312,6 +312,10 @@ pub(crate) async fn serve<S>(
 /// `idle`, or one side has not taken a write for `idle`; then close both,
 /// giving each close [`REFUSAL_WRITE_BUDGET`].
 ///
+/// Every write is flushed before the next read (see [`write_flushed`]): the
+/// browser side is a TLS stream, which can hold the end of a response in its
+/// own buffer until something flushes it.
+///
 /// The write is bounded on its own because the idle timer is not polled while
 /// a write waits: without it, a browser that asks for a page and then stops
 /// reading would hold its dashboard and route slots past `idle`, and enough of
@@ -334,7 +338,7 @@ where
             read = a_read.read(&mut a_buf) => match read {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if !wrote_within(idle, b_write.write_all(&a_buf[..n])).await {
+                    if !wrote_within(idle, write_flushed(&mut b_write, &a_buf[..n])).await {
                         break;
                     }
                     deadline = Instant::now() + idle;
@@ -343,7 +347,7 @@ where
             read = b_read.read(&mut b_buf) => match read {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if !wrote_within(idle, a_write.write_all(&b_buf[..n])).await {
+                    if !wrote_within(idle, write_flushed(&mut a_write, &b_buf[..n])).await {
                         break;
                     }
                     deadline = Instant::now() + idle;
@@ -353,6 +357,24 @@ where
     }
     let _ = tokio::time::timeout(REFUSAL_WRITE_BUDGET, a_write.shutdown()).await;
     let _ = tokio::time::timeout(REFUSAL_WRITE_BUDGET, b_write.shutdown()).await;
+}
+
+/// Write all of `bytes`, then flush them.
+///
+/// `write_all` alone is not enough on a TLS stream: it returns once the
+/// stream has taken the plaintext, which may still be in the TLS session's
+/// own send buffer (up to 64 KiB with rustls) when the socket was full. Only
+/// a flush, or the next write, sends the rest. A keep-alive connection has no
+/// next write once a response is done, so without this the browser is left
+/// waiting on the end of that response until the connection closes, and the
+/// close flushes it. The frontdoor's keep-alive loop uses it for the same
+/// reason.
+pub(crate) async fn write_flushed<W>(writer: &mut W, bytes: &[u8]) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(bytes).await?;
+    writer.flush().await
 }
 
 /// Whether `write` finished, successfully, within `idle`.
@@ -407,6 +429,61 @@ where
         let _ = browser.shutdown().await;
     })
     .await;
+}
+
+/// A TLS client and server over an in-memory socket that holds `capacity`
+/// bytes each way, for tests that need a real TLS writer: one that keeps what
+/// the socket can't take in its own buffer until it is flushed.
+#[cfg(test)]
+pub(crate) async fn tls_over_duplex(
+    capacity: usize,
+) -> (
+    tokio_rustls::client::TlsStream<tokio::io::DuplexStream>,
+    tokio_rustls::server::TlsStream<tokio::io::DuplexStream>,
+) {
+    let (ca_cert, ca_key) = zeroclaw_tls::testing::gen_ca();
+    let (cert, key) =
+        zeroclaw_tls::testing::gen_server_cert(&ca_cert, &ca_key, &["abc.relay.test".to_string()]);
+    let pem_certs = |pem: &str| {
+        rustls_pemfile::certs(&mut pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let server = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            pem_certs(&cert),
+            rustls_pemfile::private_key(&mut key.as_bytes())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    for ca in pem_certs(&ca_cert) {
+        roots.add(ca).unwrap();
+    }
+    let client = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    let (client_io, server_io) = tokio::io::duplex(capacity);
+    let accepting = tokio::spawn(async move {
+        tokio_rustls::TlsAcceptor::from(Arc::new(server))
+            .accept(server_io)
+            .await
+            .unwrap()
+    });
+    let name = rustls::pki_types::ServerName::try_from("abc.relay.test").unwrap();
+    let client = tokio_rustls::TlsConnector::from(Arc::new(client))
+        .connect(name, client_io)
+        .await
+        .unwrap();
+    (client, accepting.await.unwrap())
 }
 
 #[cfg(test)]
@@ -590,6 +667,46 @@ mod tests {
         .expect("closing a browser that never reads must not hold its slots");
         drop(browser);
         answering.abort();
+    }
+
+    /// A browser on a real TLS stream gets the whole of a response while the
+    /// daemon keeps the connection open for its next request (keep-alive).
+    ///
+    /// The TLS writer takes plaintext into its own send buffer and can return
+    /// from a write before that data is on the socket. The socket here holds
+    /// far less than one TLS record, as a browser's does once its receive
+    /// window is full, so the last record is always still in that buffer when
+    /// the daemon has nothing more to send. Unflushed, it stays there until the
+    /// idle timeout, and the browser waits on the end of the response.
+    #[tokio::test]
+    async fn a_tls_browser_gets_the_whole_response_while_the_connection_stays_open() {
+        let (mut browser, relay_browser_side) = tls_over_duplex(4 * 1024).await;
+        let (relay_daemon_side, mut daemon) = tokio::io::duplex(64 * 1024);
+        let splicing = tokio::spawn(splice(
+            relay_browser_side,
+            relay_daemon_side,
+            Duration::from_secs(60),
+        ));
+
+        // One response of whole TLS records, then nothing: the daemon holds the
+        // connection open, so no close flushes the end of it.
+        let response = vec![b'x'; 16 * 16 * 1024];
+        let answering = {
+            let response = response.clone();
+            tokio::spawn(async move {
+                daemon.write_all(&response).await.unwrap();
+                daemon
+            })
+        };
+        let mut got = vec![0u8; response.len()];
+        let read = tokio::time::timeout(Duration::from_secs(5), browser.read_exact(&mut got)).await;
+        assert!(
+            matches!(read, Ok(Ok(_))),
+            "the browser must get the whole response while the connection stays open"
+        );
+        assert_eq!(got, response);
+        let _daemon = answering.await.unwrap();
+        splicing.abort();
     }
 
     /// Serve one browser that sends a request, and return what it was sent.

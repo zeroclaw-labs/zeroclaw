@@ -86,7 +86,20 @@ log line that the WSS listener is up on `0.0.0.0:9781`.
 
 The client now needs a certificate. There are two ways to get one.
 
-### 1b. Client side - option A: enrollment (recommended)
+### OIDC first contact (no pairing)
+
+For a configured OIDC deployment, start with
+`zerocode login <alias> wss://<host>:9781 --gateway-url https://<gateway>`.
+The client can have an empty config directory, and the daemon need not know
+its user or device or have any pairing code pending. After OIDC approval,
+the gateway verifies the bearer and session-creation authority (or
+`system:execute`) and signs the
+client's locally generated CSR. The returned CA bootstraps WSS trust, while
+WSS remains mandatory mTLS plus per-connection bearer authentication. This
+path does not use `[enroll]`, port 9782, or a SAS prompt. See
+[OIDC remote login](./remote.md#sign-in-with-oidc-recommended-for-oidc-deployments).
+
+### 1b. Client side - option A: pairing-based enrollment
 
 Enrollment gives a certless client its first certificate over a pairing-gated,
 server-authenticated endpoint, with no manual cert handling. Turn it on:
@@ -155,7 +168,8 @@ if `uri` is in config) needs no more flags.
 Enrollment endpoint defaults: `--enroll-host` defaults to `--connect`'s host;
 `--enroll-port` defaults to `9782`.
 
-The first release intentionally requires a pairing code for every enrollment.
+The dedicated enrollment listener requires a pairing code for every request.
+OIDC first contact instead uses the authenticated gateway route above.
 The reserved `allow_unpaired_enrollment` knob is rejected at daemon startup until
 the client has an explicit no-code trust anchor such as a pinned daemon CA
 fingerprint. This keeps the provisional enrollment TLS path from turning into

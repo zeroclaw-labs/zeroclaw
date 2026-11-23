@@ -4426,6 +4426,9 @@ impl Agent {
             self.context_limits_for_route(&selected_route.provider_name, &selected_route.model);
 
         let turn_id = Self::new_turn_id();
+        // This frame owns the turn id and any model-switch rounds, so it
+        // backstops the turn's elicitation hint record on every exit.
+        let _hint_scope = crate::agent::loop_::TurnHintScope::new(&turn_id);
         let turn_observer = Arc::clone(&self.observer);
         let mut guard = crate::observability::AgentTurnGuard::start(
             turn_observer.as_ref(),
@@ -4981,6 +4984,10 @@ impl Agent {
         let attempt_allowlist = model_selection.allowed_provider_refs;
         let mut selected_route = self.model_route_resolver.resolve(&effective_model);
         let turn_id = Self::new_turn_id();
+        // This frame owns the turn id and the model-switch round loop, so it
+        // backstops the turn's elicitation hint record on every exit — a
+        // switch round that fails to rebuild its provider included.
+        let _hint_scope = crate::agent::loop_::TurnHintScope::new(&turn_id);
         let mut committed_response = String::new();
         // Requested-vs-served divergence for THIS turn. Source of truth is the
         // task-local record inside `zeroclaw_providers::reliable`, consumed
@@ -13981,8 +13988,9 @@ mod tests {
 
     #[test]
     fn session_cwd_keeps_workspace_in_allowed_roots() {
-        let workspace = std::env::temp_dir().join("zeroclaw_test_session_cwd_workspace");
-        let session = std::env::temp_dir().join("zeroclaw_test_session_cwd_session");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let session = tmp.path().join("session");
         let _ = std::fs::create_dir_all(&workspace);
         let _ = std::fs::create_dir_all(&session);
 
