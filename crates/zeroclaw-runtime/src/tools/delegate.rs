@@ -300,7 +300,7 @@ impl UnrestrictedToolWithholding {
 struct OwnedParentTools {
     tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
     origins: crate::tools::NativeMemoryOrigins,
-    mcp_registry: Arc<std::sync::OnceLock<Arc<zeroclaw_tools::McpRegistry>>>,
+    mcp_registry: Arc<std::sync::OnceLock<Arc<zeroclaw_tools::mcp_client::McpRegistry>>>,
     memory_policies: Option<Arc<BoundedMemoryPolicyChain>>,
 }
 
@@ -793,7 +793,7 @@ impl DelegateTool {
     /// parent-tool list. The same binding is carried by bounded and same-hop
     /// child views, so late inheritance checks use dispatch ownership rather
     /// than re-parsing overlapping server-name prefixes.
-    pub(crate) fn bind_mcp_registry(&self, registry: Arc<zeroclaw_tools::McpRegistry>) {
+    pub(crate) fn bind_mcp_registry(&self, registry: Arc<zeroclaw_tools::mcp_client::McpRegistry>) {
         let _ = self.parent_tools.mcp_registry.set(registry);
     }
 
@@ -2327,7 +2327,7 @@ impl DelegateTool {
 
     fn config_withholds_delegate_tool(
         config: Option<&Config>,
-        registry: Option<&zeroclaw_tools::McpRegistry>,
+        registry: Option<&zeroclaw_tools::mcp_client::McpRegistry>,
         name: &str,
     ) -> bool {
         let Some(config) = config else {
