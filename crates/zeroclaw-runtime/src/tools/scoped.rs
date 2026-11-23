@@ -702,7 +702,7 @@ fn mcp_tool_reaches_delegated_agents(
         return false;
     }
     name.split_once(zeroclaw_tools::mcp_client::MCP_TOOL_NAME_SEPARATOR)
-        .map_or(true, |(server, _)| !denied_servers.contains(server))
+        .is_none_or(|(server, _)| !denied_servers.contains(server))
 }
 
 impl ScopedToolRegistry {
