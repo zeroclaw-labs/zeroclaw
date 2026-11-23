@@ -378,6 +378,9 @@ pub struct WhatsAppWebChannel {
     /// When true, allowed unaddressed group messages become context-only
     /// history entries instead of being dropped.
     passive_group_context: bool,
+    /// Polls this channel posted, so their votes can be read. Written by
+    /// `send_poll`, read by the inbound handler.
+    poll_targets: PollTargets,
     /// Whether outgoing PDF documents get a first-page preview. Read from
     /// `[channels.whatsapp.<alias>].document_thumbnails` in
     /// [`WhatsAppWebChannel::new`].
@@ -475,6 +478,7 @@ struct WhatsAppInboundContext {
     self_chat_mode: bool,
     mention_only: bool,
     passive_group_context: bool,
+    poll_targets: PollTargets,
     bot_phone: Arc<Mutex<Option<String>>>,
     bot_lid: Arc<Mutex<Option<String>>>,
     dm_mention_patterns: Arc<Vec<regex::Regex>>,
@@ -562,6 +566,7 @@ impl WhatsAppWebChannel {
             peer_resolver,
             mention_only,
             passive_group_context,
+            poll_targets: Arc::new(Mutex::new(std::collections::HashMap::new())),
             document_thumbnails,
             bot_phone: Arc::new(Mutex::new(bot_phone)),
             bot_lid: Arc::new(Mutex::new(None)),
@@ -1012,7 +1017,7 @@ impl WhatsAppWebChannel {
                     is_group,
                     &context.dm_mention_patterns,
                     &context.group_mention_patterns,
-                    msg.text_content().unwrap_or(""),
+                    Self::inbound_text(msg),
                 )
             {
                 ::zeroclaw_log::record!(
@@ -1072,9 +1077,17 @@ impl WhatsAppWebChannel {
         }
 
         let normalized = normalized.unwrap_or_else(|| sender.clone());
+
+        // A vote carries no text, so it never reaches the content handling
+        // below. It is answered here, against the poll this channel posted.
+        if let Some(update) = msg.poll_update_message.as_option() {
+            Self::handle_poll_vote(update, info, client, context, &normalized, &reply_target).await;
+            return;
+        }
+
         let conversation_scope = Self::group_context_scope(context.passive_group_context, is_group);
         let mut passive_context = false;
-        let text_content = msg.text_content().unwrap_or("").trim().to_string();
+        let text_content = Self::inbound_text(msg).trim().to_string();
         let mut content = Self::media_fallback_content(text_content, msg);
 
         ::zeroclaw_log::record!(
@@ -1308,6 +1321,50 @@ impl WhatsAppWebChannel {
             .render::<qrcode::render::unicode::Dense1x2>()
             .quiet_zone(true)
             .build())
+    }
+
+    /// Show a pairing QR code in the terminal and emit it as a login event,
+    /// unless the listener that owns the client has stopped (`fence`
+    /// cancelled). whatsapp-rust rotates QR codes on a detached task that
+    /// neither `disconnect` nor the bot's shutdown ends, so a channel stopped
+    /// while unpaired would keep surfacing unscannable codes for minutes.
+    /// Returns whether the code was surfaced.
+    #[cfg(feature = "whatsapp-web")]
+    fn surface_pairing_qr(alias: &str, code: &str, fence: &CancellationToken) -> bool {
+        if fence.is_cancelled() {
+            return false;
+        }
+        crate::login_events::LoginEvent::Qr {
+            payload: code,
+            image_url: None,
+            attempt: None,
+            max_attempts: None,
+        }
+        .emit(
+            "whatsapp",
+            alias,
+            "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)",
+        );
+        match Self::render_pairing_qr(code) {
+            Ok(rendered) => {
+                eprintln!();
+                eprintln!("WhatsApp Web QR code (scan in WhatsApp > Linked Devices):");
+                eprintln!("{rendered}");
+                eprintln!();
+            }
+            Err(err) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!("failed to render pairing QR in terminal: {}", err)
+                );
+                eprintln!();
+                eprintln!("WhatsApp Web QR payload: {code}");
+                eprintln!();
+            }
+        }
+        true
     }
 
     #[cfg(feature = "whatsapp-web")]
@@ -1721,6 +1778,20 @@ impl WhatsAppWebChannel {
         }
     }
 
+    /// The text the sender typed: the message body, or the caption of an
+    /// image, video or document when there is no body. wacore's
+    /// `text_content()` reads only `conversation` and `extended_text_message`,
+    /// so without the caption fallback a captioned photo would reach the
+    /// agent, and the mention gate, as a bare `[Image]`.
+    #[cfg(feature = "whatsapp-web")]
+    fn inbound_text(msg: &waproto::whatsapp::Message) -> &str {
+        use wacore::proto_helpers::MessageExt;
+        msg.text_content()
+            .filter(|text| !text.trim().is_empty())
+            .or_else(|| msg.get_caption())
+            .unwrap_or("")
+    }
+
     #[cfg(feature = "whatsapp-web")]
     fn media_fallback_content(content: String, msg: &waproto::whatsapp::Message) -> String {
         if !content.is_empty() {
@@ -1760,6 +1831,103 @@ impl WhatsAppWebChannel {
         }
 
         String::new()
+    }
+
+    /// Turn a vote on one of this channel's polls into `[choice]<option>`
+    /// messages, one per selected option, the way Signal reports poll votes.
+    /// A vote for a poll this channel did not post, or whose entry has
+    /// expired, is ignored: without the poll's secret it cannot be read, and
+    /// the chat already shows the result on the card.
+    #[cfg(feature = "whatsapp-web")]
+    async fn handle_poll_vote(
+        update: &waproto::whatsapp::message::PollUpdateMessage,
+        info: &wacore::types::message::MessageInfo,
+        client: &whatsapp_rust::Client,
+        context: &WhatsAppInboundContext,
+        sender: &str,
+        reply_target: &str,
+    ) {
+        let Some(poll_id) = update
+            .poll_creation_message_key
+            .as_option()
+            .and_then(|key| key.id.as_deref())
+        else {
+            return;
+        };
+        let Some(target) = lookup_poll_target(&context.poll_targets, poll_id) else {
+            return;
+        };
+        let Some(vote) = update.vote.as_option() else {
+            return;
+        };
+        let (Some(enc_payload), Some(enc_iv)) =
+            (vote.enc_payload.as_deref(), vote.enc_iv.as_deref())
+        else {
+            return;
+        };
+        // This channel posted the poll, so it is the creator half of the
+        // addressing the vote was encrypted under. That addressing has to be
+        // homogeneous: a vote authored under LID only opens when the creator
+        // is named by LID too, and the library's own retry swaps *both* sides,
+        // so handing it a mixed pair never resolves. Groups address
+        // participants by LID, DMs by phone number, so follow the voter.
+        let voter = &info.source.sender;
+        let Some(creator) = vote_creator_identity(voter, client.pn(), client.lid()) else {
+            return;
+        };
+
+        let selected = match client
+            .polls()
+            .decrypt_vote(
+                wacore::poll::PollVoteCiphertext {
+                    enc_payload,
+                    enc_iv,
+                },
+                &target.secret,
+                poll_id,
+                &creator,
+                voter,
+            )
+            .await
+        {
+            Ok(selected) => selected,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({ "reason": e.to_string() })),
+                    "whatsapp-web: could not read a poll vote"
+                );
+                return;
+            }
+        };
+
+        for option in poll_option_names(&target.options, &selected) {
+            if let Err(e) = context
+                .tx
+                .send(vote_message(
+                    &context.alias,
+                    sender,
+                    voter,
+                    reply_target,
+                    &option,
+                    target.vote_reply,
+                    context.passive_group_context,
+                    info.source.is_group,
+                ))
+                .await
+            {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({ "reason": e.to_string() })),
+                    "whatsapp-web: could not forward a poll vote"
+                );
+                return;
+            }
+        }
     }
 
     /// Hold `content` as this chat's pending voice reply, unless something says
@@ -4032,6 +4200,7 @@ impl Channel for WhatsAppWebChannel {
                 self_chat_mode: self.self_chat_mode,
                 mention_only: self.mention_only,
                 passive_group_context: self.passive_group_context,
+                poll_targets: Arc::clone(&self.poll_targets),
                 bot_phone: self.bot_phone.clone(),
                 bot_lid: self.bot_lid.clone(),
                 dm_mention_patterns: self.dm_mention_patterns.clone(),
@@ -4041,8 +4210,9 @@ impl Channel for WhatsAppWebChannel {
                 voice_chats: self.voice_chats.clone(),
             };
             let configured_push_name = self.push_name.clone();
-            // The SDK detaches event callbacks. Fence their config writes
-            // even when listener cancellation skips the shutdown code below.
+            // The SDK detaches event callbacks. Fence their config writes and
+            // pairing output even when listener cancellation skips the
+            // shutdown code below.
             let persistence_cancel = tokio_util::sync::CancellationToken::new();
             let persistence_guard = persistence_cancel.clone().drop_guard();
 
@@ -4174,34 +4344,11 @@ impl Channel for WhatsAppWebChannel {
                                 eprintln!();
                             }
                             Event::PairingQrCode(qr) => {
-                                let code = &qr.code;
-                                crate::login_events::LoginEvent::Qr {
-                                    payload: code.as_str(),
-                                    image_url: None,
-                                    attempt: None,
-                                    max_attempts: None,
-                                }
-                                .emit(
-                                    "whatsapp",
+                                Self::surface_pairing_qr(
                                     alias.as_ref(),
-                                    "WhatsApp Web QR code received (scan with WhatsApp > Linked Devices)",
+                                    &qr.code,
+                                    &persistence_cancel,
                                 );
-                                match Self::render_pairing_qr(code) {
-                                    Ok(rendered) => {
-                                        eprintln!();
-                                        eprintln!(
-                                            "WhatsApp Web QR code (scan in WhatsApp > Linked Devices):"
-                                        );
-                                        eprintln!("{rendered}");
-                                        eprintln!();
-                                    }
-                                    Err(err) => {
-                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("failed to render pairing QR in terminal: {}", err));
-                                        eprintln!();
-                                        eprintln!("WhatsApp Web QR payload: {code}");
-                                        eprintln!();
-                                    }
-                                }
                             }
                             _ => {}
                         }
@@ -4406,13 +4553,27 @@ impl Channel for WhatsAppWebChannel {
             anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
         };
 
-        Box::pin(
-            client
-                .polls()
-                .create(to, &poll.question, &poll.options, poll.selectable_count),
-        )
+        let (sent, secret) = Box::pin(client.polls().create(
+            to,
+            &poll.question,
+            &poll.options,
+            poll.selectable_count,
+        ))
         .await
         .map_err(|e| anyhow::Error::msg(format!("WhatsApp poll creation failed: {e}")))?;
+
+        // The secret is the only way to read this poll's votes later; WhatsApp
+        // never sends it again.
+        record_poll_target(
+            &self.poll_targets,
+            sent.message_id,
+            PollTarget {
+                secret,
+                options: poll.options.clone(),
+                vote_reply: poll.vote_reply,
+                recorded_at: std::time::Instant::now(),
+            },
+        );
         Ok(())
     }
 
@@ -4832,6 +4993,162 @@ fn note_image_preview_skipped(reason: &str) {
     );
 }
 
+/// How long a posted poll stays able to resolve incoming votes. Long enough
+/// for a chat to answer at its own pace, short enough that the secrets of
+/// polls nobody is voting on do not sit in memory forever.
+#[cfg(feature = "whatsapp-web")]
+const POLL_TARGET_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Upper bound on remembered polls. A channel that posts more than this drops
+/// the oldest, so a long-running daemon cannot grow without limit.
+#[cfg(feature = "whatsapp-web")]
+const POLL_TARGET_CAPACITY: usize = 256;
+
+/// What a later vote needs to be read: the secret WhatsApp returns when the
+/// poll is created, and the option names the vote's hashes map back to.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone)]
+struct PollTarget {
+    secret: Vec<u8>,
+    options: Vec<String>,
+    /// What this poll's votes should do when they arrive.
+    vote_reply: zeroclaw_api::channel::PollVoteReply,
+    recorded_at: std::time::Instant,
+}
+
+#[cfg(feature = "whatsapp-web")]
+type PollTargets = Arc<Mutex<std::collections::HashMap<String, PollTarget>>>;
+
+/// Remember a poll this channel just posted. Expired entries go first, and
+/// only then, if the registry is still full, the oldest live one.
+#[cfg(feature = "whatsapp-web")]
+fn record_poll_target(targets: &PollTargets, message_id: String, target: PollTarget) {
+    if message_id.is_empty() {
+        return;
+    }
+    let mut targets = targets.lock();
+    targets.retain(|_, existing| existing.recorded_at.elapsed() < POLL_TARGET_TTL);
+    if !targets.contains_key(&message_id)
+        && targets.len() >= POLL_TARGET_CAPACITY
+        && let Some(oldest) = targets
+            .iter()
+            .min_by_key(|(_, existing)| existing.recorded_at)
+            .map(|(key, _)| key.clone())
+    {
+        targets.remove(&oldest);
+    }
+    targets.insert(message_id, target);
+}
+
+/// The poll a vote refers to, or `None` when this channel did not post it or
+/// the entry has expired. Expired entries are dropped on the way out.
+#[cfg(feature = "whatsapp-web")]
+fn lookup_poll_target(targets: &PollTargets, message_id: &str) -> Option<PollTarget> {
+    let mut targets = targets.lock();
+    let target = targets.get(message_id)?.clone();
+    if target.recorded_at.elapsed() >= POLL_TARGET_TTL {
+        targets.remove(message_id);
+        return None;
+    }
+    Some(target)
+}
+
+/// The inbound message one selected option becomes.
+///
+/// The poll decided when it was posted what its votes do: stay out of the way,
+/// open a turn in the chat it was posted in, or take the voter aside. One chat
+/// can carry both kinds - a list of wines on offer that answers each buyer, and
+/// a poll that only gathers opinions - which is why this travels per poll.
+///
+/// Taking the voter aside answers their own chat, addressed by the JID the
+/// vote was authored under. That is the address an ordinary direct message
+/// from them carries too, so the private answer and their next message share
+/// one conversation, and a voter WhatsApp addresses by LID keeps their LID.
+#[cfg(feature = "whatsapp-web")]
+fn vote_message(
+    alias: &str,
+    sender: &str,
+    voter: &wacore_binary::jid::Jid,
+    poll_chat: &str,
+    option: &str,
+    vote_reply: zeroclaw_api::channel::PollVoteReply,
+    passive_group_context: bool,
+    is_group: bool,
+) -> ChannelMessage {
+    use zeroclaw_api::channel::PollVoteReply;
+    let (addressed, reply_target) = match vote_reply {
+        PollVoteReply::Ignore => (false, poll_chat.to_string()),
+        PollVoteReply::InChat => (true, poll_chat.to_string()),
+        PollVoteReply::Direct => (true, voter.to_non_ad_string()),
+    };
+    ChannelMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        channel: "whatsapp".to_string(),
+        channel_alias: Some(alias.to_string()),
+        sender: sender.to_string(),
+        platform_sender_id: None,
+        reply_target,
+        content: format!("[choice]{option}"),
+        timestamp: chrono::Utc::now().timestamp() as u64,
+        thread_ts: None,
+        interruption_scope_id: None,
+        attachments: Vec::new(),
+        subject: None,
+        internal_sop_event: None,
+        // Only the poll's own setting decides this. An `ignore` poll asked a
+        // question and wants no answer, in a group whose messages are already
+        // context and in a direct chat alike, so the vote is recorded either
+        // way and starts no turn.
+        passive_context: !addressed,
+        explicitly_addressed: addressed,
+        conversation_scope: if addressed {
+            ChannelConversationScope::Sender
+        } else {
+            WhatsAppWebChannel::group_context_scope(passive_group_context, is_group)
+        },
+        references: Vec::new(),
+        // A vote is not spoken input.
+        voice_origin: false,
+    }
+}
+
+/// This device's own JID in the namespace a vote was authored under.
+///
+/// Poll-vote keys derive from the creator and voter identities, and the pair
+/// has to be homogeneous: a vote cast under LID only opens when the creator is
+/// named by LID too. The library's retry swaps both sides at once, so a mixed
+/// pair never resolves, whichever way round it starts. Groups address
+/// participants by LID and direct chats by phone number, so follow the voter.
+#[cfg(feature = "whatsapp-web")]
+fn vote_creator_identity(
+    voter: &wacore_binary::jid::Jid,
+    own_pn: Option<wacore_binary::jid::Jid>,
+    own_lid: Option<wacore_binary::jid::Jid>,
+) -> Option<wacore_binary::jid::Jid> {
+    if voter.is_lid() { own_lid } else { own_pn }
+}
+
+/// Option names for the hashes a decrypted vote carries. WhatsApp sends the
+/// SHA-256 of each selected option rather than its text, so the poll's own
+/// option list is the only way back to a name. Unknown hashes are skipped:
+/// they mean the vote does not belong to the options we recorded.
+#[cfg(feature = "whatsapp-web")]
+fn poll_option_names(options: &[String], selected: &[Vec<u8>]) -> Vec<String> {
+    let hashes: Vec<([u8; 32], &String)> = options
+        .iter()
+        .map(|name| (wacore::poll::compute_option_hash(name), name))
+        .collect();
+    selected
+        .iter()
+        .filter_map(|hash| {
+            hashes
+                .iter()
+                .find(|(option_hash, _)| option_hash.as_slice() == hash.as_slice())
+                .map(|(_, name)| (*name).clone())
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4847,6 +5164,32 @@ mod tests {
             .write_to(&mut bytes, format)
             .expect("encode test image");
         bytes.into_inner()
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn pairing_qr_is_surfaced_while_the_listener_runs() {
+        let fence = CancellationToken::new();
+        assert!(WhatsAppWebChannel::surface_pairing_qr(
+            "assistant",
+            "2@pairing-ref,noise,identity,adv",
+            &fence,
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn pairing_qr_from_a_stopped_listener_is_not_surfaced() {
+        // whatsapp-rust keeps rotating QR codes after disconnect; once the
+        // listener's fence is cancelled they must not reach the terminal or
+        // the login event stream.
+        let fence = CancellationToken::new();
+        fence.cancel();
+        assert!(!WhatsAppWebChannel::surface_pairing_qr(
+            "assistant",
+            "2@pairing-ref,noise,identity,adv",
+            &fence,
+        ));
     }
 
     /// A JPEG whose EXIF block says "rotate 90° clockwise to display"
@@ -4973,6 +5316,242 @@ mod tests {
         .apply_to(&mut size_only);
         assert_eq!((size_only.width, size_only.height), (Some(10), Some(20)));
         assert_eq!(size_only.jpeg_thumbnail, None);
+    }
+
+    // ── Poll votes ──
+
+    #[cfg(feature = "whatsapp-web")]
+    fn poll_target(options: &[&str]) -> PollTarget {
+        PollTarget {
+            secret: vec![7u8; 32],
+            options: options.iter().map(|o| (*o).to_string()).collect(),
+            vote_reply: zeroclaw_api::channel::PollVoteReply::Ignore,
+            recorded_at: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn a_recorded_poll_can_be_looked_up_and_an_unknown_one_cannot() {
+        let targets: PollTargets = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        record_poll_target(
+            &targets,
+            "POLL1".into(),
+            poll_target(&["Friday", "Saturday"]),
+        );
+
+        let found = lookup_poll_target(&targets, "POLL1").expect("the poll was recorded");
+        assert_eq!(found.options, vec!["Friday", "Saturday"]);
+        assert!(
+            lookup_poll_target(&targets, "SOMEONE-ELSES-POLL").is_none(),
+            "a poll this channel did not post has no secret to read it with"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn an_expired_poll_is_forgotten() {
+        let targets: PollTargets = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let mut expired = poll_target(&["Friday"]);
+        expired.recorded_at = std::time::Instant::now() - POLL_TARGET_TTL;
+        targets.lock().insert("OLD".to_string(), expired);
+
+        assert!(lookup_poll_target(&targets, "OLD").is_none());
+        assert!(
+            targets.lock().is_empty(),
+            "the expired entry is dropped rather than kept around"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn the_registry_stays_bounded_and_keeps_the_newest_polls() {
+        let targets: PollTargets = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        for index in 0..POLL_TARGET_CAPACITY + 5 {
+            let mut target = poll_target(&["Friday"]);
+            // Ordered ages, oldest first, so eviction order is observable.
+            target.recorded_at = std::time::Instant::now()
+                - std::time::Duration::from_secs((POLL_TARGET_CAPACITY + 5 - index) as u64);
+            record_poll_target(&targets, format!("POLL{index}"), target);
+        }
+
+        assert_eq!(targets.lock().len(), POLL_TARGET_CAPACITY);
+        assert!(
+            lookup_poll_target(&targets, "POLL0").is_none(),
+            "the oldest poll is the one dropped"
+        );
+        assert!(
+            lookup_poll_target(&targets, &format!("POLL{}", POLL_TARGET_CAPACITY + 4)).is_some(),
+            "the newest poll is kept"
+        );
+    }
+
+    /// Group and direct alike: `ignore` means the vote is recorded and
+    /// nothing else. An earlier revision read `passive_group_context` here,
+    /// so a group without that setting - and every direct chat - had the
+    /// agent answering voters the poll never asked to answer.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn an_ignored_vote_is_recorded_without_starting_a_turn() {
+        use zeroclaw_api::channel::PollVoteReply;
+        let group = "120363000000000001@g.us";
+        let voter: Jid = "15550001111@s.whatsapp.net".parse().expect("voter");
+
+        for (passive_group_context, is_group, chat) in [
+            (true, true, group),
+            (false, true, group),
+            (false, false, "15550001111@s.whatsapp.net"),
+        ] {
+            let msg = vote_message(
+                "ventas",
+                "+15550001111",
+                &voter,
+                chat,
+                "Malbec",
+                PollVoteReply::Ignore,
+                passive_group_context,
+                is_group,
+            );
+            assert!(
+                msg.passive_context,
+                "an ignored vote is context only (passive_group_context={passive_group_context}, is_group={is_group})"
+            );
+            assert!(
+                !msg.explicitly_addressed,
+                "an ignored vote asks the agent for nothing (passive_group_context={passive_group_context}, is_group={is_group})"
+            );
+            assert_eq!(msg.content, "[choice]Malbec");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn an_in_chat_vote_answers_where_the_poll_was_posted() {
+        use zeroclaw_api::channel::PollVoteReply;
+        let group = "120363000000000001@g.us";
+
+        let msg = vote_message(
+            "ventas",
+            "+15550001111",
+            &"15550001111@s.whatsapp.net".parse::<Jid>().expect("voter"),
+            group,
+            "Malbec",
+            PollVoteReply::InChat,
+            true,
+            true,
+        );
+
+        assert_eq!(
+            msg.reply_target, group,
+            "the answer goes to the poll's chat"
+        );
+        assert!(msg.explicitly_addressed, "the poll asked for an answer");
+        assert!(!msg.passive_context, "an answered vote is not mere context");
+    }
+
+    /// A private answer has to land in the voter's ordinary conversation:
+    /// their chat address, not a bare phone number. An earlier revision sent
+    /// the normalized number, which keys a different session from the one
+    /// their next direct message opens, and dropped a LID voter's namespace.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn a_direct_vote_answers_the_voter_in_their_own_chat() {
+        use zeroclaw_api::channel::PollVoteReply;
+        let group = "120363000000000001@g.us";
+
+        // As a vote arrives: a group participant, addressed by phone number or
+        // by LID, and carrying the device the vote was cast from.
+        for (voter, chat) in [
+            (
+                "15550001111:12@s.whatsapp.net",
+                "15550001111@s.whatsapp.net",
+            ),
+            ("76188559093817:3@lid", "76188559093817@lid"),
+        ] {
+            let voter: Jid = voter.parse().expect("voter");
+            let msg = vote_message(
+                "ventas",
+                "+15550001111",
+                &voter,
+                group,
+                "Malbec",
+                PollVoteReply::Direct,
+                true,
+                true,
+            );
+
+            assert_eq!(
+                msg.reply_target,
+                WhatsAppWebChannel::compute_reply_target(chat),
+                "a vote and a direct message from {voter} address the same chat"
+            );
+            assert!(msg.explicitly_addressed, "the poll asked for an answer");
+            assert!(!msg.passive_context);
+        }
+    }
+
+    /// The bug this guards cost a live debugging session: a mixed pair
+    /// (phone-number creator, LID voter) fails GCM verification, and the
+    /// library's retry swaps both sides at once so it never lands on a
+    /// homogeneous pair either.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn the_creator_identity_follows_the_voters_namespace() {
+        let pn: Jid = "15550001111@s.whatsapp.net".parse().expect("pn");
+        let lid: Jid = "192837465500000@lid".parse().expect("lid");
+        let lid_voter: Jid = "261654491213840:3@lid".parse().expect("lid voter");
+        let pn_voter: Jid = "15550002222@s.whatsapp.net".parse().expect("pn voter");
+
+        assert_eq!(
+            vote_creator_identity(&lid_voter, Some(pn.clone()), Some(lid.clone())),
+            Some(lid),
+            "a group vote is authored under LID, so the creator must be the LID too"
+        );
+        assert_eq!(
+            vote_creator_identity(&pn_voter, Some(pn.clone()), None),
+            Some(pn),
+            "a direct chat is addressed by phone number"
+        );
+        assert_eq!(
+            vote_creator_identity(
+                &lid_voter,
+                Some("15550001111@s.whatsapp.net".parse().expect("pn")),
+                None
+            ),
+            None,
+            "without our own LID there is no homogeneous pair to try"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn votes_resolve_to_the_option_names_they_hash_to() {
+        let options: Vec<String> = ["Judas Malbec", "Colosso Malbec", "La Bestia"]
+            .iter()
+            .map(|o| (*o).to_string())
+            .collect();
+        let selected = vec![
+            wacore::poll::compute_option_hash("La Bestia").to_vec(),
+            wacore::poll::compute_option_hash("Judas Malbec").to_vec(),
+        ];
+
+        assert_eq!(
+            poll_option_names(&options, &selected),
+            vec!["La Bestia", "Judas Malbec"],
+            "a multi-select vote reports every option it picked, in vote order"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn a_vote_for_an_option_this_poll_does_not_have_is_skipped() {
+        let options = vec!["Judas Malbec".to_string()];
+        let selected = vec![
+            wacore::poll::compute_option_hash("Something else").to_vec(),
+            wacore::poll::compute_option_hash("Judas Malbec").to_vec(),
+        ];
+
+        assert_eq!(poll_option_names(&options, &selected), vec!["Judas Malbec"]);
     }
 
     /// Wrap one message in the single-entry batch that 0.7 delivers for live
@@ -6168,6 +6747,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let context = WhatsAppInboundContext {
+            poll_targets: Arc::new(Mutex::new(std::collections::HashMap::new())),
             tx,
             alias: Arc::new("persistent-lid-test".to_string()),
             peer_resolver: Arc::new(|| vec!["+15551234567".to_string()]),
@@ -6312,6 +6892,7 @@ mod tests {
         let context_for =
             |mode: &Mode, policy: &Policy, tx: tokio::sync::mpsc::Sender<ChannelMessage>| {
                 WhatsAppInboundContext {
+                    poll_targets: Arc::new(Mutex::new(std::collections::HashMap::new())),
                     tx,
                     alias: Arc::new("both-modes-policy".to_string()),
                     peer_resolver: Arc::new(|| vec![format!("+{ALLOWED}")]),
@@ -6378,6 +6959,47 @@ mod tests {
                     "{mode:?} must honour policy=ignore for a listed sender (is_group={is_group})"
                 );
             }
+
+            // Drive caption extraction through the real sender/group policy,
+            // mention gate and dispatch tail. No structured mention is present:
+            // without the caption fallback this event would be dropped.
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let mut context = context_for(&mode, &Policy::Allowlist, tx);
+            context.mention_only = true;
+            *context.bot_phone.lock() = Some("15550001234".to_string());
+            let caption = "@15550001234 what is this?";
+            let captioned = single_message_event(
+                Arc::new(captioned_media("image", Some(caption))),
+                Arc::new(MessageInfo {
+                    source: MessageSource {
+                        chat: GROUP_JID.parse().unwrap(),
+                        sender: Jid::pn(ALLOWED),
+                        is_from_me: false,
+                        is_group: true,
+                        ..Default::default()
+                    },
+                    id: format!("caption-{mode:?}"),
+                    r#type: "image".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    ..Default::default()
+                }),
+            );
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                WhatsAppWebChannel::handle_inbound_message_event(&captioned, &client, &context),
+            )
+            .await
+            .expect("caption handling must finish without a paired account");
+            let dispatched = rx
+                .try_recv()
+                .expect("allowed captioned group mention must reach dispatch");
+            assert_eq!(dispatched.content, caption);
+            assert_eq!(dispatched.sender, format!("+{ALLOWED}"));
+            assert_eq!(dispatched.reply_target, GROUP_JID);
+            assert!(
+                rx.try_recv().is_err(),
+                "one caption must dispatch only once"
+            );
         }
     }
 
@@ -6439,6 +7061,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let context = WhatsAppInboundContext {
+            poll_targets: Arc::new(Mutex::new(std::collections::HashMap::new())),
             tx,
             alias: Arc::new("batch-order".to_string()),
             peer_resolver: Arc::new(|| vec![format!("+{ALLOWED}")]),
@@ -6538,6 +7161,7 @@ mod tests {
 
         let context_for =
             |mode: Mode, tx: tokio::sync::mpsc::Sender<ChannelMessage>| WhatsAppInboundContext {
+                poll_targets: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 tx,
                 alias: Arc::new("self-chat-policy".to_string()),
                 peer_resolver: Arc::new(Vec::new),
@@ -6633,6 +7257,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let context = WhatsAppInboundContext {
+            poll_targets: Arc::new(Mutex::new(std::collections::HashMap::new())),
             tx,
             alias: Arc::new("business-dm-provenance".to_string()),
             peer_resolver: Arc::new(Vec::new),
@@ -7201,6 +7826,120 @@ mod tests {
             WhatsAppWebChannel::media_fallback_content(String::new(), &msg),
             ""
         );
+    }
+
+    /// The content the inbound handler builds before mention gating.
+    #[cfg(feature = "whatsapp-web")]
+    fn inbound_content(msg: &waproto::whatsapp::Message) -> String {
+        WhatsAppWebChannel::media_fallback_content(
+            WhatsAppWebChannel::inbound_text(msg).trim().to_string(),
+            msg,
+        )
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn captioned_media(kind: &str, caption: Option<&str>) -> waproto::whatsapp::Message {
+        let caption = caption.map(str::to_string);
+        let mut msg = waproto::whatsapp::Message::default();
+        match kind {
+            "image" => {
+                msg.image_message = waproto::whatsapp::message::ImageMessage {
+                    caption,
+                    ..Default::default()
+                }
+                .into();
+            }
+            "video" => {
+                msg.video_message = waproto::whatsapp::message::VideoMessage {
+                    caption,
+                    ..Default::default()
+                }
+                .into();
+            }
+            "document" => {
+                msg.document_message = waproto::whatsapp::message::DocumentMessage {
+                    caption,
+                    ..Default::default()
+                }
+                .into();
+            }
+            other => panic!("unknown media kind {other}"),
+        }
+        msg
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn inbound_content_uses_media_captions() {
+        for kind in ["image", "video", "document"] {
+            let msg = captioned_media(kind, Some("  what is this?  "));
+            assert_eq!(inbound_content(&msg), "what is this?", "{kind}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn inbound_content_keeps_placeholders_for_media_without_caption() {
+        for (kind, placeholder) in [
+            ("image", "[Image]"),
+            ("video", "[Video]"),
+            ("document", "[Document]"),
+        ] {
+            assert_eq!(inbound_content(&captioned_media(kind, None)), placeholder);
+            assert_eq!(
+                inbound_content(&captioned_media(kind, Some("   "))),
+                placeholder
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn inbound_content_reads_captions_inside_wrappers() {
+        let document_with_caption = waproto::whatsapp::Message {
+            document_with_caption_message: waproto::whatsapp::message::FutureProofMessage {
+                message: captioned_media("document", Some("invoice")).into(),
+            }
+            .into(),
+            ..Default::default()
+        };
+        assert_eq!(inbound_content(&document_with_caption), "invoice");
+
+        let ephemeral = waproto::whatsapp::Message {
+            ephemeral_message: waproto::whatsapp::message::FutureProofMessage {
+                message: captioned_media("image", Some("receipt")).into(),
+            }
+            .into(),
+            ..Default::default()
+        };
+        assert_eq!(inbound_content(&ephemeral), "receipt");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn inbound_content_leaves_text_messages_unchanged() {
+        let conversation = waproto::whatsapp::Message {
+            conversation: Some("hello".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(inbound_content(&conversation), "hello");
+        assert_eq!(
+            inbound_content(&extended_text_reply("200@lid", &[])),
+            "expand the previous response"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn captioned_media_text_mention_addresses_the_bot() {
+        let msg = captioned_media("image", Some("@15550001234 what is this?"));
+        let content = inbound_content(&msg);
+        assert!(WhatsAppWebChannel::is_message_addressed_to_bot(
+            &msg,
+            &content,
+            "15550001234",
+            None
+        ));
     }
 
     #[test]
@@ -7929,6 +8668,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let context = WhatsAppInboundContext {
+            poll_targets: Arc::new(Mutex::new(std::collections::HashMap::new())),
             tx,
             alias: Arc::new(alias.to_string()),
             peer_resolver: Arc::new(|| vec![format!("+{SENDER_PHONE}")]),
@@ -8044,6 +8784,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let context = WhatsAppInboundContext {
+            poll_targets: Arc::new(Mutex::new(std::collections::HashMap::new())),
             tx,
             alias: Arc::new(alias.to_string()),
             peer_resolver: Arc::new(|| vec![format!("+{SENDER_PHONE}")]),
@@ -8747,6 +9488,7 @@ mod tests {
         // than a permissive policy.
         let context_for = |self_chat_mode: bool, tx: tokio::sync::mpsc::Sender<ChannelMessage>| {
             WhatsAppInboundContext {
+                poll_targets: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 tx,
                 alias: Arc::new("default".to_string()),
                 peer_resolver: Arc::new(|| vec![format!("+{OPERATOR}")]),

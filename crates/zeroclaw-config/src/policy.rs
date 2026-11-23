@@ -1043,11 +1043,147 @@ enum QuoteState {
     Double,
 }
 
+/// Which POSIX shell will parse a command, when that is known.
+///
+/// POSIX shells disagree on a few forms that decide where a heredoc body ends
+/// or whether text runs as a command at all: bash expands `<<$'EOF'` and reads
+/// `((x << 1))` as arithmetic, while dash ends that heredoc at a literal
+/// `$EOF` line and runs `((...))` as nested subshells. The splitter refuses
+/// those forms for [`PosixShell::Unknown`] and follows bash for
+/// [`PosixShell::Bash`]. See [`SecurityPolicy::command_shell`] for how a
+/// shell is identified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PosixShell {
+    /// Any POSIX shell. Forms the shells read differently are refused.
+    #[default]
+    Unknown,
+    /// GNU bash, in normal or POSIX mode (invoked as `sh`). The modeled forms
+    /// read the same in bash 3.2 through 5.3, in either mode.
+    Bash,
+}
+
+/// The language a command is checked in: the dialect, plus which POSIX shell
+/// when the dialect is POSIX and the shell is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShellGrammar {
+    dialect: ShellDialect,
+    /// Ignored unless `dialect` is [`ShellDialect::Posix`].
+    posix_shell: PosixShell,
+}
+
+/// A dialect alone says nothing about which POSIX shell runs, so it converts
+/// to the portable grammar.
+impl From<ShellDialect> for ShellGrammar {
+    fn from(dialect: ShellDialect) -> Self {
+        Self {
+            dialect,
+            posix_shell: PosixShell::Unknown,
+        }
+    }
+}
+
+/// The shell a runtime will run a command with, as the runtime reports it
+/// before building the command. Pass it to [`SecurityPolicy::command_shell`].
+#[derive(Debug, Clone, Copy)]
+pub struct ShellTarget<'a> {
+    /// The runtime's shell language.
+    pub dialect: ShellDialect,
+    /// The runtime's [`RuntimeAdapter::shell_program`]: the configured
+    /// program before host resolution. `None` when the host cannot inspect
+    /// the program that runs (a container or WASM runtime).
+    ///
+    /// [`RuntimeAdapter::shell_program`]: crate::platform::RuntimeAdapter::shell_program
+    pub program: Option<&'a std::ffi::OsStr>,
+    /// The `PATH` the runtime will resolve a bare `program` on: a connected
+    /// TUI's forwarded `PATH`, or `None` for the daemon's own.
+    pub effective_path: Option<&'a std::ffi::OsStr>,
+}
+
+impl<'a> ShellTarget<'a> {
+    /// What `runtime` reports, for a command built with `effective_path`.
+    pub fn of(
+        runtime: &'a dyn crate::platform::RuntimeAdapter,
+        effective_path: Option<&'a std::ffi::OsStr>,
+    ) -> Self {
+        Self {
+            dialect: runtime.shell_dialect(),
+            program: runtime.shell_program(),
+            effective_path,
+        }
+    }
+}
+
+/// The grammar a command is checked in, chosen once by
+/// [`SecurityPolicy::command_shell`] and carried through the checks to
+/// [`SecurityPolicy::confirm_built_shell`], so every check reads the command
+/// the same way and the program that runs is held to that reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandShell {
+    grammar: ShellGrammar,
+}
+
+/// Identify the POSIX shell a runtime will run, from the program it reports
+/// and the `PATH` it will resolve that program on (see
+/// [`SecurityPolicy::command_shell`]).
+///
+/// The program is resolved as the native runtime resolves it, on the same
+/// `PATH`, to its canonical file; nothing is built. It is bash only when:
+/// - The runtime reports a program. A container or WASM runtime runs a
+///   program the host cannot inspect.
+/// - No container sandbox can run the command. A container runs the
+///   configured name or path inside its image, where it can be any shell.
+///   Host sandboxes run the canonical host file.
+/// - The program resolves to an executable named exactly `bash`. A bare name
+///   counts when it resolves to bash on that `PATH`.
+///
+/// Everything else, including a `bash` link to another shell, is `Unknown`.
+/// The runtime may still build a different program than this predicts, so a
+/// command read as bash is checked again against the built program
+/// ([`SecurityPolicy::confirm_built_shell`]).
+fn resolve_posix_shell(
+    program: Option<&std::ffi::OsStr>,
+    effective_path: Option<&std::ffi::OsStr>,
+    container_sandbox_possible: bool,
+) -> PosixShell {
+    #[cfg(unix)]
+    {
+        let Some(program) = program else {
+            return PosixShell::Unknown;
+        };
+        if container_sandbox_possible {
+            return PosixShell::Unknown;
+        }
+        let resolved = match effective_path {
+            Some(path) => {
+                crate::platform::resolve_executable_with_path(program, std::env::split_paths(path))
+            }
+            None => crate::platform::resolve_executable(program),
+        };
+        match resolved {
+            Ok(canonical) if is_bash(&canonical) => PosixShell::Bash,
+            _ => PosixShell::Unknown,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (program, effective_path, container_sandbox_possible);
+        PosixShell::Unknown
+    }
+}
+
+/// Whether a canonical executable path names bash.
+#[cfg(unix)]
+fn is_bash(canonical: &Path) -> bool {
+    canonical.file_name() == Some(std::ffi::OsStr::new("bash"))
+}
+
 /// A heredoc queued on a command line, waiting for its body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HeredocDelimiter {
-    /// The terminator line, or `None` when it cannot be proven.
-    terminator: Option<String>,
+    /// The terminator line as bytes, or `None` when it cannot be proven.
+    /// Bash compares terminator lines bytewise, and `$'\xc3'` can name bytes
+    /// that are not UTF-8 on their own, so the terminator is not a `String`.
+    terminator: Option<Vec<u8>>,
     /// `<<-`: leading tabs are removed from the start of each logical line
     /// before it is compared.
     strip_tabs: bool,
@@ -1095,18 +1231,21 @@ struct SegmentFrame {
     /// real outer terminator as the inner body. `None` for a grouping
     /// subshell, which shares the enclosing queue just as both shells do.
     outer_heredocs: Option<VecDeque<HeredocDelimiter>>,
-    /// For a `$((` frame: text of the expression, held back until the frame
-    /// closes. It runs no command only if the expression is confirmed.
+    /// The outer frame of `$((`, or of a bare `((` when the shell is bash:
+    /// the frame that holds the expression's text until it is confirmed.
+    arithmetic_root: bool,
+    /// For an arithmetic root: text of the expression, held back until the
+    /// frame closes. It runs no command only if the expression is confirmed.
     arithmetic_text: Vec<String>,
-    /// For a `$((` frame: whether its first inner group has closed yet.
+    /// For an arithmetic root: whether its first inner group has closed yet.
     first_group_closed: bool,
-    /// For a `$((` frame: the second `(` closed with `)` right after it.
+    /// For an arithmetic root: the second `(` closed with `)` right after it.
     /// Bash then reads arithmetic, and dash reads `$((` as arithmetic always,
     /// so neither runs the text as commands.
     arithmetic_confirmed: bool,
-    /// A grouping `(` followed at once by `(`. Bash reads `((...))` as an
-    /// arithmetic command and dash as nested subshells, so a `<<` inside is a
-    /// shift to one and a heredoc to the other.
+    /// A bare `((` when the shell is not known to be bash. Bash reads
+    /// `((...))` as an arithmetic command and dash as nested subshells, so a
+    /// `<<` inside is a shift to one and a heredoc to the other.
     double_paren: bool,
 }
 
@@ -1242,6 +1381,7 @@ fn open_segment_frame(
     // Arithmetic carries into the parentheses of an arithmetic expression,
     // but a command substitution or backtick inside it is ordinary shell
     // syntax again (heredocs included).
+    let arithmetic_root = arithmetic;
     let arithmetic = arithmetic
         || (placeholder.is_none() && frames.last().is_some_and(|frame| frame.arithmetic));
     frames.push(SegmentFrame {
@@ -1249,6 +1389,7 @@ fn open_segment_frame(
         resume,
         resume_quote: *quote,
         arithmetic,
+        arithmetic_root,
         nest: SegmentNest::default(),
         outer_heredocs: placeholder
             .is_some()
@@ -1266,10 +1407,7 @@ fn open_segment_frame(
 /// [`SegmentFrame::arithmetic_confirmed`]); everywhere else it is a segment.
 fn emit_segment(frames: &mut [SegmentFrame], segments: &mut Vec<String>, current: &mut String) {
     let root = if frames.last().is_some_and(|frame| frame.arithmetic) {
-        frames
-            .iter_mut()
-            .rev()
-            .find(|frame| frame.arithmetic && frame.resume.is_some())
+        frames.iter_mut().rev().find(|frame| frame.arithmetic_root)
     } else {
         None
     };
@@ -1361,6 +1499,7 @@ fn read_heredoc_delimiter(
     current: &mut String,
     backslash_is_literal: bool,
     in_backtick: bool,
+    posix_shell: PosixShell,
 ) -> Option<Result<HeredocDelimiter, ()>> {
     let strip_tabs = if let Some(dash) = chars.next_if_eq(&'-') {
         current.push(dash);
@@ -1486,7 +1625,7 @@ fn read_heredoc_delimiter(
     if in_backtick && raw.contains(['\\', '`']) {
         return Some(Err(()));
     }
-    let Some(delimiter) = remove_heredoc_delimiter_quotes(&raw) else {
+    let Some(delimiter) = remove_heredoc_delimiter_quotes(&raw, posix_shell) else {
         // `$'...'`, `$"..."`, and any other form whose terminator depends on
         // the shell. The opener is still a heredoc. Skipping its lines against a guessed
         // terminator is the bypass, so the caller scans them instead.
@@ -1495,7 +1634,7 @@ fn read_heredoc_delimiter(
     // A newline in the delimiter is not a one-line terminator. An empty delimiter is the blank line after `<<''`, and a
     // carriage return can end a physical line. Both are matched before the
     // body line is trimmed.
-    if delimiter.contains('\n') {
+    if delimiter.contains(&b'\n') {
         return Some(Err(()));
     }
     // A backslash-newline is removed before the word is read, so it is not
@@ -1513,19 +1652,21 @@ fn read_heredoc_delimiter(
     }))
 }
 
-/// Apply shell quote removal to a heredoc delimiter word. `None` means the
-/// word's terminator depends on the shell or is not modeled, so no body may be
-/// skipped against it.
+/// Apply shell quote removal to a heredoc delimiter word, returning the
+/// terminator line's bytes. `None` means the terminator depends on the shell
+/// or is not modeled, so no body may be skipped against it.
 ///
-/// `$'...'` and `$"..."` are refused. Bash expands `$'...'` (and translates
-/// `$"..."` through the locale catalog) before matching the terminator, but
-/// dash, the usual `sh`, has neither: `<<$'EOF'` ends at a literal `$EOF`
-/// line there, and the commands after that line run while a bash reading
-/// still treats them as body. Modeling either shell hides commands from the
-/// other, and the bash expansion was also byte-oriented (`\0` truncation,
-/// `\xc3`) in ways a `String` cannot represent.
-fn remove_heredoc_delimiter_quotes(raw: &str) -> Option<String> {
-    let mut delimiter = String::new();
+/// `$"..."` is always refused: bash translates it through the locale catalog.
+/// `$'...'` depends on the shell. Bash expands it before matching the
+/// terminator, while dash (the usual `sh`) has no `$'...'` and ends `<<$'EOF'`
+/// at a literal `$EOF` line. Modeling either one hides the commands after the
+/// body from the other, so it is refused unless the shell is known to be
+/// bash, and then expanded as bash does (see [`expand_bash_ansi_c_quote`]).
+fn remove_heredoc_delimiter_quotes(raw: &str, posix_shell: PosixShell) -> Option<Vec<u8>> {
+    let mut delimiter = Vec::new();
+    let push = |delimiter: &mut Vec<u8>, ch: char| {
+        delimiter.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+    };
     let mut chars = raw.chars().peekable();
     let mut quote = QuoteState::None;
     while let Some(ch) = chars.next() {
@@ -1533,7 +1674,13 @@ fn remove_heredoc_delimiter_quotes(raw: &str) -> Option<String> {
             (QuoteState::Single, '\'') | (QuoteState::Double, '"') => quote = QuoteState::None,
             (QuoteState::None, '\'') => quote = QuoteState::Single,
             (QuoteState::None, '"') => quote = QuoteState::Double,
-            (QuoteState::None, '$') if matches!(chars.peek(), Some('\'' | '"')) => return None,
+            (QuoteState::None, '$') if chars.next_if_eq(&'\'').is_some() => {
+                if posix_shell != PosixShell::Bash {
+                    return None;
+                }
+                expand_bash_ansi_c_quote(&mut chars, &mut delimiter)?;
+            }
+            (QuoteState::None, '$') if chars.peek() == Some(&'"') => return None,
             // A bare `$` or backtick in a heredoc delimiter is literal. Neither
             // shell expands `<<$EOF`, `<<"$EOF"`, or `<<`echo EOF``. Treating
             // every `$` as an unsupported expansion opened no heredoc, so a
@@ -1543,18 +1690,115 @@ fn remove_heredoc_delimiter_quotes(raw: &str) -> Option<String> {
                 Some(escaped)
                     if quote == QuoteState::None || matches!(escaped, '$' | '`' | '"' | '\\') =>
                 {
-                    delimiter.push(escaped);
+                    push(&mut delimiter, escaped);
                 }
                 Some(escaped) => {
-                    delimiter.push('\\');
-                    delimiter.push(escaped);
+                    push(&mut delimiter, '\\');
+                    push(&mut delimiter, escaped);
                 }
-                None => delimiter.push('\\'),
+                None => push(&mut delimiter, '\\'),
             },
-            _ => delimiter.push(ch),
+            _ => push(&mut delimiter, ch),
         }
     }
     Some(delimiter)
+}
+
+/// Expand the body of a bash `$'...'` quote in a heredoc delimiter, after the
+/// opening `$'`, through its closing `'`. Returns `None` for an escape whose
+/// meaning varies, or an unclosed quote.
+///
+/// Every rule here reads the same in bash 3.2 through 5.3, in normal and
+/// POSIX mode, as a heredoc delimiter:
+/// - `\a \b \e \E \f \n \r \t \v` are control bytes, and `\\ \' \" \?` the
+///   character itself.
+/// - `\xH` and `\xHH` are one byte. `\x` with no hex digit stays `\x`.
+/// - One to three octal digits are one byte, masked to eight bits (`\777` is
+///   `0xff`, `\400` is NUL).
+/// - Any other escape (`\q`, `\8`) keeps its backslash.
+/// - A NUL byte ends the quoted part: the rest of it is dropped, escapes
+///   still apply while finding its end, and text after the quote stays in the
+///   delimiter (`$'E\0F'X` is `EX`).
+///
+/// `\c`, `\u`, and `\U` are refused: `\c?`, `\c\\`, and the Unicode escapes
+/// changed meaning between bash 3.2 and 4.x, and `\cA` in a delimiter does
+/// not match its expansion as a word. A backslash-newline is refused too.
+fn expand_bash_ansi_c_quote(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    delimiter: &mut Vec<u8>,
+) -> Option<()> {
+    let mut truncated = false;
+    loop {
+        let ch = chars.next()?;
+        let byte = match ch {
+            '\'' => return Some(()),
+            '\\' => {
+                let escaped = chars.next()?;
+                match escaped {
+                    'a' => Some(0x07),
+                    'b' => Some(0x08),
+                    'e' | 'E' => Some(0x1b),
+                    'f' => Some(0x0c),
+                    'n' => Some(b'\n'),
+                    'r' => Some(b'\r'),
+                    't' => Some(b'\t'),
+                    'v' => Some(0x0b),
+                    '\\' | '\'' | '"' | '?' => Some(escaped as u8),
+                    'x' => {
+                        let mut value: u32 = 0;
+                        let mut digits = 0;
+                        while digits < 2 {
+                            let Some(digit) = chars.next_if(char::is_ascii_hexdigit) else {
+                                break;
+                            };
+                            value = value * 16 + digit.to_digit(16)?;
+                            digits += 1;
+                        }
+                        if digits == 0 {
+                            if !truncated {
+                                delimiter.extend_from_slice(b"\\x");
+                            }
+                            None
+                        } else {
+                            u8::try_from(value).ok()
+                        }
+                    }
+                    '0'..='7' => {
+                        let mut value = escaped.to_digit(8)?;
+                        let mut digits = 1;
+                        while digits < 3 {
+                            let Some(digit) = chars.next_if(|next| matches!(next, '0'..='7'))
+                            else {
+                                break;
+                            };
+                            value = value * 8 + digit.to_digit(8)?;
+                            digits += 1;
+                        }
+                        u8::try_from(value & 0xff).ok()
+                    }
+                    'c' | 'u' | 'U' | '\n' => return None,
+                    other => {
+                        if !truncated {
+                            delimiter.push(b'\\');
+                            delimiter.extend_from_slice(other.encode_utf8(&mut [0; 4]).as_bytes());
+                        }
+                        None
+                    }
+                }
+            }
+            other => {
+                if !truncated {
+                    delimiter.extend_from_slice(other.encode_utf8(&mut [0; 4]).as_bytes());
+                }
+                None
+            }
+        };
+        match byte {
+            Some(0) => truncated = true,
+            Some(byte) if !truncated => delimiter.push(byte),
+            _ => {}
+        }
+    }
 }
 
 /// Split a command into the simple commands a shell would run, so each one
@@ -1588,11 +1832,12 @@ fn remove_heredoc_delimiter_quotes(raw: &str) -> Option<String> {
 /// before the command containing it.
 fn split_unquoted_segments_checked(
     command: &str,
-    dialect: ShellDialect,
+    shell: impl Into<ShellGrammar>,
 ) -> Result<Vec<String>, UnreadableHeredoc> {
-    let (mut segments, balanced) = scan_unquoted_segments(command, dialect, true)?;
+    let shell = shell.into();
+    let (mut segments, balanced) = scan_unquoted_segments(command, shell, true)?;
     if !balanced {
-        let (flat, _) = scan_unquoted_segments(command, dialect, false)?;
+        let (flat, _) = scan_unquoted_segments(command, shell, false)?;
         segments.extend(flat);
     }
     Ok(segments)
@@ -1604,8 +1849,8 @@ fn split_unquoted_segments_checked(
 /// command. Either guess is a bypass, so the command is refused.
 struct UnreadableHeredoc;
 
-fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> {
-    split_unquoted_segments_checked(command, dialect).unwrap_or_default()
+fn split_unquoted_segments(command: &str, shell: impl Into<ShellGrammar>) -> Vec<String> {
+    split_unquoted_segments_checked(command, shell).unwrap_or_default()
 }
 
 /// One pass of [`split_unquoted_segments_checked`]. `model_substitutions`
@@ -1613,9 +1858,10 @@ fn split_unquoted_segments(command: &str, dialect: ShellDialect) -> Vec<String> 
 /// returned flag is `false` when that model ended unbalanced.
 fn scan_unquoted_segments(
     command: &str,
-    dialect: ShellDialect,
+    shell: ShellGrammar,
     model_substitutions: bool,
 ) -> Result<(Vec<String>, bool), UnreadableHeredoc> {
+    let dialect = shell.dialect;
     let mut segments = Vec::new();
     let mut current = String::new();
     let mut quote = QuoteState::None;
@@ -1862,10 +2108,11 @@ fn scan_unquoted_segments(
                             continue;
                         }
                         let bash_ends =
-                            delim.as_deref() == Some(format!("{prefix}{bash_line}").as_str());
+                            delim.as_deref() == Some(format!("{prefix}{bash_line}").as_bytes());
                         let dash_ends = dash_at_line_start
-                            && delim.as_deref() == Some(strip(&physical).as_str());
-                        if bash_ends != dash_ends {
+                            && delim.as_deref() == Some(strip(&physical).as_bytes());
+                        // Follow bash when it is the shell that runs the command.
+                        if bash_ends != dash_ends && shell.posix_shell != PosixShell::Bash {
                             return Err(UnreadableHeredoc);
                         }
                         let ends = bash_ends;
@@ -2005,6 +2252,7 @@ fn scan_unquoted_segments(
                                     &mut current,
                                     backslash_is_literal,
                                     in_backtick,
+                                    shell.posix_shell,
                                 ) {
                                     // A proven one-line delimiter. Its body is
                                     // data, so it is safe to skip.
@@ -2053,10 +2301,14 @@ fn scan_unquoted_segments(
                                 false,
                             ),
                             // A subshell, or other `(` syntax (`f()`, `arr=(...)`)
-                            // that is still a word boundary.
+                            // that is still a word boundary. A bare `((` is an
+                            // arithmetic command to bash (with the same `))`
+                            // test as `$((`) and nested subshells to dash.
                             _ => {
-                                let in_arithmetic_group =
-                                    frames.last().is_some_and(|frame| frame.arithmetic);
+                                let double_paren = chars.peek() == Some(&'(')
+                                    && !frames.last().is_some_and(|frame| frame.arithmetic);
+                                let bash_arithmetic =
+                                    double_paren && shell.posix_shell == PosixShell::Bash;
                                 open_segment_frame(
                                     &mut frames,
                                     &mut segments,
@@ -2065,10 +2317,10 @@ fn scan_unquoted_segments(
                                     &mut pending_heredocs,
                                     SegmentFrameKind::Paren,
                                     None,
-                                    false,
+                                    bash_arithmetic,
                                 );
-                                if !in_arithmetic_group
-                                    && chars.peek() == Some(&'(')
+                                if double_paren
+                                    && !bash_arithmetic
                                     && let Some(frame) = frames.last_mut()
                                 {
                                     frame.double_paren = true;
@@ -2082,16 +2334,15 @@ fn scan_unquoted_segments(
                                 .last()
                                 .is_some_and(|frame| frame.kind == SegmentFrameKind::Paren)
                         {
-                            // Closing the first group of a `$((` frame. If `)`
-                            // follows at once, the expression is arithmetic.
+                            // Closing the first group of an arithmetic root. If
+                            // `)` follows at once, the expression is arithmetic.
                             let group_of_root = frames.len() >= 2
                                 && frames.last().is_some_and(|frame| {
-                                    frame.arithmetic && frame.resume.is_none()
+                                    frame.arithmetic && !frame.arithmetic_root
                                 });
                             if group_of_root
                                 && let Some(root) = frames.iter_mut().rev().nth(1)
-                                && root.arithmetic
-                                && root.resume.is_some()
+                                && root.arithmetic_root
                                 && !root.first_group_closed
                             {
                                 root.first_group_closed = true;
@@ -4125,17 +4376,21 @@ impl SecurityPolicy {
 
     /// Classify command risk. Any high-risk segment marks the whole command high.
     pub fn command_risk_level(&self, command: &str) -> CommandRiskLevel {
-        self.command_risk_level_for_posix_like_shell(command, ShellDialect::Posix)
+        self.command_risk_level_for_posix_like_shell(
+            command,
+            ShellGrammar::from(ShellDialect::Posix),
+        )
     }
 
     fn command_risk_level_for_posix_like_shell(
         &self,
         command: &str,
-        dialect: ShellDialect,
+        shell: ShellGrammar,
     ) -> CommandRiskLevel {
+        let dialect = shell.dialect;
         let mut saw_medium = false;
 
-        let Ok(segments) = split_unquoted_segments_checked(command, dialect) else {
+        let Ok(segments) = split_unquoted_segments_checked(command, shell) else {
             // The body boundary cannot be proven, so the risk of the commands
             // after it cannot be proven either.
             return CommandRiskLevel::High;
@@ -4177,9 +4432,17 @@ impl SecurityPolicy {
         command: &str,
         dialect: ShellDialect,
     ) -> CommandRiskLevel {
-        match dialect {
+        self.command_risk_level_for_grammar(command, ShellGrammar::from(dialect))
+    }
+
+    fn command_risk_level_for_grammar(
+        &self,
+        command: &str,
+        shell: ShellGrammar,
+    ) -> CommandRiskLevel {
+        match shell.dialect {
             ShellDialect::Posix | ShellDialect::WindowsCmd => {
-                return self.command_risk_level_for_posix_like_shell(command, dialect);
+                return self.command_risk_level_for_posix_like_shell(command, shell);
             }
             ShellDialect::None => return CommandRiskLevel::High,
             ShellDialect::PowerShell => {}
@@ -4284,12 +4547,95 @@ impl SecurityPolicy {
     /// The dialect decides platform-specific redirect safety (e.g. the Windows
     /// `nul` null device is discard-only under `cmd.exe` but an ordinary file
     /// under a POSIX shell).
+    ///
+    /// A POSIX command is read in the grammar every POSIX shell shares. A
+    /// caller about to run the command should choose its grammar with
+    /// [`Self::command_shell`] and check it with
+    /// [`Self::validate_command_execution_in`].
     pub fn validate_command_execution_for_shell(
         &self,
         command: &str,
         approved: bool,
         dialect: ShellDialect,
     ) -> Result<CommandRiskLevel, String> {
+        self.validate_command_execution_in_grammar(command, approved, ShellGrammar::from(dialect))
+    }
+
+    /// Choose the grammar to check a command in, for the shell `target`
+    /// describes. A POSIX command is read in bash's grammar only when the
+    /// program the runtime reports resolves, on the `PATH` it will use, to
+    /// bash, and no container sandbox can run it. A bare name counts when it
+    /// resolves to bash on that `PATH`; a link named `bash` to another shell
+    /// does not. Nothing is built: the program is resolved and inspected only.
+    ///
+    /// Pass the result to every check of the command, then to
+    /// [`Self::confirm_built_shell`] once the runtime has built it.
+    pub fn command_shell(&self, target: ShellTarget<'_>) -> CommandShell {
+        let posix_shell = match target.dialect {
+            ShellDialect::Posix => resolve_posix_shell(
+                target.program,
+                target.effective_path,
+                self.container_sandbox_possible(),
+            ),
+            _ => PosixShell::Unknown,
+        };
+        CommandShell {
+            grammar: ShellGrammar {
+                dialect: target.dialect,
+                posix_shell,
+            },
+        }
+    }
+
+    /// [`Self::validate_command_execution_for_shell`], in the grammar
+    /// [`Self::command_shell`] chose.
+    pub fn validate_command_execution_in(
+        &self,
+        command: &str,
+        approved: bool,
+        shell: CommandShell,
+    ) -> Result<CommandRiskLevel, String> {
+        self.validate_command_execution_in_grammar(command, approved, shell.grammar)
+    }
+
+    /// Hold the program the runtime built to the grammar its command was
+    /// checked in. Call it after building the command and before any sandbox
+    /// wraps it: a host sandbox replaces the outer program with its own
+    /// launcher, which is not the shell.
+    ///
+    /// A command checked in bash's grammar is refused unless `built_program`
+    /// canonicalizes to bash. A command checked in the portable grammar reads
+    /// the same in any POSIX shell, so it needs no confirmation.
+    pub fn confirm_built_shell(
+        &self,
+        shell: CommandShell,
+        built_program: &std::ffi::OsStr,
+    ) -> Result<(), String> {
+        if shell.grammar.posix_shell != PosixShell::Bash {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            let built = Path::new(built_program);
+            if built.is_absolute()
+                && std::fs::canonicalize(built).is_ok_and(|canonical| is_bash(&canonical))
+            {
+                return Ok(());
+            }
+        }
+        Err(format!(
+            "Command blocked: it was checked as a bash command, but the runtime built {} to run it",
+            Path::new(built_program).display()
+        ))
+    }
+
+    fn validate_command_execution_in_grammar(
+        &self,
+        command: &str,
+        approved: bool,
+        shell: ShellGrammar,
+    ) -> Result<CommandRiskLevel, String> {
+        let dialect = shell.dialect;
         if dialect == ShellDialect::None {
             return Err("Command blocked: configured runtime has no shell access".into());
         }
@@ -4302,20 +4648,20 @@ impl SecurityPolicy {
         // enforced by that wrapper; running it again here would reject legitimate
         // absolute arguments an operator explicitly allowed (e.g. `rm -rf /tmp/x`).
         if shell_uses_windows_path_syntax(dialect)
-            && let Some(path) = self.forbidden_path_argument_for_shell(command, dialect)
+            && let Some(path) = self.forbidden_path_argument_impl(command, shell, false)
         {
             return Err(format!("Command blocked: forbidden path argument: {path}"));
         }
 
-        if !self.is_command_allowed_for_shell(command, dialect) {
+        if !self.is_command_allowed_for_grammar(command, shell) {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
 
-        let risk = self.command_risk_level_for_shell(command, dialect);
+        let risk = self.command_risk_level_for_grammar(command, shell);
 
         if risk == CommandRiskLevel::High {
             if self.block_high_risk_commands
-                && !self.is_command_explicitly_allowed_for_shell(command, dialect)
+                && !self.is_command_explicitly_allowed_for_shell(command, shell)
             {
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
             }
@@ -4340,11 +4686,8 @@ impl SecurityPolicy {
         Ok(risk)
     }
 
-    fn is_command_explicitly_allowed_for_shell(
-        &self,
-        command: &str,
-        dialect: ShellDialect,
-    ) -> bool {
+    fn is_command_explicitly_allowed_for_shell(&self, command: &str, shell: ShellGrammar) -> bool {
+        let dialect = shell.dialect;
         match dialect {
             ShellDialect::PowerShell => {
                 let Some(segments) = split_powershell_pipeline_syntax(command) else {
@@ -4370,15 +4713,16 @@ impl SecurityPolicy {
                 })
             }
             ShellDialect::Posix | ShellDialect::WindowsCmd => {
-                self.is_command_explicitly_allowed(command, dialect)
+                self.is_command_explicitly_allowed(command, shell)
             }
             ShellDialect::None => false,
         }
     }
 
-    fn is_command_explicitly_allowed(&self, command: &str, dialect: ShellDialect) -> bool {
+    fn is_command_explicitly_allowed(&self, command: &str, shell: ShellGrammar) -> bool {
+        let dialect = shell.dialect;
         // A split that refuses a heredoc proves no command is listed.
-        let Ok(segments) = split_unquoted_segments_checked(command, dialect) else {
+        let Ok(segments) = split_unquoted_segments_checked(command, shell) else {
             return false;
         };
         for segment in &segments {
@@ -4435,10 +4779,14 @@ impl SecurityPolicy {
     /// platform-specific redirect safety (the Windows `nul` null device is only
     /// discard-safe under `cmd.exe`).
     pub fn is_command_allowed_for_shell(&self, command: &str, dialect: ShellDialect) -> bool {
-        match dialect {
+        self.is_command_allowed_for_grammar(command, ShellGrammar::from(dialect))
+    }
+
+    fn is_command_allowed_for_grammar(&self, command: &str, shell: ShellGrammar) -> bool {
+        match shell.dialect {
             ShellDialect::PowerShell => self.is_simple_powershell_command_allowed(command),
             ShellDialect::Posix | ShellDialect::WindowsCmd => {
-                self.is_posix_like_command_allowed(command, dialect)
+                self.is_posix_like_command_allowed(command, shell)
             }
             ShellDialect::None => false,
         }
@@ -4506,7 +4854,8 @@ impl SecurityPolicy {
         true
     }
 
-    fn is_posix_like_command_allowed(&self, command: &str, dialect: ShellDialect) -> bool {
+    fn is_posix_like_command_allowed(&self, command: &str, shell: ShellGrammar) -> bool {
+        let dialect = shell.dialect;
         if self.autonomy == AutonomyLevel::ReadOnly {
             return false;
         }
@@ -4520,7 +4869,7 @@ impl SecurityPolicy {
             // The opt-out skips syntax restrictions, but not a heredoc whose
             // body boundary cannot be proven. The path and risk checks refuse
             // that command for the same reason.
-            return split_unquoted_segments_checked(command, dialect).is_ok();
+            return split_unquoted_segments_checked(command, shell).is_ok();
         }
 
         if command.contains('`')
@@ -4578,7 +4927,7 @@ impl SecurityPolicy {
         // Split on unquoted command separators and validate each sub-command.
         // An unreadable heredoc yields no segments, which must not read as
         // "every segment is allowed".
-        let Ok(segments) = split_unquoted_segments_checked(command, dialect) else {
+        let Ok(segments) = split_unquoted_segments_checked(command, shell) else {
             return false;
         };
         for segment in &segments {
@@ -4700,7 +5049,7 @@ impl SecurityPolicy {
         command: &str,
         dialect: ShellDialect,
     ) -> Option<String> {
-        self.forbidden_path_argument_impl(command, dialect, false)
+        self.forbidden_path_argument_impl(command, ShellGrammar::from(dialect), false)
     }
 
     /// Like [`SecurityPolicy::forbidden_workspace_path_argument`], but against
@@ -4713,16 +5062,52 @@ impl SecurityPolicy {
         command: &str,
         dialect: ShellDialect,
     ) -> Option<String> {
-        self.forbidden_path_argument_impl(command, dialect, true)
+        self.forbidden_path_argument_impl(command, ShellGrammar::from(dialect), true)
+    }
+
+    /// [`Self::forbidden_workspace_path_argument_for_shell`], in the grammar
+    /// [`Self::command_shell`] chose.
+    pub fn forbidden_workspace_path_argument_in(
+        &self,
+        command: &str,
+        shell: CommandShell,
+    ) -> Option<String> {
+        self.forbidden_path_argument_impl(command, shell.grammar, true)
+    }
+
+    /// [`Self::forbidden_path_argument`], reading a POSIX command in the
+    /// grammar [`Self::command_shell`] chose. The path syntax stays the host
+    /// default's, as in [`Self::forbidden_path_argument`]; only which POSIX
+    /// shell parses the command is taken from `shell`.
+    pub fn forbidden_path_argument_in(&self, command: &str, shell: CommandShell) -> Option<String> {
+        #[cfg(target_os = "windows")]
+        let dialect = ShellDialect::WindowsCmd;
+        #[cfg(not(target_os = "windows"))]
+        let dialect = ShellDialect::Posix;
+
+        let posix_shell = if dialect == shell.grammar.dialect {
+            shell.grammar.posix_shell
+        } else {
+            PosixShell::Unknown
+        };
+        self.forbidden_path_argument_impl(
+            command,
+            ShellGrammar {
+                dialect,
+                posix_shell,
+            },
+            false,
+        )
     }
 
     fn forbidden_path_argument_impl(
         &self,
         command: &str,
-        dialect: ShellDialect,
+        shell: ShellGrammar,
         resolve_workspace: bool,
     ) -> Option<String> {
-        if split_unquoted_segments_checked(command, dialect).is_err() {
+        let dialect = shell.dialect;
+        if split_unquoted_segments_checked(command, shell).is_err() {
             // Name the opener rather than a path. The shell wrapper refuses
             // any `Some`, and guessing which later command runs is the bypass.
             return Some("unreadable heredoc delimiter".into());
@@ -4800,7 +5185,7 @@ impl SecurityPolicy {
             })
         };
 
-        for segment in split_unquoted_segments(command, dialect) {
+        for segment in split_unquoted_segments(command, shell) {
             let words = shell_words_after_env_assignments(&segment, dialect);
             let Some(executable) = words.first() else {
                 continue;
@@ -5737,6 +6122,27 @@ impl SecurityPolicy {
             firejail_args: risk_profile.firejail_args.clone(),
             tracker: PerSenderTracker::new(),
         }
+    }
+
+    /// Whether the sandbox chosen for this profile may be a container, which
+    /// runs its image's shell rather than the host's. `auto` may pick Docker
+    /// when no host sandbox is available, so it counts. A disabled sandbox and
+    /// the host backends, which fall back to no sandbox, do not.
+    fn container_sandbox_possible(&self) -> bool {
+        if self.sandbox_enabled == Some(false) {
+            return false;
+        }
+        let backend = self
+            .sandbox_backend
+            .as_deref()
+            .map(str::trim)
+            .filter(|backend| !backend.is_empty())
+            .map(crate::schema::parse_sandbox_backend)
+            .unwrap_or_default();
+        matches!(
+            backend,
+            crate::schema::SandboxBackend::Auto | crate::schema::SandboxBackend::Docker
+        )
     }
 
     pub fn for_agent(config: &crate::schema::Config, agent_alias: &str) -> anyhow::Result<Self> {
@@ -9871,6 +10277,494 @@ mod tests {
         }
     }
 
+    fn bash_grammar() -> ShellGrammar {
+        ShellGrammar {
+            dialect: ShellDialect::Posix,
+            posix_shell: PosixShell::Bash,
+        }
+    }
+
+    /// When the shell is known to be bash, the forms POSIX shells disagree on
+    /// are read the way bash 3.2 through 5.3 read them, in normal and POSIX
+    /// mode, instead of being refused.
+    #[test]
+    fn bash_grammar_expands_ansi_c_heredoc_delimiters_bytewise() {
+        let p = unix_forbidden_path_policy();
+        let bash = |command: &str| p.forbidden_path_argument_impl(command, bash_grammar(), false);
+        // (delimiter word, the terminator line bash matches)
+        for (word, terminator) in [
+            ("$'EOF'", "EOF"),
+            ("$'E\\x41F'", "EAF"),
+            ("$'E\\x4g'", "E\u{4}g"),
+            ("$'E\\xg'", "E\\xg"),
+            ("$'E\\101F'", "EAF"),
+            ("$'E\\0101'", "E\u{8}1"),
+            ("$'E\\tF'", "E\tF"),
+            ("$'E\\rF'", "E\rF"),
+            ("$'E\\'F'", "E'F"),
+            ("$'E\\qF'", "E\\qF"),
+            ("$'E\\xc3\\xa9F'", "EéF"),
+            ("E$'O'F", "EOF"),
+            // A NUL ends the quoted part; escapes still apply while skipping
+            // the rest of it, and text after the quote stays.
+            ("$'E\\0F'X", "EX"),
+            ("$'E\\400F'", "E"),
+            ("$'E\\x00Q'", "E"),
+            ("$'\\0A\\'B'X", "X"),
+        ] {
+            // The body is data, including a lookalike of dash's terminator.
+            let body = format!("cat <<{word}\n/etc/passwd\n$EOF\n{terminator}");
+            assert_eq!(bash(&body), None, "{body:?}");
+            // The command after the terminator runs and is scanned.
+            let after = format!("cat <<{word}\nhello\n{terminator}\nwc -l /etc/passwd");
+            assert_eq!(bash(&after), Some("/etc/passwd".into()), "{after:?}");
+        }
+        // `\777` is the byte 0xff, which no UTF-8 line contains, so bash never
+        // matches the terminator and the body runs to the end.
+        assert_eq!(bash("cat <<$'E\\777F'\n/etc/passwd\nE\u{ff}F"), None);
+        // Inside a substitution the quoted command after the real terminator
+        // is scanned (Greptile's `\0A\'B'X` case).
+        assert_eq!(
+            bash("echo \"$(cat <<$'\\0A\\'B'X\nhello\nX\nwc -l /etc/passwd\nBX\n)\"\n)\""),
+            Some("/etc/passwd".into())
+        );
+        // Escapes whose meaning varies across bash versions, `$"..."`, and a
+        // newline in the delimiter stay refused.
+        for word in [
+            "$'E\\cAF'",
+            "$'E\\c?F'",
+            "$'E\\u00e9F'",
+            "$'E\\U0001F600F'",
+            "$'E\\nF'",
+            "$'E\\\nF'",
+            "$\"EOF\"",
+            "$'EOF",
+        ] {
+            let command = format!("cat <<{word}\nhello\nEOF\nwc -l /etc/passwd");
+            assert_eq!(
+                bash(&command),
+                Some("unreadable heredoc delimiter".into()),
+                "{command:?}"
+            );
+        }
+        // The portable grammar still refuses every `$'...'` delimiter.
+        assert_eq!(
+            p.forbidden_path_argument_for_shell(
+                "cat <<$'EOF'\nhello\nEOF\nwc -l /etc/passwd",
+                ShellDialect::Posix
+            ),
+            Some("unreadable heredoc delimiter".into())
+        );
+    }
+
+    /// Bash reads a bare `((...))` as arithmetic when the second `(` closes
+    /// with `)` right after it, and as nested subshells otherwise.
+    #[test]
+    fn bash_grammar_reads_bare_double_parentheses_as_arithmetic() {
+        let p = unix_forbidden_path_policy();
+        let bash = |command: &str| p.forbidden_path_argument_impl(command, bash_grammar(), false);
+        let risk = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        };
+        for command in [
+            "(( x = 10 / 2 ))",
+            "((y = x / 2)); echo \"$y\"",
+            "(( (a + b) / 2 ))",
+            // Arithmetic: bash reports an expression error and runs nothing.
+            "((cat /etc/passwd))",
+        ] {
+            assert_eq!(bash(command), None, "{command}");
+            assert_eq!(
+                risk.command_risk_level_for_grammar(command, bash_grammar()),
+                CommandRiskLevel::Low,
+                "{command}"
+            );
+        }
+        for command in [
+            // `<<` is a shift, so the next line runs.
+            "((x=8<<1))\nwc -l /etc/passwd\n1",
+            "(( x = 8 << 1 ))\nwc -l /etc/passwd",
+            // Without `))` after the second `(`'s match, these are subshells.
+            "((cat /etc/passwd) )",
+            "((true) ; cat /etc/passwd)",
+            "(( $(wc -l < /etc/passwd) / 2 ))",
+        ] {
+            assert_eq!(bash(command), Some("/etc/passwd".into()), "{command}");
+        }
+        // The portable grammar refuses the shift and scans `((cmd))`, which
+        // dash runs as subshells.
+        assert_eq!(
+            p.forbidden_path_argument_for_shell(
+                "((x=8<<1))\nwc -l /etc/passwd\n1",
+                ShellDialect::Posix
+            ),
+            Some("unreadable heredoc delimiter".into())
+        );
+        assert_eq!(
+            p.forbidden_path_argument_for_shell("((cat /etc/passwd))", ShellDialect::Posix),
+            Some("/etc/passwd".into())
+        );
+        // The `EOF)` terminator inside a quoted substitution varies across
+        // bash versions, so it stays refused even for bash.
+        assert_eq!(
+            bash("echo \"$(cat <<EOF\nhello\nEOF)\"; wc -l /etc/passwd"),
+            Some("unreadable heredoc delimiter".into())
+        );
+    }
+
+    /// The host's canonical bash, or `None` where there is none to test with.
+    #[cfg(unix)]
+    fn host_bash() -> Option<PathBuf> {
+        let bash = crate::platform::resolve_executable(std::ffi::OsStr::new("bash")).ok()?;
+        std::fs::canonicalize(bash).ok()
+    }
+
+    /// A canonical POSIX shell on this host that is not bash, to link a fake
+    /// `bash` name to.
+    #[cfg(unix)]
+    fn host_shell_other_than_bash() -> Option<PathBuf> {
+        ["/bin/sh", "dash", "zsh", "ksh"]
+            .into_iter()
+            .find_map(|shell| {
+                let resolved =
+                    crate::platform::resolve_executable(std::ffi::OsStr::new(shell)).ok()?;
+                let canonical = std::fs::canonicalize(resolved).ok()?;
+                (canonical.file_name() != Some(std::ffi::OsStr::new("bash"))).then_some(canonical)
+            })
+    }
+
+    /// A `PATH` holding one directory with `bash` linked to `target`.
+    #[cfg(unix)]
+    fn path_with_bash_linked_to(dir: &Path, target: &Path) -> std::ffi::OsString {
+        let bin = dir.join(format!(
+            "bin-{}",
+            target.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink(target, bin.join("bash")).unwrap();
+        bin.into_os_string()
+    }
+
+    /// The shell is identified from the canonical executable the program
+    /// resolves to on the `PATH` it will run with, never from its name
+    /// alone: `sh` linked to bash is bash, and a `bash` link to another shell
+    /// is not. A container sandbox, or a runtime that reports no program,
+    /// keeps the portable grammar.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_posix_shell_follows_the_canonical_executable() {
+        let Some(bash) = host_bash() else {
+            eprintln!("skipping: no bash on this host");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let resolve = |program: &str, path: Option<&std::ffi::OsStr>, container: bool| {
+            resolve_posix_shell(Some(std::ffi::OsStr::new(program)), path, container)
+        };
+        let bash_str = bash.to_str().unwrap();
+        assert_eq!(resolve(bash_str, None, false), PosixShell::Bash);
+        // A container sandbox runs the configured path inside its image,
+        // where it can be any shell.
+        assert_eq!(resolve(bash_str, None, true), PosixShell::Unknown);
+        assert_eq!(resolve_posix_shell(None, None, false), PosixShell::Unknown);
+        assert_eq!(resolve("/no/such/bash", None, false), PosixShell::Unknown);
+
+        let sh = dir.path().join("sh");
+        std::os::unix::fs::symlink(&bash, &sh).unwrap();
+        assert_eq!(resolve(sh.to_str().unwrap(), None, false), PosixShell::Bash);
+        assert_eq!(
+            resolve(sh.to_str().unwrap(), None, true),
+            PosixShell::Unknown
+        );
+
+        // A bare name is resolved on the `PATH` the command runs with.
+        let real = path_with_bash_linked_to(dir.path(), &bash);
+        assert_eq!(resolve("bash", Some(&real), false), PosixShell::Bash);
+        assert_eq!(resolve("bash", Some(&real), true), PosixShell::Unknown);
+        let Some(other) = host_shell_other_than_bash() else {
+            eprintln!("skipping the spoof cases: no POSIX shell other than bash");
+            return;
+        };
+        let spoofed = path_with_bash_linked_to(dir.path(), &other);
+        assert_eq!(resolve("bash", Some(&spoofed), false), PosixShell::Unknown);
+        let fake_bash = std::path::PathBuf::from(&spoofed).join("bash");
+        assert_eq!(
+            resolve(fake_bash.to_str().unwrap(), None, false),
+            PosixShell::Unknown
+        );
+    }
+
+    #[test]
+    fn container_sandbox_is_possible_only_for_auto_and_docker_backends() {
+        let policy = |enabled: Option<bool>, backend: Option<&str>| SecurityPolicy {
+            sandbox_enabled: enabled,
+            sandbox_backend: backend.map(str::to_string),
+            ..SecurityPolicy::default()
+        };
+        for (enabled, backend) in [
+            (None, None),
+            (None, Some("auto")),
+            (None, Some("")),
+            (None, Some("docker")),
+            (Some(true), Some("Docker")),
+        ] {
+            assert!(
+                policy(enabled, backend).container_sandbox_possible(),
+                "{enabled:?} {backend:?}"
+            );
+        }
+        for (enabled, backend) in [
+            (Some(false), None),
+            (Some(false), Some("docker")),
+            (None, Some("none")),
+            (None, Some("landlock")),
+            (None, Some("firejail")),
+            (None, Some("bubblewrap")),
+            (None, Some("sandbox-exec")),
+        ] {
+            assert!(
+                !policy(enabled, backend).container_sandbox_possible(),
+                "{enabled:?} {backend:?}"
+            );
+        }
+    }
+
+    /// A policy with its sandbox off, so the host program runs.
+    fn unsandboxed_wildcard_policy() -> SecurityPolicy {
+        SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            sandbox_enabled: Some(false),
+            ..SecurityPolicy::default()
+        }
+    }
+
+    /// Through the public checks: a command bound for bash is read in bash's
+    /// grammar, so a bash `$'...'` heredoc is accepted, and the dialect-only
+    /// checks, which know no program, refuse it.
+    #[cfg(unix)]
+    #[test]
+    fn policy_reads_commands_in_the_targets_grammar() {
+        let Some(bash) = host_bash() else {
+            eprintln!("skipping: no bash on this host");
+            return;
+        };
+        let command = "cat <<$'EOF'\nhello\nEOF";
+        let policy = unsandboxed_wildcard_policy();
+        let shell = policy.command_shell(ShellTarget {
+            dialect: ShellDialect::Posix,
+            program: Some(bash.as_os_str()),
+            effective_path: None,
+        });
+        assert_eq!(
+            policy.validate_command_execution_in(command, false, shell),
+            Ok(CommandRiskLevel::Low)
+        );
+        assert_eq!(policy.forbidden_path_argument_in(command, shell), None);
+        assert_eq!(
+            policy.forbidden_workspace_path_argument_in(command, shell),
+            None
+        );
+        assert!(
+            policy
+                .validate_command_execution_for_shell(command, false, ShellDialect::Posix)
+                .is_err()
+        );
+        assert_eq!(
+            policy.forbidden_path_argument(command),
+            Some("unreadable heredoc delimiter".into())
+        );
+        // Another dialect never takes the POSIX shell's grammar.
+        let cmd = policy.command_shell(ShellTarget {
+            dialect: ShellDialect::WindowsCmd,
+            program: Some(bash.as_os_str()),
+            effective_path: None,
+        });
+        assert_eq!(cmd.grammar.posix_shell, PosixShell::Unknown);
+    }
+
+    /// A policy keeps the portable grammar whenever the program that runs
+    /// may not be bash. Under bash, `<<$'EOF'` ends at `EOF` and hides the
+    /// `wc` line as heredoc body. Dash ends it at the literal `$EOF` line and
+    /// runs `wc`. A bare `bash` can resolve to dash on a connected TUI's
+    /// `PATH`, a container sandbox runs its image's program at the configured
+    /// name or path, and a container runtime reports no program at all.
+    #[cfg(unix)]
+    #[test]
+    fn policy_keeps_portable_grammar_when_bash_is_not_bound() {
+        let (Some(bash), Some(other)) = (host_bash(), host_shell_other_than_bash()) else {
+            eprintln!("skipping: needs bash and another POSIX shell");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let spoofed = path_with_bash_linked_to(dir.path(), &other);
+        let command = "cat <<$'EOF'\nx\n$EOF\nwc -l /etc/passwd\nEOF";
+        let unsandboxed = unsandboxed_wildcard_policy();
+        let docker = SecurityPolicy {
+            sandbox_enabled: Some(true),
+            sandbox_backend: Some("docker".into()),
+            ..unsandboxed.clone()
+        };
+        let auto = SecurityPolicy {
+            sandbox_enabled: None,
+            sandbox_backend: None,
+            ..unsandboxed.clone()
+        };
+        let posix = |program: Option<&'static std::ffi::OsStr>, path| ShellTarget {
+            dialect: ShellDialect::Posix,
+            program,
+            effective_path: path,
+        };
+        let bash_path: &'static std::ffi::OsStr =
+            Box::leak(bash.into_os_string().into_boxed_os_str());
+        for (name, policy, target) in [
+            (
+                "bare bash on a forwarded PATH where it is dash",
+                &unsandboxed,
+                posix(
+                    Some(std::ffi::OsStr::new("bash")),
+                    Some(spoofed.as_os_str()),
+                ),
+            ),
+            ("docker sandbox", &docker, posix(Some(bash_path), None)),
+            ("auto sandbox", &auto, posix(Some(bash_path), None)),
+            ("container runtime", &unsandboxed, posix(None, None)),
+        ] {
+            let shell = policy.command_shell(target);
+            assert_eq!(shell.grammar.posix_shell, PosixShell::Unknown, "{name}");
+            assert!(
+                policy
+                    .validate_command_execution_in(command, false, shell)
+                    .is_err(),
+                "{name}"
+            );
+            assert_eq!(
+                policy.forbidden_path_argument_in(command, shell),
+                Some("unreadable heredoc delimiter".into()),
+                "{name}"
+            );
+        }
+    }
+
+    /// A command read in bash's grammar runs only in bash. The runtime can
+    /// build a different program than the policy predicted, and a host
+    /// sandbox's launcher is never the shell, so the check runs before any
+    /// sandbox wraps the command. A portable reading needs no confirmation.
+    #[cfg(unix)]
+    #[test]
+    fn confirm_built_shell_holds_bash_reads_to_bash() {
+        let (Some(bash), Some(other)) = (host_bash(), host_shell_other_than_bash()) else {
+            eprintln!("skipping: needs bash and another POSIX shell");
+            return;
+        };
+        let policy = unsandboxed_wildcard_policy();
+        let read_as_bash = policy.command_shell(ShellTarget {
+            dialect: ShellDialect::Posix,
+            program: Some(bash.as_os_str()),
+            effective_path: None,
+        });
+        assert_eq!(read_as_bash.grammar.posix_shell, PosixShell::Bash);
+        let portable = policy.command_shell(ShellTarget {
+            dialect: ShellDialect::Posix,
+            program: Some(other.as_os_str()),
+            effective_path: None,
+        });
+        assert_eq!(portable.grammar.posix_shell, PosixShell::Unknown);
+
+        let dir = tempfile::tempdir().unwrap();
+        let sh_to_bash = dir.path().join("sh");
+        std::os::unix::fs::symlink(&bash, &sh_to_bash).unwrap();
+        assert_eq!(
+            policy.confirm_built_shell(read_as_bash, bash.as_os_str()),
+            Ok(())
+        );
+        assert_eq!(
+            policy.confirm_built_shell(read_as_bash, sh_to_bash.as_os_str()),
+            Ok(())
+        );
+        for built in [
+            other.as_os_str(),
+            std::ffi::OsStr::new("bash"),
+            std::ffi::OsStr::new("/no/such/bash"),
+            std::ffi::OsStr::new("/usr/bin/firejail"),
+        ] {
+            assert!(
+                policy.confirm_built_shell(read_as_bash, built).is_err(),
+                "{built:?}"
+            );
+            assert_eq!(
+                policy.confirm_built_shell(portable, built),
+                Ok(()),
+                "{built:?}"
+            );
+        }
+    }
+
+    /// A config with one agent on a sandbox-free risk profile.
+    fn one_agent_config(dir: &Path) -> crate::schema::Config {
+        use crate::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+
+        let mut cfg = Config {
+            data_dir: dir.join("data"),
+            config_path: dir.join("config.toml"),
+            ..Config::default()
+        };
+        cfg.risk_profiles.insert(
+            "default".into(),
+            RiskProfileConfig {
+                sandbox_enabled: Some(false),
+                ..RiskProfileConfig::default()
+            },
+        );
+        cfg.agents.insert(
+            "agent_a".into(),
+            AliasedAgentConfig {
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        cfg
+    }
+
+    /// The grammar follows the runtime the factory builds from the same
+    /// config, not a shell the policy recorded. With `[runtime].shell` set to
+    /// bash, a native runtime reads commands as bash and the program it
+    /// builds confirms it. A Docker runtime reports no program, so it keeps
+    /// the portable grammar whatever the host's own shells are.
+    #[cfg(all(unix, not(target_os = "android")))]
+    #[test]
+    fn grammar_follows_the_runtime_the_factory_builds() {
+        let Some(bash) = host_bash() else {
+            eprintln!("skipping: no bash on this host");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = one_agent_config(dir.path());
+        cfg.runtime.shell = Some(bash.to_string_lossy().into_owned());
+
+        cfg.runtime.kind = crate::schema::RuntimeKind::Native;
+        let policy = SecurityPolicy::for_agent(&cfg, "agent_a").unwrap();
+        let runtime = crate::platform::create_runtime(&cfg.runtime).unwrap();
+        let shell = policy.command_shell(ShellTarget::of(runtime.as_ref(), None));
+        assert_eq!(shell.grammar.posix_shell, PosixShell::Bash);
+        let built = runtime
+            .build_shell_command("true", &policy.workspace_dir)
+            .unwrap();
+        assert_eq!(
+            policy.confirm_built_shell(shell, built.as_std().get_program()),
+            Ok(())
+        );
+
+        cfg.runtime.kind = crate::schema::RuntimeKind::Docker;
+        let policy = SecurityPolicy::for_agent(&cfg, "agent_a").unwrap();
+        let runtime = crate::platform::create_runtime(&cfg.runtime).unwrap();
+        assert_eq!(runtime.shell_program(), None);
+        let shell = policy.command_shell(ShellTarget::of(runtime.as_ref(), None));
+        assert_eq!(shell.grammar.posix_shell, PosixShell::Unknown);
+    }
+
     /// The body of an unquoted heredoc is expanded, so a line ending in an odd
     /// number of backslashes continues onto the next one. Bash compares the
     /// joined line, stripping `<<-` tabs while it is still empty. Dash skips
@@ -9958,6 +10852,66 @@ mod tests {
         ] {
             assert_eq!(posix(command), None, "{command:?}");
         }
+    }
+
+    /// Bash ends an unquoted heredoc body at a joined line that spells the
+    /// terminator, stripping `<<-` tabs while the joined text is empty, so
+    /// under bash the command after it is scanned rather than refused.
+    #[test]
+    fn bash_grammar_ends_heredocs_at_joined_terminators() {
+        let p = unix_forbidden_path_policy();
+        let bash = |command: &str| p.forbidden_path_argument_impl(command, bash_grammar(), false);
+        for command in [
+            "cat <<EOF\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            // Continuations in an unquoted delimiter are removed before
+            // quote removal, so the body still joins its terminator.
+            "cat <<E\\\nOF\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "echo \"$(cat <<E\\\nOF\nEO\\\nF\n)\"; wc -l /etc/passwd\nEOF\n)\"",
+            "cat <<EOF\nE\\\nO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<EOF\nEOF\\\n\nwc -l /etc/passwd\nEOF",
+            "cat <<EOF\nE\\\n\\\nOF\nwc -l /etc/passwd\nEOF",
+            "cat <<-EOF\n\tEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<-EOF\n\t\\\nEOF\nwc -l /etc/passwd\nEOF",
+            "cat <<-EOF\n\t\\\n\tEOF\nwc -l /etc/passwd\nEOF",
+            "cat <<-EOF\n\\\n\tEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<-EOF\n\\\n\tEOF\nwc -l /etc/passwd",
+        ] {
+            assert_eq!(bash(command), Some("/etc/passwd".into()), "{command:?}");
+        }
+        // The body before the joined terminator is still data.
+        assert_eq!(bash("cat <<EOF\n/etc/passwd\nEO\\\nF"), None);
+        // Bash reads on past a continued physical `EOF`, past an indented
+        // continuation, and through quoted delimiters, which do not join.
+        for command in [
+            "cat <<EOF\nbody \\\nEOF\n/etc/passwd\nEOF",
+            "cat <<EOF\n \\\nEOF\nwc -l /etc/passwd\nEOF",
+            "cat <<'EOF'\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<\"E\\\nOF\"\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<E\\\n'OF'\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            "cat <<-EOF\n\tEO\\\n\tF\nwc -l /etc/passwd\nEOF",
+        ] {
+            assert_eq!(bash(command), None, "{command:?}");
+        }
+        // Strict allowlists still refuse every line continuation, including
+        // quoted delimiters. A plain quoted heredoc remains admissible.
+        let strict = SecurityPolicy {
+            allowed_commands: vec!["cat".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(!strict.is_command_allowed_for_grammar(
+            "cat <<E\\\nOF\nEO\\\nF\nwc -l /etc/passwd",
+            bash_grammar(),
+        ));
+        assert!(!strict.is_command_allowed_for_grammar(
+            "cat <<\"E\\\nOF\"\nEO\\\nF\nwc -l /etc/passwd\nEOF",
+            bash_grammar(),
+        ));
+        assert!(
+            strict.is_command_allowed_for_grammar(
+                "cat <<'EOF'\nwc -l /etc/passwd\nEOF",
+                bash_grammar(),
+            )
+        );
     }
 
     /// The strict allowlist decision for grouping and substitution syntax is
