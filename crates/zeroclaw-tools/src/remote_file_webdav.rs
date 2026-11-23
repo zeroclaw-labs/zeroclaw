@@ -813,26 +813,33 @@ fn build_client(
 }
 
 fn validate_endpoint(root: &Url, addresses: &[SocketAddr]) -> Result<(String, u16), WebDavError> {
-    let host = root.host_str().ok_or(WebDavError::InvalidEndpoint)?;
-    let port = root
-        .port_or_known_default()
-        .ok_or(WebDavError::InvalidEndpoint)?;
-    let host = host.trim_matches(['[', ']']);
+    let (host, port) = validate_webdav_root(root)?;
     let literal = host.parse::<IpAddr>().ok();
-    if root.scheme() != "https"
-        || !root.username().is_empty()
-        || root.password().is_some()
-        || root.query().is_some()
-        || root.fragment().is_some()
-        || !root.path().ends_with('/')
-        || addresses.is_empty()
+    if addresses.is_empty()
         || addresses
             .iter()
             .any(|address| address.port() != port || literal.is_some_and(|ip| ip != address.ip()))
     {
         return Err(WebDavError::InvalidEndpoint);
     }
-    Ok((host.to_owned(), port))
+    Ok((host, port))
+}
+
+pub(crate) fn validate_webdav_root(root: &Url) -> Result<(String, u16), WebDavError> {
+    let host = root.host_str().ok_or(WebDavError::InvalidEndpoint)?;
+    let port = root
+        .port_or_known_default()
+        .ok_or(WebDavError::InvalidEndpoint)?;
+    if root.scheme() != "https"
+        || !root.username().is_empty()
+        || root.password().is_some()
+        || root.query().is_some()
+        || root.fragment().is_some()
+        || !root.path().ends_with('/')
+    {
+        return Err(WebDavError::InvalidEndpoint);
+    }
+    Ok((host.trim_matches(['[', ']']).to_owned(), port))
 }
 
 fn checked_rename_paths(

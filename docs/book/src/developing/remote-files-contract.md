@@ -90,3 +90,5 @@ WebDAV directory listing uses Depth: 1 PROPFIND. It validates the directory resp
 ## Typed agent request
 
 The configuration crate defines the strict tagged request format for all proposed operations. Remote endpoints contain a registered resource alias and a relative path. Workspace endpoints carry only a relative path. The format accepts no passwords, URLs, connection options or approval overrides. Validation rejects empty or oversized batches, repeated destination arguments and renames that change parent directories. Canonical endpoint resolution, server-aware collision checks, grants, and tool registration remain executor responsibilities.
+
+The draft WebDAV read dispatcher resolves the operator's resource alias and checks the requested right and shared platform capability before invoking network or vault services. A grant requiring human approval returns a hold. The runtime still needs to wire the live catalog, approval service and credential resolver into this boundary. Only list and metadata requests are routed by this dispatcher.
