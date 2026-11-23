@@ -764,7 +764,8 @@ pub struct Config {
     #[group = "Integrations"]
     pub codex_cli: CodexCliConfig,
 
-    /// Gemini CLI tool configuration (`[gemini_cli]`).
+    /// Gemini CLI tool configuration (`[gemini_cli]`). Removed; enabling it
+    /// fails validation.
     #[serde(default)]
     #[nested]
     #[group = "Integrations"]
@@ -3149,6 +3150,15 @@ pub const GEMINI_CLI_PROVIDER_RETIRED: &str = "the `gemini_cli` model provider i
      API key, Agent Platform, or Gemini Enterprise) or to `[providers.models.gemini.<alias>]` \
      with an API key, point agent `model_provider` references at the new alias, then remove \
      the `gemini_cli` section";
+
+/// Why an enabled `[gemini_cli]` tool section is refused, and what to use
+/// instead. The tool implementation is removed; the section still parses so
+/// existing configs load and are told what changed.
+pub const GEMINI_CLI_TOOL_RETIRED: &str = "the `gemini_cli` tool is removed: Google replaced \
+     Gemini CLI with Antigravity CLI, and Gemini CLI stopped serving Google AI free, Pro, and \
+     Ultra accounts on June 18, 2026. Set `[gemini_cli] enabled = false` (or delete the \
+     section) and delegate coding tasks to `claude_code`, `codex_cli`, or `opencode_cli`; an \
+     Antigravity CLI coding tool is tracked in zeroclaw-labs/zeroclaw#11075";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -11435,9 +11445,9 @@ impl Default for CodexCliConfig {
 
 /// Gemini CLI tool configuration (`[gemini_cli]` section).
 ///
-/// Delegates coding tasks to the `gemini -p` CLI. Authentication uses the
-/// binary's own session by default — no API key needed unless
-/// `env_passthrough` includes `GOOGLE_API_KEY`.
+/// Removed: the tool no longer exists. The section still parses so existing
+/// configs keep loading; `enabled = true` fails validation with
+/// [`GEMINI_CLI_TOOL_RETIRED`].
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "gemini_cli"]
@@ -25207,13 +25217,21 @@ impl Config {
         }
     }
 
-    /// Refuse the retired `gemini_cli` model provider with its migration path.
+    /// Refuse the retired `gemini_cli` model provider and tool with their
+    /// migration paths.
     fn validate_retired_gemini_cli(&self) -> Result<()> {
         if let Some(alias) = self.providers.models.gemini_cli.keys().min() {
             validation_bail!(
                 ValidationFailed,
                 format!("providers.models.gemini_cli.{alias}"),
                 "providers.models.gemini_cli.{alias}: {GEMINI_CLI_PROVIDER_RETIRED}"
+            );
+        }
+        if self.gemini_cli.enabled {
+            validation_bail!(
+                ValidationFailed,
+                "gemini_cli.enabled".to_string(),
+                "gemini_cli.enabled: {GEMINI_CLI_TOOL_RETIRED}"
             );
         }
         Ok(())
@@ -35706,6 +35724,21 @@ auto_save = true
         config
             .validate()
             .expect("removing the gemini_cli alias clears the error");
+    }
+
+    #[test]
+    async fn removed_gemini_cli_tool_fails_validation_only_when_enabled() {
+        let mut config = Config::default();
+        config
+            .validate()
+            .expect("a disabled [gemini_cli] section still loads");
+        config.gemini_cli.enabled = true;
+        let error = config
+            .validate()
+            .expect_err("an enabled [gemini_cli] tool must fail validation")
+            .to_string();
+        assert!(error.contains("gemini_cli.enabled"), "{error}");
+        assert!(error.contains("removed"), "{error}");
     }
 
     #[test]
