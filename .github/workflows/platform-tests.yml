@@ -6,6 +6,9 @@ on:
     paths:
       - ".github/workflows/platform-tests.yml"
       - "crates/zeroclaw-tools/src/coding_cli.rs"
+      - "crates/zeroclaw-tools/src/portable_ssh_auth.rs"
+      - "crates/zeroclaw-tools/tests/portable_ssh_auth.rs"
+      - "crates/zeroclaw-config/src/ssh_auth_sequence.rs"
   workflow_dispatch:
   schedule:
     - cron: "17 3 * * *"
@@ -73,6 +76,8 @@ jobs:
       - name: Ensure web/dist placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Test portable SSH authentication
+        run: cargo test --locked -p zeroclaw-tools --features portable-ssh --test portable_ssh_auth
       - name: Install cargo-nextest
         shell: bash
         run: curl -LsSf "https://get.nexte.st/latest/${{ matrix.nextest-platform }}" | tar zxf - -C "$HOME/.cargo/bin"
