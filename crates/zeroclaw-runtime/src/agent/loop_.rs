@@ -26097,28 +26097,30 @@ mod capability_entry_point_tests {
         );
         capabilities.providers = Arc::new(SkillHookProviders(Arc::clone(&chats), native_calls));
 
-        let reply = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            super::run_with_capabilities(
-                config,
-                capabilities,
-                None,
-                "skill-agent",
-                Some("probe the supplied tool twice".to_owned()),
-                None,
-                None,
-                None,
-                Vec::new(),
-                false,
-                None,
-                None,
-                TurnOrigin::Interactive,
-                super::AgentRunOverrides::default(),
-            ),
-        )
-        .await
-        .expect("bounded skill hook turn")
-        .expect("the supplied provider serves the turn");
+        // The complete turn future contains the provider, tool, and post-turn
+        // skill pipelines. Heap-pin it before the test harness polls it so
+        // parallel runtime regression runs do not keep that state on the test
+        // thread's stack.
+        let turn = Box::pin(super::run_with_capabilities(
+            config,
+            capabilities,
+            None,
+            "skill-agent",
+            Some("probe the supplied tool twice".to_owned()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            TurnOrigin::Interactive,
+            super::AgentRunOverrides::default(),
+        ));
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(30), turn)
+            .await
+            .expect("bounded skill hook turn")
+            .expect("the supplied provider serves the turn");
         assert_eq!(reply, SKILL_HOOK_REPLY);
         (
             chats.load(std::sync::atomic::Ordering::SeqCst),
