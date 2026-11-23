@@ -2,6 +2,9 @@ cli-about = The fastest, smallest AI assistant.
 cli-no-command-provided = No command provided.
 cli-try-quickstart = Try `zeroclaw quickstart` to create your first agent.
 
+cli-tool-file-read-directory = Cannot read a directory as a file. Specify a file path.
+cli-tool-file-read-failed = Failed to read file: {$error}
+
 cli-quickstart-about = Create your first agent end-to-end
 cli-agent-about = Start the AI agent loop
 cli-gateway-about = Manage the gateway server (webhooks, websockets)
@@ -10,7 +13,7 @@ cli-daemon-about = Start the long-running autonomous daemon
 cli-service-about = Manage OS service lifecycle (launchd/systemd user service)
 cli-doctor-about = Run diagnostics for daemon/scheduler/channel freshness
 cli-status-about = Show system status (full details)
-cli-estop-about = Engage, inspect, and resume emergency-stop states
+cli-estop-about = Emergency stop (not enforced: every form of this command refuses to run)
 cli-cron-about = Configure and manage scheduled tasks
 cli-models-about = Manage provider model catalogs
 cli-providers-about = List supported AI providers
@@ -191,8 +194,8 @@ cli-memory-stats-about = Show memory backend statistics and health
 cli-memory-clear-about = Clear memories by category, by key, or clear all
 cli-memory-clear-unsupported-backend = memory clear is unsupported for append-only backend '{$backend}'; switch to a deletable backend (sqlite, lucid, or postgres)
 
-cli-estop-status-about = Print current estop status
-cli-estop-resume-about = Resume from an engaged estop level
+cli-estop-status-about = Not enforced: refuses to run
+cli-estop-resume-about = Not enforced: refuses to run
 
 cli-models-refresh-about = Refresh and cache provider models
 cli-models-list-about = List cached models for a provider
@@ -1032,7 +1035,7 @@ cli-status-spent-today = {"  "}Spent today:       ${$spent} / ${$limit}
 cli-status-spent-month = {"  "}Spent this month:  ${$spent} / ${$limit}
 cli-status-pricing-unavailable = {"  "}⚠ Pricing unavailable for {$count} model(s) ({$tokens} tokens uncosted): {$models}. Recorded spend is understated and daily/monthly caps CANNOT be enforced for these. Add pricing to the active provider profile or supply a catalog entry.
 cli-status-otp = {"  "}OTP enabled:       {$v}
-cli-status-estop = {"  "}E-stop enabled:    {$v}
+cli-status-estop = {"  "}E-stop enabled:    {$v} (not enforced)
 cli-status-peripherals-enabled = {"  "}Enabled:   {$v}
 cli-status-boards = {"  "}Boards:    {$v}
 cli-status-word-enabled = enabled
@@ -1212,6 +1215,7 @@ cli-plugin-update-restart = Restart the daemon so plugin instances it has alread
 cli-plugin-update-failed-exit = {$count} plugin(s) not updated.
 cli-estop-resume-done = Estop resume completed.
 cli-estop-engaged = Estop engaged.
+cli-estop-not-enforced = `zeroclaw estop` is not enforced: no running agent, daemon, or tool reads the estop state file, so engaging it would not stop anything. The estop state was not changed. To halt the agent now, stop the ZeroClaw process itself.
 cli-estop-status = Estop status:
 cli-auth-none = No auth profiles configured.
 cli-auth-active = Active profiles:
@@ -1314,6 +1318,9 @@ cli-channels-build-hint = {"  "}Build from source with `./install.sh --source --
 cli-channels-start-hint = To start channels: zeroclaw channel start
 cli-channels-doctor-hint = To check health:    zeroclaw channel doctor
 cli-channels-configure-hint = To configure:      zeroclaw config set channels.<name>.<field>=<value>
+# Refusal when a cron announcement or one-off send names a channel instance
+# whose `enabled` is false. `table` is the config table (`lark` for Feishu).
+cli-channels-delivery-disabled = [channels.{$table}.{$alias}] is disabled; set enabled = true to deliver
 
 cli-models-set-ok = Default model set to "{ $model }" on { $provider }.
 cli-models-status-current = Default model: { $model } (provider: { $provider })
@@ -1649,6 +1656,7 @@ cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is inv
 cli-doctor-degraded-section = config section `{$path}` is malformed and was reset to defaults; values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-doctor-verifiable-intent-tool-withheld = verifiable_intent.enabled is set, but the vi_verify tool is withheld from the model-visible registry until a credential chain verifier exists. Enabling the section does not enable credential verification on commerce tool calls. The issuance and verification library paths are unaffected.
 cli-doctor-security-audit-disabled-drops-certificate-record = security.audit.enabled=false: certificates are issued and renewed with no audit record. Command execution is not audited either way, because no production path records tool commands. Leave the section enabled to keep the certificate trail, and use an external supervisor or logging wrapper that observes the ZeroClaw process, or OS-level process accounting, if you need a record of what ran.
+cli-doctor-dead-delegate-grants = Delegate grants at {$path} can never run: the agent's risk profile forbids delegation (delegation_policy.mode) or blocks the `delegate` tool (allowed_tools, deny_all_tools or excluded_tools). Allow delegation in that profile or remove the grants.
 sop-approval-deferred-at-capacity = Approval could not resume run {$run_id}: execution slots are full. The gate remains waiting; retry after a slot frees.
 sop-approval-policy-unavailable = Approval failed because the parked SOP step is unavailable: {$reason}. The run remains waiting.
 sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current state.
@@ -1661,6 +1669,12 @@ sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
 tool-runtime-command-build-failed = Failed to build runtime command: {$error}
 tool-runtime-command-docker-workspace-path = Failed to build runtime command: Failed to canonicalize Docker workspace path {$path}: {$cause}
 tool-runtime-command-docker-allowed-root = Failed to build runtime command: Failed to canonicalize Docker workspace root {$path}: {$cause}
+
+# ── Shell tool failure labels (user-facing ToolComplete.error) ──
+tool-shell-exit-status = exit status { $code }
+tool-shell-killed-by-signal = killed by signal { $signal }
+tool-shell-exited-unsuccessfully = exited unsuccessfully
+tool-shell-failure-with-detail = { $status }: { $detail }
 
 # ── Terminal tool approval ──
 # The ASCII shortcut tokens stay aligned with the Rust-owned response parser.

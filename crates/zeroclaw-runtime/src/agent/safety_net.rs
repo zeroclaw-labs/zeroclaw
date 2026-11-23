@@ -4090,3 +4090,240 @@ async fn poisoned_model_switch_callback_still_raises_model_switch_requested() {
         "a switch written through the poisoned guard must be observed by the loop"
     );
 }
+
+// ── Issue 8794: interrupted turns must keep their completed tool rounds ──
+//
+/// Approval channel that never answers, so the turn parks on the approval wait.
+struct HangingApprovalChannel {
+    requests: Arc<AtomicUsize>,
+}
+impl ::zeroclaw_api::attribution::Attributable for HangingApprovalChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
+        )
+    }
+    fn alias(&self) -> &str {
+        "acp"
+    }
+}
+#[async_trait]
+impl zeroclaw_api::channel::Channel for HangingApprovalChannel {
+    fn name(&self) -> &str {
+        "acp"
+    }
+    async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn listen(
+        &self,
+        _tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn request_approval(
+        &self,
+        _recipient: &str,
+        _request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        std::future::pending().await
+    }
+}
+
+/// Cancelling while an approval is pending must still record the round: the
+/// call never ran, but it stays paired with an interrupted result.
+#[tokio::test]
+async fn issue_8794_cancel_during_approval_records_the_round() {
+    let exec = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let risk = zeroclaw_config::schema::RiskProfileConfig {
+        always_ask: vec!["echo".into()],
+        ..zeroclaw_config::schema::RiskProfileConfig::default()
+    };
+    let mut agent = approval_agent(
+        Box::new(ScriptedProvider::new(vec![tool_response(vec![tool_call(
+            "t1a", "echo",
+        )])])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls: Arc::clone(&exec),
+        })],
+        Some(Arc::new(ApprovalManager::for_non_interactive(&risk))),
+        Some(Arc::new(HangingApprovalChannel {
+            requests: Arc::clone(&requests),
+        })),
+    );
+    let token = tokio_util::sync::CancellationToken::new();
+    let cancel = token.clone();
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("t1", tx, Some(token), None)
+            .await
+    });
+    let waited = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while requests.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(waited.is_ok(), "turn must park on the approval request");
+    cancel.cancel();
+    while rx.recv().await.is_some() {}
+    let err = handle.await.expect("task join").expect_err("cancelled");
+    assert_eq!(exec.load(Ordering::SeqCst), 0, "tool never executed");
+    assert!(
+        err.new_messages
+            .iter()
+            .any(|m| matches!(m, ConversationMessage::AssistantToolCalls { .. })),
+        "the cancelled-at-approval round must be recorded (each tool call keeps a paired result)"
+    );
+    let interrupted =
+        crate::i18n::get_english_cli_string_with_args("turn-tool-interrupted-before-result", &[]);
+    assert!(
+        err.new_messages.iter().any(|m| {
+            matches!(m, ConversationMessage::ToolResults(_))
+                && format!("{m:?}").contains("t1a")
+                && format!("{m:?}").contains(&interrupted)
+        }),
+        "the recorded call must be paired with an interrupted result"
+    );
+}
+
+/// Approval channel that denies the first request and never answers the next,
+/// so a batch can hold one already-resolved call and one call still waiting.
+struct DenyThenHangApprovalChannel {
+    requests: Arc<AtomicUsize>,
+}
+impl ::zeroclaw_api::attribution::Attributable for DenyThenHangApprovalChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::AcpChannel,
+        )
+    }
+    fn alias(&self) -> &str {
+        "acp"
+    }
+}
+#[async_trait]
+impl zeroclaw_api::channel::Channel for DenyThenHangApprovalChannel {
+    fn name(&self) -> &str {
+        "acp"
+    }
+    async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn listen(
+        &self,
+        _tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn request_approval(
+        &self,
+        _recipient: &str,
+        _request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+        if self.requests.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny))
+        } else {
+            std::future::pending().await
+        }
+    }
+}
+
+/// Cancelling while a later call waits for approval keeps the real result of
+/// an earlier call in the same batch: the operator's denial is recorded, and
+/// only the call still waiting is marked interrupted.
+#[tokio::test]
+async fn issue_8794_cancel_during_approval_keeps_earlier_denial_result() {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let first_calls = Arc::new(AtomicUsize::new(0));
+    let second_calls = Arc::new(AtomicUsize::new(0));
+    let risk = zeroclaw_config::schema::RiskProfileConfig {
+        always_ask: vec!["echo".into(), "echo2".into()],
+        ..zeroclaw_config::schema::RiskProfileConfig::default()
+    };
+    let mut agent = approval_agent(
+        Box::new(ScriptedProvider::new(vec![tool_response(vec![
+            tool_call("t13a", "echo"),
+            tool_call("t13b", "echo2"),
+        ])])),
+        vec![
+            Box::new(CountingTool {
+                name: "echo",
+                calls: Arc::clone(&first_calls),
+            }),
+            Box::new(CountingTool {
+                name: "echo2",
+                calls: Arc::clone(&second_calls),
+            }),
+        ],
+        Some(Arc::new(ApprovalManager::for_non_interactive(&risk))),
+        Some(Arc::new(DenyThenHangApprovalChannel {
+            requests: Arc::clone(&requests),
+        })),
+    );
+    let token = tokio_util::sync::CancellationToken::new();
+    let cancel = token.clone();
+    let (tx, mut rx) = mpsc::channel(256);
+    let handle = zeroclaw_spawn::spawn!(async move {
+        agent
+            .turn_streamed_with_steering_state("t13", tx, Some(token), None)
+            .await
+    });
+    let waited = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while requests.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(waited.is_ok(), "turn must park on the second approval");
+    cancel.cancel();
+    while rx.recv().await.is_some() {}
+    let err = handle.await.expect("task join").expect_err("cancelled");
+    assert_eq!(
+        first_calls.load(Ordering::SeqCst),
+        0,
+        "the denied tool never ran"
+    );
+    assert_eq!(
+        second_calls.load(Ordering::SeqCst),
+        0,
+        "the tool still waiting never ran"
+    );
+    let interrupted =
+        crate::i18n::get_english_cli_string_with_args("turn-tool-interrupted-before-result", &[]);
+    let results: Vec<_> = err
+        .new_messages
+        .iter()
+        .filter_map(|m| match m {
+            ConversationMessage::ToolResults(results) => Some(results.iter()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let denied = results
+        .iter()
+        .find(|r| r.tool_call_id == "t13a")
+        .expect("the earlier call keeps a recorded result");
+    assert!(
+        denied.content.contains("Denied by user"),
+        "the earlier call keeps the operator's real denial: {}",
+        denied.content
+    );
+    assert!(
+        !denied.content.contains(&interrupted),
+        "the denial must not be replaced by the interrupted result"
+    );
+    let waiting = results
+        .iter()
+        .find(|r| r.tool_call_id == "t13b")
+        .expect("the call still waiting keeps a recorded result");
+    assert!(
+        waiting.content.contains(&interrupted),
+        "the call still waiting is paired with the interrupted result: {}",
+        waiting.content
+    );
+}
