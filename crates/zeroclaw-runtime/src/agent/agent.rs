@@ -13,7 +13,6 @@ use crate::security::ingress::{IngressPolicy, steering_policy};
 use crate::sop::{SopAuditLogger, SopEngine};
 use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
-use chrono::{Datelike, Timelike};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::Path;
@@ -1559,17 +1558,10 @@ impl Agent {
 
     /// Prefixes a user message with the current date/time in the labeled
     /// shape both embedded Agent turn paths store in history, including the
-    /// streamed path used by RPC and ACP. Other runtime owners format their
-    /// own user-message envelopes independently.
+    /// streamed path used by RPC and ACP. `prompt::timestamp_user_message`
+    /// owns that shape.
     fn enrich_user_message(&self, user_message: &str) -> String {
-        let now = self.current_turn_datetime();
-        let (year, month, day) = (now.year(), now.month(), now.day());
-        let (hour, minute, second) = (now.hour(), now.minute(), now.second());
-        let tz = now.format("%Z");
-        let date_str =
-            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
-
-        format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
+        crate::agent::prompt::timestamp_user_message(&self.current_turn_datetime(), user_message)
     }
 
     pub fn set_channel_name(&mut self, name: String) {
@@ -4475,6 +4467,9 @@ impl Agent {
             self.context_limits_for_route(&selected_route.provider_name, &selected_route.model);
 
         let turn_id = Self::new_turn_id();
+        // This frame owns the turn id and any model-switch rounds, so it
+        // backstops the turn's elicitation hint record on every exit.
+        let _hint_scope = crate::agent::loop_::TurnHintScope::new(&turn_id);
         let turn_observer = Arc::clone(&self.observer);
         let mut guard = crate::observability::AgentTurnGuard::start(
             turn_observer.as_ref(),
@@ -5030,6 +5025,10 @@ impl Agent {
         let attempt_allowlist = model_selection.allowed_provider_refs;
         let mut selected_route = self.model_route_resolver.resolve(&effective_model);
         let turn_id = Self::new_turn_id();
+        // This frame owns the turn id and the model-switch round loop, so it
+        // backstops the turn's elicitation hint record on every exit — a
+        // switch round that fails to rebuild its provider included.
+        let _hint_scope = crate::agent::loop_::TurnHintScope::new(&turn_id);
         let mut committed_response = String::new();
         // Requested-vs-served divergence for THIS turn. Source of truth is the
         // task-local record inside `zeroclaw_providers::reliable`, consumed
@@ -14030,8 +14029,9 @@ mod tests {
 
     #[test]
     fn session_cwd_keeps_workspace_in_allowed_roots() {
-        let workspace = std::env::temp_dir().join("zeroclaw_test_session_cwd_workspace");
-        let session = std::env::temp_dir().join("zeroclaw_test_session_cwd_session");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let session = tmp.path().join("session");
         let _ = std::fs::create_dir_all(&workspace);
         let _ = std::fs::create_dir_all(&session);
 

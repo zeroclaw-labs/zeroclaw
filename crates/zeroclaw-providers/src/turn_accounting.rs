@@ -214,17 +214,6 @@ impl ContextDisplay {
     pub fn trimmed_input(&self) -> Option<(u64, Option<&'static str>)> {
         self.trimmed_input
     }
-
-    /// Attach snake_case `context_input_tokens` / `context_input_tokens_source`
-    /// onto a WebSocket `done` frame.
-    pub fn add_to_done(&self, done: &mut serde_json::Value) {
-        if let Some((input, source)) = self.trimmed_input {
-            done["context_input_tokens"] = input.into();
-            if let Some(source) = source {
-                done["context_input_tokens_source"] = source.into();
-            }
-        }
-    }
 }
 
 /// Resolve terminal budget and configured context window from usage values with
@@ -455,6 +444,24 @@ mod tests {
     }
 
     #[test]
+    fn unpriced_usage_has_no_total_cost() {
+        assert_eq!(UsageFold::total_cost_usd(&[]), None);
+        let mut fold = UsageFold::default();
+        fold.apply(usage_event(
+            "local",
+            "m",
+            Some(12),
+            None,
+            Some(3),
+            None,
+            true,
+        ));
+        let entries = fold.sorted_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(UsageFold::total_cost_usd(&entries), None);
+    }
+
+    #[test]
     fn context_display_tracks_effective_trims_and_clears_on_accepted_usage() {
         let mut display = ContextDisplay::default();
         display.observe(&trim_event(0, Some(80_000)));
@@ -467,11 +474,6 @@ mod tests {
         // Rejected usage preserves trim display.
         display.observe(&usage_event("r", "m", Some(500), None, None, None, false));
         assert_eq!(display.trimmed_input(), Some((65_000, Some("calibrated"))));
-
-        let mut done = serde_json::json!({ "type": "done" });
-        display.add_to_done(&mut done);
-        assert_eq!(done["context_input_tokens"], 65_000);
-        assert_eq!(done["context_input_tokens_source"], "calibrated");
 
         // Accepted usage (even without input_tokens) supersedes trim display.
         display.observe(&usage_event("a", "m", None, None, None, None, true));

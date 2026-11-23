@@ -10,7 +10,9 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -163,6 +165,40 @@ class PrSizeLabelTest(unittest.TestCase):
         self.assertIsInstance(headers, dict)
         self.assertEqual(headers["User-Agent"], size_labeler.USER_AGENT)
         self.assertEqual(headers["Accept"], "application/vnd.github+json")
+
+    def test_client_follows_pagination_with_case_insensitive_link_header(self) -> None:
+        for header_name in ("Link", "link", "lInK"):
+            with self.subTest(header=header_name):
+                requests: list[str] = []
+
+                class Handler(BaseHTTPRequestHandler):
+                    def do_GET(self) -> None:
+                        requests.append(self.path)
+                        self.send_response(200)
+                        if self.path == "/files":
+                            self.send_header(header_name, f'<{api_url}/files?page=2>; rel="next"')
+                            payload = [{"filename": "first.rs"}]
+                        else:
+                            payload = [{"filename": "second.rs"}]
+                        self.end_headers()
+                        self.wfile.write(json.dumps(payload).encode())
+
+                    def log_message(self, _format: str, *args: object) -> None:
+                        pass
+
+                with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+                    api_url = f"http://127.0.0.1:{server.server_port}"
+                    thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01))
+                    thread.start()
+                    try:
+                        client = size_labeler.GitHubClient("fixture-token", api_url)
+                        self.assertEqual(list(client.paginate("/files")), [
+                            {"filename": "first.rs"}, {"filename": "second.rs"},
+                        ])
+                        self.assertEqual(requests, ["/files", "/files?page=2"])
+                    finally:
+                        server.shutdown()
+                        thread.join()
 
     def test_load_pr_changed_file_count_reads_trusted_metadata(self) -> None:
         class FakeClient:
