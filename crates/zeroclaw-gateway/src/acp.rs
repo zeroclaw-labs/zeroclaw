@@ -52,6 +52,7 @@ struct ActiveAcpTurn {
 /// an in-flight ACP turn.
 pub(crate) struct AcpTurnAttachment {
     origin: Weak<AcpServer>,
+    after_seq: u64,
     pub(crate) replay: Vec<AcpTurnEventFrame>,
     pub(crate) live: broadcast::Receiver<AcpTurnEventFrame>,
     pub(crate) completed: bool,
@@ -64,7 +65,6 @@ impl AcpTurnAttachment {
     async fn send_to_socket(
         self,
         sid: &str,
-        after_seq: u64,
         request_id: serde_json::Value,
         reader: &mut Option<tokio::task::JoinHandle<()>>,
         wire: &mpsc::Sender<String>,
@@ -97,7 +97,7 @@ impl AcpTurnAttachment {
         let sid = sid.to_owned();
         let wire = wire.clone();
         *reader = Some(zeroclaw_spawn::spawn!(async move {
-            let mut last_seq = after_seq;
+            let mut last_seq = self.after_seq;
             for event in self.replay {
                 last_seq = last_seq.max(event.seq);
                 let done = event.is_terminal;
@@ -275,12 +275,13 @@ impl AcpTurnHub {
     /// Reattach to an active turn for `session_id`, enforcing exact principal
     /// ownership. Returns `Ok(None)` when no turn is currently in flight,
     /// `Err(FORBIDDEN)` when owned by another principal, and `Ok(Some(_))` with
-    /// ordered replay events (`seq > after_seq`) plus a live broadcast stream.
+    /// ordered replay events plus a live broadcast stream. A cursor applies
+    /// only to the turn that issued it.
     pub(crate) fn reattach(
         &self,
         session_id: &str,
         principal_id: Option<&str>,
-        after_seq: u64,
+        cursor: Option<(uuid::Uuid, u64)>,
         active_only: bool,
         accept_partial: bool,
     ) -> Result<Option<AcpTurnAttachment>, i32> {
@@ -294,6 +295,9 @@ impl AcpTurnHub {
         if active_only && turn.completed {
             return Ok(None);
         }
+        let after_seq = cursor
+            .filter(|(turn_id, _)| *turn_id == turn.identity)
+            .map_or(0, |(_, seq)| seq);
         let truncated = turn
             .events
             .front()
@@ -325,6 +329,7 @@ impl AcpTurnHub {
         replay.sort_by_key(|e| e.seq);
         Ok(Some(AcpTurnAttachment {
             origin: turn.server.clone(),
+            after_seq,
             replay,
             live: turn.tx.subscribe(),
             completed: turn.completed,
@@ -732,22 +737,21 @@ async fn handle_socket(
                             .and_then(|p| p.get("sessionId").or_else(||p.get("session_id")))
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("");
-                        let after_seq = parsed
-                            .get("params")
-                            .and_then(|p| p.get("afterSeq"))
-                            .and_then(serde_json::Value::as_u64)
-                            .unwrap_or(0);
+                        let params = &parsed["params"];
+                        let cursor = params["turnId"]
+                            .as_str()
+                            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                            .zip(params["afterSeq"].as_u64());
                         if !server.has_gateway_session(sid).await {
                             let _ = wire_tx.send(serde_json::json!({"jsonrpc":"2.0","id":req_id,"error":{"code":FORBIDDEN,"message":"Restore the session before reattaching"}}).to_string()).await;
                             continue;
                         }
                         let reader = attached_sessions.entry(sid.to_owned()).or_default();
-                        let params = &parsed["params"];
                         let active_only = params["activeOnly"].as_bool().unwrap_or(false);
                         let accept_partial = params["acceptPartial"].as_bool().unwrap_or(false);
-                        match turn_hub.reattach(sid, principal_id.as_deref(), after_seq, active_only, accept_partial) {
+                        match turn_hub.reattach(sid, principal_id.as_deref(), cursor, active_only, accept_partial) {
                             Ok(Some(attachment)) => {
-                                attachment.send_to_socket(sid, after_seq, req_id, reader, &wire_tx, &server).await;
+                                attachment.send_to_socket(sid, req_id, reader, &wire_tx, &server).await;
                             }
                             Ok(None) => {
                                 let ack = serde_json::json!({
@@ -1230,8 +1234,19 @@ mod tests {
         );
 
         // Client reloads and reattaches after seq=1 (saw tool_call:1 before reload).
+        let turn_id = hub
+            .reattach("sess-reload", Some("alice"), None, false, false)
+            .unwrap()
+            .unwrap()
+            .turn_id;
         let mut attached = hub
-            .reattach("sess-reload", Some("alice"), 1, false, false)
+            .reattach(
+                "sess-reload",
+                Some("alice"),
+                Some((turn_id, 1)),
+                false,
+                false,
+            )
             .expect("owner reattach must succeed")
             .expect("turn is still active");
         assert!(!attached.completed);
@@ -1295,7 +1310,7 @@ mod tests {
             "reattach must replay missed frames in exact order with zero duplicates"
         );
         assert!(
-            hub.reattach("sess-reload", Some("alice"), 0, false, false)
+            hub.reattach("sess-reload", Some("alice"), None, false, false)
                 .unwrap()
                 .is_some_and(|a| a.completed),
             "terminal replay must survive completion"
@@ -1323,16 +1338,21 @@ mod tests {
         hub.record_frame(sid, serde_json::json!({"data": "first"}).to_string(), false)
             .unwrap();
 
+        let turn_id = hub
+            .reattach(sid, None, None, false, false)
+            .unwrap()
+            .unwrap()
+            .turn_id;
         let attach_twice = async |server: &Arc<super::AcpServer>| {
             let (tx, mut rx) = tokio::sync::mpsc::channel(16);
             let mut reader = None;
             for cursor in [0, 1] {
                 let attachment = hub
-                    .reattach(sid, None, cursor, false, false)
+                    .reattach(sid, None, Some((turn_id, cursor)), false, false)
                     .unwrap()
                     .unwrap();
                 attachment
-                    .send_to_socket(sid, cursor, cursor.into(), &mut reader, &tx, server)
+                    .send_to_socket(sid, cursor.into(), &mut reader, &tx, server)
                     .await;
                 let ack: serde_json::Value =
                     serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
@@ -1377,6 +1397,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reattach_replays_and_streams_a_new_turn_with_an_old_cursor() {
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 5, 60,
+        ));
+        let hub = Arc::new(super::AcpTurnHub::new(queue));
+        let observer = Arc::new(super::AcpServer::new(
+            Default::default(),
+            Default::default(),
+        ));
+        let sid = "next-turn";
+        hub.start_turn(sid, None, Default::default(), std::sync::Weak::new())
+            .await
+            .unwrap();
+        let previous_id = hub
+            .reattach(sid, None, None, false, false)
+            .unwrap()
+            .unwrap()
+            .turn_id;
+        hub.finish_turn(sid);
+        hub.start_turn(sid, None, Default::default(), std::sync::Weak::new())
+            .await
+            .unwrap();
+        hub.record_frame(
+            sid,
+            serde_json::json!({"data": "first chunk"}).to_string(),
+            false,
+        )
+        .unwrap();
+
+        let attachment = hub
+            .reattach(sid, None, Some((previous_id, 99)), false, false)
+            .unwrap()
+            .unwrap();
+        assert_ne!(attachment.turn_id, previous_id);
+        let (wire, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut reader = None;
+        attachment
+            .send_to_socket(sid, 1.into(), &mut reader, &wire, &observer)
+            .await;
+        hub.record_frame(
+            sid,
+            serde_json::json!({"result": {"stopReason": "end_turn"}}).to_string(),
+            true,
+        )
+        .unwrap();
+        let frames = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut frames = Vec::new();
+            for _ in 0..3 {
+                let value =
+                    serde_json::from_str::<serde_json::Value>(&rx.recv().await.unwrap()).unwrap();
+                frames.push(value);
+            }
+            frames
+        })
+        .await
+        .unwrap();
+        assert_eq!(frames[0]["result"]["replayed"], 1);
+        assert_eq!(frames[1]["data"], "first chunk");
+        assert_eq!(frames[2]["params"]["result"]["stopReason"], "end_turn");
+        reader.unwrap().await.unwrap();
+        hub.finish_turn(sid);
+    }
+
+    #[tokio::test]
     async fn acp_turn_hub_enforces_principal_isolation_and_allows_owner_cancel() {
         let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
             4, 10, 60,
@@ -1394,12 +1478,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            hub.reattach("sess-scoped", Some("bob"), 0, false, false)
+            hub.reattach("sess-scoped", Some("bob"), None, false, false)
                 .err(),
             Some(zeroclaw_api::jsonrpc::error_codes::FORBIDDEN)
         );
         assert_eq!(
-            hub.reattach("sess-scoped", None, 0, false, false).err(),
+            hub.reattach("sess-scoped", None, None, false, false).err(),
             Some(zeroclaw_api::jsonrpc::error_codes::FORBIDDEN)
         );
         assert_eq!(
