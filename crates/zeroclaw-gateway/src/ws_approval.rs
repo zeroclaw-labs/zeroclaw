@@ -104,6 +104,20 @@ impl Channel for WsApprovalChannel {
             .map(|attributed| attributed.response))
     }
 
+    async fn request_origin_credential_approval(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> bool {
+        // This channel is bound to the originating WebSocket and pending map.
+        matches!(
+            self.request_approval_attributed(recipient, request).await,
+            Ok(Some(decision))
+                if decision.source == ApprovalSource::Operator
+                    && decision.response == ChannelApprovalResponse::Approve
+        )
+    }
+
     async fn request_approval_attributed(
         &self,
         _recipient: &str,
@@ -178,6 +192,37 @@ mod tests {
             arguments_summary: "path=a.txt".to_string(),
             raw_arguments: None,
             position: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn origin_credential_approval_accepts_only_one_time_approval() {
+        for (decision, expected) in [
+            (ChannelApprovalResponse::Approve, true),
+            (ChannelApprovalResponse::AlwaysApprove, false),
+            (ChannelApprovalResponse::Deny, false),
+        ] {
+            let (tx, mut rx) = mpsc::channel(8);
+            let pending = new_pending_approvals();
+            let channel = WsApprovalChannel::new(tx, Arc::clone(&pending), Duration::from_secs(1));
+            let request = approval_request();
+            let respond = async {
+                let Some(TurnEvent::ApprovalRequest { request_id, .. }) = rx.recv().await else {
+                    panic!("expected an approval prompt on the originating WebSocket");
+                };
+                pending
+                    .lock()
+                    .remove(&request_id)
+                    .unwrap()
+                    .send(decision)
+                    .unwrap();
+            };
+            let (approved, ()) = tokio::join!(
+                channel.request_origin_credential_approval("operator", &request),
+                respond
+            );
+            assert_eq!(approved, expected);
+            assert!(pending.lock().is_empty());
         }
     }
 
