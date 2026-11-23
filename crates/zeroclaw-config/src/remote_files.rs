@@ -151,9 +151,243 @@ pub fn is_relative_resource_path(path: &str) -> bool {
     })
 }
 
+/// An operator-approved identity reference. Values are aliases, never secrets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoteIdentity<'a> {
+    Vault {
+        credential_alias: &'a str,
+        totp_alias: Option<&'a str>,
+    },
+    HostManaged,
+}
+
+/// Resolved endpoint borrowed from live policy. The resource identifier is
+/// canonical within the catalog and must not come directly from the model.
+#[derive(Clone, Copy)]
+pub struct ResolvedRemote<'a> {
+    pub resource_id: &'a str,
+    pub identity: RemoteIdentity<'a>,
+    pub rights: &'a Rights,
+}
+
+#[derive(Clone, Copy)]
+pub enum TransferEndpoint<'a> {
+    Workspace { rights: &'a Rights },
+    Remote(ResolvedRemote<'a>),
+}
+
+impl<'a> TransferEndpoint<'a> {
+    fn rights(self) -> &'a Rights {
+        match self {
+            Self::Workspace { rights } => rights,
+            Self::Remote(remote) => remote.rights,
+        }
+    }
+}
+
+/// Describes where the executor must obtain each identity. Aliases are
+/// resolved against each endpoint's grant and verified peer at use time.
+#[derive(Debug, Eq, PartialEq)]
+pub enum TransferRoute<'a> {
+    SameResource(ResolvedIdentity<'a>),
+    Download(ResolvedIdentity<'a>),
+    Upload(ResolvedIdentity<'a>),
+    BetweenResources {
+        source: ResolvedIdentity<'a>,
+        destination: ResolvedIdentity<'a>,
+    },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct ResolvedIdentity<'a> {
+    pub resource_id: &'a str,
+    pub identity: RemoteIdentity<'a>,
+}
+
+impl<'a> From<ResolvedRemote<'a>> for ResolvedIdentity<'a> {
+    fn from(remote: ResolvedRemote<'a>) -> Self {
+        Self {
+            resource_id: remote.resource_id,
+            identity: remote.identity,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransferHold {
+    InvalidRelativePath,
+    WorkspaceOnly,
+    ConflictingResourceIdentity,
+    Denied,
+    RequireHumanApproval,
+}
+
+/// Prepare a streamed route from canonical catalog entries, before any
+/// backend access. A held operation returns no route or identity reference.
+/// The executor must still enforce workspace policy, peer verification,
+/// root containment, and grant revalidation before dispatch and removal.
+pub fn plan_streamed_transfer<'a>(
+    source: TransferEndpoint<'a>,
+    source_path: &str,
+    destination: TransferEndpoint<'a>,
+    destination_path: &str,
+    transfer: Transfer,
+    overwrite: bool,
+) -> Result<TransferRoute<'a>, TransferHold> {
+    if ![source_path, destination_path]
+        .into_iter()
+        .all(is_relative_resource_path)
+    {
+        return Err(TransferHold::InvalidRelativePath);
+    }
+
+    let route = match (source, destination) {
+        (TransferEndpoint::Workspace { .. }, TransferEndpoint::Workspace { .. }) => {
+            return Err(TransferHold::WorkspaceOnly);
+        }
+        (TransferEndpoint::Remote(remote), TransferEndpoint::Workspace { .. }) => {
+            TransferRoute::Download(remote.into())
+        }
+        (TransferEndpoint::Workspace { .. }, TransferEndpoint::Remote(remote)) => {
+            TransferRoute::Upload(remote.into())
+        }
+        (TransferEndpoint::Remote(source), TransferEndpoint::Remote(destination))
+            if source.resource_id == destination.resource_id =>
+        {
+            if source.identity != destination.identity {
+                return Err(TransferHold::ConflictingResourceIdentity);
+            }
+            TransferRoute::SameResource(source.into())
+        }
+        (TransferEndpoint::Remote(source), TransferEndpoint::Remote(destination)) => {
+            TransferRoute::BetweenResources {
+                source: source.into(),
+                destination: destination.into(),
+            }
+        }
+    };
+
+    match check_streamed_transfer(source.rights(), destination.rights(), transfer, overwrite) {
+        Decision::Denied => Err(TransferHold::Denied),
+        Decision::RequireHumanApproval => Err(TransferHold::RequireHumanApproval),
+        Decision::Allowed => Ok(route),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_preserves_endpoint_bindings_even_when_aliases_match() {
+        use Right::*;
+        let source_rights = rights(&[CopyFiles, ReadFile], false);
+        let destination_rights = rights(&[CopyFiles, CreateFile], false);
+        let identity = RemoteIdentity::Vault {
+            credential_alias: "TEST_LOGIN",
+            totp_alias: Some("TEST_TOTP"),
+        };
+        let source = ResolvedRemote {
+            resource_id: "server-a",
+            identity,
+            rights: &source_rights,
+        };
+        let destination = ResolvedRemote {
+            resource_id: "server-b",
+            identity,
+            rights: &destination_rights,
+        };
+        let plan = |source, destination| {
+            plan_streamed_transfer(
+                source,
+                "report.pdf",
+                destination,
+                "inbox/report.pdf",
+                Transfer::CopyFiles,
+                false,
+            )
+        };
+        assert_eq!(
+            plan(
+                TransferEndpoint::Remote(source),
+                TransferEndpoint::Remote(destination)
+            ),
+            Ok(TransferRoute::BetweenResources {
+                source: source.into(),
+                destination: destination.into()
+            })
+        );
+        assert_eq!(
+            plan(
+                TransferEndpoint::Remote(source),
+                TransferEndpoint::Workspace {
+                    rights: &destination_rights
+                }
+            ),
+            Ok(TransferRoute::Download(source.into()))
+        );
+        assert_eq!(
+            plan(
+                TransferEndpoint::Workspace {
+                    rights: &source_rights
+                },
+                TransferEndpoint::Remote(destination)
+            ),
+            Ok(TransferRoute::Upload(destination.into()))
+        );
+        let same_resource = ResolvedRemote {
+            resource_id: "server-a",
+            ..destination
+        };
+        assert_eq!(
+            plan(
+                TransferEndpoint::Remote(source),
+                TransferEndpoint::Remote(same_resource)
+            ),
+            Ok(TransferRoute::SameResource(source.into()))
+        );
+        let conflicting = ResolvedRemote {
+            identity: RemoteIdentity::HostManaged,
+            ..same_resource
+        };
+        assert_eq!(
+            plan(
+                TransferEndpoint::Remote(source),
+                TransferEndpoint::Remote(conflicting)
+            ),
+            Err(TransferHold::ConflictingResourceIdentity)
+        );
+    }
+
+    #[test]
+    fn invalid_destination_and_approval_hold_return_no_route() {
+        use Right::*;
+        let source_rights = rights(&[CopyFiles, ReadFile], false);
+        let destination_rights = rights(&[CopyFiles, CreateFile], true);
+        let source = TransferEndpoint::Workspace {
+            rights: &source_rights,
+        };
+        let destination = TransferEndpoint::Remote(ResolvedRemote {
+            resource_id: "server-a",
+            identity: RemoteIdentity::HostManaged,
+            rights: &destination_rights,
+        });
+        let plan = |path| {
+            plan_streamed_transfer(
+                source,
+                "report.pdf",
+                destination,
+                path,
+                Transfer::CopyFiles,
+                false,
+            )
+        };
+        assert_eq!(plan("../inbox"), Err(TransferHold::InvalidRelativePath));
+        assert_eq!(
+            plan("inbox/report.pdf"),
+            Err(TransferHold::RequireHumanApproval)
+        );
+    }
 
     fn rights(operations: &[Right], require_human_approval: bool) -> Rights {
         Rights {
