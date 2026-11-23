@@ -1670,6 +1670,7 @@ mod tests {
     async fn connect_nonexistent_command_fails_cleanly() {
         // A command that doesn't exist should fail at spawn, not panic.
         let config = McpServerConfig {
+            deny_delegate_inheritance: false,
             pinned_resources: Vec::new(),
             name: "nonexistent".to_string(),
             command: "/usr/bin/this_binary_does_not_exist_zeroclaw_test".to_string(),
@@ -1692,6 +1693,7 @@ mod tests {
     async fn connect_all_nonfatal_on_single_failure() {
         // If one server config is bad, connect_all should succeed (with 0 servers).
         let configs = vec![McpServerConfig {
+            deny_delegate_inheritance: false,
             pinned_resources: Vec::new(),
             name: "bad".to_string(),
             command: "/usr/bin/does_not_exist_zc_test".to_string(),
@@ -2669,6 +2671,7 @@ done
         );
 
         let config = McpServerConfig {
+            deny_delegate_inheritance: false,
             pinned_resources: Vec::new(),
             name: "echo".to_string(),
             command: "/bin/sh".to_string(),
