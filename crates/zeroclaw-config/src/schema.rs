@@ -49000,6 +49000,80 @@ stream_tool_arguments = [
         );
     }
 
+    /// `config set`, RPC `config/set`, the gateway PATCH and env overrides
+    /// all reach `set_prop`. Text that reads as infinity or NaN is refused
+    /// for a plain float field and for an optional one, and the value already
+    /// set is kept. Finite edge values still store exactly.
+    #[test]
+    async fn set_prop_float_refuses_non_finite_text_and_keeps_the_stored_value() {
+        let mut config = Config::default();
+        let vector_weight = config.memory.vector_weight;
+        config
+            .set_prop_persistent("runtime.docker.cpu_limit", "2.5")
+            .unwrap();
+        for text in [
+            "inf", "+inf", "-inf", "Infinity", "infinity", "NaN", "nan", "1e999", "-1e999",
+        ] {
+            for prop in ["memory.vector_weight", "runtime.docker.cpu_limit"] {
+                let err = config.set_prop_persistent(prop, text).expect_err(text);
+                assert!(
+                    format!("{err:#}").contains("Invalid float value"),
+                    "{prop} {text}: {err:#}"
+                );
+            }
+            assert_eq!(
+                config.memory.vector_weight.to_bits(),
+                vector_weight.to_bits(),
+                "{text}"
+            );
+            assert_eq!(config.runtime.docker.cpu_limit, Some(2.5), "{text}");
+        }
+        for (text, want) in [
+            ("-0.0", -0.0_f64),
+            ("5e-324", 5e-324),
+            ("1.7976931348623157e308", f64::MAX),
+            ("5", 5.0),
+        ] {
+            config
+                .set_prop_persistent("memory.vector_weight", text)
+                .unwrap();
+            assert_eq!(
+                config.memory.vector_weight.to_bits(),
+                want.to_bits(),
+                "{text}"
+            );
+            config
+                .set_prop_persistent("runtime.docker.cpu_limit", text)
+                .unwrap();
+            assert_eq!(
+                config.runtime.docker.cpu_limit.map(f64::to_bits),
+                Some(want.to_bits()),
+                "{text}"
+            );
+        }
+    }
+
+    /// `energy_threshold` is an `f32`: `1e39` is finite as an `f64` but
+    /// would be stored as infinity, so it is refused too.
+    #[test]
+    async fn set_prop_f32_refuses_a_value_too_large_for_the_field() {
+        let mut wake = VoiceWakeConfig::default();
+        let before = wake.energy_threshold;
+        for text in ["1e39", "-1e39", "inf", "NaN"] {
+            let err = wake
+                .set_prop("voice_wake.energy_threshold", text)
+                .expect_err(text);
+            assert!(
+                format!("{err:#}").contains("Invalid float value"),
+                "{text}: {err:#}"
+            );
+            assert_eq!(wake.energy_threshold.to_bits(), before.to_bits(), "{text}");
+        }
+        wake.set_prop("voice_wake.energy_threshold", "0.05")
+            .unwrap();
+        assert_eq!(wake.energy_threshold, 0.05_f32);
+    }
+
     #[test]
     async fn set_prop_option_string_set_and_clear() {
         let mut mx = test_matrix_config();
