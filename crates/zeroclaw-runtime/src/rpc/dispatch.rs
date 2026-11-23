@@ -2761,24 +2761,35 @@ impl RpcDispatcher {
             SessionPromptOutcome, SessionPromptRefusal, SessionPromptScope,
         };
 
-        let Some(target_alias) = self.ctx.sessions.get_agent_alias(&session_id).await else {
+        // One snapshot of the incarnation: its agent and owner are fixed for
+        // its generation, and admission below requires that generation, so
+        // a same-ID replacement cannot inherit this check.
+        let Some((target_alias, attached_here, generation)) = self
+            .ctx
+            .sessions
+            .with_session_effect(&session_id, |session| {
+                session.map(|session| {
+                    (
+                        session.agent_alias.clone(),
+                        session.owner_tui_id() == self.tui_id.as_deref(),
+                        session.generation,
+                    )
+                })
+            })
+            .await
+        else {
             return Err(SessionPromptRefusal::NotFound);
         };
         if !self.agent_prompt_reaches(&caller_alias, &target_alias) {
             return Err(SessionPromptRefusal::NotReachable { target_alias });
         }
-        let attached_here = self
-            .ctx
-            .sessions
-            .with_session_effect(&session_id, |session| {
-                session.map(|session| session.owner_tui_id() == self.tui_id.as_deref())
-            })
-            .await;
-        match attached_here {
-            None => return Err(SessionPromptRefusal::NotFound),
-            Some(false) => return Err(SessionPromptRefusal::OtherConnection),
-            Some(true) => {}
+        if !attached_here {
+            return Err(SessionPromptRefusal::OtherConnection);
         }
+        self.ctx
+            .sessions
+            .wait_test_effect_pause("injected-prompt-checked")
+            .await;
 
         let req: SessionPromptParams = serde_json::from_value(serde_json::json!({
             "session_id": session_id,
@@ -2802,7 +2813,11 @@ impl RpcDispatcher {
         let scope = SessionPromptScope::capture();
         let turn = zeroclaw_spawn::spawn!(scope.scope(async move {
             dispatcher
-                .run_session_prompt_with(req, None, crate::rpc::session::PromptAdmission::IfIdle)
+                .run_session_prompt_with(
+                    req,
+                    Some(generation),
+                    crate::rpc::session::PromptAdmission::IfIdle,
+                )
                 .await
         }));
         match turn.await {
@@ -53390,6 +53405,19 @@ mod tests {
         ) -> Fixture {
             let tmp = tempfile::TempDir::new().unwrap();
             let mut config = session_cwd_config(&tmp, 4242, None);
+            // An agent Alice may prompt but `caller` cannot reach.
+            let mut unreachable = config.agents["test-agent"].clone();
+            unreachable.workspace.path = Some(tmp.path().join("unreachable-workspace"));
+            std::fs::create_dir_all(tmp.path().join("unreachable-workspace")).unwrap();
+            config
+                .agents
+                .insert("unreachable-agent".into(), unreachable);
+            config
+                .permission_profiles
+                .get_mut("session-scoped")
+                .expect("the fixture profile exists")
+                .allowed_agents
+                .push("unreachable-agent".into());
             if let Some((mode, target_mode)) = caller_delegation {
                 config.risk_profiles.insert(
                     "caller-profile".into(),
@@ -53577,6 +53605,78 @@ mod tests {
                 .expect("the owner's turn does not panic")
                 .expect("the owner's turn succeeds");
             assert_eq!(fixture.handles.calls().await.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_session_replaced_after_the_check_is_not_prompted() {
+            let fixture = fixture(
+                Some((
+                    zeroclaw_config::autonomy::DelegationMode::Allow,
+                    DelegateExecutionMode::Independent,
+                )),
+                None,
+                false,
+            )
+            .await;
+            let (arrived, release) = fixture
+                .ctx
+                .sessions
+                .set_test_effect_pause("injected-prompt-checked");
+            let dispatcher = connection(&fixture.ctx, None).await;
+            let prompt =
+                zeroclaw_spawn::spawn!(async move { inject(&dispatcher, SID, "caller").await });
+            tokio::time::timeout(std::time::Duration::from_secs(5), arrived.notified())
+                .await
+                .expect("the prompt passes its reach check");
+
+            let (provider, replacement) = recording_provider(false);
+            let workspace = fixture
+                .ctx
+                .config
+                .read()
+                .agent_workspace_dir("unreachable-agent")
+                .canonicalize()
+                .unwrap();
+            let agent = crate::agent::agent::Agent::builder()
+                .model_provider(Box::new(provider))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    Vec::new(),
+                ))
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::noop::NoopObserver))
+                .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+                .workspace_dir(workspace.clone())
+                .agent_alias("unreachable-agent".to_string())
+                .build()
+                .expect("replacement agent should build");
+            assert!(fixture.ctx.sessions.remove(SID).await);
+            fixture
+                .ctx
+                .sessions
+                .insert(
+                    SID.to_string(),
+                    crate::rpc::session::RpcSession::new(
+                        agent,
+                        "unreachable-agent",
+                        workspace.to_str().unwrap(),
+                        ChatMode::Chat,
+                    )
+                    .with_owner_principal(Some("user:alice".to_string())),
+                )
+                .await
+                .unwrap();
+            release.notify_one();
+
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), prompt)
+                .await
+                .expect("the prompt settles")
+                .expect("the prompt task does not panic");
+            assert!(matches!(result, Err(SessionPromptRefusal::NotFound)));
+            assert!(
+                replacement.calls().await.is_empty(),
+                "the replacement agent never runs the injected turn"
+            );
+            assert!(fixture.handles.calls().await.is_empty());
         }
 
         #[tokio::test]
