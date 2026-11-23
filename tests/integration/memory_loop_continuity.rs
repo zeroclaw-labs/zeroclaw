@@ -381,6 +381,54 @@ async fn agent_multi_turn_with_tools_builds_context() {
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
+async fn bounded_mock_preserves_scripted_response_when_shared_budget_is_exhausted() {
+    use zeroclaw::providers::traits::{
+        GenerationAttemptBudget, GenerationAttemptBudgetExhausted, ToolRoundPolicy,
+    };
+    use zeroclaw::providers::{ChatRequest, ModelProvider};
+
+    let provider = MockModelProvider::new(vec![text_response("first"), text_response("second")]);
+    let budget = GenerationAttemptBudget::new(1);
+    let shared_budget = budget.clone();
+    let request = ChatRequest {
+        messages: &[],
+        tools: None,
+        thinking: None,
+    };
+    let first = provider
+        .chat_with_attempt_budget(request, "test-model", None, ToolRoundPolicy::Batch, &budget)
+        .await
+        .unwrap();
+    assert_eq!(first.text.as_deref(), Some("first"));
+    let denied = provider
+        .chat_with_attempt_budget(
+            request,
+            "test-model",
+            None,
+            ToolRoundPolicy::Batch,
+            &shared_budget,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        denied
+            .downcast_ref::<GenerationAttemptBudgetExhausted>()
+            .is_some()
+    );
+    let second = provider
+        .chat_with_attempt_budget(
+            request,
+            "test-model",
+            None,
+            ToolRoundPolicy::Batch,
+            &GenerationAttemptBudget::new(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.text.as_deref(), Some("second"));
+}
+
+#[tokio::test]
 async fn consolidation_extracts_facts_to_memory() {
     let tmp = tempfile::TempDir::new().unwrap();
     let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new("test", tmp.path()).unwrap());

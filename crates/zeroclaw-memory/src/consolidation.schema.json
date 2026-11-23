@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["history_entry", "memory_update"],
+  "properties": {
+    "history_entry": {"type": "string", "pattern": "[^\\s\\u0085]", "maxLength": 2000},
+    "memory_update": {"type": ["string", "null"], "maxLength": 4000},
+    "facts": {
+      "type": "array",
+      "maxItems": 5,
+      "items": {"type": "string", "pattern": "[^\\s\\u0085]", "maxLength": 1000}
+    },
+    "trend": {"type": ["string", "null"], "maxLength": 2000},
+    "kind": {
+      "type": ["string", "null"],
+      "enum": ["preference", "fact", "decision", "entity", null],
+      "maxLength": 10
+    }
+  },
+  "if": {"properties": {"memory_update": {"type": "null"}}},
+  "then": {"properties": {"kind": {"type": "null"}}}
+}

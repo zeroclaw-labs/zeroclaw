@@ -445,6 +445,7 @@ impl CopilotModelProvider {
         tools: Option<&[ToolSpec]>,
         model: &str,
         temperature: Option<f64>,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
     ) -> anyhow::Result<ProviderChatResponse> {
         let (token, endpoint) = self.get_api_key().await?;
         let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
@@ -462,8 +463,11 @@ impl CopilotModelProvider {
             tools: native_tools,
         };
 
-        let mut req = self
-            .http_client()
+        let client = match budget {
+            Some(_) => crate::bounded::timeout_client("model_provider.copilot", 120)?,
+            None => self.http_client(),
+        };
+        let mut req = client
             .post(&url)
             .header("Authorization", format!("Bearer {token}"))
             .json(&request);
@@ -472,7 +476,7 @@ impl CopilotModelProvider {
             req = req.header(*header, *value);
         }
 
-        let response = req.send().await?;
+        let response = crate::bounded::send(req, budget, None).await?;
 
         if !response.status().is_success() {
             return Err(super::api_error("GitHub Copilot", response).await);
@@ -897,6 +901,28 @@ async fn remove_cache_file(dir: &Arc<Dir>, name: &'static str) -> bool {
         .is_ok_and(|result| result.is_ok())
 }
 
+impl CopilotModelProvider {
+    async fn chat_inner(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        if let Some(budget) = budget {
+            budget.ensure_available()?;
+        }
+        self.send_chat_request(
+            Self::convert_messages(request.messages),
+            request.tools,
+            model,
+            temperature,
+            budget,
+        )
+        .await
+    }
+}
+
 #[async_trait]
 impl ModelProvider for CopilotModelProvider {
     // ── ModelProvider-family defaults ──
@@ -928,7 +954,7 @@ impl ModelProvider for CopilotModelProvider {
         });
 
         let response = self
-            .send_chat_request(messages, None, model, temperature)
+            .send_chat_request(messages, None, model, temperature, None)
             .await?;
         Ok(response.text.unwrap_or_default())
     }
@@ -940,7 +966,13 @@ impl ModelProvider for CopilotModelProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let response = self
-            .send_chat_request(Self::convert_messages(messages), None, model, temperature)
+            .send_chat_request(
+                Self::convert_messages(messages),
+                None,
+                model,
+                temperature,
+                None,
+            )
             .await?;
         Ok(response.text.unwrap_or_default())
     }
@@ -951,13 +983,19 @@ impl ModelProvider for CopilotModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        self.send_chat_request(
-            Self::convert_messages(request.messages),
-            request.tools,
-            model,
-            temperature,
-        )
-        .await
+        self.chat_inner(request, model, temperature, None).await
+    }
+
+    async fn chat_with_attempt_budget(
+        &self,
+        request: crate::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        _policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: &zeroclaw_api::model_provider::GenerationAttemptBudget,
+    ) -> anyhow::Result<crate::traits::ChatResponse> {
+        self.chat_inner(request, model, temperature, Some(budget))
+            .await
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -1496,5 +1534,31 @@ mod tests {
             cache_dir.read_to_string(foreign_name).unwrap(),
             "foreign-content"
         );
+    }
+}
+
+#[cfg(test)]
+mod attempt_budget_tests {
+    use super::*;
+    use crate::bounded::tests as fixture;
+
+    #[tokio::test]
+    async fn copilot_shares_budget_across_calls() {
+        let server = fixture::server(vec![
+            fixture::Reply::json(200, fixture::CHAT_OK),
+            fixture::Reply::json(200, fixture::CHAT_OK),
+        ])
+        .await;
+        let provider = CopilotModelProvider {
+            alias: "fixture".into(),
+            github_token: None,
+            token_dir: None,
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(Some(CachedApiKey {
+                token: "fixture-key".into(),
+                api_endpoint: server.url.clone(),
+                expires_at: i64::MAX,
+            }))),
+        };
+        fixture::assert_two_requests(&provider, &server).await;
     }
 }

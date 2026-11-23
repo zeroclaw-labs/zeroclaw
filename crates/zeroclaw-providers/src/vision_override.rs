@@ -44,6 +44,10 @@ impl VisionOverrideProvider {
 
 #[async_trait]
 impl ModelProvider for VisionOverrideProvider {
+    fn supports_forced_tool_choice(&self, model: &str) -> bool {
+        self.inner.supports_forced_tool_choice(model)
+    }
+
     fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
         self.inner.supports_exact_request_replay(request, model)
     }
@@ -213,6 +217,20 @@ impl ModelProvider for VisionOverrideProvider {
         mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
             .chat_with_tool_round_policy(request, model, temperature, policy)
+            .await
+    }
+
+    async fn chat_with_attempt_budget(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: &zeroclaw_api::model_provider::GenerationAttemptBudget,
+    ) -> anyhow::Result<ChatResponse> {
+        mark_current_dispatch_composite();
+        ProviderDispatch::from_ref(&*self.inner)
+            .chat_with_attempt_budget(request, model, temperature, policy, budget)
             .await
     }
 
@@ -398,6 +416,9 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for ModelAwareCapabilityFake {
+        fn supports_forced_tool_choice(&self, model: &str) -> bool {
+            model == "routed-model"
+        }
         fn supports_exact_request_replay(&self, request: ChatRequest<'_>, model: &str) -> bool {
             model == "routed-model" && request.tools.is_none()
         }
@@ -428,6 +449,9 @@ mod tests {
     #[test]
     fn vision_override_preserves_model_aware_tool_capabilities() {
         let wrapped = VisionOverrideProvider::new(Box::new(ModelAwareCapabilityFake), false);
+
+        assert!(wrapped.supports_forced_tool_choice("routed-model"));
+        assert!(!wrapped.supports_forced_tool_choice("other-model"));
 
         let capabilities = wrapped.capabilities_for_model("routed-model");
         assert!(
