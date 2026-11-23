@@ -116,17 +116,21 @@ ACP image blocks; `agy acp` advertises `promptCapabilities.image = true`.
 ### Grok Build CLI: slot `grok_cli`
 
 Shells out to the Grok Build CLI through the documented **`grok agent stdio`**
-ACP surface and uses the CLI's login cache by default. Run `grok login`, or use
-the explicit API-key bridge shown below. The typed alias `api_key` is not used,
-and ambient `XAI_API_KEY` is not inherited unless the alias opts in, so the Grok
-CLI remains the authentication owner. This is the only transport: initialize →
+ACP surface and uses the CLI's login cache by default. Run `grok login`, or opt
+an alias into API-key auth as shown below. Ambient `XAI_API_KEY` is not
+inherited unless the alias opts in, so the Grok CLI login cache remains the
+default authentication owner. This is the only transport: initialize →
 authenticate → session/new → session/prompt over newline-delimited JSON-RPC.
 Small and large prompts both travel on stdin and never appear in argv or a
 prompt file.
 
 The documented ACP integration and default argument profile are validated
-against Grok Build CLI `0.2.118` (ACP advertise/live probes) with earlier baseline `0.2.111`. Treat upgrades of the external CLI as a
-compatibility change and revalidate `grok agent stdio` before deploying them.
+against Grok Build CLI `0.2.118` (ACP advertise/live probes) with earlier baseline `0.2.111`.
+Grok Build `1.0.x` advertises only the `grok.com` auth method (its login cache
+and sign-in flow) while still accepting the unadvertised `xai.api_key` method;
+ZeroClaw selects `xai.api_key` when an API key is configured and `grok.com`
+otherwise. Treat upgrades of the external CLI as a compatibility change and
+revalidate `grok agent stdio` before deploying them.
 
 #### ACP vision / image input (current Grok Build behavior)
 
@@ -219,19 +223,26 @@ bounded budget.
 [providers.models.grok_cli.default]
 model = "grok-4.5"
 working_directory = "/srv/zeroclaw/grok-workspace"
-env_passthrough = ["XAI_API_KEY"]
+# API-key auth, option 1: the typed alias secret, set with
+#   zeroclaw config set providers.models.grok_cli.default.api_key
+# API-key auth, option 2 (instead of option 1): a daemon environment variable
+# env_passthrough = ["XAI_API_KEY"]
 # Optional: 4 MiB by default; accepted range is 1-64 MiB.
 max_acp_stdout_bytes = 8388608
 ```
 
-Export `XAI_API_KEY` into the daemon environment before starting ZeroClaw. The
-ACP client selects `xai.api_key` only when that name is listed in
-`env_passthrough` and a non-empty value is present in the process environment at
-**child spawn** (not snapshotted into the long-lived provider handle). Otherwise
-it falls back to the CLI login cache. Typed alias `api_key` remains rejected:
-this is an intentional process-env bridge rather than a second Config secret
-field. Values are not written to provider TOML; a future typed Config bridge
-may load the same name at config time without changing the operator surface.
+There are two mutually exclusive ways to give an alias an xAI API key:
+
+- **Typed `api_key`**: stored encrypted in config like every other provider
+  key. ZeroClaw places it in the child's `XAI_API_KEY` at spawn, because the
+  Grok CLI reads API keys only from that variable.
+- **`env_passthrough = ["XAI_API_KEY"]`**: export `XAI_API_KEY` into the daemon
+  environment before starting ZeroClaw; the value is read from the process
+  environment at each **child spawn** and never written to config.
+
+Configuring both is rejected. With either, the ACP client selects
+`xai.api_key`; otherwise it falls back to the CLI login cache. The key never
+appears in argv or ACP frames.
 
 An existing absolute `working_directory` is required. It is canonicalized and used for both the child cwd and ACP session boundary, so the provider never falls back to the daemon cwd. Optional `binary_path` accepts an absolute path or a bare executable name (default `grok`); relative paths with separators are rejected. Bare names resolve against absolute host `PATH` directories before the child cwd is set, ignoring empty and relative entries. The selected file is canonicalized and checked for executability before spawn. Alias `timeout_secs` bounds protocol reads and writes (default 600s).
 
