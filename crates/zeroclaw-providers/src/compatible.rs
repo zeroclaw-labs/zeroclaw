@@ -369,14 +369,6 @@ fn streaming_api_error(status: reqwest::StatusCode, body: &str) -> StreamError {
     }
 }
 
-fn provider_http_error(name: &str, status: reqwest::StatusCode, body: &str) -> anyhow::Error {
-    let error = super::api_error_from_parts(name, status, body);
-    anyhow::Error::new(crate::reliable::ProviderHttpError::new(
-        status,
-        error.to_string(),
-    ))
-}
-
 /// Upper bound on a `/models` catalog response buffered before parsing. Real
 /// catalogs run to at most a few hundred KB (hundreds of models with pricing),
 /// so this leaves generous headroom while stopping a misbehaving or compromised
@@ -1581,8 +1573,9 @@ impl OpenAiCompatibleModelProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = super::response_retry_after(&response);
             let body = response.text().await?;
-            return Err(provider_http_error(&self.name, status, &body));
+            return Err(super::api_error_from_parts(&self.name, status, &body, retry_after).into());
         }
 
         let body = response.text().await?;
@@ -4438,8 +4431,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = super::response_retry_after(&response);
             let error = response.text().await?;
-            return Err(provider_http_error(&self.name, status, &error));
+            return Err(
+                super::api_error_from_parts(&self.name, status, &error, retry_after).into(),
+            );
         }
 
         let body = response.text().await?;
@@ -4557,6 +4553,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
 
             let status = response.status();
+            let retry_after = super::response_retry_after(&response);
             let error = response.text().await?;
             if !exact_request_replay
                 && tools_count > 0
@@ -4584,7 +4581,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 continue;
             }
 
-            return Err(provider_http_error(&self.name, status, &error));
+            return Err(
+                super::api_error_from_parts(&self.name, status, &error, retry_after).into(),
+            );
         };
 
         let body = response.text().await?;
@@ -4683,6 +4682,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
 
             let status = response.status();
+            let retry_after = super::response_retry_after(&response);
             let error = response.text().await?;
             let sanitized = super::sanitize_api_error(&error);
 
@@ -4731,7 +4731,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 return Ok(response);
             }
 
-            return Err(provider_http_error(&self.name, status, &error));
+            return Err(
+                super::api_error_from_parts(&self.name, status, &error, retry_after).into(),
+            );
         };
 
         let body = response.text().await?;
@@ -17452,11 +17454,13 @@ mod tests {
 
     #[test]
     fn message_only_bad_request_preserves_http_status_without_prose_classification() {
-        let error = provider_http_error(
+        let error: anyhow::Error = crate::api_error_from_parts(
             "test",
             reqwest::StatusCode::BAD_REQUEST,
             r#"{"error":{"message":"request could not be processed"}}"#,
-        );
+            None,
+        )
+        .into();
 
         assert_eq!(
             error

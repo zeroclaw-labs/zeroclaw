@@ -1016,6 +1016,7 @@ impl HailoOllamaModelProvider {
             .send()
             .await?;
         let status = response.status();
+        let retry_after = super::response_retry_after(&response);
         let body = response.bytes().await?;
 
         if !status.is_success() {
@@ -1033,12 +1034,16 @@ impl HailoOllamaModelProvider {
                     })),
                 "Hailo-Ollama API error response"
             );
-            anyhow::bail!(
-                "Hailo-Ollama API error ({}): {}. Check that Hailo-Ollama is running and the \
-                 model is loaded",
+            return Err(super::reliable::ProviderHttpError::new(
                 status,
-                sanitized
-            );
+                format!(
+                    "Hailo-Ollama API error ({}): {}. Check that Hailo-Ollama is running and the \
+                 model is loaded",
+                    status, sanitized
+                ),
+                retry_after,
+            )
+            .into_retry_error());
         }
 
         let parsed: ApiChatResponse = serde_json::from_slice(&body).map_err(|error| {

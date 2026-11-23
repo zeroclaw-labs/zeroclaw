@@ -2994,12 +2994,7 @@ impl ModelProvider for AnthropicModelProvider {
         let response = request.send().await?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let error = super::api_error("Anthropic", response).await;
-            return Err(anyhow::Error::new(crate::reliable::ProviderHttpError::new(
-                status,
-                error.to_string(),
-            )));
+            return Err(super::typed_api_error("Anthropic", response).await.into());
         }
 
         let chat_response: NativeChatResponse = response.json().await?;
@@ -3149,12 +3144,7 @@ impl ModelProvider for AnthropicModelProvider {
             .send()
             .await?;
         if !response.status().is_success() {
-            let status = response.status();
-            let error = super::api_error("Anthropic", response).await;
-            return Err(anyhow::Error::new(crate::reliable::ProviderHttpError::new(
-                status,
-                error.to_string(),
-            )));
+            return Err(super::typed_api_error("Anthropic", response).await.into());
         }
 
         let native_response: NativeChatResponse = response.json().await?;
