@@ -62,11 +62,21 @@ impl LogsCopyMenu {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct LogsCopyFeedback {
     rect: Rect,
     surface: LogsTextSurface,
+    outcome: Result<crate::clipboard::CopyOutcome, String>,
     shown_at: Instant,
+}
+
+impl LogsCopyFeedback {
+    fn label(&self) -> String {
+        match &self.outcome {
+            Ok(outcome) => outcome.label(),
+            Err(notice) => notice.clone(),
+        }
+    }
 }
 
 fn copy_menu_rect(column: u16, row: u16, bounds: Rect) -> Option<Rect> {
@@ -539,6 +549,10 @@ pub(crate) struct Logs {
     follow: bool,
     min_severity: u8,
     subscribed: bool,
+    /// The daemon's reason for refusing this principal its log, shown in
+    /// place of the list. The daemon-wide log is limited to administrators
+    /// and the shared operator, and needs `logs:read`.
+    refused: Option<String>,
     detail_open: bool,
     detail: DetailState,
     /// Id of the event whose detail is currently being fetched
@@ -592,6 +606,7 @@ impl Logs {
             follow: true,
             min_severity: SEV_DEBUG,
             subscribed: false,
+            refused: None,
             detail_open: false,
             detail: DetailState::Loading,
             detail_request_id: None,
@@ -625,8 +640,15 @@ impl Logs {
     }
 
     pub(crate) async fn init(&mut self) -> anyhow::Result<()> {
-        self.rpc.logs_subscribe().await?;
-        self.subscribed = true;
+        match self.rpc.logs_subscribe().await {
+            Ok(()) => self.subscribed = true,
+            // A principal the daemon does not show its log still gets the
+            // rest of the TUI; this pane says why it is empty.
+            Err(error) => match crate::client::forbidden_reason(&error).map(str::to_string) {
+                Some(reason) => self.refused = Some(reason),
+                None => return Err(error),
+            },
+        }
         // Load initial history
         self.load_page(None, None, None).await;
         Ok(())
@@ -639,6 +661,11 @@ impl Logs {
         cursor_offset: Option<u64>,
         cursor_legacy: Option<(String, String)>,
     ) {
+        // The persisted log is refused with the stream: there is nothing to
+        // page, so don't ask.
+        if self.refused.is_some() {
+            return;
+        }
         self.loading = true;
         // Set when a cursor-bearing response turns out to contain only events
         // already in the buffer, which means the cursor bought no older
@@ -913,9 +940,11 @@ impl Logs {
         let status = Line::from(vec![
             Span::styled(" Logs ", theme::title_style()),
             Span::styled(format!("({}) ", filtered.len()), theme::dim_style()),
+            // Older events are offered only while there is history to page:
+            // a refused pane has none, whatever a refilter did to `at_end`.
             if self.loading {
                 Span::styled("[loading] ", theme::warn_style())
-            } else if !self.at_end {
+            } else if !self.at_end && self.refused.is_none() {
                 Span::styled("[more\u{2191}] ", theme::dim_style())
             } else {
                 Span::raw("")
@@ -1023,6 +1052,21 @@ impl Logs {
         self.last_list_area = area;
         // Track inner height (minus borders) for scroll centering.
         self.list_height = area.height.saturating_sub(2);
+
+        if let Some(reason) = &self.refused {
+            let notice = crate::i18n::t_args("zc-logs-refused", &[("reason", reason)]);
+            frame.render_widget(
+                Paragraph::new(Span::styled(notice, theme::warn_style()))
+                    .wrap(Wrap { trim: true })
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(theme::dim_style()),
+                    ),
+                area,
+            );
+            return;
+        }
 
         let items: Vec<ListItem> = filtered
             .iter()
@@ -1166,6 +1210,7 @@ impl Logs {
         }
         if self
             .copy_feedback
+            .as_ref()
             .is_some_and(|feedback| feedback.surface == surface)
         {
             self.copy_feedback = None;
@@ -1285,14 +1330,22 @@ impl Logs {
         if target.text.is_empty() {
             return false;
         }
-        crate::mouse::copy_osc52(&target.text);
-        self.text_selection = None;
+        let outcome = crate::clipboard::copy_text(&target.text)
+            .map_err(|error| crate::clipboard::copy_failure_notice(&error));
+        if outcome.is_ok() {
+            self.text_selection = None;
+        }
         self.copy_menu = None;
+        let label = match &outcome {
+            Ok(outcome) => outcome.label(),
+            Err(notice) => notice.clone(),
+        };
         self.copy_feedback = self
-            .feedback_rect(target.anchor, target.surface)
+            .feedback_rect(target.anchor, target.surface, &label)
             .map(|rect| LogsCopyFeedback {
                 rect,
                 surface: target.surface,
+                outcome,
                 shown_at: Instant::now(),
             });
         true
@@ -1419,12 +1472,11 @@ impl Logs {
         false
     }
 
-    fn feedback_rect(&self, anchor: Rect, surface: LogsTextSurface) -> Option<Rect> {
+    fn feedback_rect(&self, anchor: Rect, surface: LogsTextSurface, label: &str) -> Option<Rect> {
         use unicode_width::UnicodeWidthStr;
 
         let bounds = self.snapshot(surface)?.area;
-        let label = crate::i18n::t("zc-logs-copied");
-        let width = (UnicodeWidthStr::width(label.as_str()) as u16).min(bounds.width);
+        let width = (UnicodeWidthStr::width(label) as u16).min(bounds.width);
         if width == 0 || bounds.height == 0 {
             return None;
         }
@@ -1438,6 +1490,7 @@ impl Logs {
     fn expire_copy_feedback(&mut self) {
         if self
             .copy_feedback
+            .as_ref()
             .is_some_and(|feedback| feedback.shown_at.elapsed() >= COPY_FEEDBACK_TTL)
         {
             self.copy_feedback = None;
@@ -1457,14 +1510,19 @@ impl Logs {
     }
 
     fn render_copy_feedback(&self, frame: &mut ratatui::Frame) {
-        let Some(feedback) = self.copy_feedback else {
+        let Some(feedback) = &self.copy_feedback else {
             return;
         };
         frame.render_widget(Clear, feedback.rect);
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                crate::i18n::t("zc-logs-copied"),
-                theme::success_style().add_modifier(Modifier::BOLD),
+                feedback.label(),
+                if feedback.outcome.is_ok() {
+                    theme::success_style()
+                } else {
+                    theme::error_style()
+                }
+                .add_modifier(Modifier::BOLD),
             )))
             .alignment(Alignment::Center),
             feedback.rect,
@@ -2146,6 +2204,127 @@ mod tests {
         assert!(logs.copy_feedback.is_none());
     }
 
+    /// A log pane on a fake daemon that answers every request with `answer`
+    /// and records the method of each.
+    fn logs_with_daemon(
+        answer: crate::jsonrpc::JsonRpcError,
+    ) -> (Logs, Arc<std::sync::Mutex<Vec<String>>>) {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (daemon, daemon_seen) = (Arc::clone(&outbound), Arc::clone(&seen));
+        tokio::spawn(async move {
+            while let Some(frame) = rx.recv().await {
+                let request: serde_json::Value = serde_json::from_str(&frame).expect("a request");
+                daemon_seen
+                    .lock()
+                    .unwrap()
+                    .push(request["method"].as_str().unwrap_or_default().to_string());
+                let id = request["id"].as_str().unwrap_or_default().to_string();
+                daemon.dispatch_response(&id, None, Some(answer.clone()));
+            }
+        });
+        (Logs::new(Arc::new(RpcClient::with_rpc(outbound))), seen)
+    }
+
+    fn rpc_error(code: i32, message: &str) -> crate::jsonrpc::JsonRpcError {
+        crate::jsonrpc::JsonRpcError {
+            code,
+            message: message.to_string(),
+            data: None,
+        }
+    }
+
+    fn rendered(logs: &mut Logs, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+        terminal
+            .draw(|frame| logs.draw(frame, frame.area()))
+            .expect("draw logs");
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The daemon keeps its log from a scoped principal, as it does for any
+    /// account that is neither an administrator nor the shared operator.
+    /// Startup goes on: the pane shows the daemon's reason, and the
+    /// persisted log is not asked for.
+    #[tokio::test]
+    async fn a_refused_log_leaves_the_pane_open_with_the_reason() {
+        let reason = "Scoped principals cannot read the daemon-wide logs";
+        let (mut logs, seen) =
+            logs_with_daemon(rpc_error(crate::jsonrpc::error_codes::FORBIDDEN, reason));
+
+        logs.init()
+            .await
+            .expect("a refused log is not a startup failure");
+
+        assert!(!logs.subscribed);
+        assert_eq!(logs.refused.as_deref(), Some(reason));
+        assert_eq!(*seen.lock().unwrap(), ["logs/subscribe"]);
+        let screen = rendered(&mut logs, 120, 12);
+        assert!(screen.contains(reason), "{screen}");
+        assert!(
+            !screen.contains("[more\u{2191}]"),
+            "no older events are offered: {screen}"
+        );
+    }
+
+    /// Changing the severity or the search refilters the pane, which resets
+    /// its paging. A refused pane must still offer no older events, and ask
+    /// the daemon for nothing more.
+    #[tokio::test]
+    async fn a_refused_log_never_offers_older_events() {
+        let (mut logs, seen) = logs_with_daemon(rpc_error(
+            crate::jsonrpc::error_codes::FORBIDDEN,
+            "Scoped principals cannot read the daemon-wide logs",
+        ));
+        logs.init()
+            .await
+            .expect("a refused log is not a startup failure");
+        let offers_more = |logs: &mut Logs| rendered(logs, 120, 12).contains("[more\u{2191}]");
+        assert!(!offers_more(&mut logs));
+
+        for (key, what) in [
+            (KeyCode::Char('+'), "severity up"),
+            (KeyCode::Char('-'), "severity down"),
+            (KeyCode::Char('/'), "search begun"),
+            (KeyCode::Char('x'), "search typed"),
+            (KeyCode::Enter, "search accepted"),
+        ] {
+            logs.handle_key(KeyEvent::new(key, KeyModifiers::NONE))
+                .await;
+            assert!(!offers_more(&mut logs), "older events offered after {what}");
+        }
+        assert_eq!(logs.search_query, "x", "the search was accepted");
+        logs.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))
+            .await;
+        assert!(logs.search_query.is_empty(), "the search was cleared");
+        assert!(
+            !offers_more(&mut logs),
+            "older events offered after the search was cleared"
+        );
+        assert_eq!(*seen.lock().unwrap(), ["logs/subscribe"]);
+    }
+
+    /// Any other failure still fails startup, as before.
+    #[tokio::test]
+    async fn a_failed_log_subscription_still_fails_startup() {
+        let (mut logs, _) = logs_with_daemon(rpc_error(
+            crate::jsonrpc::error_codes::INTERNAL_ERROR,
+            "boom",
+        ));
+
+        assert!(logs.init().await.is_err());
+        assert!(logs.refused.is_none());
+    }
+
     #[test]
     fn preview_fallback_renders_row_fields() {
         let detail = LogDetail::from_preview(&sample_entry());
@@ -2377,6 +2556,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_requested_copy_renders_log_outcome_label() {
+        use unicode_width::UnicodeWidthStr;
+
+        let mut logs = test_logs();
+        logs.events.push(sample_entry());
+        logs.list_state.select(Some(0));
+        draw(&mut logs, 100, 12);
+        let outcome = crate::clipboard::CopyOutcome::TerminalRequested;
+        crate::clipboard::with_copy_result(Ok(outcome), || {
+            assert!(logs.copy_current_selection_or_row());
+        });
+        let feedback = logs.copy_feedback.as_ref().expect("requested feedback");
+        assert_eq!(feedback.outcome, Ok(outcome));
+        assert_eq!(
+            usize::from(feedback.rect.width),
+            UnicodeWidthStr::width(outcome.label().as_str())
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).expect("test terminal");
+        terminal
+            .draw(|frame| logs.draw(frame, frame.area()))
+            .expect("draw logs");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            rendered.contains(&outcome.label()),
+            "rendered: {rendered:?}"
+        );
+        assert!(!rendered.contains(&crate::clipboard::CopyOutcome::Copied.label()));
+    }
+
+    #[tokio::test]
+    async fn failed_log_copy_keeps_selection_and_renders_error() {
+        let mut logs = test_logs();
+        logs.events.push(sample_entry());
+        draw(&mut logs, 120, 12);
+        let area = logs.list_snapshot.as_ref().expect("list snapshot").area;
+        assert!(logs.begin_text_drag(area.x, area.y));
+        assert!(logs.update_text_drag(area.x + 5, area.y));
+        logs.finish_text_drag();
+        let selection = logs.text_selection;
+        let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer rejected copy");
+        let expected = crate::clipboard::copy_failure_notice(&error);
+        crate::clipboard::with_copy_result(Err(error), || {
+            assert!(
+                logs.copy_current_selection_or_row(),
+                "an attempted copy owns its key"
+            );
+        });
+        assert_eq!(logs.text_selection, selection);
+        assert_eq!(
+            logs.copy_feedback.as_ref().unwrap().outcome,
+            Err(expected.clone())
+        );
+        let mut terminal = Terminal::new(TestBackend::new(120, 12)).expect("test terminal");
+        terminal
+            .draw(|frame| logs.draw(frame, frame.area()))
+            .expect("draw logs");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains(&expected), "rendered: {rendered:?}");
+        assert!(!rendered.contains(&crate::clipboard::CopyOutcome::Copied.label()));
+        assert_eq!(logs.text_selection, selection);
+    }
+
+    #[tokio::test]
     async fn copy_shortcut_prefers_selection_and_whole_detail_y_still_works() {
         let mut logs = test_logs();
         let entry = sample_entry();
@@ -2394,7 +2648,10 @@ mod tests {
             .await;
         assert!(logs.text_selection.is_none());
         assert_eq!(
-            logs.copy_feedback.expect("selection feedback").surface,
+            logs.copy_feedback
+                .as_ref()
+                .expect("selection feedback")
+                .surface,
             LogsTextSurface::Detail,
         );
 
@@ -2426,7 +2683,7 @@ mod tests {
         logs.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER))
             .await;
         assert_eq!(
-            logs.copy_feedback.expect("row feedback").surface,
+            logs.copy_feedback.as_ref().expect("row feedback").surface,
             LogsTextSurface::List,
         );
     }

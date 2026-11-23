@@ -12,6 +12,8 @@
 tool-backup = Create, list, verify, and restore shared data directory backups
 
 tool-browser = Web/browser automation with pluggable backends (agent-browser, rust-native, computer_use). Supports DOM actions plus optional OS-level actions (mouse_move, mouse_click, mouse_drag, key_type, key_press, screen_capture) through a computer-use sidecar. Use 'snapshot' to map interactive elements to refs (@e1, @e2). Enforces browser.allowed_domains for open actions.
+tool-browser-error-zero-timeout = browser.timeout_secs must be > 0
+tool-browser-error-action-timeout = agent-browser '{ $action }' timed out after { $seconds }s (browser.timeout_secs); the subprocess was killed
 
 tool-browser-delegate = Delegate browser-based tasks to a browser-capable CLI for interacting with web applications like Teams, Outlook, Jira, Confluence
 
@@ -146,7 +148,7 @@ tool-git-forge-error-raw-requires-path = 'raw' requires 'path'.
 tool-git-forge-error-requires-resource = a typed call requires 'resource' (or use action 'raw'/'describe').
 tool-git-forge-error-missing-repo = Missing 'repo' (expected 'owner/repo').
 
-tool-glob-search = Search for files matching a glob pattern within the workspace. Returns a sorted list of matching file paths relative to the workspace root. Examples: '**/*.rs' (all Rust files), 'src/**/mod.rs' (all mod.rs in src).
+tool-glob-search = Search for files matching a glob pattern within the workspace, or under an allowed root with an absolute pattern. Returns a sorted list of matching file paths: relative to the workspace root, absolute for files outside it. Examples: '**/*.rs' (all Rust files), 'src/**/mod.rs' (all mod.rs in src).
 
 tool-google-workspace = Interact with Google Workspace services (Drive, Gmail, Calendar, Sheets, Docs, etc.) via the gws CLI. Requires gws to be installed and authenticated.
 
@@ -193,6 +195,8 @@ tool-project-intel = Project delivery intelligence: generate status reports, det
 tool-proxy-config = Manage ZeroClaw proxy settings (scope: environment | zeroclaw | services), including runtime and process env application
 
 tool-pushover = Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.
+
+tool-read-skill = Read the full source file for an available skill by name. Use this when its prompt entry says the instructions load on demand.
 
 tool-schedule = Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. To send a scheduled message to Discord/Telegram/Slack/Matrix, use the cron_add tool with job_type='agent' and a delivery config like {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}.
 

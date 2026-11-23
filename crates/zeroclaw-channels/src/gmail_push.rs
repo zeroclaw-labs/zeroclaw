@@ -1084,6 +1084,84 @@ mod tests {
     }
 
     #[test]
+    fn extract_body_text_walks_nested_multipart_parts() {
+        let plain_b64 = BASE64
+            .encode(b"Nested plain text")
+            .replace('+', "-")
+            .replace('/', "_")
+            .replace('=', "");
+        let msg = GmailMessage {
+            id: "msg-nested".into(),
+            thread_id: String::new(),
+            snippet: "fallback".into(),
+            payload: Some(MessagePayload {
+                headers: Vec::new(),
+                body: None,
+                parts: vec![MessagePart {
+                    mime_type: "multipart/alternative".into(),
+                    body: None,
+                    parts: vec![MessagePart {
+                        mime_type: "text/plain".into(),
+                        body: Some(MessageBody {
+                            data: Some(plain_b64),
+                            size: 17,
+                        }),
+                        parts: Vec::new(),
+                        filename: String::new(),
+                    }],
+                    filename: String::new(),
+                }],
+                mime_type: "multipart/mixed".into(),
+            }),
+            internal_date: "0".into(),
+        };
+
+        assert_eq!(extract_body_text(&msg), "Nested plain text");
+    }
+
+    #[test]
+    fn malformed_plain_parts_allow_html_snippet_and_later_valid_plain_fallbacks() {
+        let part = |mime_type: &str, data: String| MessagePart {
+            mime_type: mime_type.into(),
+            body: Some(MessageBody {
+                size: data.len() as u64,
+                data: Some(data),
+            }),
+            parts: Vec::new(),
+            filename: String::new(),
+        };
+        // Exercise both malformed base64 and valid base64 containing invalid UTF-8.
+        for malformed in ["%%%".to_string(), BASE64.encode([0xff])] {
+            let mut msg = GmailMessage {
+                id: "fallback-probe".into(),
+                thread_id: String::new(),
+                snippet: "snippet 回退".into(),
+                payload: Some(MessagePayload {
+                    headers: Vec::new(),
+                    body: None,
+                    mime_type: "multipart/alternative".into(),
+                    parts: vec![
+                        part("text/plain", malformed),
+                        part("text/html", BASE64.encode("<p>HTML 回退🦀</p>")),
+                    ],
+                }),
+                internal_date: "0".into(),
+            };
+            assert_eq!(extract_body_text(&msg), "HTML 回退🦀");
+
+            msg.payload
+                .as_mut()
+                .unwrap()
+                .parts
+                .push(part("text/plain", BASE64.encode("plain 中文 e\u{301}")));
+            assert_eq!(extract_body_text(&msg), "plain 中文 e\u{301}");
+
+            msg.payload.as_mut().unwrap().parts.truncate(1);
+            assert_eq!(extract_body_text(&msg), "snippet 回退");
+        }
+    }
+
+    #[test]
     fn extract_body_text_fallback_to_snippet() {
         let msg = GmailMessage {
             id: "msg-5".into(),

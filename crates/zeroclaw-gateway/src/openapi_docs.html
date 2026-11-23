@@ -32,8 +32,8 @@
     <div class="offline-note">
       <h2>Offline mode</h2>
       <p>
-        The Scalar bundle could not be loaded from
-        <code>cdn.jsdelivr.net</code>. The OpenAPI spec is still reachable at
+        The pinned Scalar bundle (<code>@scalar/api-reference@1.76.3</code>) could not be loaded from
+        <code>cdn.jsdelivr.net</code> (network error or integrity failure). The OpenAPI spec is still reachable at
         <a href="/api/openapi.json"><code>/api/openapi.json</code></a> — point
         any compatible viewer at it (Insomnia, Postman, Swagger UI, etc.).
       </p>
@@ -51,7 +51,9 @@
         data-configuration='{"theme": "default", "showSidebar": true, "hideClientButton": false, "authentication": {"preferredSecurityScheme": "bearerAuth"}}'
       ></script>
       <script
-        src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"
+        src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.76.3/dist/browser/standalone.js"
+        integrity="sha384-H/jJ+XQ0S+5wKmVCrODlHKRKyDzdSBog4sUPc+AQTZddtU1FyQsiCrA47EUte2Fd"
+        crossorigin="anonymous"
         onerror="document.body.classList.add('offline')"
       ></script>
     </div>

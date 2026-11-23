@@ -84,9 +84,12 @@ fn watched_refs(dir: &Path) -> Vec<PathBuf> {
     }
     if let Some(branch) = git(dir, &["symbolic-ref", "--quiet", "HEAD"])
         && let Some(path) = git_path(dir, &branch)
-        && path.exists()
+        && let Some(watched) = path.ancestors().find(|ancestor| ancestor.exists())
     {
-        paths.push(path);
+        // A packed branch has no loose ref yet. Its nearest existing directory
+        // changes when a commit creates the ref; watching the missing file
+        // directly would make Cargo rerun on every unchanged build.
+        paths.push(watched.to_path_buf());
     }
     paths
 }
@@ -141,6 +144,9 @@ fn instructions(dir: &Path, package_version: &str, build_id: &str) -> Vec<String
     );
     lines
 }
+
+#[cfg(test)]
+mod git_layout_tests;
 
 #[cfg(test)]
 mod tests {
