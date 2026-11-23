@@ -10426,6 +10426,154 @@ mod tests {
         );
     }
 
+    mod stale_park_tests {
+        use super::*;
+
+        fn cancel_from_another_engine(sop: Sop, store: Arc<dyn SopRunStore>, run_id: &str) {
+            let mut owner = engine_with_sops(vec![sop]).with_store(store);
+            owner.restore_runs();
+            owner.cancel_run(run_id).unwrap();
+        }
+
+        #[test]
+        fn deterministic_park_refuses_a_cancelled_run() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut sop = deterministic_sop("det-stale");
+            sop.location = Some(dir.path().into());
+            let store = Arc::new(InMemoryRunStore::new());
+            let mut engine = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+            let first = engine.start_run(&sop.name, manual_event()).unwrap();
+            let id = extract_run_id(&first);
+            cancel_from_another_engine(sop, store, id);
+
+            let error = engine
+                .advance_deterministic_step(id, serde_json::json!("done"), None)
+                .unwrap_err();
+            assert!(err_is_stale_run_copy(&error), "{error}");
+            assert_eq!(engine.get_run(id).unwrap().status, SopRunStatus::Cancelled);
+        }
+
+        #[test]
+        fn failed_park_retry_adopts_the_stored_cancellation() {
+            let mut sop = four_step_sop("retry-stale");
+            sop.steps[1].requires_confirmation = true;
+            let store = Arc::new(FailingSaveLeasedStore::healthy());
+            let mut engine = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+            let first = engine.start_run(&sop.name, manual_event()).unwrap();
+            let id = extract_run_id(&first);
+            store.fail_next_save();
+            engine
+                .advance_step(id, completed_step_result(1, "done"))
+                .unwrap();
+            assert!(engine.is_park_persist_pending(id));
+            cancel_from_another_engine(sop, store, id);
+
+            engine.run_maintenance_tick();
+            assert_eq!(engine.get_run(id).unwrap().status, SopRunStatus::Cancelled);
+            assert!(!engine.is_park_persist_pending(id));
+        }
+
+        #[test]
+        fn capacity_blocked_park_retry_adopts_the_stored_cancellation() {
+            let mut sop = four_step_sop("capacity-stale");
+            sop.steps[1].requires_confirmation = true;
+            sop.max_pending_approvals = 1;
+            sop.max_concurrent = 2;
+            let store = Arc::new(InMemoryRunStore::new());
+            let mut engine = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+            let first = engine.start_run(&sop.name, manual_event()).unwrap();
+            let second = engine.start_run(&sop.name, manual_event()).unwrap();
+            let first_id = extract_run_id(&first);
+            let id = extract_run_id(&second);
+            engine
+                .advance_step(first_id, completed_step_result(1, "one"))
+                .unwrap();
+            let blocked = engine
+                .advance_step(id, completed_step_result(1, "two"))
+                .unwrap();
+            assert!(
+                matches!(blocked, SopRunAction::Pending { .. }),
+                "{blocked:?}"
+            );
+            engine.cancel_run(first_id).unwrap();
+            cancel_from_another_engine(sop, store, id);
+
+            engine.run_maintenance_tick();
+            assert_eq!(engine.get_run(id).unwrap().status, SopRunStatus::Cancelled);
+        }
+
+        // Both engines saw the first checkpoint. The owner has already parked
+        // at the next checkpoint by the time the other engine tries its write.
+        fn assert_rollback_keeps_new_checkpoint(
+            decide: impl FnOnce(&mut SopEngine, DeterministicRunState) -> Result<SopRunAction>,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut sop = deterministic_sop("competing-checkpoints");
+            sop.location = Some(dir.path().into());
+            sop.steps[1].on_failure = StepFailure::Goto { step: 3 };
+            sop.steps[2].kind = SopStepKind::Checkpoint;
+            let store = Arc::new(InMemoryRunStore::new());
+            let lagging = Arc::new(LaggingLoadStore {
+                inner: store.clone(),
+                lagged: parking_lot::Mutex::new(None),
+            });
+            let mut owner = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+            let first = owner.start_run(&sop.name, manual_event()).unwrap();
+            let id = extract_run_id(&first);
+            let parked = owner
+                .advance_deterministic_step(id, serde_json::json!("done"), None)
+                .unwrap();
+            let SopRunAction::CheckpointWait { state_file, .. } = parked else {
+                panic!("expected the first checkpoint, got {parked:?}");
+            };
+            let state = SopEngine::load_deterministic_state(&state_file).unwrap();
+            // Keep the two waits distinguishable without sleeping for a clock tick.
+            owner.active_runs.get_mut(id).unwrap().waiting_since =
+                Some("2020-01-01T00:00:00Z".into());
+            assert!(owner.persist_active_checked(id));
+            let old = store.load_run(id).unwrap().unwrap();
+            let mut stale = engine_with_sops(vec![sop]).with_store(lagging.clone());
+            stale.restore_runs();
+            let advanced = owner.approve_step(id).unwrap();
+            assert!(
+                matches!(advanced, SopRunAction::CheckpointWait { .. }),
+                "{advanced:?}"
+            );
+            let new = store.load_run(id).unwrap().unwrap();
+            assert_eq!(new.run.current_step, 3);
+            assert_ne!(old.run.waiting_since, new.run.waiting_since);
+            // Model the owner advancing after the gate precheck: that read sees
+            // the earlier record, but the store evaluates the write against the new one.
+            *lagging.lagged.lock() = Some(old);
+
+            let error = decide(&mut stale, state).unwrap_err();
+            assert!(err_is_stale_run_copy(&error), "{error}");
+            let adopted = stale.get_run(id).unwrap();
+            assert_eq!(adopted.current_step, new.run.current_step);
+            assert_eq!(adopted.waiting_since, new.run.waiting_since);
+            assert_eq!(store.load_run(id).unwrap().unwrap().revision, new.revision);
+        }
+
+        #[test]
+        fn checkpoint_denial_keeps_the_adopted_record() {
+            assert_rollback_keeps_new_checkpoint(|engine, old| {
+                engine.decide_checkpoint(&old.run_id, ApprovalDecision::Deny { reason: None })
+            });
+        }
+
+        #[test]
+        fn checkpoint_approval_keeps_the_adopted_wait_time() {
+            assert_rollback_keeps_new_checkpoint(|engine, old| engine.approve_step(&old.run_id));
+        }
+
+        #[test]
+        fn deterministic_resume_keeps_the_adopted_checkpoint() {
+            assert_rollback_keeps_new_checkpoint(|engine, old| {
+                engine.resume_deterministic_run(old)
+            });
+        }
+    }
+
     /// The owner could not finish a cancellation (its terminal write failed),
     /// and another engine finished it instead. Maintenance adopts the stored
     /// terminal record instead of retrying the refused write every tick.

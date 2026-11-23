@@ -73,10 +73,11 @@ function notificationChannel(): BroadcastChannel | undefined {
   catch { console.warn('Voice preference notifications unavailable; settings reload on tab return.'); }
 }
 
-export async function saveVoicePreferences(prefs: VoicePreferences, deviceId?: string): Promise<void> {
+/** Saves the given fields; the gateway keeps the saved value of every field left out. */
+export async function saveVoicePreferences(changes: Partial<VoicePreferences>, deviceId?: string): Promise<void> {
   const identity = getToken();
   const result = await apiFetch<DevicePreferences>(preferencePath(deviceId), {
-    method: 'PUT', cache: 'no-store', body: JSON.stringify(prefs),
+    method: 'PUT', cache: 'no-store', body: JSON.stringify(changes),
   });
   if (identity !== getToken() || (deviceId && result.device_id !== deviceId)) throw new Error('Paired device changed');
   window.dispatchEvent(new CustomEvent(preferenceEvent, { detail: result }));

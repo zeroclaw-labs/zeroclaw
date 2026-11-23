@@ -55,6 +55,16 @@ const WS_APPROVAL_TIMEOUT_SECS: u64 = 120;
 /// or, worse, tools route to an arbitrary seeded channel.
 const WS_CHANNEL_KEY: &str = "wss";
 
+/// Write the latest effective context trim into a WebSocket done frame.
+pub(crate) fn add_trim_to_done(display: &ContextDisplay, done: &mut serde_json::Value) {
+    if let Some((input, source)) = display.trimmed_input() {
+        done["context_input_tokens"] = input.into();
+        if let Some(source) = source {
+            done["context_input_tokens_source"] = source.into();
+        }
+    }
+}
+
 fn gateway_steering_input(content: String) -> SteeringInput {
     SteeringInput::new(content).with_ingress(IngressContext {
         message_id: None,
@@ -2477,7 +2487,7 @@ async fn process_chat_message(
             // classifier `category` (and any refusal explanation) never do.
             let safeguard_notice = outcome.safeguard_fallback.as_ref();
             let mut done = build_done_frame_json(&meta, &usage_by_provider_vec);
-            context_display.add_to_done(&mut done);
+            add_trim_to_done(&context_display, &mut done);
             for frame in success_terminal_ws_frames(safeguard_notice, done) {
                 let _ = sender.send(Message::Text(frame.to_string().into())).await;
             }
@@ -2779,7 +2789,7 @@ mod tests {
         display.observe(&context_trim(2, None));
         assert_eq!(display.trimmed_input(), None);
         let mut done = serde_json::json!({"type": "done", "last_input_tokens": null});
-        display.add_to_done(&mut done);
+        add_trim_to_done(&display, &mut done);
         assert!(done.get("context_input_tokens").is_none());
         assert!(done.get("context_input_tokens_source").is_none());
 
@@ -2788,7 +2798,7 @@ mod tests {
         display.observe(&context_trim(2, None));
         assert_eq!(display.trimmed_input(), Some((90_000, Some("calibrated"))));
         display.observe(&context_trim(2, Some(70_000)));
-        display.add_to_done(&mut done);
+        add_trim_to_done(&display, &mut done);
         assert_eq!(done["context_input_tokens"], 70_000);
         assert_eq!(done["context_input_tokens_source"], "calibrated");
         assert!(done["last_input_tokens"].is_null());
@@ -2821,7 +2831,7 @@ mod tests {
             ));
             assert_eq!(display.trimmed_input(), None);
             let mut done = serde_json::json!({"type": "done"});
-            display.add_to_done(&mut done);
+            add_trim_to_done(&display, &mut done);
             assert!(done.get("context_input_tokens").is_none());
             assert!(done.get("context_input_tokens_source").is_none());
         }

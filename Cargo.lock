@@ -14531,6 +14531,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "toml 1.1.2+spec-1.1.0",
  "tracing-subscriber",
  "uuid",
  "windows-sys 0.61.2",
