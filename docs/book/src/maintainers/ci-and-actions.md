@@ -415,7 +415,7 @@ Most Rust-heavy jobs in `ci.yml` cache through the local `./.github/actions/rust
 - **Recovery saves only on success.** Its `cache-on-failure: 'false'` keeps failed recovery runs from seeding its cache. Other composite-cache compile jobs retain `cache-on-failure: true`, so a partial master run can still seed their next attempt warm.
 - **Windows build cache is enabled.** The Windows build leg runs the same pinned Rust cache action as Linux and macOS. If Windows cache behavior flakes or regresses, revert the workflow change and document the failing restore/save evidence in the cache issue.
 - **Incremental compilation is disabled.** `CARGO_INCREMENTAL: 0` at the workflow level. Incremental builds inflate cache size and produce non-reproducible artifacts under partial-stale conditions.
-- **`cargo-deny` and `cargo-nextest` are installed fresh each run.** The `security` job runs `cargo install cargo-deny --locked`; the Linux `test` job and both scheduled `platform-tests.yml` legs pull the appropriate `cargo-nextest` binary from `get.nexte.st`. The advisory PR Windows job instead downloads its pinned nextest release archive and verifies a hardcoded SHA-256 before extraction because it runs on a much larger set of untrusted PRs. Neither tool is cached, so each install adds a fixed cost to its job. Switching either to `taiki-e/install-action` would let them be cached, but that action is not in the allowlist today.
+- **`cargo-deny` and `cargo-nextest` are installed fresh each run.** The `security` job runs `cargo install cargo-deny --locked`; the Linux `test` job pulls `cargo-nextest` from `get.nexte.st`. Both scheduled `platform-tests.yml` legs use the SHA-pinned `taiki-e/install-action` with checksum verification enabled by default and `fallback: none`, so unavailable prebuilt binaries fail without compiling from source. The action selects an installation directory and adds it to `PATH` even when the runner's Rust installation does not provide `$HOME/.cargo/bin`. The advisory PR Windows job still downloads its pinned nextest release archive and verifies a hardcoded SHA-256 before extraction. Neither tool is cached, so each install adds a fixed cost to its job.
 
 ## When the gate goes red
 
@@ -444,6 +444,7 @@ All third-party refs are pinned to a full commit SHA with a trailing version com
 | `actions/attest` (`v4.2.2`) | `release-stable-manual.yml` | Generate GitHub-hosted Build Level 2 provenance for release assets |
 | `actions/labeler` (`v6.1.0`) | `pr-path-labeler.yml` | Apply path/scope labels from `.github/labeler.yml` |
 | `dtolnay/rust-toolchain` (`stable`, `v1`) | `ci.yml`, `platform-tests.yml`, `pub-crates.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `daily-audit.yml`, `desktop-check.yml`, `docs-deploy.yml`, `codeql.yml` | Install Rust toolchain |
+| `taiki-e/install-action` (`v2.90.8`) | `platform-tests.yml` | Install prebuilt cargo-nextest with checksum verification and runner-aware installation paths |
 | `Swatinem/rust-cache` (`v2.9.2`) | `ci.yml` (GitHub-hosted composite path and direct Blacksmith Windows recovery), `platform-tests.yml`, `pub-crates.yml`, `release-stable-manual.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `desktop-check.yml`, `docs-deploy.yml` | Cargo build/dependency caching on GitHub-hosted runners and Blacksmith Windows recovery |
 | `useblacksmith/rust-cache` (`v3.0.1`) | `ci.yml` (Blacksmith path of `./.github/actions/rust-cache`) | Cargo build/dependency caching on Blacksmith sticky disk; selected by the `use-blacksmith: 'true'` input each Blacksmith compile job passes to the composite (a checked-in constant) |
 | `docker/setup-buildx-action` (`v3.11.1`, `v4.0.0`) | `release-stable-manual.yml`, `docker-publish.yml` | Docker Buildx setup |
@@ -463,6 +464,7 @@ Equivalent allowlist patterns (kept narrow on purpose):
 ```
 actions/*
 dtolnay/rust-toolchain@*
+taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c
 Swatinem/rust-cache@*
 useblacksmith/rust-cache@*
 docker/*
@@ -473,6 +475,10 @@ github/codeql-action/upload-sarif@*
 github/codeql-action/init@*
 github/codeql-action/analyze@*
 ```
+
+Before enabling the platform installer, a maintainer must approve and add the
+exact `taiki-e/install-action` ref above to the repository's selected-actions
+settings. Updating this document does not update GitHub's repository policy.
 
 Export the current effective policy:
 
