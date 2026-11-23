@@ -56147,7 +56147,7 @@ Done."#;
         .await;
     }
 
-    /// Regression for #12276: Telegram peer groups name senders, while a group
+    /// Telegram peer groups name senders, while a group
     /// reply is addressed to the chat. A sender configured for voice must still
     /// start synthesis from the opening stream chunk before generation resumes.
     #[cfg(feature = "channel-telegram")]
@@ -56162,7 +56162,7 @@ Done."#;
         .await;
     }
 
-    /// Regression for #12276: an explicit voice route can target an otherwise
+    /// An explicit voice route can target an otherwise
     /// text peer, so preparation must honor that route before generation pauses.
     #[cfg(feature = "channel-telegram")]
     #[tokio::test]
