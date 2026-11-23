@@ -85,7 +85,7 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         | "avian" | "deepmyst" | "astrai" | "sglang" | "vllm" | "osaurus" | "litellm"
         | "llamacpp" | "ollama" | "hailo_ollama" | "manifest" | "morph" | "github_models"
         | "upstage" | "featherless" | "arcee" | "lambda_ai" | "inception" | "cheaperinference"
-        | "custom" => (None, None),
+        | "bf16" | "custom" => (None, None),
         _ => return None,
     };
     Some(pair)

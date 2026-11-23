@@ -601,6 +601,31 @@ model = "..."
 api_key = "..."
 ```
 
+**bf16.ai**: slot `bf16`. An OpenAI-compatible uncensored LLM API serving
+open-weight models (refusal behavior removed from the weights rather than
+papered over with system prompts) with 1M context windows, vision, structured
+tool calling, and ultra-low false-positive refusal rates — suited for
+autonomous SOP and multi-step tool workflows governed by ZeroClaw's own OS
+sandboxes and risk profiles. Current models and prices are on
+[bf16.ai/models](https://bf16.ai/models). The endpoint is
+`https://api.bf16.ai/v1` with bearer-token auth (`sk-bf16-v1-...`). Model IDs
+include `deepseek/deepseek-v4.1-flash-uncensored`,
+`zai-org/glm-5.3-uncensored`, `zai-org/glm-5.3-flash-uncensored`,
+`moonshotai/kimi-k3.1-pro-uncensored`, and smart routers such as `bf16/auto`.
+The `/v1/models` endpoint is public (no key required to list models). Create a
+key at [bf16.ai/dashboard/keys](https://bf16.ai/dashboard/keys). Use the
+canonical `bf16` slot only.
+
+```toml
+[providers.models.bf16.default]
+model = "deepseek/deepseek-v4.1-flash-uncensored"
+api_key = "..."
+```
+
+To bridge an existing `BF16_API_KEY` shell variable into ZeroClaw's
+schema-mirror env surface, set
+`ZEROCLAW_providers__models__bf16__default__api_key="$BF16_API_KEY"`.
+
 **Cheaper Inference**: slot `cheaperinference`. An OpenAI-compatible LLM
 gateway with one endpoint for models from several labs. Current models and
 prices are on [cheaperinference.com](https://cheaperinference.com/#models). The
