@@ -113,6 +113,9 @@ export interface AgentContextValue {
   currentModel: string | null;
   availableModels: string[];
   switchModel: (model: string) => Promise<void>;
+  checkCodexUsage: () => Promise<unknown>;
+  /** An explicit model refresh can change credentials even at the same alias. */
+  modelInfoVersion: number;
   modelLoading: boolean;
   /** Re-fetch model list from server. Useful after user edits config externally. */
   refreshModels: () => void;
@@ -246,6 +249,7 @@ export interface SessionSocket {
   disconnect(): void;
   readonly connected: boolean;
   sendMessage(content: string): void;
+  checkCodexUsage?(expectedSessionId: string): Promise<unknown>;
   sendApprovalResponse(requestId: string, decision: ApprovalDecision): void;
 }
 
@@ -1450,6 +1454,17 @@ export function AgentProvider({
     }
   }, [foldTurnStream, perSocket]);
 
+  const checkCodexUsage = useCallback(async () => {
+    if (activeSessionIdRef.current !== sessionId || pendingModelSwitchRef.current || typingRef.current) return null;
+    const socket: SessionSocket | null = wsRef.current;
+    const version = wsVersionRef.current;
+    const reply = await socket?.checkCodexUsage?.(sessionId);
+    return socket === wsRef.current && version === wsVersionRef.current &&
+      activeSessionIdRef.current === sessionId && !pendingModelSwitchRef.current && !typingRef.current
+      ? reply
+      : null;
+  }, [sessionId]);
+
   const switchModel = useCallback(async (model: string) => {
     if (modelLoading) return; // debounce
     setModelLoading(true);
@@ -1849,6 +1864,8 @@ export function AgentProvider({
     currentModel,
     availableModels,
     switchModel,
+    checkCodexUsage,
+    modelInfoVersion,
     modelLoading,
     refreshModels: () => setModelInfoVersion((v) => v + 1),
     deleteMessage,

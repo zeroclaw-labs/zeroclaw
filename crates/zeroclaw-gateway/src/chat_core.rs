@@ -446,6 +446,19 @@ impl Chat {
             }
         };
         match parsed["type"].as_str().unwrap_or("") {
+            crate::api_codex_usage::REQUEST => {
+                // A scoped chat grant never grants access to the shared subscription.
+                match crate::api_codex_usage::request_id(&parsed) {
+                    Some(id) => {
+                        refusal(
+                            sender,
+                            &crate::api_codex_usage::unavailable(id, "not_permitted"),
+                        )
+                        .await
+                    }
+                    None => None,
+                }
+            }
             "approval_response" => {
                 if is_sop_approval(&parsed) {
                     return refusal(sender, &sop_approval_refusal()).await;
@@ -762,6 +775,13 @@ impl Chat {
                         continue;
                     };
                     match parsed["type"].as_str() {
+                        Some(crate::api_codex_usage::REQUEST) => {
+                            if let Some(id) = crate::api_codex_usage::request_id(&parsed)
+                                && send(sender, &crate::api_codex_usage::unavailable(id, "not_permitted")).await.is_err()
+                            {
+                                turn.disconnect().await;
+                            }
+                        }
                         Some("approval_response") => {
                             if is_sop_approval(&parsed) {
                                 if send(sender, &sop_approval_refusal()).await.is_err() {

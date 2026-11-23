@@ -10,6 +10,7 @@ pub mod acp;
 pub mod agent_owned_state;
 pub mod api;
 pub mod api_browse;
+mod api_codex_usage;
 pub mod api_config;
 pub mod api_logs;
 pub mod api_oidc;

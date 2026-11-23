@@ -55,6 +55,8 @@ export const AUTH_EVENTS = {
   sessionEnded: 'zeroclaw-session-ended',
   accessLost: 'zeroclaw-access-lost',
   resumed: 'zeroclaw-auth-resumed',
+  // Storage events do not reach the tab that set or cleared its own bearer.
+  credentialsChanged: 'zeroclaw-credentials-changed',
 } as const;
 
 let oidcSession: OidcSession | null = null;
@@ -176,6 +178,7 @@ export function setToken(token: string): void {
   } catch {
     // localStorage may be unavailable (e.g. in some private browsing modes)
   }
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event(AUTH_EVENTS.credentialsChanged));
 }
 
 /**
@@ -187,6 +190,7 @@ export function clearToken(): void {
   } catch {
     // Ignore
   }
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event(AUTH_EVENTS.credentialsChanged));
 }
 
 /**

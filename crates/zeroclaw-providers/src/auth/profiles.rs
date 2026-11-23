@@ -208,6 +208,13 @@ impl AuthProfilesStore {
         let Some(stored_access) = p.access_token.as_deref().filter(|v| !v.trim().is_empty()) else {
             return Ok(Some(OAuthAccessSnapshot::MissingAccessToken));
         };
+        // Usage lookups only accept plaintext or locally encrypted tokens; an
+        // external reference must never reach a resolver or spawn a subprocess.
+        if SecretStore::is_onepassword_ref(stored_access) {
+            return Err(anyhow::Error::msg(
+                "external secret references are not supported for the selected access credential",
+            ));
+        }
         let access_token = self
             .secret_store
             .decrypt(stored_access)
@@ -857,6 +864,64 @@ mod tests {
         assert!(tokens.refresh_token.is_none());
         assert!(tokens.id_token.is_none());
         assert_eq!(tokio::fs::read(store.path()).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn read_oauth_access_only_rejects_external_secret_refs_without_resolving() {
+        // The malformed ref makes any resolver attempt fail validation before
+        // `op` could be spawned, so no subprocess is ever run by this test.
+        // Only the dedicated rejection message proves the guard ran first.
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        let profile = AuthProfile::new_oauth(
+            "openai-codex",
+            "default",
+            TokenSet {
+                access_token: "op://vault-only".into(),
+                refresh_token: Some("fake-refresh".into()),
+                id_token: None,
+                expires_at: None,
+                token_type: None,
+                scope: None,
+            },
+        );
+        store.upsert_profile(profile, true).await.unwrap();
+        let before = tokio::fs::read(store.path()).await.unwrap();
+
+        let Err(err) = store.read_oauth_access_only("openai-codex", None).await else {
+            panic!("expected the external reference to be rejected");
+        };
+        let err = err.to_string();
+        assert!(err.contains("external secret references are not supported"));
+        assert!(!err.contains("op://"));
+        assert_eq!(tokio::fs::read(store.path()).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn read_oauth_access_only_reads_plaintext_access_token() {
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        let profile = AuthProfile::new_oauth(
+            "openai-codex",
+            "default",
+            TokenSet {
+                access_token: "fake-plain-access".into(),
+                refresh_token: None,
+                id_token: None,
+                expires_at: None,
+                token_type: None,
+                scope: None,
+            },
+        );
+        store.upsert_profile(profile, true).await.unwrap();
+        let Some(OAuthAccessSnapshot::Access { tokens, .. }) = store
+            .read_oauth_access_only("openai-codex", None)
+            .await
+            .unwrap()
+        else {
+            panic!("expected plaintext access token");
+        };
+        assert_eq!(tokens.access_token, "fake-plain-access");
     }
 
     #[tokio::test]

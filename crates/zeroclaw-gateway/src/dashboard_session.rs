@@ -1464,6 +1464,11 @@ impl SessionWatch {
         self.session.principal().id.as_str()
     }
 
+    /// Whether this watch belongs to an admitted in-process operator socket.
+    pub(crate) fn is_operator(&self) -> bool {
+        self.require_admin && self.session.is_admin() && self.session.ended_now().is_none()
+    }
+
     /// The ends a stream can see by itself, without waiting for the task
     /// that watches it: the session's own cancellation (sign-out, eviction,
     /// revocation) and its generation's stop. Neither holds anything of the
