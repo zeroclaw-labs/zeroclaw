@@ -2057,7 +2057,9 @@ test('a new conversation closes this one, clears the page, and deletes nothing',
     assert.deepEqual(runtime.deleteCalls, []);
     assert.equal(requestedUrls.some((u) => u.startsWith('DELETE')), false);
     // The next message starts the next conversation.
-    await startConversation(mounted, runtime, 'fresh', 'core-2');
+    const next = await startConversation(mounted, runtime, 'fresh', 'core-2');
+    assert.notEqual(next.sessionId, socket.sessionId);
+    assert.notEqual(socket.sessionId, mounted.context().sessionId);
     assert.equal(runtime.sockets.length, 2);
     await unmount(mounted.renderer);
   });

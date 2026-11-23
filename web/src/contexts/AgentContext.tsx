@@ -308,10 +308,9 @@ export function AgentProvider({
   // Fixed for the provider's life: a re-auth as another account reloads.
   const [perSocket] = useState(conversationPerSocket);
   // With one conversation per socket, none is open until a message starts
-  // one, and each start opens a new socket (this counter re-runs the socket
-  // effect). Until then the socket effect opens nothing.
+  // one. Each start gets a fresh ID so ACP cannot resume the previous chat.
   const [startsConversationOnSend, setStartsConversationOnSend] = useState(perSocket);
-  const [socketGeneration, setSocketGeneration] = useState(0);
+  const [scopedSessionId, setScopedSessionId] = useState<string | null>(null);
   // The gateway's id for the open conversation (from `session_start`): what
   // the stop button aborts. The page's own `sessionId` names nothing there.
   const conversationIdRef = useRef<string | null>(null);
@@ -1024,8 +1023,10 @@ export function AgentProvider({
   // selected session's persisted history.
   useEffect(() => {
     // One conversation per socket: none opens until a message starts one.
-    if (perSocket && socketGeneration === 0) return;
-    const ws = sessionRuntime.createSocket({ agentAlias, sessionId, autoReconnect: !perSocket });
+    if (perSocket && scopedSessionId === null) return;
+    const ws = sessionRuntime.createSocket({
+      agentAlias, sessionId: scopedSessionId ?? sessionId, autoReconnect: !perSocket,
+    });
     // A navigation after the config write creates an equally valid replacement
     // to the one switchModel would build directly. Mark only sockets created
     // after commit; a socket merely opening after commit may still have been
@@ -1049,7 +1050,7 @@ export function AgentProvider({
         wsRef.current.disconnect();
       }
     };
-  }, [attachSocketCallbacks, agentAlias, sessionId, sessionRuntime, perSocket, socketGeneration]);
+  }, [attachSocketCallbacks, agentAlias, sessionId, sessionRuntime, perSocket, scopedSessionId]);
 
   // Fetch current model and available models from config.
   useEffect(() => {
@@ -1154,7 +1155,7 @@ export function AgentProvider({
           local: true,
         },
       ]);
-      setSocketGeneration((g) => g + 1);
+      setScopedSessionId(newSessionId());
       return;
     }
     if (!wsRef.current?.connected) return;
@@ -1284,7 +1285,7 @@ export function AgentProvider({
 
       const ws = sessionRuntimeRef.current.createSocket({
         agentAlias,
-        sessionId: activeSessionIdRef.current,
+        sessionId: scopedSessionId ?? activeSessionIdRef.current,
         autoReconnect: !perSocket,
       });
       // Point wsRef at the NEW client before connect(), so a synchronous
@@ -1312,7 +1313,7 @@ export function AgentProvider({
       setModelLoading(false);
       setError(err instanceof Error ? err.message : t('agent.failed_switch_model'));
     }
-  }, [attachSocketCallbacks, modelLoading, typing, agentAlias, foldTurnStream, perSocket, abortLiveSession]);
+  }, [attachSocketCallbacks, modelLoading, typing, agentAlias, foldTurnStream, perSocket, scopedSessionId, abortLiveSession]);
 
   const deleteMessage = useCallback((id: string) => {
     localMessageMutationVersionRef.current += 1;
@@ -1422,6 +1423,7 @@ export function AgentProvider({
         oldWs.disconnect();
       }
       wsRef.current = null;
+      setScopedSessionId(null);
       setConnected(false);
       setStartsConversationOnSend(true);
       return;

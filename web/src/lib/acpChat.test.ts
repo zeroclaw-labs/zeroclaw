@@ -6,6 +6,7 @@ Object.defineProperty(globalThis, 'window', { value: new Window({ url: 'http://l
 
 const {
   acpNotificationToWsMessage,
+  acpPermissionToWsMessage,
   acpPromptResultToWsMessage,
   acpSessionUpdateToWsMessage,
 } = await import('./acpChat.ts');
@@ -116,4 +117,17 @@ test('ACP terminal metadata maps to context and usage without losing null usage'
     context_input_tokens_source: 'calibrated',
     last_input_tokens: null,
   });
+});
+
+test('permission requests count down to the server deadline across replay', () => {
+  const issued = 1_800_000_000_000;
+  const request = {
+    jsonrpc: '2.0' as const,
+    id: 'permission-1',
+    method: 'session/request_permission',
+    params: { _meta: { zeroclaw: { expiresAtUnixMs: issued + 3_600_000 } } },
+  };
+  assert.equal(acpPermissionToWsMessage(request, issued).timeout_secs, 3600);
+  assert.equal(acpPermissionToWsMessage(request, issued + 300_000).timeout_secs, 3300);
+  assert.equal(acpPermissionToWsMessage(request, issued + 4_000_000).timeout_secs, 0);
 });

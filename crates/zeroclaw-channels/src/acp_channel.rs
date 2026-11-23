@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
@@ -14,6 +14,12 @@ use zeroclaw_api::elicitation::{
 use zeroclaw_runtime::i18n;
 
 use crate::orchestrator::acp_server::RpcOutbound;
+
+/// Absolute deadline so replayed WebChat permission prompts keep their original expiry.
+fn permission_expires_at_ms(timeout: Duration) -> anyhow::Result<u64> {
+    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    Ok(u64::try_from(elapsed.saturating_add(timeout).as_millis())?)
+}
 
 /// Per-session ACP back-channel. One instance is registered into each tool's
 /// channel map at session/new time and torn down on session/stop.
@@ -76,6 +82,7 @@ impl AcpChannel {
 
         let params = json!({
             "sessionId": self.session_id,
+            "_meta": { "zeroclaw": { "expiresAtUnixMs": permission_expires_at_ms(timeout)? } },
             "options": options,
             // `toolCall` is required by the ACP schema. We use a synthetic
             // ask_user tool call so the client surfaces the prompt with a
@@ -484,6 +491,7 @@ impl Channel for AcpChannel {
         }
         let params = json!({
             "sessionId": self.session_id,
+            "_meta": { "zeroclaw": { "expiresAtUnixMs": permission_expires_at_ms(self.approval_timeout)? } },
             "options": options,
             "toolCall": tool_call,
         });
@@ -672,6 +680,7 @@ mod tests {
 
         // Spawn the request; capture the outbound id, then dispatch a
         // matching "selected" response so the await resolves.
+        let earliest_expiry = permission_expires_at_ms(Duration::from_secs(5)).unwrap();
         let task = zeroclaw_spawn::spawn!(async move {
             ch.request_choice("Confirm?", &choices, Duration::from_secs(5))
                 .await
@@ -679,6 +688,11 @@ mod tests {
 
         let line = rx.recv().await.unwrap();
         let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let latest_expiry = permission_expires_at_ms(Duration::from_secs(5)).unwrap();
+        let expiry = req["params"]["_meta"]["zeroclaw"]["expiresAtUnixMs"]
+            .as_u64()
+            .unwrap();
+        assert!((earliest_expiry..=latest_expiry).contains(&expiry));
         assert_eq!(req["method"], "session/request_permission");
         assert_eq!(req["params"]["options"].as_array().unwrap().len(), 3);
         assert_eq!(req["params"]["options"][0]["name"], "Option A");
@@ -1002,10 +1016,16 @@ mod tests {
             position: None,
         };
 
+        let earliest_expiry = permission_expires_at_ms(Duration::from_secs(30)).unwrap();
         let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
 
         let line = rx.recv().await.unwrap();
         let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let latest_expiry = permission_expires_at_ms(Duration::from_secs(30)).unwrap();
+        let expiry = req["params"]["_meta"]["zeroclaw"]["expiresAtUnixMs"]
+            .as_u64()
+            .unwrap();
+        assert!((earliest_expiry..=latest_expiry).contains(&expiry));
         assert_eq!(req["method"], "session/request_permission");
         assert_eq!(req["params"]["sessionId"], "sess-1");
         assert_eq!(req["params"]["options"].as_array().unwrap().len(), 3);

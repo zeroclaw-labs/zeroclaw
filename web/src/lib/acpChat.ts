@@ -12,6 +12,7 @@ import {
 } from '@/lib/acp';
 import {
   AUTH_EVENTS,
+  getClockOffsetMs,
   isReauthPending,
 } from '@/lib/auth';
 import {
@@ -25,7 +26,6 @@ const ACP_PROTOCOL_VERSION = 1;
 const ACP_SESSION_LIMIT_REACHED = -32001;
 const DEFAULT_RECONNECT_DELAY = 1_000;
 const MAX_RECONNECT_DELAY = 30_000;
-const DEFAULT_APPROVAL_TIMEOUT_SECS = 120;
 
 function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -140,6 +140,28 @@ export function acpPromptResultToWsMessage(result: AcpSessionPromptResult): WsMe
       : null;
   }
   return message;
+}
+
+export function acpPermissionToWsMessage(request: AcpRequest, serverNowMs: number) {
+  const params = record(request.params);
+  const toolCall = record(params?.toolCall) ?? {};
+  const expiresAt = numberValue(record(record(params?._meta)?.zeroclaw)?.expiresAtUnixMs);
+  const rawOptions = Array.isArray(params?.options) ? params.options : [];
+  const options = rawOptions.map(record).filter((option) => option !== null).map((option) => ({
+    optionId: stringValue(option.optionId) ?? '',
+    name: stringValue(option.name),
+    kind: stringValue(option.kind),
+  })).filter((option) => option.optionId);
+  const requestId = String(request.id);
+  return {
+    type: 'approval_request' as const,
+    request_id: requestId,
+    tool: stringValue(toolCall.name) ?? stringValue(toolCall.title) ?? 'unknown',
+    arguments_summary: stringValue(toolCall.argumentsSummary)
+      ?? (text(toolCall.content) || JSON.stringify(toolCall.rawInput ?? {})),
+    timeout_secs: expiresAt === undefined ? undefined : Math.max(0, (expiresAt - serverNowMs) / 1000),
+    approval_options: options,
+  };
 }
 
 interface PendingPermission {
@@ -417,26 +439,10 @@ export class AcpChatSocket {
       });
       return;
     }
-    const params = record(request.params);
-    const toolCall = record(params?.toolCall) ?? {};
-    const rawOptions = Array.isArray(params?.options) ? params.options : [];
-    const options = rawOptions.map(record).filter((option) => option !== null).map((option) => ({
-      optionId: stringValue(option.optionId) ?? '',
-      name: stringValue(option.name),
-      kind: stringValue(option.kind),
-    })).filter((option) => option.optionId);
-    const requestId = String(request.id);
-    const approval = options.some((option) => option.optionId === 'allow-once');
-    this.permissions.set(requestId, { id: request.id, approval });
-    this.onMessage?.({
-      type: 'approval_request',
-      request_id: requestId,
-      tool: stringValue(toolCall.name) ?? stringValue(toolCall.title) ?? 'unknown',
-      arguments_summary: stringValue(toolCall.argumentsSummary)
-        ?? (text(toolCall.content) || JSON.stringify(toolCall.rawInput ?? {})),
-      timeout_secs: DEFAULT_APPROVAL_TIMEOUT_SECS,
-      approval_options: options,
-    });
+    const message = acpPermissionToWsMessage(request, Date.now() + getClockOffsetMs());
+    const approval = message.approval_options.some((option) => option.optionId === 'allow-once');
+    this.permissions.set(message.request_id, { id: request.id, approval });
+    this.onMessage?.(message);
   }
 
   private readonly handleAuthResumed = (): void => {
