@@ -14011,6 +14011,8 @@ dependencies = [
  "zeroclaw-memory",
  "zeroclaw-plugins",
  "zeroclaw-providers",
+ "zeroclaw-rpc-client",
+ "zeroclaw-rpc-proto",
  "zeroclaw-runtime",
  "zeroclaw-spawn",
  "zeroclaw-tls",

@@ -80,9 +80,14 @@ impl Gateway {
             let _ = ready_tx.send(Some(addr));
         });
         let ingress = DashboardIngress::new();
+        let plugin_webhook_ingress =
+            Arc::new(zeroclaw_infra::plugin_webhook::PluginWebhookIngress::new(
+                config.gateway.idempotency_ttl_secs,
+                config.gateway.idempotency_max_keys,
+            ));
         let supervision = zeroclaw_gateway::GatewaySupervision::new(
             Some(readiness),
-            Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new()),
+            plugin_webhook_ingress,
             authority,
             None,
         )
