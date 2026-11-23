@@ -36,6 +36,31 @@ pub struct WebDavRead {
     client: Client,
 }
 
+/// Inputs come from an authorized transfer route. The executor generates
+/// the temporary name and retains ownership of staging cleanup.
+pub struct WebDavRelay<'a> {
+    pub source: &'a WebDavRead,
+    pub source_path: &'a str,
+    pub source_authorization: Option<HeaderValue>,
+    pub staging_path: &'a str,
+    pub destination_path: &'a str,
+    pub destination_authorization: Option<HeaderValue>,
+    pub limit: Option<u64>,
+}
+
+pub enum PublicationAuthorization {
+    Denied,
+    Granted(Option<HeaderValue>),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum CopyOutcome {
+    Published { bytes: u64 },
+    PublicationDenied { staged_bytes: u64 },
+    PublicationRejected { staged_bytes: u64 },
+    PublicationUnconfirmed { staged_bytes: u64 },
+}
+
 impl WebDavRead {
     /// Build from an operator-approved root and addresses already checked by
     /// outbound network policy. The caller must resolve current grants before
@@ -177,6 +202,47 @@ impl WebDavRead {
         Ok(written)
     }
 
+    /// Keep staging and publication distinct so the caller can revalidate
+    /// live grants and obtain a fresh destination authorization between them.
+    pub async fn copy_from(
+        &self,
+        relay: WebDavRelay<'_>,
+        authorize_publication: impl AsyncFnOnce() -> PublicationAuthorization,
+    ) -> Result<CopyOutcome, WebDavError> {
+        // Preflight the final target before making a request to either server.
+        checked_rename_paths(&self.root, relay.staging_path, relay.destination_path)?;
+        let bytes = self
+            .stage_from(
+                relay.source,
+                relay.source_path,
+                relay.source_authorization,
+                relay.staging_path,
+                relay.destination_authorization,
+                relay.limit,
+            )
+            .await?;
+        let PublicationAuthorization::Granted(header) = authorize_publication().await else {
+            return Ok(CopyOutcome::PublicationDenied {
+                staged_bytes: bytes,
+            });
+        };
+
+        Ok(
+            match self
+                .publish_staging(relay.staging_path, relay.destination_path, header)
+                .await
+            {
+                PublishResult::Confirmed => CopyOutcome::Published { bytes },
+                PublishResult::Rejected => CopyOutcome::PublicationRejected {
+                    staged_bytes: bytes,
+                },
+                PublishResult::Unknown => CopyOutcome::PublicationUnconfirmed {
+                    staged_bytes: bytes,
+                },
+            },
+        )
+    }
+
     /// Create exactly one directory. Parent creation and authorization are
     /// handled separately by the caller.
     pub async fn create_directory(
@@ -244,16 +310,7 @@ impl WebDavRead {
         destination: &str,
         authorization: Option<HeaderValue>,
     ) -> Result<(), WebDavError> {
-        let parent = |path: &str| {
-            path.rsplit_once('/')
-                .map_or("", |(parent, _)| parent)
-                .to_owned()
-        };
-        if source == destination || parent(source) != parent(destination) {
-            return Err(WebDavError::InvalidPath);
-        }
-        let source = resource_url(&self.root, source)?;
-        let destination = resource_url(&self.root, destination)?;
+        let (source, destination) = checked_rename_paths(&self.root, source, destination)?;
         let method = Method::from_bytes(b"MOVE").map_err(|_| WebDavError::Transport)?;
         let response = self
             .send(method, source, authorization, Some(destination), None)
@@ -419,6 +476,23 @@ fn validate_endpoint(root: &Url, addresses: &[SocketAddr]) -> Result<(String, u1
         return Err(WebDavError::InvalidEndpoint);
     }
     Ok((host.to_owned(), port))
+}
+
+fn checked_rename_paths(
+    root: &Url,
+    source: &str,
+    destination: &str,
+) -> Result<(Url, Url), WebDavError> {
+    fn parent(path: &str) -> &str {
+        path.rsplit_once('/').map_or("", |(parent, _)| parent)
+    }
+    if source == destination || parent(source) != parent(destination) {
+        return Err(WebDavError::InvalidPath);
+    }
+    Ok((
+        resource_url(root, source)?,
+        resource_url(root, destination)?,
+    ))
 }
 
 fn resource_url(root: &Url, path: &str) -> Result<Url, WebDavError> {
@@ -686,7 +760,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_isolates_origin_credentials_and_verifies_staging_size() {
+    async fn relay_isolates_credentials_and_rechecks_publication() {
+        for allow in [true, false] {
+            exercise_relay(allow).await;
+        }
+    }
+
+    async fn exercise_relay(allow: bool) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -709,7 +789,7 @@ mod tests {
         .unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
         let server = ::zeroclaw_spawn::spawn!(async move {
-            for (listener, method, path, identity, response) in [
+            let mut responses = vec![
                 (
                     &source,
                     "GET",
@@ -731,7 +811,17 @@ mod tests {
                     "destination-fixture",
                     "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n",
                 ),
-            ] {
+            ];
+            if allow {
+                responses.push((
+                    &destination,
+                    "MOVE",
+                    "staging.tmp",
+                    "refreshed-fixture",
+                    "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ));
+            }
+            for (listener, method, path, identity, response) in responses {
                 let (tcp, _) = listener.accept().await.unwrap();
                 let mut tls = acceptor.accept(tcp).await.unwrap();
                 let mut request = Vec::new();
@@ -749,6 +839,13 @@ mod tests {
                     tls.read_exact(&mut body).await.unwrap();
                     assert_eq!(&body, b"4\r\ndemo\r\n0\r\n\r\n");
                 }
+                if method == "MOVE" {
+                    assert!(request.contains(&format!(
+                        "\r\ndestination: https://files.test:{}/dav/report.txt\r\n",
+                        destination_addr.port()
+                    )));
+                    assert!(request.contains("\r\noverwrite: f\r\n"));
+                }
                 tls.write_all(response.as_bytes()).await.unwrap();
                 tls.shutdown().await.unwrap();
             }
@@ -764,18 +861,43 @@ mod tests {
         };
 
         tokio::time::timeout(Duration::from_secs(10), async {
-            let transferred = adapter(destination_addr)
-                .stage_from(
-                    &adapter(source_addr),
-                    "report.txt",
-                    Some(HeaderValue::from_static("Bearer source-fixture")),
-                    "staging.tmp",
-                    Some(HeaderValue::from_static("Bearer destination-fixture")),
-                    None,
+            let source = adapter(source_addr);
+            let destination = adapter(destination_addr);
+            let outcome = destination
+                .copy_from(
+                    WebDavRelay {
+                        source: &source,
+                        source_path: "report.txt",
+                        source_authorization: Some(HeaderValue::from_static(
+                            "Bearer source-fixture",
+                        )),
+                        staging_path: "staging.tmp",
+                        destination_path: "report.txt",
+                        destination_authorization: Some(HeaderValue::from_static(
+                            "Bearer destination-fixture",
+                        )),
+                        limit: None,
+                    },
+                    async || {
+                        if allow {
+                            PublicationAuthorization::Granted(Some(HeaderValue::from_static(
+                                "Bearer refreshed-fixture",
+                            )))
+                        } else {
+                            PublicationAuthorization::Denied
+                        }
+                    },
                 )
                 .await
                 .unwrap();
-            assert_eq!(transferred, 4);
+            assert_eq!(
+                outcome,
+                if allow {
+                    CopyOutcome::Published { bytes: 4 }
+                } else {
+                    CopyOutcome::PublicationDenied { staged_bytes: 4 }
+                }
+            );
             server.await.unwrap();
         })
         .await
