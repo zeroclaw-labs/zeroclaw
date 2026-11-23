@@ -256,6 +256,7 @@ pub enum ModelProviderKind {
     Gemini,
     GeminiCli,
     GrokCli,
+    AntigravityCli,
     GoogleAi,
     Mistral,
     Groq,

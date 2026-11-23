@@ -48,6 +48,65 @@ Google's Gemini API. Supports vision and pre-executed grounded search (see [Stre
 
 Shells out to the `gemini` CLI; uses the CLI's existing auth.
 
+### Antigravity CLI: slot `antigravity_cli`
+
+Runs Google's Antigravity CLI through its **`agy acp`** Agent Client Protocol
+server. Every request spawns `agy acp`, runs initialize → authenticate →
+session/new → session/set_model → session/prompt over newline-delimited
+JSON-RPC, and tears the child down. The prompt travels on stdin and never
+appears in argv or a prompt file. The system prompt uses Antigravity's
+`_meta.antigravity.systemPrompt.append` session extension, so ZeroClaw requires
+an `agy` build that advertises it (1.5.x does).
+
+ZeroClaw is an outer harness: it supplies its own system prompt and owns the
+conversation. Google's current Antigravity terms permit only API-key, Agent
+Platform, and Gemini Enterprise sign-in for such harnesses, so `auth_method`
+accepts:
+
+| `auth_method` | Credential | Notes |
+| ------------- | ---------- | ----- |
+| `gemini_api_key` (default) | The alias `api_key` secret | Sent only in the ACP `authenticate` `_meta.apiKey` field, never in argv or the child environment |
+| `agent_platform` | Application Default Credentials | Pass `GOOGLE_CLOUD_PROJECT` / `GOOGLE_CLOUD_LOCATION` with `env_passthrough` when your setup needs them |
+| `oauth_business` | Gemini Enterprise sign-in cached in the alias state directory | Explicit opt-in. ZeroClaw refuses the session unless Antigravity reports a business tier |
+| `oauth_personal` | Personal Google sign-in | Refused when the provider is built. Using a personal sign-in from a third-party harness can get the Google account suspended |
+
+Each alias runs `agy` with its own `--gemini-dir`, by default
+`<zeroclaw dir>/antigravity_cli/<alias>`, created with owner-only permissions.
+A personal sign-in cached in `~/.gemini` is therefore never reused, including
+through Antigravity's fallback to a saved login. For `oauth_business`, sign in
+once into that directory:
+
+```bash
+agy acp --login --gemini-dir ~/.zeroclaw/antigravity_cli/work
+```
+
+```toml
+[providers.models.antigravity_cli.home]
+model = "gemini-3.8-flash-high"           # a modelId from the account's model list; "default" keeps Antigravity's choice
+working_directory = "/path/to/agents/default/workspace"
+# api_key is set with `zeroclaw config set providers.models.antigravity_cli.home.api_key`
+# binary_path = "/home/you/.local/bin/agy"
+
+[providers.models.antigravity_cli.work]
+model = "gemini-3.8-flash-high"
+working_directory = "/path/to/agents/work/workspace"
+auth_method = "agent_platform"
+env_passthrough = ["GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION"]
+```
+
+The child environment is cleared before spawn; `env_passthrough` defaults to
+empty and rejects `GEMINI_*`, `GOOGLE_API_KEY`, `GOOGLE_GENAI_*`, `AGY_*`, and
+`ANTIGRAVITY_*`. ACP permission requests are rejected unless `extra_args`
+includes `--dangerously-skip-permissions`, which also makes the headless client
+select `allow_once`. `extra_args` accepts only `--sandbox`,
+`--dangerously-skip-permissions`, `--process-per-session`,
+`--include-default-customizations=<true|false>`, `--add-dir <dir>`, and
+`--agent <name>`; transport, state-directory, login, telemetry, logging, and
+endpoint flags are reserved. The same limits as `grok_cli` apply: one-shot
+sessions, no native ZeroClaw tool calls, no token usage, temperatures `0.7` or
+`1.0` only, and `timeout_secs` clamped to one hour. Alias `vision = true` sends
+ACP image blocks; `agy acp` advertises `promptCapabilities.image = true`.
+
 ### Grok Build CLI: slot `grok_cli`
 
 Shells out to the Grok Build CLI through the documented **`grok agent stdio`**

@@ -274,6 +274,10 @@ hermes = "none"
 openclaw = "none"
 hermes = "none"
 
+[providers.antigravity_cli]
+openclaw = "none"
+hermes = "none"
+
 [providers.bedrock]
 openclaw = "supported"
 hermes = "supported"

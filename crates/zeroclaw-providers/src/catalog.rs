@@ -24,6 +24,7 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         "gemini" => (Some("google"), Some("google")),
         "gemini_cli" => (Some("google"), Some("google")),
         "grok_cli" => (Some("xai"), Some("x-ai")),
+        "antigravity_cli" => (Some("google"), Some("google")),
         "openrouter" => (Some("openrouter"), Some("openrouter")),
         "copilot" => (Some("github-copilot"), None),
         "minimax" => (Some("minimax"), Some("minimax")),

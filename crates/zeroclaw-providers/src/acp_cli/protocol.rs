@@ -140,6 +140,10 @@ pub(crate) enum AcpError {
     StopReason,
     #[error("ACP could not encode an internal request")]
     Encode,
+    /// The provider's session policy refused the created session. `reason`
+    /// is provider-owned static text, never child-controlled.
+    #[error("ACP session rejected: {reason}")]
+    SessionPolicy { reason: &'static str },
 }
 
 impl AcpError {
@@ -160,6 +164,7 @@ impl AcpError {
             Self::EmptyOutput => "acp_empty_output",
             Self::StopReason => "acp_stop_reason",
             Self::Encode => "acp_encode_failed",
+            Self::SessionPolicy { .. } => "acp_session_policy",
         }
     }
 }
@@ -197,12 +202,22 @@ impl LabeledAcpError {
     }
 }
 
+/// Provider check applied to the `session/new` result before any prompt is
+/// sent. Must return [`AcpError::SessionPolicy`] to refuse the session.
+pub(crate) type SessionCheck<'a> = &'a (dyn Fn(&Value) -> Result<(), AcpError> + Send + Sync);
+
 /// Inputs for one bounded ACP prompt against an already-spawned child.
 pub(crate) struct OneshotPrompt<'a> {
     pub(crate) prompt: &'a [AcpPromptContent],
     pub(crate) cwd: &'a Path,
     pub(crate) permission_policy: AcpPermissionPolicy,
     pub(crate) max_stdout_bytes: usize,
+    /// Optional `_meta` object sent with `session/new`.
+    pub(crate) session_meta: Option<&'a Value>,
+    /// Optional model selected with `session/set_model` after `session/new`.
+    pub(crate) model: Option<&'a str>,
+    /// Optional policy check on the `session/new` result.
+    pub(crate) session_check: Option<SessionCheck<'a>>,
 }
 
 /// Map a small set of well-known integer JSON-RPC codes to fixed public
@@ -266,8 +281,9 @@ fn session_matches(message: &Value, session_id: Option<&str>) -> bool {
 /// Run one prompt against an already-spawned ACP stdio child.
 ///
 /// `select_auth` maps the `initialize` result to the complete `authenticate`
-/// params. It must fail with [`AcpError::NoAuthenticationMethod`] rather than
-/// guess when no acceptable method is advertised.
+/// params, or `None` to skip `authenticate` and use the agent's cached
+/// sign-in. It must fail with [`AcpError::NoAuthenticationMethod`] rather
+/// than guess when no acceptable method is advertised.
 pub(crate) async fn run_oneshot_prompt<W, R, A>(
     stdin: &mut W,
     stdout: R,
@@ -277,13 +293,16 @@ pub(crate) async fn run_oneshot_prompt<W, R, A>(
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
-    A: FnOnce(&Value) -> Result<Value, AcpError>,
+    A: FnOnce(&Value) -> Result<Option<Value>, AcpError>,
 {
     let OneshotPrompt {
         prompt,
         cwd,
         permission_policy,
         max_stdout_bytes,
+        session_meta,
+        model,
+        session_check,
     } = *request;
     let mut reader = AcpReader::new(stdout, max_stdout_bytes);
     let mut next_id = 1_u64;
@@ -308,28 +327,33 @@ where
     .await?;
     validate_protocol_version(&initialize)?;
 
-    let authenticate = select_auth(&initialize)?;
-    rpc_request(
-        stdin,
-        &mut reader,
-        &mut next_id,
-        "authenticate",
-        authenticate,
-        &mut assistant,
-        permission_policy,
-        None,
-    )
-    .await?;
+    if let Some(authenticate) = select_auth(&initialize)? {
+        rpc_request(
+            stdin,
+            &mut reader,
+            &mut next_id,
+            "authenticate",
+            authenticate,
+            &mut assistant,
+            permission_policy,
+            None,
+        )
+        .await?;
+    }
 
+    let mut session_params = json!({
+        "cwd": cwd,
+        "mcpServers": []
+    });
+    if let Some(meta) = session_meta {
+        session_params["_meta"] = meta.clone();
+    }
     let new_session = rpc_request(
         stdin,
         &mut reader,
         &mut next_id,
         "session/new",
-        json!({
-            "cwd": cwd,
-            "mcpServers": []
-        }),
+        session_params,
         &mut assistant,
         permission_policy,
         None,
@@ -342,6 +366,26 @@ where
             phase: "session/new",
         })?
         .to_string();
+    if let Some(check) = session_check {
+        check(&new_session)?;
+    }
+
+    if let Some(model) = model {
+        rpc_request(
+            stdin,
+            &mut reader,
+            &mut next_id,
+            "session/set_model",
+            json!({
+                "sessionId": session_id,
+                "modelId": model
+            }),
+            &mut assistant,
+            permission_policy,
+            Some(session_id.as_str()),
+        )
+        .await?;
+    }
 
     // Authentication/session notifications are not part of the answer.
     assistant.clear();
@@ -995,7 +1039,11 @@ mod tests {
                 }),
                 Some("authenticate") => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
                 Some("session/new") => json!({
-                    "jsonrpc": "2.0", "id": id, "result": { "sessionId": "s1" }
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {
+                        "sessionId": "s1",
+                        "_meta": { "tier": { "id": "fake-tier" } }
+                    }
                 }),
                 Some("session/prompt") => {
                     let chunk = json!({
@@ -1038,10 +1086,15 @@ mod tests {
             cwd: Path::new("/"),
             permission_policy: AcpPermissionPolicy::RejectOnce,
             max_stdout_bytes: DEFAULT_ACP_STDOUT_LIMIT_BYTES,
+            session_meta: None,
+            model: None,
+            session_check: None,
         };
         let reply = run_oneshot_prompt(&mut client_in, client_out, &request, |initialize| {
             assert_eq!(initialize["authMethods"][1]["id"], "method-b");
-            Ok(json!({ "methodId": "method-b", "_meta": { "marker": 7 } }))
+            Ok(Some(
+                json!({ "methodId": "method-b", "_meta": { "marker": 7 } }),
+            ))
         })
         .await
         .expect("one-shot reply");
@@ -1069,6 +1122,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oneshot_can_skip_authenticate_and_forwards_session_meta_and_model() {
+        let (mut client_in, server_in) = duplex(65_536);
+        let (server_out, client_out) = duplex(65_536);
+        let agent = ::zeroclaw_spawn::spawn!(fake_agent(server_in, server_out));
+
+        let prompt = [AcpPromptContent::Text("hello".to_string())];
+        let meta = json!({ "vendor": { "systemPrompt": { "append": "SYSTEM" } } });
+        let check = |session: &Value| {
+            assert_eq!(session["_meta"]["tier"]["id"], "fake-tier");
+            Ok(())
+        };
+        let request = OneshotPrompt {
+            prompt: &prompt,
+            cwd: Path::new("/"),
+            permission_policy: AcpPermissionPolicy::RejectOnce,
+            max_stdout_bytes: DEFAULT_ACP_STDOUT_LIMIT_BYTES,
+            session_meta: Some(&meta),
+            model: Some("model-x"),
+            session_check: Some(&check),
+        };
+        let reply = run_oneshot_prompt(&mut client_in, client_out, &request, |_| Ok(None))
+            .await
+            .expect("one-shot reply");
+        assert_eq!(reply, "ONESHOT_OK");
+        drop(client_in);
+
+        let received = agent.await.expect("fake agent");
+        let methods: Vec<&str> = received
+            .iter()
+            .filter_map(|request| request["method"].as_str())
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                "initialize",
+                "session/new",
+                "session/set_model",
+                "session/prompt"
+            ]
+        );
+        assert_eq!(received[1]["params"]["_meta"], meta);
+        assert_eq!(
+            received[2]["params"],
+            json!({ "sessionId": "s1", "modelId": "model-x" })
+        );
+    }
+
+    #[tokio::test]
+    async fn oneshot_session_policy_refusal_stops_before_model_and_prompt() {
+        let (mut client_in, server_in) = duplex(65_536);
+        let (server_out, client_out) = duplex(65_536);
+        let agent = ::zeroclaw_spawn::spawn!(fake_agent(server_in, server_out));
+
+        let prompt = [AcpPromptContent::Text(
+            "PROMPT_MUST_NOT_BE_SENT".to_string(),
+        )];
+        let check = |_: &Value| {
+            Err(AcpError::SessionPolicy {
+                reason: "tier not allowed",
+            })
+        };
+        let request = OneshotPrompt {
+            prompt: &prompt,
+            cwd: Path::new("/"),
+            permission_policy: AcpPermissionPolicy::RejectOnce,
+            max_stdout_bytes: DEFAULT_ACP_STDOUT_LIMIT_BYTES,
+            session_meta: None,
+            model: Some("model-x"),
+            session_check: Some(&check),
+        };
+        let error = run_oneshot_prompt(&mut client_in, client_out, &request, |_| Ok(None))
+            .await
+            .expect_err("policy refusal must fail the request");
+        assert!(matches!(error, AcpError::SessionPolicy { .. }));
+        assert_eq!(error.to_string(), "ACP session rejected: tier not allowed");
+        drop(client_in);
+
+        let received = agent.await.expect("fake agent");
+        let methods: Vec<&str> = received
+            .iter()
+            .filter_map(|request| request["method"].as_str())
+            .collect();
+        assert_eq!(methods, ["initialize", "session/new"]);
+    }
+
+    #[tokio::test]
     async fn oneshot_stops_before_session_when_auth_selection_fails() {
         let (mut client_in, server_in) = duplex(65_536);
         let (server_out, client_out) = duplex(65_536);
@@ -1080,6 +1219,9 @@ mod tests {
             cwd: Path::new("/"),
             permission_policy: AcpPermissionPolicy::RejectOnce,
             max_stdout_bytes: DEFAULT_ACP_STDOUT_LIMIT_BYTES,
+            session_meta: None,
+            model: None,
+            session_check: None,
         };
         let error = run_oneshot_prompt(&mut client_in, client_out, &request, |_| {
             Err(AcpError::NoAuthenticationMethod)

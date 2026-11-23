@@ -3209,6 +3209,86 @@ pub struct GrokCliModelProviderConfig {
     pub max_acp_stdout_bytes: Option<usize>,
 }
 
+// ── Antigravity CLI (ACP subprocess) ──
+
+/// How the `agy acp` child authenticates for an `antigravity_cli` alias.
+///
+/// ZeroClaw is an outer harness that injects its own system prompt, so
+/// Google's current Antigravity terms permit only API-key, Agent Platform,
+/// and Gemini Enterprise sign-in for it. Personal Google sign-in is accepted
+/// by the schema but refused when the provider is built.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AntigravityCliAuthMethod {
+    /// Gemini Developer API key from this alias's `api_key` secret. The key
+    /// is sent to the child over ACP stdin, never in argv or the environment.
+    #[default]
+    GeminiApiKey,
+    /// Gemini Enterprise Agent Platform (formerly Vertex AI) with Application
+    /// Default Credentials.
+    AgentPlatform,
+    /// Gemini Enterprise sign-in cached in this alias's isolated Antigravity
+    /// state directory. Explicit opt-in; the provider refuses sessions whose
+    /// reported tier is not a business tier.
+    OauthBusiness,
+    /// Personal Google sign-in. Refused: Google's Antigravity terms do not
+    /// currently permit consumer sign-in inside third-party harnesses.
+    OauthPersonal,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.antigravity_cli"]
+pub struct AntigravityCliModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// Absolute path or bare executable name for the Antigravity CLI
+    /// (default: `agy`). Bare names resolve only from absolute PATH
+    /// directories; empty and relative PATH entries are ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<String>,
+    /// Required absolute working directory for the `agy acp` subprocess and
+    /// ACP session boundary. The directory must exist when the provider is
+    /// built.
+    pub working_directory: String,
+    /// Authentication method for the child. Defaults to `gemini_api_key`,
+    /// which requires this alias's `api_key`. `oauth_personal` is refused.
+    #[serde(default)]
+    pub auth_method: AntigravityCliAuthMethod,
+    /// Absolute directory for this alias's Antigravity state (`agy
+    /// --gemini-dir`). Defaults to `<zeroclaw dir>/antigravity_cli/<alias>`
+    /// so a personal sign-in cached in `~/.gemini` is never reused. For
+    /// `oauth_business`, sign in once with `agy acp --login --gemini-dir
+    /// <this directory>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_directory: Option<String>,
+    /// Extra environment variable names inherited by the `agy` subprocess,
+    /// resolved from the ZeroClaw process environment at spawn time (for
+    /// example `GOOGLE_CLOUD_PROJECT` for `agent_platform`). Gemini API key
+    /// variables are rejected; use the typed `api_key` instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[credential_class = "legacy_env_path"]
+    pub env_passthrough: Vec<String>,
+    /// Extra `agy acp` flags. Only known flags are accepted:
+    /// `--sandbox`, `--dangerously-skip-permissions`,
+    /// `--process-per-session`, `--include-default-customizations=<bool>`,
+    /// `--add-dir <dir>`, and `--agent <name>`. Transport, state, login,
+    /// telemetry, logging, and endpoint flags are reserved.
+    /// `--dangerously-skip-permissions` also authorizes ZeroClaw to approve
+    /// the child's permission requests for this alias.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
+    /// Maximum cumulative stdout bytes accepted from `agy acp` for one ACP
+    /// request. When unset, ZeroClaw uses 4 MiB. Values must be between
+    /// 1 MiB and 64 MiB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_acp_stdout_bytes: Option<usize>,
+}
+
 // ── LMStudio (local default) ──
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -3889,6 +3969,7 @@ impl_default_family_endpoint! {
     GeminiModelProviderConfig,
     GeminiCliModelProviderConfig,
     GrokCliModelProviderConfig,
+    AntigravityCliModelProviderConfig,
     LmstudioModelProviderConfig,
     LlamacppModelProviderConfig,
     SglangModelProviderConfig,
@@ -35569,6 +35650,38 @@ auto_save = true
             ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
         );
         assert_eq!(parsed.max_acp_stdout_bytes, Some(8_388_608));
+    }
+
+    #[test]
+    async fn antigravity_cli_alias_requires_working_directory_and_defaults_to_api_key() {
+        let error = toml::from_str::<AntigravityCliModelProviderConfig>(
+            "model = \"gemini-3.8-flash-high\"",
+        )
+        .expect_err("working_directory is required");
+        assert!(error.to_string().contains("working_directory"));
+
+        let parsed: AntigravityCliModelProviderConfig = toml::from_str(
+            r#"
+                model = "gemini-3.8-flash-high"
+                working_directory = "/srv/zeroclaw/workspace"
+            "#,
+        )
+        .expect("minimal Antigravity alias");
+        assert_eq!(parsed.auth_method, AntigravityCliAuthMethod::GeminiApiKey);
+        assert_eq!(parsed.state_directory, None);
+
+        for (raw, expected) in [
+            ("gemini_api_key", AntigravityCliAuthMethod::GeminiApiKey),
+            ("agent_platform", AntigravityCliAuthMethod::AgentPlatform),
+            ("oauth_business", AntigravityCliAuthMethod::OauthBusiness),
+            ("oauth_personal", AntigravityCliAuthMethod::OauthPersonal),
+        ] {
+            let parsed: AntigravityCliModelProviderConfig = toml::from_str(&format!(
+                "working_directory = \"/srv/w\"\nauth_method = \"{raw}\""
+            ))
+            .expect("auth method parses");
+            assert_eq!(parsed.auth_method, expected);
+        }
     }
 
     #[test]

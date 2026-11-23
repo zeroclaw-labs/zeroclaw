@@ -560,9 +560,9 @@ pub(crate) fn fallback_auth_ready_for_alias(
 
 use zeroclaw_config::schema::{
     Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicModelProviderConfig,
-    AnyscaleModelProviderConfig, ArceeModelProviderConfig, AstraiModelProviderConfig,
-    AtlasCloudModelProviderConfig, AtomicChatModelProviderConfig, AuthMode,
-    AvianModelProviderConfig, AzureModelProviderConfig, BaichuanModelProviderConfig,
+    AntigravityCliModelProviderConfig, AnyscaleModelProviderConfig, ArceeModelProviderConfig,
+    AstraiModelProviderConfig, AtlasCloudModelProviderConfig, AtomicChatModelProviderConfig,
+    AuthMode, AvianModelProviderConfig, AzureModelProviderConfig, BaichuanModelProviderConfig,
     BasetenModelProviderConfig, BedrockModelProviderConfig, CerebrasModelProviderConfig,
     CheaperInferenceModelProviderConfig, CloudflareModelProviderConfig, CohereModelProviderConfig,
     CopilotModelProviderConfig, CrusoeModelProviderConfig, CustomModelProviderConfig,
@@ -1814,6 +1814,51 @@ impl FamilyProviderFactory for GrokCliModelProviderConfig {
     }
 }
 
+impl FamilyProviderFactory for AntigravityCliModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::CliBacked;
+
+    fn create_provider(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        _api_url: Option<&str>,
+        opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
+        let state_root = opts.zeroclaw_dir.clone().unwrap_or_else(|| {
+            directories::UserDirs::new().map_or_else(
+                || std::path::PathBuf::from(".zeroclaw"),
+                |dirs| dirs.home_dir().join(".zeroclaw"),
+            )
+        });
+        Ok(Box::new(
+            crate::antigravity_cli::AntigravityCliModelProvider::builder(alias)
+                .binary_path(self.binary_path.as_deref())
+                .working_directory(&self.working_directory)
+                .state_directory(self.state_directory.as_deref())
+                .state_root(state_root)
+                .auth_method(self.auth_method)
+                .api_key(key)
+                .env_passthrough(self.env_passthrough.clone())
+                .extra_args(self.extra_args.clone())
+                .max_acp_stdout_bytes(self.max_acp_stdout_bytes)
+                .timeout_secs(self.base.timeout_secs)
+                .vision_enabled(opts.vision == Some(true))
+                .build()?,
+        ))
+    }
+
+    fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        use zeroclaw_config::schema::AntigravityCliAuthMethod;
+        match self.auth_method {
+            AntigravityCliAuthMethod::GeminiApiKey => has_api_key(key),
+            AntigravityCliAuthMethod::AgentPlatform | AntigravityCliAuthMethod::OauthBusiness => {
+                true
+            }
+            AntigravityCliAuthMethod::OauthPersonal => false,
+        }
+    }
+}
+
 impl FamilyProviderFactory for KiloCliModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::CliBacked;
 
@@ -2393,7 +2438,7 @@ mod tests {
                 "{family} requires operator endpoint input"
             );
         }
-        for family in ["gemini_cli", "grok_cli", "kilocli"] {
+        for family in ["gemini_cli", "grok_cli", "antigravity_cli", "kilocli"] {
             assert_eq!(
                 endpoint_for_family(family),
                 Some(ProviderEndpoint::CliBacked),
@@ -2481,6 +2526,80 @@ mod tests {
             .expect("vision opt-in must build the Grok CLI provider");
 
         assert!(provider.capabilities().vision);
+    }
+
+    fn antigravity_cli_config(
+        working_directory: &std::path::Path,
+        auth_method: zeroclaw_config::schema::AntigravityCliAuthMethod,
+    ) -> AntigravityCliModelProviderConfig {
+        AntigravityCliModelProviderConfig {
+            binary_path: Some(
+                std::env::current_exe()
+                    .expect("current test executable")
+                    .display()
+                    .to_string(),
+            ),
+            working_directory: working_directory.display().to_string(),
+            auth_method,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn antigravity_cli_factory_uses_typed_api_key_and_isolated_state() {
+        use zeroclaw_config::schema::AntigravityCliAuthMethod;
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let config = antigravity_cli_config(temp.path(), AntigravityCliAuthMethod::GeminiApiKey);
+        let opts = ModelProviderRuntimeOptions {
+            zeroclaw_dir: Some(temp.path().join("zeroclaw")),
+            vision: Some(true),
+            ..Default::default()
+        };
+
+        let missing = match config.create_provider("default", None, None, &opts) {
+            Ok(_) => panic!("gemini_api_key without api_key must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            missing
+                .to_string()
+                .contains("requires this alias's api_key")
+        );
+        assert!(!config.fallback_auth_ready(None, &opts));
+        assert!(config.fallback_auth_ready(Some("test-key"), &opts));
+
+        let provider = config
+            .create_provider("default", Some("test-key"), None, &opts)
+            .expect("typed api_key builds the Antigravity CLI provider");
+        assert!(provider.capabilities().vision);
+    }
+
+    #[test]
+    fn antigravity_cli_factory_refuses_personal_sign_in() {
+        use zeroclaw_config::schema::AntigravityCliAuthMethod;
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let config = antigravity_cli_config(temp.path(), AntigravityCliAuthMethod::OauthPersonal);
+        let opts = ModelProviderRuntimeOptions {
+            zeroclaw_dir: Some(temp.path().join("zeroclaw")),
+            ..Default::default()
+        };
+        assert!(!config.fallback_auth_ready(None, &opts));
+        let error = match config.create_provider("default", None, None, &opts) {
+            Ok(_) => panic!("oauth_personal must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("oauth_personal"));
+
+        for method in [
+            AntigravityCliAuthMethod::AgentPlatform,
+            AntigravityCliAuthMethod::OauthBusiness,
+        ] {
+            let config = antigravity_cli_config(temp.path(), method);
+            assert!(config.fallback_auth_ready(None, &opts));
+            config
+                .create_provider("default", None, None, &opts)
+                .expect("keyless Antigravity methods build");
+        }
     }
 
     #[test]

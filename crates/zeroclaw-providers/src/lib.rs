@@ -3,6 +3,7 @@
 
 pub(crate) mod acp_cli;
 pub mod anthropic;
+pub mod antigravity_cli;
 pub mod auth;
 pub mod azure_openai;
 pub mod bedrock;
@@ -1519,6 +1520,8 @@ pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
         "gemini-cli" => "gemini_cli",
         // Grok Build CLI is its own typed slot (subprocess runtime).
         "grok-cli" | "grokcli" => "grok_cli",
+        // Antigravity CLI is its own typed slot (ACP subprocess runtime).
+        "antigravity-cli" | "agy" => "antigravity_cli",
         // Stepfun-intl folds with a different uri at the schema layer.
         "stepfun-intl" | "step-intl" => "stepfun",
         // Anthropic special folds.
@@ -2408,6 +2411,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("copilot", "GitHub Copilot", false),
             ("gemini_cli", "Gemini CLI", true),
             ("grok_cli", "Grok Build CLI", true),
+            ("antigravity_cli", "Antigravity CLI", true),
             ("kilocli", "KiloCLI", true),
             ("kilo", "Kilo", false),
             ("zerorouter", "ZeroRouter", false),
@@ -3917,6 +3921,15 @@ mod tests {
     }
 
     #[test]
+    fn factory_antigravity_cli() {
+        let error = match create_model_provider("antigravity_cli", Some("test-key")) {
+            Ok(_) => panic!("unscoped antigravity_cli provider must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("working_directory"));
+    }
+
+    #[test]
     fn factory_kilocli() {
         assert!(create_model_provider("kilocli", None).is_ok());
     }
@@ -4476,9 +4489,9 @@ mod tests {
         // `normalize_model_provider_type` in `schema/v2.rs` and never reach
         // the runtime. `azure` is excluded (typed-config required, see
         // `listed_model_providers_are_constructible` skip list); `custom` is
-        // excluded (URI required); `grok_cli` is excluded because ACP requires
-        // an explicit absolute working_directory. Dedicated factory tests cover
-        // each required-config family.
+        // excluded (URI required); `grok_cli` and `antigravity_cli` are
+        // excluded because ACP requires an explicit absolute working_directory.
+        // Dedicated factory tests cover each required-config family.
         let canonical = [
             "openrouter",
             "anthropic",
@@ -4570,9 +4583,10 @@ mod tests {
             if model_provider.name == "custom" {
                 continue;
             }
-            // Grok ACP deliberately refuses the daemon cwd as an implicit
-            // trust boundary; a typed alias must provide working_directory.
-            if model_provider.name == "grok_cli" {
+            // ACP CLI providers deliberately refuse the daemon cwd as an
+            // implicit trust boundary; a typed alias must provide
+            // working_directory.
+            if matches!(model_provider.name, "grok_cli" | "antigravity_cli") {
                 continue;
             }
             let api_key = if model_provider.name == "hailo_ollama" {
