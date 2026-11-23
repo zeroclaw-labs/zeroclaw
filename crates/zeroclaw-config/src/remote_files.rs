@@ -316,9 +316,260 @@ impl PlatformOperations {
     }
 }
 
+/// The model can name a resource or its workspace. Connection configuration
+/// and the grant's credential aliases are resolved exclusively by the host.
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(tag = "location", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FileEndpoint {
+    Remote { resource: String, path: String },
+    Workspace { path: String },
+}
+
+impl FileEndpoint {
+    fn is_valid(&self) -> bool {
+        match self {
+            Self::Remote { resource, path } => {
+                valid_resource_alias(resource) && is_relative_resource_path(path)
+            }
+            Self::Workspace { path } => is_relative_resource_path(path),
+        }
+    }
+}
+
+/// Untrusted tool arguments. This type carries no credentials, hosts, URLs
+/// or approval bypasses. Successful validation does not grant authority.
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RemoteFilesRequest {
+    ListDirectory {
+        resource: String,
+        path: Option<String>,
+    },
+    CopyFiles {
+        files: Vec<FilePair>,
+    },
+    MoveFiles {
+        files: Vec<FilePair>,
+    },
+    DeleteFiles {
+        resource: String,
+        paths: Vec<String>,
+    },
+    RenameFiles {
+        resource: String,
+        files: Vec<RenamePair>,
+    },
+    CreateDirectory {
+        resource: String,
+        path: String,
+    },
+    RenameDirectory {
+        resource: String,
+        from: String,
+        to: String,
+    },
+    DeleteDirectory {
+        resource: String,
+        path: String,
+        #[serde(default)]
+        recursive: bool,
+    },
+    CopyDirectory {
+        from: FileEndpoint,
+        to: FileEndpoint,
+        #[serde(default)]
+        recursive: bool,
+    },
+    MoveDirectory {
+        from: FileEndpoint,
+        to: FileEndpoint,
+        #[serde(default)]
+        recursive: bool,
+    },
+    GetFileInfo {
+        resource: String,
+        path: String,
+    },
+    SetFileInfo {
+        resource: String,
+        path: String,
+        modified_unix_seconds: i64,
+    },
+    Login {
+        resource: String,
+    },
+    Logout {
+        resource: String,
+    },
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FilePair {
+    pub from: FileEndpoint,
+    pub to: FileEndpoint,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RenamePair {
+    pub from: String,
+    pub to: String,
+}
+
+impl RemoteFilesRequest {
+    /// Reject invalid arguments before any catalog or backend access.
+    pub fn validate(&self) -> bool {
+        use RemoteFilesRequest::*;
+        match self {
+            ListDirectory { resource, path } => {
+                valid_resource_alias(resource)
+                    && path.as_deref().is_none_or(is_relative_resource_path)
+            }
+            Login { resource } | Logout { resource } => valid_resource_alias(resource),
+            CreateDirectory { resource, path }
+            | DeleteDirectory { resource, path, .. }
+            | GetFileInfo { resource, path }
+            | SetFileInfo { resource, path, .. } => {
+                valid_resource_alias(resource) && is_relative_resource_path(path)
+            }
+            CopyFiles { files } | MoveFiles { files } => {
+                valid_batch(files, |pair| valid_transfer(&pair.from, &pair.to))
+                    && unique_by(files, |pair| &pair.to)
+            }
+            CopyDirectory { from, to, .. } | MoveDirectory { from, to, .. } => {
+                valid_transfer(from, to)
+            }
+            DeleteFiles { resource, paths } => {
+                valid_resource_alias(resource)
+                    && valid_batch(paths, |path| is_relative_resource_path(path))
+                    && unique_by(paths, |path| path)
+            }
+            RenameFiles { resource, files } => {
+                valid_resource_alias(resource)
+                    && valid_batch(files, |pair| valid_rename(&pair.from, &pair.to))
+                    && unique_by(files, |pair| &pair.to)
+            }
+            RenameDirectory { resource, from, to } => {
+                valid_resource_alias(resource) && valid_rename(from, to)
+            }
+        }
+    }
+}
+
+fn valid_resource_alias(alias: &str) -> bool {
+    (1..=64).contains(&alias.len())
+        && alias
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn valid_batch<T>(items: &[T], validate: impl Fn(&T) -> bool) -> bool {
+    (1..=128).contains(&items.len()) && items.iter().all(validate)
+}
+
+fn unique_by<T, K: Eq>(items: &[T], key: impl Fn(&T) -> &K) -> bool {
+    items.iter().enumerate().all(|(index, item)| {
+        items[..index]
+            .iter()
+            .all(|previous| key(previous) != key(item))
+    })
+}
+
+fn valid_transfer(from: &FileEndpoint, to: &FileEndpoint) -> bool {
+    from.is_valid()
+        && to.is_valid()
+        && from != to
+        && !matches!(
+            (from, to),
+            (
+                FileEndpoint::Workspace { .. },
+                FileEndpoint::Workspace { .. }
+            )
+        )
+}
+
+fn valid_rename(from: &str, to: &str) -> bool {
+    fn parent(path: &str) -> &str {
+        path.rsplit_once('/').map_or("", |(parent, _)| parent)
+    }
+    from != to
+        && is_relative_resource_path(from)
+        && is_relative_resource_path(to)
+        && parent(from) == parent(to)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn model_arguments_accept_aliases_and_reject_connection_parameters() {
+        let request = serde_json::json!({
+            "operation": "move_files",
+            "files": [{
+                "from": {"location": "remote", "resource": "REPORTS", "path": "today.pdf"},
+                "to": {"location": "workspace", "path": "incoming/today.pdf"}
+            }]
+        });
+        assert!(
+            serde_json::from_value::<RemoteFilesRequest>(request.clone())
+                .unwrap()
+                .validate()
+        );
+        let mut with_credential = request.clone();
+        with_credential["files"][0]["from"]["password"] = serde_json::json!("fixture");
+        assert!(serde_json::from_value::<RemoteFilesRequest>(with_credential).is_err());
+        let mut invalid_alias = request.clone();
+        invalid_alias["files"][0]["from"]["resource"] = serde_json::json!("https://files.test");
+        assert!(
+            !serde_json::from_value::<RemoteFilesRequest>(invalid_alias)
+                .unwrap()
+                .validate()
+        );
+        let mut invalid_path = request;
+        invalid_path["files"][0]["to"]["path"] = serde_json::json!("../outside.pdf");
+        assert!(
+            !serde_json::from_value::<RemoteFilesRequest>(invalid_path)
+                .unwrap()
+                .validate()
+        );
+    }
+
+    #[test]
+    fn requests_reject_duplicate_destinations_and_cross_parent_rename() {
+        let rename = |files| RemoteFilesRequest::RenameFiles {
+            resource: "REPORTS".into(),
+            files,
+        };
+        assert!(
+            !rename(vec![
+                RenamePair {
+                    from: "a.txt".into(),
+                    to: "c.txt".into()
+                },
+                RenamePair {
+                    from: "b.txt".into(),
+                    to: "c.txt".into()
+                },
+            ])
+            .validate()
+        );
+        assert!(
+            !rename(vec![RenamePair {
+                from: "old/a.txt".into(),
+                to: "other/a.txt".into()
+            }])
+            .validate()
+        );
+        assert!(
+            rename(vec![RenamePair {
+                from: "old/a.txt".into(),
+                to: "old/b.txt".into()
+            }])
+            .validate()
+        );
+    }
+
     #[test]
     fn availability_requires_host_prerequisites_and_all_three_platforms() {
         use Right::*;
