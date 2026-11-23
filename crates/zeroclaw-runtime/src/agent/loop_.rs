@@ -277,6 +277,32 @@ fn effort_turn_route(
     }))
 }
 
+/// The effort policy a run routes by. A child whose inherited allowlist
+/// excludes the cloud route's provider routes as if escalation were off, so a
+/// detailed subtask from a local-only turn runs locally instead of failing.
+/// The cloud route is found as `resolve_effort_route` finds it: last exact hint.
+fn effort_policy_within(
+    config: &Config,
+    policy: Option<&zeroclaw_config::scattered_types::EffortRoutingConfig>,
+    inherited: Option<&Arc<HashSet<String>>>,
+) -> Option<zeroclaw_config::scattered_types::EffortRoutingConfig> {
+    let mut policy = policy?.clone();
+    if let Some(inherited) = inherited {
+        let cloud_hint = policy.cloud_hint.trim();
+        let cloud_allowed = config
+            .model_routes
+            .iter()
+            .rev()
+            .find(|route| route.hint == cloud_hint)
+            .is_some_and(|route| inherited.contains(&route.model_provider));
+        if !cloud_allowed {
+            policy.cloud_escalation =
+                zeroclaw_config::scattered_types::CloudEscalationPolicy::Never;
+        }
+    }
+    Some(policy)
+}
+
 fn effort_scoped_provider_config(
     config: &Config,
     allowed_provider_refs: &HashSet<String>,
@@ -1467,6 +1493,23 @@ pub struct AgentRunOverrides {
     /// inherits the step's boundary rather than rebuilding the agent's full
     /// surface. `None` for every ordinary agent run.
     pub sop_step_scope: Option<crate::sop::active_scope::HeadlessStepScope>,
+    /// Provider profiles the parent turn may attempt, for a child run started
+    /// from inside it. Every provider attempt of the child, including fallbacks
+    /// and its own effort routing, stays inside this set. `None` for a run
+    /// with no enclosing provider restriction.
+    pub provider_allowlist: Option<Arc<HashSet<String>>>,
+}
+
+/// Narrow a run's own provider allowlist by the one it inherited, so a child
+/// never attempts a provider its parent turn could not.
+fn narrow_provider_allowlist(
+    own: Arc<HashSet<String>>,
+    inherited: Option<&Arc<HashSet<String>>>,
+) -> Arc<HashSet<String>> {
+    match inherited {
+        Some(inherited) => Arc::new(own.intersection(inherited).cloned().collect()),
+        None => own,
+    }
 }
 
 fn agent_provider_composite(
@@ -1954,14 +1997,18 @@ async fn run_inner(
         };
         let mut effort_provider_config = None;
         let mut active_effort_provider_refs: Option<Arc<HashSet<String>>> = None;
+        let inherited_provider_allowlist = overrides.provider_allowlist.clone();
+        let effort_policy = effort_policy_within(
+            &config,
+            agent.resolved.effort_routing.as_ref(),
+            inherited_provider_allowlist.as_ref(),
+        );
         if automatic_model_routing && let Some(initial_message) = message.as_deref() {
             let effective_message =
                 crate::agent::thinking::strip_thinking_directive(initial_message);
-            if let Some(selection) = effort_turn_route(
-                &config,
-                agent.resolved.effort_routing.as_ref(),
-                effective_message.as_ref(),
-            )? {
+            if let Some(selection) =
+                effort_turn_route(&config, effort_policy.as_ref(), effective_message.as_ref())?
+            {
                 provider_name = selection.model_provider;
                 model_name = selection.model;
                 effort_provider_config = Some(effort_scoped_provider_config(
@@ -1970,6 +2017,21 @@ async fn run_inner(
                 ));
                 active_effort_provider_refs = Some(selection.allowed_provider_refs);
             }
+        }
+        let allowed = match active_effort_provider_refs.take() {
+            Some(own) => Some(narrow_provider_allowlist(
+                own,
+                inherited_provider_allowlist.as_ref(),
+            )),
+            None => inherited_provider_allowlist.clone(),
+        };
+        if let Some(allowed) = allowed {
+            anyhow::ensure!(
+                allowed.contains(&provider_name),
+                "model provider `{provider_name}` is outside the enclosing turn's provider allowlist"
+            );
+            effort_provider_config = Some(effort_scoped_provider_config(&config, &allowed));
+            active_effort_provider_refs = Some(allowed);
         }
         let mut context_limits =
             config.resolved_context_limits_for_route(agent_alias, &provider_name, &model_name);
@@ -2867,21 +2929,20 @@ async fn run_inner(
                 });
 
                 if automatic_model_routing
-                    && let Some(selection) = effort_turn_route(
-                        &config,
-                        agent.resolved.effort_routing.as_ref(),
-                        &effective_input,
-                    )?
+                    && let Some(selection) =
+                        effort_turn_route(&config, effort_policy.as_ref(), &effective_input)?
                 {
+                    let allowed_provider_refs = narrow_provider_allowlist(
+                        selection.allowed_provider_refs,
+                        inherited_provider_allowlist.as_ref(),
+                    );
                     if provider_name != selection.model_provider
                         || model_name != selection.model
                         || active_effort_provider_refs.as_deref()
-                            != Some(selection.allowed_provider_refs.as_ref())
+                            != Some(allowed_provider_refs.as_ref())
                     {
-                        let scoped_config = effort_scoped_provider_config(
-                            &config,
-                            selection.allowed_provider_refs.as_ref(),
-                        );
+                        let scoped_config =
+                            effort_scoped_provider_config(&config, allowed_provider_refs.as_ref());
                         model_provider =
                             capabilities.model_provider(&crate::composition::ProviderRequest {
                                 config: &scoped_config,
@@ -2899,7 +2960,7 @@ async fn run_inner(
                         );
                         turn_guard.set_model_route(provider_name.clone(), model_name.clone());
                     }
-                    active_effort_provider_refs = Some(selection.allowed_provider_refs);
+                    active_effort_provider_refs = Some(allowed_provider_refs);
                 }
 
                 // Compute per-turn excluded MCP tools from tool_filter_groups
@@ -4670,6 +4731,7 @@ mod tests {
     zeroclaw_api::mock_tool_attribution!(
         ActivatingTool,
         CountingTool,
+        ScopeProbe,
         CredentialOutputTool,
         EmptySuccessTool,
         RecordingArgsTool,
@@ -9038,6 +9100,17 @@ mod tests {
                     reasoning_content: None,
                 },
                 ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "step-probe".to_string(),
+                        name: "scope_probe".to_string(),
+                        arguments: "{}".to_string(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                ChatResponse {
                     text: Some("step recovered".to_string()),
                     tool_calls: Vec::new(),
                     usage: None,
@@ -9087,9 +9160,13 @@ mod tests {
                     body: "Use only allowed tools".to_string(),
                     scope: Some(crate::sop::StepToolScope {
                         allow: Some(if allow_search {
-                            vec!["allowed_tool".to_string(), "tool_search".to_string()]
+                            vec![
+                                "allowed_tool".to_string(),
+                                "tool_search".to_string(),
+                                "scope_probe".to_string(),
+                            ]
                         } else {
-                            vec!["allowed_tool".to_string()]
+                            vec!["allowed_tool".to_string(), "scope_probe".to_string()]
                         }),
                         deny: Vec::new(),
                     }),
@@ -9113,6 +9190,7 @@ mod tests {
 
             let allowed_invocations = Arc::new(AtomicUsize::new(0));
             let denied_invocations = Arc::new(AtomicUsize::new(0));
+            let seen_scope = Arc::new(std::sync::Mutex::new(None));
             let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
                 Box::new(crate::tools::SopExecuteTool::new(Arc::clone(&engine))),
                 mock_tool("tool_search"),
@@ -9124,6 +9202,9 @@ mod tests {
                     "denied_tool",
                     Arc::clone(&denied_invocations),
                 )),
+                Box::new(ScopeProbe {
+                    seen: Arc::clone(&seen_scope),
+                }),
             ]);
             let activated = Arc::new(Mutex::new(crate::tools::ActivatedToolSet::new()));
             activated.lock().unwrap().set_deferred_builtin_specs(
@@ -9272,6 +9353,20 @@ mod tests {
                 "denied tool call must be rejected before execution: {history:?}"
             );
 
+            // Child-run tools must see the same step boundary on live and
+            // headless paths, including the restriction on model selection.
+            let seen = seen_scope
+                .lock()
+                .unwrap()
+                .take()
+                .expect("a tool inside a live step must see the step scope");
+            let excluded = seen.excluded(&["denied_tool".to_string(), "model_switch".to_string()]);
+            assert!(
+                excluded.iter().any(|t| t == "denied_tool")
+                    && excluded.iter().any(|t| t == "model_switch"),
+                "the visible scope must carry the step's exclusions, got {excluded:?}"
+            );
+
             let started = sop_started_run_id_from_history(&history)
                 .expect("sop_execute tool result should include a run id");
             let engine = engine.lock().unwrap();
@@ -9282,7 +9377,7 @@ mod tests {
             assert_eq!(run.step_results.len(), 1);
             assert_eq!(run.step_results[0].output, "step recovered");
             let requests = requests.lock().unwrap();
-            assert_eq!(requests.len(), 4);
+            assert_eq!(requests.len(), 5);
             let prompt = |index: usize| {
                 requests[index]
                     .iter()
@@ -9294,7 +9389,7 @@ mod tests {
             if cap == 0 || cap == 10_000 {
                 assert!(prompt(0).contains("<available-deferred-builtin-tools>"));
             }
-            for index in [1, 2] {
+            for index in [1, 2, 3] {
                 if cap > 0 {
                     assert!(prompt(index).chars().count() <= cap);
                     assert!(
@@ -9332,11 +9427,44 @@ mod tests {
             }
             assert_eq!(
                 prompt(0),
-                prompt(3),
+                prompt(4),
                 "step fallback must not mutate the parent prompt"
             );
-            assert_eq!(history[0].content, prompt(3));
+            assert_eq!(history[0].content, prompt(4));
             assert_eq!(activated.lock().unwrap().hidden_builtin_names().len(), 2);
+        }
+    }
+
+    /// Records the SOP step scope in force on the task when called.
+    struct ScopeProbe {
+        seen: Arc<std::sync::Mutex<Option<crate::sop::active_scope::HeadlessStepScope>>>,
+    }
+
+    #[async_trait]
+    impl Tool for ScopeProbe {
+        fn name(&self) -> &str {
+            "scope_probe"
+        }
+
+        fn description(&self) -> &str {
+            "Records the active step scope"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            *self.seen.lock().expect("probe lock") =
+                crate::sop::active_scope::active_headless_step_scope();
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "probed".into(),
+                error: None,
+            })
         }
     }
 
