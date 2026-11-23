@@ -5534,12 +5534,6 @@ impl Config {
                 .get(alias)
                 .map(ActiveStorage::Markdown)
                 .unwrap_or(ActiveStorage::None),
-            "lucid" => self
-                .storage
-                .lucid
-                .get(alias)
-                .map(ActiveStorage::Lucid)
-                .unwrap_or(ActiveStorage::None),
             _ => ActiveStorage::None,
         }
     }
@@ -5561,8 +5555,6 @@ pub enum ActiveStorage<'a> {
     Qdrant(&'a QdrantStorageConfig),
     /// Markdown directory storage instance.
     Markdown(&'a MarkdownStorageConfig),
-    /// Lucid CLI sync instance.
-    Lucid(&'a LucidStorageConfig),
 }
 
 impl ActiveStorage<'_> {
@@ -5575,7 +5567,6 @@ impl ActiveStorage<'_> {
             ActiveStorage::Postgres(_) => "postgres",
             ActiveStorage::Qdrant(_) => "qdrant",
             ActiveStorage::Markdown(_) => "markdown",
-            ActiveStorage::Lucid(_) => "lucid",
         }
     }
 }
@@ -12923,10 +12914,6 @@ pub struct StorageConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub markdown: HashMap<String, MarkdownStorageConfig>,
-    /// Lucid CLI sync instances (`[storage.lucid.<alias>]`).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    #[nested]
-    pub lucid: HashMap<String, LucidStorageConfig>,
 }
 
 /// SQLite storage backend (`[storage.sqlite.<alias>]`).
@@ -13026,32 +13013,6 @@ pub struct MarkdownStorageConfig {
     /// Optional override for the markdown root directory.
     /// When unset, defaults to `<workspace_dir>/memory/`.
     pub directory: Option<String>,
-}
-
-/// Lucid CLI sync backend (`[storage.lucid.<alias>]`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "storage_lucid"]
-#[serde(default)]
-pub struct LucidStorageConfig {
-    /// Optional path to the lucid-memory binary. When unset, the bare `lucid`
-    /// executable is resolved on `PATH`. A blank or whitespace-only value is
-    /// rejected at config validation and remains invalid if startup continues,
-    /// so an invalid explicit selector never falls through to `PATH`.
-    pub binary_path: Option<String>,
-    /// Recall (context) timeout override, in milliseconds. Lucid CLI cold
-    /// starts (loading the local embedding model) can exceed 1.5s on ARM
-    /// hosts; raise this if recalls still time out on your hardware.
-    /// Unset falls back to the built-in default (3000ms). `0` is rejected
-    /// at config validation; because startup warns and continues after
-    /// validation errors, a `0` that reaches the runtime is treated as
-    /// unset and falls back to the default.
-    pub recall_timeout_ms: Option<u64>,
-    /// Store timeout override, in milliseconds. Same cold-start
-    /// consideration as `recall_timeout_ms`. Unset falls back to the
-    /// built-in default (3000ms); `0` is rejected at validation and, if
-    /// startup continues after the warning, is likewise treated as unset.
-    pub store_timeout_ms: Option<u64>,
 }
 
 fn default_storage_schema() -> String {
@@ -25070,35 +25031,19 @@ impl Config {
             }
         }
 
-        let mut lucid_aliases: Vec<&String> = self.storage.lucid.keys().collect();
-        lucid_aliases.sort();
-        for alias in lucid_aliases {
-            let lucid = &self.storage.lucid[alias];
-            if lucid
-                .binary_path
-                .as_ref()
-                .is_some_and(|path| path.trim().is_empty())
-            {
-                validation_bail!(
-                    RequiredFieldEmpty,
-                    format!("storage.lucid.{alias}.binary_path"),
-                    "storage.lucid.{alias}.binary_path must not be empty"
-                );
-            }
-            if matches!(lucid.recall_timeout_ms, Some(0)) {
-                validation_bail!(
-                    InvalidNumericRange,
-                    format!("storage.lucid.{alias}.recall_timeout_ms"),
-                    "storage.lucid.{alias}.recall_timeout_ms must be greater than 0"
-                );
-            }
-            if matches!(lucid.store_timeout_ms, Some(0)) {
-                validation_bail!(
-                    InvalidNumericRange,
-                    format!("storage.lucid.{alias}.store_timeout_ms"),
-                    "storage.lucid.{alias}.store_timeout_ms must be greater than 0"
-                );
-            }
+        // Load replaces a removed backend in the file (`RETIRED_VALUES`), so
+        // one seen here arrived afterwards, from an environment override or a
+        // config edit. The memory factory would refuse it at startup; refuse
+        // it before it is saved or applied.
+        if crate::migration::is_retired_memory_backend(&self.memory.backend) {
+            validation_bail!(
+                InvalidEnumVariant,
+                "memory.backend",
+                "memory.backend = {:?} selects the Lucid memory backend, which was removed; set \
+                 memory.backend = \"sqlite\": the SQLite store Lucid wrote to already holds its \
+                 memories",
+                self.memory.backend
+            );
         }
 
         // Reply-pacing bounds — both `reply_min_interval_secs` and
@@ -27281,8 +27226,12 @@ impl Config {
             // config loaded would leave without the notice it is owed.
             let mut retired = crate::migration::apply_retired_keys_to_doc(doc.as_table_mut());
             // Values above a `CAPPED_KEYS` maximum are lowered the same way,
-            // with the notice the load path gives.
+            // with the notice the load path gives, and values that select
+            // something retired (`RETIRED_VALUES`) are replaced.
             retired.extend(crate::migration::lower_capped_keys_in_doc(
+                doc.as_table_mut(),
+            ));
+            retired.extend(crate::migration::replace_retired_values_in_doc(
                 doc.as_table_mut(),
             ));
             // Then sync onto the spelling the snapshot is written in, keeping
@@ -27407,8 +27356,13 @@ impl Config {
         let mut retired = crate::migration::apply_retired_keys_to_doc(doc.as_table_mut());
         // A value above a `CAPPED_KEYS` maximum is lowered for the same
         // reason: the load path lowers it, so it is never dirty, and it would
-        // otherwise stay in the file through every incremental save.
+        // otherwise stay in the file through every incremental save. A value
+        // that selects something retired (`RETIRED_VALUES`) is replaced for
+        // that reason too.
         retired.extend(crate::migration::lower_capped_keys_in_doc(
+            doc.as_table_mut(),
+        ));
+        retired.extend(crate::migration::replace_retired_values_in_doc(
             doc.as_table_mut(),
         ));
         // A setting the file spells another way the schema accepts
@@ -27567,14 +27521,16 @@ fn log_migration_saved(notices: &[crate::migration::MigrationNotice]) {
     }
 }
 
-/// Log each retired key a save removed from `config.toml`, and each capped
-/// value it lowered. Called only once the file is durably replaced: a failed
-/// write leaves them on disk and must not claim otherwise.
+/// Log each retired key a save removed from `config.toml`, each capped value
+/// it lowered, and each retired value it replaced. Called only once the file
+/// is durably replaced: a failed write leaves them on disk and must not claim
+/// otherwise.
 fn log_retirements_saved(retired: &[crate::migration::MigrationNotice]) {
     for notice in retired {
         let path = match notice {
             crate::migration::MigrationNotice::Removed { path, .. }
-            | crate::migration::MigrationNotice::Lowered { path, .. } => path.as_str(),
+            | crate::migration::MigrationNotice::Lowered { path, .. }
+            | crate::migration::MigrationNotice::Replaced { path, .. } => path.as_str(),
             crate::migration::MigrationNotice::AssumedV1
             | crate::migration::MigrationNotice::InferredV3
             | crate::migration::MigrationNotice::IgnoredEnvOverride { .. } => continue,
@@ -35060,7 +35016,6 @@ auto_save = true
         assert!(storage.postgres.is_empty());
         assert!(storage.qdrant.is_empty());
         assert!(storage.markdown.is_empty());
-        assert!(storage.lucid.is_empty());
     }
 
     #[test]
@@ -35944,68 +35899,55 @@ connect_timeout_secs = 12
         assert_eq!(pg.connect_timeout_secs, Some(12));
     }
 
+    /// Load replaces a Lucid backend, so one that reaches validation was set
+    /// afterwards (an environment override, a config edit). It is refused at
+    /// `memory.backend`, naming `sqlite`, in every spelling of the kind; the
+    /// live backends still validate.
     #[test]
-    async fn storage_lucid_timeout_overrides_deserialize() {
-        let raw = r#"
-default_temperature = 0.7
-
-[storage.lucid.default]
-binary_path = "/opt/lucid/bin/lucid"
-recall_timeout_ms = 5000
-store_timeout_ms = 4000
-"#;
-
-        let parsed = parse_test_config(raw);
-        let lucid = parsed
-            .storage
-            .lucid
-            .get("default")
-            .expect("lucid.default present");
-        assert_eq!(lucid.binary_path.as_deref(), Some("/opt/lucid/bin/lucid"));
-        assert_eq!(lucid.recall_timeout_ms, Some(5000));
-        assert_eq!(lucid.store_timeout_ms, Some(4000));
-    }
-
-    #[test]
-    async fn validate_rejects_zero_lucid_timeouts_with_alias_qualified_paths() {
-        for field in ["recall_timeout_ms", "store_timeout_ms"] {
-            let raw = format!(
-                r#"
-default_temperature = 0.7
-
-[storage.lucid.edge_arm]
-{field} = 0
-"#
-            );
-            let parsed = parse_test_config(&raw);
-            let error = parsed
+    async fn validate_rejects_a_lucid_backend_set_after_load() {
+        for retired in ["lucid", "Lucid.x", " LUCID ", "lucid.selected"] {
+            let mut config = Config::default();
+            config.memory.backend = retired.to_string();
+            let error = config
                 .validate()
-                .expect_err("zero Lucid timeout must fail validation");
-            let expected_path = format!("storage.lucid.edge_arm.{field}");
-            assert!(
-                error.to_string().contains(&expected_path),
-                "validation error must name {expected_path}: {error:#}"
+                .expect_err("a removed memory backend must fail validation");
+            let structured = error
+                .downcast_ref::<crate::api_error::ConfigApiError>()
+                .unwrap_or_else(|| panic!("{retired:?}: not a structured error: {error:#}"));
+            assert_eq!(
+                structured.path.as_deref(),
+                Some("memory.backend"),
+                "{retired:?}"
             );
+            assert_eq!(
+                structured.code,
+                crate::api_error::ConfigApiCode::InvalidEnumVariant,
+                "{retired:?}"
+            );
+            assert!(
+                structured.message.contains("removed") && structured.message.contains("sqlite"),
+                "{retired:?}: {}",
+                structured.message
+            );
+        }
+        for live in ["sqlite", "sqlite.default", "markdown", "none"] {
+            let mut config = Config::default();
+            config.memory.backend = live.to_string();
+            config
+                .validate()
+                .unwrap_or_else(|err| panic!("{live:?} must validate: {err:#}"));
         }
     }
 
+    /// `[storage.lucid.<alias>]` is no longer a schema section: dashboards
+    /// and pickers that walk the schema stop offering it.
     #[test]
-    async fn validate_rejects_blank_lucid_binary_with_alias_qualified_path() {
-        let raw = r#"
-default_temperature = 0.7
-
-[storage.lucid.edge_arm]
-binary_path = "   "
-"#;
-        let parsed = parse_test_config(raw);
-        let error = parsed
-            .validate()
-            .expect_err("blank Lucid binary path must fail validation");
+    async fn lucid_is_no_longer_a_storage_section() {
         assert!(
-            error
-                .to_string()
-                .contains("storage.lucid.edge_arm.binary_path"),
-            "validation error must name the alias-qualified binary path: {error:#}"
+            !Config::map_key_sections()
+                .iter()
+                .any(|section| section.path.starts_with("storage.lucid")),
+            "storage.lucid must not be a keyed section"
         );
     }
 
@@ -47722,6 +47664,63 @@ channel = "notion"
                 reloaded.notices
             );
             assert_eq!(reloaded.config.gateway.pairing_dashboard.lockout_secs, 120);
+        }
+    }
+
+    /// Both saves carry the retired Lucid backend out of the file: the values
+    /// that selected it say `sqlite`, the Lucid table is gone, and a reload
+    /// has nothing left to change. The incremental save edits in place, so
+    /// the replaced values keep their comments and an unrelated commented
+    /// key keeps its bytes.
+    #[test]
+    async fn saves_replace_a_lucid_backend_in_the_file() {
+        let raw = format!(
+            "schema_version = {}\n\
+             locale = \"en\" # operator locale\n\n\
+             [memory]\nbackend = \"lucid\" # chosen at quickstart\n\n\
+             [storage.lucid.default]\nbinary_path = \"/opt/lucid/bin/lucid\"\n\n\
+             [agents.alpha.memory]\nbackend = \"lucid\" # alpha's store\n\n\
+             [observability]\nbackend = \"none\"\n\n\
+             [tools]\noptional = [\"*\"]\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        for full in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            std::fs::write(&config_path, &raw).unwrap();
+            let mut config = crate::migration::migrate_to_current_salvaged(&raw).config;
+            config.config_path = config_path.clone();
+            config.loaded_from = Some(config_path.clone());
+            config.observability.backend = ObservabilityBackend::Otel;
+            config.mark_dirty("observability.backend");
+            if full {
+                config.save().await.unwrap();
+            } else {
+                config.save_dirty().await.unwrap();
+            }
+            let written = std::fs::read_to_string(&config_path).unwrap();
+            assert!(!written.contains("lucid"), "full={full}:\n{written}");
+            assert!(
+                written.contains("backend = \"otel\""),
+                "full={full}:\n{written}"
+            );
+            if !full {
+                for kept in [
+                    "locale = \"en\" # operator locale\n",
+                    "[memory]\nbackend = \"sqlite\" # chosen at quickstart\n",
+                    "[agents.alpha.memory]\nbackend = \"sqlite\" # alpha's store\n",
+                ] {
+                    assert!(written.contains(kept), "`{kept}` must survive:\n{written}");
+                }
+            }
+            let reloaded = crate::migration::migrate_to_current_salvaged(&written);
+            assert!(
+                reloaded.notices.is_empty(),
+                "full={full}: {:?}",
+                reloaded.notices
+            );
+            assert!(reloaded.dropped.is_empty(), "full={full}");
+            assert_eq!(reloaded.config.memory.backend, "sqlite", "full={full}");
         }
     }
 

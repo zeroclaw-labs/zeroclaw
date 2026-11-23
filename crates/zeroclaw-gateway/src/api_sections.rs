@@ -614,7 +614,6 @@ fn storage_rank(key: &str) -> usize {
         "postgres" => 1,
         "qdrant" => 2,
         "markdown" => 3,
-        "lucid" => 4,
         _ => 99,
     }
 }
@@ -632,9 +631,6 @@ fn storage_description(key: &str) -> Option<&'static str> {
         }
         "markdown" => {
             Some("Human-readable files with simple local storage and no database service.")
-        }
-        "lucid" => {
-            Some("Bridge to local lucid-memory CLI while keeping SQLite-style local operation.")
         }
         _ => None,
     }
@@ -2523,12 +2519,16 @@ mod tests {
         let cfg = empty_cfg();
         let items = storage_picker(&cfg);
         let keys: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
-        for expected in ["sqlite", "postgres", "qdrant", "markdown", "lucid"] {
+        for expected in ["sqlite", "postgres", "qdrant", "markdown"] {
             assert!(
                 keys.contains(&expected),
                 "storage picker must list `{expected}`, got: {keys:?}",
             );
         }
+        assert!(
+            !keys.contains(&"lucid"),
+            "the removed Lucid backend must not be offered, got: {keys:?}",
+        );
         // Fresh config — no kind should be badged.
         assert!(
             items.iter().all(|i| i.badge.is_none()),
