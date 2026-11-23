@@ -29,6 +29,10 @@ pub enum WebDavError {
     StagingSizeMismatch,
     #[error("remote_files_webdav_invalid_properties")]
     InvalidProperties,
+    #[error("remote_files_webdav_source_version_required")]
+    SourceVersionRequired,
+    #[error("remote_files_webdav_source_not_file")]
+    SourceNotFile,
     #[error("remote_files_webdav_destination_io")]
     DestinationIo(#[source] io::Error),
 }
@@ -61,6 +65,14 @@ pub enum CopyOutcome {
     PublicationDenied { staged_bytes: u64 },
     PublicationRejected { staged_bytes: u64 },
     PublicationUnconfirmed { staged_bytes: u64 },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum MoveOutcome {
+    NotPublished(CopyOutcome),
+    Moved { bytes: u64 },
+    CopiedSourceRetained { bytes: u64 },
+    CopiedSourceRemovalUnconfirmed { bytes: u64 },
 }
 
 impl WebDavRead {
@@ -199,23 +211,31 @@ impl WebDavRead {
 
     /// Relay a file between two separately authorized endpoints. The staging
     /// pathname belongs to the executor; publication remains a separate step.
-    pub async fn stage_from(
+    async fn stage_from(
         &self,
-        source: &Self,
-        source_path: &str,
-        source_authorization: Option<HeaderValue>,
-        staging_path: &str,
-        destination_authorization: Option<HeaderValue>,
-        limit: Option<u64>,
-    ) -> Result<u64, WebDavError> {
+        relay: &WebDavRelay<'_>,
+        require_version: bool,
+    ) -> Result<(u64, Option<HeaderValue>), WebDavError> {
         use futures_util::TryStreamExt;
 
-        // Validate both paths before initiating the source request.
-        resource_url(&self.root, staging_path)?;
-        let response = source
-            .request(Method::GET, source_path, source_authorization)
+        resource_url(&self.root, relay.staging_path)?;
+        let response = relay
+            .source
+            .request(
+                Method::GET,
+                relay.source_path,
+                relay.source_authorization.clone(),
+            )
             .await?;
         let size = response.content_length();
+        let version = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .filter(|tag| is_strong_etag(tag))
+            .cloned();
+        if require_version && version.is_none() {
+            return Err(WebDavError::SourceVersionRequired);
+        }
         let reader = tokio_util::io::StreamReader::new(
             response
                 .bytes_stream()
@@ -223,21 +243,21 @@ impl WebDavRead {
         );
         let written = self
             .upload_new_staging_file(
-                staging_path,
-                destination_authorization.clone(),
+                relay.staging_path,
+                relay.destination_authorization.clone(),
                 reader,
                 size,
-                limit,
+                relay.limit,
             )
             .await?;
         if self
-            .file_size(staging_path, destination_authorization)
+            .file_size(relay.staging_path, relay.destination_authorization.clone())
             .await?
             != Some(written)
         {
             return Err(WebDavError::StagingSizeMismatch);
         }
-        Ok(written)
+        Ok((written, version))
     }
 
     /// Keep staging and publication distinct so the caller can revalidate
@@ -247,38 +267,93 @@ impl WebDavRead {
         relay: WebDavRelay<'_>,
         authorize_publication: impl AsyncFnOnce() -> PublicationAuthorization,
     ) -> Result<CopyOutcome, WebDavError> {
-        // Preflight the final target before making a request to either server.
-        checked_rename_paths(&self.root, relay.staging_path, relay.destination_path)?;
-        let bytes = self
-            .stage_from(
-                relay.source,
-                relay.source_path,
-                relay.source_authorization,
-                relay.staging_path,
-                relay.destination_authorization,
-                relay.limit,
-            )
-            .await?;
-        let PublicationAuthorization::Granted(header) = authorize_publication().await else {
-            return Ok(CopyOutcome::PublicationDenied {
-                staged_bytes: bytes,
-            });
-        };
+        self.copy_with_source_version(&relay, false, authorize_publication)
+            .await
+            .map(|(outcome, _)| outcome)
+    }
 
-        Ok(
-            match self
-                .publish_staging(relay.staging_path, relay.destination_path, header)
-                .await
-            {
-                PublishResult::Confirmed => CopyOutcome::Published { bytes },
-                PublishResult::Rejected => CopyOutcome::PublicationRejected {
+    async fn copy_with_source_version(
+        &self,
+        relay: &WebDavRelay<'_>,
+        require_version: bool,
+        authorize_publication: impl AsyncFnOnce() -> PublicationAuthorization,
+    ) -> Result<(CopyOutcome, Option<HeaderValue>), WebDavError> {
+        checked_rename_paths(&self.root, relay.staging_path, relay.destination_path)?;
+        let (bytes, version) = self.stage_from(relay, require_version).await?;
+        let PublicationAuthorization::Granted(header) = authorize_publication().await else {
+            return Ok((
+                CopyOutcome::PublicationDenied {
                     staged_bytes: bytes,
                 },
-                PublishResult::Unknown => CopyOutcome::PublicationUnconfirmed {
-                    staged_bytes: bytes,
-                },
+                version,
+            ));
+        };
+        let result = self
+            .publish_staging(relay.staging_path, relay.destination_path, header)
+            .await;
+        let outcome = match result {
+            PublishResult::Confirmed => CopyOutcome::Published { bytes },
+            PublishResult::Rejected => CopyOutcome::PublicationRejected {
+                staged_bytes: bytes,
             },
-        )
+            PublishResult::Unknown => CopyOutcome::PublicationUnconfirmed {
+                staged_bytes: bytes,
+            },
+        };
+        Ok((outcome, version))
+    }
+
+    /// Move one file between authorized endpoints. A destination publication
+    /// that was not confirmed never reaches the source-removal callback.
+    pub async fn move_file_from(
+        &self,
+        relay: WebDavRelay<'_>,
+        authorize_publication: impl AsyncFnOnce() -> PublicationAuthorization,
+        authorize_removal: impl AsyncFnOnce() -> PublicationAuthorization,
+    ) -> Result<MoveOutcome, WebDavError> {
+        let (copy, version) = self
+            .copy_with_source_version(&relay, true, authorize_publication)
+            .await?;
+        let CopyOutcome::Published { bytes } = copy else {
+            return Ok(MoveOutcome::NotPublished(copy));
+        };
+        let PublicationAuthorization::Granted(header) = authorize_removal().await else {
+            return Ok(MoveOutcome::CopiedSourceRetained { bytes });
+        };
+        let Some(version) = version else {
+            return Ok(MoveOutcome::CopiedSourceRetained { bytes });
+        };
+        let result = relay
+            .source
+            .remove_versioned_file(relay.source_path, version, header)
+            .await;
+        Ok(match result {
+            Ok(()) => MoveOutcome::Moved { bytes },
+            Err(WebDavError::Status(StatusCode::PRECONDITION_FAILED))
+            | Err(WebDavError::SourceNotFile) => MoveOutcome::CopiedSourceRetained { bytes },
+            Err(_) => MoveOutcome::CopiedSourceRemovalUnconfirmed { bytes },
+        })
+    }
+
+    async fn remove_versioned_file(
+        &self,
+        path: &str,
+        version: HeaderValue,
+        authorization: Option<HeaderValue>,
+    ) -> Result<(), WebDavError> {
+        if self.resource_kind(path, authorization.clone()).await? != WebDavResourceKind::File {
+            return Err(WebDavError::SourceNotFile);
+        }
+        let request = self
+            .client
+            .delete(resource_url(&self.root, path)?)
+            .timeout(Duration::from_secs(30))
+            .header(reqwest::header::IF_MATCH, version);
+        let response = with_authorization(request, authorization)
+            .send()
+            .await
+            .map_err(|_| WebDavError::Transport)?;
+        require_status(response, StatusCode::NO_CONTENT).map(|_| ())
     }
 
     /// Create exactly one directory. Parent creation and authorization are
@@ -582,6 +657,16 @@ fn with_authorization(
         }
         None => request,
     }
+}
+
+fn is_strong_etag(tag: &HeaderValue) -> bool {
+    let bytes = tag.as_bytes();
+    bytes.len() >= 2
+        && bytes[0] == b'"'
+        && bytes[bytes.len() - 1] == b'"'
+        && bytes[1..bytes.len() - 1]
+            .iter()
+            .all(|byte| *byte == 0x21 || (0x23..=0x7e).contains(byte) || *byte >= 0x80)
 }
 
 fn require_status(response: Response, expected: StatusCode) -> Result<Response, WebDavError> {
@@ -916,11 +1001,17 @@ mod tests {
     #[tokio::test]
     async fn relay_isolates_credentials_and_rechecks_publication() {
         for allow in [true, false] {
-            exercise_relay(allow).await;
+            exercise_relay(allow, None).await;
         }
     }
 
-    async fn exercise_relay(allow: bool) {
+    #[tokio::test]
+    async fn move_requires_publication_and_preserves_a_changed_source() {
+        exercise_relay(true, Some(true)).await;
+        exercise_relay(true, Some(false)).await;
+    }
+
+    async fn exercise_relay(allow: bool, removal_accepts: Option<bool>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -949,7 +1040,7 @@ mod tests {
                     "GET",
                     "report.txt",
                     "source-fixture",
-                    "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndemo",
+                    "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nETag: \"source-v1\"\r\nConnection: close\r\n\r\ndemo",
                 ),
                 (
                     &destination,
@@ -974,6 +1065,14 @@ mod tests {
                     "refreshed-fixture",
                     "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 ));
+            }
+            if let Some(accepts) = removal_accepts {
+                responses.push((&source, "PROPFIND", "report.txt", "removal-fixture", "HTTP/1.1 207 Multi-Status\r\nContent-Length: 198\r\nConnection: close\r\n\r\n<d:multistatus xmlns:d=\"DAV:\"><d:response><d:href>/dav/report.txt</d:href><d:propstat><d:prop><d:resourcetype/></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"));
+                responses.push((&source, "DELETE", "report.txt", "removal-fixture", if accepts {
+                    "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                }));
             }
             for (listener, method, path, identity, response) in responses {
                 let (tcp, _) = listener.accept().await.unwrap();
@@ -1000,6 +1099,21 @@ mod tests {
                     )));
                     assert!(request.contains("\r\noverwrite: f\r\n"));
                 }
+                if method == "PROPFIND" {
+                    assert!(request.contains("\r\ndepth: 0\r\n"));
+                    let length: usize = request
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    let mut body = vec![0; length];
+                    tls.read_exact(&mut body).await.unwrap();
+                    assert!(String::from_utf8(body).unwrap().contains("resourcetype"));
+                }
+                if method == "DELETE" {
+                    assert!(request.contains("\r\nif-match: \"source-v1\"\r\n"));
+                }
                 tls.write_all(response.as_bytes()).await.unwrap();
                 tls.shutdown().await.unwrap();
             }
@@ -1017,41 +1131,54 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), async {
             let source = adapter(source_addr);
             let destination = adapter(destination_addr);
-            let outcome = destination
-                .copy_from(
-                    WebDavRelay {
-                        source: &source,
-                        source_path: "report.txt",
-                        source_authorization: Some(HeaderValue::from_static(
-                            "Bearer source-fixture",
-                        )),
-                        staging_path: "staging.tmp",
-                        destination_path: "report.txt",
-                        destination_authorization: Some(HeaderValue::from_static(
-                            "Bearer destination-fixture",
-                        )),
-                        limit: None,
-                    },
-                    async || {
-                        if allow {
-                            PublicationAuthorization::Granted(Some(HeaderValue::from_static(
-                                "Bearer refreshed-fixture",
-                            )))
-                        } else {
-                            PublicationAuthorization::Denied
-                        }
-                    },
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                outcome,
+            let relay = WebDavRelay {
+                source: &source,
+                source_path: "report.txt",
+                source_authorization: Some(HeaderValue::from_static("Bearer source-fixture")),
+                staging_path: "staging.tmp",
+                destination_path: "report.txt",
+                destination_authorization: Some(HeaderValue::from_static(
+                    "Bearer destination-fixture",
+                )),
+                limit: None,
+            };
+            let publication = async || {
                 if allow {
-                    CopyOutcome::Published { bytes: 4 }
+                    PublicationAuthorization::Granted(Some(HeaderValue::from_static(
+                        "Bearer refreshed-fixture",
+                    )))
                 } else {
-                    CopyOutcome::PublicationDenied { staged_bytes: 4 }
+                    PublicationAuthorization::Denied
                 }
-            );
+            };
+            if let Some(accepts) = removal_accepts {
+                let outcome = destination
+                    .move_file_from(relay, publication, async || {
+                        PublicationAuthorization::Granted(Some(HeaderValue::from_static(
+                            "Bearer removal-fixture",
+                        )))
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    outcome,
+                    if accepts {
+                        MoveOutcome::Moved { bytes: 4 }
+                    } else {
+                        MoveOutcome::CopiedSourceRetained { bytes: 4 }
+                    }
+                );
+            } else {
+                let outcome = destination.copy_from(relay, publication).await.unwrap();
+                assert_eq!(
+                    outcome,
+                    if allow {
+                        CopyOutcome::Published { bytes: 4 }
+                    } else {
+                        CopyOutcome::PublicationDenied { staged_bytes: 4 }
+                    }
+                );
+            }
             server.await.unwrap();
         })
         .await
@@ -1080,6 +1207,14 @@ mod tests {
         assert!(stream.next().await.unwrap().is_err());
         assert!(progress.limit_reached.load(Ordering::Acquire));
         assert!(!progress.finished.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn deletion_requires_one_strong_etag() {
+        assert!(is_strong_etag(&HeaderValue::from_static(r#""source-v1""#)));
+        for value in ["*", "abc", r#"W/"weak""#, r#""a", "b""#] {
+            assert!(!is_strong_etag(&HeaderValue::from_str(value).unwrap()));
+        }
     }
 
     #[test]
