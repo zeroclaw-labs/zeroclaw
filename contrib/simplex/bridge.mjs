@@ -13,8 +13,10 @@ import {VoiceNotes} from './notes.mjs';
 import {simplexTextMessages} from './format.mjs';
 import {LiveTexts} from './live.mjs';
 
+const MAX_BOT_COMMANDS = 64;
+const MAX_QUOTED_REPLY_CHARS = 1000;
 const pending = new Map();
-let socket, call, invitation;
+let socket, socketUrl, socketOpening, menuRegistration, call, invitation;
 async function emit(value) {
   if (!process.stdout.write(JSON.stringify(value) + '\n')) await once(process.stdout, 'drain');
 }
@@ -44,6 +46,114 @@ function contactId(value) {
   if (!Number.isSafeInteger(value) || value <= 0) throw Error('simplex_invalid_contact');
   return String(value);
 }
+function truncateChars(value, limit) {
+  const chars = Array.from(value);
+  return chars.length <= limit ? value : chars.slice(0, limit - 1).join('') + '…';
+}
+function expectedBotCommands(values) {
+  if (!Array.isArray(values)) return [];
+  const commands = [], seen = new Set();
+  for (const value of values.slice(0, MAX_BOT_COMMANDS * 4)) {
+    if (commands.length >= MAX_BOT_COMMANDS || value === null || typeof value !== 'object') continue;
+    const keyword = typeof value.keyword === 'string'
+      ? value.keyword.trim().replace(/^\/+/, '') : '';
+    if (!/^[a-zA-Z0-9_-]{1,64}$/.test(keyword) || seen.has(keyword)) continue;
+    const rawLabel = typeof value.label === 'string' ? value.label.trim() : '';
+    if (!rawLabel || /[\u0000-\u001f\u007f']/.test(rawLabel)) continue;
+    seen.add(keyword);
+    commands.push({type: 'command', keyword, label: rawLabel});
+  }
+  return commands;
+}
+function profileMatches(profile, expected) {
+  const actualCommands = profile?.preferences?.commands;
+  return profile?.peerType === 'bot'
+    && Array.isArray(actualCommands)
+    && actualCommands.length === expected.length
+    && actualCommands.every((actual, index) => {
+      const wanted = expected[index];
+      return actual?.type === wanted.type
+        && actual?.keyword === wanted.keyword
+        && actual?.label === wanted.label
+        && (actual.params === undefined || actual.params === null);
+    });
+}
+async function registerBotMenu(values) {
+  const expected = expectedBotCommands(values);
+  if (!expected.length) return;
+  const current = await rpc('/p');
+  if (current?.type !== 'userProfile') throw Error('simplex_bot_menu_profile_unavailable');
+  if (profileMatches(current.profile, expected)) return;
+  const entries = expected.map(({label, keyword}) => `'${label}':${keyword}`);
+  await rpc(`/set bot commands ${entries.join(',')}`);
+  const confirmed = await rpc('/p');
+  if (confirmed?.type !== 'userProfile' || !profileMatches(confirmed.profile, expected)) {
+    throw Error('simplex_bot_menu_not_confirmed');
+  }
+}
+function registerMenuOnce(values) {
+  if (menuRegistration || !Array.isArray(values)) return;
+  // Profile command registration is best effort. A CLI rejection, timeout, or
+  // disconnect must not prevent message transport from starting.
+  menuRegistration = registerBotMenu(values).catch(() => {});
+}
+async function initialize(message) {
+  const url = new URL(message.websocket_url);
+  if (url.protocol !== 'ws:' || !['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname) || url.username || url.password) throw Error('simplex_local_api_required');
+  if (socketOpening) {
+    if (socketUrl !== url.href) throw Error('simplex_websocket_url_conflict');
+    await socketOpening;
+    return;
+  }
+  socketUrl = url.href;
+  socketOpening = (async () => {
+    socket = new WebSocket(url, {maxPayload: 8 * 1024 * 1024});
+    await once(socket, 'open');
+    let inbound = Promise.resolve(), queuedEvents = 0;
+    socket.on('message', data => {
+      let value;
+      try {value = JSON.parse(data);} catch {return fatal();}
+      const waiter = pending.get(value.corrId);
+      if (waiter) {
+        clearTimeout(waiter.timer); pending.delete(value.corrId);
+        if (['chatCmdError', 'chatError'].includes(value.resp?.type)) waiter.reject(Object.assign(Error('simplex_command_failed'), {notDelivered:true}));
+        else waiter.resolve(value.resp);
+      } else if (!value.corrId) {
+        if (queuedEvents >= 32) {fatal(); return;}
+        queuedEvents++;
+        inbound = inbound.then(() => event(value.resp ?? {})).finally(() => queuedEvents--).catch(fatal);
+      }
+    });
+    socket.on('close', fatal); socket.on('error', fatal);
+    setImmediate(() => notes.recover().then(() => live.discover(emit)).catch(fatal));
+  })();
+  try {
+    await socketOpening;
+  } catch (error) {
+    socketOpening = undefined;
+    socketUrl = undefined;
+    socket = undefined;
+    throw error;
+  }
+}
+function quotedText(content) {
+  return content && ['text', 'link'].includes(content.type) && typeof content.text === 'string'
+    ? content.text.replace(/\r\n?/g, '\n').trim() : '';
+}
+function replyContext(item, text) {
+  // A typed control must reach the runtime exactly as sent.
+  if (text.trimStart().startsWith('/')) return text;
+  const quoted = item.chatItem?.quotedItem;
+  const direction = quoted?.chatDir?.type;
+  const sender = direction === 'directRcv' ? 'user' : direction === 'directSnd' ? 'assistant' : '';
+  const original = quotedText(quoted?.content);
+  if (!sender || !original) return text;
+  const bounded = truncateChars(original, MAX_QUOTED_REPLY_CHARS);
+  const block = bounded.split('\n').map(line => `> ${line}`).join('\n');
+  // The quote always precedes the new text, so a slash inside quoted text
+  // cannot become the first token the runtime command parser sees.
+  return `> Quoted ${sender} message:\n${block}\n\n${text}`;
+}
 async function event(resp) {
   await notes.event(resp);
   switch (resp.type) {
@@ -56,7 +166,7 @@ async function event(resp) {
         if (body?.type !== 'rcvMsgContent' || !['text', 'link'].includes(body.msgContent?.type)
             || typeof body.msgContent.text !== 'string') continue;
         await emit({type: 'message', contact: contactId(item.chatInfo.contact.contactId),
-          id: String(item.chatItem.meta.itemId), text: body.msgContent.text});
+          id: String(item.chatItem.meta.itemId), text: replyContext(item, body.msgContent.text)});
       }
       break;
     case 'callInvitation': {
@@ -141,27 +251,8 @@ async function command(message) {
   let observation;
   try {
     if (type === 'init') {
-      const url = new URL(message.websocket_url);
-      if (url.protocol !== 'ws:' || !['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname) || url.username || url.password) throw Error('simplex_local_api_required');
-      socket = new WebSocket(url, {maxPayload: 8 * 1024 * 1024});
-      await once(socket, 'open');
-      let inbound = Promise.resolve(), queuedEvents = 0;
-      socket.on('message', data => {
-        let value;
-        try {value = JSON.parse(data);} catch {return fatal();}
-        const waiter = pending.get(value.corrId);
-        if (waiter) {
-          clearTimeout(waiter.timer); pending.delete(value.corrId);
-          if (['chatCmdError', 'chatError'].includes(value.resp?.type)) waiter.reject(Object.assign(Error('simplex_command_failed'), {notDelivered:true}));
-          else waiter.resolve(value.resp);
-        } else if (!value.corrId) {
-          if (queuedEvents >= 32) {fatal(); return;}
-          queuedEvents++;
-          inbound = inbound.then(() => event(value.resp ?? {})).finally(() => queuedEvents--).catch(fatal);
-        }
-      });
-      socket.on('close', fatal); socket.on('error', fatal);
-      setImmediate(() => notes.recover().then(() => live.discover(emit)).catch(fatal));
+      await initialize(message);
+      registerMenuOnce(message.bot_commands);
     } else if (type === 'ping') await rpc('/u');
     else if (type === 'receive_voice') await notes.receive(message);
     else if (type === 'send') {

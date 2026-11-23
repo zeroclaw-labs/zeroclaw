@@ -432,6 +432,13 @@ channel-telegram-cmd-stop-desc = Annuler la tâche en cours
 channel-telegram-cmd-model-desc = Afficher ou changer le modèle actuel
 channel-telegram-cmd-models-desc = Lister les fournisseurs de modèles disponibles ou changer de fournisseur
 channel-telegram-cmd-config-desc = Afficher la configuration actuelle
+channel-simplex-cmd-new-label = Nouvelle session
+channel-simplex-cmd-clear-label = Effacer la session
+channel-simplex-cmd-stop-label = Arrêter la tâche
+channel-simplex-cmd-thinking-label = Réflexion
+channel-simplex-cmd-model-label = Modèle
+channel-simplex-cmd-models-label = Fournisseurs
+channel-simplex-cmd-config-label = Configuration
 onboard-openai-auth-note =
     Authentification OpenAI :
     • Clé API — accès API standard via platform.openai.com (sk-...)

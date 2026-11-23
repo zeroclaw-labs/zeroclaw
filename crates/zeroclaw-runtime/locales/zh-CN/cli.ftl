@@ -428,6 +428,13 @@ channel-telegram-cmd-stop-desc = 取消当前进行中的任务
 channel-telegram-cmd-model-desc = 显示或切换当前模型
 channel-telegram-cmd-models-desc = 列出可用的模型提供商或切换提供商
 channel-telegram-cmd-config-desc = 显示当前配置
+channel-simplex-cmd-new-label = 新建会话
+channel-simplex-cmd-clear-label = 清除会话
+channel-simplex-cmd-stop-label = 停止任务
+channel-simplex-cmd-thinking-label = 思考
+channel-simplex-cmd-model-label = 模型
+channel-simplex-cmd-models-label = 模型提供商
+channel-simplex-cmd-config-label = 配置
 onboard-openai-auth-note =
     OpenAI 身份验证：
     • API 密钥 — 通过 platform.openai.com 的标准 API 访问（sk-...）

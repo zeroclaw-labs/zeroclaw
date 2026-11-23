@@ -1772,6 +1772,14 @@ turn-repeated-failure-retry-skipped = Skipped an additional identical call in th
 
 channel-simplex-not-configured-error = The SimpleX channel is not configured.
 
+channel-simplex-cmd-new-label = New session
+channel-simplex-cmd-clear-label = Clear session
+channel-simplex-cmd-stop-label = Stop task
+channel-simplex-cmd-thinking-label = Thinking
+channel-simplex-cmd-model-label = Model
+channel-simplex-cmd-models-label = Providers
+channel-simplex-cmd-config-label = Config
+
 channel-simplex-voice-note-failed = I couldn’t process that voice note. Please try again, or send your message as text.
 
 channel-simplex-voice-reply-failed = I couldn’t send the voice reply. The text response is available above.

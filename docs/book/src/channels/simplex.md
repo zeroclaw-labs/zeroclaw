@@ -51,6 +51,19 @@ from Android, and retrieve the resulting numeric contact ID with
 `/_contacts <userId>`. Keep the invitation private. Use the actual local contact
 ID in the configuration below; display names never authorize access.
 
+## Chat controls and quoted replies
+
+Use `/new` or bare `/clear` to reset the conversation context, and `/stop`
+to interrupt the current reply. `/model` shows the current selection; type
+`/model <hint>` to switch routes. `/models` lists providers, `/config` shows
+runtime settings, and `/thinking` controls reasoning effort. These are text
+commands; model selection uses the same scope and permission checks as other
+channels. Commands can also be typed if the bot menu has not refreshed.
+
+When you reply to a text message, the agent receives an excerpt of the quoted
+message with its direction, so it can tell what “this one” refers to. Quoted
+commands are context only; to run a command, send it as your own message.
+
 ## Configuration
 
 ```toml

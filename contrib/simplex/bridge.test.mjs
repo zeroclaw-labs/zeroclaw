@@ -29,6 +29,175 @@ test('bridge refuses non-loopback SimpleX API endpoints before opening a socket'
   }
 });
 
+test('bridge compares the bot profile before writing the seven-command public menu', async () => {
+  const server = new WebSocketServer({host: '127.0.0.1', port: 0});
+  await once(server, 'listening');
+  const child = spawn(process.execPath, [fileURLToPath(new URL('./bridge.mjs', import.meta.url))], {stdio: ['pipe', 'pipe', 'ignore']});
+  const lines = createInterface({input: child.stdout});
+  const frames = [], commands = [];
+  let profile = {peerType: 'bot', preferences: {voice: {allow: 'yes'}, commands: []}};
+  let connections = 0;
+  let second, secondLines;
+  lines.on('line', line => frames.push(JSON.parse(line)));
+  const send = value => child.stdin.write(JSON.stringify(value) + '\n');
+  async function wait(predicate, description) {
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      const result = predicate();
+      if (result) return result;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.fail(`${description}: ${JSON.stringify({frames, commands, profile})}`);
+  }
+  function connect(id, menu) {
+    send({type: 'init', id, websocket_url: `ws://127.0.0.1:${server.address().port}`, bot_commands: menu});
+  }
+  const menu = [
+    {type: 'command', keyword: 'new', label: 'New session'},
+    {type: 'command', keyword: 'clear', label: 'Clear session'},
+    {type: 'command', keyword: 'stop', label: 'Stop task'},
+    {type: 'command', keyword: 'thinking', label: 'Thinking'},
+    {type: 'command', keyword: 'model', label: 'Model'},
+    {type: 'command', keyword: 'models', label: 'Providers'},
+    {type: 'command', keyword: 'config', label: 'Config'},
+  ];
+  try {
+    const connected = once(server, 'connection');
+    connect('init', menu);
+    const [socket] = await connected;
+    connections++;
+    socket.on('message', data => {
+      const {corrId, cmd} = JSON.parse(data);
+      commands.push(cmd);
+      let resp;
+      if (cmd === '/p') {
+        resp = {type: 'userProfile', profile};
+      } else if (cmd === "/set bot commands 'New session':new,'Clear session':clear,'Stop task':stop,'Thinking':thinking,'Model':model,'Providers':models,'Config':config") {
+        profile = {peerType: 'bot', preferences: {voice: {allow: 'yes'}, commands: menu}};
+        resp = {type: 'userProfileUpdated'};
+      } else if (cmd === '/u') {
+        resp = {type: 'activeUser', user: {userId: 1}};
+      } else if (cmd.startsWith('/_get chats ')) {
+        resp = {type: 'apiChats', chats: []};
+      } else {
+        resp = {type: 'cmdOk'};
+      }
+      socket.send(JSON.stringify({corrId, resp}));
+    });
+
+    assert.equal((await wait(() => frames.find(frame => frame.type === 'result' && frame.id === 'init'),
+      'init did not settle')).ok, true);
+    await wait(() => commands.filter(command => command === '/set bot commands ' +
+      "'New session':new,'Clear session':clear,'Stop task':stop,'Thinking':thinking,'Model':model,'Providers':models,'Config':config").length === 1,
+    'public menu was not written once');
+    assert.equal(commands.filter(command => command === '/p').length, 2, 'profile must be read before and after the write');
+    assert.deepEqual(profile.preferences.commands, menu);
+    assert.equal(profile.preferences.voice.allow, 'yes', 'registration replaced unrelated profile preferences');
+
+    // A fresh bridge process sees the official profile, so it must not rewrite.
+    child.stdin.end();
+    child.kill('SIGTERM');
+    for (const client of server.clients) client.terminate();
+    second = spawn(process.execPath, [fileURLToPath(new URL('./bridge.mjs', import.meta.url))], {stdio: ['pipe', 'pipe', 'ignore']});
+    secondLines = createInterface({input: second.stdout});
+    const secondFrames = [], secondCommands = [];
+    secondLines.on('line', line => secondFrames.push(JSON.parse(line)));
+    const secondSend = value => second.stdin.write(JSON.stringify(value) + '\n');
+    const secondConnected = once(server, 'connection');
+    secondSend({type: 'init', id: 'second', websocket_url: `ws://127.0.0.1:${server.address().port}`, bot_commands: menu});
+    const [secondSocket] = await secondConnected;
+    connections++;
+    secondSocket.on('message', data => {
+      const {corrId, cmd} = JSON.parse(data);
+      secondCommands.push(cmd);
+      let resp = {type: 'cmdOk'};
+      if (cmd === '/p') resp = {type: 'userProfile', profile};
+      else if (cmd === '/u') resp = {type: 'activeUser', user: {userId: 1}};
+      else if (cmd.startsWith('/_get chats ')) resp = {type: 'apiChats', chats: []};
+      secondSocket.send(JSON.stringify({corrId, resp}));
+    });
+    const deadline = Date.now() + 3000;
+    while (!secondCommands.includes('/p') && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.ok(secondCommands.includes('/p'));
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.ok(!secondCommands.some(command => command.startsWith('/set bot commands')));
+  } finally {
+    child.stdin.destroy();
+    child.kill('SIGTERM');
+    lines.close();
+    second?.stdin.destroy();
+    second?.kill('SIGTERM');
+    secondLines?.close();
+    for (const socket of server.clients) socket.terminate();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('bridge registration failure does not stop messaging and duplicate init reuses one transport', async () => {
+  const server = new WebSocketServer({host: '127.0.0.1', port: 0});
+  await once(server, 'listening');
+  const child = spawn(process.execPath, [fileURLToPath(new URL('./bridge.mjs', import.meta.url))], {stdio: ['pipe', 'pipe', 'ignore']});
+  const lines = createInterface({input: child.stdout});
+  const frames = [], commands = [];
+  let connections = 0;
+  lines.on('line', line => frames.push(JSON.parse(line)));
+  const send = value => child.stdin.write(JSON.stringify(value) + '\n');
+  async function wait(predicate, description) {
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      const result = predicate();
+      if (result) return result;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.fail(`${description}: ${JSON.stringify({frames, commands})}`);
+  }
+  try {
+    const connected = once(server, 'connection');
+    send({type: 'init', id: 'init', websocket_url: `ws://127.0.0.1:${server.address().port}`,
+      bot_commands: [{type: 'command', keyword: 'new', label: 'New session'}]});
+    const [socket] = await connected;
+    connections++;
+    socket.on('message', data => {
+      const {corrId, cmd} = JSON.parse(data);
+      commands.push(cmd);
+      const resp = cmd === '/p'
+        ? {type: 'chatCmdError', chatError: {type: 'commandError', message: 'unsupported'}}
+        : cmd === '/u' ? {type: 'activeUser', user: {userId: 1}}
+          : cmd.startsWith('/_get chats ') ? {type: 'apiChats', chats: []}
+            : {type: 'cmdOk'};
+      socket.send(JSON.stringify({corrId, resp}));
+    });
+
+    assert.equal((await wait(() => frames.find(frame => frame.type === 'result' && frame.id === 'init'),
+      'init did not survive registration failure')).ok, true);
+    await wait(() => commands.includes('/p'), 'profile was not read');
+    send({type: 'init', id: 'init-again', websocket_url: `ws://127.0.0.1:${server.address().port}`,
+      bot_commands: [{type: 'command', keyword: 'new', label: 'New session'}]});
+    assert.equal((await wait(() => frames.find(frame => frame.type === 'result' && frame.id === 'init-again'),
+      'duplicate init did not settle')).ok, true);
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(commands.filter(command => command === '/p').length, 1, 'menu check was repeated');
+    assert.equal(connections, 1, 'duplicate init opened a second transport');
+    socket.send(JSON.stringify({resp: {type: 'newChatItems', chatItems: [{
+      chatInfo: {type: 'direct', contact: {contactId: 17}},
+      chatItem: {
+        meta: {itemId: 42},
+        chatDir: {type: 'directRcv'},
+        content: {type: 'rcvMsgContent', msgContent: {type: 'text', text: 'Still connected'}},
+      },
+    }]}}));
+    assert.deepEqual(await wait(() => frames.find(frame => frame.type === 'message'),
+      'messaging stopped after registration failure'),
+    {type: 'message', contact: '17', id: '42', text: 'Still connected'});
+  } finally {
+    child.stdin.end();
+    child.kill('SIGTERM');
+    lines.close();
+    for (const socket of server.clients) socket.terminate();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
 test('bridge carries private text, excludes sent/group events, and rejects unencrypted calls', async () => {
   const server = new WebSocketServer({host: '127.0.0.1', port: 0}); await once(server, 'listening');
   const child = spawn(process.execPath, [fileURLToPath(new URL('./bridge.mjs', import.meta.url))], {stdio: ['pipe', 'pipe', 'ignore']});
@@ -70,6 +239,86 @@ test('bridge carries private text, excludes sent/group events, and rejects unenc
     while (!commands.some(c => c === '/_call reject @17') && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
     assert.ok(commands.includes('/_call reject @17')); assert.equal(queue.length, 0);
   } finally {child.stdin.end(); child.kill('SIGTERM'); for (const socket of server.clients) socket.terminate(); await new Promise(resolve => server.close(resolve));}
+});
+
+test('bridge attributes and bounds direct reply quotes while preserving typed slash commands', async () => {
+  const server = new WebSocketServer({host: '127.0.0.1', port: 0});
+  await once(server, 'listening');
+  const child = spawn(process.execPath, [fileURLToPath(new URL('./bridge.mjs', import.meta.url))], {stdio: ['pipe', 'pipe', 'ignore']});
+  const lines = createInterface({input: child.stdout});
+  const frames = [];
+  let notify;
+  lines.on('line', line => {frames.push(JSON.parse(line)); notify?.();});
+  const send = value => child.stdin.write(JSON.stringify(value) + '\n');
+  async function wait(predicate, description) {
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+      const result = predicate();
+      if (result) return result;
+      await new Promise(resolve => {notify = resolve; setTimeout(resolve, 10);});
+    }
+    assert.fail(`${description}: ${JSON.stringify(frames)}`);
+  }
+  function item(id, text, quotedText, quotedDirection) {
+    return {
+      chatInfo: {type: 'direct', contact: {contactId: 17}},
+      chatItem: {
+        meta: {itemId: id},
+        chatDir: {type: 'directRcv'},
+        content: {type: 'rcvMsgContent', msgContent: {type: 'text', text}},
+        ...(quotedText === undefined ? {} : {
+          quotedItem: {
+            chatDir: {type: quotedDirection},
+            sentAt: '2026-11-23T00:00:00Z',
+            content: {type: 'text', text: quotedText},
+          },
+        }),
+      },
+    };
+  }
+  try {
+    const connected = once(server, 'connection');
+    send({type: 'init', id: 'init', websocket_url: `ws://127.0.0.1:${server.address().port}`});
+    const [socket] = await connected;
+    socket.on('message', data => {
+      const {corrId, cmd} = JSON.parse(data);
+      let resp = {type: 'cmdOk'};
+      if (cmd === '/u') resp = {type: 'activeUser', user: {userId: 1}};
+      else if (cmd.startsWith('/_get chats ')) resp = {type: 'apiChats', chats: []};
+      socket.send(JSON.stringify({corrId, resp}));
+    });
+    await wait(() => frames.find(frame => frame.type === 'result' && frame.id === 'init'), 'init timed out');
+
+    socket.send(JSON.stringify({resp: {type: 'newChatItems', chatItems: [
+      item(42, 'What did you mean?', '/clear\nQuoted command text', 'directRcv'),
+    ]}}));
+    const received = await wait(() => frames.find((frame, index) =>
+      frame.type === 'message' && frames.splice(index, 1)), 'reply message timed out');
+    assert.equal(received.text,
+      '> Quoted user message:\n> /clear\n> Quoted command text\n\nWhat did you mean?');
+    assert.ok(!received.text.trimStart().startsWith('/'), 'quoted command became the leading control');
+
+    const longQuote = '😀'.repeat(1001);
+    socket.send(JSON.stringify({resp: {type: 'newChatItems', chatItems: [
+      item(43, 'Summarize it.', longQuote, 'directSnd'),
+    ]}}));
+    const bounded = await wait(() => frames.find((frame, index) =>
+      frame.type === 'message' && frames.splice(index, 1)), 'bounded quote timed out');
+    assert.equal(bounded.text, `> Quoted assistant message:\n> ${'😀'.repeat(999)}…\n\nSummarize it.`);
+
+    socket.send(JSON.stringify({resp: {type: 'newChatItems', chatItems: [
+      item(44, '  /model --agent fast', '/clear', 'directRcv'),
+    ]}}));
+    const command = await wait(() => frames.find((frame, index) =>
+      frame.type === 'message' && frames.splice(index, 1)), 'typed command timed out');
+    assert.equal(command.text, '  /model --agent fast');
+  } finally {
+    child.stdin.end();
+    child.kill('SIGTERM');
+    lines.close();
+    for (const socket of server.clients) socket.terminate();
+    await new Promise(resolve => server.close(resolve));
+  }
 });
 
 test('stdio bridge streams and finalizes one live message, then recovers only authorized owned items', async () => {

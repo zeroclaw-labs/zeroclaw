@@ -2725,6 +2725,7 @@ fn supports_runtime_model_switch(channel_name: &str) -> bool {
     matches!(
         channel_name,
         "telegram"
+            | "simplex"
             | "discord"
             | "matrix"
             | "slack"
@@ -43164,6 +43165,25 @@ BTC is currently around $65,000 based on latest tool output."#
                 .all(|message| message.starts_with("-1001234:77:")),
             "the busy notice must follow the hook-rewritten route: {busy_messages:?}"
         );
+    }
+
+    #[test]
+    fn simplex_routes_text_model_commands_through_shared_controls() {
+        for (input, expected) in [
+            ("/model", ChannelRuntimeCommand::ShowModel),
+            ("/models", ChannelRuntimeCommand::ShowProviders),
+            ("/config", ChannelRuntimeCommand::ShowConfig),
+            (
+                "/model fast",
+                ChannelRuntimeCommand::SetModel("fast".into()),
+            ),
+            (
+                "/model --agent fast",
+                ChannelRuntimeCommand::SetModelScoped(OverrideScope::Agent, "fast".into()),
+            ),
+        ] {
+            assert_eq!(parse_runtime_command("simplex", input), Some(expected));
+        }
     }
 
     #[test]

@@ -25,6 +25,28 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME: u64 = 8 * 1024 * 1024;
 const MAX_CONCURRENT_BATCH_TRANSCRIPTIONS: usize = 2;
 const MAX_PENDING_ORDERED_MESSAGES: usize = 32;
+const SIMPLEX_BOT_COMMANDS: [(&str, &str); 7] = [
+    ("new", "channel-simplex-cmd-new-label"),
+    ("clear", "channel-simplex-cmd-clear-label"),
+    ("stop", "channel-simplex-cmd-stop-label"),
+    ("thinking", "channel-simplex-cmd-thinking-label"),
+    ("model", "channel-simplex-cmd-model-label"),
+    ("models", "channel-simplex-cmd-models-label"),
+    ("config", "channel-simplex-cmd-config-label"),
+];
+
+fn simplex_bot_commands() -> Vec<Value> {
+    SIMPLEX_BOT_COMMANDS
+        .into_iter()
+        .map(|(keyword, label_key)| {
+            json!({
+                "type": "command",
+                "keyword": keyword,
+                "label": zeroclaw_runtime::i18n::get_required_cli_string(label_key),
+            })
+        })
+        .collect()
+}
 
 fn bridge_result(value: Value) -> Result<()> {
     if value["ok"] == true {
@@ -1302,7 +1324,11 @@ impl Channel for SimplexChannel {
         let channel = self.clone();
         tasks.spawn(async move {
             channel
-                .request(json!({"type": "init", "websocket_url": settings.websocket_url}))
+                .request(json!({
+                    "type": "init",
+                    "websocket_url": settings.websocket_url,
+                    "bot_commands": simplex_bot_commands(),
+                }))
                 .await?;
             let mut ingress = OrderedMessageIngress::new(
                 channel.clone(),
@@ -2000,6 +2026,33 @@ mod tests {
                 .unwrap_err()
                 .downcast_ref::<FinalizeUncertainDelivery>()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn public_bot_menu_advertises_only_parameterless_session_commands() {
+        let commands = simplex_bot_commands();
+        let keywords = commands
+            .iter()
+            .map(|command| command["keyword"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keywords,
+            [
+                "new", "clear", "stop", "thinking", "model", "models", "config"
+            ]
+        );
+        assert!(commands.iter().all(|command| {
+            command["type"] == "command"
+                && command["label"]
+                    .as_str()
+                    .is_some_and(|label| !label.is_empty())
+                && command.get("params").is_none()
+        }));
+        assert!(
+            keywords
+                .iter()
+                .all(|keyword| !matches!(*keyword, "compact" | "hindsight"))
         );
     }
 
