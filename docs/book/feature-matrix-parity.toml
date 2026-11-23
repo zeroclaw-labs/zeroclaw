@@ -266,10 +266,6 @@ hermes = "partial"
 openclaw = "supported"
 hermes = "supported"
 
-[providers.gemini_cli]
-openclaw = "supported"
-hermes = "none"
-
 [providers.grok_cli]
 openclaw = "none"
 hermes = "none"

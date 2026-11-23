@@ -1758,6 +1758,8 @@ impl FamilyProviderFactory for CopilotModelProviderConfig {
 impl FamilyProviderFactory for GeminiCliModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::CliBacked;
 
+    /// Retired: always refuses with the shared migration message so an agent
+    /// still pointing at a `gemini_cli` alias fails at startup with the fix.
     fn create_provider(
         &self,
         alias: &str,
@@ -1765,13 +1767,25 @@ impl FamilyProviderFactory for GeminiCliModelProviderConfig {
         _api_url: Option<&str>,
         _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        Ok(Box::new(
-            crate::gemini_cli::GeminiCliModelProvider::builder(alias)
-                .binary_path(self.binary_path.as_deref())
-                .build(),
-        ))
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "model_provider": format!("gemini_cli.{alias}"),
+                    "error_key": "gemini_cli_retired",
+                })),
+            "gemini_cli: retired model provider refused"
+        );
+        anyhow::bail!(
+            "providers.models.gemini_cli.{alias}: {}",
+            zeroclaw_config::schema::GEMINI_CLI_PROVIDER_RETIRED
+        )
     }
 
+    /// Always ready, so a fallback naming a retired alias reaches
+    /// `create_provider` and reports the migration message rather than a
+    /// request for credentials the provider would never use.
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
         true
     }

@@ -44,9 +44,15 @@ remain unsupported.
 
 Google's Gemini API. Supports vision and pre-executed grounded search (see [Streaming](./streaming.md) for `PreExecutedToolCall` events).
 
-### Gemini CLI: slot `gemini_cli`
+### Gemini CLI: slot `gemini_cli` (retired)
 
-Shells out to the `gemini` CLI; uses the CLI's existing auth.
+Retired. Google replaced Gemini CLI with Antigravity CLI, and Gemini CLI stopped
+serving Google AI free, Pro, and Ultra accounts on June 18, 2026. A configured
+`[providers.models.gemini_cli.<alias>]` now fails config validation, and an
+agent that still points at it fails at startup, with a message naming the
+replacement. Move the alias to [`antigravity_cli`](#antigravity-cli-slot-antigravity_cli)
+or to [`gemini`](#gemini-slot-gemini) with an API key, update agent
+`model_provider` references, and remove the `gemini_cli` section.
 
 ### Antigravity CLI: slot `antigravity_cli`
 

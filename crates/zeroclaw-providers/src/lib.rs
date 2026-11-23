@@ -13,7 +13,6 @@ pub mod copilot;
 pub mod dispatch;
 pub mod factory;
 pub mod gemini;
-pub mod gemini_cli;
 pub mod grok_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod hailo_ollama;
@@ -2360,8 +2359,9 @@ pub fn recommended_runtime_profile(name: &str) -> Option<&'static str> {
 /// `zeroclaw-config` are a dual-maintenance surface: the macro carries the
 /// canonical slot set, this list adds display-only fields (`display_name`,
 /// `local`). The `listed_model_providers_match_canonical_slots` test enforces
-/// that the two cover exactly the same slots, so a provider added to the macro
-/// without a display entry here (or vice versa) fails `cargo test`.
+/// that the two cover exactly the same slots, except
+/// [`RETIRED_MODEL_PROVIDER_SLOTS`], so a provider added to the macro without a
+/// display entry here (or vice versa) fails `cargo test`.
 pub fn list_model_providers() -> Vec<ModelProviderInfo> {
     let mut out: Vec<ModelProviderInfo> = Vec::new();
     push_family(
@@ -2409,7 +2409,6 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("perplexity", "Perplexity", false),
             ("cohere", "Cohere", false),
             ("copilot", "GitHub Copilot", false),
-            ("gemini_cli", "Gemini CLI", true),
             ("grok_cli", "Grok Build CLI", true),
             ("antigravity_cli", "Antigravity CLI", true),
             ("kilocli", "KiloCLI", true),
@@ -2487,12 +2486,18 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             .collect::<std::collections::BTreeSet<_>>(),
         canonical_model_provider_slots()
             .into_iter()
+            .filter(|slot| !RETIRED_MODEL_PROVIDER_SLOTS.contains(slot))
             .collect::<std::collections::BTreeSet<_>>(),
         "list_model_providers() drifted from for_each_model_provider_slot!: \
          every canonical slot needs exactly one display entry and vice versa"
     );
     out
 }
+
+/// Config slots kept only so existing configs parse and fail validation with
+/// a migration message. They are not offered in provider listings and their
+/// factories always refuse.
+pub const RETIRED_MODEL_PROVIDER_SLOTS: &[&str] = &["gemini_cli"];
 
 #[must_use]
 pub fn canonical_model_provider_slots() -> Vec<&'static str> {
@@ -3909,7 +3914,14 @@ mod tests {
     }
 
     #[test]
-    fn factory_gemini_cli() {}
+    fn factory_gemini_cli_is_retired_with_migration_guidance() {
+        let error = match create_model_provider("gemini_cli", None) {
+            Ok(_) => panic!("retired gemini_cli provider must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("retired"), "{error}");
+        assert!(error.contains("antigravity_cli"), "{error}");
+    }
 
     #[test]
     fn factory_grok_cli() {
@@ -4528,7 +4540,6 @@ mod tests {
             "perplexity",
             "cohere",
             "copilot",
-            "gemini_cli",
             "kilocli",
             "nvidia",
             "astrai",
@@ -4561,8 +4572,10 @@ mod tests {
     fn listed_model_providers_match_canonical_slots() {
         let listed: std::collections::BTreeSet<&str> =
             list_model_providers().iter().map(|p| p.name).collect();
-        let canonical: std::collections::BTreeSet<&str> =
-            canonical_model_provider_slots().into_iter().collect();
+        let canonical: std::collections::BTreeSet<&str> = canonical_model_provider_slots()
+            .into_iter()
+            .filter(|slot| !RETIRED_MODEL_PROVIDER_SLOTS.contains(slot))
+            .collect();
         let missing: Vec<&&str> = canonical.difference(&listed).collect();
         let phantom: Vec<&&str> = listed.difference(&canonical).collect();
         assert!(
@@ -5773,6 +5786,52 @@ mod tests {
         assert!(
             message.contains("uri"),
             "factory error must preserve the missing field detail: {message}"
+        );
+    }
+
+    #[test]
+    fn resilient_alias_fallback_to_retired_gemini_cli_reports_retirement() {
+        use zeroclaw_config::schema::{Config, GeminiCliModelProviderConfig, ModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            zeroclaw_config::schema::OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("primary-key".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "gemini_cli.old",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config
+            .providers
+            .models
+            .gemini_cli
+            .insert("old".to_string(), GeminiCliModelProviderConfig::default());
+
+        let message = match create_resilient_model_provider_for_alias(
+            &config,
+            "openai",
+            "primary",
+            Some("primary-key"),
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        ) {
+            Ok(_) => panic!("a retired gemini_cli fallback must abort the build"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            message.contains(zeroclaw_config::schema::GEMINI_CLI_PROVIDER_RETIRED),
+            "error must carry the retirement migration message: {message}"
+        );
+        assert!(
+            !message.contains("profile-resolved credential"),
+            "a retired provider must not ask for credentials: {message}"
         );
     }
 

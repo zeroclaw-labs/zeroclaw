@@ -254,7 +254,6 @@ pub enum ModelProviderKind {
     Ollama,
     HailoOllama,
     Gemini,
-    GeminiCli,
     GrokCli,
     AntigravityCli,
     GoogleAi,

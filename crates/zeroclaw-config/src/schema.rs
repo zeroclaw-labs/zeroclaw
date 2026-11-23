@@ -3137,7 +3137,18 @@ pub struct GeminiModelProviderConfig {
     pub oauth_project: Option<String>,
 }
 
-// ── Gemini CLI (subprocess wrapper) ──
+// ── Gemini CLI (subprocess wrapper, retired) ──
+
+/// Why a `[providers.models.gemini_cli.<alias>]` entry is refused, and what to
+/// use instead. Shared by config validation and the provider factory so both
+/// surfaces tell the operator the same migration path.
+pub const GEMINI_CLI_PROVIDER_RETIRED: &str = "the `gemini_cli` model provider is retired: \
+     Google replaced Gemini CLI with Antigravity CLI, and Gemini CLI stopped serving Google AI \
+     free, Pro, and Ultra accounts on June 18, 2026. Move this alias to \
+     `[providers.models.antigravity_cli.<alias>]` (Antigravity CLI over `agy acp`, with a Gemini \
+     API key, Agent Platform, or Gemini Enterprise) or to `[providers.models.gemini.<alias>]` \
+     with an API key, point agent `model_provider` references at the new alias, then remove \
+     the `gemini_cli` section";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -3155,6 +3166,9 @@ impl ModelEndpoint for GeminiCliEndpoint {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.gemini_cli"]
+/// Retired. Kept so existing configs still parse and fail validation with
+/// [`GEMINI_CLI_PROVIDER_RETIRED`] instead of being dropped silently. Use
+/// `[providers.models.antigravity_cli.<alias>]` instead.
 pub struct GeminiCliModelProviderConfig {
     #[nested]
     #[serde(flatten)]
@@ -25189,6 +25203,18 @@ impl Config {
         }
     }
 
+    /// Refuse the retired `gemini_cli` model provider with its migration path.
+    fn validate_retired_gemini_cli(&self) -> Result<()> {
+        if let Some(alias) = self.providers.models.gemini_cli.keys().min() {
+            validation_bail!(
+                ValidationFailed,
+                format!("providers.models.gemini_cli.{alias}"),
+                "providers.models.gemini_cli.{alias}: {GEMINI_CLI_PROVIDER_RETIRED}"
+            );
+        }
+        Ok(())
+    }
+
     /// Validate configuration values that would cause runtime failures.
     ///
     /// Called after TOML deserialization and env-override application to catch
@@ -25196,6 +25222,7 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
         self.cost.rates.validate()?;
+        self.validate_retired_gemini_cli()?;
 
         for (profile_alias, profile) in &self.runtime_profiles {
             if profile.max_execution_tree_iterations == Some(0) {
@@ -35650,6 +35677,31 @@ auto_save = true
             ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
         );
         assert_eq!(parsed.max_acp_stdout_bytes, Some(8_388_608));
+    }
+
+    #[test]
+    async fn retired_gemini_cli_provider_fails_validation_with_migration_path() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .gemini_cli
+            .insert("home".to_string(), GeminiCliModelProviderConfig::default());
+        let error = config
+            .validate()
+            .expect_err("a gemini_cli alias must fail validation")
+            .to_string();
+        assert!(
+            error.contains("providers.models.gemini_cli.home"),
+            "{error}"
+        );
+        assert!(error.contains("retired"), "{error}");
+        assert!(error.contains("antigravity_cli"), "{error}");
+
+        config.providers.models.gemini_cli.clear();
+        config
+            .validate()
+            .expect("removing the gemini_cli alias clears the error");
     }
 
     #[test]
