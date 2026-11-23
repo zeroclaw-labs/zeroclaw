@@ -102,6 +102,8 @@ pub struct AnthropicModelProvider {
     /// One TTL per request by design. Defaults to the 5-minute API
     /// default.
     cache_ttl: CacheTtl,
+    /// Sent as `output_config.effort` on every request; `None` omits it.
+    effort: Option<String>,
     /// Memoized cleaned tool schemas: each registered schema is cleaned once
     /// per provider instance (not once per request) and the byte-stable
     /// result keeps the `cache_control` tools block identical across
@@ -166,6 +168,14 @@ struct NativeChatRequest {
     /// only; `None` (the default) keeps the request byte-identical to today.
     #[serde(skip_serializing_if = "Option::is_none")]
     fallbacks: Option<Vec<NativeFallbackEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<OutputConfig>,
+}
+
+/// The native `output_config` object: how deeply the model thinks.
+#[derive(Debug, Serialize)]
+struct OutputConfig {
+    effort: String,
 }
 
 /// One entry in the native `fallbacks` array: a model Anthropic may serve
@@ -543,18 +553,20 @@ impl CacheControl {
         }
     }
 
-    /// Ephemeral breakpoint carrying the configured cache entry lifetime.
-    /// `FiveMinutes` serializes exactly like [`Self::ephemeral`] — the API
-    /// default needs no explicit `ttl` — so call sites can pass the
-    /// resolved TTL unconditionally without perturbing default-config
-    /// requests.
-    pub(crate) fn ephemeral_with_ttl(ttl: CacheTtl) -> Self {
+    /// Ephemeral breakpoint carrying the configured cache entry lifetime, or
+    /// `None` when caching is disabled (`CacheTtl::Off`) so no breakpoint is
+    /// written at all. `FiveMinutes` serializes exactly like
+    /// [`Self::ephemeral`] — the API default needs no explicit `ttl` — so
+    /// call sites can pass the resolved TTL unconditionally without
+    /// perturbing default-config requests.
+    pub(crate) fn ephemeral_with_ttl(ttl: CacheTtl) -> Option<Self> {
         match ttl {
-            CacheTtl::FiveMinutes => Self::ephemeral(),
-            CacheTtl::OneHour => Self {
+            CacheTtl::FiveMinutes => Some(Self::ephemeral()),
+            CacheTtl::OneHour => Some(Self {
                 cache_type: "ephemeral".to_string(),
                 ttl: Some("1h".to_string()),
-            },
+            }),
+            CacheTtl::Off => None,
         }
     }
 }
@@ -672,6 +684,7 @@ pub struct AnthropicBuilder {
     timeout_secs: Option<u64>,
     server_fallback_models: Vec<String>,
     cache_ttl: Option<CacheTtl>,
+    effort: Option<String>,
 }
 
 impl AnthropicBuilder {
@@ -727,6 +740,14 @@ impl AnthropicBuilder {
         self
     }
 
+    /// Effort level sent as `output_config.effort` on every request (`low`,
+    /// `medium`, `high`, `xhigh`, `max`). Defaults to unset, which leaves
+    /// requests byte-identical to today.
+    pub fn effort(mut self, effort: Option<&str>) -> Self {
+        self.effort = effort.map(ToString::to_string);
+        self
+    }
+
     pub fn build(self) -> AnthropicModelProvider {
         AnthropicModelProvider {
             alias: self.alias,
@@ -741,6 +762,7 @@ impl AnthropicBuilder {
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
             server_fallback_models: self.server_fallback_models,
             cache_ttl: self.cache_ttl.unwrap_or_default(),
+            effort: self.effort,
             schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
         }
     }
@@ -759,7 +781,12 @@ impl AnthropicModelProvider {
             timeout_secs: None,
             server_fallback_models: Vec::new(),
             cache_ttl: None,
+            effort: None,
         }
+    }
+
+    fn output_config(&self) -> Option<OutputConfig> {
+        self.effort.clone().map(|effort| OutputConfig { effort })
     }
 
     fn is_setup_token(token: &str) -> bool {
@@ -845,7 +872,7 @@ impl AnthropicModelProvider {
         let prefix = SystemBlock {
             block_type: "text".to_string(),
             text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
-            cache_control: Some(CacheControl::ephemeral_with_ttl(cache_ttl)),
+            cache_control: CacheControl::ephemeral_with_ttl(cache_ttl),
         };
         match system {
             Some(SystemPrompt::Blocks(mut blocks)) => {
@@ -857,7 +884,7 @@ impl AnthropicModelProvider {
                 SystemBlock {
                     block_type: "text".to_string(),
                     text: s,
-                    cache_control: Some(CacheControl::ephemeral_with_ttl(cache_ttl)),
+                    cache_control: CacheControl::ephemeral_with_ttl(cache_ttl),
                 },
             ])),
             None => Some(SystemPrompt::Blocks(vec![prefix])),
@@ -900,7 +927,7 @@ impl AnthropicModelProvider {
             match content {
                 NativeContentOut::Text { cache_control, .. }
                 | NativeContentOut::ToolResult { cache_control, .. } => {
-                    *cache_control = Some(CacheControl::ephemeral_with_ttl(cache_ttl));
+                    *cache_control = CacheControl::ephemeral_with_ttl(cache_ttl);
                     return true;
                 }
                 NativeContentOut::ToolUse { .. }
@@ -934,7 +961,7 @@ impl AnthropicModelProvider {
         // Cache the last tool definition (caches all tools); the tools
         // marker carries the configured cache entry lifetime.
         if let Some(last_tool) = native_tools.last_mut() {
-            last_tool.cache_control = Some(CacheControl::ephemeral_with_ttl(self.cache_ttl));
+            last_tool.cache_control = CacheControl::ephemeral_with_ttl(self.cache_ttl);
         }
 
         Some(native_tools)
@@ -964,14 +991,22 @@ impl AnthropicModelProvider {
                         .and_then(|t| t.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let signature = block
+                    // Anthropic accepts only signed thinking: a block whose
+                    // signature never arrived (a stream cut off mid-thinking,
+                    // or reasoning recorded by another provider) would fail
+                    // the whole request with `thinking.signature: Field
+                    // required`, so it is left out.
+                    let Some(signature) = block
                         .get("signature")
                         .and_then(|s| s.as_str())
                         .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string());
+                        .map(|s| s.to_string())
+                    else {
+                        continue;
+                    };
                     blocks.push(NativeContentOut::Thinking {
                         thinking,
-                        signature,
+                        signature: Some(signature),
                     });
                 }
             }
@@ -1714,7 +1749,7 @@ impl AnthropicModelProvider {
             SystemPrompt::Blocks(vec![SystemBlock {
                 block_type: "text".to_string(),
                 text,
-                cache_control: Some(CacheControl::ephemeral_with_ttl(cache_ttl)),
+                cache_control: CacheControl::ephemeral_with_ttl(cache_ttl),
             }])
         });
 
@@ -2952,6 +2987,7 @@ impl ModelProvider for AnthropicModelProvider {
             stream: None,
             thinking: None,
             fallbacks,
+            output_config: self.output_config(),
         };
 
         let mut request = self
@@ -3106,6 +3142,7 @@ impl ModelProvider for AnthropicModelProvider {
             stream: None,
             thinking: thinking_config,
             fallbacks,
+            output_config: self.output_config(),
         };
 
         let req = self
@@ -3344,6 +3381,7 @@ impl ModelProvider for AnthropicModelProvider {
                 // Streaming path (incl. this thinking `stream: None` request):
                 // never opts into server-side fallback.
                 fallbacks: None,
+                output_config: self.output_config(),
             };
             // Serialize eagerly so the request body is owned and `'static`
             // across the async boundary.
@@ -3475,6 +3513,7 @@ impl ModelProvider for AnthropicModelProvider {
             thinking: thinking_config,
             // Streaming never opts into server-side fallback.
             fallbacks: None,
+            output_config: self.output_config(),
         };
 
         let body = match Self::build_streaming_request(&native_request) {
@@ -4823,6 +4862,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("max_tokens"));
@@ -4845,6 +4885,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(
@@ -4867,20 +4908,27 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     /// D5 pin: the default (5m) lifetime serializes byte-identically to the
-    /// pre-TTL wire, and only the 1h lifetime adds the `ttl` field.
+    /// pre-TTL wire, only the 1h lifetime adds the `ttl` field, and `off`
+    /// produces no marker at all.
     #[test]
     fn cache_control_ttl_serialization_pinned() {
-        let five_minutes = CacheControl::ephemeral_with_ttl(CacheTtl::FiveMinutes);
+        let five_minutes =
+            CacheControl::ephemeral_with_ttl(CacheTtl::FiveMinutes).expect("5m produces a marker");
         assert_eq!(
             serde_json::to_string(&five_minutes).unwrap(),
             r#"{"type":"ephemeral"}"#,
             "5m must serialize exactly like the pre-TTL default marker"
         );
-        let one_hour = CacheControl::ephemeral_with_ttl(CacheTtl::OneHour);
+        let one_hour =
+            CacheControl::ephemeral_with_ttl(CacheTtl::OneHour).expect("1h produces a marker");
         assert_eq!(
             serde_json::to_string(&one_hour).unwrap(),
             r#"{"type":"ephemeral","ttl":"1h"}"#,
             "1h must emit exactly one added field, in declaration order"
+        );
+        assert!(
+            CacheControl::ephemeral_with_ttl(CacheTtl::Off).is_none(),
+            "off must place no breakpoint at all"
         );
     }
 
@@ -5053,6 +5101,27 @@ data: {\"type\":\"message_stop\"}\n\n";
                 serde_json::to_string(control).unwrap(),
                 r#"{"type":"ephemeral"}"#,
                 "default markers serialize byte-identically to the pre-TTL wire"
+            );
+        }
+
+        // off: no breakpoint anywhere — not the system block, not the last
+        // tool definition, not the rolling last message.
+        let off = run_request(CacheTtl::Off).await;
+        assert!(
+            !off.to_string().contains("cache_control"),
+            "off must emit no cache_control key anywhere: {off}"
+        );
+        let mut controls = Vec::new();
+        collect_cache_controls(&off, &mut controls);
+        assert!(controls.is_empty(), "off must place zero markers: {off}");
+        for site in ["system", "tools", "messages"] {
+            assert!(
+                off.get(site).is_some(),
+                "request body must carry the {site} key: {off}"
+            );
+            assert!(
+                !off[site].to_string().contains("cache_control"),
+                "off must leave the {site} breakpoint site unmarked: {off}"
             );
         }
     }
@@ -5738,6 +5807,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -5767,6 +5837,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             stream: None,
             thinking: None,
             fallbacks: None,
+            output_config: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -5814,6 +5885,56 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(native_msgs[0].role, "user");
         assert_eq!(native_msgs[1].role, "assistant");
         assert_eq!(native_msgs[2].role, "user");
+    }
+
+    #[test]
+    fn convert_messages_leaves_out_thinking_that_has_no_signature() {
+        // A stream cut off by max_tokens mid-thinking stores the text with an
+        // empty signature; reasoning from another provider has none at all.
+        let reasoning = [
+            r#"{"thinking":"cut off","signature":""}"#,
+            r#"{"thinking":"from elsewhere"}"#,
+            r#"{"thinking":"kept","signature":"sig_ok"}"#,
+        ]
+        .join("\n");
+        let envelope = serde_json::json!({
+            "content": "",
+            "tool_calls": [{"id": "toolu_1", "name": "shell", "arguments": "{}"}],
+            "reasoning_content": reasoning,
+        })
+        .to_string();
+        let messages = vec![
+            ChatMessage::user("run it"),
+            ChatMessage::assistant(envelope),
+            ChatMessage::tool(
+                serde_json::json!({"content": "done", "tool_call_id": "toolu_1"}).to_string(),
+            ),
+        ];
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
+        let assistant = native_msgs
+            .iter()
+            .find(|m| m.role == "assistant")
+            .expect("assistant message survives conversion");
+        let thinking: Vec<_> = assistant
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                NativeContentOut::Thinking {
+                    thinking,
+                    signature,
+                } => Some((thinking.as_str(), signature.as_deref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking, [("kept", Some("sig_ok"))]);
+        assert!(
+            assistant
+                .content
+                .iter()
+                .any(|block| matches!(block, NativeContentOut::ToolUse { .. })),
+            "the tool call itself is still replayed"
+        );
     }
 
     // The seam sanitizer rewrites an assistant tool-call envelope
@@ -9503,6 +9624,31 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     #[tokio::test]
+    async fn effort_config_adds_output_config_and_nothing_else() {
+        let (addr, captured, server) = spawn_capturing_server().await;
+        let builder = || {
+            AnthropicModelProvider::builder("test")
+                .credential(Some("sk-ant-api-key"))
+                .base_url(&format!("http://{addr}"))
+        };
+        for (effort, expected) in [
+            (Some("medium"), serde_json::json!({"effort": "medium"})),
+            (None, serde_json::Value::Null),
+        ] {
+            let result = builder()
+                .effort(effort)
+                .build()
+                .chat_with_system(None, "hello", "claude-opus-5-5", None)
+                .await;
+            assert!(result.is_ok(), "chat failed: {:?}", result.err());
+            let (_, body) = captured.lock().unwrap().take().expect("no request");
+            assert_eq!(body["output_config"], expected, "{body}");
+            assert!(body.get("thinking").is_none(), "no thinking: {body}");
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn oauth_credential_merges_beta_values_into_one_header() {
         let (addr, captured, server) = spawn_capturing_server().await;
         let provider = AnthropicModelProvider::builder("test")
@@ -10691,6 +10837,7 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
                 display: Some(ThinkingDisplay::Updates),
             }),
             fallbacks: None,
+            output_config: None,
         };
 
         let body = serde_json::to_value(&request).expect("serialize");
@@ -11016,6 +11163,7 @@ data: {\"type\":\"message_stop\"}\n\n";
                 display: Some(ThinkingDisplay::Updates),
             }),
             fallbacks: None,
+            output_config: None,
         };
 
         let body = serde_json::to_value(&request).expect("serialize");
