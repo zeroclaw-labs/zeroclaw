@@ -236,9 +236,22 @@ pub(crate) fn config_for_delegated_agent(config: &Config) -> Config {
 
 /// Whether `tool_name` is an MCP callable owned by `server_name`.
 ///
-/// MCP callable names use `<server>__<tool>`. Match from the complete server
-/// name so separators inside that name remain part of the identity.
-pub(crate) fn mcp_tool_name_belongs_to_server(tool_name: &str, server_name: &str) -> bool {
+/// The connected registry is authoritative when it knows the callable. Its
+/// owner index distinguishes a `read` tool on `team__ordinary` from an
+/// `ordinary__read` tool on `team`, even though both produce the same callable
+/// spelling. Prefix matching is a fail-closed fallback for names absent from
+/// the registry, such as a same-name source tool that a delegated registry has
+/// not admitted.
+pub(crate) fn mcp_tool_name_belongs_to_server(
+    tool_name: &str,
+    server_name: &str,
+    registry: Option<&McpRegistry>,
+) -> bool {
+    if let Some(is_from_server) =
+        registry.and_then(|registry| registry.tool_is_from_server(tool_name, server_name))
+    {
+        return is_from_server;
+    }
     tool_name
         .strip_prefix(server_name)
         .and_then(|suffix| suffix.strip_prefix(zeroclaw_tools::mcp_client::MCP_TOOL_NAME_SEPARATOR))

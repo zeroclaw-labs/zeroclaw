@@ -1234,6 +1234,23 @@ impl McpRegistry {
         names
     }
 
+    /// Whether the registry knows `prefixed_name` and, if so, whether it is
+    /// routed to `server_name`.
+    ///
+    /// Ownership comes from the same index that dispatches the call. This
+    /// matters when configured server names overlap: `team__ordinary__read`
+    /// can be a `read` tool on `team__ordinary`, rather than an
+    /// `ordinary__read` tool on `team`. `None` means the registry does not
+    /// know the callable at all.
+    pub fn tool_is_from_server(&self, prefixed_name: &str, server_name: &str) -> Option<bool> {
+        let (owner_idx, _) = self.tool_index.get(prefixed_name)?;
+        Some(
+            self.server_index
+                .get(server_name)
+                .is_some_and(|server_idx| server_idx == owner_idx),
+        )
+    }
+
     /// Tool definition for a given prefixed name (cloned).
     pub async fn get_tool_def(&self, prefixed_name: &str) -> Option<McpToolDef> {
         let (server_idx, original_name) = self.tool_index.get(prefixed_name)?;
@@ -1774,6 +1791,42 @@ mod tests {
         expected.sort();
         assert_eq!(forward, expected);
         assert_eq!(reverse, expected);
+    }
+
+    #[test]
+    fn tool_server_ownership_uses_registry_index_for_prefix_collisions() {
+        let registry = McpRegistry {
+            servers: Vec::new(),
+            tool_index: HashMap::from([
+                ("team__read".to_string(), (0usize, "read".to_string())),
+                (
+                    "team__ordinary__read".to_string(),
+                    (1usize, "read".to_string()),
+                ),
+            ]),
+            server_index: HashMap::from([
+                ("team".to_string(), 0usize),
+                ("team__ordinary".to_string(), 1usize),
+            ]),
+        };
+
+        assert_eq!(
+            registry.tool_is_from_server("team__read", "team"),
+            Some(true)
+        );
+        assert_eq!(
+            registry.tool_is_from_server("team__ordinary__read", "team"),
+            Some(false),
+            "the shorter server name is only a text prefix, not the owner"
+        );
+        assert_eq!(
+            registry.tool_is_from_server("team__ordinary__read", "team__ordinary"),
+            Some(true)
+        );
+        assert_eq!(
+            registry.tool_is_from_server("team__missing__read", "team"),
+            None
+        );
     }
 
     #[tokio::test]

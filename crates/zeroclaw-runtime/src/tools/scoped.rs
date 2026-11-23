@@ -697,13 +697,14 @@ fn mcp_tool_reaches_delegated_agents(
     name: &str,
     denied_servers: &HashSet<String>,
     any_denied_server: bool,
+    registry: Option<&tools::McpRegistry>,
 ) -> bool {
     if any_denied_server && matches!(name, "tool_search" | "mcp_resources" | "mcp_prompts") {
         return false;
     }
     !denied_servers
         .iter()
-        .any(|server| tools::mcp_tool_name_belongs_to_server(name, server))
+        .any(|server| tools::mcp_tool_name_belongs_to_server(name, server, registry))
 }
 
 impl ScopedToolRegistry {
@@ -810,7 +811,7 @@ impl ScopedToolRegistry {
             capability_slots: _,
             // The Agent captures the concrete delegate before assembly, for owner
             // binding and to bind descendant registries to live RPC authority.
-            delegate_tool: _,
+            delegate_tool: bound_delegate_tool,
         } = built;
 
         // 1. Peripherals. Loading CONNECTS hardware (serial opens are exclusive for
@@ -1033,6 +1034,7 @@ impl ScopedToolRegistry {
         // MCP-origin ground truth for the tool_filter_groups gates; see
         // the `ScopedAssembled::mcp_tool_names` field doc for the contract.
         let mut mcp_tool_names: HashSet<String> = HashSet::new();
+        let mut canonical_mcp_registry: Option<Arc<tools::McpRegistry>> = None;
 
         #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
         tools::late_tool_search_observer::record("phase", "mcp", 3, 0);
@@ -1107,6 +1109,10 @@ impl ScopedToolRegistry {
                     }
                 };
             if let Some(registry) = shared_registry {
+                if let Some(delegate_tool) = bound_delegate_tool.as_ref() {
+                    delegate_tool.bind_mcp_registry(Arc::clone(&registry));
+                }
+                canonical_mcp_registry = Some(Arc::clone(&registry));
                 #[cfg(all(test, feature = "plugins-wasm-cranelift"))]
                 tools::late_tool_search_observer::record(
                     "mcp-registry",
@@ -1292,11 +1298,13 @@ impl ScopedToolRegistry {
                         if let Some(ref handle) = delegate_handle {
                             let delegate_tools = Arc::clone(handle);
                             let denied_delegate_servers = denied_delegate_servers.clone();
+                            let delegate_registry = Arc::clone(&registry);
                             tool_search = tool_search.with_activation_hook(Arc::new(move |tool| {
                                 if !mcp_tool_reaches_delegated_agents(
                                     tool.name(),
                                     &denied_delegate_servers,
                                     false,
+                                    Some(delegate_registry.as_ref()),
                                 ) {
                                     return;
                                 }
@@ -1503,6 +1511,7 @@ impl ScopedToolRegistry {
                     tool.name(),
                     &denied_delegate_servers,
                     withholds_delegate_mcp,
+                    canonical_mcp_registry.as_deref(),
                 )
             });
         }
@@ -3505,6 +3514,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn eager_delegate_view_uses_mcp_owner_for_overlapping_server_names() {
+        let server = mock_mcp_http_server_with_tools(&[("read", "read")]).await;
+        let server2 = mock_mcp_http_server_with_tools(&[("read", "read")]).await;
+        let mut config = config_with_bundled_mcp(server.uri(), server2.uri());
+        config.mcp.deferred_loading = false;
+        config.mcp.servers[0].name = "team".into();
+        config.mcp.servers[0].deny_delegate_inheritance = true;
+        config.mcp.servers[1].name = "team__ordinary".into();
+        config
+            .mcp_bundles
+            .get_mut("mockbundle")
+            .expect("test bundle")
+            .servers = vec!["team".into(), "team__ordinary".into()];
+
+        let (out, parent) = assemble_native_compat(
+            &config,
+            vec![Box::new(MockTool("team__missing__read"))],
+            Vec::new(),
+        )
+        .await;
+        for name in ["team__read", "team__ordinary__read"] {
+            assert!(
+                crate::agent::tool_execution::find_tool(&out.registry, name).is_some(),
+                "the direct agent still receives `{name}`"
+            );
+        }
+
+        let inherited: Vec<String> = parent
+            .read()
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        assert!(
+            !inherited.iter().any(|name| name == "team__read"),
+            "the target server's tool must stay withheld: {inherited:?}"
+        );
+        assert!(
+            inherited.iter().any(|name| name == "team__ordinary__read"),
+            "registry ownership must preserve the permitted overlapping server: {inherited:?}"
+        );
+        assert!(
+            !inherited.iter().any(|name| name == "team__missing__read"),
+            "an unregistered name matching the withheld server prefix must fail closed: {inherited:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn delegate_parent_view_withholds_tools_from_separator_server_names() {
         let mut config =
             config_with_bundled_mcp("http://127.0.0.1:1".into(), "http://127.0.0.1:2".into());
@@ -3556,6 +3612,47 @@ mod tests {
             inherited,
             ["team__ordinary__read", "team__authority_extra__read"],
             "the complete withheld server name must match without withholding an unrelated near-prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_delegate_activation_uses_mcp_owner_for_overlapping_server_names() {
+        let server = mock_mcp_http_server_with_tools(&[("read", "read")]).await;
+        let server2 = mock_mcp_http_server_with_tools(&[("read", "read")]).await;
+        let mut config = config_with_bundled_mcp(server.uri(), server2.uri());
+        config.mcp.deferred_loading = true;
+        config.mcp.servers[0].name = "team".into();
+        config.mcp.servers[0].deny_delegate_inheritance = true;
+        config.mcp.servers[1].name = "team__ordinary".into();
+        config
+            .mcp_bundles
+            .get_mut("mockbundle")
+            .expect("test bundle")
+            .servers = vec!["team".into(), "team__ordinary".into()];
+
+        let (out, parent) = assemble_native_compat(&config, Vec::new(), Vec::new()).await;
+        let search = crate::agent::tool_execution::find_tool(&out.registry, "tool_search")
+            .expect("deferred mode exposes tool_search to the direct agent");
+
+        search
+            .execute(serde_json::json!({"query": "select:team__read"}))
+            .await
+            .expect("the direct agent can activate its protected tool");
+        assert!(
+            !parent.read().iter().any(|tool| tool.name() == "team__read"),
+            "a deferred tool owned by the withheld server must not enter delegate inheritance"
+        );
+
+        search
+            .execute(serde_json::json!({"query": "select:team__ordinary__read"}))
+            .await
+            .expect("the direct agent can activate the other server's tool");
+        assert!(
+            parent
+                .read()
+                .iter()
+                .any(|tool| tool.name() == "team__ordinary__read"),
+            "deferred activation must use registry ownership rather than the shorter name prefix"
         );
     }
 
