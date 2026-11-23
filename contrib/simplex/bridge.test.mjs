@@ -5,6 +5,9 @@ import {spawn} from 'node:child_process';
 import {createInterface} from 'node:readline';
 import {once} from 'node:events';
 import {fileURLToPath} from 'node:url';
+import {mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 
 test('bridge refuses non-loopback SimpleX API endpoints before opening a socket', async () => {
   const child = spawn(process.execPath, [fileURLToPath(new URL('./bridge.mjs', import.meta.url))], {stdio: ['pipe', 'pipe', 'ignore']});
@@ -130,5 +133,90 @@ test('stdio bridge streams and finalizes one live message, then recovers only au
     child.stdin.end();child.kill('SIGTERM');lines.close();
     for(const socket of server.clients)socket.terminate();
     await new Promise(resolve=>server.close(resolve));
+  }
+});
+
+test('hangup during pending RTC startup closes the abandoned browser without stale signals', async () => {
+  const temporary = await mkdtemp(join(tmpdir(), 'zeroclaw-bridge-rtc-'));
+  const logPath = join(temporary, 'rtc.log');
+  const releasePath = join(temporary, 'release');
+  const server = new WebSocketServer({host: '127.0.0.1', port: 0});
+  await once(server, 'listening');
+  const child = spawn(process.execPath, [
+    '--experimental-loader',
+    fileURLToPath(new URL('./bridge.rtc-loader.mjs', import.meta.url)),
+    fileURLToPath(new URL('./bridge.mjs', import.meta.url)),
+  ], {
+    stdio: ['pipe', 'pipe', 'ignore'],
+    env: {...process.env, SIMPLEX_TEST_RTC_LOG: logPath, SIMPLEX_TEST_RTC_RELEASE: releasePath},
+  });
+  const lines = createInterface({input: child.stdout});
+  const frames = [], commands = [];
+  lines.on('line', line => frames.push(JSON.parse(line)));
+
+  async function wait(predicate, description) {
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline) {
+      const result = await predicate();
+      if (result) return result;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.fail(`${description}: ${JSON.stringify({frames, commands})}`);
+  }
+  const readLog = async () => {
+    try {return await readFile(logPath, 'utf8');}
+    catch (error) {if (error.code === 'ENOENT') return ''; throw error;}
+  };
+  const send = value => child.stdin.write(JSON.stringify(value) + '\n');
+
+  try {
+    const connected = once(server, 'connection');
+    send({type: 'init', id: 'init', websocket_url: `ws://127.0.0.1:${server.address().port}`});
+    const [socket] = await connected;
+    socket.on('message', data => {
+      const {corrId, cmd} = JSON.parse(data);
+      commands.push(cmd);
+      socket.send(JSON.stringify({corrId, resp: {type: 'cmdOk'}}));
+    });
+    assert.equal((await wait(() => frames.find(frame => frame.type === 'result' && frame.id === 'init'),
+      'bridge initialization timed out')).ok, true);
+
+    socket.send(JSON.stringify({resp: {type: 'callInvitation', callInvitation: {
+      contact: {contactId: 17},
+      sharedKey: 'fixture-key',
+      callType: {media: 'audio', capabilities: {encryption: true}},
+    }}}));
+    const invitation = await wait(() => frames.find(frame => frame.type === 'call_invitation'),
+      'call invitation timed out');
+
+    send({type: 'accept', id: 'accept', contact: '17', call_id: invitation.call_id});
+    await wait(() => readLog().then(log => log.includes('open\n')),
+      'RTC startup did not become pending');
+    send({type: 'hangup', id: 'hangup', contact: '17', call_id: invitation.call_id});
+    assert.equal((await wait(() => frames.find(frame => frame.type === 'result' && frame.id === 'hangup'),
+      'hangup timed out')).ok, true);
+    await wait(() => frames.some(frame => frame.type === 'call_ended'), 'call end was not emitted');
+
+    await writeFile(releasePath, 'release');
+    assert.equal((await wait(() => frames.find(frame => frame.type === 'result' && frame.id === 'accept'),
+      'accept did not settle after RTC startup')).ok, true);
+    const rtcLog = await wait(async () => {
+      const value = await readLog();
+      return ['open\n', 'signal\n', 'close\n'].every(marker => value.includes(marker)) && value;
+    }, 'abandoned RTC was not closed');
+
+    assert.match(rtcLog, /^open\nsignal\nclose\n$/);
+    assert.ok(commands.includes('/_call end @17'));
+    assert.ok(!commands.some(command => command.startsWith('/_call extra ')), 'stale ICE signal was sent');
+    assert.ok(!commands.some(command => command.startsWith('/_call status ')), 'stale connection status was sent');
+    assert.ok(!commands.some(command => command.startsWith('/_call offer ')), 'stale offer was sent');
+    assert.ok(!frames.some(frame => frame.type === 'call_connected'), 'abandoned call became connected');
+  } finally {
+    child.stdin.destroy();
+    child.kill('SIGTERM');
+    lines.close();
+    for (const socket of server.clients) socket.terminate();
+    await new Promise(resolve => server.close(resolve));
+    await rm(temporary, {recursive: true, force: true});
   }
 });

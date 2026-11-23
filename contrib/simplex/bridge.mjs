@@ -103,7 +103,7 @@ async function accept(contact, callId, streaming) {
     emit({type: 'utterance', contact, call_id: current.id, scope: `${current.id}/${current.generation}`, finished,
       audio: audio.toString('base64')}).catch(fatal);
   });
-  current.rtc = await openRtc({
+  const rtc = await openRtc({
     assets: process.env.SIMPLEX_CALL_ASSETS ?? join(homedir(), '.local/share/zeroclaw-simplex'),
     executablePath: process.env.CHROMIUM_PATH,
     onPcm: encoded => {
@@ -125,7 +125,13 @@ async function accept(contact, callId, streaming) {
       } catch {await endCall();}
     },
   });
-  const {resp} = await current.rtc.command({type: 'start', media: 'audio', aesKey: incoming.key, relay: true});
+  if (call !== current) {
+    await rtc.close();
+    return;
+  }
+  current.rtc = rtc;
+  const {resp} = await rtc.command({type: 'start', media: 'audio', aesKey: incoming.key, relay: true});
+  if (call !== current) return;
   if (resp.type !== 'offer' || resp.capabilities?.encryption !== true) {await endCall(); throw Error('simplex_encryption_required');}
   await rpc(`/_call offer @${contact} ${JSON.stringify({callType: {media: 'audio', capabilities: {encryption: true}},
     rtcSession: {rtcSession: resp.offer, rtcIceCandidates: resp.iceCandidates}})}`);
