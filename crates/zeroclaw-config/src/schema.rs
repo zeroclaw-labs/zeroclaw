@@ -121,6 +121,7 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, RuntimeProxyC
 
 struct RuntimeProxyCachedClient {
     generation: u64,
+    runtime_id: tokio::runtime::Id,
     client: reqwest::Client,
 }
 
@@ -936,14 +937,16 @@ pub enum AuthMode {
 /// Prompt-cache entry lifetime to request for this provider's Anthropic
 /// cache markers. `"5m"` is the API default; `"1h"` extends the cache
 /// entry lifetime to one hour so a pause longer than five minutes does
-/// not force a full-price rewrite of the cached prefix. Meaningful only
-/// where Anthropic-shaped `cache_control` markers reach the API: the
-/// native Anthropic provider always places them, compatible providers
-/// only behind `cache_passthrough` (with passthrough off the setting is
-/// inert). One TTL applies to every marker this implementation places;
-/// operator-supplied `cache_control` (via `provider_extra` or raw tool
-/// JSON) sits outside that guarantee and must order 1h before 5m when
-/// mixing lifetimes in one request.
+/// not force a full-price rewrite of the cached prefix; `"off"` places no
+/// markers at all, for a workload that never reuses a prefix and would
+/// otherwise pay the write premium with no read to amortise it.
+/// Meaningful only where Anthropic-shaped `cache_control` markers reach
+/// the API: the native Anthropic provider always places them, compatible
+/// providers only behind `cache_passthrough` (with passthrough off the
+/// setting is inert). One TTL applies to every marker this implementation
+/// places; operator-supplied `cache_control` (via `provider_extra` or raw
+/// tool JSON) sits outside that guarantee and must order 1h before 5m
+/// when mixing lifetimes in one request.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
 )]
@@ -956,6 +959,9 @@ pub enum CacheTtl {
     /// 1-hour cache lifetime; cache writes bill at a premium write rate.
     #[serde(rename = "1h")]
     OneHour,
+    /// Place no prompt-cache breakpoints at all.
+    #[serde(rename = "off")]
+    Off,
 }
 
 /// Named model_provider profile definition.
@@ -2694,6 +2700,78 @@ pub struct AtlasCloudModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── Cheaper Inference ──
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CheaperInferenceEndpoint {
+    #[default]
+    Default,
+}
+
+impl CheaperInferenceEndpoint {
+    /// Canonical Cheaper Inference endpoint. Single source of truth:
+    /// `CompatFamilySpec::DEFAULT_URL` for `CheaperInferenceModelProviderConfig`
+    /// references this const so the schema and factory surfaces never drift.
+    pub const DEFAULT_URI: &'static str = "https://api.cheaperinference.com/v1";
+}
+
+impl ModelEndpoint for CheaperInferenceEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => Self::DEFAULT_URI,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.cheaperinference"]
+pub struct CheaperInferenceModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+#[cfg(test)]
+mod cheaperinference_tests {
+    use super::*;
+
+    #[test]
+    fn cheaperinference_endpoint_uri() {
+        assert_eq!(
+            CheaperInferenceEndpoint::Default.uri(),
+            "https://api.cheaperinference.com/v1"
+        );
+    }
+
+    #[test]
+    fn cheaperinference_config_defaults_empty() {
+        let cfg = CheaperInferenceModelProviderConfig::default();
+        assert!(cfg.base.api_key.is_none());
+        assert!(cfg.base.model.is_none());
+    }
+
+    #[test]
+    fn cheaperinference_alias_round_trips_through_config() {
+        let toml = r#"
+[providers.models.cheaperinference.default]
+model = "gpt-5.4-mini"
+"#;
+        let config: Config = toml::from_str(toml).expect("cheaperinference alias deserializes");
+        let alias = config
+            .providers
+            .models
+            .cheaperinference
+            .get("default")
+            .expect("cheaperinference.default present");
+        assert_eq!(alias.base.model.as_deref(), Some("gpt-5.4-mini"));
+    }
+}
+
 // ── OVH ──
 
 #[derive(
@@ -3800,6 +3878,7 @@ impl_default_family_endpoint! {
     VercelModelProviderConfig,
     CloudflareModelProviderConfig,
     AtlasCloudModelProviderConfig,
+    CheaperInferenceModelProviderConfig,
     OvhModelProviderConfig,
     CopilotModelProviderConfig,
     DoubaoModelProviderConfig,
@@ -4924,6 +5003,13 @@ impl Config {
     }
 
     #[must_use]
+    pub fn effective_tool_elicitation(&self, agent_alias: &str) -> bool {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.tool_elicitation)
+            .unwrap_or(false)
+    }
+
+    #[must_use]
     pub fn effective_tool_dispatcher(&self, agent_alias: &str) -> String {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.tool_dispatcher.as_ref())
@@ -5165,6 +5251,66 @@ impl Config {
             0 => CronJobClaim::Unclaimed,
             1 => CronJobClaim::Sole(enabled[0]),
             _ => CronJobClaim::Contested(enabled),
+        }
+    }
+
+    /// One warning per agent whose explicit `delegates` roster can never fire:
+    /// the resolved risk profile forbids delegation, or its tool policy
+    /// blocks `delegate` (a closed `allowed_tools` list without it,
+    /// `deny_all_tools = true`, or `excluded_tools` naming it). The
+    /// configuration is coherent but inert, and operators otherwise only
+    /// discover that at the first delegation attempt.
+    fn collect_dead_delegate_grant_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for (alias, agent) in &self.agents {
+            if !agent.enabled || agent.delegates.is_empty() {
+                continue;
+            }
+            let Some(profile) = self.risk_profile_for_agent(alias) else {
+                continue;
+            };
+            let profile_alias = agent.risk_profile.trim();
+            let grant_count = agent.delegates.len();
+            let policy_blocks = !profile.delegation_policy.permits();
+            // `effective_allowed_tools()` folds in `deny_all_tools` and the
+            // legacy deny-all sentinel: `Some([])` denies every tool, `None`
+            // is unrestricted.
+            let allowlist_blocks = profile
+                .effective_allowed_tools()
+                .is_some_and(|allowed| !allowed.iter().any(|name| name == "delegate"));
+            let excluded = profile.excluded_tools.iter().any(|name| name == "delegate");
+            let tools_block = allowlist_blocks || excluded;
+            if !policy_blocks && !tools_block {
+                continue;
+            }
+            let tool_reason = if profile.deny_all_tools {
+                "sets deny_all_tools"
+            } else if excluded {
+                "lists `delegate` in excluded_tools"
+            } else {
+                "has an allowed_tools list that omits `delegate`"
+            };
+            let reason = match (policy_blocks, tools_block) {
+                (true, true) => format!(
+                    "risk profile `{profile_alias}` has a delegation_policy.mode that does not \
+                     permit delegation and {tool_reason}"
+                ),
+                (true, false) => format!(
+                    "risk profile `{profile_alias}` has a delegation_policy.mode that does not \
+                     permit delegation"
+                ),
+                (false, _) => format!("risk profile `{profile_alias}` {tool_reason}"),
+            };
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                crate::validation_warnings::DEAD_DELEGATE_GRANTS,
+                format!(
+                    "agents.{alias} has {grant_count} delegate grant(s) but {reason}, so the \
+                     grants are unreachable at runtime"
+                ),
+                format!("agents.{alias}.delegates"),
+            ));
         }
     }
 
@@ -7971,6 +8117,11 @@ pub struct GatewayConfig {
     #[serde(default = "default_gateway_websocket_ping_interval_secs")]
     pub websocket_ping_interval_secs: u64,
 
+    /// Global browser dictation silence timeout in seconds. 0 disables automatic sending.
+    /// Applies to every paired device; accepted range: 0..=300. Default: 15.
+    #[serde(default = "default_voice_silence_timeout_secs")]
+    pub voice_silence_timeout_secs: u64,
+
     /// Pairing-code generation policy (`[gateway.pairing_code]`). The one
     /// source of truth for the length and character family of every code
     /// the gateway issues.
@@ -8041,6 +8192,10 @@ fn default_gateway_long_running_request_timeout_secs() -> u64 {
     600
 }
 
+fn default_voice_silence_timeout_secs() -> u64 {
+    15
+}
+
 fn default_gateway_websocket_ping_interval_secs() -> u64 {
     30
 }
@@ -8105,6 +8260,7 @@ impl Default for GatewayConfig {
             session_persistence: true,
             session_ttl_hours: 0,
             websocket_ping_interval_secs: default_gateway_websocket_ping_interval_secs(),
+            voice_silence_timeout_secs: default_voice_silence_timeout_secs(),
             pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
             dashboard_sign_in: DashboardSignInConfig::default(),
@@ -8924,6 +9080,11 @@ pub struct BrowserConfig {
     /// Browser automation backend: "agent_browser" | "rust_native" | "computer_use" | "auto"
     #[serde(default = "default_browser_backend")]
     pub backend: String,
+    /// Timeout in seconds for agent-browser CLI commands (default: 60).
+    /// Bounds every `browser` tool action on the `agent_browser` backend so a
+    /// wedged CLI cannot hang an agent turn indefinitely.
+    #[serde(default = "default_browser_timeout_secs")]
+    pub timeout_secs: u64,
     /// Show browser window for agent_browser backend. When unset, inherits AGENT_BROWSER_HEADED.
     #[serde(default)]
     pub headed: Option<bool>,
@@ -8960,6 +9121,10 @@ fn default_browser_backend() -> String {
     "agent_browser".into()
 }
 
+fn default_browser_timeout_secs() -> u64 {
+    60
+}
+
 fn default_browser_webdriver_url() -> String {
     "http://127.0.0.1:9515".into()
 }
@@ -8986,6 +9151,7 @@ impl Default for BrowserConfig {
             allowed_domains: vec!["*".into()],
             session_name: None,
             backend: default_browser_backend(),
+            timeout_secs: default_browser_timeout_secs(),
             headed: None,
             native_headless: default_true(),
             native_webdriver_url: default_browser_webdriver_url(),
@@ -12027,21 +12193,28 @@ fn runtime_proxy_cache_key(
 }
 
 fn runtime_proxy_cached_client(cache_key: &str) -> Option<reqwest::Client> {
+    let runtime_id = tokio::runtime::Handle::try_current().ok()?.id();
     let generation = runtime_proxy_current_generation();
     match runtime_proxy_client_cache().read() {
         Ok(guard) => guard
             .get(cache_key)
-            .filter(|entry| entry.generation == generation)
+            .filter(|entry| entry.generation == generation && entry.runtime_id == runtime_id)
             .map(|entry| entry.client.clone()),
         Err(poisoned) => poisoned
             .into_inner()
             .get(cache_key)
-            .filter(|entry| entry.generation == generation)
+            .filter(|entry| entry.generation == generation && entry.runtime_id == runtime_id)
             .map(|entry| entry.client.clone()),
     }
 }
 
 fn set_runtime_proxy_cached_client(cache_key: String, generation: u64, client: reqwest::Client) {
+    // A pooled client's dispatcher belongs to the Tokio runtime that first
+    // uses it. Never hand that client to another runtime after its owner exits.
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let runtime_id = runtime.id();
     if generation != runtime_proxy_current_generation() {
         return;
     }
@@ -12049,13 +12222,27 @@ fn set_runtime_proxy_cached_client(cache_key: String, generation: u64, client: r
     match runtime_proxy_client_cache().write() {
         Ok(mut guard) => {
             if generation == runtime_proxy_config_generation() {
-                guard.insert(cache_key, RuntimeProxyCachedClient { generation, client });
+                guard.insert(
+                    cache_key,
+                    RuntimeProxyCachedClient {
+                        generation,
+                        runtime_id,
+                        client,
+                    },
+                );
             }
         }
         Err(poisoned) => {
             let mut guard = poisoned.into_inner();
             if generation == runtime_proxy_config_generation() {
-                guard.insert(cache_key, RuntimeProxyCachedClient { generation, client });
+                guard.insert(
+                    cache_key,
+                    RuntimeProxyCachedClient {
+                        generation,
+                        runtime_id,
+                        client,
+                    },
+                );
             }
         }
     }
@@ -15169,6 +15356,9 @@ pub struct RuntimeProfileConfig {
     pub parallel_tools: Option<bool>,
     /// Request one native tool call per provider response when supported. Default off.
     pub single_tool_rounds: Option<bool>,
+    /// Enable pre-turn tool-elicitation hints (prefilter + ephemeral hint).
+    /// `None` inherits (default off).
+    pub tool_elicitation: Option<bool>,
     /// Tool dispatch strategy (e.g. `"auto"`). `None` inherits.
     pub tool_dispatcher: Option<String>,
     /// Tools exempt from within-turn dedup check.
@@ -15237,6 +15427,7 @@ impl Default for RuntimeProfileConfig {
             compact_context: None,
             parallel_tools: None,
             single_tool_rounds: None,
+            tool_elicitation: None,
             tool_dispatcher: None,
             tool_call_dedup_exempt: Vec::new(),
             deferred_builtin_tools: false,
@@ -18114,6 +18305,9 @@ pub struct MatrixConfig {
     #[serde(default)]
     pub device_id: Option<String>,
     /// Allowed Matrix room IDs. Empty = allow all rooms the bot has joined.
+    /// Also gates room invites: an invite from an allowed peer is accepted
+    /// only for a listed room. When empty, an invite is accepted into any
+    /// room, but only from a peer named explicitly (not just via `*`).
     /// Entries are matched literally against the canonical room ID
     /// (`!abc:server`) of each incoming message; `#room:server` aliases are
     /// not resolved for this allowlist (they are resolved only for outbound
@@ -20167,7 +20361,8 @@ pub struct SecurityConfig {
     #[nested]
     pub otp: OtpConfig,
 
-    /// Emergency-stop state machine configuration.
+    /// Emergency-stop configuration. Not enforced: no runtime path reads the
+    /// estop state, so these settings do not stop anything.
     #[serde(default)]
     #[nested]
     pub estop: EstopConfig,
@@ -20383,15 +20578,17 @@ impl Default for OtpConfig {
 #[prefix = "security.estop"]
 #[serde(deny_unknown_fields)]
 pub struct EstopConfig {
-    /// Enable emergency stop controls.
+    /// Emergency stop switch. Not enforced: no runtime path reads the estop
+    /// state, so enabling it does not stop anything.
     #[serde(default)]
     pub enabled: bool,
 
-    /// File path used to persist estop state.
+    /// File path reserved for estop state. Not enforced: nothing reads its contents.
     #[serde(default = "default_estop_state_file")]
     pub state_file: String,
 
-    /// Require a valid OTP before resume operations.
+    /// Require a valid OTP before resume operations. Not enforced: the resume
+    /// command refuses to run.
     #[serde(default = "default_true")]
     pub require_otp_to_resume: bool,
 }
@@ -23946,6 +24143,7 @@ impl Config {
         self.collect_verifiable_intent_warnings(&mut warnings);
         self.collect_cron_claim_warnings(&mut warnings);
         self.collect_compiled_out_tool_warnings(&mut warnings);
+        self.collect_dead_delegate_grant_warnings(&mut warnings);
         warnings.extend(validate_memory_semantics(&self.memory));
         for (alias, wa) in &self.channels.whatsapp {
             warnings.extend(validate_whatsapp_semantics(alias, wa));
@@ -24096,6 +24294,24 @@ impl Config {
                      checked. Use a build that includes `{feature}`, or disable the section."
                 ),
                 format!("{section}.enabled"),
+            ));
+        }
+        // Web search defaults to enabled, so unlike the sections above its
+        // absence in a lean build is the norm, not a config written for a
+        // fuller build — report it the same way rather than dropping it
+        // silently. It stands outside `OptInTool::ALL` because the inventory
+        // files `web_search_tool` under `External`; see the variant's note.
+        let web_search = crate::opt_in_tools::OptInTool::WebSearch;
+        if !web_search.compiled() && web_search.enabled_in(self) {
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                crate::validation_warnings::TOOL_COMPILED_OUT,
+                format!(
+                    "[web_search] is enabled, but this build was compiled without the \
+                     `tools-external` feature, so the tool is unavailable and its settings \
+                     are not checked. Use a build that includes `tools-external` (the \
+                     `tools-compat` bundle), or disable the section."
+                ),
+                "web_search.enabled".to_string(),
             ));
         }
     }
@@ -24691,6 +24907,10 @@ impl Config {
             }
         }
 
+        if self.gateway.voice_silence_timeout_secs > 300 {
+            let path = "gateway.voice_silence_timeout_secs";
+            validation_bail!(InvalidNumericRange, path, "{path} must be 0..=300");
+        }
         let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
         if websocket_ping_interval_secs > GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS {
             let path = "gateway.websocket_ping_interval_secs";
@@ -29860,6 +30080,17 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
+    fn cache_ttl_off_is_a_known_lifetime_that_round_trips() {
+        let off: ModelProviderConfig = toml::from_str("cache_ttl = \"off\"").unwrap();
+        assert_eq!(off.cache_ttl, Some(CacheTtl::Off));
+        assert_eq!(
+            toml::to_string(&off).unwrap(),
+            "cache_ttl = \"off\"\n",
+            "off must round-trip its wire string"
+        );
+    }
+
+    #[::core::prelude::v1::test]
     fn cache_ttl_rejects_unknown_lifetime() {
         let parsed = toml::from_str::<ModelProviderConfig>("cache_ttl = \"2h\"");
         assert!(
@@ -32990,6 +33221,18 @@ enabled = true
     }
 
     #[test]
+    async fn validate_global_voice_silence_timeout_bounds() {
+        let mut config = Config::default();
+        assert_eq!(config.gateway.voice_silence_timeout_secs, 15);
+        for seconds in [0, 1, 15, 300] {
+            config.gateway.voice_silence_timeout_secs = seconds;
+            config.validate().expect("valid voice timeout");
+        }
+        config.gateway.voice_silence_timeout_secs = 301;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     async fn validate_rejects_websocket_ping_interval_above_upper_bound() {
         let mut config = Config::default();
         config.gateway.websocket_ping_interval_secs = GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS + 1;
@@ -35809,6 +36052,30 @@ runtime_profile = "missing"
     }
 
     #[test]
+    async fn runtime_profile_tool_elicitation_is_honored() {
+        let raw = r#"
+[runtime_profiles.hinted]
+tool_elicitation = true
+
+[agents.default]
+runtime_profile = "hinted"
+"#;
+        let parsed = parse_test_config(raw);
+        assert!(parsed.effective_tool_elicitation("default"));
+    }
+
+    #[test]
+    async fn tool_elicitation_defaults_off() {
+        let parsed = parse_test_config(
+            r#"
+[agents.default]
+runtime_profile = "default"
+"#,
+        );
+        assert!(!parsed.effective_tool_elicitation("default"));
+    }
+
+    #[test]
     async fn runtime_profile_unset_max_tool_iterations_uses_default() {
         // A profile that does not set max_tool_iterations (sentinel 0) falls
         // back to the global default rather than 0.
@@ -38151,6 +38418,7 @@ allowed_numbers = ["+1", "+2"]
             session_persistence: true,
             session_ttl_hours: 0,
             websocket_ping_interval_secs: 30,
+            voice_silence_timeout_secs: 15,
             pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
             dashboard_sign_in: DashboardSignInConfig::default(),
@@ -38349,6 +38617,7 @@ default_temperature = 0.7
         );
         assert_eq!(b.allowed_domains, vec!["*".to_string()]);
         assert_eq!(b.backend, "agent_browser");
+        assert_eq!(b.timeout_secs, 60);
         assert_eq!(b.headed, None);
         assert!(b.native_headless);
         assert_eq!(b.native_webdriver_url, "http://127.0.0.1:9515");
@@ -38369,6 +38638,7 @@ default_temperature = 0.7
             allowed_domains: vec!["example.com".into(), "docs.example.com".into()],
             session_name: None,
             backend: "auto".into(),
+            timeout_secs: 45,
             headed: Some(true),
             native_headless: false,
             native_webdriver_url: "http://localhost:4444".into(),
@@ -38391,6 +38661,7 @@ default_temperature = 0.7
         assert_eq!(parsed.allowed_domains.len(), 2);
         assert_eq!(parsed.allowed_domains[0], "example.com");
         assert_eq!(parsed.backend, "auto");
+        assert_eq!(parsed.timeout_secs, 45);
         assert_eq!(parsed.headed, Some(true));
         assert!(!parsed.native_headless);
         assert_eq!(parsed.native_webdriver_url, "http://localhost:4444");
@@ -40470,8 +40741,13 @@ runtime_profile = "default"
     )))]
     #[test]
     async fn a_lean_build_validates_enabled_sections_for_tools_it_lacks() {
+        let mut quiet = Config::default();
+        // `[web_search]` defaults to enabled and reports compiled out in a
+        // build without `tools-external`; this assertion is about the
+        // sections enabled below, so keep the default noise out.
+        quiet.web_search.enabled = false;
         assert!(
-            !Config::default()
+            !quiet
                 .collect_warnings()
                 .iter()
                 .any(|warning| warning.code == crate::validation_warnings::TOOL_COMPILED_OUT),
@@ -40479,6 +40755,7 @@ runtime_profile = "default"
         );
 
         let mut config = Config::default();
+        config.web_search.enabled = false;
         config.microsoft365.enabled = true;
         config.project_intel.enabled = true;
         config.project_intel.templates_dir = Some("/nonexistent/zeroclaw-templates".into());
@@ -40515,6 +40792,10 @@ runtime_profile = "default"
     async fn google_workspace_allowlist_is_checked_only_where_the_tool_is_compiled() {
         use crate::opt_in_tools::OptInTool;
         let mut config = Config::default();
+        // `[web_search]` defaults to enabled and stands outside this test's
+        // focus; it reports compiled out in any build without
+        // `tools-external`, which the assertion below is not about.
+        config.web_search.enabled = false;
         config.google_workspace.enabled = true;
         config.google_workspace.allowed_services = vec!["drive".into()];
         config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
@@ -40546,6 +40827,28 @@ runtime_profile = "default"
         }
     }
 
+    /// `web_search` defaults to enabled, so a build without `tools-external`
+    /// must say the tool is compiled out instead of silently dropping it;
+    /// a build that carries the feature reports nothing.
+    #[test]
+    async fn web_search_section_reports_compiled_out_without_tools_external() {
+        use crate::opt_in_tools::OptInTool;
+        let mut config = Config::default();
+        config.web_search.enabled = true;
+
+        let compiled_out: Vec<String> = config
+            .collect_warnings()
+            .into_iter()
+            .filter(|warning| warning.code == crate::validation_warnings::TOOL_COMPILED_OUT)
+            .map(|warning| warning.path)
+            .collect();
+        if OptInTool::WebSearch.compiled() {
+            assert!(compiled_out.is_empty(), "{compiled_out:?}");
+        } else {
+            assert_eq!(compiled_out, ["web_search.enabled"]);
+        }
+    }
+
     /// The counterpart in a build that carries the tools: their settings are
     /// still checked, and nothing is reported as compiled out.
     #[cfg(all(
@@ -40568,6 +40871,10 @@ runtime_profile = "default"
         ];
         for (field, enable) in cases {
             let mut config = Config::default();
+            // `[web_search]` defaults to enabled and stands outside this
+            // test's focus; in a build without `tools-external` it would
+            // report compiled out and trip the assertion below.
+            config.web_search.enabled = false;
             enable(&mut config);
             let err = config
                 .validate()
@@ -40996,6 +41303,118 @@ api_token = "tok"
         assert!(err.contains("sub_resource contains invalid characters"));
     }
 
+    #[test]
+    async fn runtime_proxy_client_cache_survives_owner_runtime_shutdown() {
+        let _guard = env_override_lock().await;
+        struct RestoreProxyBypass(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreProxyBypass {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    // SAFETY: the environment test lock outlives this guard.
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(key, value),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let _bypass = RestoreProxyBypass(
+            ["NO_PROXY", "no_proxy"]
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        );
+        for key in ["NO_PROXY", "no_proxy"] {
+            set_or_clear_env(key, Some("127.0.0.1"));
+        }
+        let previous = runtime_proxy_config();
+        set_runtime_proxy_config(ProxyConfig::default());
+        let result = tokio::task::spawn_blocking(|| {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+                let mut connections: Vec<(std::net::TcpStream, Vec<u8>)> = Vec::new();
+                let mut served_on = Vec::new();
+                while served_on.len() < 4 && std::time::Instant::now() < deadline {
+                    loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => {
+                                socket.set_nonblocking(true).unwrap();
+                                connections.push((socket, Vec::new()));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(error) => panic!("fixture accept: {error}"),
+                        }
+                    }
+                    for (index, (socket, buffered)) in connections.iter_mut().enumerate() {
+                        let mut chunk = [0u8; 4096];
+                        match socket.read(&mut chunk) {
+                            Ok(count) => buffered.extend_from_slice(&chunk[..count]),
+                            Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionReset) => {},
+                            Err(error) => panic!("fixture read: {error}"),
+                        }
+                        while let Some(end) = buffered.windows(4).position(|part| part == b"\r\n\r\n") {
+                            buffered.drain(..end + 4);
+                            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok").unwrap();
+                            served_on.push(index);
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                served_on
+            });
+            let service = format!("runtime-owner-{}", uuid::Uuid::new_v4());
+            fn request_on(runtime: &tokio::runtime::Runtime, service: &str, endpoint: &str, count: usize) -> Vec<reqwest::Result<String>> {
+                runtime.block_on(async {
+                    let mut results = Vec::new();
+                    for _ in 0..count {
+                        let client = build_runtime_proxy_client_with_timeouts(service, 2, 2);
+                        results.push(async {client.get(endpoint).send().await?.text().await}.await);
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    results
+                })
+            }
+            let runtime = || tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let first_owner = runtime();
+            let mut results = request_on(&first_owner, &service, &endpoint, 2);
+            // Keep the first owner's live pool, but stop driving its reactor.
+            // A runtime-blind hit now dispatches into that paused owner and times out.
+            let second_owner = runtime();
+            results.extend(request_on(&second_owner, &service, &endpoint, 1));
+            drop(first_owner);
+            drop(second_owner);
+            // Also exercise cache lookup after its last owner has shut down.
+            let after_shutdown = runtime();
+            results.extend(request_on(&after_shutdown, &service, &endpoint, 1));
+            drop(after_shutdown);
+            (results, server.join().unwrap())
+        }).await;
+        set_runtime_proxy_config(previous);
+        let (results, served_on) = result.unwrap();
+        for result in results {
+            assert_eq!(result.unwrap(), "ok");
+        }
+        assert_eq!(served_on.len(), 4);
+        assert_eq!(
+            served_on[0], served_on[1],
+            "warm requests must reuse a live pooled connection"
+        );
+        assert_ne!(
+            served_on[1], served_on[2],
+            "a new runtime needs its own connection"
+        );
+        assert_ne!(
+            served_on[2], served_on[3],
+            "a shut-down owner cannot supply the next pool"
+        );
+    }
+
     fn runtime_proxy_cache_contains(cache_key: &str) -> bool {
         runtime_proxy_cached_client(cache_key).is_some()
     }
@@ -41105,6 +41524,7 @@ api_token = "tok"
                     cache_key.clone(),
                     RuntimeProxyCachedClient {
                         generation: stale_generation,
+                        runtime_id: tokio::runtime::Handle::current().id(),
                         client: reqwest::Client::new(),
                     },
                 );
@@ -41115,6 +41535,7 @@ api_token = "tok"
                     cache_key.clone(),
                     RuntimeProxyCachedClient {
                         generation: stale_generation,
+                        runtime_id: tokio::runtime::Handle::current().id(),
                         client: reqwest::Client::new(),
                     },
                 );
@@ -43407,6 +43828,163 @@ group_policy = "disabled"
 
         let config: Config = toml::from_str("").expect("empty TOML loads with defaults");
         assert!(config.security.audit.enabled);
+    }
+
+    #[test]
+    async fn collect_warnings_flags_dead_delegate_grants_under_forbidden_policy() {
+        let mut config: Config = toml::from_str(
+            r#"
+[risk_profiles.worker_project]
+[risk_profiles.worker_project.delegation_policy]
+mode = "forbidden"
+
+[agents.projects_assistant]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[[agents.projects_assistant.delegates]]
+agent = "demiurge"
+mode = "independent"
+
+[agents.demiurge]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[providers.models.openai.gpt]
+model = "gpt-4o-mini"
+"#,
+        )
+        .expect("dead-grant fixture loads");
+        suppress_semantic_memory_warning(&mut config);
+
+        let warnings =
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let w = &warnings[0];
+        assert_eq!(w.path, "agents.projects_assistant.delegates");
+        assert!(
+            w.message.contains("delegation_policy.mode")
+                && w.message.contains("projects_assistant")
+                && w.message.contains("unreachable"),
+            "unexpected message: {}",
+            w.message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_silent_when_delegate_grants_match_allow_policy() {
+        let mut config: Config = toml::from_str(
+            r#"
+[risk_profiles.worker_project]
+[risk_profiles.worker_project.delegation_policy]
+mode = "allow"
+
+[agents.projects_assistant]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[[agents.projects_assistant.delegates]]
+agent = "demiurge"
+mode = "independent"
+
+[agents.demiurge]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[providers.models.openai.gpt]
+model = "gpt-4o-mini"
+"#,
+        )
+        .expect("reachable-grant fixture loads");
+        suppress_semantic_memory_warning(&mut config);
+
+        assert!(
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS)
+                .is_empty()
+        );
+    }
+
+    fn dead_grant_fixture(profile_body: &str) -> Config {
+        let mut config: Config = toml::from_str(&format!(
+            r#"
+[risk_profiles.worker_project]
+{profile_body}
+[risk_profiles.worker_project.delegation_policy]
+mode = "allow"
+
+[agents.projects_assistant]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[[agents.projects_assistant.delegates]]
+agent = "demiurge"
+mode = "independent"
+
+[agents.demiurge]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[providers.models.openai.gpt]
+model = "gpt-4o-mini"
+"#
+        ))
+        .expect("dead-grant fixture loads");
+        suppress_semantic_memory_warning(&mut config);
+        config
+    }
+
+    #[test]
+    async fn collect_warnings_flags_dead_delegate_grants_under_deny_all_tools() {
+        let config = dead_grant_fixture("deny_all_tools = true");
+        let warnings =
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.contains("deny_all_tools"),
+            "unexpected message: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_dead_delegate_grants_when_delegate_excluded() {
+        let config = dead_grant_fixture(r#"excluded_tools = ["delegate"]"#);
+        let warnings =
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.contains("excluded_tools"),
+            "unexpected message: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_dead_delegate_grants_when_allowlist_omits_delegate() {
+        let config = dead_grant_fixture(r#"allowed_tools = ["shell"]"#);
+        let warnings =
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.contains("allowed_tools") && !warnings[0].message.contains("  "),
+            "unexpected message: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_silent_when_allowlist_admits_delegate() {
+        let config = dead_grant_fixture(r#"allowed_tools = ["shell", "delegate"]"#);
+        assert!(
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS)
+                .is_empty()
+        );
     }
 
     // Disabling the section silently stops the certificate trail:
@@ -54029,6 +54607,9 @@ group_policy = "all"
 
     fn suppress_semantic_memory_warning(config: &mut Config) {
         config.memory.search_mode = SearchMode::Bm25;
+        // Default-on `[web_search]` reports TOOL_COMPILED_OUT in builds
+        // without `tools-external`; these tests count unrelated warnings.
+        config.web_search.enabled = false;
     }
 
     #[test]

@@ -4,7 +4,7 @@ use crate::security::AutonomyLevel;
 use crate::skills::Skill;
 use crate::tools::Tool;
 use anyhow::Result;
-use chrono::{Datelike, Local};
+use chrono::{DateTime, Datelike, Local, TimeZone};
 use std::fmt::Write;
 use std::path::Path;
 use zeroclaw_config::schema::IdentityConfig;
@@ -97,6 +97,20 @@ pub(crate) const TIMESTAMP_ORIENTATION: &str = "This is an interactive conversat
 
 pub(crate) fn append_timestamp_orientation(prompt: &mut String) {
     prompt.push_str(TIMESTAMP_ORIENTATION);
+}
+
+/// Prefixes a user message with a `[CURRENT DATE & TIME: ...]` line. This
+/// per-turn line, not the system prompt, is where the model gets the time of
+/// day; see `SystemPromptBuilder::with_defaults`.
+pub(crate) fn timestamp_user_message<Tz>(now: &DateTime<Tz>, message: &str) -> String
+where
+    Tz: TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    format!(
+        "[CURRENT DATE & TIME: {}]\n\n{message}",
+        now.format("%Y-%m-%d %H:%M:%S %Z")
+    )
 }
 
 pub struct PromptContext<'a> {
@@ -197,9 +211,9 @@ impl SystemPromptBuilder {
     /// content (and with it every provider prompt-cache entry hashed behind
     /// it) would change once a day per session. The per-turn
     /// `[CURRENT DATE & TIME]` user-message prefix is the authoritative
-    /// clock, so the cached system prefix stays byte-stable. Builders for
-    /// paths without that prefix (e.g. the delegate sub-agent prompt) opt in
-    /// by adding the section explicitly.
+    /// clock, so the cached system prefix stays byte-stable. Builders that
+    /// also want the date in the system prompt opt in by adding the section
+    /// explicitly.
     pub fn with_defaults() -> Self {
         Self {
             sections: vec![
@@ -1276,6 +1290,19 @@ mod tests {
         assert!(payload.contains("UTC offset:"));
         assert!(!payload.contains("Time:"));
         assert!(!payload.contains("ISO 8601:"));
+    }
+
+    #[test]
+    fn timestamp_user_message_prefixes_time_of_day_and_utc_offset() {
+        let now = chrono::FixedOffset::west_opt(8 * 3600)
+            .unwrap()
+            .with_ymd_and_hms(2026, 3, 14, 21, 38, 5)
+            .unwrap();
+
+        assert_eq!(
+            timestamp_user_message(&now, "What time is it?"),
+            "[CURRENT DATE & TIME: 2026-03-14 21:38:05 -08:00]\n\nWhat time is it?"
+        );
     }
 
     #[test]
