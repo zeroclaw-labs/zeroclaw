@@ -88,27 +88,87 @@ impl WebDavRead {
         Ok(written)
     }
 
+    /// Create exactly one directory. Parent creation and authorization are
+    /// handled separately by the caller.
+    pub async fn create_directory(
+        &self,
+        path: &str,
+        authorization: Option<HeaderValue>,
+    ) -> Result<(), WebDavError> {
+        let method = Method::from_bytes(b"MKCOL").map_err(|_| WebDavError::Transport)?;
+        let response = self
+            .send(method, resource_url(&self.root, path)?, authorization, None)
+            .await?;
+        require_status(response, StatusCode::CREATED).map(|_| ())
+    }
+
+    /// Rename within the same parent and registered WebDAV resource. The
+    /// destination is never supplied as a URL by the model. Callers must
+    /// authorize both paths and any affected directory subtree first.
+    pub async fn rename(
+        &self,
+        source: &str,
+        destination: &str,
+        authorization: Option<HeaderValue>,
+    ) -> Result<(), WebDavError> {
+        let parent = |path: &str| {
+            path.rsplit_once('/')
+                .map_or("", |(parent, _)| parent)
+                .to_owned()
+        };
+        if source == destination || parent(source) != parent(destination) {
+            return Err(WebDavError::InvalidPath);
+        }
+        let source = resource_url(&self.root, source)?;
+        let destination = resource_url(&self.root, destination)?;
+        let method = Method::from_bytes(b"MOVE").map_err(|_| WebDavError::Transport)?;
+        let response = self
+            .send(method, source, authorization, Some(destination))
+            .await?;
+        require_status(response, StatusCode::CREATED).map(|_| ())
+    }
+
     async fn request(
         &self,
         method: Method,
         path: &str,
         authorization: Option<HeaderValue>,
     ) -> Result<Response, WebDavError> {
-        let url = resource_url(&self.root, path)?;
+        let response = self
+            .send(method, resource_url(&self.root, path)?, authorization, None)
+            .await?;
+        require_status(response, StatusCode::OK)
+    }
+
+    async fn send(
+        &self,
+        method: Method,
+        url: Url,
+        authorization: Option<HeaderValue>,
+        rename_destination: Option<Url>,
+    ) -> Result<Response, WebDavError> {
         let mut request = self
             .client
             .request(method, url)
             .header(ACCEPT_ENCODING, "identity");
+        if let Some(destination) = rename_destination {
+            request = request
+                .header("Destination", destination.as_str())
+                .header("Overwrite", "F");
+        }
         if let Some(mut authorization) = authorization {
             authorization.set_sensitive(true);
             request = request.header(AUTHORIZATION, authorization);
         }
-        let response = request.send().await.map_err(|_| WebDavError::Transport)?;
-        if response.status() != StatusCode::OK {
-            return Err(WebDavError::Status(response.status()));
-        }
-        Ok(response)
+        request.send().await.map_err(|_| WebDavError::Transport)
     }
+}
+
+fn require_status(response: Response, expected: StatusCode) -> Result<Response, WebDavError> {
+    if response.status() != expected {
+        return Err(WebDavError::Status(response.status()));
+    }
+    Ok(response)
 }
 
 fn build_client(
@@ -169,7 +229,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn https_fixture_checks_metadata_transfer_limit_and_redirect() {
+    async fn https_fixture_checks_reads_mutations_limits_and_redirects() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -211,6 +271,21 @@ mod tests {
                     "redirect.txt",
                     "HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 ),
+                (
+                    "MKCOL",
+                    "docs",
+                    "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ),
+                (
+                    "MOVE",
+                    "docs/old.txt",
+                    "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ),
+                (
+                    "MOVE",
+                    "docs/new.txt",
+                    "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ),
             ] {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut tls = acceptor.accept(stream).await.unwrap();
@@ -226,6 +301,19 @@ mod tests {
                         .to_ascii_lowercase()
                         .contains("\r\nauthorization: bearer fixture-only\r\n")
                 );
+                if method == "MOVE" {
+                    let request = request.to_ascii_lowercase();
+                    let target = if path == "docs/old.txt" {
+                        "new.txt"
+                    } else {
+                        "existing.txt"
+                    };
+                    assert!(request.contains("\r\noverwrite: f\r\n"));
+                    assert!(request.contains(&format!(
+                        "\r\ndestination: https://files.test:{}/dav/docs/{target}\r\n",
+                        addr.port()
+                    )));
+                }
                 tls.write_all(response.as_bytes()).await.unwrap();
                 tls.shutdown().await.unwrap();
             }
@@ -269,6 +357,26 @@ mod tests {
                     .download("redirect.txt", authorization(), 4, &mut staged)
                     .await,
                 Err(WebDavError::Status(StatusCode::FOUND))
+            ));
+            adapter
+                .create_directory("docs", authorization())
+                .await
+                .unwrap();
+            adapter
+                .rename("docs/old.txt", "docs/new.txt", authorization())
+                .await
+                .unwrap();
+            assert!(matches!(
+                adapter
+                    .rename("docs/new.txt", "elsewhere/new.txt", authorization())
+                    .await,
+                Err(WebDavError::InvalidPath)
+            ));
+            assert!(matches!(
+                adapter
+                    .rename("docs/new.txt", "docs/existing.txt", authorization())
+                    .await,
+                Err(WebDavError::Status(StatusCode::PRECONDITION_FAILED))
             ));
             server.await.unwrap();
         })

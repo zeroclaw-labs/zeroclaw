@@ -73,8 +73,8 @@ Caller integration still needs to acquire or refresh the handle from the registe
 
 The public operation set for each backend is the intersection of what the shared contract verifies on Linux, Windows and macOS. A backend with missing host facilities remains unavailable on that host. An implementation present on one or two platforms is experimental until the same behavior is verified on all three. The same rule applies to operations, errors and approval semantics. The Linux mount adapter is not advertised by itself.
 
-## WebDAV over HTTPS read adapter
+## WebDAV over HTTPS adapter
 
 The draft uses one portable Reqwest transport for HEAD size lookup and bounded GET into a staging writer. It accepts an operator-managed HTTPS directory URL and addresses already checked against the deployment's egress policy. DNS addresses are pinned for the client, TLS authenticates the peer, redirects are disabled, and the request URL is built beneath that root from validated path components. The adapter receives the authorization header from its caller and marks it sensitive.
 
-Runtime integration must resolve live grants and verify the permitted egress addresses before authorizing use of a vault reference. Tests cover URL and address validation plus a disposable HTTPS server for metadata, download, chunked size limits and redirect refusal. Windows/macOS and production WebDAV execution remain pending. WebDAV listing and mutation methods are not enabled by this adapter.
+Runtime integration must resolve live grants and verify the permitted egress addresses before authorizing use of a vault reference. Tests cover URL and address validation plus a disposable HTTPS server for metadata, download, chunked size limits and redirect refusal. Windows/macOS and production WebDAV execution remain pending. The adapter also exposes MKCOL for one directory and same-parent MOVE for rename, with Overwrite: F. Both paths are built within the registered root. The WebDAV server must enforce the no-overwrite precondition. A transport failure during a mutation requires state verification before retry. Upload, delete and listing remain pending.
