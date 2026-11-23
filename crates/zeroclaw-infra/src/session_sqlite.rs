@@ -1306,15 +1306,18 @@ impl SessionBackend for SqliteSessionBackend {
 
         let count = stale_keys.len();
         for key in &stale_keys {
-            let _ = conn.execute("DELETE FROM sessions WHERE session_key = ?1", params![key]);
-            let _ = conn.execute(
+            conn.execute("DELETE FROM sessions WHERE session_key = ?1", params![key])
+                .map_err(std::io::Error::other)?;
+            conn.execute(
                 "DELETE FROM session_metadata WHERE session_key = ?1",
                 params![key],
-            );
-            let _ = conn.execute(
+            )
+            .map_err(std::io::Error::other)?;
+            conn.execute(
                 "DELETE FROM session_messages WHERE target_session_key = ?1",
                 params![key],
-            );
+            )
+            .map_err(std::io::Error::other)?;
         }
 
         Ok(count)
@@ -2329,6 +2332,27 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "the reused id does not inherit the expired session's inbox"
+        );
+    }
+
+    #[test]
+    fn stale_cleanup_reports_a_failed_delete() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        session_with_received_and_pending_messages(&backend);
+        {
+            let conn = backend.conn.lock();
+            let old_time = (Utc::now() - Duration::hours(100)).to_rfc3339();
+            conn.execute(
+                "UPDATE session_metadata SET last_activity = ?1 WHERE session_key = 'target'",
+                params![old_time],
+            )
+            .unwrap();
+            conn.execute("DROP TABLE session_messages", []).unwrap();
+        }
+        assert!(
+            backend.cleanup_stale(48).is_err(),
+            "a delete that fails is reported, not counted as cleaned"
         );
     }
 
