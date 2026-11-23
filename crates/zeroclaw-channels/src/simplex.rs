@@ -75,7 +75,7 @@ struct Inner {
     /// Creates the unfinished spoken turn from completed STT chunks. It is
     /// neither durable chat history nor a policy snapshot; only the assembled
     /// turn enters shared dispatch, once silence closes it.
-    transcripts: Mutex<HashMap<String, String>>,
+    transcripts: Mutex<HashMap<(String, String), String>>,
     /// Invalidates queued or running call transcription after call control.
     /// Entries exist only for active calls; ordinary text and notes use local
     /// tokens and never allocate here.
@@ -333,14 +333,19 @@ impl SimplexChannel {
             .clone()
     }
     fn invalidate_call_transcription(&self, contact: &str, call_id: &str) {
-        if let Some(generation) = self
-            .inner
-            .call_transcriptions
-            .lock()
-            .remove(&(contact.to_string(), call_id.to_string()))
+        let mut call_transcriptions = self.inner.call_transcriptions.lock();
+        if let Some(generation) =
+            call_transcriptions.remove(&(contact.to_string(), call_id.to_string()))
         {
             generation.cancel();
         }
+        let prefix = format!("{call_id}/");
+        self.inner
+            .transcripts
+            .lock()
+            .retain(|(scope_contact, scope), _| {
+                scope_contact != contact || !scope.starts_with(&prefix)
+            });
     }
     async fn report_event_failure(&self, contact: &str, voice: bool, error: anyhow::Error) {
         if voice && let Err(notice_error) = self.voice_notice(contact, false).await {
@@ -746,11 +751,6 @@ impl SimplexChannel {
             if let Some(call) = event["call_id"].as_str() {
                 self.inner.recognition.lock().remove(call);
             }
-            let prefix = format!("{}/", event["call_id"].as_str().unwrap_or(""));
-            self.inner
-                .transcripts
-                .lock()
-                .retain(|scope, _| !scope.starts_with(&prefix));
             return Ok(());
         }
         if kind == "voice_transfer_failed" {
@@ -849,6 +849,9 @@ impl SimplexChannel {
         let contact = event["contact"]
             .as_str()
             .context("simplex_contact_missing")?;
+        if !self.allowed(contact, call) {
+            return Ok(());
+        }
         let mut text = if voice {
             let prepare_started = std::time::Instant::now();
             let bytes = base64::engine::general_purpose::STANDARD
@@ -929,8 +932,13 @@ impl SimplexChannel {
             let scope = event["scope"]
                 .as_str()
                 .context("simplex_voice_scope_missing")?;
-            let Some(complete) =
-                self.assemble_transcript(scope, &text, event["finished"] == true)?
+            let Some(complete) = self.assemble_transcript(
+                contact,
+                scope,
+                &text,
+                event["finished"] == true,
+                &generation,
+            )?
             else {
                 return Ok(());
             };
@@ -987,16 +995,20 @@ impl SimplexChannel {
     }
     fn assemble_transcript(
         &self,
+        contact: &str,
         scope: &str,
         text: &str,
         finished: bool,
+        generation: &CancellationToken,
     ) -> Result<Option<String>> {
         let mut transcripts = self.inner.transcripts.lock();
+        ensure!(!generation.is_cancelled(), "simplex_message_cancelled");
+        let key = (contact.to_string(), scope.to_string());
         ensure!(
-            transcripts.contains_key(scope) || transcripts.len() < 32,
+            transcripts.contains_key(&key) || transcripts.len() < 32,
             "simplex_unfinished_turn_limit"
         );
-        let combined = transcripts.entry(scope.to_string()).or_default();
+        let combined = transcripts.entry(key.clone()).or_default();
         ensure!(
             combined.len() + text.len() <= 256_000,
             "simplex_transcript_limit"
@@ -1008,7 +1020,7 @@ impl SimplexChannel {
             combined.push_str(text.trim());
         }
         Ok(if finished {
-            transcripts.remove(scope)
+            transcripts.remove(&key)
         } else {
             None
         })
@@ -2504,33 +2516,121 @@ mod tests {
     #[test]
     fn continuous_speech_chunks_form_one_input_only_after_silence() {
         let (channel, _) = fixture();
+        let generation = CancellationToken::new();
         assert!(
             channel
-                .assemble_transcript("call/turn", "First part.", false)
+                .assemble_transcript("17", "call/turn", "First part.", false, &generation)
                 .unwrap()
                 .is_none()
         );
         assert!(
             channel
-                .assemble_transcript("call/turn", "Second part.", false)
+                .assemble_transcript("17", "call/turn", "Second part.", false, &generation)
                 .unwrap()
                 .is_none()
         );
         assert_eq!(
             channel
-                .assemble_transcript("call/turn", "", true)
+                .assemble_transcript("17", "call/turn", "", true, &generation)
                 .unwrap()
                 .as_deref(),
             Some("First part. Second part.")
         );
         assert_eq!(
             channel
-                .assemble_transcript("call/next", "Next turn.", true)
+                .assemble_transcript("17", "call/next", "Next turn.", true, &generation)
                 .unwrap()
                 .as_deref(),
             Some("Next turn.")
         );
         assert!(channel.inner.transcripts.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn interrupted_call_clears_partial_transcript_scope_without_losing_future_capacity() {
+        let (channel, _) = fixture();
+        let abandoned = channel.call_transcription_generation("17", "call");
+        channel
+            .assemble_transcript("17", "call/abandoned", "stale partial", false, &abandoned)
+            .unwrap();
+        let other_contact = channel.call_transcription_generation("18", "call");
+        channel
+            .assemble_transcript(
+                "18",
+                "call/abandoned",
+                "other contact partial",
+                false,
+                &other_contact,
+            )
+            .unwrap();
+        for index in 0..30 {
+            channel
+                .assemble_transcript(
+                    "18",
+                    &format!("other/{index}"),
+                    "partial",
+                    false,
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+        }
+        assert_eq!(channel.inner.transcripts.lock().len(), 32);
+
+        let (tx, mut rx) = mpsc::channel(2);
+        channel
+            .event(
+                json!({
+                    "type":"interrupted","contact":"17","call_id":"call",
+                    "scope":"call/next","playback":{"interrupted":false}
+                }),
+                &tx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rx.recv().await.unwrap().control,
+            Some(ChannelControl::Interrupt)
+        );
+        assert!(
+            !channel
+                .inner
+                .transcripts
+                .lock()
+                .keys()
+                .any(|(contact, scope)| contact == "17" && scope.starts_with("call/"))
+        );
+        assert!(
+            channel
+                .inner
+                .transcripts
+                .lock()
+                .contains_key(&("18".into(), "call/abandoned".into()))
+        );
+        assert!(abandoned.is_cancelled());
+        assert!(
+            channel
+                .assemble_transcript("17", "call/abandoned", "late chunk", false, &abandoned)
+                .unwrap_err()
+                .to_string()
+                .contains("simplex_message_cancelled")
+        );
+
+        let fresh = channel.call_transcription_generation("17", "call");
+        assert!(
+            channel
+                .assemble_transcript("17", "call/fresh", "future input", false, &fresh)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!fresh.is_cancelled());
+        assert!(
+            channel
+                .inner
+                .transcripts
+                .lock()
+                .contains_key(&("17".into(), "call/fresh".into()))
+        );
+        assert_eq!(channel.inner.transcripts.lock().len(), 32);
     }
 
     #[tokio::test]
@@ -2808,6 +2908,77 @@ mod tests {
         assert_eq!(rx.recv().await.unwrap().content, "transcribed first");
         assert_eq!(rx.recv().await.unwrap().content, "text after note");
         assert!(ingress.channel.inner.call_transcriptions.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn revoked_queued_voice_note_never_reaches_transcription_provider() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let responder_started = started.clone();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/transcribe"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body = String::from_utf8_lossy(&request.body);
+                let filename = ["held.m4a", "revoked.m4a"]
+                    .into_iter()
+                    .find(|filename| body.contains(filename))
+                    .unwrap_or("unknown")
+                    .to_string();
+                responder_started.lock().push(filename.clone());
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(200))
+                    .set_body_json(json!({"text":format!("heard {filename}")}))
+            })
+            .mount(&server)
+            .await;
+        let (channel, live) = fixture();
+        allow_contacts(&live, &["18"]);
+        configure_batch_transcription(&live, format!("{}/transcribe", server.uri()));
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut ingress = OrderedMessageIngress::new(channel, tx, 1);
+        ingress
+            .submit(batch_voice_event("17", "held", "held.m4a"))
+            .unwrap();
+        ingress
+            .submit(batch_voice_event("18", "revoked", "revoked.m4a"))
+            .unwrap();
+        ingress
+            .submit(json!({
+                "type":"message","contact":"17","id":"text",
+                "text":"same-contact text after note"
+            }))
+            .unwrap();
+        wait_for_started_requests(&started, 1).await;
+        assert_eq!(started.lock().as_slice(), ["held.m4a"]);
+
+        let mut config = live.snapshot();
+        config
+            .peer_groups
+            .get_mut("owner")
+            .unwrap()
+            .external_peers
+            .retain(|peer| zeroclaw_config::schema::peer_grant_identity(peer) != Some("18"));
+        live.publish(live.next_revision().unwrap(), config).unwrap();
+
+        drain_ingress(&mut ingress).await;
+        assert_eq!(started.lock().as_slice(), ["held.m4a"]);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "the revoked queued note must be rejected before transcription"
+        );
+        assert_eq!(rx.recv().await.unwrap().content, "heard held.m4a");
+        assert_eq!(
+            rx.recv().await.unwrap().content,
+            "same-contact text after note"
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(ingress.active.is_empty());
+        assert!(ingress.pending.is_empty());
     }
 
     #[tokio::test]
