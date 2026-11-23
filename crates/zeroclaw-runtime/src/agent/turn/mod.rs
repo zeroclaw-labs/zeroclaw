@@ -5,6 +5,7 @@ pub(crate) mod call_prep;
 pub(crate) mod context;
 pub(crate) mod context_recovery;
 pub(crate) mod delivery_defaults;
+pub(crate) mod elicitation;
 pub(crate) mod events;
 pub(crate) mod execution;
 pub(crate) mod history_append;
@@ -1806,6 +1807,50 @@ async fn run_tool_call_loop_impl<'a>(
         }
     }
 
+    // Pre-turn tool-elicitation hint. The DECISION was made at the
+    // dispatch edge, once per logical turn, against the immutable inbound
+    // text (`elicitation::prescan_inbound_for_elicitation`) — the engine
+    // only consumes it, and never scans provider-visible history: the
+    // channel turn preamble and memory enrichment both contain text that
+    // real tool triggers match. A recorded no-match is equally binding, so
+    // a model-switch retry cannot rescan enriched history into a new hit.
+    // On a hit, the one-line hint rides the latest user message's content —
+    // the same idiom as memory context, since a separate system message
+    // gets hoisted to context start by provider-side normalization.
+    // Ephemeral by construction: the user turn is persisted before this
+    // Vec is built. Telemetry records tool names only, never message text.
+    let mut hinted_tool: Option<String> = None;
+    let mut hint_call_recorded = false;
+    if ingress.origin == zeroclaw_api::ingress::TurnOrigin::Channel
+        && config
+            .zip(agent_alias)
+            .is_some_and(|(cfg, alias)| cfg.effective_tool_elicitation(alias))
+        && let Some(state) = elicitation::state_for(turn_id)
+        && let Some(tool_name) = state.decision
+    {
+        hint_call_recorded = state.call_recorded;
+        if !state.injected
+            && let Some(last_user_idx) = turn_state.history.iter().rposition(|m| m.role == "user")
+        {
+            let existing = &turn_state.history[last_user_idx].content;
+            turn_state.history[last_user_idx].content =
+                format!("{existing}\n\n{}", elicitation::hint_message(&tool_name));
+            elicitation::mark_injected(turn_id);
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Agent)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "tool": tool_name,
+                        "trace_id": turn_id,
+                    })),
+                "hint_injected"
+            );
+        }
+        hinted_tool = Some(tool_name);
+    }
+
     if let Some(turn_memory) = &memory {
         let has_session = turn_memory.sessions.iter().any(Option::is_some);
         if let crate::agent::memory_inject::InjectPolicy::Inject {
@@ -3350,12 +3395,20 @@ async fn run_tool_call_loop_impl<'a>(
                 .await;
         }
 
+        // A cancel that lands while a call waits for approval ends preparation
+        // before anything ran. Preparation has already abandoned its hook
+        // contexts and hands back the results it had settled (for example an
+        // operator denial), so the round continues below as an interrupted
+        // batch: settled calls keep their result, every other call gets the
+        // interrupted result, and the round is still recorded, keeping each
+        // tool call paired with a result.
+        let mut cancelled_in_preparation = false;
         let PreparedToolCalls {
             mut ordered_results,
             mut executable_indices,
             mut executable_calls,
             mut stream_calls,
-        } = prepare_tool_calls(
+        } = match prepare_tool_calls(
             &ctx,
             tools_registry,
             activated_tools,
@@ -3366,7 +3419,20 @@ async fn run_tool_call_loop_impl<'a>(
             iteration,
             knobs.dedup_enabled,
         )
-        .await?;
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(aborted) if is_tool_loop_cancelled(&aborted.error) => {
+                cancelled_in_preparation = true;
+                PreparedToolCalls {
+                    ordered_results: aborted.ordered_results,
+                    executable_indices: Vec::new(),
+                    executable_calls: Vec::new(),
+                    stream_calls: Vec::new(),
+                }
+            }
+            Err(aborted) => return Err(aborted.error),
+        };
 
         // Hooks and approvals have resolved the effective call. Admit one
         // recovery dispatch for the warned identity; record the remaining
@@ -3491,9 +3557,13 @@ async fn run_tool_call_loop_impl<'a>(
             knobs.provider_attempt_allowlist.clone(),
             execution,
         );
-        let execution_result = match shared_budget.clone() {
-            Some(budget) => ExecutionTreeBudget::scope(budget, Box::pin(execution)).await,
-            None => execution.await,
+        let execution_result = if cancelled_in_preparation {
+            Ok(Vec::new())
+        } else {
+            match shared_budget.clone() {
+                Some(budget) => ExecutionTreeBudget::scope(budget, Box::pin(execution)).await,
+                None => execution.await,
+            }
         };
         let executed_slots = match execution_result {
             Ok(slots) => slots,
@@ -3516,7 +3586,8 @@ async fn run_tool_call_loop_impl<'a>(
             }
         };
 
-        let cancelled_mid_batch = executed_slots.iter().any(Option::is_none);
+        let cancelled_mid_batch =
+            cancelled_in_preparation || executed_slots.iter().any(Option::is_none);
 
         let mut executed_completed_indices: Vec<usize> = Vec::new();
         let mut executed_completed_calls = Vec::new();
@@ -3535,6 +3606,25 @@ async fn run_tool_call_loop_impl<'a>(
                 executed_completed_stream_calls.push(stream_call);
                 executed_completed_outcomes.push(outcome);
             }
+        }
+
+        // Third elicitation telemetry event: the hinted tool was
+        // actually called this turn. Invocation-only — it correlates the
+        // hint with the call and deliberately claims nothing about the
+        // tool's own result (that is `tool_call_result`'s job), so the
+        // outcome stays Unknown even for a successful execution. Emitted at
+        // most once per turn; tool names only, never message text.
+        if let Some(hinted) = &hinted_tool
+            && !hint_call_recorded
+            && executed_completed_calls.iter().any(|c| c.name == *hinted)
+        {
+            hint_call_recorded = true;
+            elicitation::record_hint_call(turn_id);
+            ::zeroclaw_log::record!(
+                INFO,
+                elicitation::hinted_call_event(hinted, iteration + 1, turn_id),
+                "tool_called_after_hint"
+            );
         }
 
         let repetition_disposition = if let Some(guard) =

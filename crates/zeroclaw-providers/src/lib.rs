@@ -2383,6 +2383,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("vercel", "Vercel AI Gateway", false),
             ("cloudflare", "Cloudflare AI", false),
             ("atlascloud", "Atlas Cloud", false),
+            ("cheaperinference", "Cheaper Inference", false),
             ("moonshot", "Moonshot", false),
             ("synthetic", "Synthetic", false),
             ("opencode", "OpenCode", false),
@@ -2655,6 +2656,43 @@ mod tests {
     }
 
     #[test]
+    fn resolve_cheaperinference_credential_stays_on_typed_alias_boundary() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("CHEAPER_INFERENCE_API_KEY", Some("  cheaper-env-key  "));
+        assert!(resolve_model_provider_credential("cheaperinference", None).is_none());
+        assert_eq!(
+            resolve_model_provider_credential("cheaperinference", Some("  explicit-key  "))
+                .as_deref(),
+            Some("explicit-key")
+        );
+    }
+
+    #[test]
+    fn cheaperinference_uses_canonical_provider_id_only() {
+        assert_eq!(
+            canonicalize_v2_model_provider_name("cheaperinference"),
+            "cheaperinference"
+        );
+        for alias in ["cheaper-inference", "cheaper_inference"] {
+            assert_eq!(canonicalize_v2_model_provider_name(alias), alias);
+        }
+    }
+
+    #[test]
+    fn cheaperinference_provider_is_listed_and_constructible() {
+        let providers = list_model_providers();
+        let cheaperinference = providers
+            .iter()
+            .find(|provider| provider.name == "cheaperinference")
+            .expect("Cheaper Inference provider should be listed");
+        assert_eq!(cheaperinference.display_name, "Cheaper Inference");
+        assert!(
+            create_model_provider("cheaperinference", Some("provider-test-credential")).is_ok(),
+            "Cheaper Inference should construct through the OpenAI-compatible family factory"
+        );
+    }
+
+    #[test]
     fn resolve_qwen_oauth_context_prefers_explicit_override() {
         let _env_lock = env_lock();
         let context = resolve_qwen_oauth_context(Some("  explicit-qwen-token  "));
@@ -2665,8 +2703,8 @@ mod tests {
     #[test]
     fn resolve_qwen_oauth_context_reads_cached_credentials_file() {
         let _env_lock = env_lock();
-        let fake_home = format!("/tmp/zeroclaw-qwen-oauth-home-{}-file", std::process::id());
-        let creds_dir = PathBuf::from(&fake_home).join(".qwen");
+        let fake_home = tempfile::tempdir().unwrap();
+        let creds_dir = fake_home.path().join(".qwen");
         std::fs::create_dir_all(&creds_dir).unwrap();
         let creds_path = creds_dir.join("oauth_creds.json");
         std::fs::write(
@@ -2675,7 +2713,10 @@ mod tests {
         )
         .unwrap();
 
-        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
+        let _home_guard = EnvGuard::set(
+            "HOME",
+            Some(fake_home.path().to_str().expect("UTF-8 test path")),
+        );
 
         let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER));
 
@@ -2689,8 +2730,11 @@ mod tests {
     #[test]
     fn resolve_qwen_oauth_context_returns_none_without_cache() {
         let _env_lock = env_lock();
-        let fake_home = format!("/tmp/zeroclaw-qwen-oauth-home-{}-empty", std::process::id());
-        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
+        let fake_home = tempfile::tempdir().unwrap();
+        let _home_guard = EnvGuard::set(
+            "HOME",
+            Some(fake_home.path().to_str().expect("UTF-8 test path")),
+        );
 
         let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER));
         assert!(context.credential.is_none());
@@ -4009,6 +4053,10 @@ mod tests {
         assert_eq!(
             default_model_provider_url("crusoe"),
             Some("https://api.inference.crusoecloud.com/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("cheaperinference"),
+            Some("https://api.cheaperinference.com/v1")
         );
     }
 

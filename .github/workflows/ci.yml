@@ -1579,6 +1579,13 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # The root package enables runtime/test-util in its dev-dependencies.
+      # Select only the external consumer to exercise its public API contract.
+      - name: Test runtime composition as an external consumer
+        run: cargo test --locked -p runtime-composition-consumer
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
       # The crate's default feature set excludes the host-side hardware
       # modules. Compile-only `ci-all` coverage cannot exercise their process,
       # timeout, cleanup, and validation regressions.
@@ -2197,6 +2204,9 @@ jobs:
       - name: Run SOP editor regressions
         working-directory: web
         run: npm run test:sop-editor
+      - name: Voice tests
+        working-directory: web
+        run: npm run test:voice
       - name: Run dashboard sign-in regressions
         working-directory: web
         run: npm run test:auth
