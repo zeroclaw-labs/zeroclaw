@@ -2291,6 +2291,78 @@ mod tests {
         assert!(page2.at_end, "no older events remain");
     }
 
+    #[test]
+    fn unicode_segment_cursors_use_byte_offsets_before_and_after_rotation() {
+        for rotate in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let active = tmp.path().join("trace.jsonl");
+            let archive = tmp.path().join("trace.0000000001-20260101-000000.jsonl");
+            let events: Vec<_> = ["中文", "emoji 🦀\nsecond line", "combining e\u{301}"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, message)| {
+                    let mut event = make_event("unicode-page", None);
+                    event.id = format!("unicode-{index}");
+                    event.timestamp = format!("2026-01-01T00:00:0{index}.000Z");
+                    event.message = Some(message.into());
+                    event
+                })
+                .collect();
+            write_jsonl(&active, &events);
+            // Derive expected offsets from the actual JSONL bytes, independently
+            // of the reader's cursor and line-scanning implementations.
+            let line_ends: Vec<_> = std::fs::read(&active)
+                .unwrap()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, byte)| (*byte == b'\n').then_some((index + 1) as u64))
+                .collect();
+            assert_eq!(line_ends.len(), events.len());
+            let mut cursor = None;
+
+            for index in (0..events.len()).rev() {
+                let page = query_log_page(&active, true, &LogFilter::default(), 1, cursor.as_ref())
+                    .unwrap();
+                assert_eq!(page.events.len(), 1, "rotate={rotate}, index={index}");
+                assert_eq!(page.events[0].id, events[index].id);
+                assert_eq!(page.events[0].message, events[index].message);
+                assert!(!page.incomplete);
+                assert_eq!(page.at_end, index == 0);
+                let archived = rotate && index < events.len() - 1;
+                let expected = if archived {
+                    format!("archive:1:{}", line_ends[index])
+                } else {
+                    format!("active:{}:{}", line_ends[index], events[index].id)
+                };
+                assert_eq!(page.next_segment_cursor.as_deref(), Some(expected.as_str()));
+                assert_eq!(
+                    page.next_cursor_line_offset,
+                    if archived {
+                        None
+                    } else {
+                        Some(line_ends[index])
+                    }
+                );
+                cursor = Some(SegmentCursor::from_wire(&expected).unwrap());
+
+                if rotate && index == events.len() - 1 {
+                    std::fs::rename(&active, &archive).unwrap();
+                    let mut newer = make_event("new-active", None);
+                    newer.id = "new-active".into();
+                    newer.timestamp = "2026-01-01T00:00:03.000Z".into();
+                    write_jsonl(&active, &[newer]);
+                }
+            }
+
+            let exhausted =
+                query_log_page(&active, true, &LogFilter::default(), 1, cursor.as_ref()).unwrap();
+            assert!(exhausted.events.is_empty());
+            assert!(exhausted.at_end);
+            assert!(!exhausted.incomplete);
+            assert!(exhausted.next_segment_cursor.is_none());
+        }
+    }
+
     /// Regression for the active-file rotation race: when the active file is
     /// rotated between two pagination requests, the segment cursor produced on
     /// page 1 names the (now-renamed) file's basename, which is the same as the
