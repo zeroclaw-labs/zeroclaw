@@ -32,6 +32,11 @@ The headless helper requires Chromium's sandbox to work in the host environment.
 Create a private directory for the SimpleX databases and run the CLI with a
 loopback WebSocket API (for example, port 5225). Use a service with `UMask=0077`
 and do not expose that API: the official CLI API has no authentication.
+ZeroClaw accepts only `ws` URLs whose host is exactly `127.0.0.1`, `[::1]`, or
+`localhost`, with no username or password. Remote hosts, alternate wildcard
+addresses, and `wss` are rejected because the CLI API itself has no
+authentication. Keep this connection on the same machine; do not expose it
+through a LAN listener or reverse proxy.
 
 ```sh
 mkdir -m 700 -p "$HOME/.zeroclaw/data/simplex"
@@ -178,10 +183,14 @@ stream_uri = "ws://127.0.0.1:18161/v1/audio/stream" # live PCM
 # bearer_token uses the provider's existing secret configuration
 ```
 
-`stream_uri` defaults absent. The endpoint must be loopback and implement the
-Parakeet companion protocol: authenticated WebSocket, `ready` with `sampleRate`
-16000 and `streaming` true, binary mono PCM16 input, and `speech_start`, `partial`,
-and `final` JSON events carrying `utteranceId`. The companion owns streaming ASR,
+`stream_uri` defaults absent. When set, it must use `ws` or `wss` with a host
+that is exactly `127.0.0.1`, `[::1]`, or `localhost`, no username/password, and
+no URL fragment. Remote endpoints and wildcard bind addresses are rejected
+before a connection is opened, so PCM and the optional bearer token cannot be
+sent to a non-loopback plaintext transport. The companion must implement the
+Parakeet protocol: authenticated WebSocket, `ready` with `sampleRate` 16000 and
+`streaming` true, binary mono PCM16 input, and `speech_start`, `partial`, and
+`final` JSON events carrying `utteranceId`. The companion owns streaming ASR,
 voice activity detection, noise reduction, and endpoint timing. Configure its
 buffered attention profile there. Parakeet Unified's balanced 560 ms chunk plus
 560 ms right context provides 1.12 s of algorithmic lookahead; that is separate

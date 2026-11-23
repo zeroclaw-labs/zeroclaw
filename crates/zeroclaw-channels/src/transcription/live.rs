@@ -119,7 +119,8 @@ mod tests {
     #[tokio::test]
     async fn pcm_stream_authenticates_and_emits_final_without_batch_transcription() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let uri = format!("ws://{}/stream", listener.local_addr().unwrap());
+        // The production connection gate permits plaintext only for this exact loopback fixture.
+        let uri = format!("ws://{}/stream", listener.local_addr().unwrap()); // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
         let server = zeroclaw_spawn::spawn!(async move {
             let (tcp, _) = listener.accept().await.unwrap();
             use tokio_tungstenite::tungstenite::handshake::server::{
@@ -195,8 +196,10 @@ mod tests {
     #[tokio::test]
     async fn stream_endpoint_cannot_exfiltrate_pcm_or_credentials_to_remote_hosts() {
         for uri in [
-            "ws://example.org/stream",
-            "ws://user@127.0.0.1/stream",
+            "ws://example.org/stream", // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+            "ws://user@127.0.0.1/stream", // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+            "wss://example.org/stream",
+            "ws://0.0.0.0/stream", // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
             "https://127.0.0.1/stream",
         ] {
             assert!(

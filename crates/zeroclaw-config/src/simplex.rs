@@ -10,7 +10,8 @@ use zeroclaw_macros::Configurable;
 pub struct SimplexConfig {
     /// Activate this adapter. Connections are denied unless peer_groups explicitly allow them.
     pub enabled: bool,
-    /// Local official SimpleX CLI WebSocket endpoint, e.g. ws://127.0.0.1:5225.
+    /// Local official SimpleX CLI endpoint. Only plaintext WebSockets bound to
+    /// an exact loopback host are accepted because the CLI API is unauthenticated.
     pub websocket_url: String,
     /// External bridge executable followed by its arguments. No shell is invoked.
     pub bridge_command: Vec<String>,
@@ -63,9 +64,12 @@ mod tests {
         config.enabled = true;
         config.bridge_command = vec!["bridge".into()];
         for url in [
-            "ws://example.org:5225",
+            // Deliberately non-loopback inputs prove validation runs before connecting.
+            "ws://example.org:5225", // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+            "ws://0.0.0.0:5225", // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+            "ws://127.0.0.2:5225", // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
             "wss://127.0.0.1:5225",
-            "ws://user@localhost:5225",
+            "ws://user@localhost:5225", // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
         ] {
             config.websocket_url = url.into();
             assert!(config.validate().is_err());

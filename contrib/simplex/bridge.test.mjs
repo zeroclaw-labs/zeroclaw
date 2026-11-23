@@ -6,6 +6,26 @@ import {createInterface} from 'node:readline';
 import {once} from 'node:events';
 import {fileURLToPath} from 'node:url';
 
+test('bridge refuses non-loopback SimpleX API endpoints before opening a socket', async () => {
+  const child = spawn(process.execPath, [fileURLToPath(new URL('./bridge.mjs', import.meta.url))], {stdio: ['pipe', 'pipe', 'ignore']});
+  const lines = createInterface({input: child.stdout});
+  try {
+    child.stdin.write(JSON.stringify({type: 'init', id: 'init',
+      websocket_url: 'ws://example.test:5225'}) + '\n'); // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+    const [line] = await Promise.race([
+      once(lines, 'line'),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('bridge validation timed out')), 2000)),
+    ]);
+    const result = JSON.parse(line);
+    assert.equal(result.id, 'init');
+    assert.equal(result.ok, false);
+  } finally {
+    child.stdin.end();
+    child.kill('SIGTERM');
+    lines.close();
+  }
+});
+
 test('bridge carries private text, excludes sent/group events, and rejects unencrypted calls', async () => {
   const server = new WebSocketServer({host: '127.0.0.1', port: 0}); await once(server, 'listening');
   const child = spawn(process.execPath, [fileURLToPath(new URL('./bridge.mjs', import.meta.url))], {stdio: ['pipe', 'pipe', 'ignore']});

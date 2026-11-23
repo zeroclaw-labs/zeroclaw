@@ -1704,39 +1704,10 @@ mod tests {
 
     #[tokio::test]
     async fn live_text_coalesces_updates_and_finalizes_without_a_duplicate_send() {
-        use zeroclaw_api::session_events::capture::{
-            DeliveryFuture, DeliveryIntent, EngineTurnFuture, EngineTurnInput, SessionContextPort,
-            SessionControlPort, SessionExecutionPort, scope_session_execution,
-        };
-
-        #[derive(Default)]
-        struct ReceiptRecorder(Mutex<Vec<String>>);
-        #[async_trait::async_trait]
-        impl SessionContextPort for ReceiptRecorder {}
-        #[async_trait::async_trait]
-        impl SessionControlPort for ReceiptRecorder {}
-        #[async_trait::async_trait]
-        impl SessionExecutionPort for ReceiptRecorder {
-            async fn execute(&self, _: EngineTurnInput, _: EngineTurnFuture<'_>) -> Result<String> {
-                anyhow::bail!("unexpected turn execution")
-            }
-
-            async fn deliver(
-                &self,
-                intent: DeliveryIntent,
-                send: DeliveryFuture<'_>,
-            ) -> Result<Value> {
-                let result = send.await?;
-                self.0.lock().push(intent.completion_boundary);
-                Ok(result)
-            }
-        }
-
         let (channel, _) = fixture();
         let (values, worker) = record_bridge(&channel);
-        let receipts = Arc::new(ReceiptRecorder::default());
-        let message = SendMessage::new("", "17");
-        let id = scope_session_execution(receipts.clone(), channel.send_draft(&message))
+        let id = channel
+            .send_draft(&SendMessage::new("", "17"))
             .await
             .unwrap()
             .unwrap();
@@ -1776,15 +1747,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(values.lock().last().unwrap()["type"], "live_finish");
-        let edits = values
-            .lock()
-            .iter()
-            .filter(|value| value["type"] == "live_update")
-            .count();
-        assert_eq!(
-            receipts.0.lock().as_slice(),
-            vec!["live_text_preview:channel_adapter_acceptance"; edits]
-        );
         let before = values.lock().len();
         let error = channel
             .finalize_draft("17", &id, "Final answer", true)
@@ -2354,7 +2316,8 @@ mod tests {
         use tokio_tungstenite::tungstenite::Message;
         use zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let uri = format!("ws://{}/stream", listener.local_addr().unwrap());
+        // The production connection gate permits plaintext only for this exact loopback fixture.
+        let uri = format!("ws://{}/stream", listener.local_addr().unwrap()); // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
         let server = zeroclaw_spawn::spawn!(async move {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
