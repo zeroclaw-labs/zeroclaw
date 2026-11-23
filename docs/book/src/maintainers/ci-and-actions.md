@@ -10,7 +10,9 @@ Fires on every PR targeting `master` and on trusted pushes to `master`.
 Composite job with multiple matrix legs:
 
 - **fmt**: `cargo fmt --all -- --check`
-- **history-guard**: fetches full history and checks the commit under test
+- **history-guard**: fetches the whole commit graph as a treeless clone
+  (`filter: tree:0`: every commit, without the trees and blobs behind them)
+  and checks the commit under test
   against `origin/master`; pull requests use the explicit
   `github.event.pull_request.head.sha`, while trusted pushes and merge-queue
   runs use `github.sha`. The guard and its fixture test reject an empty
