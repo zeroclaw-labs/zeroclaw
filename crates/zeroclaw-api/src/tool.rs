@@ -52,6 +52,15 @@ impl ToolExecutionContext {
         self
     }
 
+    pub fn inherit_credential_approver(mut self) -> Self {
+        self.credential_approver = Self::current().and_then(|context| context.credential_approver);
+        self
+    }
+
+    pub async fn scope<T>(&self, future: impl std::future::Future<Output = T>) -> T {
+        TOOL_EXECUTION_CONTEXT.scope(self.clone(), future).await
+    }
+
     /// Ask for a fresh decision. This does not validate or refresh the grant;
     /// the consumer must verify its revision before using the credential.
     pub async fn request_credential_approval(request: &CredentialApprovalRequest) -> bool {

@@ -58,6 +58,31 @@ impl ::zeroclaw_api::attribution::Attributable for WsApprovalChannel {
     }
 }
 
+impl std::fmt::Debug for WsApprovalChannel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WsApprovalChannel")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl zeroclaw_api::tool::CredentialApprover for WsApprovalChannel {
+    async fn approve(&self, request: &zeroclaw_api::tool::CredentialApprovalRequest) -> bool {
+        let channel_request = ChannelApprovalRequest {
+            tool_name: "credential_use".into(),
+            arguments_summary: format!(
+                "Credential: {:?}; destination: {:?}; operation: {:?}",
+                request.credential_alias, request.destination, request.operation
+            ),
+            raw_arguments: None,
+            position: None,
+        };
+        self.request_origin_credential_approval("", &channel_request)
+            .await
+    }
+}
+
 #[async_trait]
 impl Channel for WsApprovalChannel {
     fn name(&self) -> &str {
