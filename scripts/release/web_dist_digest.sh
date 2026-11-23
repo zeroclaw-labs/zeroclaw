@@ -46,7 +46,9 @@ while IFS= read -r -d '' path; do
     echo "error: $dir contains a file name with a newline; refusing to digest it." >&2
     exit 1
   fi
-  digest="$(sha256 "$path" | awk '{print $1}')"
+  # Hash stdin so checksum tools cannot prefix an escape marker for a path
+  # containing backslashes. Only the file's bytes belong in this field.
+  digest="$(sha256 < "$path" | awk '{print $1}')"
   printf '%s  %s\n' "$digest" "${path#./}" >>"$manifest"
   count=$((count + 1))
 done < <(find . -type f -print0 | sort -z)
@@ -56,4 +58,4 @@ if [[ $count -eq 0 ]]; then
   exit 1
 fi
 
-sha256 "$manifest" | awk '{print $1}'
+sha256 < "$manifest" | awk '{print $1}'

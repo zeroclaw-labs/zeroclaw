@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the publisher process with local Cargo/registry doubles; never upload."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -350,6 +351,16 @@ class PublishCratesTest(unittest.TestCase):
             text=True, capture_output=True, timeout=15)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("contains no files", result.stderr)
+
+    @unittest.skipIf(os.name == "nt", "backslashes are path separators on Windows")
+    def test_web_digest_hashes_file_bytes_without_checksum_filename_escaping(self):
+        dist = self.root / "web/dist"
+        (dist / "asset\\name.js").write_bytes(b"dashboard asset")
+        manifest = b"".join(
+            f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n".encode()
+            for path in sorted(dist.iterdir(), key=lambda path: path.name.encode())
+        )
+        self.assertEqual(self.web_digest(), hashlib.sha256(manifest).hexdigest())
 
 
     def tagged_tree_with_broken_publisher(self):

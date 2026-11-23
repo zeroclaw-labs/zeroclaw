@@ -24,8 +24,9 @@ impl Tool for GlobSearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search for files matching a glob pattern within the workspace. \
-         Returns a sorted list of matching file paths relative to the workspace root. \
+        "Search for files matching a glob pattern within the workspace, or under an \
+         allowed root with an absolute pattern. Returns a sorted list of matching file \
+         paths: relative to the workspace root, absolute for files outside it. \
          Examples: '**/*.rs' (all Rust files), 'src/**/mod.rs' (all mod.rs in src)."
     }
 
@@ -61,9 +62,10 @@ impl Tool for GlobSearchTool {
         // RateLimitedTool + PathGuardedTool wrappers at registration time
         // (see zeroclaw-runtime::tools::mod).
 
-        // Security: reject absolute paths unless under an explicit allowed root.
+        // Security: reject absolute paths unless under a readable allowed root
+        // (read-write or read-only); each match is still checked for readability.
         if (pattern.starts_with('/') || pattern.starts_with('\\'))
-            && !self.security.is_under_allowed_root(pattern)
+            && !self.security.is_under_any_allowed_root(pattern)
         {
             return Ok(ToolResult {
                 success: false,
@@ -136,9 +138,12 @@ impl Tool for GlobSearchTool {
                 continue;
             }
 
-            // Convert to workspace-relative path
-            if let Ok(rel) = resolved.strip_prefix(&workspace_canon) {
-                results.push(rel.to_string_lossy().to_string());
+            // Workspace files are reported relative to it; files under another
+            // readable root (an absolute pattern accepted above) keep their
+            // absolute path instead of being dropped.
+            match resolved.strip_prefix(&workspace_canon) {
+                Ok(rel) => results.push(rel.to_string_lossy().to_string()),
+                Err(_) => results.push(resolved.to_string_lossy().to_string()),
             }
 
             if results.len() >= MAX_RESULTS {
@@ -406,6 +411,90 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .contains("Invalid glob pattern")
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_search_lists_files_under_an_allowed_root_outside_the_workspace() {
+        let workspace = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        std::fs::create_dir(project.path().join("docs")).unwrap();
+        std::fs::write(project.path().join("docs/offer.md"), "offer").unwrap();
+        let project_canon = std::fs::canonicalize(project.path()).unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_roots: vec![project_canon.clone()],
+            workspace_only: false,
+            ..SecurityPolicy::default()
+        });
+        let tool = GlobSearchTool::new(security);
+
+        let pattern = format!("{}/docs/*.md", project_canon.display());
+        let result = tool.execute(json!({ "pattern": pattern })).await.unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let expected = project_canon.join("docs/offer.md");
+        assert!(
+            result.output.contains(&*expected.to_string_lossy()),
+            "allowed-root match must be listed with its absolute path; got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_search_lists_files_under_a_read_only_root() {
+        let workspace = TempDir::new().unwrap();
+        let shared = TempDir::new().unwrap();
+        std::fs::write(shared.path().join("index.md"), "index").unwrap();
+        let shared_canon = std::fs::canonicalize(shared.path()).unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_roots_read_only: vec![shared_canon.clone()],
+            workspace_only: false,
+            ..SecurityPolicy::default()
+        });
+        let tool = GlobSearchTool::new(security);
+
+        let pattern = format!("{}/*.md", shared_canon.display());
+        let result = tool.execute(json!({ "pattern": pattern })).await.unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(
+            result
+                .output
+                .contains(&*shared_canon.join("index.md").to_string_lossy()),
+            "read-only root match must be listed; got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_search_never_lists_files_under_a_write_only_root() {
+        let workspace = TempDir::new().unwrap();
+        let drop_box = TempDir::new().unwrap();
+        std::fs::write(drop_box.path().join("secret.txt"), "secret").unwrap();
+        let drop_canon = std::fs::canonicalize(drop_box.path()).unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_roots_write_only: vec![drop_canon.clone()],
+            workspace_only: false,
+            ..SecurityPolicy::default()
+        });
+        let tool = GlobSearchTool::new(security);
+
+        let pattern = format!("{}/*", drop_canon.display());
+        let result = tool.execute(json!({ "pattern": pattern })).await.unwrap();
+
+        assert!(
+            !result.output.contains("secret.txt"),
+            "write-only root must not be listed; got: {}",
+            result.output
         );
     }
 
