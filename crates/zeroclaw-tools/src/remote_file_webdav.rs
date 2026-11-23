@@ -1,5 +1,6 @@
 //! Read-side transport for operator-registered WebDAV resources.
 
+use crate::remote_file_transfer::PublishResult;
 use reqwest::header::{ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, HeaderValue, IF_NONE_MATCH};
 use reqwest::{Client, Method, Response, StatusCode, Url};
 use std::io;
@@ -140,9 +141,53 @@ impl WebDavRead {
     ) -> Result<(), WebDavError> {
         let method = Method::from_bytes(b"MKCOL").map_err(|_| WebDavError::Transport)?;
         let response = self
-            .send(method, resource_url(&self.root, path)?, authorization, None)
+            .send(
+                method,
+                resource_url(&self.root, path)?,
+                authorization,
+                None,
+                None,
+            )
             .await?;
         require_status(response, StatusCode::CREATED).map(|_| ())
+    }
+
+    /// Copy a file within this registered resource without routing its bytes
+    /// through ZeroClaw. The executor must authorize both paths and verify
+    /// that the source is a file. Depth zero forbids recursive collection copy.
+    pub async fn copy_file_on_server(
+        &self,
+        source: &str,
+        destination: &str,
+        authorization: Option<HeaderValue>,
+    ) -> Result<(), WebDavError> {
+        if source == destination {
+            return Err(WebDavError::InvalidPath);
+        }
+        let source = resource_url(&self.root, source)?;
+        let destination = resource_url(&self.root, destination)?;
+        let method = Method::from_bytes(b"COPY").map_err(|_| WebDavError::Transport)?;
+        let response = self
+            .send(method, source, authorization, Some(destination), Some("0"))
+            .await?;
+        require_status(response, StatusCode::CREATED).map(|_| ())
+    }
+
+    /// Commit the verified staging object in its parent directory. Only a
+    /// definite server rejection is reported as rejected. All other failures
+    /// leave the executor responsible for reconciling state.
+    pub async fn publish_staging(
+        &self,
+        staging: &str,
+        destination: &str,
+        authorization: Option<HeaderValue>,
+    ) -> PublishResult {
+        match self.rename(staging, destination, authorization).await {
+            Ok(()) => PublishResult::Confirmed,
+            Err(WebDavError::InvalidPath | WebDavError::InvalidEndpoint)
+            | Err(WebDavError::Status(StatusCode::PRECONDITION_FAILED)) => PublishResult::Rejected,
+            Err(_) => PublishResult::Unknown,
+        }
     }
 
     /// Rename within the same parent and registered WebDAV resource. The
@@ -166,7 +211,7 @@ impl WebDavRead {
         let destination = resource_url(&self.root, destination)?;
         let method = Method::from_bytes(b"MOVE").map_err(|_| WebDavError::Transport)?;
         let response = self
-            .send(method, source, authorization, Some(destination))
+            .send(method, source, authorization, Some(destination), None)
             .await?;
         require_status(response, StatusCode::CREATED).map(|_| ())
     }
@@ -178,7 +223,13 @@ impl WebDavRead {
         authorization: Option<HeaderValue>,
     ) -> Result<Response, WebDavError> {
         let response = self
-            .send(method, resource_url(&self.root, path)?, authorization, None)
+            .send(
+                method,
+                resource_url(&self.root, path)?,
+                authorization,
+                None,
+                None,
+            )
             .await?;
         require_status(response, StatusCode::OK)
     }
@@ -188,17 +239,21 @@ impl WebDavRead {
         method: Method,
         url: Url,
         authorization: Option<HeaderValue>,
-        rename_destination: Option<Url>,
+        destination: Option<Url>,
+        depth: Option<&'static str>,
     ) -> Result<Response, WebDavError> {
         let mut request = self
             .client
             .request(method, url)
             .timeout(Duration::from_secs(60))
             .header(ACCEPT_ENCODING, "identity");
-        if let Some(destination) = rename_destination {
+        if let Some(destination) = destination {
             request = request
                 .header("Destination", destination.as_str())
                 .header("Overwrite", "F");
+        }
+        if let Some(depth) = depth {
+            request = request.header("Depth", depth);
         }
         with_authorization(request, authorization)
             .send()
@@ -400,6 +455,26 @@ mod tests {
                     "docs/staging.tmp",
                     "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 ),
+                (
+                    "COPY",
+                    "docs/new.txt",
+                    "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ),
+                (
+                    "MOVE",
+                    "docs/staging.tmp",
+                    "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ),
+                (
+                    "MOVE",
+                    "docs/collision.tmp",
+                    "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ),
+                (
+                    "MOVE",
+                    "docs/unknown.tmp",
+                    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ),
             ] {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut tls = acceptor.accept(stream).await.unwrap();
@@ -415,18 +490,22 @@ mod tests {
                         .to_ascii_lowercase()
                         .contains("\r\nauthorization: bearer fixture-only\r\n")
                 );
-                if method == "MOVE" {
+                if matches!(method, "COPY" | "MOVE") {
                     let request = request.to_ascii_lowercase();
-                    let target = if path == "docs/old.txt" {
-                        "new.txt"
-                    } else {
-                        "existing.txt"
+                    let target = match (method, path) {
+                        ("COPY", _) => "copy.txt",
+                        (_, "docs/old.txt") => "new.txt",
+                        (_, "docs/new.txt") => "existing.txt",
+                        _ => "final.txt",
                     };
                     assert!(request.contains("\r\noverwrite: f\r\n"));
                     assert!(request.contains(&format!(
                         "\r\ndestination: https://files.test:{}/dav/docs/{target}\r\n",
                         addr.port()
                     )));
+                    if method == "COPY" {
+                        assert!(request.contains("\r\ndepth: 0\r\n"));
+                    }
                 }
                 if method == "PUT" {
                     let request = request.to_ascii_lowercase();
@@ -534,6 +613,22 @@ mod tests {
                     .await,
                 Err(WebDavError::Status(StatusCode::PRECONDITION_FAILED))
             ));
+            adapter
+                .copy_file_on_server("docs/new.txt", "docs/copy.txt", authorization())
+                .await
+                .unwrap();
+            for (stage, expected) in [
+                ("docs/staging.tmp", PublishResult::Confirmed),
+                ("docs/collision.tmp", PublishResult::Rejected),
+                ("docs/unknown.tmp", PublishResult::Unknown),
+            ] {
+                assert_eq!(
+                    adapter
+                        .publish_staging(stage, "docs/final.txt", authorization())
+                        .await,
+                    expected
+                );
+            }
             server.await.unwrap();
         })
         .await
