@@ -130,3 +130,18 @@ pub(crate) fn decode_scoped_value(
         })
         .ok_or_else(|| anyhow::Error::msg(scoped_credential_message("tool-http-credential-value")))
 }
+
+pub(crate) fn scoped_totp(seed: &str, timestamp: u64) -> anyhow::Result<String> {
+    let normalized = seed.trim().trim_end_matches('=').to_ascii_uppercase();
+    let secret = data_encoding::BASE32_NOPAD
+        .decode(normalized.as_bytes())
+        .map_err(|_| anyhow::Error::msg("Invalid TOTP seed encoding"))?;
+    anyhow::ensure!(!secret.is_empty(), "Empty TOTP seed");
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, &secret);
+    let counter = (timestamp / 30).to_be_bytes();
+    let digest = ring::hmac::sign(&key, &counter);
+    let hash = digest.as_ref();
+    let offset = usize::from(hash[19] & 15);
+    let value = u32::from_be_bytes(hash[offset..offset + 4].try_into()?) & 0x7fff_ffff;
+    Ok(format!("{:06}", value % 1_000_000))
+}

@@ -43,8 +43,31 @@ Run `cargo test --locked -p zeroclaw-tools --features portable-ssh --test portab
 to exercise all six modes without a system SSH daemon. The test server sends
 identical non-English prompt labels, validates the actual responses, and
 covers host-key mismatch, visible fields and incomplete key-plus-TOTP.
-The operator form and task-owned pool are separate integration work, and
-Linux loopback results do not certify Windows or macOS.
+The unified form writes an encrypted, revision-checked authorization. The
+new task pool reloads the selected factor bindings before sending each new
+command. The catalog and pool have been exercised against a disposable
+QEMU OpenSSH server. The runtime exposes the authorization through the shell tool. Build with
+`portable-ssh` and configure the daemon with `ZEROCLAW_SSH_CREDENTIAL_DIR`
+(the encrypted catalog directory) and `ZEROCLAW_SSH_KNOWN_HOSTS` (the absolute
+path to an operator-managed OpenSSH pin file). A missing, changed or ambiguous
+pin denies the request. Keep one trusted key per endpoint in this file.
+
+Use the shell tool with an SSH authorization instead of including credentials
+in the remote command. For example:
+
+```json
+{
+  "command": "hostname",
+  "ssh_authorization": { "alias": "LAB_LOGIN", "host": "lab.example.net" }
+}
+```
+
+The shell still requires its normal operator policy and approval. A sandboxed
+shell cannot borrow the host's SSH authorization. An explicit username may
+disambiguate multiple authorized accounts for the same key and endpoint.
+The broker reuses the connection within one agent task, disconnects on
+normal task completion, and closes an inactive transport after 30 minutes.
+Verify the resulting runtime on each client platform before enabling it.
 
 The sections below describe the draft implementation that this design
 supersedes. They document its current behavior until the new transport and

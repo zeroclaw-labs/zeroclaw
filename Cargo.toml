@@ -437,6 +437,7 @@ dev-sim = ["dep:zeroclaw-hardware", "zeroclaw-hardware/dev-sim"]
 sandbox-landlock = ["zeroclaw-runtime/sandbox-landlock"]
 sandbox-bubblewrap = ["zeroclaw-runtime/sandbox-bubblewrap"]
 browser-native = ["tools-external", "zeroclaw-tools/browser-native"]
+portable-ssh = ["zeroclaw-runtime/portable-ssh", "zeroclaw-tools/portable-ssh"]
 plugins-wasm = [
     "dep:zeroclaw-plugins",
     "dep:semver",

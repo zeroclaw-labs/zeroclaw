@@ -76,6 +76,7 @@ fn configure_task_ssh_environment(
     }
     if sandbox.name() == "none"
         && let Some(task) = task
+        && !task.state_dir.is_empty()
     {
         cmd.env("ZEROCLAW_SSH_TASK", task.id);
         cmd.env("ZEROCLAW_SSH_STATE_DIR", task.state_dir);
@@ -205,6 +206,16 @@ fn get_session_id() -> Option<String> {
         .filter(|key| !key.is_empty())
 }
 
+#[cfg(feature = "portable-ssh")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedSshRequest {
+    alias: String,
+    host: String,
+    port: Option<u16>,
+    username: Option<String>,
+}
+
 #[async_trait]
 impl Tool for ShellTool {
     fn name(&self) -> &str {
@@ -216,7 +227,7 @@ impl Tool for ShellTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
+        let schema = json!({
             "type": "object",
             "properties": {
                 "command": {
@@ -230,7 +241,26 @@ impl Tool for ShellTool {
                 }
             },
             "required": ["command"]
-        })
+        });
+        #[cfg(feature = "portable-ssh")]
+        {
+            let mut schema = schema;
+            schema["properties"]["ssh_authorization"] = json!({
+                "type": "object",
+                "description": "Run command on an authorized SSH destination using the credential alias. Omit for local execution.",
+                "additionalProperties": false,
+                "required": ["alias", "host"],
+                "properties": {
+                    "alias": {"type": "string"},
+                    "host": {"type": "string"},
+                    "port": {"type": "integer", "minimum": 1, "maximum": 65535, "default": 22},
+                    "username": {"type": "string", "description": "Required only to disambiguate a destination with multiple authorized users."}
+                }
+            });
+            schema
+        }
+        #[cfg(not(feature = "portable-ssh"))]
+        schema
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -296,9 +326,69 @@ impl Tool for ShellTool {
             });
         }
 
+        if let Some(ssh) = args.get("ssh_authorization") {
+            #[cfg(feature = "portable-ssh")]
+            {
+                let request: ManagedSshRequest = serde_json::from_value(ssh.clone())?;
+                let result = async {
+                    anyhow::ensure!(
+                        self.sandbox.name() == "none",
+                        "Managed SSH is unavailable in this sandbox"
+                    );
+                    self.security
+                        .validate_command_execution_in("ssh", approved, shell)
+                        .map_err(anyhow::Error::msg)?;
+                    let task = zeroclaw_tools::task_ssh::current()
+                        .and_then(|task| task.portable)
+                        .ok_or_else(|| {
+                            anyhow::Error::msg("Managed SSH is unavailable for this task")
+                        })?;
+                    task.execute_for_alias(
+                        &request.alias,
+                        &request.host,
+                        request.port.unwrap_or(22),
+                        request.username.as_deref(),
+                        command,
+                        Duration::from_secs(self.timeout_secs),
+                    )
+                    .await
+                }
+                .await;
+                return Ok(match result {
+                    Ok(output) => {
+                        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+                        text.push_str(&String::from_utf8_lossy(&output.stderr));
+                        ToolResult {
+                            success: output.status == 0,
+                            output: text.into(),
+                            error: (output.status != 0).then(|| {
+                                format!("SSH command exited with status {}", output.status)
+                            }),
+                        }
+                    }
+                    Err(error) => ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(error.to_string()),
+                    },
+                });
+            }
+            #[cfg(not(feature = "portable-ssh"))]
+            {
+                let _ = ssh;
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some("Managed SSH is unavailable in this build".into()),
+                });
+            }
+        }
+
         // A shared host broker must not be reachable from an OS sandbox,
         // even by discovering its socket in a shared directory such as /tmp.
-        if self.sandbox.name() != "none" && zeroclaw_tools::task_ssh::current().is_some() {
+        if self.sandbox.name() != "none"
+            && zeroclaw_tools::task_ssh::current().is_some_and(|task| !task.state_dir.is_empty())
+        {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -2447,6 +2537,8 @@ mod tests {
             Some(zeroclaw_tools::task_ssh::SshTask {
                 id: "test-task".into(),
                 state_dir: "/tmp/test-broker".into(),
+                #[cfg(feature = "portable-ssh")]
+                portable: None,
             }),
         );
         let output = command.output().await.unwrap();
@@ -2471,6 +2563,8 @@ mod tests {
             Some(zeroclaw_tools::task_ssh::SshTask {
                 id: "test-task".into(),
                 state_dir: "/tmp/test-broker".into(),
+                #[cfg(feature = "portable-ssh")]
+                portable: None,
             }),
         );
         let output = command.output().await.unwrap();

@@ -13,6 +13,117 @@ tokio::task_local! {
 pub struct SshTask {
     pub id: String,
     pub state_dir: String,
+    #[cfg(feature = "portable-ssh")]
+    pub portable: Option<PortableTaskOwner>,
+}
+
+#[cfg(feature = "portable-ssh")]
+#[derive(Clone)]
+pub struct PortableTaskOwner {
+    active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pool: std::sync::Arc<tokio::sync::Mutex<crate::portable_ssh_auth::PortableSshTask>>,
+}
+
+#[cfg(feature = "portable-ssh")]
+impl PortableTaskOwner {
+    fn from_operator_config() -> Option<Self> {
+        std::env::var_os("ZEROCLAW_SSH_KNOWN_HOSTS")?;
+        std::env::var_os("ZEROCLAW_SSH_CREDENTIAL_DIR")?;
+        Some(Self {
+            active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            pool: Default::default(),
+        })
+    }
+
+    pub async fn execute_for_alias(
+        &self,
+        alias: &str,
+        host: &str,
+        port: u16,
+        username: Option<&str>,
+        command: &str,
+        timeout: std::time::Duration,
+    ) -> Result<crate::portable_ssh_auth::PortableSshOutput> {
+        let root =
+            std::env::var_os("ZEROCLAW_SSH_CREDENTIAL_DIR").context("SSH catalog unavailable")?;
+        let catalog = std::path::PathBuf::from(root).join("config.toml");
+        let (record, _) =
+            crate::scoped_credentials::load_scoped_credential_snapshot(Some(&catalog), alias)?;
+        let mut destinations = record.ssh_profiles.into_iter().filter_map(|profile| {
+            let dest = profile.destination;
+            (matches!(
+                profile.authentication,
+                zeroclaw_config::ssh_auth_profile::SshAuthentication::Portable { .. }
+            ) && dest.host.eq_ignore_ascii_case(host)
+                && dest.port == port
+                && username.is_none_or(|user| user == dest.username))
+            .then_some(dest)
+        });
+        let destination = destinations
+            .next()
+            .context("SSH destination is not authorized")?;
+        anyhow::ensure!(
+            destinations.next().is_none(),
+            "Specify the authorized SSH username for this destination"
+        );
+        self.execute(alias, destination, command, timeout).await
+    }
+
+    pub async fn execute(
+        &self,
+        alias: &str,
+        destination: zeroclaw_config::schema::SshCredentialDestination,
+        command: &str,
+        timeout: std::time::Duration,
+    ) -> Result<crate::portable_ssh_auth::PortableSshOutput> {
+        let mut pool = self.pool.lock().await;
+        anyhow::ensure!(
+            self.active.load(std::sync::atomic::Ordering::Acquire),
+            "SSH task ended"
+        );
+        let root =
+            std::env::var_os("ZEROCLAW_SSH_CREDENTIAL_DIR").context("SSH catalog unavailable")?;
+        let known_hosts =
+            std::env::var_os("ZEROCLAW_SSH_KNOWN_HOSTS").context("SSH host pins unavailable")?;
+        anyhow::ensure!(destination.is_valid(), "Invalid SSH destination");
+        let pin =
+            crate::portable_ssh_auth::host_pin(&destination, std::path::Path::new(&known_hosts))?;
+        let catalog = std::path::PathBuf::from(root).join("config.toml");
+        pool.execute(&catalog, alias, destination, pin, command, timeout)
+            .await
+    }
+}
+
+#[cfg(feature = "portable-ssh")]
+struct PortableTaskGuard(Option<PortableTaskOwner>);
+
+#[cfg(feature = "portable-ssh")]
+impl Drop for PortableTaskGuard {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.0 {
+            owner
+                .active
+                .store(false, std::sync::atomic::Ordering::Release);
+            if let Ok(mut pool) = owner.pool.try_lock() {
+                *pool = Default::default();
+            }
+        }
+    }
+}
+
+async fn run_owned<T>(task: SshTask, future: impl Future<Output = T>) -> T {
+    #[cfg(feature = "portable-ssh")]
+    let owner = PortableTaskGuard(task.portable.clone());
+    let result = SSH_TASK.scope(task, future).await;
+    #[cfg(feature = "portable-ssh")]
+    if let Some(ref portable) = owner.0 {
+        portable
+            .active
+            .store(false, std::sync::atomic::Ordering::Release);
+        let pool = std::mem::take(&mut *portable.pool.lock().await);
+        pool.close().await;
+    }
+    result
 }
 
 pub fn current() -> Option<SshTask> {
@@ -67,13 +178,27 @@ async fn scope_with_helper_and_agent<T>(
     agent: Option<std::ffi::OsString>,
     future: std::pin::Pin<Box<dyn Future<Output = Result<T>> + Send + '_>>,
 ) -> Result<T> {
-    let Some(helper) = helper else {
-        return future.await;
-    };
     if current().is_some() {
         return future.await;
     }
+    #[cfg(feature = "portable-ssh")]
+    let portable = PortableTaskOwner::from_operator_config();
     let task = uuid::Uuid::new_v4().simple().to_string();
+    let Some(helper) = helper else {
+        #[cfg(feature = "portable-ssh")]
+        if portable.is_some() {
+            return run_owned(
+                SshTask {
+                    id: task,
+                    state_dir: String::new(),
+                    portable,
+                },
+                future,
+            )
+            .await;
+        }
+        return future.await;
+    };
     let mut command = Command::new(helper);
     if let Some(agent) = agent {
         command.env("SSH_AUTH_SOCK", agent);
@@ -122,15 +247,16 @@ async fn scope_with_helper_and_agent<T>(
             "tool-ssh-task-state-directory",
         ))?
         .to_string();
-    let result = SSH_TASK
-        .scope(
-            SshTask {
-                id: task,
-                state_dir,
-            },
-            future,
-        )
-        .await;
+    let result = run_owned(
+        SshTask {
+            id: task,
+            state_dir,
+            #[cfg(feature = "portable-ssh")]
+            portable,
+        },
+        future,
+    )
+    .await;
     drop(lease.input.take());
     let status = tokio::time::timeout(std::time::Duration::from_secs(10), lease.child.wait())
         .await

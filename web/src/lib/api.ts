@@ -1387,12 +1387,14 @@ export type HttpCredentialSource = "local" | "open_bao" | "one_password" | "azur
 export type SshDestination = { host: string; port: number; username: string };
 export type PamChallengeRole = "username" | "password" | "totp" | "password_then_totp";
 export type PamChallenge = { label: string; role: PamChallengeRole };
+export type PortableSshMode = "key" | "key_then_totp" | "password" | "password_then_totp" | "totp_then_password" | "password_and_totp";
 export type SshProfileAuth =
+  | { mode: "portable"; sequence: PortableSshMode; primary_alias: string; totp_alias?: string }
   | { mode: "public_key"; key_alias: string }
   | { mode: "password"; password_alias: string }
   | { mode: "pam"; password_alias?: string; totp_alias?: string; challenges: PamChallenge[] };
 export type SshAuthProfile = { destination: SshDestination; authentication: SshProfileAuth };
-export type HttpCredentialRow = { name: string; permission_revision: string; origin: string; kind: HttpCredentialKind; source: HttpCredentialSource; destinations?: SshDestination[] | null; ssh_profiles?: SshAuthProfile[]; http_allowed?: boolean | null; http_origins?: string[]; browser_origin?: string | null; browser_origins?: string[]; header?: "bearer" | "x_api_key" | "token" | null };
+export type HttpCredentialRow = { name: string; permission_revision: string; origin: string; kind: HttpCredentialKind; source: HttpCredentialSource; destinations?: SshDestination[] | null; ssh_profiles?: SshAuthProfile[]; ssh_username?: string | null; http_allowed?: boolean | null; http_origins?: string[]; browser_origin?: string | null; browser_origins?: string[]; header?: "bearer" | "x_api_key" | "token" | null };
 type HttpCredentialAuth =
   | { kind: "totp"; seed: string }
   | { kind: "user_password"; username: string; password: string }

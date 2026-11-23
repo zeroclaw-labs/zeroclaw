@@ -235,6 +235,25 @@ pub fn build_spec() -> serde_json::Value {
         }
     });
 
+    let portable_ssh_profile = serde_json::json!({
+        "type": "object",
+        "required": ["destination", "authentication"],
+        "properties": {
+            "destination": ssh_destination,
+            "authentication": {
+                "type": "object",
+                "required": ["mode", "sequence", "primary_alias"],
+                "properties": {
+                    "mode": {"const": "portable"},
+                    "sequence": {"enum": ["key", "key_then_totp", "password", "password_then_totp", "totp_then_password", "password_and_totp"]},
+                    "primary_alias": {"type": "string"},
+                    "totp_alias": {"type": ["string", "null"], "description": "Required only by modes that use TOTP."}
+                }
+            }
+        }
+    });
+    let legacy_ssh_destinations =
+        serde_json::json!({"type": ["array", "null"], "items": ssh_destination});
     let http_credentials_get = serde_json::json!({
         "tags": ["config"],
         "summary": "List scoped credential metadata",
@@ -255,19 +274,14 @@ pub fn build_spec() -> serde_json::Value {
                                 "kind": {"type": "string"},
                                 "source": {"type": "string"},
                                 "permission_revision": {"type": "string", "description": "Current revision of the credential permission state."},
+                                "ssh_username": {"type": ["string", "null"], "description": "SSH login from a username/password alias."},
+                                "ssh_profiles": {"type": "array", "description": "SSH authorization metadata, including earlier profile formats when present.", "items": {"type": "object"}},
                                 "http_allowed": {"type": ["boolean", "null"]},
                                 "http_origins": {"type": "array", "items": {"type": "string"}},
                                 "browser_origin": {"type": ["string", "null"]},
                                 "browser_origins": {"type": "array", "items": {"type": "string"}},
                                 "header": {"type": ["string", "null"]},
-                                "destinations": {"type": ["array", "null"], "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "host": {"type": "string"},
-                                        "port": {"type": "integer"},
-                                        "username": {"type": "string"}
-                                    }
-                                }}
+                                "destinations": legacy_ssh_destinations
                             }
                         }}
                     }
@@ -314,7 +328,7 @@ pub fn build_spec() -> serde_json::Value {
                     "permissions": {
                         "type": "object",
                         "properties": {
-                            "expected_revision": {"type": "string", "description": "Use the permission_revision from GET. Required when replacing http_origins, browser.origins, or destinations. A missing required or stale revision returns 409."},
+                            "expected_revision": {"type": "string", "description": "Use the permission_revision from GET. Required when replacing http_origins, browser.origins, destinations, or ssh_profiles. A missing required or stale revision returns 409."},
                             "http_allowed": {"type": "boolean"},
                             "http_origins": {"type": "array", "maxItems": 32, "items": {"type": "string"}},
                             "browser": {
@@ -324,7 +338,9 @@ pub fn build_spec() -> serde_json::Value {
                                     "origins": {"type": "array", "maxItems": 32, "items": {"type": "string"}}
                                 }
                             },
-                            "destinations": {"type": "array", "items": ssh_destination}
+                            "destinations": {"type": "array", "items": ssh_destination},
+                            "ssh_profiles": {"type": "array", "maxItems": 32, "items": portable_ssh_profile,
+                                "description": "Replaces the scoped SSH authorization list. Use an empty list to revoke all SSH profiles for the alias."}
                         }
                     }
                 }

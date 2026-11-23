@@ -39,6 +39,10 @@ pub(super) fn select(alias: &str, effective: &str) -> Result<Option<Factors>> {
     profile.validate()?;
     let (password_alias, totp_alias) = match &profile.authentication {
         SshAuthentication::PublicKey { .. } => return Ok(None),
+        SshAuthentication::Portable { .. } => {
+            anyhow::bail!("Portable SSH authentication requires the native transport")
+        }
+
         SshAuthentication::Password { password_alias } => (Some(password_alias), None),
         SshAuthentication::Pam {
             password_alias,
@@ -120,25 +124,12 @@ impl Factors {
     async fn totp(&self) -> Result<String> {
         let (source, reference) = self.seed.as_ref().context("SSH TOTP missing")?;
         let seed = resolve_scoped_value(*source, reference.clone()).await?;
-        let bytes = data_encoding::BASE32_NOPAD
-            .decode(
-                seed.trim()
-                    .trim_end_matches('=')
-                    .to_ascii_uppercase()
-                    .as_bytes(),
-            )
-            .map_err(|_| anyhow::Error::msg("invalid SSH TOTP seed"))?;
-        ensure!(!bytes.is_empty(), "empty SSH TOTP seed");
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
-        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, &bytes);
-        let digest = ring::hmac::sign(&key, &(now / 30).to_be_bytes());
-        let hash = digest.as_ref();
-        let offset = usize::from(hash[19] & 15);
-        let code =
-            (u32::from_be_bytes(hash[offset..offset + 4].try_into()?) & 0x7fff_ffff) % 1_000_000;
-        Ok(format!("{code:06}"))
+        crate::scoped_credentials::scoped_totp(
+            &seed,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs(),
+        )
     }
 
     pub(super) async fn authenticate(

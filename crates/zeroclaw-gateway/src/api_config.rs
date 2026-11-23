@@ -1407,6 +1407,37 @@ fn validate_ssh_profiles(
             "Duplicate SSH profile destination"
         );
         let factors = match &profile.authentication {
+            SshAuthentication::Portable {
+                sequence,
+                primary_alias,
+                totp_alias,
+            } => {
+                anyhow::ensure!(
+                    primary_alias == anchor,
+                    "SSH grant belongs to a different alias"
+                );
+                let load = |name: &str| -> anyhow::Result<ScopedHttpCredential> {
+                    let encrypted = credentials
+                        .get(name)
+                        .filter(|value| value.starts_with("enc2:"))
+                        .ok_or_else(|| anyhow::Error::msg("SSH credential is unavailable"))?;
+                    Ok(serde_json::from_str(&store.decrypt(encrypted)?)?)
+                };
+                let primary = load(primary_alias)?;
+                match &primary.auth {
+                    ScopedHttpAuth::SshKey { .. } if sequence.uses_key() => {}
+                    ScopedHttpAuth::UserPassword { username, .. }
+                        if !sequence.uses_key() && username == &dest.username => {}
+                    _ => anyhow::bail!("SSH credential kind or username does not match"),
+                }
+                if let Some(alias) = totp_alias {
+                    anyhow::ensure!(
+                        matches!(load(alias)?.auth, ScopedHttpAuth::Totp { .. }),
+                        "Invalid SSH TOTP credential"
+                    );
+                }
+                continue;
+            }
             SshAuthentication::PublicKey { key_alias } => [Some((key_alias, "ssh_key")), None],
             SshAuthentication::Password { password_alias } => {
                 [Some((password_alias, "user_password")), None]
@@ -1447,6 +1478,66 @@ fn validate_ssh_profiles(
             }
         }
     }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn portable_ssh_grant_binds_primary_username_and_totp_without_second_grant() -> anyhow::Result<()> {
+    use zeroclaw_config::{secrets::SecretStore, ssh_auth_profile::SshAuthProfile};
+    let temp = tempfile::tempdir()?;
+    let store = SecretStore::new(temp.path(), true);
+    let encrypted = |auth: serde_json::Value| {
+        store.encrypt(&serde_json::json!({"origin":"","auth":auth}).to_string())
+    };
+    let mut credentials = std::collections::HashMap::from([
+        (
+            "LOGIN".into(),
+            encrypted(
+                serde_json::json!({"kind":"user_password","username":"fixture","password":"synthetic"}),
+            )?,
+        ),
+        (
+            "OTP".into(),
+            encrypted(serde_json::json!({"kind":"totp","seed":"synthetic"}))?,
+        ),
+    ]);
+    let profile: SshAuthProfile = serde_json::from_value(serde_json::json!({
+        "destination":{"host":"fixture.example.test","port":2222,"username":"fixture"},
+        "authentication":{"mode":"portable","sequence":"password_then_totp","primary_alias":"LOGIN","totp_alias":"OTP"}
+    }))?;
+    validate_ssh_profiles(
+        "LOGIN",
+        std::slice::from_ref(&profile),
+        &credentials,
+        &store,
+    )?;
+    assert!(
+        validate_ssh_profiles("OTP", std::slice::from_ref(&profile), &credentials, &store).is_err()
+    );
+    credentials.insert(
+        "LOGIN".into(),
+        encrypted(
+            serde_json::json!({"kind":"user_password","username":"another","password":"synthetic"}),
+        )?,
+    );
+    assert!(
+        validate_ssh_profiles(
+            "LOGIN",
+            std::slice::from_ref(&profile),
+            &credentials,
+            &store
+        )
+        .is_err()
+    );
+    credentials.insert(
+        "LOGIN".into(),
+        encrypted(
+            serde_json::json!({"kind":"user_password","username":"fixture","password":"synthetic"}),
+        )?,
+    );
+    credentials.remove("OTP");
+    assert!(validate_ssh_profiles("LOGIN", &[profile], &credentials, &store).is_err());
     Ok(())
 }
 
@@ -1595,7 +1686,7 @@ pub async fn list_http_credentials(
                 rows.push((
                     name,
                     serde_json::json!({
-                        "name": name, "permission_revision": permission_revision(&record), "ssh_profiles": record.ssh_profiles, "origin": record.origin, "kind": kind, "source": record.source, "destinations": destinations, "header": header, "http_allowed": http_allowed, "http_origins": record.http_grants(), "browser_origin": record.browser_origin, "browser_origins": record.browser_grants().collect::<Vec<_>>()
+                        "name": name, "permission_revision": permission_revision(&record), "ssh_profiles": record.ssh_profiles, "ssh_username": match &record.auth { ScopedHttpAuth::UserPassword { username, .. } => Some(username), _ => None }, "origin": record.origin, "kind": kind, "source": record.source, "destinations": destinations, "header": header, "http_allowed": http_allowed, "http_origins": record.http_grants(), "browser_origin": record.browser_origin, "browser_origins": record.browser_grants().collect::<Vec<_>>()
                     }),
                 ));
             }
@@ -1694,6 +1785,19 @@ pub async fn mutate_http_credential(
                         || validate_ssh_profiles(&mutation.name, &profiles, credentials, &store).is_err()
                     {
                         return StatusCode::BAD_REQUEST.into_response();
+                    }
+                    // A destination moved into a portable authorization must
+                    // not retain an independent legacy grant to the same account.
+                    let remains_legacy = |grant: &zeroclaw_config::schema::SshCredentialDestination| {
+                        !record.ssh_profiles.iter().chain(&profiles).any(|profile| {
+                            matches!(&profile.authentication, zeroclaw_config::ssh_auth_profile::SshAuthentication::Portable { .. })
+                                && profile.destination.matches(&grant.host, grant.port, &grant.username)
+                        })
+                    };
+                    if let ScopedHttpAuth::SshKey { destinations, .. } = &mut record.auth {
+                        destinations.retain(remains_legacy);
+                    } else {
+                        record.ssh_factor_destinations.retain(remains_legacy);
                     }
                     record.ssh_profiles = profiles;
                 } else if let Some(requested) = permissions.http_origins {
@@ -1852,7 +1956,13 @@ pub async fn mutate_http_credential(
                     }
                     credential.browser_origin = previous.browser_origin;
                     credential.browser_origins = previous.browser_origins;
-                    credential.ssh_profiles = previous.ssh_profiles;
+                    credential.ssh_profiles = previous.ssh_profiles.into_iter().filter(|profile| {
+                        match &credential.auth {
+                            ScopedHttpAuth::UserPassword { username, .. } => profile.destination.username == *username,
+                            _ => true,
+                        }
+                    }).collect();
+
                     credential.ssh_factor_destinations = match &credential.auth {
                         ScopedHttpAuth::UserPassword { username, .. } => previous
                             .ssh_factor_destinations.into_iter()

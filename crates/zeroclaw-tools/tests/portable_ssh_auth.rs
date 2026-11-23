@@ -242,3 +242,57 @@ async fn probe(
         Ok(false)
     }
 }
+
+#[test]
+fn scoped_binding_rejects_another_account_and_revoked_totp() -> Result<()> {
+    use serde_json::json;
+    use zeroclaw_config::{schema::Config, secrets::SecretStore};
+    use zeroclaw_tools::portable_ssh_auth::PortableSshBinding;
+
+    let temp = tempfile::tempdir()?;
+    let store = SecretStore::new(temp.path(), true);
+    let catalog = temp.path().join("config.toml");
+    let mut config = Config::default();
+    config.secrets.encrypt = true;
+    let destination = || SshCredentialDestination {
+        host: "fixture.example.test".into(),
+        port: 2222,
+        username: USER.into(),
+    };
+    let record = |username: &str| {
+        json!({
+            "origin": "",
+            "ssh_profiles": [{
+                "destination": destination(),
+                "authentication": {
+                    "mode":"portable", "sequence":"password_then_totp",
+                    "primary_alias":"LOGIN", "totp_alias":"OTP"
+                }
+            }],
+            "auth": {"kind":"user_password","username":username,"password":PASSWORD}
+        })
+    };
+    config
+        .http_request
+        .scoped_credentials
+        .insert("LOGIN".into(), store.encrypt(&record(USER).to_string())?);
+    config.http_request.scoped_credentials.insert(
+        "OTP".into(),
+        store.encrypt(
+            &json!({"origin":"","auth":{"kind":"totp","seed":"JBSWY3DPEHPK3PXP"}}).to_string(),
+        )?,
+    );
+    std::fs::write(&catalog, toml::to_string(&config)?)?;
+
+    let mut other = destination();
+    other.username = "other".into();
+    assert!(PortableSshBinding::load(&catalog, "LOGIN", other).is_err());
+    let bound = PortableSshBinding::load(&catalog, "LOGIN", destination())?;
+    bound.revalidate()?;
+
+    config.http_request.scoped_credentials.remove("OTP");
+    std::fs::write(&catalog, toml::to_string(&config)?)?;
+    assert!(bound.revalidate().is_err());
+    assert!(PortableSshBinding::load(&catalog, "LOGIN", destination()).is_err());
+    Ok(())
+}

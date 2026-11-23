@@ -44,6 +44,11 @@ pub struct PamChallenge {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SshAuthentication {
+    Portable {
+        sequence: crate::ssh_auth_sequence::SshAuthMode,
+        primary_alias: String,
+        totp_alias: Option<String>,
+    },
     PublicKey {
         key_alias: String,
     },
@@ -69,6 +74,20 @@ impl SshAuthProfile {
         ensure!(self.destination.is_valid(), "Invalid SSH destination");
         let valid_alias = ScopedHttpCredential::valid_name;
         match &self.authentication {
+            SshAuthentication::Portable {
+                sequence,
+                primary_alias,
+                totp_alias,
+            } => {
+                ensure!(valid_alias(primary_alias), "Invalid SSH primary alias");
+                ensure!(
+                    sequence.requires_totp() == totp_alias.is_some()
+                        && totp_alias
+                            .as_ref()
+                            .is_none_or(|alias| alias != primary_alias && valid_alias(alias)),
+                    "Invalid SSH TOTP binding"
+                );
+            }
             SshAuthentication::PublicKey { key_alias } => {
                 ensure!(valid_alias(key_alias), "Invalid SSH key alias");
             }
