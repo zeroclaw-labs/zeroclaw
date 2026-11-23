@@ -1,10 +1,26 @@
 use crate::media::RenderedMarker;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 tokio::task_local! {
     static TOOL_EXECUTION_CONTEXT: ToolExecutionContext;
+}
+
+/// Canonical, secret-free details for one credential operation.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CredentialApprovalRequest {
+    pub credential_alias: String,
+    pub destination: String,
+    pub operation: String,
+}
+
+/// An operator approval service installed by the owner of a tool call.
+/// Implementations must return false when an operator cannot answer.
+#[async_trait]
+pub trait CredentialApprover: std::fmt::Debug + Send + Sync {
+    async fn approve(&self, request: &CredentialApprovalRequest) -> bool;
 }
 
 /// Per-call execution inputs supplied by the turn owner.
@@ -15,6 +31,7 @@ tokio::task_local! {
 #[derive(Debug, Clone, Default)]
 pub struct ToolExecutionContext {
     cancellation_token: Option<CancellationToken>,
+    credential_approver: Option<Arc<dyn CredentialApprover>>,
 }
 
 /// The execution future was dropped because its owner cancelled the call.
@@ -24,7 +41,24 @@ pub struct ToolExecutionCancelled;
 
 impl ToolExecutionContext {
     pub fn new(cancellation_token: Option<CancellationToken>) -> Self {
-        Self { cancellation_token }
+        Self {
+            cancellation_token,
+            credential_approver: None,
+        }
+    }
+
+    pub fn with_credential_approver(mut self, approver: Arc<dyn CredentialApprover>) -> Self {
+        self.credential_approver = Some(approver);
+        self
+    }
+
+    /// Ask for a fresh decision. This does not validate or refresh the grant;
+    /// the consumer must verify its revision before using the credential.
+    pub async fn request_credential_approval(request: &CredentialApprovalRequest) -> bool {
+        match Self::current().and_then(|context| context.credential_approver) {
+            Some(approver) => approver.approve(request).await,
+            None => false,
+        }
     }
 
     pub fn cancellation_token(&self) -> Option<&CancellationToken> {
@@ -629,6 +663,38 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn credential_approval_denies_without_a_call_scoped_approver() {
+        #[derive(Debug)]
+        struct ApproveRead;
+
+        #[async_trait]
+        impl CredentialApprover for ApproveRead {
+            async fn approve(&self, request: &CredentialApprovalRequest) -> bool {
+                request.operation == "list_directory"
+            }
+        }
+
+        let mut request = CredentialApprovalRequest {
+            credential_alias: "REPORTS".into(),
+            destination: "https://files.example.test/dav/".into(),
+            operation: "list_directory".into(),
+        };
+        assert!(!ToolExecutionContext::request_credential_approval(&request).await);
+
+        ToolExecutionContext::default()
+            .with_credential_approver(Arc::new(ApproveRead))
+            .run(async {
+                assert!(ToolExecutionContext::request_credential_approval(&request).await);
+                request.operation = "delete_file".into();
+                assert!(!ToolExecutionContext::request_credential_approval(&request).await);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(!ToolExecutionContext::request_credential_approval(&request).await);
+    }
 
     #[tokio::test]
     async fn tool_context_masks_and_restores_nested_scopes() {
