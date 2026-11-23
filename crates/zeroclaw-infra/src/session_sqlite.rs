@@ -1311,6 +1311,10 @@ impl SessionBackend for SqliteSessionBackend {
                 "DELETE FROM session_metadata WHERE session_key = ?1",
                 params![key],
             );
+            let _ = conn.execute(
+                "DELETE FROM session_messages WHERE target_session_key = ?1",
+                params![key],
+            );
         }
 
         Ok(count)
@@ -1370,9 +1374,9 @@ impl SessionBackend for SqliteSessionBackend {
         )
         .map_err(std::io::Error::other)?;
 
-        // A deleted session never admits the messages still pending for it.
+        // A deleted session keeps none of its messages, received or pending.
         conn.execute(
-            "DELETE FROM session_messages WHERE target_session_key = ?1 AND admitted_at IS NULL",
+            "DELETE FROM session_messages WHERE target_session_key = ?1",
             params![session_key],
         )
         .map_err(std::io::Error::other)?;
@@ -1434,7 +1438,7 @@ impl SessionBackend for SqliteSessionBackend {
         )
         .map_err(std::io::Error::other)?;
         tx.execute(
-            "DELETE FROM session_messages WHERE target_session_key = ?1 AND admitted_at IS NULL",
+            "DELETE FROM session_messages WHERE target_session_key = ?1",
             params![session_key],
         )
         .map_err(std::io::Error::other)?;
@@ -1496,7 +1500,7 @@ impl SessionBackend for SqliteSessionBackend {
         )
         .map_err(std::io::Error::other)?;
         conn.execute(
-            "DELETE FROM session_messages WHERE target_session_key = ?1 AND admitted_at IS NULL",
+            "DELETE FROM session_messages WHERE target_session_key = ?1",
             params![session_key],
         )
         .map_err(std::io::Error::other)?;
@@ -2228,6 +2232,103 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a recreated session does not inherit a message sent to the deleted one"
+        );
+    }
+
+    /// Every row addressed to `target`, received or pending.
+    fn stored_message_rows(backend: &SqliteSessionBackend, target: &str) -> i64 {
+        backend
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM session_messages WHERE target_session_key = ?1",
+                params![target],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// A session `target` owned by Alice holding one received and one
+    /// pending message.
+    fn session_with_received_and_pending_messages(backend: &SqliteSessionBackend) {
+        backend.append("target", &ChatMessage::user("hi")).unwrap();
+        backend
+            .set_session_principal("target", "user:alice")
+            .unwrap();
+        backend
+            .store_session_message(&peer_message("d-read", "target", "already read"))
+            .unwrap();
+        assert!(backend.mark_session_message_admitted("d-read").unwrap());
+        backend
+            .store_session_message(&peer_message("d-new", "target", "not read yet"))
+            .unwrap();
+        assert_eq!(stored_message_rows(backend, "target"), 2);
+    }
+
+    #[test]
+    fn delete_session_removes_received_and_pending_messages() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        session_with_received_and_pending_messages(&backend);
+        assert!(backend.delete_session("target").unwrap());
+        assert_eq!(stored_message_rows(&backend, "target"), 0);
+    }
+
+    #[test]
+    fn authorized_delete_removes_received_and_pending_messages() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        session_with_received_and_pending_messages(&backend);
+        let authorize = |_owner: Option<&str>| -> std::io::Result<
+            Box<dyn crate::session_backend::SessionEffectGuard>,
+        > { Ok(Box::new(())) };
+        assert!(
+            backend
+                .delete_session_authorized("target", Some("user:alice"), &authorize)
+                .unwrap()
+        );
+        assert_eq!(stored_message_rows(&backend, "target"), 0);
+    }
+
+    #[test]
+    fn owned_delete_removes_received_and_pending_messages() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        session_with_received_and_pending_messages(&backend);
+        assert!(
+            backend
+                .delete_session_owned("target", "user:alice")
+                .unwrap()
+        );
+        assert_eq!(stored_message_rows(&backend, "target"), 0);
+    }
+
+    #[test]
+    fn stale_cleanup_removes_messages_so_a_reused_id_starts_empty() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        session_with_received_and_pending_messages(&backend);
+        {
+            let conn = backend.conn.lock();
+            let old_time = (Utc::now() - Duration::hours(100)).to_rfc3339();
+            conn.execute(
+                "UPDATE session_metadata SET last_activity = ?1 WHERE session_key = 'target'",
+                params![old_time],
+            )
+            .unwrap();
+        }
+        assert_eq!(backend.cleanup_stale(48).unwrap(), 1);
+        assert_eq!(stored_message_rows(&backend, "target"), 0);
+
+        backend
+            .append("target", &ChatMessage::user("a new session"))
+            .unwrap();
+        assert!(
+            backend
+                .next_pending_session_message("target")
+                .unwrap()
+                .is_none(),
+            "the reused id does not inherit the expired session's inbox"
         );
     }
 
