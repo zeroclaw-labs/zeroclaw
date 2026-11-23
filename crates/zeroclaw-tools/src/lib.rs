@@ -1,6 +1,7 @@
 //! Tool implementations for agent-callable capabilities.
 
 pub mod attribution;
+pub mod remote_file_transfer;
 pub mod helpers;
 pub(crate) mod i18n;
 pub mod inventory;
