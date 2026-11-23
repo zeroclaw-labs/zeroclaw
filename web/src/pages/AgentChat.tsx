@@ -1,4 +1,6 @@
-import { memo, useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { displayMessageText } from '@/lib/chatMessageText';
+import BrowserVoiceControls from '@/components/BrowserVoiceControls';
+import { memo, useState, useEffect, useRef, useCallback, useMemo, useId } from 'react';
 import { Link, Navigate, useParams } from 'react-router-dom';
 import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, Brain, BarChart2, FolderOpen, ImagePlus, Loader2 } from 'lucide-react';
 import ReactMarkdown, { type Components } from 'react-markdown';
@@ -274,6 +276,10 @@ export function AgentChatInner({
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modelDropdownRef = useRef<HTMLDivElement>(null);
+  const modelButtonRef = useRef<HTMLButtonElement>(null);
+  const modelMenuId = useId();
+  // The menu renders only when there are models to pick from.
+  const modelMenuOpen = showModelDropdown && availableModels.length > 0;
 
   // AgentChatInner stays mounted while the selected conversation changes.
   // Load that conversation's draft explicitly; useState's initializer only ran
@@ -316,6 +322,26 @@ export function AgentChatInner({
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
+
+  // Escape closes the model menu, as it does the conversation picker's, so
+  // keyboard users can dismiss it. An Escape that a React handler or an
+  // earlier `document` listener already took (`preventDefault`), or one that
+  // ends an IME composition, is left alone; dialogs listen on `window`, which
+  // runs after this. Focus goes back to the button only if it was in the
+  // picker (or nowhere), so Escape in the composer doesn't pull focus away.
+  useEffect(() => {
+    if (!modelMenuOpen) return;
+    function handleEscape(e: KeyboardEvent) {
+      if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing) return;
+      setShowModelDropdown(false);
+      const active = document.activeElement;
+      if (!active || active === document.body || modelDropdownRef.current?.contains(active)) {
+        modelButtonRef.current?.focus();
+      }
+    }
+    document.addEventListener('keydown', handleEscape);
+    return () => document.removeEventListener('keydown', handleEscape);
+  }, [modelMenuOpen]);
 
   /**
    * Slash-command dispatcher (#7137). Returns true when `trimmed` was handled
@@ -407,15 +433,20 @@ export function AgentChatInner({
     }
   }, [addLocalMessage, clearAllMessages, startNewSession, currentModel, availableModels, switchModel, modelLoading, operator, commands]);
 
+  const [voiceSubmitRequested, setVoiceSubmitRequested] = useState<string | null>(null);
+  const cancelVoiceCapture = useRef<(() => void) | null>(null);
   const handleSend = () => {
     const trimmed = input.trim();
     if (!trimmed) return;
+    const command = isSlashCommand(trimmed);
+    if (!command && !canSend) return;
+    cancelVoiceCapture.current?.();
 
     // Slash commands are dispatched BEFORE the connectivity check so purely
     // local commands like /help still work during transient disconnects.
     // Network-dependent commands (/clear, /model) self-recover via their own
     // reconnect paths inside the context. #7137
-    if (isSlashCommand(trimmed)) {
+    if (command) {
       runCommand(trimmed);
     } else {
       if (!canSend) return;
@@ -432,10 +463,19 @@ export function AgentChatInner({
     }
   };
 
+  useEffect(() => {
+    if (!voiceSubmitRequested) return;
+    setVoiceSubmitRequested(null);
+    // A voice timeout submits a normal ready draft, never a local slash command.
+    if (voiceSubmitRequested === draftKey && canSend && (hydrated || startsConversationOnSend) && !typing && input.trim() && !isSlashCommand(input.trim())) handleSend();
+  });
+
   const isComposingRef = useRef(false);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Escape' && showCommandHint) {
+      // Taken here, so the same Escape doesn't also close the model menu.
+      e.preventDefault();
       setShowCommandHint(false);
       return;
     }
@@ -700,9 +740,11 @@ export function AgentChatInner({
           {operator ? (
             <div className="relative min-w-0" ref={modelDropdownRef}>
               <button
+                ref={modelButtonRef}
                 type="button"
                 onClick={() => setShowModelDropdown((v) => !v)}
-                aria-expanded={showModelDropdown && availableModels.length > 0}
+                aria-expanded={modelMenuOpen}
+                aria-controls={modelMenuOpen ? modelMenuId : undefined}
                 disabled={modelLoading || typing || (availableModels.length === 0 && currentModel === null)}
                 className="flex items-center gap-2 px-3 h-7 max-w-full rounded-[var(--radius-md)] text-xs font-medium border border-pc-border bg-pc-elevated text-pc-text-secondary transition-colors hover:text-pc-text hover:border-pc-border-strong disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]"
               >
@@ -714,8 +756,8 @@ export function AgentChatInner({
                 <ChevronDown className="h-3 w-3 shrink-0" />
               </button>
 
-              {showModelDropdown && availableModels.length > 0 && (
-                <div className="absolute end-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 min-w-[200px] max-h-60 overflow-y-auto">
+              {modelMenuOpen && (
+                <div id={modelMenuId} className="absolute end-0 mt-1.5 rounded-[var(--radius-md)] border border-pc-border bg-pc-elevated shadow-[var(--pc-shadow-md)] z-50 py-1 min-w-[200px] max-h-60 overflow-y-auto">
                   {availableModels.map((model) => {
                     const isActive = model === currentModel;
                     return (
@@ -797,6 +839,9 @@ export function AgentChatInner({
             aria-pressed={keepThinkingCollapsed}
             className="aria-pressed:border-pc-accent aria-pressed:bg-pc-accent/10"
           >
+            {/* A check while on, so the pressed state doesn't rely on the
+                accent colour alone. */}
+            {keepThinkingCollapsed && <Check className="h-3 w-3" />}
             <Brain className="h-3 w-3" />
             {t('agent.thinking_keep_collapsed')}
           </Button>
@@ -921,6 +966,7 @@ export function AgentChatInner({
           </div>
         )}
         <div className="flex items-end gap-3 max-w-4xl mx-auto">
+          <BrowserVoiceControls key={draftKey} captureRef={cancelVoiceCapture} onSilence={() => setVoiceSubmitRequested(draftKey)} messages={messages} hydrated={hydrated} typing={typing} onTranscript={text => applyInput(prev => `${prev}${prev && !/\s$/.test(prev) ? ' ' : ''}${text}`)} />
           {operator && (
             <>
               <input
@@ -1023,18 +1069,6 @@ export function AgentChatInner({
   );
 }
 
-// Channel-user (and some agent) messages arrive with a leading
-// `[YYYY-MM-DD HH:MM:SS TZ] ` prefix the gateway prepends. The zone is a chrono
-// `%Z` abbreviation (e.g. CEST) that JS `Date` can't reliably parse, so we
-// don't try — we just strip the prefix for display and copy; the bubble shows
-// its own wall-clock caption separately. Anchored to the start so a bracketed
-// datetime appearing mid-message (a log line, an error report) is left intact.
-const SERVER_TIMESTAMP_RE = /^\s*\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [^\]]+\]\s*/;
-
-function stripServerTimestamp(content: string): string {
-  return content.replace(SERVER_TIMESTAMP_RE, '');
-}
-
 // Each chat message is rendered through this memoized component so that
 // typing into the input does not re-render every existing message (and
 // re-run ReactMarkdown on each one). Keep the prop surface small and pass
@@ -1061,7 +1095,7 @@ const MessageItem = memo(function MessageItem({
   // verbatim and never carry the gateway's `[timestamp]` prefix, so don't strip
   // them (that would clip a message starting with a bracketed datetime). Only
   // server-sourced messages can be prefixed.
-  const cleanContent = msg.local || msg.ephemeral ? msg.content : stripServerTimestamp(msg.content);
+  const cleanContent = displayMessageText(msg);
 
   return (
     <div
