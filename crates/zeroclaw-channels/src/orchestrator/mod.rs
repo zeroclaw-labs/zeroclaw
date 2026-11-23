@@ -12590,7 +12590,7 @@ async fn run_message_dispatch_loop_until_cancelled(
                 .unwrap_or_default()
                 .as_secs();
             if now.saturating_sub(msg.timestamp) > EDIT_FRESHNESS_SECS {
-                // Recorded, not dispatched — and marked, so the model can
+                // Recorded, not dispatched; marked, so the model can
                 // tell an out-of-order history line that revises an earlier
                 // message from a brand-new one.
                 let mut msg = msg;

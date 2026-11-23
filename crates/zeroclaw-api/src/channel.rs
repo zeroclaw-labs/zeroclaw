@@ -449,7 +449,7 @@ pub struct ChannelMessage {
     pub voice_origin: bool,
     /// Set by the receiving channel when the platform delivered this message
     /// as an edit of a previously sent message (Telegram `edited_message`).
-    /// This field creates that fact for the runtime — nothing else on the
+    /// This field creates that fact for the runtime; nothing else on the
     /// inbound side records it. `false` means an ordinary new message.
     pub edited: bool,
 }

@@ -17455,7 +17455,7 @@ pub struct TelegramConfig {
     /// agent (coalesced latest-wins over the debounce window and dispatched
     /// with an `[edited]` marker), while an edit of a message older than the
     /// freshness window is recorded as history context only. Default:
-    /// `false` — edits are ignored. Coalescing requires a non-zero
+    /// `false`: edits are ignored. Coalescing requires a non-zero
     /// `[channels].debounce_ms`: with the global default of `0` the debounce
     /// window is zero and every edit dispatches immediately as its own turn
     /// (freshness marking still applies).
