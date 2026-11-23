@@ -93,13 +93,17 @@ async function mountMeter() {
   });
   assert.ok(socket.onMessage, 'the real AgentProvider installs the receiving callback');
   assert.ok(current?.hydrated, 'chat hydration completes before events are delivered');
+  function button(label: string) {
+    const el = [...container.querySelectorAll('button')].find((b) => b.textContent?.trim() === label);
+    assert.ok(el, `button ${label} is rendered`);
+    return el;
+  }
   return {
     socket,
+    button,
     text: () => container.textContent ?? '',
     async click(label: string) {
-      const button = [...container.querySelectorAll('button')].find((b) => b.textContent?.trim() === label);
-      assert.ok(button, `button ${label} is rendered`);
-      await act(async () => { button.click(); });
+      await act(async () => { button(label).click(); });
     },
     async refreshModels() { await act(async () => { current?.refreshModels(); }); },
     async receive(frame: WsMessage) {
@@ -305,6 +309,29 @@ test('Codex usage displays only reported windows, without hiding real zero or un
     await chat.click('Check Codex usage');
     assert.match(chat.text(), /5-hour window0% used/);
     assert.match(chat.text(), /Weekly windowUnknown/);
+  } finally {
+    await chat.unmount();
+  }
+});
+
+test('Codex usage waits for a running turn without reporting a route error or auto-fetching', async () => {
+  const chat = await mountMeter();
+  try {
+    let checks = 0;
+    chat.socket.usage = async () => { checks += 1; return usageFrame(12); };
+    await chat.receive({ type: 'chunk', content: 'working' });
+    await chat.click('Codex usage');
+    assert.equal(chat.button('Check Codex usage').disabled, true);
+    await chat.click('Check Codex usage');
+    assert.match(chat.text(), /Available when this turn finishes\./);
+    assert.doesNotMatch(chat.text(), /route could not be verified/);
+    await chat.receive(done());
+    assert.equal(chat.button('Check Codex usage').disabled, false);
+    assert.doesNotMatch(chat.text(), /Available when this turn finishes/);
+    assert.equal(checks, 0);
+    await chat.click('Check Codex usage');
+    assert.equal(checks, 1);
+    assert.match(chat.text(), /12% used/);
   } finally {
     await chat.unmount();
   }

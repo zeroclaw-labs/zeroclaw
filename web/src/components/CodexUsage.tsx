@@ -157,12 +157,13 @@ export default function CodexUsage({
           <Button
             size="sm"
             variant="ghost"
-            disabled={loading}
-            onClick={() => void checker.check({ connected: connected && !busy, switching })}
+            disabled={busy || loading}
+            onClick={() => void checker.check({ connected, switching })}
           >
             {loading ? t('agent.codex_usage_checking') : t('agent.codex_usage_check')}
           </Button>
           <div role="status" aria-live="polite" className="flex flex-col gap-2">
+            {busy && <p className="text-pc-text-secondary">{t('agent.codex_usage_busy')}</p>}
             {state.kind === 'problem' && (
               <p className="text-status-error">{t(`agent.codex_usage_p_${state.problem}`)}</p>
             )}

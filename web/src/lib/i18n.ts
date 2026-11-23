@@ -1715,6 +1715,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.codex_usage_heading': 'Codex subscription usage',
     'agent.codex_usage_check': 'Check Codex usage',
     'agent.codex_usage_checking': 'Checking…',
+    'agent.codex_usage_busy': 'Available when this turn finishes.',
     'agent.codex_usage_note': 'Share of your Codex subscription allowance used. This is not model token or cost reporting.',
     'agent.codex_usage_five_hour': '5-hour window',
     'agent.codex_usage_weekly': 'Weekly window',
