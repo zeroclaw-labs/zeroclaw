@@ -1710,21 +1710,17 @@ pub(crate) type Cutover = Option<Extension<CutoverWebChat>>;
 async fn operator_webchat_id(
     store: &Arc<AcpSessionStore>,
     id: String,
-) -> Result<Option<String>, Response> {
+) -> anyhow::Result<Option<String>> {
     let store = Arc::clone(store);
-    match tokio::task::spawn_blocking(move || store.operator_webchat_id(&id)).await {
-        Ok(Ok(id)) => Ok(id),
-        Ok(Err(e)) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error":e.to_string()})),
-        )
-            .into_response()),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error":e.to_string()})),
-        )
-            .into_response()),
-    }
+    tokio::task::spawn_blocking(move || store.operator_webchat_id(&id)).await?
+}
+
+fn webchat_store_error(error: impl std::fmt::Display) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": error.to_string()})),
+    )
+        .into_response()
 }
 
 async fn webchat_store_result(
@@ -1743,16 +1739,8 @@ async fn webchat_store_result(
     match tokio::task::spawn_blocking(move || op(&store)).await {
         Ok(Ok(Some(value))) => Json(value).into_response(),
         Ok(Ok(None)) => CoreFailure::NotFound.into_response(),
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error":e.to_string()})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error":e.to_string()})),
-        )
-            .into_response(),
+        Ok(Err(e)) => webchat_store_error(e),
+        Err(e) => webchat_store_error(e),
     }
 }
 
@@ -1896,7 +1884,7 @@ pub(crate) async fn session_delete(
             let id = match operator_webchat_id(&store, id).await {
                 Ok(Some(id)) => id,
                 Ok(None) => return CoreFailure::NotFound.into_response(),
-                Err(response) => return response,
+                Err(error) => return webchat_store_error(error),
             };
             let Ok(permit) = turns.acquire_for_webchat_delete(&id).await else {
                 return StatusCode::CONFLICT.into_response();
@@ -1948,7 +1936,7 @@ pub(crate) async fn session_message_post(
     let id = match operator_webchat_id(&store, id).await {
         Ok(Some(id)) => id,
         Ok(None) => return CoreFailure::NotFound.into_response(),
-        Err(response) => return response,
+        Err(error) => return webchat_store_error(error),
     };
     let permit = match state.session_queue.acquire(&id).await {
         Ok(permit) => permit,
