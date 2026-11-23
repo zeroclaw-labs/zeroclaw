@@ -1859,6 +1859,12 @@ impl MessageContent {
     /// turn's rolling breakpoint. Empty text is never marked, because the
     /// wire format rejects empty text blocks that carry `cache_control`.
     fn apply_cache_control(&mut self, cache_ttl: CacheTtl) -> bool {
+        // Caching disabled: place nothing and leave the wire shape untouched.
+        // The block conversion below exists only to host a breakpoint, so
+        // converting here would perturb the request for no gain.
+        let Some(control) = crate::anthropic::CacheControl::ephemeral_with_ttl(cache_ttl) else {
+            return false;
+        };
         match self {
             MessageContent::Text(text) => {
                 if text.is_empty() {
@@ -1866,9 +1872,7 @@ impl MessageContent {
                 }
                 *self = MessageContent::Parts(vec![MessagePart::Text {
                     text: std::mem::take(text),
-                    cache_control: Some(crate::anthropic::CacheControl::ephemeral_with_ttl(
-                        cache_ttl,
-                    )),
+                    cache_control: Some(control),
                 }]);
                 true
             }
@@ -1880,9 +1884,7 @@ impl MessageContent {
                     } = part
                         && !text.is_empty()
                     {
-                        *cache_control = Some(crate::anthropic::CacheControl::ephemeral_with_ttl(
-                            cache_ttl,
-                        ));
+                        *cache_control = Some(control.clone());
                         return true;
                     }
                 }
@@ -3007,6 +3009,13 @@ fn sse_bytes_to_events_for_contract(
                     return;
                 }
             }
+        }
+
+        // Some compatible endpoints close after a complete terminal sentinel
+        // without a final newline. Do not infer completion from an unfinished
+        // JSON response, partial sentinel, or trailing incomplete UTF-8 bytes.
+        if utf8_buf.is_empty() && buffer.strip_prefix("data:").map(str::trim) == Some("[DONE]") {
+            saw_completion = true;
         }
 
         if !emitted_tool_calls {
@@ -5874,6 +5883,64 @@ mod tests {
         let msgs = body["messages"].as_array().expect("messages array");
         assert_eq!(msgs[0]["content"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(msgs[3]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    /// `off` behind the flag: no breakpoint anywhere, and the wire shape is
+    /// untouched — a message that would have carried a breakpoint does not
+    /// convert to block form, so the body is byte-identical to the same
+    /// request with `cache_passthrough` off.
+    #[tokio::test]
+    async fn cache_ttl_off_leaves_the_compat_wire_unmarked() {
+        let messages = vec![
+            ChatMessage::system("be brief"),
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+        ];
+
+        let (provider, captured, server) =
+            mock_cache_capture_with_ttl(true, Some(CacheTtl::Off)).await;
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("off request failed: {error}"));
+        let off_body = captured.lock().unwrap()[0].clone();
+        assert!(
+            !off_body.to_string().contains("cache_control"),
+            "off must emit no cache_control key anywhere: {off_body}"
+        );
+
+        // Control run: same request, flag off. `off` must be indistinguishable
+        // from not asking for caching at all.
+        let (provider, captured, server) =
+            mock_cache_capture_with_ttl(false, Some(CacheTtl::Off)).await;
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await;
+        server.abort();
+        result.unwrap_or_else(|error| panic!("control request failed: {error}"));
+        let control_body = captured.lock().unwrap()[0].clone();
+        assert_eq!(
+            off_body, control_body,
+            "off must leave the compat wire byte-identical to the flag-off wire"
+        );
     }
 
     /// D3: `cache_ttl` without `cache_passthrough` is inert — the structured
@@ -10002,16 +10069,16 @@ mod tests {
         // The path-read step stores raw bytes; PEM parsing happens in http_client().
         // Writing invalid PEM to a temp file: read succeeds (bytes stored), then
         // http_client() logs a WARN and falls back to system roots — no panic, no error.
-        let path = format!("/tmp/zeroclaw-test-invalid-pem-{}.pem", std::process::id());
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("invalid.pem");
         std::fs::write(&path, b"not-a-valid-pem").unwrap();
         let p = OpenAiCompatibleModelProvider::builder("test")
             .display_name("test")
             .base_url("https://example.com")
             .credential(None)
             .auth_style(AuthStyle::Bearer)
-            .tls_ca_cert_path(&path)
+            .tls_ca_cert_path(path.to_str().expect("UTF-8 test path"))
             .build();
-        std::fs::remove_file(&path).ok();
         assert!(
             p.tls_ca_cert_pem.is_some(),
             "readable file (even with bad PEM) must populate tls_ca_cert_pem bytes"
@@ -10026,19 +10093,16 @@ mod tests {
     fn with_tls_ca_cert_path_invalid_pem_streaming_http_client_still_builds() {
         // Streaming requests use a separate client builder, so the TLS override
         // must degrade the same way there: warn, use system roots, and keep going.
-        let path = format!(
-            "/tmp/zeroclaw-test-invalid-pem-streaming-{}.pem",
-            std::process::id()
-        );
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("invalid.pem");
         std::fs::write(&path, b"not-a-valid-pem").unwrap();
         let p = OpenAiCompatibleModelProvider::builder("test")
             .display_name("test")
             .base_url("https://example.com")
             .credential(None)
             .auth_style(AuthStyle::Bearer)
-            .tls_ca_cert_path(&path)
+            .tls_ca_cert_path(path.to_str().expect("UTF-8 test path"))
             .build();
-        std::fs::remove_file(&path).ok();
         assert!(
             p.tls_ca_cert_pem.is_some(),
             "readable file (even with bad PEM) must populate tls_ca_cert_pem bytes"
@@ -10175,6 +10239,58 @@ mod tests {
             matches!(events.last(), Some(Ok(StreamEvent::Final))),
             "got: {events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn eof_after_done_without_newline_preserves_content_and_usage() {
+        let events = collect_stream_events(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}\n\ndata: [DONE]",
+        ).await;
+        assert!(
+            events.iter().all(Result::is_ok),
+            "complete sentinel must terminate: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Ok(StreamEvent::TextDelta(c)) if c.delta == "hi"))
+        );
+        assert!(events.iter().any(|e| matches!(e, Ok(StreamEvent::Usage(u)) if u.input_tokens == Some(7) && u.output_tokens == Some(2))));
+        assert!(matches!(events.last(), Some(Ok(StreamEvent::Final))));
+    }
+
+    #[tokio::test]
+    async fn eof_after_done_with_incomplete_utf8_is_still_truncated() {
+        let body: &'static [u8] = b"data: [DONE]\xe2\x82";
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(reqwest::StatusCode::OK)
+                .body(reqwest::Body::from(body))
+                .expect("test response should build"),
+        );
+        let events: Vec<_> = sse_bytes_to_events(response, false).collect().await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Ok(StreamEvent::Final))),
+            "incomplete UTF-8 must not emit Final: {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(Err(StreamError::Http(message))) if message.contains("truncated")),
+            "expected truncation error: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_with_partial_terminal_data_is_still_truncated() {
+        for body in [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DON",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[{\"finish_reason\":\"stop\"}]}",
+        ] {
+            let events = collect_stream_events(body).await;
+            assert!(!events.iter().any(|e| matches!(e, Ok(StreamEvent::Final))));
+            assert!(matches!(events.last(), Some(Err(_))));
+        }
     }
 
     #[tokio::test]
