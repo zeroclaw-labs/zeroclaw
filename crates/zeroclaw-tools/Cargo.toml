@@ -105,6 +105,7 @@ tool-opencode-cli = ["zeroclaw-config/tool-opencode-cli"]
 test-helpers = []
 
 [dev-dependencies]
+rand = "0.10"
 zeroclaw-infra.workspace = true
 zeroclaw-providers = { workspace = true, features = ["test-helpers"] }
 rcgen = "0.13"

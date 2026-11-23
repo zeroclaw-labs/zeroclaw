@@ -38,6 +38,14 @@ task broker, with connection scope and task lifetime enforced consistently
 on all supported systems. Verify the six modes against disposable SSH
 servers and record client-platform build and runtime results separately.
 
+The protocol adapter and the SSH loopback suite are available for review.
+Run `cargo test --locked -p zeroclaw-tools --features portable-ssh --test portable_ssh_auth`
+to exercise all six modes without a system SSH daemon. The test server sends
+identical non-English prompt labels, validates the actual responses, and
+covers host-key mismatch, visible fields and incomplete key-plus-TOTP.
+The operator form and task-owned pool are separate integration work, and
+Linux loopback results do not certify Windows or macOS.
+
 The sections below describe the draft implementation that this design
 supersedes. They document its current behavior until the new transport and
 authorization form are implemented.
