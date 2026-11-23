@@ -107,3 +107,9 @@ credential_alias = "REPORT_LOGIN"
 Config validation compiles the catalog without network access. The default is an empty catalog. Requests must still match a live grant for the canonical alias, exact root, and credential binding. Editing an endpoint does not extend an existing grant to its new destination. The tool is not registered by this setting alone.
 
 The catalog-backed dispatcher uses the shared ZeroClaw network guard. It denies private resolution by default and permits it only when the operator policy explicitly allows the resolved endpoint. Every resolved address is checked, including NAT64 translations and cloud metadata addresses. The HTTPS transport pins the vetted addresses. If deployment proxy policy would make that pinning ineffective, the operation is denied instead of taking a direct path. The managed vault callback remains separate so the feature can reuse the existing credential catalog when that upstream work is available.
+
+## Integration with the managed credential catalog
+
+The review branch depends on the scoped credential catalog and loader in #12596. The WebDAV dispatcher uses the same encrypted credential records. Its dedicated live resource grant binds the exact endpoint and credential alias to the requested operation. HTTP and Browser grants do not supply that authorization. The resolver rechecks the stored encrypted record and resource grant before returning a sensitive authorization header.
+
+This slice supports local encrypted username/password, Bearer and Token credentials. It fails closed for other types or external provider references. The inherited external lookup can spawn a provider command; the Remote Files dispatcher does not invoke that path. A shell-free external vault integration and end-to-end runtime wiring remain pending.

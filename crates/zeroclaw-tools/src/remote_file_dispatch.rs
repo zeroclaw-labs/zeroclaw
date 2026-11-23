@@ -205,9 +205,146 @@ pub async fn dispatch_catalog_webdav_read<'a>(
     .await
 }
 
+/// Resolve a WebDAV credential using the same encrypted records as the
+/// existing managed HTTP and browser consumers. The authorization closure
+/// must check a dedicated Remote Files grant, not an HTTP or browser grant.
+pub(crate) fn resolve_local_webdav_header(
+    config_path: &std::path::Path,
+    alias: &str,
+    authorized: impl Fn() -> bool,
+) -> Result<HeaderValue, ReadDispatchError> {
+    use base64::Engine;
+    use zeroclaw_config::schema::{ScopedApiKeyHeader, ScopedCredentialSource, ScopedHttpAuth};
+
+    if !authorized() {
+        return Err(ReadDispatchError::Denied);
+    }
+    let (credential, revision) =
+        crate::scoped_credentials::load_scoped_credential_snapshot(Some(config_path), alias)
+            .map_err(|_| ReadDispatchError::CredentialUnavailable)?;
+    if !matches!(credential.source, ScopedCredentialSource::Local) {
+        return Err(ReadDispatchError::CredentialUnavailable);
+    }
+
+    let value = match credential.auth {
+        ScopedHttpAuth::ApiKey {
+            value,
+            header: ScopedApiKeyHeader::Bearer,
+        } if !value.is_empty() => {
+            format!("Bearer {value}")
+        }
+        ScopedHttpAuth::ApiKey {
+            value,
+            header: ScopedApiKeyHeader::Token,
+        } if !value.is_empty() => {
+            format!("Token {value}")
+        }
+        ScopedHttpAuth::UserPassword { username, password }
+            if !username.is_empty() && !username.contains(':') && !password.is_empty() =>
+        {
+            let value =
+                base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+            format!("Basic {value}")
+        }
+        _ => return Err(ReadDispatchError::CredentialUnavailable),
+    };
+
+    let mut header =
+        HeaderValue::from_str(&value).map_err(|_| ReadDispatchError::CredentialUnavailable)?;
+    header.set_sensitive(true);
+    let (_, current_revision) =
+        crate::scoped_credentials::load_scoped_credential_snapshot(Some(config_path), alias)
+            .map_err(|_| ReadDispatchError::CredentialUnavailable)?;
+    if current_revision != revision || !authorized() {
+        return Err(ReadDispatchError::Denied);
+    }
+    Ok(header)
+}
+
+/// Read using the shared encrypted store and a live Remote Files grant for
+/// the exact resource binding. This intermediate entry point stays gated
+/// by platform capability and holds requests requiring human approval.
+pub async fn dispatch_vault_webdav_read<'a>(
+    request: &RemoteFilesRequest,
+    catalog: &'a WebDavCatalog,
+    config_path: &std::path::Path,
+    live_rights: impl Fn(&str, &Url, RemoteIdentity<'a>) -> Option<&'a Rights>,
+    availability: &'a BackendAvailability,
+    network: &WebDavNetworkPolicy<'_>,
+) -> Result<WebDavReadResult, ReadDispatchError> {
+    let (alias, right) = match request {
+        RemoteFilesRequest::ListDirectory { resource, .. } => (resource, Right::ListDirectory),
+        RemoteFilesRequest::GetFileInfo { resource, .. } => (resource, Right::GetFileInfo),
+        _ => return Err(ReadDispatchError::UnsupportedOperation),
+    };
+    let canonical_alias = alias.to_ascii_lowercase();
+
+    dispatch_catalog_webdav_read(
+        request,
+        catalog,
+        &live_rights,
+        availability,
+        network,
+        async |root, identity| {
+            let RemoteIdentity::Vault {
+                credential_alias,
+                totp_alias: None,
+            } = identity
+            else {
+                return Err(ReadDispatchError::CredentialUnavailable);
+            };
+            resolve_local_webdav_header(config_path, credential_alias, || {
+                live_rights(&canonical_alias, root, identity)
+                    .is_some_and(|rights| rights.check(&[right]) == Decision::Allowed)
+            })
+        },
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn webdav_resolves_existing_encrypted_entry_only_with_a_live_dedicated_grant() {
+        use std::cell::Cell;
+        use zeroclaw_config::{schema::Config, secrets::SecretStore};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("config.toml");
+        let mut config = Config::default();
+        config.secrets.encrypt = true;
+        let record = serde_json::json!({
+            "origin": "https://example.test",
+            "http_allowed": false,
+            "auth": {"kind": "user_password", "username": "fixture", "password": "demo"}
+        });
+        let value = SecretStore::new(fixture.path(), true)
+            .encrypt(&record.to_string())
+            .unwrap();
+        config
+            .http_request
+            .scoped_credentials
+            .insert("REPORT_LOGIN".into(), value);
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+
+        let header = resolve_local_webdav_header(&path, "REPORT_LOGIN", || true).unwrap();
+        assert_eq!(header, "Basic Zml4dHVyZTpkZW1v");
+        assert!(header.is_sensitive());
+        assert!(matches!(
+            resolve_local_webdav_header(&path, "REPORT_LOGIN", || false),
+            Err(ReadDispatchError::Denied)
+        ));
+        let calls = Cell::new(0);
+        assert!(matches!(
+            resolve_local_webdav_header(&path, "REPORT_LOGIN", || {
+                calls.set(calls.get() + 1);
+                calls.get() == 1
+            }),
+            Err(ReadDispatchError::Denied)
+        ));
+    }
+
     use std::collections::BTreeSet;
 
     #[tokio::test]
