@@ -883,6 +883,7 @@ fn take_peer_message_into_prompt(
 ) -> Option<String> {
     let message = match backend.next_pending_session_message(session_key) {
         Ok(message) => message?,
+        Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return None,
         Err(error) => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -7169,6 +7170,10 @@ impl RpcDispatcher {
         let preparation_prompt = prompt.clone();
         let preparation_turn_id = turn_id.clone();
         let preparation_error_for_task = Arc::clone(&preparation_error);
+        // Set only when prepare admits the turn. A turn cancelled while it
+        // waits for the agent lock never runs prepare and leaves this false.
+        let prepared = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let prepared_for_task = Arc::clone(&prepared);
         let prepare = move |mut guard: tokio::sync::OwnedMutexGuard<crate::agent::agent::Agent>| async move {
             current
                 .ctx
@@ -7228,6 +7233,7 @@ impl RpcDispatcher {
                     new_messages: Vec::new(),
                 });
             }
+            prepared_for_task.store(true, std::sync::atomic::Ordering::Release);
             Ok(guard)
         };
         let turn = crate::rpc::turn::execute_turn_prepared(
@@ -7313,6 +7319,7 @@ impl RpcDispatcher {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         if refused_preparation.is_none()
+            && prepared.load(std::sync::atomic::Ordering::Acquire)
             && let Some(delivery_id) = peer_delivery.as_deref()
             && let Some(backend) = self.ctx.session_backend.as_ref()
             && let Err(error) = backend.mark_session_message_admitted(delivery_id)
@@ -53986,6 +53993,75 @@ mod tests {
             1,
             "only the first turn's history carries it: {text}"
         );
+    }
+
+    /// A turn cancelled while it waits for the Agent lock never reaches
+    /// prepare, so its peer message stays pending for the next turn.
+    #[tokio::test]
+    async fn a_turn_cancelled_before_prepare_leaves_its_peer_message_pending() {
+        use zeroclaw_infra::session_backend::SessionBackend as _;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "s-peer-cancel";
+        let (ctx, backend, workspace) = steering_ctx(&tmp, |profile| profile.admin = true);
+        let _handles = install_recording_session(
+            &ctx,
+            &backend,
+            sid,
+            "user:alice",
+            &workspace,
+            Vec::new(),
+            false,
+        )
+        .await;
+        backend
+            .store_session_message(&zeroclaw_api::session_message::SessionMessage::new(
+                "d-cancel",
+                "rpc_s-sender",
+                format!("rpc_{sid}"),
+                "the build is green",
+                Some("test-agent".into()),
+                Some("test-agent".into()),
+            ))
+            .unwrap();
+        let (alice, _alice_rx) = roster_peer(&ctx, 4242).await;
+        let (entered, release) = ctx.sessions.set_test_prompt_execution_pause();
+        let task = zeroclaw_spawn::spawn!(async move {
+            alice
+                .handle_session_prompt(&json!({"session_id": sid, "prompt": "next step?"}))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the prompt passes its final check");
+        let held = ctx
+            .sessions
+            .get_agent(sid)
+            .await
+            .expect("the session has an agent")
+            .lock_owned()
+            .await;
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !ctx.sessions.cancel_session(sid) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the waiting turn is cancellable");
+        // Hold the lock past the cancel grace so the waiting turn is aborted
+        // before it can prepare; the prompt's cleanup then needs the lock.
+        tokio::time::sleep(std::time::Duration::from_secs(7)).await;
+        drop(held);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(15), task)
+            .await
+            .expect("the cancelled prompt settles")
+            .expect("the prompt task does not panic");
+
+        let pending = backend
+            .next_pending_session_message(&format!("rpc_{sid}"))
+            .unwrap()
+            .expect("the unread message stays pending");
+        assert_eq!(pending.delivery_id, "d-cancel");
     }
 
     const QUEUED_PROMPT: &str = "summarize the incident";

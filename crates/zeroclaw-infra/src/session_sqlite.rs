@@ -1495,6 +1495,11 @@ impl SessionBackend for SqliteSessionBackend {
             params![session_key],
         )
         .map_err(std::io::Error::other)?;
+        conn.execute(
+            "DELETE FROM session_messages WHERE target_session_key = ?1 AND admitted_at IS NULL",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
         Ok(true)
     }
 
@@ -1503,10 +1508,14 @@ impl SessionBackend for SqliteSessionBackend {
         message: &zeroclaw_api::session_message::SessionMessage,
     ) -> std::io::Result<()> {
         let conn = self.conn.lock();
-        conn.execute(
+        // Check the target and insert in one statement under the connection
+        // lock that session deletion also holds, so a message cannot land
+        // after its recipient is deleted.
+        let rows = conn.execute(
             "INSERT INTO session_messages (delivery_id, source_session_key, target_session_key, \
              body, accepted_at, source_agent_alias, target_agent_alias, admitted_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 \
+             WHERE EXISTS (SELECT 1 FROM session_metadata WHERE session_key = ?3)",
             params![
                 message.delivery_id,
                 message.source_session_key,
@@ -1519,6 +1528,12 @@ impl SessionBackend for SqliteSessionBackend {
             ],
         )
         .map_err(std::io::Error::other)?;
+        if rows == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "target session does not exist",
+            ));
+        }
         Ok(())
     }
 
@@ -2103,6 +2118,8 @@ mod tests {
     fn session_messages_are_pending_in_order_until_admitted() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("target", &ChatMessage::user("hi")).unwrap();
+        backend.append("other", &ChatMessage::user("hi")).unwrap();
         backend
             .store_session_message(&peer_message("d1", "target", "first"))
             .unwrap();
@@ -2168,6 +2185,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         {
             let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+            backend.append("target", &ChatMessage::user("hi")).unwrap();
             backend
                 .store_session_message(&peer_message("d1", "target", "durable"))
                 .unwrap();
@@ -2183,6 +2201,34 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(next.body, "durable");
+    }
+
+    #[test]
+    fn a_message_for_a_missing_or_deleted_session_is_not_stored() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let missing = backend
+            .store_session_message(&peer_message("d0", "target", "early"))
+            .unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+
+        backend.append("target", &ChatMessage::user("hi")).unwrap();
+        assert!(backend.delete_session("target").unwrap());
+        let deleted = backend
+            .store_session_message(&peer_message("d1", "target", "late"))
+            .unwrap_err();
+        assert_eq!(deleted.kind(), std::io::ErrorKind::NotFound);
+
+        backend
+            .append("target", &ChatMessage::user("recreated"))
+            .unwrap();
+        assert!(
+            backend
+                .next_pending_session_message("target")
+                .unwrap()
+                .is_none(),
+            "a recreated session does not inherit a message sent to the deleted one"
+        );
     }
 
     #[test]

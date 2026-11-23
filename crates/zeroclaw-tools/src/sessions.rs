@@ -739,6 +739,14 @@ impl Tool for SessionsMessageTool {
         else {
             return Ok(session_not_found(target_session_id));
         };
+        // Only RPC Chat turns read pending messages, so refuse any other
+        // surface instead of storing a message that is never delivered.
+        if !target_session_key.starts_with(RPC_SESSION_KEY_PREFIX) {
+            return Ok(Self::failure(tool_msg_with_args(
+                "tool-sessions-message-error-target-unsupported",
+                &[("session_id", &target_session_key)],
+            )));
+        }
 
         let source_metadata = self.backend.get_session_metadata(&source_session_key);
         let target_metadata = self.backend.get_session_metadata(&target_session_key);
@@ -783,6 +791,9 @@ impl Tool for SessionsMessageTool {
             Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(Self::failure(tool_msg(
                 "tool-sessions-message-error-unsupported",
             ))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(session_not_found(target_session_id))
+            }
             Err(e) => {
                 let error = e.to_string();
                 Ok(Self::failure(tool_msg_with_args(
@@ -2683,8 +2694,8 @@ mod tests {
     #[tokio::test]
     async fn sessions_message_creates_durable_event() {
         let (_tmp, inner) = seeded_metadata_backend(vec![
-            session_metadata("alice_session", Some("agent1"), None, 2),
-            session_metadata("bob_session", Some("agent1"), None, 1),
+            session_metadata("rpc_alice_session", Some("agent1"), None, 2),
+            session_metadata("rpc_bob_session", Some("agent1"), None, 1),
         ]);
         let capturing_backend = Arc::new(MessageCapturingBackend::new(inner));
         let backend: Arc<dyn SessionBackend> = capturing_backend.clone();
@@ -2708,8 +2719,8 @@ mod tests {
 
         let captured = capturing_backend.captured_messages();
         assert_eq!(captured.len(), 1);
-        assert_eq!(captured[0].source_session_key, "alice_session");
-        assert_eq!(captured[0].target_session_key, "bob_session");
+        assert_eq!(captured[0].source_session_key, "rpc_alice_session");
+        assert_eq!(captured[0].target_session_key, "rpc_bob_session");
         assert_eq!(captured[0].body, "Hello from Alice");
         assert!(!captured[0].admitted);
     }
@@ -2717,8 +2728,8 @@ mod tests {
     #[tokio::test]
     async fn sessions_message_rejects_cross_alias() {
         let (_tmp, backend) = seeded_metadata_backend(vec![
-            session_metadata("alice_session", Some("agent1"), None, 2),
-            session_metadata("bob_session", Some("agent2"), None, 1),
+            session_metadata("rpc_alice_session", Some("agent1"), None, 2),
+            session_metadata("rpc_bob_session", Some("agent2"), None, 1),
         ]);
 
         let tool = SessionsMessageTool::new(backend, test_security(), Some("agent1".into()));
@@ -2750,8 +2761,8 @@ mod tests {
     #[tokio::test]
     async fn sessions_message_rejects_missing_source_alias() {
         let (_tmp, backend) = seeded_metadata_backend(vec![
-            session_metadata("alice_session", None, None, 2),
-            session_metadata("bob_session", Some("agent1"), None, 1),
+            session_metadata("rpc_alice_session", None, None, 2),
+            session_metadata("rpc_bob_session", Some("agent1"), None, 1),
         ]);
 
         let tool = SessionsMessageTool::new(backend, test_security(), Some("agent1".into()));
@@ -2777,8 +2788,8 @@ mod tests {
     #[tokio::test]
     async fn sessions_message_validates_body_size() {
         let (_tmp, inner) = seeded_metadata_backend(vec![
-            session_metadata("alice_session", Some("agent1"), None, 2),
-            session_metadata("bob_session", Some("agent1"), None, 1),
+            session_metadata("rpc_alice_session", Some("agent1"), None, 2),
+            session_metadata("rpc_bob_session", Some("agent1"), None, 1),
         ]);
         let capturing_backend = Arc::new(MessageCapturingBackend::new(inner));
         let backend: Arc<dyn SessionBackend> = capturing_backend.clone();
@@ -2883,8 +2894,8 @@ mod tests {
     #[tokio::test]
     async fn sessions_message_rejects_source_alias_other_than_bound_agent() {
         let (_tmp, inner) = seeded_metadata_backend(vec![
-            session_metadata("alice_session", Some("agent2"), None, 2),
-            session_metadata("bob_session", Some("agent2"), None, 1),
+            session_metadata("rpc_alice_session", Some("agent2"), None, 2),
+            session_metadata("rpc_bob_session", Some("agent2"), None, 1),
         ]);
         let capturing_backend = Arc::new(MessageCapturingBackend::new(inner));
         let backend: Arc<dyn SessionBackend> = capturing_backend.clone();
@@ -2918,8 +2929,8 @@ mod tests {
     #[tokio::test]
     async fn sessions_message_reports_backend_without_message_store() {
         let (_tmp, backend) = seeded_metadata_backend(vec![
-            session_metadata("alice_session", Some("agent1"), None, 2),
-            session_metadata("bob_session", Some("agent1"), None, 1),
+            session_metadata("rpc_alice_session", Some("agent1"), None, 2),
+            session_metadata("rpc_bob_session", Some("agent1"), None, 1),
         ]);
         let tool = SessionsMessageTool::new(backend, test_security(), Some("agent1".into()));
 
@@ -2939,6 +2950,41 @@ mod tests {
             result.error.as_deref(),
             Some(tool_msg("tool-sessions-message-error-unsupported").as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn sessions_message_refuses_a_target_whose_turns_never_read_messages() {
+        let (_tmp, inner) = seeded_metadata_backend(vec![
+            session_metadata("rpc_alice_session", Some("agent1"), None, 2),
+            session_metadata("gw_bob_session", Some("agent1"), None, 1),
+        ]);
+        let capturing_backend = Arc::new(MessageCapturingBackend::new(inner));
+        let backend: Arc<dyn SessionBackend> = capturing_backend.clone();
+        let tool = SessionsMessageTool::new(backend, test_security(), Some("agent1".into()));
+
+        let result = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(
+                Some("alice_session".into()),
+                tool.execute(json!({
+                    "target_session_id": "gw_bob_session",
+                    "message": "Hello"
+                })),
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                tool_msg_with_args(
+                    "tool-sessions-message-error-target-unsupported",
+                    &[("session_id", "gw_bob_session")],
+                )
+                .as_str()
+            )
+        );
+        assert!(capturing_backend.captured_messages().is_empty());
     }
 
     #[tokio::test]
