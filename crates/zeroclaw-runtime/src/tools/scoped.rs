@@ -701,8 +701,9 @@ fn mcp_tool_reaches_delegated_agents(
     if any_denied_server && matches!(name, "tool_search" | "mcp_resources" | "mcp_prompts") {
         return false;
     }
-    name.split_once(zeroclaw_tools::mcp_client::MCP_TOOL_NAME_SEPARATOR)
-        .is_none_or(|(server, _)| !denied_servers.contains(server))
+    !denied_servers
+        .iter()
+        .any(|server| tools::mcp_tool_name_belongs_to_server(name, server))
 }
 
 impl ScopedToolRegistry {
@@ -3500,6 +3501,61 @@ mod tests {
         assert!(
             inherited.iter().any(|name| name == "remote2__echo"),
             "inheritance remains available for other MCP servers: {inherited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_parent_view_withholds_tools_from_separator_server_names() {
+        let mut config =
+            config_with_bundled_mcp("http://127.0.0.1:1".into(), "http://127.0.0.1:2".into());
+        config.mcp.servers[0].name = "team__authority".into();
+        config.mcp.servers[0].deny_delegate_inheritance = true;
+        config.mcp.servers[1].name = "team__ordinary".into();
+        config
+            .mcp_bundles
+            .get_mut("mockbundle")
+            .expect("test bundle")
+            .servers = vec!["team__authority".into(), "team__ordinary".into()];
+
+        let parent: DelegateParentToolsHandle = Arc::new(parking_lot::RwLock::new(vec![
+            Arc::new(MockTool("team__authority__read")) as Arc<dyn Tool>,
+            Arc::new(MockTool("team__ordinary__read")),
+            Arc::new(MockTool("team__authority_extra__read")),
+        ]));
+        let mut built = built_with(Vec::new());
+        built.delegate_handle = Some(Arc::clone(&parent));
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+
+        ScopedToolRegistry::assemble(ScopedAssembly {
+            config: &config,
+            agent_alias: "scoped",
+            security: &security,
+            built,
+            skills: &[],
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: true,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: Some(Arc::new(tools::McpRegistry::for_test_with_server_count(0))),
+        })
+        .await;
+
+        let inherited: Vec<String> = parent
+            .read()
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        assert_eq!(
+            inherited,
+            ["team__ordinary__read", "team__authority_extra__read"],
+            "the complete withheld server name must match without withholding an unrelated near-prefix"
         );
     }
 

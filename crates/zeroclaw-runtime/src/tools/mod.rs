@@ -234,6 +234,17 @@ pub(crate) fn config_for_delegated_agent(config: &Config) -> Config {
     delegated
 }
 
+/// Whether `tool_name` is an MCP callable owned by `server_name`.
+///
+/// MCP callable names use `<server>__<tool>`. Match from the complete server
+/// name so separators inside that name remain part of the identity.
+pub(crate) fn mcp_tool_name_belongs_to_server(tool_name: &str, server_name: &str) -> bool {
+    tool_name
+        .strip_prefix(server_name)
+        .and_then(|suffix| suffix.strip_prefix(zeroclaw_tools::mcp_client::MCP_TOOL_NAME_SEPARATOR))
+        .is_some()
+}
+
 /// Thin wrapper that makes an `Arc<dyn Tool>` usable as `Box<dyn Tool>`.
 pub struct ArcToolRef(pub Arc<dyn Tool>);
 // ArcToolRef is the public constructor name for ArcToolWrapper

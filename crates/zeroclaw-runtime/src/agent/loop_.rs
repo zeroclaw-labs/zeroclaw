@@ -1622,9 +1622,33 @@ pub async fn run_with_capabilities(
     .await
 }
 
+fn config_for_run(
+    mut config: Config,
+    agent_alias: &str,
+    admission: Option<&AgentExecutionAdmission>,
+    overrides: &AgentRunOverrides,
+) -> Result<Config> {
+    if let Some(admission) = admission {
+        admission.revalidate()?;
+        anyhow::ensure!(
+            admission.alias() == agent_alias,
+            "agent execution admission alias changed during construction"
+        );
+        config = admission.config().as_ref().clone();
+    }
+    // Admission selects the authoritative snapshot; narrow it before building child tools.
+    if overrides.is_subagent {
+        config = crate::tools::config_for_delegated_agent(&config);
+    }
+    if overrides.suppress_memory_auto_save {
+        config.memory.auto_save = false;
+    }
+    Ok(config)
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn run_inner(
-    mut config: Config,
+    config: Config,
     capabilities: Option<RuntimeCapabilities>,
     principal: Option<PrincipalId>,
     agent_alias: &str,
@@ -1651,17 +1675,12 @@ async fn run_inner(
         .as_ref()
         .map(AgentExecutionAdmission::capability)
         .or_else(|| overrides.execution_capability.clone());
-    if let Some(admission) = execution_admission.as_ref() {
-        admission.revalidate()?;
-        anyhow::ensure!(
-            admission.alias() == agent_alias,
-            "agent execution admission alias changed during construction"
-        );
-        config = admission.config().as_ref().clone();
-    }
-    if overrides.suppress_memory_auto_save {
-        config.memory.auto_save = false;
-    }
+    let config = config_for_run(
+        config,
+        agent_alias,
+        execution_admission.as_ref(),
+        &overrides,
+    )?;
     let capabilities = capabilities.unwrap_or_else(|| RuntimeCapabilities::config_backed(&config));
     let agent = resolved_agent_for_turn(&config, agent_alias)?;
     crate::agent::thinking::validate_thinking_config(&agent.resolved.thinking);
@@ -4426,6 +4445,49 @@ async fn process_message_inner(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn admitted_subagent_uses_only_inheritable_mcp_servers() {
+        use zeroclaw_config::schema::McpServerConfig;
+
+        let mut authoritative = Config::default();
+        authoritative
+            .agents
+            .insert("alpha".into(), Default::default());
+        for (name, withheld) in [("ordinary", false), ("private", true)] {
+            authoritative.mcp.servers.push(McpServerConfig {
+                name: name.into(),
+                deny_delegate_inheritance: withheld,
+                ..Default::default()
+            });
+        }
+        let authority = crate::LiveConfigAuthority::new(authoritative);
+        let admission = authority.execution_capability().admit("alpha").unwrap();
+        for (is_subagent, expected) in [
+            (true, vec!["ordinary"]),
+            (false, vec!["ordinary", "private"]),
+        ] {
+            let effective = super::config_for_run(
+                Config::default(),
+                "alpha",
+                Some(&admission),
+                &super::AgentRunOverrides {
+                    is_subagent,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                effective
+                    .mcp
+                    .servers
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
     /// A run over an owner's plane re-assembles its SOP steps under that
     /// owner; a run over shared memory carries none.
     #[test]

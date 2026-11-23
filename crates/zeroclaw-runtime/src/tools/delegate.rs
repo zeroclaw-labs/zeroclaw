@@ -2324,12 +2324,10 @@ impl DelegateTool {
         if any_withheld && matches!(name, "tool_search" | "mcp_resources" | "mcp_prompts") {
             return true;
         }
-        name.split_once(zeroclaw_tools::mcp_client::MCP_TOOL_NAME_SEPARATOR)
-            .is_some_and(|(server, _)| {
-                config.mcp.servers.iter().any(|configured| {
-                    configured.name == server && configured.deny_delegate_inheritance
-                })
-            })
+        config.mcp.servers.iter().any(|configured| {
+            configured.deny_delegate_inheritance
+                && crate::tools::mcp_tool_name_belongs_to_server(name, &configured.name)
+        })
     }
 
     /// Resolve every configured skill bundle alias to its directory.
@@ -15240,6 +15238,34 @@ target = "memory_recall"
             assert!(
                 !DelegateTool::config_withholds_delegate_tool(Some(&config), name),
                 "`{name}` is unrelated to the withheld server"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_delegation_withholds_tools_from_separator_server_names() {
+        let mut config = Config::default();
+        config.mcp.servers = vec![
+            zeroclaw_config::schema::McpServerConfig {
+                name: "team__authority".into(),
+                deny_delegate_inheritance: true,
+                ..Default::default()
+            },
+            zeroclaw_config::schema::McpServerConfig {
+                name: "team__ordinary".into(),
+                ..Default::default()
+            },
+        ];
+
+        for (name, withheld) in [
+            ("team__authority__read", true),
+            ("team__ordinary__read", false),
+            ("team__authority_extra__read", false),
+        ] {
+            assert_eq!(
+                DelegateTool::config_withholds_delegate_tool(Some(&config), name),
+                withheld,
+                "unexpected bounded-delegation decision for `{name}`"
             );
         }
     }
