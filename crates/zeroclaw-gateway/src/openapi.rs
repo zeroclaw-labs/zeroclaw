@@ -225,6 +225,124 @@ pub fn build_spec() -> serde_json::Value {
         "404": error_responses["404"].clone(),
     });
 
+    let ssh_destination = serde_json::json!({
+        "type": "object",
+        "required": ["host", "port", "username"],
+        "properties": {
+            "host": {"type": "string"},
+            "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+            "username": {"type": "string"}
+        }
+    });
+
+    let http_credentials_get = serde_json::json!({
+        "tags": ["config"],
+        "summary": "List scoped credential metadata",
+        "responses": {
+            "200": {
+                "description": "Credential metadata. Secret values and references are omitted.",
+                "content": {"application/json": {"schema": {
+                    "type": "object",
+                    "required": ["encryption_enabled", "credentials"],
+                    "properties": {
+                        "encryption_enabled": {"type": "boolean"},
+                        "credentials": {"type": "array", "items": {
+                            "type": "object",
+                            "required": ["name", "origin", "kind", "source", "permission_revision"],
+                            "properties": {
+                                "name": {"type": "string"},
+                                "origin": {"type": "string"},
+                                "kind": {"type": "string"},
+                                "source": {"type": "string"},
+                                "permission_revision": {"type": "string", "description": "Current revision of the credential permission state."},
+                                "http_allowed": {"type": ["boolean", "null"]},
+                                "http_origins": {"type": "array", "items": {"type": "string"}},
+                                "browser_origin": {"type": ["string", "null"]},
+                                "browser_origins": {"type": "array", "items": {"type": "string"}},
+                                "header": {"type": ["string", "null"]},
+                                "destinations": {"type": ["array", "null"], "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "host": {"type": "string"},
+                                        "port": {"type": "integer"},
+                                        "username": {"type": "string"}
+                                    }
+                                }}
+                            }
+                        }}
+                    }
+                }}}
+            },
+            "403": {"description": "Authenticated operator required"},
+            "503": {"description": "Credential catalog unavailable"}
+        }
+    });
+    let http_credentials_post = serde_json::json!({
+        "tags": ["config"],
+        "summary": "Create, replace or remove a scoped credential or update its grant",
+        "description": "New aliases have no HTTP grant. Grant changes use a separate replace request with permissions.",
+        "requestBody": {
+            "required": true,
+            "content": {"application/json": {"schema": {
+                "type": "object",
+                "required": ["name", "operation"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "operation": {"type": "string", "enum": ["create", "replace", "delete"]},
+                    "credential": {
+                        "type": "object",
+                        "required": ["origin", "auth"],
+                        "properties": {
+                            "origin": {"type": "string"},
+                            "source": {"type": "string"},
+                            "auth": {
+                                "type": "object",
+                                "required": ["kind"],
+                                "properties": {
+                                    "kind": {"type": "string", "enum": ["api_key", "user_password", "totp", "ssh_key"]},
+                                    "header": {"type": "string"},
+                                    "username": {"type": "string", "writeOnly": true},
+                                    "value": {"type": "string", "writeOnly": true},
+                                    "password": {"type": "string", "writeOnly": true},
+                                    "seed": {"type": "string", "writeOnly": true},
+                                    "private_key": {"type": "string", "writeOnly": true},
+                                    "destinations": {"type": "array", "items": ssh_destination}
+                                }
+                            }
+                        }
+                    },
+                    "permissions": {
+                        "type": "object",
+                        "properties": {
+                            "expected_revision": {"type": "string", "description": "Use the permission_revision from GET. Required when replacing http_origins, browser.origins, or destinations. A missing required or stale revision returns 409."},
+                            "http_allowed": {"type": "boolean"},
+                            "http_origins": {"type": "array", "maxItems": 32, "items": {"type": "string"}},
+                            "browser": {
+                                "type": "object",
+                                "properties": {
+                                    "origin": {"type": ["string", "null"]},
+                                    "origins": {"type": "array", "maxItems": 32, "items": {"type": "string"}}
+                                }
+                            },
+                            "destinations": {"type": "array", "items": ssh_destination}
+                        }
+                    }
+                }
+            }}}
+        },
+        "responses": {
+            "204": {"description": "Mutation saved"},
+            "400": {"description": "Invalid credential or grant"},
+            "403": {"description": "Authenticated operator required"},
+            "404": {"description": "Credential not found for grant update"},
+            "409": {"description": "Credential state conflicts with the operation"},
+            "412": {"description": "Initialized encryption required"}
+        }
+    });
+    let http_credentials = serde_json::json!({
+        "get": http_credentials_get,
+        "post": http_credentials_post
+    });
     let paths = serde_json::json!({
         "/api/status": {
             "get": {
@@ -264,6 +382,63 @@ pub fn build_spec() -> serde_json::Value {
                 "parameters": [path_param.clone()],
                 "responses": prop_get_responses,
             },
+        },
+        "/api/config/http-credentials": http_credentials,
+        "/api/config/plugin-tls-credentials": {
+            "get": {
+                "tags": ["config"],
+                "summary": "List plugin TLS credential bindings",
+                "description": "An authenticated operator receives binding metadata and configured state. Credential values are write-only.",
+                "responses": {
+                    "200": {
+                        "description": "Credential binding metadata",
+                        "content": {"application/json": {"schema": {
+                            "type": "object",
+                            "required": ["encryption_enabled", "credentials"],
+                            "properties": {
+                                "encryption_enabled": {"type": "boolean"},
+                                "credentials": {"type": "array", "items": {
+                                    "type": "object",
+                                    "required": ["instance", "property", "configured", "profiles"],
+                                    "properties": {
+                                        "instance": {"type": "string"},
+                                        "property": {"type": "string"},
+                                        "configured": {"type": "boolean"},
+                                        "profiles": {"type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}}}
+                                    }
+                                }}
+                            }
+                        }}}
+                    },
+                    "403": {"description": "Authenticated operator required"}
+                }
+            },
+            "post": {
+                "tags": ["config"],
+                "summary": "Set, replace or delete a bound plugin TLS credential",
+                "description": "Uses the existing encrypted plugin configuration. Deleting a credential removes the local value and can interrupt dependent TLS profiles.",
+                "requestBody": {
+                    "required": true,
+                    "content": {"application/json": {"schema": {
+                        "type": "object",
+                        "required": ["instance", "property", "operation"],
+                        "properties": {
+                            "instance": {"type": "string"},
+                            "property": {"type": "string"},
+                            "operation": {"type": "string", "enum": ["create", "replace", "delete"]},
+                            "value": {"type": "string", "writeOnly": true, "maxLength": 32768}
+                        }
+                    }}}
+                },
+                "responses": {
+                    "200": {"description": "Only the resulting configured state"},
+                    "400": {"description": "Invalid credential request"},
+                    "403": {"description": "Authenticated operator required"},
+                    "404": {"description": "Binding not found"},
+                    "409": {"description": "Credential state no longer matches the operation"},
+                    "412": {"description": "Secret encryption and an initialized encryption key are required"}
+                }
+            }
         },
         "/api/config/list": {
             "get": {
@@ -1015,6 +1190,42 @@ mod tests {
             csp.contains("https://cdn.jsdelivr.net"),
             "default layer must not clobber the handler-owned docs CSP: {csp}"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "schema-export")]
+    fn scoped_credential_openapi_marks_secret_inputs_write_only() {
+        let spec = build_spec();
+        let path = &spec["paths"]["/api/config/http-credentials"];
+        assert!(path["get"]["responses"]["200"].is_object());
+        assert!(path["post"]["responses"]["204"].is_object());
+        assert!(path["post"]["responses"]["409"].is_object());
+        let row = &path["get"]["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
+            ["credentials"]["items"];
+        assert_eq!(row["properties"]["permission_revision"]["type"], "string");
+        let required = row["required"].as_array().unwrap();
+        assert!(required.iter().any(|field| field == "permission_revision"));
+        let update = &path["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"]
+            ["permissions"]["properties"];
+        assert_eq!(update["expected_revision"]["type"], "string");
+        let auth = &path["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"]
+            ["credential"]["properties"]["auth"]["properties"];
+        let request =
+            &path["post"]["requestBody"]["content"]["application/json"]["schema"]["properties"];
+        let destination = &auth["destinations"]["items"];
+        assert_eq!(
+            destination["required"],
+            serde_json::json!(["host", "port", "username"])
+        );
+        assert_eq!(destination["properties"]["port"]["minimum"], 1);
+        assert_eq!(destination["properties"]["port"]["maximum"], 65535);
+        assert_eq!(
+            destination,
+            &request["permissions"]["properties"]["destinations"]["items"]
+        );
+        for name in ["value", "password", "seed", "private_key"] {
+            assert_eq!(auth[name]["writeOnly"], true);
+        }
     }
 
     #[cfg(all(feature = "schema-export", feature = "a2a"))]

@@ -1,6 +1,6 @@
 use crate::helpers::domain_guard;
 use async_trait::async_trait;
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{AUTHORIZATION, HOST, HeaderMap, HeaderName, HeaderValue};
 use serde_json::json;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -15,6 +15,10 @@ use zeroclaw_config::schema::{ProxyConfig, ProxyScope};
 const HTTP_REQUEST_PROXY_PINNING_ERROR: &str = "http_request requires direct transport so validated DNS answers remain pinned; set \
      proxy.scope = \"services\" and omit tool.http_request and tool.* from proxy.services, or disable the proxy; \
      proxy.scope = \"environment\" is incompatible with pinned HTTP requests";
+
+use crate::scoped_credentials::{
+    load_scoped_credential_snapshot, resolve_scoped_value, scoped_credential_message,
+};
 
 /// HTTP request tool for API interactions.
 /// Supports GET, POST, PUT, DELETE methods with configurable security.
@@ -45,6 +49,114 @@ struct HttpRequestUrlPolicy {
     host: String,
     port: u16,
     private_resolution_allowed: bool,
+}
+
+fn redact_response_body(
+    body: String,
+    redact: &impl Fn(&str) -> String,
+    contains_credentials: bool,
+) -> String {
+    if !contains_credentials {
+        return redact(&body);
+    }
+
+    // Validate without materializing numbers, preserving integers larger than
+    // u64 and avoiding global serde_json numeric feature changes.
+    let mut decoder = serde_json::Deserializer::from_str(&body);
+    let is_json = <serde::de::IgnoredAny as serde::Deserialize>::deserialize(&mut decoder)
+        .and_then(|_| decoder.end())
+        .is_ok();
+
+    // Redact decoded JSON strings and scalar tokens without changing syntax
+    // or escape sequences. Preserve every unrelated numeric token verbatim.
+    let bytes = body.as_bytes();
+    let mut output = String::with_capacity(body.len());
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let start = cursor;
+        match bytes[cursor] {
+            b'"' => {
+                cursor += 1;
+                let mut closed = false;
+                while cursor < bytes.len() {
+                    match bytes[cursor] {
+                        b'\\' => cursor = (cursor + 2).min(bytes.len()),
+                        b'"' => {
+                            cursor += 1;
+                            closed = true;
+                            break;
+                        }
+                        _ => cursor += 1,
+                    }
+                }
+                if !closed {
+                    // No later quote can close a JSON string in this suffix.
+                    // Copy it once; never rescan every escaped quote inside it.
+                    if body[start..].contains('\\') {
+                        output.push_str("[REDACTED]");
+                    } else {
+                        output.push_str(&body[start..]);
+                    }
+                    break;
+                }
+                let token = &body[start..cursor];
+                if let Ok(decoded) = serde_json::from_str::<String>(token) {
+                    let redacted = redact(&decoded);
+                    if redacted == decoded && !is_json {
+                        // Reconsider the closing quote as an opening boundary,
+                        // but never rewind through the already decoded string.
+                        output.push_str(&body[start..cursor - 1]);
+                        cursor -= 1;
+                    } else if redacted == decoded {
+                        output.push_str(token);
+                    } else {
+                        // Serializing a String cannot fail.
+                        output.push_str(&serde_json::to_string(&redacted).expect("JSON string"));
+                    }
+                } else if is_json {
+                    output.push_str(token);
+                } else {
+                    // Rejected spans may contain recoverable escaped secrets.
+                    // Omit the ambiguous span instead of exposing it or rescanning
+                    // every interior escaped quote. Reconsider only its end.
+                    output.push_str("[REDACTED]");
+                    cursor -= 1;
+                }
+            }
+            b'-' | b'0'..=b'9' | b't' | b'f' | b'n' if is_json => {
+                cursor += 1;
+                while cursor < bytes.len()
+                    && matches!(
+                        bytes[cursor],
+                        b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'.' | b'+' | b'-'
+                    )
+                {
+                    cursor += 1;
+                }
+                let token = &body[start..cursor];
+                let redacted = redact(token);
+                if redacted == token {
+                    output.push_str(token);
+                } else {
+                    // An altered scalar becomes a JSON string, preserving the
+                    // surrounding structured response and unrelated raw numbers.
+                    output.push_str(&serde_json::to_string(&redacted).expect("JSON string"));
+                }
+            }
+            _ => {
+                let character = body[cursor..].chars().next().expect("cursor is in bounds");
+                output.push(character);
+                cursor += character.len_utf8();
+            }
+        }
+    }
+    if is_json {
+        output
+    } else {
+        // JSONP, NDJSON and malformed replies still need decoded-string
+        // scrubbing above, plus literal replacement across quotation marks.
+        redact(&output)
+    }
 }
 
 impl HttpRequestTool {
@@ -350,6 +462,94 @@ impl HttpRequestTool {
         }
     }
 
+    async fn apply_scoped_credential(
+        &self,
+        headers: &mut HeaderMap,
+        name: &str,
+        target: &ValidatedHttpRequestTarget,
+    ) -> anyhow::Result<Vec<String>> {
+        self.apply_scoped_credential_with_resolver(headers, name, target, resolve_scoped_value)
+            .await
+    }
+
+    async fn apply_scoped_credential_with_resolver<F, Fut>(
+        &self,
+        headers: &mut HeaderMap,
+        name: &str,
+        target: &ValidatedHttpRequestTarget,
+        resolve: F,
+    ) -> anyhow::Result<Vec<String>>
+    where
+        F: FnOnce(zeroclaw_config::schema::ScopedCredentialSource, String) -> Fut + Send,
+        Fut: std::future::Future<Output = anyhow::Result<String>> + Send,
+    {
+        use base64::Engine as _;
+        use zeroclaw_config::schema::{ScopedApiKeyHeader, ScopedHttpAuth, ScopedHttpCredential};
+
+        if headers.contains_key(HOST) {
+            return Err(anyhow::Error::msg(scoped_credential_message(
+                "tool-http-credential-host",
+            )));
+        }
+        let alias = name;
+        let (credential, reviewed) =
+            load_scoped_credential_snapshot(self.config_path.as_deref(), alias)?;
+        if !ScopedHttpCredential::https_origin(&target.url)
+            .is_some_and(|origin| credential.http_grants().contains(&origin))
+        {
+            return Err(anyhow::Error::msg(scoped_credential_message(
+                "tool-http-credential-origin",
+            )));
+        }
+        let (name, authorization, mut sensitive) = match credential.auth {
+            ScopedHttpAuth::ApiKey { value, header } => {
+                let value = resolve(credential.source, value).await?;
+                match header {
+                    ScopedApiKeyHeader::Bearer => {
+                        (AUTHORIZATION, format!("Bearer {value}"), vec![value])
+                    }
+                    ScopedApiKeyHeader::Token => {
+                        (AUTHORIZATION, format!("Token {value}"), vec![value])
+                    }
+                    ScopedApiKeyHeader::XApiKey => (
+                        HeaderName::from_static("x-api-key"),
+                        value.clone(),
+                        vec![value],
+                    ),
+                }
+            }
+            ScopedHttpAuth::UserPassword { username, password } => {
+                let password = resolve(credential.source, password).await?;
+                let pair = format!("{username}:{password}");
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&pair);
+                (
+                    AUTHORIZATION,
+                    format!("Basic {encoded}"),
+                    vec![pair, encoded, password, username],
+                )
+            }
+            ScopedHttpAuth::SshKey { .. } | ScopedHttpAuth::Totp { .. } => {
+                return Err(anyhow::Error::msg(scoped_credential_message(
+                    "tool-http-credential-kind",
+                )));
+            }
+        };
+        // The external lookup can await while the operator changes the catalog.
+        let (_, current) = load_scoped_credential_snapshot(self.config_path.as_deref(), alias)?;
+        if current != reviewed {
+            return Err(anyhow::Error::msg(scoped_credential_message(
+                "tool-http-credential-origin",
+            )));
+        }
+        let mut header = HeaderValue::from_str(&authorization).map_err(|_| {
+            anyhow::Error::msg(scoped_credential_message("tool-http-credential-invalid"))
+        })?;
+        header.set_sensitive(true);
+        headers.insert(name, header);
+        sensitive.insert(0, authorization);
+        Ok(sensitive)
+    }
+
     fn apply_auth_secret(
         &self,
         headers: &mut HeaderMap,
@@ -366,6 +566,27 @@ impl HttpRequestTool {
         })?;
         headers.insert(AUTHORIZATION, header_value);
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn scoped_credential_fixture(
+        &mut self,
+        dir: &Path,
+        credential: zeroclaw_config::schema::ScopedHttpCredential,
+    ) {
+        use zeroclaw_config::{schema::Config, secrets::SecretStore};
+        let mut config = Config::default();
+        config.secrets.encrypt = true;
+        let stored = SecretStore::new(dir, true)
+            .encrypt(&serde_json::to_string(&credential).unwrap())
+            .unwrap();
+        config
+            .http_request
+            .scoped_credentials
+            .insert("TEST".into(), stored);
+        let path = dir.join("config.toml");
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        self.config_path = Some(path);
     }
 
     #[cfg(test)]
@@ -535,6 +756,10 @@ impl Tool for HttpRequestTool {
                     "description": "Optional HTTP headers as key-value pairs. Use auth_secret for Authorization values that should come from config secrets.",
                     "default": {}
                 },
+                "credential": {
+                    "type": "string",
+                    "description": "Operator-managed credential alias bound to this HTTPS origin. Supports Bearer tokens, X-API-Key, and HTTP Basic. Pass only the alias."
+                },
                 "auth_secret": {
                     "type": "string",
                     "description": "Name of a secret in [http_request.secrets] to send as the Authorization header. Secret entries may be literal, encrypted, or environment-backed as ${ENV_VAR}. Overrides any literal Authorization header."
@@ -660,13 +885,43 @@ impl Tool for HttpRequestTool {
                 });
             }
         };
-        if let Err(e) = self.apply_auth_secret(&mut request_headers, auth_secret) {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(e.to_string()),
-            });
-        }
+        let scoped = match args.get("credential") {
+            Some(value) => Some(value.as_str().ok_or_else(|| {
+                anyhow::Error::msg(scoped_credential_message("tool-http-credential-argument"))
+            })?),
+            None => None,
+        };
+        let credential_result = match (scoped, auth_secret) {
+            (Some(_), Some(_)) => Err(anyhow::Error::msg(scoped_credential_message(
+                "tool-http-credential-exclusive",
+            ))),
+            (Some(name), None) => {
+                self.apply_scoped_credential(&mut request_headers, name, &target)
+                    .await
+            }
+            (None, _) => self
+                .apply_auth_secret(&mut request_headers, auth_secret)
+                .map(|()| Vec::new()),
+        };
+        let sensitive = match credential_result {
+            Ok(sensitive) => sensitive,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(error.to_string()),
+                });
+            }
+        };
+        let redact = |output: &str| {
+            let mut output = output.to_owned();
+            for value in &sensitive {
+                if !value.is_empty() {
+                    output = output.replace(value, "[REDACTED]");
+                }
+            }
+            output
+        };
 
         match self
             .execute_request(&target, method.clone(), request_headers, body)
@@ -704,6 +959,19 @@ impl Tool for HttpRequestTool {
                         ),
                     };
 
+                let headers_text = redact(&headers_text);
+                // An exact-value scrub cannot match the partial credential
+                // left when a decoded body is cut across the secret.
+                let response_text = if !sensitive.is_empty()
+                    && response_text.ends_with("... [Response truncated due to size limit] ...")
+                {
+                    crate::i18n::get_required_tool_string(
+                        "tool-http-request-authenticated-response-truncated",
+                    )
+                } else {
+                    redact_response_body(response_text, &redact, !sensitive.is_empty())
+                };
+                let body_error = body_error.as_deref().map(redact);
                 let output = format!(
                     "Status: {} {}\nResponse Headers: {}\n\nResponse Body:\n{}",
                     status_code,
@@ -746,7 +1014,7 @@ impl Tool for HttpRequestTool {
                 Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some(error),
+                    error: Some(redact(&error)),
                 })
             }
         }
@@ -1078,6 +1346,210 @@ mod tests {
             properties.contains_key("auth_secret"),
             "http_request schema must expose auth_secret"
         );
+    }
+
+    #[test]
+    fn scoped_external_cli_outputs_match_documented_formats() {
+        use zeroclaw_config::schema::ScopedCredentialSource as Source;
+
+        for (source, output, expected) in [
+            (Source::OnePassword, &b"fixture-op\n"[..], "fixture-op"),
+            (Source::Azure, &b"fixture-azure\r\n"[..], "fixture-azure"),
+            (Source::Aws, &b"\"fixture-aws\"\n"[..], "fixture-aws"),
+            (Source::Google, &b"fixture-google"[..], "fixture-google"),
+            (Source::OpenBao, &b"fixture-bao"[..], "fixture-bao"),
+        ] {
+            assert_eq!(
+                crate::scoped_credentials::decode_scoped_value(source, output.to_vec()).unwrap(),
+                expected
+            );
+        }
+        for (source, output) in [
+            (Source::Aws, &b"null"[..]),
+            (Source::Aws, &b"{}"[..]),
+            (Source::Google, &b"multiple\nlines"[..]),
+            (Source::Azure, &b"\r\n"[..]),
+            (Source::OnePassword, &b"\xff"[..]),
+        ] {
+            assert!(
+                crate::scoped_credentials::decode_scoped_value(source, output.to_vec()).is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn revocation_during_scoped_lookup_never_inserts_authorization() {
+        use zeroclaw_config::{
+            schema::{Config, ScopedCredentialSource, ScopedHttpCredential},
+            secrets::SecretStore,
+        };
+        for delete in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut tool = HttpRequestTool::new(
+                Arc::new(SecurityPolicy::default()),
+                vec!["*".into()],
+                1024,
+                10,
+                false,
+                vec![],
+                vec![],
+            )
+            .unwrap();
+            let mut credential: ScopedHttpCredential = serde_json::from_value(serde_json::json!({
+                "origin": "https://example.com", "http_allowed": true,
+                "auth": {"kind": "api_key", "value": "kv/fixture/token", "header": "bearer"}
+            }))
+            .unwrap();
+            credential.source = ScopedCredentialSource::OpenBao;
+            tool.scoped_credential_fixture(dir.path(), credential);
+            let path = tool.config_path.clone().unwrap();
+            let target = ValidatedHttpRequestTarget {
+                url: "https://example.com/protected".into(),
+                host: String::new(),
+                resolved_addrs: Vec::new(),
+            };
+            let mut headers = HeaderMap::new();
+            let (started, lookup_started) = tokio::sync::oneshot::channel();
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            let apply = tool.apply_scoped_credential_with_resolver(
+                &mut headers,
+                "TEST",
+                &target,
+                |source, _| async move {
+                    assert!(matches!(source, ScopedCredentialSource::OpenBao));
+                    started.send(()).unwrap();
+                    resumed.await.unwrap();
+                    Ok("resolved-synthetic-token".into())
+                },
+            );
+            let revoke = async {
+                lookup_started.await.unwrap();
+                let mut config: Config =
+                    toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+                if delete {
+                    config.http_request.scoped_credentials.remove("TEST");
+                } else {
+                    let store = SecretStore::new(dir.path(), true);
+                    let stored = &config.http_request.scoped_credentials["TEST"];
+                    let mut record: ScopedHttpCredential =
+                        serde_json::from_str(&store.decrypt(stored).unwrap()).unwrap();
+                    record.http_allowed = false;
+                    record.http_origins = Some(Vec::new());
+                    let replacement = store
+                        .encrypt(&serde_json::to_string(&record).unwrap())
+                        .unwrap();
+                    config
+                        .http_request
+                        .scoped_credentials
+                        .insert("TEST".into(), replacement);
+                }
+                std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+                resume.send(()).unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::join!(apply, revoke)
+            })
+            .await
+            .expect("lookup/revocation coordination must finish");
+            assert!(result.is_err());
+            assert!(
+                headers.is_empty(),
+                "revoked credentials must not reach request headers"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_credential_cannot_cross_https_origins() {
+        use zeroclaw_config::schema::{ScopedApiKeyHeader, ScopedHttpAuth, ScopedHttpCredential};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1024,
+            10,
+            false,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        tool.scoped_credential_fixture(
+            dir.path(),
+            ScopedHttpCredential {
+                origin: "https://example.com".into(),
+                http_allowed: true,
+                http_origins: None,
+                browser_origin: None,
+                browser_origins: Vec::new(),
+                source: Default::default(),
+                auth: ScopedHttpAuth::ApiKey {
+                    value: "fixture-key".into(),
+                    header: ScopedApiKeyHeader::XApiKey,
+                },
+            },
+        );
+        let mut headers = HeaderMap::new();
+        for url in [
+            "http://example.com",
+            "https://other.example.com",
+            "https://example.com:8443",
+        ] {
+            let target = ValidatedHttpRequestTarget {
+                url: url.into(),
+                host: String::new(),
+                resolved_addrs: Vec::new(),
+            };
+            assert!(
+                tool.apply_scoped_credential(&mut headers, "TEST", &target)
+                    .await
+                    .is_err()
+            );
+            assert!(headers.is_empty());
+        }
+        let target = ValidatedHttpRequestTarget {
+            url: "https://example.com/api".into(),
+            host: String::new(),
+            resolved_addrs: Vec::new(),
+        };
+        assert!(
+            tool.apply_scoped_credential(&mut headers, "TEST", &target)
+                .await
+                .is_ok()
+        );
+        assert_eq!(headers["x-api-key"], "fixture-key");
+        assert!(headers["x-api-key"].is_sensitive());
+        tool.scoped_credential_fixture(
+            dir.path(),
+            ScopedHttpCredential {
+                origin: "https://example.com".into(),
+                http_allowed: false,
+                http_origins: None,
+                browser_origin: None,
+                browser_origins: Vec::new(),
+                source: Default::default(),
+                auth: ScopedHttpAuth::ApiKey {
+                    value: "fixture-key".into(),
+                    header: ScopedApiKeyHeader::XApiKey,
+                },
+            },
+        );
+        headers.clear();
+        assert!(
+            tool.apply_scoped_credential(&mut headers, "TEST", &target)
+                .await
+                .is_err()
+        );
+        assert!(headers.is_empty());
+
+        let mut forged = HeaderMap::new();
+        forged.insert(HOST, HeaderValue::from_static("another.example.com"));
+        assert!(
+            tool.apply_scoped_credential(&mut forged, "TEST", &target)
+                .await
+                .is_err()
+        );
+        assert!(!forged.contains_key("x-api-key"));
     }
 
     #[test]
@@ -2254,6 +2726,142 @@ api_token = "Bearer from-secret"
         assert_eq!(parsed["authorization"], "Bearer secret");
         assert_eq!(parsed["x-api-key"], "my-key");
         assert_eq!(parsed["content-type"], "application/json");
+    }
+
+    #[test]
+    fn authenticated_escaped_quote_runs_are_processed_without_suffix_rescans() {
+        let escaped = r#"\""#.repeat(200_000);
+        for body in [format!("\"{escaped}"), format!("callback(\"{escaped}\")")] {
+            let output = redact_response_body(body.clone(), &str::to_owned, true);
+            if body.starts_with("callback") {
+                assert_eq!(output, body);
+            } else {
+                assert_eq!(output, "[REDACTED]");
+            }
+        }
+    }
+
+    #[test]
+    fn authenticated_rejected_quoted_spans_fail_closed() {
+        for body in [
+            r#"log: "bad\q \"\u0073ecret123""#,
+            r#""\q\"\u0073ecret123 ""#,
+            r#"log: "\u0073ecret123"#,
+        ] {
+            let output =
+                redact_response_body(body.into(), &|s| s.replace("secret123", "[REDACTED]"), true);
+            assert!(!output.contains("secret123"));
+            assert!(!output.contains(r"\u0073ecret123"));
+            assert!(output.contains("[REDACTED]"));
+        }
+    }
+
+    #[test]
+    fn authenticated_non_json_redacts_escaped_strings() {
+        let secret = "secret123";
+        for body in [
+            r#"callback({"token":"\u0073ecret123"})"#,
+            r#"{"token":"\u0073ecret123","unfinished": "#,
+            r#"<p title="bad\q">{"token":"\u0073ecret123"}</p>"#,
+        ] {
+            let output = redact_response_body(
+                body.into(),
+                &|text| text.replace(secret, "[REDACTED]"),
+                true,
+            );
+            assert!(!output.contains(secret));
+            assert!(!output.contains(r"\u0073ecret123"));
+            assert!(output.contains("[REDACTED]"), "{output}");
+        }
+    }
+
+    #[test]
+    fn authenticated_ndjson_redacts_decoded_secrets_in_each_record() {
+        let secret = "abc\"def";
+        let body = "{\"message\":\"abc\\\"def\"}\n{\"message\":\"abc\\u0022def\"}";
+        let output = redact_response_body(
+            body.into(),
+            &|text| text.replace(secret, "[REDACTED]"),
+            true,
+        );
+        let rows: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row["message"] == "[REDACTED]"));
+    }
+
+    #[test]
+    fn authenticated_json_unicode_escapes_remain_structured() {
+        let output = redact_response_body(
+            r#"{"city":"\u6771\u4eac"}"#.into(),
+            &|text| text.replace("u", "[REDACTED]"),
+            true,
+        );
+        let structured: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(structured["city"], "東京");
+    }
+
+    #[test]
+    fn authenticated_scalar_credentials_preserve_valid_json() {
+        for scalar in ["true", "false", "null", "-123.45e+2"] {
+            let body = format!("{{\"value\":{scalar}}}");
+            let output =
+                redact_response_body(body, &|text| text.replace(scalar, "[REDACTED]"), true);
+            let structured: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(structured["value"], "[REDACTED]");
+        }
+    }
+
+    #[test]
+    fn authenticated_text_redacts_secret_containing_quotes() {
+        let secret = "abc\"def";
+        for body in [format!("credential: {secret}"), format!("<p>{secret}</p>")] {
+            let output =
+                redact_response_body(body, &|text| text.replace(secret, "[REDACTED]"), true);
+            assert!(!output.contains(secret));
+            assert!(output.contains("[REDACTED]"));
+        }
+    }
+
+    #[test]
+    fn authenticated_numeric_secrets_preserve_structured_json() {
+        let output = redact_response_body(
+            r#"{"count":123456,"ok":true,"large":18446744073709551617}"#.into(),
+            &|text| text.replace("123456", "[REDACTED]"),
+            true,
+        );
+        let structured: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(structured["count"], "[REDACTED]");
+        assert_eq!(structured["ok"], true);
+        assert!(output.contains("18446744073709551617"));
+    }
+
+    #[test]
+    fn authenticated_json_body_preserves_large_integers() {
+        let body = r#"{"id":18446744073709551617,"nested":[-9223372036854775809,"fixture-key"]}"#;
+        let output = redact_response_body(
+            body.into(),
+            &|text| text.replace("fixture-key", "[REDACTED]"),
+            true,
+        );
+        assert!(output.contains("18446744073709551617"));
+        assert!(output.contains("-9223372036854775809"));
+        assert!(!output.contains("fixture-key"));
+        let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["nested"][1], "[REDACTED]");
+    }
+
+    #[test]
+    fn authenticated_json_body_redacts_decoded_values_and_keys() {
+        let secret = r#"token\"with\escapes"#;
+        let body = json!({"nested": [{"credential": secret}], (secret): "key"}).to_string();
+        let output = redact_response_body(body, &|text| text.replace(secret, "[REDACTED]"), true);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+            json!({"nested": [{"credential": "[REDACTED]"}], "[REDACTED]": "key"})
+        );
     }
 
     #[test]
