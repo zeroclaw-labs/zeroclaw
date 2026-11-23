@@ -37,18 +37,9 @@ impl WebDavRead {
         root: Url,
         addresses: &[SocketAddr],
     ) -> Result<Self, WebDavError> {
-        let (host, port) = validate_endpoint(&root, addresses)?;
-        let mut builder = Client::builder()
-            .https_only(true)
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(60));
-        if host.parse::<IpAddr>().is_err() {
-            debug_assert!(addresses.iter().all(|address| address.port() == port));
-            builder = builder.resolve_to_addrs(&host, addresses);
-        }
-        let client = builder.build().map_err(|_| WebDavError::Transport)?;
+        let client = build_client(&root, addresses)?
+            .build()
+            .map_err(|_| WebDavError::Transport)?;
         Ok(Self { root, client })
     }
 
@@ -120,6 +111,24 @@ impl WebDavRead {
     }
 }
 
+fn build_client(
+    root: &Url,
+    addresses: &[SocketAddr],
+) -> Result<reqwest::ClientBuilder, WebDavError> {
+    let (host, port) = validate_endpoint(root, addresses)?;
+    let mut builder = Client::builder()
+        .https_only(true)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60));
+    if host.parse::<IpAddr>().is_err() {
+        debug_assert!(addresses.iter().all(|address| address.port() == port));
+        builder = builder.resolve_to_addrs(&host, addresses);
+    }
+    Ok(builder)
+}
+
 fn validate_endpoint(root: &Url, addresses: &[SocketAddr]) -> Result<(String, u16), WebDavError> {
     let host = root.host_str().ok_or(WebDavError::InvalidEndpoint)?;
     let port = root
@@ -158,6 +167,114 @@ fn resource_url(root: &Url, path: &str) -> Result<Url, WebDavError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn https_fixture_checks_metadata_transfer_limit_and_redirect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let certificate = rcgen::generate_simple_self_signed(vec!["files.test".into()]).unwrap();
+        let trust = reqwest::Certificate::from_der(certificate.cert.der()).unwrap();
+        let server_config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certificate.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            for (method, path, response) in [
+                (
+                    "HEAD",
+                    "report.txt",
+                    "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n",
+                ),
+                (
+                    "GET",
+                    "report.txt",
+                    "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndemo",
+                ),
+                (
+                    "GET",
+                    "large.txt",
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nlarge\r\n0\r\n\r\n",
+                ),
+                (
+                    "GET",
+                    "redirect.txt",
+                    "HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ),
+            ] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut tls = acceptor.accept(stream).await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(request.len() < 8192);
+                    request.push(tls.read_u8().await.unwrap());
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(request.starts_with(&format!("{method} /dav/{path} HTTP/1.1\r\n")));
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("\r\nauthorization: bearer fixture-only\r\n")
+                );
+                tls.write_all(response.as_bytes()).await.unwrap();
+                tls.shutdown().await.unwrap();
+            }
+        });
+
+        let root = Url::parse(&format!("https://files.test:{}/dav/", addr.port())).unwrap();
+        let client = build_client(&root, &[addr])
+            .unwrap()
+            .add_root_certificate(trust)
+            .build()
+            .unwrap();
+        let adapter = WebDavRead { root, client };
+        let authorization = || Some(HeaderValue::from_static("Bearer fixture-only"));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            assert_eq!(
+                adapter
+                    .file_size("report.txt", authorization())
+                    .await
+                    .unwrap(),
+                Some(4)
+            );
+            let mut staged = Vec::new();
+            assert_eq!(
+                adapter
+                    .download("report.txt", authorization(), 4, &mut staged)
+                    .await
+                    .unwrap(),
+                4
+            );
+            assert_eq!(staged, b"demo");
+            staged.clear();
+            assert!(matches!(
+                adapter
+                    .download("large.txt", authorization(), 4, &mut staged)
+                    .await,
+                Err(WebDavError::ByteLimit)
+            ));
+            assert!(staged.is_empty());
+            assert!(matches!(
+                adapter
+                    .download("redirect.txt", authorization(), 4, &mut staged)
+                    .await,
+                Err(WebDavError::Status(StatusCode::FOUND))
+            ));
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn url_stays_inside_registered_https_root() {
