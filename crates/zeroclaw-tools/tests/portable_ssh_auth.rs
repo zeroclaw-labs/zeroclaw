@@ -211,7 +211,7 @@ async fn probe(
     };
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
     let addr = listener.local_addr()?;
-    let server = tokio::spawn(async move {
+    let server = zeroclaw_spawn::spawn!(async move {
         let (stream, _) = listener.accept().await?;
         server::run_stream(config, stream, behavior).await?.await?;
         Ok::<(), anyhow::Error>(())
