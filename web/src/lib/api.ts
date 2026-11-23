@@ -1385,7 +1385,11 @@ export interface MapKeyResponse {
 export type HttpCredentialKind = "user_password" | "api_key" | "ssh_key" | "totp";
 export type HttpCredentialSource = "local" | "open_bao" | "one_password" | "azure" | "aws" | "google";
 export type SshDestination = { host: string; port: number; username: string };
-export type HttpCredentialRow = { name: string; permission_revision: string; origin: string; kind: HttpCredentialKind; source: HttpCredentialSource; destinations?: SshDestination[] | null; http_allowed?: boolean | null; http_origins?: string[]; browser_origin?: string | null; browser_origins?: string[]; header?: "bearer" | "x_api_key" | "token" | null };
+export type RemoteFilesResource = { resource: string; root: string };
+export type RemoteFilesGrant = RemoteFilesResource & {
+  rights: { operations: string[]; require_human_approval: boolean };
+};
+export type HttpCredentialRow = { name: string; permission_revision: string; origin: string; kind: HttpCredentialKind; source: HttpCredentialSource; destinations?: SshDestination[] | null; http_allowed?: boolean | null; http_origins?: string[]; remote_files_grants?: RemoteFilesGrant[]; remote_files_resources?: RemoteFilesResource[]; browser_origin?: string | null; browser_origins?: string[]; header?: "bearer" | "x_api_key" | "token" | null };
 type HttpCredentialAuth =
   | { kind: "totp"; seed: string }
   | { kind: "user_password"; username: string; password: string }
@@ -1402,7 +1406,7 @@ export function listHttpCredentials() {
 
 export function changeHttpCredential(mutation:
   | { name: string; operation: "create" | "replace"; credential: { origin: string; source: HttpCredentialSource; auth: HttpCredentialAuth } }
-  | { name: string; operation: "replace"; permissions: { expected_revision?: string } & ({ http_allowed: boolean } | { http_origins: string[] } | { destinations: SshDestination[] } | { browser: { origins: string[] } }) }
+  | { name: string; operation: "replace"; permissions: { expected_revision?: string } & ({ http_allowed: boolean } | { http_origins: string[] } | { destinations: SshDestination[] } | { browser: { origins: string[] } } | { remote_files_grants: RemoteFilesGrant[] }) }
   | { name: string; operation: "delete" }
 ) {
   return apiFetch<void>(httpCredentialsPath, { method: "POST", body: JSON.stringify(mutation) });

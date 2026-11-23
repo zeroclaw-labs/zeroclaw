@@ -1502,6 +1502,7 @@ pub async fn list_http_credentials(
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             };
             let store = SecretStore::new(dir, config.secrets.encrypt);
+            let webdav_catalog = config.remote_files.webdav_catalog().ok();
             let mut rows = Vec::new();
             for (name, stored) in &config.http_request.scoped_credentials {
                 let decoded = if stored.starts_with("enc2:") {
@@ -1526,10 +1527,17 @@ pub async fn list_http_credentials(
                 };
                 let http_allowed = record.origin.starts_with("https://")
                     .then_some(record.http_allowed);
+                let remote_files_resources: Vec<_> = config.remote_files.webdav.iter()
+                    .filter(|resource| record.supports_local_webdav() && resource.credential_alias == *name)
+                    .filter_map(|resource| {
+                        let root = webdav_catalog.as_ref()?.resource(&resource.alias)?.root();
+                        Some(serde_json::json!({"resource": resource.alias, "root": root.as_str()}))
+                    })
+                    .collect();
                 rows.push((
                     name,
                     serde_json::json!({
-                        "name": name, "permission_revision": permission_revision(&record), "origin": record.origin, "kind": kind, "source": record.source, "destinations": destinations, "header": header, "http_allowed": http_allowed, "http_origins": record.http_grants(), "browser_origin": record.browser_origin, "browser_origins": record.browser_grants().collect::<Vec<_>>(), "remote_files_grants": record.remote_files_grants
+                        "name": name, "permission_revision": permission_revision(&record), "origin": record.origin, "kind": kind, "source": record.source, "destinations": destinations, "header": header, "http_allowed": http_allowed, "http_origins": record.http_grants(), "browser_origin": record.browser_origin, "browser_origins": record.browser_grants().collect::<Vec<_>>(), "remote_files_grants": record.remote_files_grants, "remote_files_resources": remote_files_resources
                     }),
                 ));
             }

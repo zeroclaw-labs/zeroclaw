@@ -300,6 +300,13 @@ pub fn build_spec() -> serde_json::Value {
     http_credentials_get["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
         ["credentials"]["items"]["properties"]["remote_files_grants"] =
         remote_files_grant_list.clone();
+    http_credentials_get["responses"]["200"]["content"]["application/json"]["schema"]["properties"]
+        ["credentials"]["items"]["properties"]["remote_files_resources"] = serde_json::json!({
+        "type": "array", "items": {
+            "type": "object", "required": ["resource", "root"], "additionalProperties": false,
+            "properties": {"resource": {"type": "string"}, "root": {"type": "string", "format": "uri"}}
+        }
+    });
     let mut http_credentials_post = serde_json::json!({
         "tags": ["config"],
         "summary": "Create, replace or remove a scoped credential or update its grant",
