@@ -43,12 +43,13 @@ Each draft owns one synthesis worker. Token updates replace a bounded latest
 text snapshot rather than creating an unbounded work queue. Only sanitized,
 leak-checked assistant text enters preparation; reasoning and tool-status text
 do not. A new assistant phase or rewritten final response discards incompatible
-speculative audio. Cancellation drops the draft's worker. With outbound hooks
-enabled, synthesis waits for final approval so a hook can reject or rewrite the
-text before it reaches the TTS provider. Preparation reads the current per-turn
-route on every text update; text-only or redirected replies cancel preparation
-for the original destination. Segments sent before a route change cannot be
-retracted from the configured provider.
+speculative audio. Cancellation drops the draft's worker. Installed outbound
+hook handlers make synthesis wait for final approval so a hook can reject or
+rewrite the text before it reaches the TTS provider. An enabled hook runner
+with no installed handlers does not defer synthesis. Preparation reads the
+current per-turn route on every text update; text-only or redirected replies
+cancel preparation for the original destination. Segments sent before a route
+change cannot be retracted from the configured provider.
 
 Finalization waits for the worker, reuses matching completed clips and encodes
 one OGG/Opus file for one Telegram voice upload. There is no quiet-period timer
