@@ -207,6 +207,20 @@ struct Cli {
     enroll_port: Option<u16>,
 }
 
+impl Cli {
+    fn initial_reconnect_state(&self) -> app::SharedReconnectState {
+        // Shared state that survives a reconnect. Quickstart's Stage 2 writes
+        // the new agent's alias here so the recovering app loop drops the user
+        // into Chat. The startup flag uses the same Immediate handoff.
+        Arc::new(std::sync::Mutex::new(app::CrossReconnectState {
+            pending_quickstart_chat: self
+                .agent
+                .clone()
+                .map(app::PendingQuickstartChat::Immediate),
+        }))
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Sign in through the remote gateway and save a URL-scoped OIDC login.
@@ -1321,6 +1335,7 @@ async fn run() -> anyhow::Result<()> {
         &local_config_dir,
         owned_daemon_pid,
         initial_leg,
+        cli.initial_reconnect_state(),
         #[cfg(unix)]
         shutdown_signals
             .as_mut()
@@ -1344,14 +1359,9 @@ async fn run_until_exit(
     config_dir: &std::path::Path,
     owned_daemon_pid: Option<u32>,
     initial_leg: ActiveLeg,
+    reconnect_state: app::SharedReconnectState,
     #[cfg(unix)] shutdown_signals: &mut ShutdownSignals,
 ) -> anyhow::Result<()> {
-    // Shared state that survives a reconnect. Quickstart's Stage 2 writes
-    // the new agent's alias here so the recovering `app::run` loop drops
-    // the user into Chat once the daemon is back up.
-    let reconnect_state: app::SharedReconnectState =
-        Arc::new(std::sync::Mutex::new(app::CrossReconnectState::default()));
-
     let label = target.label();
     let insecure_tls = target.insecure_tls();
 
@@ -2779,6 +2789,18 @@ mod connection_tests {
             before,
             "a refused lock must leave the file unchanged"
         );
+    }
+
+    #[test]
+    fn agent_short_and_long_flags_parse() {
+        let short = Cli::parse_from(["zerocode", "-a", "chiefofstaff"]);
+        assert_eq!(short.agent.as_deref(), Some("chiefofstaff"));
+
+        let long = Cli::parse_from(["zerocode", "--agent", "scout"]);
+        assert_eq!(long.agent.as_deref(), Some("scout"));
+
+        let omitted = Cli::parse_from(["zerocode"]);
+        assert!(omitted.agent.is_none());
     }
 
     #[test]
