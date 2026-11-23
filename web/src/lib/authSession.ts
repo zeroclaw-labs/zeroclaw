@@ -31,6 +31,11 @@ export interface OidcMethod {
 export interface AuthMethods {
   pairing_required: boolean;
   oidc: OidcMethod[];
+  /**
+   * Present (true) when this dashboard is reached through a relay that ends
+   * the browser's TLS, so the relay's operator can read the session.
+   */
+  via_relay?: true;
 }
 
 /** The `reason` of a 401/403 body from a cookie-authenticated request. */
@@ -38,6 +43,8 @@ export type AuthFailureReason =
   | 'session_expired'
   | 'session_invalid'
   | 'operator_required'
+  | 'not_permitted'
+  | 'agent_not_allowed'
   | 'csrf'
   | 'origin';
 
@@ -45,9 +52,18 @@ const FAILURE_REASONS: readonly AuthFailureReason[] = [
   'session_expired',
   'session_invalid',
   'operator_required',
+  'not_permitted',
+  'agent_not_allowed',
   'csrf',
   'origin',
 ];
+
+/** 403 reasons that mean "this account may not do that", shown as not available. */
+export const NOT_AVAILABLE_REASONS: ReadonlySet<AuthFailureReason> = new Set([
+  'operator_required',
+  'not_permitted',
+  'agent_not_allowed',
+]);
 
 /** Name of the BroadcastChannel sign-in, re-auth and sign-out talk on. */
 export const AUTH_CHANNEL = 'zeroclaw-auth';
@@ -78,7 +94,7 @@ export function failureReason(body: string): AuthFailureReason | null {
 
 export function parseAuthMethods(value: unknown): AuthMethods | null {
   if (!value || typeof value !== 'object') return null;
-  const raw = value as { pairing_required?: unknown; oidc?: unknown };
+  const raw = value as { pairing_required?: unknown; oidc?: unknown; via_relay?: unknown };
   const oidc = Array.isArray(raw.oidc)
     ? raw.oidc.flatMap((entry: unknown): OidcMethod[] => {
         if (!entry || typeof entry !== 'object') return [];
@@ -91,6 +107,7 @@ export function parseAuthMethods(value: unknown): AuthMethods | null {
   return {
     pairing_required: raw.pairing_required !== false,
     oidc,
+    ...(raw.via_relay === true ? { via_relay: true as const } : {}),
   };
 }
 
@@ -134,6 +151,7 @@ export function parseOidcSession(value: unknown): OidcSession | null {
     features: {
       chat: flags.chat === true,
       operator_pages: flags.operator_pages === true,
+      core_sessions: flags.core_sessions === true,
       config: flags.config === true,
     },
   };
@@ -184,8 +202,8 @@ export async function fetchThroughRestart(
 }
 
 /**
- * `GET /api/auth/methods`. Null when the gateway doesn't answer it, which the
- * caller treats as "no sign-in providers".
+ * `GET /api/auth/methods`. Null when the gateway doesn't answer it: the
+ * methods are then unknown, and the caller must not offer pairing.
  */
 export async function fetchAuthMethods(
   fetchImpl: FetchLike = fetch,
@@ -299,7 +317,16 @@ export type InitialAuth =
   | { kind: 'paired' }
   | { kind: 'open' }
   | { kind: 'signed-in'; session: OidcSession; clockOffsetMs: number; providers: OidcMethod[] }
-  | { kind: 'signed-out'; providers: OidcMethod[] };
+  | {
+      kind: 'signed-out';
+      providers: OidcMethod[];
+      /**
+       * The gateway answered how to sign in (always, in the desktop app).
+       * Without that answer the page can't tell whether pairing is allowed:
+       * through a relay it isn't, and only the answer says so.
+       */
+      methodsKnown: boolean;
+    };
 
 export interface InitialAuthDeps {
   /** A pairing token is stored. */
@@ -317,7 +344,9 @@ export interface InitialAuthDeps {
  * - A stored pairing token wins without a request, exactly as before.
  * - A gateway that doesn't require pairing is open, exactly as before.
  * - Only when the gateway lists sign-in providers is the session cookie
- *   checked; otherwise the result is today's pairing dialog.
+ *   checked; otherwise the result is today's pairing dialog, once the
+ *   gateway has said how to sign in. Without that answer the methods are
+ *   unknown, and the caller must not offer pairing.
  */
 export async function resolveInitialAuth(deps: InitialAuthDeps): Promise<InitialAuth> {
   if (deps.hasToken) return { kind: 'paired' };
@@ -338,7 +367,7 @@ export async function resolveInitialAuth(deps: InitialAuthDeps): Promise<Initial
       };
     }
   }
-  return { kind: 'signed-out', providers };
+  return { kind: 'signed-out', providers, methodsKnown: deps.desktop || methods !== null };
 }
 
 // ---------------------------------------------------------------------------
