@@ -2,6 +2,7 @@ use super::web_search_provider_routing::{
     SearchStatus, WebSearchProviderRoute, resolve_web_search_provider,
 };
 use crate::helpers::response_body;
+use crate::i18n::{get_required_tool_string, get_required_tool_string_with_args};
 use crate::util_helpers::truncate_with_ellipsis;
 use async_trait::async_trait;
 use regex::Regex;
@@ -42,10 +43,73 @@ fn anysearch_config_parse_attrs(path: &Path, line: Option<usize>) -> serde_json:
 }
 
 fn anysearch_config_parse_error(path: &Path, line: Option<usize>) -> anyhow::Error {
-    let location = line.map_or_else(String::new, |line| format!(", line {line}"));
-    anyhow::Error::msg(format!(
-        "Failed to parse config file {} for AnySearch API key ({ANYSEARCH_CONFIG_PARSE_ERROR}{location})",
-        path.display()
+    let path = path.display().to_string();
+    let location = line.map_or_else(String::new, |line| {
+        let line = line.to_string();
+        get_required_tool_string_with_args(
+            "tool-web-search-tool-error-anysearch-config-parse-line",
+            &[("line", &line)],
+        )
+    });
+    anyhow::Error::msg(get_required_tool_string_with_args(
+        "tool-web-search-tool-error-anysearch-config-parse",
+        &[
+            ("path", &path),
+            ("error_code", ANYSEARCH_CONFIG_PARSE_ERROR),
+            ("location", &location),
+        ],
+    ))
+}
+
+fn anysearch_optional_string<'a>(
+    result: &'a serde_json::Value,
+    field: &str,
+) -> anyhow::Result<Option<&'a str>> {
+    match result.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(Some)
+            .ok_or_else(anysearch_invalid_response_error),
+    }
+}
+
+fn anysearch_result_url(result: &serde_json::Value) -> anyhow::Result<String> {
+    let Some(url) = anysearch_optional_string(result, "url")? else {
+        return Err(anysearch_invalid_response_error());
+    };
+    let url = url.trim();
+    if url.is_empty() || url.chars().any(char::is_control) {
+        return Err(anysearch_invalid_response_error());
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|_| anysearch_invalid_response_error())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(anysearch_invalid_response_error());
+    }
+    Ok(url.to_owned())
+}
+
+fn validate_anysearch_result(result: &serde_json::Value) -> anyhow::Result<()> {
+    if !result.is_object() {
+        return Err(anysearch_invalid_response_error());
+    }
+    anysearch_result_url(result)?;
+    anysearch_optional_string(result, "title")?;
+    anysearch_optional_string(result, "content")?;
+    anysearch_optional_string(result, "snippet")?;
+    Ok(())
+}
+
+fn anysearch_invalid_response_error() -> anyhow::Error {
+    ::zeroclaw_log::record!(
+        ERROR,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({"search_provider": "anysearch"})),
+        "web_search: invalid AnySearch response"
+    );
+    anyhow::Error::msg(get_required_tool_string(
+        "tool-web-search-tool-error-anysearch-invalid-response",
     ))
 }
 
@@ -1070,9 +1134,11 @@ impl WebSearchTool {
                     })),
                 "web_search: failed to read config for AnySearch API key"
             );
-            anyhow::Error::msg(format!(
-                "Failed to read config file {} for AnySearch API key: {e}",
-                self.config_path.display()
+            let path = self.config_path.display().to_string();
+            let error = e.to_string();
+            anyhow::Error::msg(get_required_tool_string_with_args(
+                "tool-web-search-tool-error-anysearch-config-read",
+                &[("path", &path), ("error", &error)],
             ))
         })?;
 
@@ -1148,13 +1214,14 @@ impl WebSearchTool {
         let response_body =
             response_body::read_bounded(response, Some(ANYSEARCH_RESPONSE_LIMIT_BYTES)).await?;
         if response_body.overflowed {
-            anyhow::bail!(
-                "AnySearch response exceeds the {} byte size limit",
-                ANYSEARCH_RESPONSE_LIMIT_BYTES
-            );
+            let limit = ANYSEARCH_RESPONSE_LIMIT_BYTES.to_string();
+            return Err(anyhow::Error::msg(get_required_tool_string_with_args(
+                "tool-web-search-tool-error-anysearch-response-too-large",
+                &[("limit", &limit)],
+            )));
         }
         let json: serde_json::Value = serde_json::from_slice(&response_body.bytes)
-            .map_err(|_| anyhow::Error::msg("Invalid AnySearch API response"))?;
+            .map_err(|_| anysearch_invalid_response_error())?;
         self.parse_anysearch_results(&json, query)
     }
 
@@ -1163,50 +1230,56 @@ impl WebSearchTool {
         json: &serde_json::Value,
         query: &str,
     ) -> anyhow::Result<String> {
-        if let Some(code) = json.get("code").and_then(|code| code.as_i64())
-            && code != 0
-        {
+        let Some(code) = json.get("code").and_then(serde_json::Value::as_i64) else {
+            return Err(anysearch_invalid_response_error());
+        };
+        if code != 0 {
             let message = json
                 .get("message")
                 .and_then(|message| message.as_str())
-                .unwrap_or("(no message)");
-            anyhow::bail!(
-                "AnySearch returned error (code {code}): {}",
-                cap_provider_error(message)
-            );
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map_or_else(
+                    || get_required_tool_string("tool-web-search-tool-anysearch-no-error-details"),
+                    ToOwned::to_owned,
+                );
+            let code = code.to_string();
+            let message = cap_provider_error(&message);
+            return Err(anyhow::Error::msg(get_required_tool_string_with_args(
+                "tool-web-search-tool-error-anysearch-api",
+                &[("code", &code), ("message", &message)],
+            )));
         }
 
         let results = json
             .get("data")
             .and_then(|data| data.get("results"))
             .and_then(|results| results.as_array())
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"search_provider": "anysearch"})),
-                    "web_search: invalid AnySearch response"
-                );
-                anyhow::Error::msg("Invalid AnySearch API response")
-            })?;
+            .ok_or_else(anysearch_invalid_response_error)?;
 
         if results.is_empty() {
             return Ok(no_results_message(query));
         }
 
+        for result in results {
+            validate_anysearch_result(result)?;
+        }
+
         let mut blocks = Vec::new();
         for (index, result) in results.iter().take(self.max_results).enumerate() {
-            let title = result
-                .get("title")
-                .and_then(|title| title.as_str())
-                .unwrap_or("No title");
-            let url = result.get("url").and_then(|url| url.as_str()).unwrap_or("");
-            let body = result
-                .get("content")
-                .and_then(|content| content.as_str())
-                .filter(|content| !content.is_empty())
-                .or_else(|| result.get("snippet").and_then(|snippet| snippet.as_str()))
+            let title = anysearch_optional_string(result, "title")?
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map_or_else(
+                    || get_required_tool_string("tool-web-search-tool-anysearch-no-title"),
+                    ToOwned::to_owned,
+                );
+            let url = anysearch_result_url(result)?;
+            let content = anysearch_optional_string(result, "content")?;
+            let snippet = anysearch_optional_string(result, "snippet")?;
+            let body = content
+                .filter(|content| !content.trim().is_empty())
+                .or_else(|| snippet.filter(|snippet| !snippet.trim().is_empty()))
                 .unwrap_or("");
 
             let mut block = vec![format!("{}. {}", index + 1, title), format!("   {url}")];
@@ -2475,16 +2548,27 @@ mod tests {
     #[tokio::test]
     async fn transport_search_failure_redacts_query_bearing_url() {
         let query = "private 多字节 query";
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("test should reserve a task-owned loopback port");
+        let address = listener.local_addr().unwrap();
+        drop(listener);
         let client = reqwest::Client::builder()
             .no_proxy()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(3))
             .build()
             .expect("test client should build without proxy discovery");
         let error = client
-            .get(format!("http://127.0.0.1:1/search?q={query}"))
+            .get(format!("http://{address}/search?q={query}"))
             .send()
             .await
             .expect_err("closed local port should produce a deterministic transport error");
 
+        assert!(error.is_connect());
+        assert!(
+            !error.is_timeout(),
+            "the task-owned closed port must refuse: {error}"
+        );
         let message = transport_search_failure("duckduckgo", "request", &error).to_string();
         assert!(message.contains("duckduckgo search failed"));
         assert!(message.contains("transport=connect"));
@@ -3879,6 +3963,105 @@ mod tests {
                 .to_string()
                 .contains("Invalid AnySearch API response")
         );
+
+        for malformed in [
+            serde_json::json!({"data": {"results": []}}),
+            serde_json::json!({"code": "0", "data": {"results": []}}),
+            serde_json::json!({"code": 0, "data": {"results": [null]}}),
+        ] {
+            assert_eq!(
+                tool.parse_anysearch_results(&malformed, "rust")
+                    .unwrap_err()
+                    .to_string(),
+                get_required_tool_string("tool-web-search-tool-error-anysearch-invalid-response")
+            );
+        }
+
+        let missing_title = serde_json::json!({
+            "code": 0,
+            "data": {"results": [{"url": "https://example.com"}]}
+        });
+        assert!(
+            tool.parse_anysearch_results(&missing_title, "rust")
+                .unwrap()
+                .contains(&get_required_tool_string(
+                    "tool-web-search-tool-anysearch-no-title"
+                ))
+        );
+
+        let whitespace_fields = serde_json::json!({
+            "code": 0,
+            "data": {"results": [{
+                "title": " \t",
+                "url": " https://example.com/result ",
+                "content": " \r\n",
+                "snippet": "fallback snippet"
+            }]}
+        });
+        let rendered = tool
+            .parse_anysearch_results(&whitespace_fields, "rust")
+            .unwrap();
+        assert!(rendered.contains("No title"));
+        assert!(rendered.contains("https://example.com/result"));
+        assert!(rendered.contains("fallback snippet"));
+
+        let indented_content = "    alpha\n    beta";
+        let indented_response = serde_json::json!({
+            "code": 0,
+            "data": {"results": [{
+                "url": "https://example.com/indented",
+                "content": indented_content
+            }]}
+        });
+        let rendered = tool
+            .parse_anysearch_results(&indented_response, "rust")
+            .unwrap();
+        assert!(rendered.contains(&format!("   {indented_content}")));
+
+        for invalid_result in [
+            serde_json::json!({"title": "title", "url": 123}),
+            serde_json::json!({"title": 123, "url": "https://example.com"}),
+            serde_json::json!({"content": false, "url": "https://example.com"}),
+            serde_json::json!({"snippet": [], "url": "https://example.com"}),
+            serde_json::json!({"title": "title"}),
+            serde_json::json!({"title": "title", "url": "javascript:alert(1)"}),
+            serde_json::json!({"title": "title", "url": "https://example.com\nforged"}),
+            serde_json::json!({}),
+        ] {
+            let response = serde_json::json!({
+                "code": 0,
+                "data": {"results": [invalid_result]}
+            });
+            assert_eq!(
+                tool.parse_anysearch_results(&response, "rust")
+                    .unwrap_err()
+                    .to_string(),
+                get_required_tool_string("tool-web-search-tool-error-anysearch-invalid-response")
+            );
+        }
+
+        let mut beyond_limit_results = vec![
+            serde_json::json!({"title": "valid", "url": "https://example.com"});
+            tool.max_results
+        ];
+        beyond_limit_results.push(serde_json::json!({"title": "invalid"}));
+        let invalid_after_limit = serde_json::json!({
+            "code": 0,
+            "data": {"results": beyond_limit_results}
+        });
+        assert!(
+            tool.parse_anysearch_results(&invalid_after_limit, "rust")
+                .is_err()
+        );
+
+        for message in [serde_json::Value::Null, serde_json::json!(" \t\r\n")] {
+            let api_error = serde_json::json!({"code": 429, "message": message});
+            let error = tool
+                .parse_anysearch_results(&api_error, "rust")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("no error details"));
+        }
     }
 
     #[tokio::test]
@@ -4144,11 +4327,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_serply_connection_refused_error_is_query_free() {
-        // Reserve the port without listening so parallel tests cannot reuse it
-        // before the request and turn connection refusal into a different error.
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let addr = socket.local_addr().unwrap();
+        // Use loopback port 1: it is below every ephemeral range, so no
+        // parallel test can be handed it, and with no listener there the
+        // kernel refuses the connect on every platform. An ephemeral port
+        // cannot give both. A released one can be taken by a parallel test
+        // before the request, and one held by a bound but non-listening socket
+        // is refused on Linux but silently dropped on macOS, where the request
+        // then times out. The trade-off is assuming nothing on the test host
+        // listens on port 1; a listener there would fail this test rather than
+        // pass it.
+        let addr = "127.0.0.1:1";
 
         let (_tmp, tool) = serply_tool_with_key("serply-test-key");
         let client = reqwest::Client::builder()
@@ -4949,30 +5137,48 @@ mod tests {
         );
     }
 
-    /// An HTTP 200 whose chunked body never ends must be rejected once it
-    /// crosses the cap, and the client must stop reading at that point rather
-    /// than buffer to completion. The server here keeps the stream open and
-    /// keeps writing until the client closes the connection; if the client
-    /// only stopped consuming, the server's writes would stall and the
-    /// timeout below would fail the test.
+    /// An unterminated chunked body must be rejected at the cap before JSON
+    /// decoding, and its connection must be abandoned while the Client lives.
+    /// Send exactly cap + 1 body bytes without a terminal chunk, then observe
+    /// EOF or connection reset directly. Successful server writes do not
+    /// measure how much the client consumed: a finite write budget can fit in
+    /// socket buffers before the peer's close becomes visible.
     #[tokio::test]
     async fn test_keenable_oversized_chunked_response_is_rejected_before_decoding() {
+        use std::io::ErrorKind;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         const CHUNK_BYTES: usize = 64 * 1024;
-        // Far more than the cap: only an early close by the client stops it.
-        let total_chunks = KEENABLE_MAX_RESPONSE_BYTES / CHUNK_BYTES * 8;
+        const REQUEST_BYTES: usize = 4096;
+
+        struct AbortServerOnDrop(tokio::task::AbortHandle);
+
+        impl Drop for AbortServerOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = zeroclaw_spawn::spawn!(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let mut head = Vec::new();
-            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
-                let mut buffer = [0_u8; 1024];
-                let read = stream.read(&mut buffer).await.expect("read request head");
+            let mut head = [0_u8; REQUEST_BYTES];
+            let mut head_len = 0;
+            while !head[..head_len]
+                .windows(4)
+                .any(|window| window == b"\r\n\r\n")
+            {
+                assert!(
+                    head_len < head.len(),
+                    "request head exceeds fixture capacity"
+                );
+                let read = stream
+                    .read(&mut head[head_len..])
+                    .await
+                    .expect("read request head");
                 assert!(read > 0, "client closed before finishing the request");
-                head.extend_from_slice(&buffer[..read]);
+                head_len += read;
             }
             stream
                 .write_all(
@@ -4982,31 +5188,68 @@ mod tests {
                 .await
                 .expect("write response head");
 
-            // A JSON document that never ends: an open results array whose
-            // first snippet the filler chunks keep extending.
+            // One complete data chunk, but no terminal chunk or complete JSON.
+            // A reader that waits for EOF cannot finish this response.
             let prefix = b"{\"results\":[{\"snippet\":\"";
-            let mut opening = format!("{:x}\r\n", prefix.len()).into_bytes();
-            opening.extend_from_slice(prefix);
-            opening.extend_from_slice(b"\r\n");
+            let body_bytes = KEENABLE_MAX_RESPONSE_BYTES + 1;
+            assert!(prefix.len() < body_bytes, "prefix exceeds fixture body");
+            let mut chunk_header = [0_u8; 32];
+            let chunk_header_len = {
+                let mut cursor = std::io::Cursor::new(&mut chunk_header[..]);
+                std::io::Write::write_fmt(&mut cursor, format_args!("{body_bytes:x}\r\n"))
+                    .expect("format chunk header");
+                usize::try_from(cursor.position()).expect("chunk header fits the fixed buffer")
+            };
             stream
-                .write_all(&opening)
+                .write_all(&chunk_header[..chunk_header_len])
                 .await
-                .expect("write opening chunk");
+                .expect("write chunk header");
+            stream.write_all(prefix).await.expect("write JSON prefix");
 
-            let mut frame = format!("{CHUNK_BYTES:x}\r\n").into_bytes();
-            frame.extend_from_slice(&vec![b'a'; CHUNK_BYTES]);
-            frame.extend_from_slice(b"\r\n");
-            let mut sent = 0_usize;
-            let mut client_closed = false;
-            for _ in 0..total_chunks {
-                if stream.write_all(&frame).await.is_err() {
-                    client_closed = true;
-                    break;
-                }
-                sent += CHUNK_BYTES;
+            let filler = [b'a'; CHUNK_BYTES];
+            let mut sent = prefix.len();
+            while sent < body_bytes {
+                let chunk_len = (body_bytes - sent).min(filler.len());
+                stream
+                    .write_all(&filler[..chunk_len])
+                    .await
+                    .expect("write controlled body");
+                sent += chunk_len;
             }
+            // The reader can abandon after the overflow byte, before this
+            // framing write. A write error still is not the close oracle.
+            match stream.write_all(b"\r\n").await {
+                Ok(()) => {}
+                Err(error) => {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+                        ),
+                        "write trailing chunk framing: {error}"
+                    );
+                }
+            }
+
+            let mut close_buffer = [0_u8; 1024];
+            let mut residual_request_bytes = 0;
+            let client_closed = loop {
+                match stream.read(&mut close_buffer).await {
+                    Ok(0) => break true,
+                    Ok(read) => {
+                        residual_request_bytes += read;
+                        assert!(
+                            residual_request_bytes <= REQUEST_BYTES,
+                            "residual request body exceeds fixture capacity"
+                        );
+                    }
+                    Err(error) if error.kind() == ErrorKind::ConnectionReset => break true,
+                    Err(error) => panic!("observe client close: {error}"),
+                }
+            };
             (sent, client_closed)
         });
+        let _server_cleanup = AbortServerOnDrop(server.abort_handle());
 
         let tool = WebSearchTool::new("keenable".to_string(), None, None, 5, 15);
         let client = tool
@@ -5022,6 +5265,7 @@ mod tests {
             msg.contains(&KEENABLE_MAX_RESPONSE_BYTES.to_string()),
             "{msg}"
         );
+        assert!(msg.contains("was not decoded"), "{msg}");
         assert!(!msg.contains("aaaa"), "error echoes the body: {msg}");
 
         let (sent, client_closed) = tokio::time::timeout(Duration::from_secs(20), server)
@@ -5029,10 +5273,9 @@ mod tests {
             .expect("the client must close the connection instead of stalling the server")
             .expect("server task");
         assert!(client_closed, "the client never closed the connection");
-        assert!(
-            sent < total_chunks * CHUNK_BYTES,
-            "the server wrote the whole body ({sent} bytes): the client buffered to completion"
-        );
+        assert_eq!(sent, KEENABLE_MAX_RESPONSE_BYTES + 1);
+        // The close observation above must happen before dropping the Client.
+        drop(client);
     }
 
     // ── Format characterization ──────────────────────────────────────────

@@ -32,6 +32,15 @@ pub const SERVER_FALLBACK_MODEL_DUPLICATES_PRIMARY: &str =
 pub const SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD: &str =
     "security_audit_disabled_drops_certificate_record";
 
+/// Stable code for a section that enables an opt-in tool this build was
+/// compiled without. The section has no effect, and the tool's own settings
+/// are not checked; see [`crate::opt_in_tools`].
+pub const TOOL_COMPILED_OUT: &str = "tool_compiled_out";
+
+/// Stable code for a half-configured email outbound pair: the channel loads and
+/// stays inbound-only even though the operator configured sending.
+pub const EMAIL_SMTP_PARTIALLY_CONFIGURED: &str = "email_smtp_partially_configured";
+
 /// One non-fatal validation issue surfaced after a successful save.
 ///
 /// Stable codes (extend as new warnings are added):
@@ -60,6 +69,10 @@ pub const SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD: &str =
 ///   notice about lost capability, not a fail-open alarm. `"all"` admits every
 ///   group before and after, and `"ignore"` rejects every group before and
 ///   after under BOTH modes, so neither is reported.
+/// - `email_smtp_partially_configured`: exactly one of `smtp_host` and
+///   `from_address` is set on an enabled email channel. SMTP needs both, so
+///   the channel loads and reads mail but refuses every outbound send until
+///   the missing half is set, or both are cleared for an inbound-only mailbox.
 /// - `memory_config_knob_inert`: a `[memory]` knob is set to a non-default
 ///   value but has no runtime consumer yet, so it currently has no effect
 ///   (see `validate_memory_semantics` in `schema.rs` for the current list).
@@ -90,6 +103,9 @@ pub const SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD: &str =
 ///   that trace has no sink under `observability.log_persistence = "none"`;
 ///   this warning is the channel that survives, since `zeroclaw doctor` and the
 ///   config API read the structured list rather than the log.
+/// - `tool_compiled_out`: a `[<tool>]` section is enabled, but this build was
+///   compiled without the tool's `tool-*` feature, so the section has no
+///   effect and its settings are not validated.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {

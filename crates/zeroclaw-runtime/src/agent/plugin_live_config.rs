@@ -204,6 +204,8 @@ fn live_delegating_agent_config(
     instance_key: &str,
 ) -> Config {
     let mut config = live_agent_config(tmp, plugins_root, instance_key);
+    // This regression exercises selected delegation, not the default catalog.
+    config.tools.optional = vec!["delegate".into()];
 
     config.risk_profiles.insert(
         "delegator-profile".to_string(),
@@ -357,7 +359,8 @@ async fn live_delegated_plugin_tool_observes_config_reload_after_construction() 
 
     let delegate = agent.delegate_tool.as_ref().expect(
         "the parent registry must register a DelegateTool when delegation targets are \
-         configured; without it this regression cannot reach a delegated registry at all",
+         configured and delegate is selected; without it this regression cannot reach a \
+         delegated registry at all",
     );
     let target_policy = delegate
         .policy_for_target("plugin-target")

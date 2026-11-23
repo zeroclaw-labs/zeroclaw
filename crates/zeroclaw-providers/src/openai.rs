@@ -22,13 +22,14 @@ use zeroclaw_api::tool::ToolSpec;
 pub(crate) const BASE_URL: &str = "https://api.openai.com/v1";
 
 /// Default endpoint for the OpenAI Responses API.
-const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
+pub(crate) const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 
 pub struct OpenAiModelProvider {
     /// `[providers.models.openai.<alias>]` config-key alias.
     alias: String,
     base_url: String,
     canonical_base_url: &'static str,
+    single_tool_rounds_supported: bool,
     credential: Option<String>,
     max_tokens: Option<u32>,
     timeout_secs: u64,
@@ -94,6 +95,8 @@ struct NativeChatRequest {
     tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
 }
@@ -239,11 +242,17 @@ pub struct OpenAiBuilder {
     credential: Option<String>,
     base_url: Option<String>,
     canonical_base_url: Option<&'static str>,
+    single_tool_rounds_supported: bool,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
 }
 
 impl OpenAiBuilder {
+    pub(crate) fn single_tool_rounds_supported(mut self, supported: bool) -> Self {
+        self.single_tool_rounds_supported = supported;
+        self
+    }
+
     /// Explicit API credential. Whitespace-only inputs collapse to
     /// `None`.
     pub fn credential(mut self, credential: Option<&str>) -> Self {
@@ -286,6 +295,7 @@ impl OpenAiBuilder {
             alias: self.alias,
             base_url: self.base_url.unwrap_or_else(|| BASE_URL.to_string()),
             canonical_base_url: self.canonical_base_url.unwrap_or(BASE_URL),
+            single_tool_rounds_supported: self.single_tool_rounds_supported,
             credential: self.credential,
             max_tokens: self.max_tokens,
             timeout_secs: self.timeout_secs.unwrap_or(120),
@@ -302,6 +312,7 @@ impl OpenAiModelProvider {
             credential: None,
             base_url: None,
             canonical_base_url: None,
+            single_tool_rounds_supported: false,
             max_tokens: None,
             timeout_secs: None,
         }
@@ -465,6 +476,10 @@ impl OpenAiModelProvider {
 
 #[async_trait]
 impl ModelProvider for OpenAiModelProvider {
+    fn supports_single_tool_rounds(&self, _model: &str) -> bool {
+        self.single_tool_rounds_supported
+    }
+
     // ── ModelProvider-family defaults ──
     fn default_base_url(&self) -> Option<&str> {
         Some(self.canonical_base_url)
@@ -549,6 +564,22 @@ impl ModelProvider for OpenAiModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        self.chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+        .await
+    }
+
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -572,6 +603,10 @@ impl ModelProvider for OpenAiModelProvider {
             tool_choice: tools
                 .as_ref()
                 .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
+            parallel_tool_calls: (tools_count > 0
+                && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+                && self.supports_single_tool_rounds(model))
+            .then_some(false),
             tools,
             max_tokens: self.max_tokens,
         };
@@ -676,6 +711,7 @@ impl ModelProvider for OpenAiModelProvider {
                 .as_ref()
                 .and_then(|t| (!t.is_empty()).then(|| "auto".to_string())),
             tools: native_tools,
+            parallel_tool_calls: None,
             max_tokens: self.max_tokens,
         };
 
@@ -980,6 +1016,7 @@ pub(crate) async fn run_responses_sse(
 pub struct OpenAiResponsesModelProvider {
     alias: String,
     responses_url: String,
+    single_tool_rounds_supported: bool,
     credential: Option<String>,
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
@@ -1007,6 +1044,7 @@ pub struct OpenAiResponsesModelProvider {
 pub struct OpenAiResponsesBuilder {
     alias: String,
     api_url: Option<String>,
+    single_tool_rounds_supported: bool,
     credential: Option<String>,
     max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
@@ -1015,6 +1053,11 @@ pub struct OpenAiResponsesBuilder {
 }
 
 impl OpenAiResponsesBuilder {
+    pub(crate) fn single_tool_rounds_supported(mut self, supported: bool) -> Self {
+        self.single_tool_rounds_supported = supported;
+        self
+    }
+
     /// Override the API endpoint. The `/responses` suffix is appended
     /// automatically if the input does not already end in it.
     pub fn api_url(mut self, api_url: &str) -> Self {
@@ -1079,6 +1122,7 @@ impl OpenAiResponsesBuilder {
         OpenAiResponsesModelProvider {
             alias: self.alias,
             responses_url,
+            single_tool_rounds_supported: self.single_tool_rounds_supported,
             credential: self.credential,
             max_tokens: self.max_tokens,
             reasoning_effort: self.reasoning_effort,
@@ -1095,6 +1139,7 @@ impl OpenAiResponsesModelProvider {
         OpenAiResponsesBuilder {
             alias: alias.to_string(),
             api_url: None,
+            single_tool_rounds_supported: false,
             credential: None,
             max_tokens: None,
             reasoning_effort: None,
@@ -1247,6 +1292,10 @@ impl OpenAiResponsesModelProvider {
 
 #[async_trait]
 impl ModelProvider for OpenAiResponsesModelProvider {
+    fn supports_single_tool_rounds(&self, _model: &str) -> bool {
+        self.single_tool_rounds_supported
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: true,
@@ -1351,6 +1400,22 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
+        self.chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+        .await
+    }
+
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::Error::msg("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
@@ -1362,7 +1427,13 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         };
         let tools = convert_tools(request.tools);
         let tools_count = tools.as_ref().map_or(0, Vec::len);
-        let req = self.build_request(instructions, input, tools, model, temperature, false);
+        let mut req = self.build_request(instructions, input, tools, model, temperature, false);
+        if tools_count > 0
+            && policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+            && self.supports_single_tool_rounds(model)
+        {
+            req.parallel_tool_calls = Some(false);
+        }
         if ::zeroclaw_log::debug_enabled() {
             ::zeroclaw_log::record!(
                 DEBUG,
@@ -1408,6 +1479,23 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         if !options.enabled {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
         }
@@ -1420,6 +1508,8 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             }
         };
 
+        let single_tool_rounds = policy == zeroclaw_api::model_provider::ToolRoundPolicy::Single
+            && self.supports_single_tool_rounds(model);
         let messages_owned = request.messages.to_vec();
         let tools_owned = request.tools.map(<[ToolSpec]>::to_vec);
         let model = model.to_string();
@@ -1457,7 +1547,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
                 stream: true,
                 tools,
                 tool_choice: has_tools.then(|| "auto".to_string()),
-                parallel_tool_calls: has_tools.then_some(true),
+                parallel_tool_calls: has_tools.then_some(!single_tool_rounds),
                 temperature,
                 max_output_tokens: max_tokens,
                 reasoning,
@@ -1510,6 +1600,419 @@ impl ::zeroclaw_api::attribution::Attributable for OpenAiResponsesModelProvider 
     }
     fn alias(&self) -> &str {
         &self.alias
+    }
+}
+
+#[cfg(test)]
+mod tool_round_policy_tests {
+    use super::*;
+    use crate::ProviderDispatch;
+    use crate::traits::ToolRoundPolicy;
+    use axum::{Json, Router, routing::post};
+    use std::sync::{Arc, Mutex};
+
+    struct ModelPolicyCapture {
+        calls: Arc<Mutex<Vec<(String, ToolRoundPolicy)>>>,
+        fail_once: std::sync::atomic::AtomicBool,
+        streaming: bool,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for ModelPolicyCapture {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "policy-capture"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ModelPolicyCapture {
+        fn supports_single_tool_rounds(&self, model: &str) -> bool {
+            model == "supported-model"
+        }
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+        fn supports_streaming(&self) -> bool {
+            self.streaming
+        }
+        fn supports_streaming_tool_events(&self) -> bool {
+            self.streaming
+        }
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            unreachable!()
+        }
+        async fn chat_with_tool_round_policy(
+            &self,
+            _request: ProviderChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+            policy: ToolRoundPolicy,
+        ) -> anyhow::Result<ProviderChatResponse> {
+            self.calls.lock().unwrap().push((model.into(), policy));
+            if self
+                .fail_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                anyhow::bail!("503 temporarily unavailable");
+            }
+            Ok(ProviderChatResponse {
+                text: Some("ok".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+        fn stream_chat_with_tool_round_policy(
+            &self,
+            _request: ProviderChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+            policy: ToolRoundPolicy,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            self.calls.lock().unwrap().push((model.into(), policy));
+            stream::iter([
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("ok"))),
+                Ok(StreamEvent::Final),
+            ])
+            .boxed()
+        }
+    }
+
+    fn model_capture(
+        calls: &Arc<Mutex<Vec<(String, ToolRoundPolicy)>>>,
+        fail_once: bool,
+        streaming: bool,
+    ) -> Box<dyn ModelProvider> {
+        Box::new(ModelPolicyCapture {
+            calls: Arc::clone(calls),
+            fail_once: std::sync::atomic::AtomicBool::new(fail_once),
+            streaming,
+        })
+    }
+
+    #[tokio::test]
+    async fn model_routes_retries_and_reachable_fallbacks_preserve_tool_round_policy() {
+        use crate::reliable::{ReliableModelProvider, ReliableModelProviderEntry};
+        use crate::router::{Route, RouterModelProvider};
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let messages = [ChatMessage::user("go")];
+        let request = ProviderChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        for (streaming, retries) in [(false, 0), (false, 1), (true, 0)] {
+            let reliable = ReliableModelProvider::new_with_entries(
+                "reliable",
+                vec![
+                    ReliableModelProviderEntry::new_pinned(
+                        "primary",
+                        "custom.primary",
+                        "primary",
+                        "supported-model",
+                        model_capture(&calls, false, streaming),
+                    ),
+                    ReliableModelProviderEntry::new_pinned(
+                        "fallback",
+                        "custom.fallback",
+                        "fallback",
+                        "unsupported-model",
+                        model_capture(&calls, false, streaming),
+                    ),
+                ],
+                0,
+                1,
+            );
+            assert!(!reliable.supports_single_tool_rounds("supported-model"));
+            let reliable = ReliableModelProvider::new(
+                "reliable",
+                vec![
+                    (
+                        "custom.primary".into(),
+                        model_capture(&calls, !streaming, streaming),
+                    ),
+                    (
+                        "custom.fallback".into(),
+                        model_capture(&calls, false, streaming),
+                    ),
+                ],
+                retries,
+                1,
+            );
+            assert!(reliable.supports_single_tool_rounds("supported-model"));
+            assert!(!reliable.supports_single_tool_rounds("unsupported-model"));
+            let router = RouterModelProvider::new(
+                "router",
+                vec![("custom.reliable".into(), Box::new(reliable))],
+                vec![(
+                    "single".into(),
+                    Route {
+                        provider_name: "custom.reliable".into(),
+                        model: "supported-model".into(),
+                    },
+                )],
+                "unsupported-model".into(),
+            );
+            assert!(!router.supports_single_tool_rounds("unsupported-model"));
+            assert!(router.supports_single_tool_rounds("hint:single"));
+            let dispatch = ProviderDispatch::from_ref(&router);
+            calls.lock().unwrap().clear();
+            if streaming {
+                let mut events = dispatch.stream_chat_with_tool_round_policy(
+                    request,
+                    "hint:single",
+                    None,
+                    StreamOptions::new(true),
+                    ToolRoundPolicy::Single,
+                );
+                while let Some(event) = events.next().await {
+                    event.unwrap();
+                }
+            } else {
+                dispatch
+                    .chat_with_tool_round_policy(
+                        request,
+                        "hint:single",
+                        None,
+                        ToolRoundPolicy::Single,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let recorded = calls.lock().unwrap();
+            assert_eq!(recorded.len(), if streaming { 1 } else { 2 });
+            assert!(
+                recorded
+                    .iter()
+                    .all(|(model, policy)| model == "supported-model"
+                        && *policy == ToolRoundPolicy::Single)
+            );
+        }
+        let reliable = ReliableModelProvider::new(
+            "fallback",
+            vec![("custom.primary".into(), model_capture(&calls, false, false))],
+            0,
+            1,
+        )
+        .with_model_fallbacks(std::collections::HashMap::from([(
+            "supported-model".into(),
+            vec!["unsupported-model".into()],
+        )]));
+        assert!(!reliable.supports_single_tool_rounds("supported-model"));
+    }
+
+    async fn wire_body(
+        wire: u8,
+        streaming: bool,
+        policy: Option<ToolRoundPolicy>,
+        tool_shape: u8,
+    ) -> serde_json::Value {
+        let captured = Arc::new(Mutex::new(None));
+        let capture = Arc::clone(&captured);
+        let path = match wire {
+            0 => "/chat/completions",
+            1 => "/responses",
+            _ => "/v1/messages",
+        };
+        let app = Router::new().route(path, post(move |Json(body): Json<serde_json::Value>| {
+            let capture = Arc::clone(&capture);
+            async move {
+                *capture.lock().unwrap() = Some(body);
+                let response = match (wire, streaming) {
+                    (0, _) => r#"{"choices":[{"message":{"content":"ok"}}]}"#.to_string(),
+                    (1, false) => r#"{"output_text":"ok","output":[]}"#.to_string(),
+                    (1, true) => "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"output_text\":\"ok\"}}\n\n".to_string(),
+                    (_, false) => r#"{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}"#.to_string(),
+                    (_, true) => concat!(
+                        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
+                        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+                        "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                        "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+                        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                    ).to_string(),
+                };
+                let content_type = if streaming && wire != 0 { "text/event-stream" } else { "application/json" };
+                ([("content-type", content_type)], response)
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        // The factory denies custom hosts. Opt in this local protocol fixture only.
+        let provider: Box<dyn ModelProvider> = match wire {
+            0 => Box::new(
+                OpenAiModelProvider::builder("fixture")
+                    .base_url(&url)
+                    .credential(Some("test-key"))
+                    .single_tool_rounds_supported(true)
+                    .build(),
+            ),
+            1 => Box::new(
+                OpenAiResponsesModelProvider::builder("fixture")
+                    .api_url(&url)
+                    .credential(Some("test-key"))
+                    .single_tool_rounds_supported(true)
+                    .build(),
+            ),
+            _ => Box::new(
+                crate::anthropic::AnthropicModelProvider::builder("fixture")
+                    .base_url(&url)
+                    .credential(Some("test-key"))
+                    .single_tool_rounds_supported(true)
+                    .build(),
+            ),
+        };
+        let provider = crate::model_pin::ModelPinnedProvider::builder("pinned")
+            .pinned_model("fixture-model")
+            .inner(provider)
+            .build();
+        let provider: Box<dyn ModelProvider> = Box::new(
+            crate::vision_override::VisionOverrideProvider::new(Box::new(provider), true),
+        );
+        let provider: Box<dyn ModelProvider> = if wire == 0 && streaming {
+            Box::new(crate::router::RouterModelProvider::new(
+                "synthetic",
+                vec![("openai.fixture".into(), provider)],
+                vec![],
+                "fixture-model".into(),
+            ))
+        } else {
+            provider
+        };
+        let provider: Arc<dyn ModelProvider> = Arc::from(provider);
+        assert!(provider.supports_single_tool_rounds("ignored"));
+        let dispatch = ProviderDispatch::new(Arc::clone(&provider));
+        let messages = [
+            ChatMessage::user("continue"),
+            ChatMessage::assistant(
+                r#"{"content":"working","tool_calls":[{"id":"call-one","name":"echo","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(
+                r#"{"tool_call_id":"call-one","tool_name":"echo","content":"result-one"}"#,
+            ),
+        ];
+        let tools = if tool_shape == 2 {
+            vec![ToolSpec::new(
+                "echo",
+                "Echo",
+                serde_json::json!({"type": "object"}),
+            )]
+        } else {
+            vec![]
+        };
+        let request = ProviderChatRequest {
+            messages: &messages,
+            tools: (tool_shape != 0).then_some(tools.as_slice()),
+            thinking: None,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            if streaming {
+                let mut stream = match policy {
+                    Some(policy) => dispatch.stream_chat_with_tool_round_policy(
+                        request,
+                        "ignored",
+                        None,
+                        StreamOptions::new(true),
+                        policy,
+                    ),
+                    None => {
+                        dispatch.stream_chat(request, "ignored", None, StreamOptions::new(true))
+                    }
+                };
+                let mut final_seen = false;
+                while let Some(event) = stream.next().await {
+                    if matches!(event.unwrap(), StreamEvent::Final) {
+                        final_seen = true;
+                        break;
+                    }
+                }
+                assert!(final_seen);
+            } else {
+                match policy {
+                    Some(policy) => dispatch
+                        .chat_with_tool_round_policy(request, "ignored", None, policy)
+                        .await
+                        .unwrap(),
+                    None => dispatch.chat(request, "ignored", None).await.unwrap(),
+                };
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
+        let body = captured.lock().unwrap().take().unwrap();
+        assert_eq!(body["model"], "fixture-model");
+        body
+    }
+
+    #[tokio::test]
+    async fn native_tool_round_flags_reach_stream_and_chat_wires_without_changing_defaults() {
+        for wire in 0..3 {
+            for streaming in [false, true] {
+                for tool_shape in 0..3 {
+                    let single =
+                        wire_body(wire, streaming, Some(ToolRoundPolicy::Single), tool_shape).await;
+                    let batch =
+                        wire_body(wire, streaming, Some(ToolRoundPolicy::Batch), tool_shape).await;
+                    let legacy = wire_body(wire, streaming, None, tool_shape).await;
+                    assert_eq!(batch, legacy, "legacy and explicit Batch wire must match");
+                    if tool_shape != 2 {
+                        assert_eq!(single, batch, "tool-less request shape must not change");
+                        assert!(single.get("parallel_tool_calls").is_none());
+                        assert!(single.get("tool_choice").is_none());
+                    } else if wire == 2 {
+                        assert_eq!(single["tool_choice"]["type"], "auto");
+                        assert_eq!(single["tool_choice"]["disable_parallel_tool_use"], true);
+                        assert!(batch.get("tool_choice").is_none());
+                    } else {
+                        assert_eq!(single["parallel_tool_calls"], false);
+                        if wire == 1 {
+                            assert_eq!(batch["parallel_tool_calls"], true);
+                        } else {
+                            assert!(batch.get("parallel_tool_calls").is_none());
+                        }
+                    }
+                    if wire == 2 {
+                        let messages = single["messages"].as_array().unwrap();
+                        assert_eq!(messages[1]["content"][1]["type"], "tool_use");
+                        assert_eq!(messages[1]["content"][1]["id"], "call-one");
+                        assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+                        assert_eq!(messages[2]["content"][0]["tool_use_id"], "call-one");
+                    } else if wire == 0 {
+                        assert_eq!(single["messages"][1]["tool_calls"][0]["id"], "call-one");
+                        assert_eq!(single["messages"][2]["tool_call_id"], "call-one");
+                    } else {
+                        let input = single["input"].as_array().unwrap();
+                        let call = input
+                            .iter()
+                            .find(|item| item["type"] == "function_call")
+                            .unwrap();
+                        let result = input
+                            .iter()
+                            .find(|item| item["type"] == "function_call_output")
+                            .unwrap();
+                        assert_eq!(call["call_id"], "call-one");
+                        assert_eq!(result["call_id"], "call-one");
+                    }
+                }
+            }
+        }
     }
 }
 

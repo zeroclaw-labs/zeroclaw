@@ -33,6 +33,8 @@
 //! configuration registers, and a new tool with a literal name. Edit the table
 //! and the docs page together.
 
+use zeroclaw_config::opt_in_tools::OptInTool;
+
 /// Where a built-in tool sits under the proposed runtime composition contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -47,6 +49,48 @@ pub enum ToolTier {
     Optional,
 }
 
+/// The build group required by a tool's owning implementation.
+///
+/// This does not grant runtime selection, configured prerequisites or execution authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BuiltinToolCompilation {
+    /// The implementation is not behind an opt-in tool feature.
+    Always,
+    /// Native adapters compiled by `tools-external`.
+    External,
+    /// An existing SaaS or coding-CLI compilation group.
+    OptIn(OptInTool),
+}
+
+impl BuiltinToolCompilation {
+    /// Whether this build carries the required compilation group.
+    pub const fn compiled(self) -> bool {
+        match self {
+            Self::Always => true,
+            Self::External => cfg!(feature = "tools-external"),
+            Self::OptIn(tool) => {
+                // A consumer can enable config features without compiling the concrete owner.
+                let owner_compiled = match tool {
+                    OptInTool::Jira => cfg!(feature = "tool-jira"),
+                    OptInTool::Notion => cfg!(feature = "tool-notion"),
+                    OptInTool::LinkedIn => cfg!(feature = "tool-linkedin"),
+                    OptInTool::Composio => cfg!(feature = "tool-composio"),
+                    OptInTool::GoogleWorkspace => cfg!(feature = "tool-google-workspace"),
+                    OptInTool::Microsoft365 => cfg!(feature = "tool-microsoft365"),
+                    OptInTool::ProjectIntel => cfg!(feature = "tool-project-intel"),
+                    OptInTool::ClaudeCode => cfg!(feature = "tool-claude-code"),
+                    OptInTool::ClaudeCodeRunner => cfg!(feature = "tool-claude-code-runner"),
+                    OptInTool::CodexCli => cfg!(feature = "tool-codex-cli"),
+                    OptInTool::GeminiCli => cfg!(feature = "tool-gemini-cli"),
+                    OptInTool::OpenCodeCli => cfg!(feature = "tool-opencode-cli"),
+                };
+                owner_compiled && tool.compiled()
+            }
+        }
+    }
+}
+
 /// One row of [`BUILTIN_TOOLS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -55,6 +99,15 @@ pub struct BuiltinToolSpec {
     pub name: &'static str,
     /// The tier the docs tables record for the tool.
     pub tier: ToolTier,
+    /// The implementation's build requirement, independent of its tier.
+    pub compilation: BuiltinToolCompilation,
+}
+
+impl BuiltinToolSpec {
+    /// Whether the row's build group is compiled, before runtime selection and policy.
+    pub const fn compiled(&self) -> bool {
+        self.compilation.compiled()
+    }
 }
 
 /// Every built-in agent tool, grouped by tier in the order of the docs tables.
@@ -63,396 +116,489 @@ pub const BUILTIN_TOOLS: &[BuiltinToolSpec] = &[
     BuiltinToolSpec {
         name: "shell",
         tier: ToolTier::Core,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "file_read",
         tier: ToolTier::Core,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "file_write",
         tier: ToolTier::Core,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "file_edit",
         tier: ToolTier::Core,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "glob_search",
         tier: ToolTier::Core,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "content_search",
         tier: ToolTier::Core,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "git_operations",
         tier: ToolTier::Core,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "memory_store",
         tier: ToolTier::Core,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "memory_recall",
         tier: ToolTier::Core,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "memory_forget",
         tier: ToolTier::Core,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "web_fetch",
         tier: ToolTier::Core,
+        compilation: BuiltinToolCompilation::Always,
     },
     // Tier 2: host-coupled. Scheduling.
     BuiltinToolSpec {
         name: "cron_add",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "cron_list",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "cron_remove",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "cron_update",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "cron_run",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "cron_runs",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "schedule",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     // Memory plane.
     BuiltinToolSpec {
         name: "memory_export",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "memory_purge",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     // Agent execution.
     BuiltinToolSpec {
         name: "spawn_subagent",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "delegate",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "send_message_to_peer",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     // Control plane.
     BuiltinToolSpec {
         name: "model_switch",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "model_routing_config",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "proxy_config",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     // Channel bridging.
     BuiltinToolSpec {
         name: "ask_user",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "escalate_to_human",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "reaction",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "poll",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "channel_room",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "send_via",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "git_forge",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     // Sessions.
     BuiltinToolSpec {
         name: "sessions_current",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "sessions_list",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "sessions_history",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "sessions_send",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     // SOP.
     BuiltinToolSpec {
         name: "sop_list",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "sop_execute",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "sop_advance",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "sop_approve",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "sop_status",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "sop_workshop",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     // Skills, task list, canvas, ACP delivery, and the provider-bound task.
     BuiltinToolSpec {
         name: "read_skill",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "TodoWrite",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "canvas",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "deliver_file",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "llm_task",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     // Sandbox-bound coding CLIs.
     BuiltinToolSpec {
         name: "claude_code",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::OptIn(OptInTool::ClaudeCode),
     },
     BuiltinToolSpec {
         name: "codex_cli",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::OptIn(OptInTool::CodexCli),
     },
     BuiltinToolSpec {
         name: "gemini_cli",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::OptIn(OptInTool::GeminiCli),
     },
     BuiltinToolSpec {
         name: "opencode_cli",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::OptIn(OptInTool::OpenCodeCli),
     },
     // Live config.
     BuiltinToolSpec {
         name: "a2a_discover",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "a2a_send",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "a2a_get_task",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "a2a_cancel",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "file_download",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     // Runtime-defined.
     BuiltinToolSpec {
         name: "security_ops",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     // Built outside the registry factory, by the scoped registry assembly.
     BuiltinToolSpec {
         name: "execute_pipeline",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "tool_search",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "mcp_resources",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "mcp_prompts",
         tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
     },
     // Tier 3: optional. Utilities.
     BuiltinToolSpec {
         name: "calculator",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "weather",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::External,
     },
     BuiltinToolSpec {
         name: "pushover",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::External,
     },
     BuiltinToolSpec {
         name: "screenshot",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::External,
     },
     BuiltinToolSpec {
         name: "image_info",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::Always,
     },
     // Browser.
     BuiltinToolSpec {
         name: "browser_open",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::External,
     },
     BuiltinToolSpec {
         name: "browser",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::External,
     },
     BuiltinToolSpec {
         name: "browser_delegate",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::External,
     },
     BuiltinToolSpec {
         name: "text_browser",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::External,
     },
     // Network.
     BuiltinToolSpec {
         name: "http_request",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "web_search_tool",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::External,
     },
     // SaaS integrations.
     BuiltinToolSpec {
         name: "notion",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::OptIn(OptInTool::Notion),
     },
     BuiltinToolSpec {
         name: "jira",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::OptIn(OptInTool::Jira),
     },
     BuiltinToolSpec {
         name: "linkedin",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::OptIn(OptInTool::LinkedIn),
     },
     BuiltinToolSpec {
         name: "composio",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::OptIn(OptInTool::Composio),
     },
     BuiltinToolSpec {
         name: "google_workspace",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::OptIn(OptInTool::GoogleWorkspace),
     },
     BuiltinToolSpec {
         name: "microsoft365",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::OptIn(OptInTool::Microsoft365),
     },
     // Reporting.
     BuiltinToolSpec {
         name: "project_intel",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::OptIn(OptInTool::ProjectIntel),
     },
     BuiltinToolSpec {
         name: "report_template",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::OptIn(OptInTool::ProjectIntel),
     },
     // Coding runner.
     BuiltinToolSpec {
         name: "claude_code_runner",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::OptIn(OptInTool::ClaudeCodeRunner),
     },
     // Ops.
     BuiltinToolSpec {
         name: "backup",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "data_management",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "cloud_ops",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "cloud_patterns",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::Always,
     },
     // Media and transfer.
     BuiltinToolSpec {
         name: "image_gen",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::External,
     },
     BuiltinToolSpec {
         name: "file_upload",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "file_upload_bundle",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::Always,
     },
     // Channel companions.
     BuiltinToolSpec {
         name: "discord_search",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::Always,
     },
     BuiltinToolSpec {
         name: "email_search",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::External,
     },
     BuiltinToolSpec {
         name: "email_read",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::External,
     },
     // Knowledge.
     BuiltinToolSpec {
         name: "knowledge",
         tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::Always,
     },
 ];
 
@@ -509,6 +655,64 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    #[test]
+    fn external_compilation_rows_match_canonical_names() {
+        let external: BTreeSet<&str> = BUILTIN_TOOLS
+            .iter()
+            .filter(|spec| spec.compilation == BuiltinToolCompilation::External)
+            .map(|spec| spec.name)
+            .collect();
+        let expected: BTreeSet<&str> = zeroclaw_config::builtin_tools::EXTERNAL_TOOL_NAMES
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(
+            external, expected,
+            "external compilation requirements must cover exactly the canonical adapters"
+        );
+    }
+
+    #[test]
+    fn opt_in_compilation_rows_cover_canonical_groups() {
+        let groups: BTreeSet<&str> = BUILTIN_TOOLS
+            .iter()
+            .filter_map(|spec| match spec.compilation {
+                BuiltinToolCompilation::OptIn(tool) => Some(tool.feature()),
+                _ => None,
+            })
+            .collect();
+        let expected: BTreeSet<&str> = zeroclaw_config::opt_in_tools::OptInTool::ALL
+            .iter()
+            .map(|tool| tool.feature())
+            .collect();
+        assert_eq!(
+            groups, expected,
+            "inventory compilation groups must cover every canonical opt-in feature"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires only zeroclaw-config/tool-notion; executed by the opt-in CI job"]
+    fn config_only_notion_feature_does_not_compile_owner() {
+        assert!(
+            OptInTool::Notion.compiled(),
+            "positive control: this graph must enable the canonical config feature"
+        );
+        assert!(
+            !std::hint::black_box(cfg!(feature = "tool-notion")),
+            "this graph must leave the concrete tools owner feature disabled"
+        );
+        let notion = builtin_tool("notion").expect("canonical Notion inventory row");
+        assert_eq!(
+            notion.compilation,
+            BuiltinToolCompilation::OptIn(OptInTool::Notion)
+        );
+        assert!(
+            !notion.compiled(),
+            "a config-only feature must not report the unbuilt concrete tool as compiled"
+        );
     }
 
     /// Deliberately pins the retained core set, the FND-001 D5 decision, here in

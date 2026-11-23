@@ -8,17 +8,24 @@ use zeroclaw_api::tool_attribution;
 
 use crate::ask_user::AskUserTool;
 use crate::backup_tool::BackupTool;
+#[cfg(feature = "tools-external")]
 use crate::browser::BrowserTool;
+#[cfg(feature = "tools-external")]
 use crate::browser_delegate::BrowserDelegateTool;
+#[cfg(feature = "tools-external")]
 use crate::browser_open::BrowserOpenTool;
 use crate::calculator::CalculatorTool;
 use crate::canvas::CanvasTool;
 use crate::channel_room::ChannelRoomTool;
+#[cfg(feature = "tool-claude-code")]
 use crate::claude_code::ClaudeCodeTool;
+#[cfg(feature = "tool-claude-code-runner")]
 use crate::claude_code_runner::ClaudeCodeRunnerTool;
 use crate::cloud_ops::CloudOpsTool;
 use crate::cloud_patterns::CloudPatternsTool;
+#[cfg(feature = "tool-codex-cli")]
 use crate::codex_cli::CodexCliTool;
+#[cfg(feature = "tool-composio")]
 use crate::composio::ComposioTool;
 use crate::content_search::ContentSearchTool;
 use crate::data_management::DataManagementTool;
@@ -29,19 +36,24 @@ use crate::file_edit::FileEditTool;
 use crate::file_upload::FileUploadTool;
 use crate::file_upload_bundle::FileUploadBundleTool;
 use crate::file_write::FileWriteTool;
+#[cfg(feature = "tool-gemini-cli")]
 use crate::gemini_cli::GeminiCliTool;
 use crate::git_forge::GitForgeTool;
 use crate::git_operations::GitOperationsTool;
 use crate::glob_search::GlobSearchTool;
+#[cfg(feature = "tool-google-workspace")]
 use crate::google_workspace::GoogleWorkspaceTool;
 use crate::hardware_board_info::HardwareBoardInfoTool;
 use crate::hardware_memory_map::HardwareMemoryMapTool;
 use crate::hardware_memory_read::HardwareMemoryReadTool;
 use crate::http_request::HttpRequestTool;
+#[cfg(feature = "tools-external")]
 use crate::image_gen::ImageGenTool;
 use crate::image_info::ImageInfoTool;
+#[cfg(feature = "tool-jira")]
 use crate::jira_tool::JiraTool;
 use crate::knowledge_tool::KnowledgeTool;
+#[cfg(feature = "tool-linkedin")]
 use crate::linkedin::LinkedInTool;
 use crate::llm_task::LlmTaskTool;
 use crate::mcp_tool::McpToolWrapper;
@@ -50,42 +62,59 @@ use crate::memory_forget::MemoryForgetTool;
 use crate::memory_purge::MemoryPurgeTool;
 use crate::memory_recall::MemoryRecallTool;
 use crate::memory_store::MemoryStoreTool;
+#[cfg(feature = "tool-microsoft365")]
 use crate::microsoft365::Microsoft365Tool;
 use crate::model_routing_config::ModelRoutingConfigTool;
+#[cfg(feature = "tool-notion")]
 use crate::notion_tool::NotionTool;
+#[cfg(feature = "tool-opencode-cli")]
 use crate::opencode_cli::OpenCodeCliTool;
 use crate::pipeline::PipelineTool;
 use crate::poll::PollTool;
+#[cfg(feature = "tool-project-intel")]
 use crate::project_intel::ProjectIntelTool;
 use crate::proxy_config::ProxyConfigTool;
+#[cfg(feature = "tools-external")]
 use crate::pushover::PushoverTool;
 use crate::reaction::ReactionTool;
+#[cfg(feature = "tool-project-intel")]
 use crate::report_template_tool::ReportTemplateTool;
+#[cfg(feature = "tools-external")]
 use crate::screenshot::ScreenshotTool;
 use crate::send_via::SendViaTool;
 use crate::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
     SessionsListTool, SessionsSendTool,
 };
+#[cfg(feature = "tools-external")]
 use crate::text_browser::TextBrowserTool;
 use crate::tool_search::ToolSearchTool;
+#[cfg(feature = "tools-external")]
 use crate::weather_tool::WeatherTool;
 use crate::web_fetch::WebFetchTool;
+#[cfg(feature = "tools-external")]
 use crate::web_search_tool::WebSearchTool;
 
 tool_attribution!(AskUserTool, ToolKind::Wait);
 tool_attribution!(BackupTool, ToolKind::Plugin);
+#[cfg(feature = "tools-external")]
 tool_attribution!(BrowserTool, ToolKind::Plugin);
+#[cfg(feature = "tools-external")]
 tool_attribution!(BrowserDelegateTool, ToolKind::Plugin);
+#[cfg(feature = "tools-external")]
 tool_attribution!(BrowserOpenTool, ToolKind::Plugin);
 tool_attribution!(CalculatorTool, ToolKind::Plugin);
 tool_attribution!(CanvasTool, ToolKind::Plugin);
 tool_attribution!(ChannelRoomTool, ToolKind::Plugin);
+#[cfg(feature = "tool-claude-code")]
 tool_attribution!(ClaudeCodeTool, ToolKind::Plugin);
+#[cfg(feature = "tool-claude-code-runner")]
 tool_attribution!(ClaudeCodeRunnerTool, ToolKind::Plugin);
 tool_attribution!(CloudOpsTool, ToolKind::Plugin);
 tool_attribution!(CloudPatternsTool, ToolKind::Plugin);
+#[cfg(feature = "tool-codex-cli")]
 tool_attribution!(CodexCliTool, ToolKind::Plugin);
+#[cfg(feature = "tool-composio")]
 tool_attribution!(ComposioTool, ToolKind::Plugin);
 tool_attribution!(ContentSearchTool, ToolKind::Search);
 tool_attribution!(DataManagementTool, ToolKind::Plugin);
@@ -96,19 +125,24 @@ tool_attribution!(FileEditTool, ToolKind::Plugin);
 tool_attribution!(FileUploadTool, ToolKind::Plugin);
 tool_attribution!(FileUploadBundleTool, ToolKind::Plugin);
 tool_attribution!(FileWriteTool, ToolKind::Plugin);
+#[cfg(feature = "tool-gemini-cli")]
 tool_attribution!(GeminiCliTool, ToolKind::Plugin);
 tool_attribution!(GitOperationsTool, ToolKind::Shell);
 tool_attribution!(GitForgeTool, ToolKind::Plugin);
 tool_attribution!(GlobSearchTool, ToolKind::Search);
+#[cfg(feature = "tool-google-workspace")]
 tool_attribution!(GoogleWorkspaceTool, ToolKind::Plugin);
 tool_attribution!(HardwareBoardInfoTool, ToolKind::Plugin);
 tool_attribution!(HardwareMemoryMapTool, ToolKind::Plugin);
 tool_attribution!(HardwareMemoryReadTool, ToolKind::Plugin);
 tool_attribution!(HttpRequestTool, ToolKind::HttpRequest);
+#[cfg(feature = "tools-external")]
 tool_attribution!(ImageGenTool, ToolKind::Plugin);
 tool_attribution!(ImageInfoTool, ToolKind::Plugin);
+#[cfg(feature = "tool-jira")]
 tool_attribution!(JiraTool, ToolKind::Plugin);
 tool_attribution!(KnowledgeTool, ToolKind::Plugin);
+#[cfg(feature = "tool-linkedin")]
 tool_attribution!(LinkedInTool, ToolKind::Plugin);
 tool_attribution!(LlmTaskTool, ToolKind::Plugin);
 tool_attribution!(McpToolWrapper, ToolKind::Plugin, ToolProvenance::Extension);
@@ -117,17 +151,24 @@ tool_attribution!(MemoryForgetTool, ToolKind::Memory);
 tool_attribution!(MemoryPurgeTool, ToolKind::Memory);
 tool_attribution!(MemoryRecallTool, ToolKind::Memory);
 tool_attribution!(MemoryStoreTool, ToolKind::Memory);
+#[cfg(feature = "tool-microsoft365")]
 tool_attribution!(Microsoft365Tool, ToolKind::Plugin);
 tool_attribution!(ModelRoutingConfigTool, ToolKind::Plugin);
+#[cfg(feature = "tool-notion")]
 tool_attribution!(NotionTool, ToolKind::Plugin);
+#[cfg(feature = "tool-opencode-cli")]
 tool_attribution!(OpenCodeCliTool, ToolKind::Plugin);
 tool_attribution!(PipelineTool, ToolKind::Plugin);
 tool_attribution!(PollTool, ToolKind::Wait);
+#[cfg(feature = "tool-project-intel")]
 tool_attribution!(ProjectIntelTool, ToolKind::Plugin);
 tool_attribution!(ProxyConfigTool, ToolKind::Plugin);
+#[cfg(feature = "tools-external")]
 tool_attribution!(PushoverTool, ToolKind::Plugin);
 tool_attribution!(ReactionTool, ToolKind::Plugin);
+#[cfg(feature = "tool-project-intel")]
 tool_attribution!(ReportTemplateTool, ToolKind::Plugin);
+#[cfg(feature = "tools-external")]
 tool_attribution!(ScreenshotTool, ToolKind::Plugin);
 tool_attribution!(SendViaTool, ToolKind::Plugin);
 tool_attribution!(SessionDeleteTool, ToolKind::Plugin);
@@ -136,10 +177,13 @@ tool_attribution!(SessionsCurrentTool, ToolKind::Plugin);
 tool_attribution!(SessionsHistoryTool, ToolKind::Plugin);
 tool_attribution!(SessionsListTool, ToolKind::Plugin);
 tool_attribution!(SessionsSendTool, ToolKind::Plugin);
+#[cfg(feature = "tools-external")]
 tool_attribution!(TextBrowserTool, ToolKind::Plugin);
 tool_attribution!(ToolSearchTool, ToolKind::Search);
+#[cfg(feature = "tools-external")]
 tool_attribution!(WeatherTool, ToolKind::Plugin);
 tool_attribution!(WebFetchTool, ToolKind::FetchUrl);
+#[cfg(feature = "tools-external")]
 tool_attribution!(WebSearchTool, ToolKind::Search);
 
 #[cfg(test)]

@@ -114,7 +114,10 @@ pub fn parse_plugin_spec(source: &str) -> Result<PluginSpec> {
     if source.is_empty() {
         bail!("plugin name must not be empty");
     }
-    let Some((name, version)) = source.rsplit_once('@') else {
+    // A package name cannot contain `@` and a registry version can, so the
+    // name ends at the first one: `name@version` parses back to the entry it
+    // was printed from, whatever the version holds.
+    let Some((name, version)) = source.split_once('@') else {
         return Ok(PluginSpec {
             name: source.to_string(),
             version: None,
@@ -265,6 +268,30 @@ mod tests {
                 version: Some("0.2.0".to_string()),
             }
         );
+    }
+
+    #[test]
+    fn a_version_holding_an_at_sign_parses_back_whole() {
+        let entry = PluginRegistryEntry {
+            name: "team-calendar".to_string(),
+            version: "0.3.0@rc.1".to_string(),
+            description: None,
+            author: None,
+            capabilities: vec!["tool".to_string()],
+            url: "https://example.invalid/team-calendar-0.3.0.zip".to_string(),
+            sha256: None,
+        };
+
+        assert_eq!(
+            parse_plugin_spec(&install_source(&entry)).unwrap(),
+            PluginSpec {
+                name: "team-calendar".to_string(),
+                version: Some("0.3.0@rc.1".to_string()),
+            }
+        );
+        for malformed in ["@0.3.0", "team-calendar@"] {
+            assert!(parse_plugin_spec(malformed).is_err(), "{malformed}");
+        }
     }
 
     #[test]

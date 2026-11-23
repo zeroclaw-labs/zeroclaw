@@ -60,6 +60,7 @@ async fn emit_summary_attempt_usage(
                     provider_ref: summary.provider_ref.clone(),
                     model: summary.model.clone(),
                     accepted: summary.accepted,
+                    estimated_input_tokens: summary.estimated_input_tokens,
                 })
                 .await;
         }
@@ -94,6 +95,7 @@ pub(crate) async fn finish_after_max_iterations(
     crumb_present: &mut bool,
     reported_usage: Option<super::ReportedRequestUsage>,
     observer: &dyn crate::observability::Observer,
+    vision_source: Option<super::VisionProviderSource<'_>>,
 ) -> Result<String> {
     let exhaustion = limit.explanation();
     ::zeroclaw_log::record!(
@@ -143,17 +145,20 @@ pub(crate) async fn finish_after_max_iterations(
 
     // Resolve against the real latest user turn, before the synthetic summary
     // prompt could hide a fresh image from the vision-capability policy.
-    let (vision_provider, degrade_strip_images) = super::vision_route::resolve_vision_provider(
-        config,
-        model_provider,
-        history,
-        multimodal_config,
-        provider_name,
-        model,
-        dispatch_model,
-        security,
-    )
-    .await?;
+    let (vision_provider, degrade_strip_images) =
+        super::vision_route::resolve_vision_provider_with_allowed_refs(
+            config,
+            model_provider,
+            history,
+            multimodal_config,
+            provider_name,
+            model,
+            dispatch_model,
+            security,
+            vision_source,
+            knobs.provider_attempt_allowlist.as_deref(),
+        )
+        .await?;
     let (model_provider, provider_name, model, dispatch_model) = match vision_provider.as_ref() {
         Some(route) => (
             route.provider.as_ref(),
@@ -339,11 +344,17 @@ pub(crate) async fn finish_after_max_iterations(
                     );
                 }
                 if floor {
+                    // The summary call is tools-free, so the schemas cost nothing here.
                     return Err(super::context_window_exceeded_error(
                         (provider_name, &selected_model),
                         context_limits,
                         tokens,
                         token_counter.source(),
+                        (
+                            crate::agent::history::estimate_history_tokens(&messages),
+                            crate::agent::history::estimate_system_floor_tokens(&messages),
+                            0,
+                        ),
                     ));
                 }
                 break;
@@ -442,6 +453,24 @@ pub(crate) async fn finish_after_max_iterations(
             ));
         }
         SummaryCall::Done(Ok(resp)) => {
+            // When the provider omitted `input_tokens` on the accepted
+            // summary, carry a display-only estimate of the summary request
+            // so the context meter keeps its numerator after the final-summary
+            // event. Rejected attempts and accounting stay provider-reported.
+            let accepted_estimate = resp
+                .usage
+                .as_ref()
+                .and_then(|u| u.input_tokens)
+                .is_none()
+                .then(|| crate::agent::history::estimate_history_tokens(history) as u64)
+                .filter(|&est| est > 0);
+            if let Some(est) = accepted_estimate {
+                for summary in &mut summary_attempts {
+                    if summary.accepted {
+                        summary.estimated_input_tokens = Some(est);
+                    }
+                }
+            }
             emit_summary_attempt_usage(event_tx, &summary_attempts).await;
             resp
         }
@@ -591,6 +620,46 @@ mod graceful_summary_metering_tests {
         }
     }
 
+    /// Provider that omits `usage` entirely, like llama.cpp and other
+    /// local OpenAI-compatible servers.
+    struct UsageOmittingProvider;
+
+    #[async_trait]
+    impl ModelProvider for UsageOmittingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("wrap-up summary".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("wrap-up summary".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl Attributable for UsageOmittingProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "usage-omitting-provider"
+        }
+    }
+
     async fn run_summary_with_events(
         provider: &dyn ModelProvider,
         accumulated_display_text: String,
@@ -628,6 +697,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
         )
         .await
     }
@@ -703,6 +773,49 @@ mod graceful_summary_metering_tests {
         }
         // Exactly the summary call's accepted attempt — no more, no less.
         assert_eq!(usage_events, vec![(Some(100), Some(20), true)]);
+    }
+
+    // The graceful summary now fails closed on budget exhaustion: it was the one
+    // tool-loop provider call that skipped the budget check. A tripped budget
+    // (negative limit) makes the seam bail BEFORE spending, so the provider is
+    // never called and the cap is surfaced as an error.
+    #[tokio::test]
+    async fn graceful_summary_carries_estimate_when_provider_omits_input_tokens() {
+        let provider = UsageOmittingProvider;
+        let ctx = ToolLoopCostTrackingContext::usage_only();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+
+        let out = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                run_summary_with_events(&provider, String::new(), Some(&event_tx), None),
+            )
+            .await
+            .expect("graceful summary should succeed");
+
+        assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
+        let mut usage_events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let TurnEvent::Usage {
+                input_tokens,
+                estimated_input_tokens,
+                accepted,
+                ..
+            } = event
+            {
+                usage_events.push((input_tokens, estimated_input_tokens, accepted));
+            }
+        }
+        // The provider omitted input_tokens; the accepted summary carries a
+        // display-only estimate, not a measured count.
+        assert_eq!(usage_events.len(), 1, "expected exactly one usage event");
+        let (input_tokens, estimated, accepted) = usage_events[0];
+        assert_eq!(input_tokens, None, "measured input_tokens must stay None");
+        assert!(
+            estimated.is_some_and(|est| est > 0),
+            "accepted summary must carry a positive estimate, got {estimated:?}"
+        );
+        assert!(accepted, "summary attempt must be accepted");
     }
 
     // The graceful summary now fails closed on budget exhaustion: it was the one
@@ -952,6 +1065,7 @@ mod graceful_summary_metering_tests {
                 &mut crumb_present,
                 None,
                 &crate::observability::NoopObserver,
+                None,
             )
             .await;
             assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -1101,6 +1215,7 @@ mod graceful_summary_metering_tests {
                 &mut crumb_present,
                 None,
                 &crate::observability::NoopObserver,
+                None,
             )
             .await
             .expect("graceful summary succeeds");
@@ -1175,6 +1290,7 @@ mod graceful_summary_metering_tests {
                 &mut crumb_present,
                 None,
                 &crate::observability::NoopObserver,
+                None,
             )
             .await
             .expect_err("summary prompt must be included in the floor decision");
@@ -1263,6 +1379,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -1346,6 +1463,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -1444,6 +1562,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -1492,7 +1611,7 @@ mod graceful_summary_metering_tests {
         let mut history = vec![
             ChatMessage::user("call the tool and describe the screenshot"),
             ChatMessage::assistant(r#"{"tool_calls":[{"id":"toolu_legacy"}]}"#),
-            ChatMessage::tool(tool_content),
+            ChatMessage::tool(tool_content.clone()),
         ];
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default();
@@ -1525,6 +1644,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -1541,10 +1661,11 @@ mod graceful_summary_metering_tests {
         );
         // A legacy carrier is delivered as its bytes: the body reaches the
         // provider verbatim, quoted marker syntax and raw path included, as
-        // text. Nothing infers, sweeps, or strips it.
-        let body = format!("saw {marker} in output");
+        // text. Nothing infers, sweeps, or strips it. Compare the whole
+        // carrier: its JSON escaping doubles a Windows path's backslashes, so
+        // the unescaped body never appears in it there.
         assert!(
-            captured.contains(&body),
+            captured.contains(&tool_content),
             "the legacy body is delivered verbatim: {captured}"
         );
         assert!(
@@ -1615,6 +1736,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -1669,6 +1791,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -1755,6 +1878,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -1844,6 +1968,7 @@ mod graceful_summary_metering_tests {
             &mut false,
             None,
             &crate::observability::NoopObserver,
+            None,
         )
         .await
         .expect("graceful summary should succeed");

@@ -477,6 +477,12 @@ impl DispatchOwnership {
             message_id: message_id.to_string(),
         }
     }
+
+    /// Settle now rather than at scope end, so a caller can order the
+    /// settlement against its other releases. Same effect as a drop.
+    pub(crate) fn release(self) {
+        drop(self);
+    }
 }
 
 impl Drop for DispatchOwnership {
@@ -867,6 +873,26 @@ mod tests {
         drop(super::DispatchOwnership::hold("selection-dropped-revoked"));
         assert!(!is_registered("selection-dropped-revoked"));
         assert!(!super::take_revoked("selection-dropped-revoked"));
+    }
+
+    #[tokio::test]
+    async fn released_ownership_settles_at_the_call() {
+        let _guard = test_lock();
+        // The dispatch loop releases ownership explicitly to order the
+        // settlement ahead of its permits, so the release itself must
+        // reclaim the revoked marker exactly as the drop does.
+        let mut ack = super::register("selection-released-revoked");
+        ack.mark_enqueued();
+        assert!(matches!(
+            super::revoke("selection-released-revoked"),
+            super::RevokeOutcome::Won
+        ));
+        drop(ack);
+        let ownership = super::DispatchOwnership::hold("selection-released-revoked");
+        assert!(is_registered("selection-released-revoked"));
+        ownership.release();
+        assert!(!is_registered("selection-released-revoked"));
+        assert!(!super::take_revoked("selection-released-revoked"));
     }
 
     #[tokio::test]

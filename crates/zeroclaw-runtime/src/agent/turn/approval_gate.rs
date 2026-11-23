@@ -44,9 +44,24 @@ pub(crate) async fn gate_tool_approval(
         // back to auto-deny.
         let (decision, decided_by, unanswerable) = if mgr.is_non_interactive() {
             let attributed = if let Some(ch) = ctx.channel {
+                let arguments_summary = crate::approval::summarize_args(&request.arguments);
+                let arguments_summary =
+                    match (ctx.channel_name, ctx.agent_alias, ctx.parent_agent_alias) {
+                        ("delegate", Some(target), Some(caller)) => {
+                            let attribution = crate::i18n::get_required_cli_string_with_args(
+                                "channel-approval-independent-delegate",
+                                &[
+                                    ("target", &format!("{target:?}")),
+                                    ("caller", &format!("{caller:?}")),
+                                ],
+                            );
+                            format!("{attribution}\n{arguments_summary}")
+                        }
+                        _ => arguments_summary,
+                    };
                 let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
                     tool_name: request.tool_name.clone(),
-                    arguments_summary: crate::approval::summarize_args(&request.arguments),
+                    arguments_summary,
                     raw_arguments: Some(request.arguments.clone()),
                     position: Some(position),
                 };

@@ -109,6 +109,39 @@ where
     F: Fn(TurnEvent) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send,
 {
+    execute_turn_prepared(
+        agent,
+        prompt,
+        cancel,
+        attribution,
+        cost_context,
+        connection_activity,
+        steering_rx,
+        admission,
+        (|guard| async { Ok(guard) }, on_event),
+    )
+    .await
+}
+
+pub async fn execute_turn_prepared<F, Fut, P, Prep>(
+    agent: Arc<Mutex<Agent>>,
+    prompt: String,
+    cancel: CancellationToken,
+    attribution: TurnAttribution,
+    cost_context: Option<ToolLoopCostTrackingContext>,
+    connection_activity: Option<crate::rpc::ConnectionActivity>,
+    steering_rx: Option<mpsc::Receiver<crate::agent::SteeringInput>>,
+    admission: Option<TurnAdmission>,
+    callbacks: (P, F),
+) -> Result<TurnOutcome, TurnError>
+where
+    F: Fn(TurnEvent) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+    P: FnOnce(tokio::sync::OwnedMutexGuard<Agent>) -> Prep + Send + 'static,
+    Prep: std::future::Future<Output = Result<tokio::sync::OwnedMutexGuard<Agent>, StreamedTurnError>>
+        + Send,
+{
+    let (prepare, on_event) = callbacks;
     let (event_tx, mut event_rx) = mpsc::channel::<TurnEvent>(64);
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
@@ -120,7 +153,8 @@ where
         // it, and the reload drain must not read zero while it does.
         let _connection_activity = connection_activity;
         let mut steering_rx = steering_rx;
-        let mut guard = agent.lock().await;
+        let guard = agent.lock_owned().await;
+        let mut guard = prepare(guard).await?;
         // Judged on this guard, with no await before the turn starts under
         // it: every earlier check predates at least this lock wait.
         if let Some(admit) = admission
@@ -450,6 +484,11 @@ impl TurnUsageFold {
             provider_ref,
             model,
             accepted,
+            // Billing totals and the accepted-serving snapshot describe
+            // provider-measured usage only. The display estimate is a
+            // context-meter concern and is labelled on the RPC
+            // `context_usage` surface, not folded into TurnComplete.
+            estimated_input_tokens: _,
         } = event
         else {
             return;
@@ -568,6 +607,7 @@ mod tests {
             provider_ref: provider_ref.into(),
             model: model.into(),
             accepted,
+            estimated_input_tokens: None,
         }
     }
 
@@ -629,6 +669,31 @@ mod tests {
         assert_eq!(totals.model_context_window, Some(200_000));
         assert_eq!(totals.tokens_used, None, "no counts reported is not zero");
         assert_eq!(totals.cost_usd, None, "an unpriced turn carries no cost");
+    }
+
+    #[test]
+    fn usage_fold_does_not_bill_estimated_input_tokens() {
+        let mut fold = TurnUsageFold::default();
+        fold.apply(&TurnEvent::Usage {
+            input_tokens: None,
+            cached_input_tokens: None,
+            output_tokens: None,
+            cost_usd: None,
+            context_token_budget: Some(180_000),
+            model_context_window: Some(200_000),
+            provider_ref: "llamacpp.default".into(),
+            model: "local-model".into(),
+            accepted: true,
+            estimated_input_tokens: Some(4_200),
+        });
+        let totals = fold.totals(None).expect("usage arrived");
+        assert_eq!(
+            totals.input_tokens, None,
+            "a display estimate must not become a billed input total"
+        );
+        assert_eq!(totals.last_input_tokens, None);
+        assert_eq!(totals.tokens_used, None);
+        assert_eq!(totals.cost_usd, None);
     }
 
     // ── Matrix test support items (module-level) ──────────────────────────

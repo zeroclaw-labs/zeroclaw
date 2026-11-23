@@ -115,10 +115,17 @@ fn read_source_bounded(source: &AttachmentSource) -> Result<Vec<u8>, JsonRpcErro
     // open wait indefinitely on Linux (fifo(7)); `O_NONBLOCK` returns
     // immediately so the regular-file check below can reject it. `nofollow`
     // keeps a swapped final symlink from redirecting the read after the root
-    // was authorized.
+    // was authorized. `maybe_dir` lets a directory open too, so the
+    // regular-file check is what refuses it on every platform: Windows
+    // otherwise opens the component as a non-directory and reports a
+    // directory as "Access is denied". It has no effect on Unix. On Windows it
+    // adds backup semantics, which change access only for a token with
+    // SeBackupPrivilege enabled, and withholds delete sharing while the
+    // bounded read holds the handle.
     let file = {
+        use cap_fs_ext::OpenOptionsMaybeDirExt;
         let mut opts = OpenOptions::new();
-        opts.read(true);
+        opts.read(true).maybe_dir(true);
         set_nonblocking_nofollow(&mut opts);
         parent_dir
             .open_with(&file_name, &opts)
