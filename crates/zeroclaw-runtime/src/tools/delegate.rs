@@ -16283,22 +16283,30 @@ target = "memory_recall"
     #[tokio::test]
     async fn undeclared_argument_rejected_before_target_lookup() {
         let tool = DelegateTool::new(sample_agents(), None, test_security());
-        let result = tool
-            .execute(json!({
-                "agent": "nonexistent",
-                "prompt": "test",
-                "model": "requested-model-id"
-            }))
-            .await
-            .unwrap();
+        let args = json!({
+            "agent": "nonexistent",
+            "prompt": "test",
+            "model": "requested-model-id"
+        });
+        // The wording follows the active locale, so compare with what the
+        // entry check itself returns for this call.
+        let expected = crate::tools::undeclared_arguments::refuse_undeclared_arguments(
+            &tool.parameters_schema(),
+            &args,
+        )
+        .expect("the undeclared `model` argument is refused")
+        .error
+        .unwrap();
+
+        let result = tool.execute(args).await.unwrap();
 
         assert!(!result.success);
         let error = result.error.unwrap();
-        assert!(error.contains("Unknown argument 'model'"), "{error}");
-        // The key is named, its value is not echoed.
+        // The whole error is the refusal: target lookup never ran, so
+        // `nonexistent` was not resolved.
+        assert_eq!(error, expected);
+        // The key's value is not echoed.
         assert!(!error.contains("requested-model-id"), "{error}");
-        // The refusal precedes target lookup: `nonexistent` is never resolved.
-        assert!(!error.contains("Unknown agent"), "{error}");
     }
 
     #[tokio::test]
@@ -16308,10 +16316,16 @@ target = "memory_recall"
             json!({"action": "list_results", "model": "x"}),
             json!({"parallel": ["researcher"], "prompt": "test", "effort": "high"}),
         ] {
+            let expected = crate::tools::undeclared_arguments::refuse_undeclared_arguments(
+                &tool.parameters_schema(),
+                &args,
+            )
+            .expect("the undeclared argument is refused")
+            .error
+            .unwrap();
             let result = tool.execute(args.clone()).await.unwrap();
             assert!(!result.success, "{args}");
-            let error = result.error.unwrap();
-            assert!(error.contains("Unknown argument"), "{args}: {error}");
+            assert_eq!(result.error.unwrap(), expected, "{args}");
         }
     }
 
