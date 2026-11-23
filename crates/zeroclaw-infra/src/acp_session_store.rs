@@ -13,6 +13,18 @@ use zeroclaw_log::{Action, EventOutcome};
 
 const MAX_PERSISTED_TOOL_OUTPUT_BYTES: usize = 16 * 1024;
 
+/// A session already owns the requested ACP session ID.
+#[derive(Debug)]
+pub struct AcpSessionIdConflict;
+
+impl std::fmt::Display for AcpSessionIdConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ACP session ID already exists")
+    }
+}
+
+impl std::error::Error for AcpSessionIdConflict {}
+
 /// Internal discriminator for `acp_tool_calls.event_kind`. The 'in' row
 /// records the call args; the 'out' row records the result. Two append-only
 /// rows per call, correlated by the provider-issued `tool_call_id`.
@@ -788,7 +800,8 @@ impl AcpSessionStore {
     }
 
     /// Record a session with an optional host-validated interaction surface,
-    /// stamped with its owning principal (RFC 7141).
+    /// stamped with its owning principal (RFC 7141). A duplicate ID returns
+    /// [`AcpSessionIdConflict`].
     pub fn create_session_with_interaction_surface(
         &self,
         session_uuid: &str,
@@ -799,10 +812,11 @@ impl AcpSessionStore {
     ) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock();
-        conn.execute(
+        let inserted = conn.execute(
             "INSERT INTO acp_sessions
                (session_uuid, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, trim_breadcrumb, principal_id)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, 0, ?6)",
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, 0, ?6)
+             ON CONFLICT(session_uuid) DO NOTHING",
             params![
                 session_uuid,
                 agent_alias,
@@ -813,6 +827,7 @@ impl AcpSessionStore {
             ],
         )
         .context("Failed to create ACP session")?;
+        anyhow::ensure!(inserted != 0, AcpSessionIdConflict);
         Ok(conn.last_insert_rowid())
     }
 
