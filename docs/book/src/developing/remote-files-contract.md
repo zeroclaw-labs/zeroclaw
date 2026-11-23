@@ -62,3 +62,9 @@ The WebUI grants constrain what this agent is allowed to attempt, where it may u
 ## Staged transfer executor boundary
 
 The shared Rust transfer coordinator copies to an adapter-owned staging destination with a byte limit. The adapter must verify destination integrity and finalize the staging object. For a move, the coordinator requests source removal only after the adapter confirms publication. If publication is uncertain, keep the source. If the destination was published but source removal is denied or unconfirmed, report a partial move. The removal adapter must revalidate the grant and the source object's identity before deletion. Adapters own temporary cleanup and must distinguish a definite rejection from an ambiguous response.
+
+## Linux mounted-resource read adapter
+
+The draft includes a read-only adapter for an operator-provisioned SMB 3 or NFS mount on Linux. It accepts a directory handle acquired from an authorized resource and checks the handle's mount ID, filesystem, and source against kernel mount information. SMB requires a reported SMB 3 dialect. Descendant opens use Linux openat2 with no symlinks and no mount crossing. Only regular files are opened for reading. Kernels without those primitives return an error.
+
+Caller integration still needs to acquire or refresh the handle from the registered mount, apply live authorization, and schedule blocking filesystem work outside the async executor. This adapter does not mount shares, write remote data, expose a tool, or implement Windows/macOS mounting. Tests use synthetic mount information and a local filesystem fixture; real SMB/NFS coverage remains pending.
