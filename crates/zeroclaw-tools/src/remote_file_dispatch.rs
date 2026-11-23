@@ -6,9 +6,68 @@ use crate::remote_file_webdav::{
 };
 use reqwest::{Url, header::HeaderValue};
 use std::net::SocketAddr;
+use std::time::Duration;
 use zeroclaw_config::remote_files::{
     BackendAvailability, Decision, RemoteFilesRequest, RemoteIdentity, Right, Rights, WebDavCatalog,
 };
+use zeroclaw_config::schema::{ProxyConfig, ProxyScope};
+use zeroclaw_infra::net_guard::{
+    Nat64Prefix, validate_resolved_ips_are_public, validate_resolved_ips_exclude_metadata,
+};
+
+/// Deployment egress policy for a registered WebDAV resource. Private
+/// network access is an operator decision made for the resolved resource.
+pub struct WebDavNetworkPolicy<'a> {
+    pub proxy: &'a ProxyConfig,
+    pub nat64_prefixes: &'a [Nat64Prefix],
+    pub allow_private_endpoint: bool,
+}
+
+impl WebDavNetworkPolicy<'_> {
+    async fn resolve(&self, root: &Url) -> Result<Vec<SocketAddr>, ReadDispatchError> {
+        self.resolve_with(root, async |host, port| {
+            tokio::net::lookup_host((host, port))
+                .await
+                .map(|addresses| addresses.collect())
+                .map_err(|_| ReadDispatchError::NetworkDenied)
+        })
+        .await
+    }
+
+    async fn resolve_with(
+        &self,
+        root: &Url,
+        lookup: impl AsyncFnOnce(&str, u16) -> Result<Vec<SocketAddr>, ReadDispatchError>,
+    ) -> Result<Vec<SocketAddr>, ReadDispatchError> {
+        let (host, port) = crate::remote_file_webdav::validate_webdav_root(root)?;
+        if (self.proxy.enabled && self.proxy.scope == ProxyScope::Environment)
+            || (self.proxy.has_any_proxy_url()
+                && self.proxy.should_apply_to_service("tool.remote_files"))
+        {
+            return Err(ReadDispatchError::NetworkDenied);
+        }
+
+        let addresses = if let Ok(ip) = host.parse() {
+            vec![SocketAddr::new(ip, port)]
+        } else {
+            tokio::time::timeout(Duration::from_secs(5), lookup(&host, port))
+                .await
+                .map_err(|_| ReadDispatchError::NetworkDenied)??
+        };
+        if addresses.len() > 32 || addresses.iter().any(|address| address.port() != port) {
+            return Err(ReadDispatchError::NetworkDenied);
+        }
+
+        let ips: Vec<_> = addresses.iter().map(SocketAddr::ip).collect();
+        let validate = if self.allow_private_endpoint {
+            validate_resolved_ips_exclude_metadata
+        } else {
+            validate_resolved_ips_are_public
+        };
+        validate(&host, &ips, self.nat64_prefixes).map_err(|_| ReadDispatchError::NetworkDenied)?;
+        Ok(addresses)
+    }
+}
 
 pub struct WebDavReadGrant<'a> {
     pub root: &'a Url,
@@ -118,7 +177,7 @@ pub async fn dispatch_catalog_webdav_read<'a>(
     catalog: &'a WebDavCatalog,
     live_rights: impl FnOnce(&str, &Url, RemoteIdentity<'a>) -> Option<&'a Rights>,
     availability: &'a BackendAvailability,
-    verify_egress: impl AsyncFnOnce(&Url) -> Result<Vec<SocketAddr>, ReadDispatchError>,
+    network: &WebDavNetworkPolicy<'_>,
     resolve_authorization: impl AsyncFnOnce(
         &Url,
         RemoteIdentity<'a>,
@@ -140,7 +199,7 @@ pub async fn dispatch_catalog_webdav_read<'a>(
                 availability,
             })
         },
-        verify_egress,
+        async |url| network.resolve(url).await,
         resolve_authorization,
     )
     .await
@@ -150,6 +209,66 @@ pub async fn dispatch_catalog_webdav_read<'a>(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[tokio::test]
+    async fn egress_requires_explicit_private_access_and_always_blocks_metadata() {
+        let root = Url::parse("https://files.test/dav/").unwrap();
+        let proxy = ProxyConfig::default();
+        let mut policy = WebDavNetworkPolicy {
+            proxy: &proxy,
+            nat64_prefixes: &[],
+            allow_private_endpoint: false,
+        };
+
+        let addresses = || async {
+            Ok(vec![
+                "93.184.216.34:443".parse().unwrap(),
+                "10.1.2.3:443".parse().unwrap(),
+            ])
+        };
+        assert!(matches!(
+            policy
+                .resolve_with(&root, async |_, _| addresses().await)
+                .await,
+            Err(ReadDispatchError::NetworkDenied)
+        ));
+        policy.allow_private_endpoint = true;
+        assert_eq!(
+            policy
+                .resolve_with(&root, async |_, _| addresses().await)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(matches!(
+            policy
+                .resolve_with(&root, async |_, _| Ok(vec![
+                    "169.254.169.254:443".parse().unwrap()
+                ]))
+                .await,
+            Err(ReadDispatchError::NetworkDenied)
+        ));
+
+        let proxy = ProxyConfig {
+            enabled: true,
+            scope: ProxyScope::Environment,
+            ..ProxyConfig::default()
+        };
+        let policy = WebDavNetworkPolicy {
+            proxy: &proxy,
+            nat64_prefixes: &[],
+            allow_private_endpoint: true,
+        };
+        assert!(matches!(
+            policy
+                .resolve_with(&root, async |_, _| panic!(
+                    "proxy conflict must precede DNS"
+                ))
+                .await,
+            Err(ReadDispatchError::NetworkDenied)
+        ));
+    }
 
     #[tokio::test]
     async fn catalog_lookup_accepts_case_variants_but_requires_a_live_grant() {
@@ -165,6 +284,12 @@ mod tests {
         let request = RemoteFilesRequest::ListDirectory {
             resource: "Reports".into(),
             path: None,
+        };
+        let proxy = ProxyConfig::default();
+        let network = WebDavNetworkPolicy {
+            proxy: &proxy,
+            nat64_prefixes: &[],
+            allow_private_endpoint: false,
         };
         let result = dispatch_catalog_webdav_read(
             &request,
@@ -182,7 +307,7 @@ mod tests {
                 None
             },
             &availability,
-            async |_| panic!("network must not be called"),
+            &network,
             async |_, _| panic!("vault must not be called"),
         )
         .await;
