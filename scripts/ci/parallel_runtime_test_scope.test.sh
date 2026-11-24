@@ -102,6 +102,7 @@ PATH="${mock_dir}:$PATH" \
     bash "$gate" >/dev/null
 
 expect_cargo_log "channels scope" \
+    'test --locked --quiet -p zeroclaw-channels --lib --no-run' \
     'test --locked --quiet -p zeroclaw-channels --lib -- --test-threads=16'
 
 : > "$cargo_log"
@@ -111,7 +112,9 @@ PATH="${mock_dir}:$PATH" \
     bash "$gate" >/dev/null
 
 expect_cargo_log "default scope" \
+    'test --locked --quiet -p zeroclaw-runtime --lib --no-run' \
     'test --locked --quiet -p zeroclaw-runtime --lib -- --test-threads=16' \
+    'test --locked --quiet -p zeroclaw-channels --lib --no-run' \
     'test --locked --quiet -p zeroclaw-channels --lib -- --test-threads=16'
 
 : > "$cargo_log"
@@ -122,7 +125,9 @@ PATH="${mock_dir}:$PATH" \
     bash "$gate" >/dev/null
 
 expect_cargo_log "empty scope" \
+    'test --locked --quiet -p zeroclaw-runtime --lib --no-run' \
     'test --locked --quiet -p zeroclaw-runtime --lib -- --test-threads=16' \
+    'test --locked --quiet -p zeroclaw-channels --lib --no-run' \
     'test --locked --quiet -p zeroclaw-channels --lib -- --test-threads=16'
 
 : > "$cargo_log"
@@ -141,6 +146,56 @@ fi
 if [ -s "$cargo_log" ]; then
     echo "FAIL: unsupported scope invoked Cargo" >&2
     exit 1
+fi
+
+: > "$cargo_log"
+set +e
+PATH="${mock_dir}:$PATH" \
+    ZEROCLAW_PARALLEL_TEST_CARGO_LOG="$cargo_log" \
+    ZEROCLAW_PARALLEL_TEST_PASS_TIMEOUT_SECONDS=0 \
+    bash "$gate" >/dev/null 2>&1
+status=$?
+set -e
+if [ "$status" -ne 2 ] || [ -s "$cargo_log" ]; then
+    echo "FAIL: a zero pass timeout should exit 2 before Cargo runs, got $status" >&2
+    exit 1
+fi
+
+# A pass that stops must fail at its deadline and say which pass it was. The
+# build call returns at once; only the test run sleeps past the deadline.
+if command -v timeout >/dev/null 2>&1; then
+    cat > "${mock_dir}/cargo" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$ZEROCLAW_PARALLEL_TEST_CARGO_LOG"
+case "$*" in
+    *--no-run*) exit 0 ;;
+esac
+sleep 30
+EOF
+    chmod +x "${mock_dir}/cargo"
+    : > "$cargo_log"
+    hang_output="${mock_dir}/hang.out"
+    set +e
+    PATH="${mock_dir}:$PATH" \
+        ZEROCLAW_PARALLEL_TEST_CARGO_LOG="$cargo_log" \
+        ZEROCLAW_PARALLEL_TEST_RUNS=2 \
+        ZEROCLAW_PARALLEL_TEST_SCOPE=channels \
+        ZEROCLAW_PARALLEL_TEST_PASS_TIMEOUT_SECONDS=1 \
+        bash "$gate" > "$hang_output" 2>&1
+    status=$?
+    set -e
+    if [ "$status" -ne 124 ]; then
+        echo "FAIL: a stopped pass should exit 124, got $status" >&2
+        exit 1
+    fi
+    if ! grep -Fq "zeroclaw-channels run 1/2 did not finish within 1s" "$hang_output"; then
+        echo "FAIL: a stopped pass should be reported by crate and run" >&2
+        cat "$hang_output" >&2
+        exit 1
+    fi
+    expect_cargo_log "stopped pass ends the gate" \
+        'test --locked --quiet -p zeroclaw-channels --lib --no-run' \
+        'test --locked --quiet -p zeroclaw-channels --lib -- --test-threads=16'
 fi
 
 echo "parallel runtime test scope tests: pass"

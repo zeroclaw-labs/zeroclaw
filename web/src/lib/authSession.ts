@@ -15,6 +15,7 @@ import {
   type OidcSession,
 } from './auth';
 import { apiOrigin, basePath } from './basePath';
+import { generateUUID } from './uuid';
 
 // ---------------------------------------------------------------------------
 // Contract types
@@ -276,16 +277,56 @@ export function currentReturnPath(
 /** `/auth/sign-in/{alias}`: a full-page start, or the re-auth popup. */
 export function signInUrl(
   alias: string,
-  options: { returnPath?: string; popup?: boolean } = {},
+  options: { returnPath?: string; popup?: boolean; notice?: string } = {},
 ): string {
   const params = new URLSearchParams();
   if (options.popup) {
     params.set('popup', '1');
   } else if (options.returnPath) {
     params.set('return', options.returnPath);
+    if (options.notice) params.set('notice', options.notice);
   }
   const query = params.toString();
   return gatewayUrl(`/auth/sign-in/${encodeURIComponent(alias)}${query ? `?${query}` : ''}`);
+}
+
+// The gateway echoes this tab's nonce in the successful callback redirect.
+const SIGN_IN_NOTICE_KEY = 'zeroclaw_sign_in_notice';
+
+export function fullPageSignInUrl(alias: string): string {
+  // A new sign-in replaces an earlier completion awaiting a session check.
+  takeSignInNotice();
+  const returnPath = currentReturnPath() + window.location.hash;
+  try {
+    const notice = generateUUID();
+    sessionStorage.setItem(SIGN_IN_NOTICE_KEY, notice);
+    return signInUrl(alias, { returnPath, notice });
+  } catch {
+    return signInUrl(alias, { returnPath });
+  }
+}
+
+/** Consume a matched callback and restore its return URL. */
+export function takeSignInNotice(mode: 'consume' | 'retry' | 'supersede' = 'consume'): boolean {
+  try {
+    const notice = sessionStorage.getItem(SIGN_IN_NOTICE_KEY);
+    if (!notice) return false;
+    const suffix = `#zeroclaw-signed-in=${notice}`;
+    const { pathname, search, hash } = window.location;
+    const matched = hash.endsWith(suffix);
+    // Retry a verified completion, but discard an abandoned attempt on startup.
+    if (matched && mode === 'retry') return false;
+    // A broadcast may supersede a completed callback while its probe is pending.
+    // It must leave a sign-in that hasn't returned from the provider alone.
+    if (!matched && mode === 'supersede') return false;
+    sessionStorage.removeItem(SIGN_IN_NOTICE_KEY);
+    if (!matched) return false;
+    const originalUrl = pathname + search + hash.slice(0, -suffix.length);
+    window.history.replaceState(window.history.state, '', originalUrl);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -326,6 +367,8 @@ export type InitialAuth =
        * through a relay it isn't, and only the answer says so.
        */
       methodsKnown: boolean;
+      /** The cookie check could not tell whether the callback established a session. */
+      sessionCheckFailed?: true;
     };
 
 export interface InitialAuthDeps {
@@ -365,6 +408,9 @@ export async function resolveInitialAuth(deps: InitialAuthDeps): Promise<Initial
         clockOffsetMs: probe.clockOffsetMs,
         providers,
       };
+    }
+    if (probe.kind === 'error') {
+      return { kind: 'signed-out', providers, methodsKnown: true, sessionCheckFailed: true };
     }
   }
   return { kind: 'signed-out', providers, methodsKnown: deps.desktop || methods !== null };

@@ -4180,6 +4180,76 @@ mod tests {
             assert_eq!(run.decided_mode, Some(SopExecutionMode::StepByStep));
         }
 
+        #[tokio::test]
+        async fn switch_with_only_decision_guards_completes_when_answers_are_ignored() {
+            use crate::sop::approval::{
+                ApprovalDecision, ApprovalPrincipal, BrokerOutcome, ResolveOutcome,
+            };
+            use crate::sop::step_contract::SwitchRule;
+
+            let mut sop = part_sop();
+            sop.decision = Some(spec());
+            sop.steps.push(SopStep {
+                number: 3,
+                ..sop.steps[1].clone()
+            });
+            sop.steps[0].routing.switch = vec![
+                SwitchRule {
+                    name: "yes".into(),
+                    when: Some("$.decisions.1 >= 0.5".into()),
+                    goto: Some(2),
+                },
+                SwitchRule {
+                    name: "no".into(),
+                    when: Some("$.decisions.1 < 0.5".into()),
+                    goto: Some(3),
+                },
+            ];
+            // This step answer would select the first port, but the gate answer is absent.
+            let mut answers = Scripted::script(None, "auto", 0.9);
+            answers
+                .answers
+                .insert("part_1".into(), Answer::Noul { noul: 0.9 });
+            let engine = engine_with(vec![sop], Some(Scripted::with(answers)));
+            dispatch_sop_event(&engine, &test_audit(), ticket("review")).await;
+            let run_id = active_run(&engine).run_id;
+            let mut engine = engine.lock().unwrap();
+            let approved = engine
+                .resolve_via_broker(
+                    &run_id,
+                    ApprovalDecision::Approve,
+                    ApprovalPrincipal::cli(None),
+                )
+                .unwrap();
+            assert!(matches!(
+                approved,
+                BrokerOutcome::Resolved(ResolveOutcome::Resumed(_))
+            ));
+            let action = engine
+                .advance_step(
+                    &run_id,
+                    SopStepResult {
+                        effective_agent: None,
+                        step_number: 1,
+                        status: SopStepStatus::Completed,
+                        output: "done".into(),
+                        started_at: now_iso8601(),
+                        completed_at: Some(now_iso8601()),
+                        tool_calls: Vec::new(),
+                    },
+                )
+                .unwrap();
+            assert!(
+                matches!(action, SopRunAction::Completed { .. }),
+                "{action:?}"
+            );
+            let run = engine.get_run(&run_id).unwrap();
+            assert_eq!(run.status, SopRunStatus::Completed);
+            assert!(run.decisions.is_empty());
+            assert_eq!(run.step_results.len(), 1);
+            assert_eq!(run.step_results[0].step_number, 1);
+        }
+
         /// Dispatch a gated, moded SOP whose model says "no" to step 1 but whose
         /// mode answer is unusable: step 1 must still run, under the strict mode.
         async fn assert_unusable_mode_answer_does_not_skip_a_step(mut answers: Answers) {
@@ -4214,7 +4284,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn model_outage_runs_every_step() {
+        async fn model_outage_leaves_the_conditional_step_eligible() {
             let engine = engine_with(vec![part_sop()], Some(Scripted::down()));
             dispatch_sop_event(&engine, &test_audit(), ticket("typo fix")).await;
             let run = active_run(&engine);

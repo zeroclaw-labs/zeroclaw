@@ -289,7 +289,7 @@ impl Enrollment {
                 self.config.issuer
             );
         };
-        let mut form = vec![("scope", "openid".to_string())];
+        let mut form = vec![("scope", self.config.effective_scope())];
         if let Some(challenge) = challenge {
             form.push(("code_challenge_method", "S256".into()));
             form.push(("code_challenge", challenge.to_string()));
@@ -371,7 +371,7 @@ impl Enrollment {
         let discovery = self.discovery().await?;
         let mut form = vec![
             ("grant_type", "client_credentials".to_string()),
-            ("scope", "openid".to_string()),
+            ("scope", self.config.effective_service_scope()),
         ];
         let request = self.with_client_auth(self.http.post(&discovery.token_endpoint), &mut form);
         let response = request.form(&form).send().await?;
@@ -609,13 +609,14 @@ impl Enrollment {
         let state = random_urlsafe(16)?;
         let nonce = random_urlsafe(16)?;
         let challenge = s256_challenge(&verifier);
+        let scope = self.config.effective_scope();
         let authorize_url = reqwest::Url::parse_with_params(
             &authorize_endpoint,
             &[
                 ("response_type", "code"),
                 ("client_id", self.config.effective_client_id()),
                 ("redirect_uri", redirect_uri),
-                ("scope", "openid"),
+                ("scope", scope.as_str()),
                 ("state", state.as_str()),
                 ("nonce", nonce.as_str()),
                 ("code_challenge", challenge.as_str()),
@@ -1546,6 +1547,138 @@ mod tests {
         assert!(err.to_string().contains("client_secret"));
     }
 
+    /// Matches a form-encoded request whose `name` field decodes to exactly
+    /// `value` (not a substring, so order and encoding are both checked).
+    /// A form body and a URL query share one encoding, so `reqwest::Url`
+    /// decodes it without another dependency.
+    fn form_field(name: &'static str, value: &'static str) -> impl wiremock::Match {
+        move |request: &wiremock::Request| {
+            let Ok(body) = std::str::from_utf8(&request.body) else {
+                return false;
+            };
+            let Ok(url) = reqwest::Url::parse(&format!("http://form.invalid/?{body}")) else {
+                return false;
+            };
+            url.query_pairs()
+                .filter(|(key, _)| key == name)
+                .map(|(_, v)| v.into_owned())
+                .collect::<Vec<_>>()
+                == [value]
+        }
+    }
+
+    fn entra_shaped(mut config: OidcConfig) -> OidcConfig {
+        config.scopes = vec![
+            "openid".into(),
+            "offline_access".into(),
+            "api://zeroclaw/zeroclaw.access".into(),
+        ];
+        config.service_scopes = vec!["api://zeroclaw/.default".into()];
+        config
+    }
+
+    fn device_start_body() -> serde_json::Value {
+        serde_json::json!({
+            "device_code": "dev-123",
+            "user_code": "ABCD-EFGH",
+            "verification_uri": "https://sso.example.com/activate",
+            "expires_in": 600,
+            "interval": 5,
+        })
+    }
+
+    #[tokio::test]
+    async fn device_grant_requests_openid_when_no_scopes_are_configured() {
+        let server = idp_with_device_endpoint().await;
+        Mock::given(method("POST"))
+            .and(path("/device"))
+            .and(form_field("scope", "openid"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(device_start_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let enrollment = Enrollment::new("corp", config(&server.uri(), None)).unwrap();
+        enrollment.device_grant_start().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn device_grant_requests_the_configured_scopes_in_order() {
+        let server = idp_with_device_endpoint().await;
+        Mock::given(method("POST"))
+            .and(path("/device"))
+            .and(form_field(
+                "scope",
+                "openid offline_access api://zeroclaw/zeroclaw.access",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(device_start_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let enrollment =
+            Enrollment::new("corp", entra_shaped(config(&server.uri(), None))).unwrap();
+        // The S256 variant is the one the gateway relays; both share the form.
+        enrollment.device_grant_start_s256(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_credentials_requests_the_service_scopes_not_the_interactive_ones() {
+        let server = idp_with_device_endpoint().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(form_field("grant_type", "client_credentials"))
+            .and(form_field("scope", "api://zeroclaw/.default"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "svc-token",
+                "token_type": "bearer",
+                "expires_in": 300,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let enrollment =
+            Enrollment::new("corp", entra_shaped(config(&server.uri(), Some("s3cret")))).unwrap();
+        let token = enrollment.client_credentials().await.unwrap();
+        assert_eq!(token.access_token, "svc-token");
+    }
+
+    #[tokio::test]
+    async fn client_credentials_requests_openid_when_no_service_scopes_are_configured() {
+        let server = idp_with_device_endpoint().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(form_field("scope", "openid"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "svc-token",
+                "token_type": "bearer",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let enrollment = Enrollment::new("corp", config(&server.uri(), Some("s3cret"))).unwrap();
+        enrollment.client_credentials().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pkce_authorize_url_carries_the_configured_scopes() {
+        let server = idp_with_pkce_endpoints().await;
+        let enrollment =
+            Enrollment::new("corp", entra_shaped(config(&server.uri(), None))).unwrap();
+        let flow = enrollment
+            .pkce_start("http://127.0.0.1:7777/callback")
+            .await
+            .unwrap();
+        let url = reqwest::Url::parse(&flow.authorize_url).unwrap();
+        let scopes: Vec<_> = url
+            .query_pairs()
+            .filter(|(key, _)| key == "scope")
+            .map(|(_, v)| v.into_owned())
+            .collect();
+        assert_eq!(
+            scopes,
+            ["openid offline_access api://zeroclaw/zeroclaw.access"]
+        );
+    }
+
     #[tokio::test]
     async fn client_credentials_returns_token() {
         let server = idp_with_device_endpoint().await;
@@ -1636,6 +1769,7 @@ mod tests {
         let url = reqwest::Url::parse(&flow.authorize_url).unwrap();
         let params: std::collections::HashMap<_, _> = url.query_pairs().collect();
         assert_eq!(params["response_type"], "code");
+        assert_eq!(params["scope"], "openid");
         assert_eq!(params["code_challenge_method"], "S256");
         assert_eq!(
             params["code_challenge"],

@@ -50,7 +50,8 @@ pub struct OpenAiCodexModelProvider {
 struct ResponsesRequest {
     model: String,
     input: Vec<Value>,
-    instructions: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
     store: bool,
     stream: bool,
     text: ResponsesTextOptions,
@@ -358,7 +359,64 @@ pub(crate) fn build_function_call_item(call: ProviderToolCall) -> Value {
     })
 }
 
-pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
+/// True for OpenAI `gpt-6.2` and newer, bare or with an exact `openai/`,
+/// `openai.` or `<region>.openai.` qualifier. Anything else, including
+/// unknown or stacked qualifiers, keeps the legacy `instructions` shape.
+fn uses_developer_prompt_input(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    let id = if let Some(rest) = lower.strip_prefix("openai/") {
+        rest
+    } else if let Some(rest) = lower.strip_prefix("openai.") {
+        rest
+    } else if let Some((region, rest)) = lower.split_once(".openai.")
+        && !region.is_empty()
+        && region
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        rest
+    } else {
+        lower.as_str()
+    };
+    let Some(version) = id.strip_prefix("gpt-") else {
+        return false;
+    };
+    let (Some(major), rest) = split_leading_number(version) else {
+        return false;
+    };
+    let (minor, rest) = match rest.strip_prefix('.') {
+        Some(after) => match split_leading_number(after) {
+            (Some(minor), rest) => (Some(minor), rest),
+            (None, _) => return false,
+        },
+        None => (None, rest),
+    };
+    if !(rest.is_empty() || rest.starts_with('-')) {
+        return false;
+    }
+    match major {
+        0..=5 => false,
+        6 => minor.is_some_and(|minor| minor >= 2),
+        _ => true,
+    }
+}
+
+fn split_leading_number(text: &str) -> (Option<u32>, &str) {
+    let end = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    (text[..end].parse().ok(), &text[end..])
+}
+
+/// Convert chat history to Responses `(instructions, input)`.
+///
+/// For GPT-6.2+ the joined system prompt becomes a leading developer message
+/// in `input` (cacheable prefix) and `instructions` is `None`; an empty prompt
+/// emits neither. Other models keep top-level `instructions`.
+pub(crate) fn build_responses_input(
+    messages: &[ChatMessage],
+    model: &str,
+) -> (Option<String>, Vec<Value>) {
     let mut system_parts: Vec<&str> = Vec::new();
     let mut input: Vec<Value> = Vec::new();
 
@@ -488,7 +546,23 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
         system_parts.join("\n\n")
     };
 
-    (instructions, input)
+    if uses_developer_prompt_input(model) {
+        if !instructions.is_empty() {
+            input.insert(
+                0,
+                response_message_item(
+                    "developer",
+                    vec![serde_json::json!({
+                        "type": "input_text",
+                        "text": instructions,
+                    })],
+                ),
+            );
+        }
+        return (None, input);
+    }
+
+    (Some(instructions), input)
 }
 
 fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
@@ -1357,7 +1431,7 @@ impl OpenAiCodexModelProvider {
     async fn send_responses_request(
         &self,
         input: Vec<Value>,
-        instructions: String,
+        instructions: Option<String>,
         tools: Option<Vec<ResponsesToolSpec>>,
         model: &str,
     ) -> anyhow::Result<ResponsesTurnResult> {
@@ -1515,7 +1589,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
         let prepared =
             crate::multimodal::prepare_messages_for_provider(&messages, &self.multimodal).await?;
 
-        let (instructions, input) = build_responses_input(&prepared.messages);
+        let (instructions, input) = build_responses_input(&prepared.messages, model);
         self.send_responses_request(input, instructions, None, model)
             .await
             .map(|response| response.text.unwrap_or_default())
@@ -1532,7 +1606,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
         let prepared =
             crate::multimodal::prepare_messages_for_provider(messages, &self.multimodal).await?;
 
-        let (instructions, input) = build_responses_input(&prepared.messages);
+        let (instructions, input) = build_responses_input(&prepared.messages, model);
         self.send_responses_request(input, instructions, None, model)
             .await
             .map(|response| response.text.unwrap_or_default())
@@ -1547,7 +1621,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
         let prepared =
             crate::multimodal::prepare_messages_for_provider(request.messages, &self.multimodal)
                 .await?;
-        let (instructions, input) = build_responses_input(&prepared.messages);
+        let (instructions, input) = build_responses_input(&prepared.messages, model);
         let response = self
             .send_responses_request(input, instructions, convert_tools(request.tools), model)
             .await?;
@@ -1612,7 +1686,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
                 }
             };
 
-            let (instructions, input) = build_responses_input(&prepared.messages);
+            let (instructions, input) = build_responses_input(&prepared.messages, &model);
             let normalized_model = normalize_model_id(&model);
             let tools = convert_tools(tools.as_deref());
             let tools_count = tools.as_ref().map_or(0, Vec::len);
@@ -1776,6 +1850,297 @@ mod tests {
         (provider, captured, server_handle, temp_dir, proxy_guard)
     }
 
+    const COMPLETED_SSE: &str = "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"output_text\":\"ok\"}}\n\ndata: [DONE]\n";
+
+    #[test]
+    fn developer_prompt_model_matcher_table() {
+        for model in [
+            "gpt-6.2",
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
+            "GPT-6.2-Sol",
+            "openai/gpt-6.2-sol",
+            "us.openai.gpt-6.2-astra",
+            "us-east-1.openai.gpt-6.2",
+            "openai.gpt-6.2",
+            "gpt-6.3",
+            "gpt-6.10",
+            "gpt-6.10-mini",
+            "gpt-7",
+            "gpt-7.0",
+            "gpt-7-mini",
+            "openai/gpt-12.1",
+        ] {
+            assert!(uses_developer_prompt_input(model), "{model} should match");
+        }
+        for model in [
+            "",
+            "gpt-6",
+            "gpt-6-mini",
+            "gpt-6.0",
+            "gpt-6.1",
+            "gpt-6.1-sol",
+            "gpt-5.5",
+            "gpt-5-codex",
+            "gpt-4o",
+            "gpt-4.1",
+            "gpt-oss-120b",
+            "gpt-6.2x",
+            "gpt-6.2.1",
+            "gpt-",
+            "o3",
+            "o4-mini",
+            "claude-sonnet-5-5",
+            "anthropic/gpt-6.2-sol",
+            "xai/grok-6.2",
+            "grok-6.2",
+            "my-gpt-6.2",
+            "gpt6.2",
+            "not-gpt-6.2-sol",
+            "mistral/not-openai.gpt-6.2",
+            "not-openai.gpt-6.2",
+            "spoofopenai.gpt-6.2",
+            "arbitrary/openai/gpt-6.2",
+            "openai/openai/gpt-6.2",
+            "openai/us.openai.gpt-6.2",
+            "evil.us.openai.gpt-6.2",
+            ".openai.gpt-6.2",
+            "us_east.openai.gpt-6.2",
+            "gpt-7.",
+            "gpt-7.-mini",
+            "gpt-6.",
+            "openai/gpt-6.2/x",
+        ] {
+            assert!(
+                !uses_developer_prompt_input(model),
+                "{model} must keep the legacy instructions shape"
+            );
+        }
+    }
+
+    #[test]
+    fn build_responses_input_gpt62_moves_system_prompt_to_leading_developer_item() {
+        let messages = vec![
+            ChatMessage::system("stable prompt"),
+            ChatMessage::user("hi"),
+            ChatMessage::system("late system"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user("again"),
+        ];
+        let (instructions, input) = build_responses_input(&messages, "openai/gpt-6.2-sol");
+        assert_eq!(instructions, None);
+        assert_eq!(
+            input[0],
+            serde_json::json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "stable prompt\n\nlate system"}],
+            })
+        );
+        let roles: Vec<_> = input
+            .iter()
+            .map(|item| item["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["developer", "user", "assistant", "user"]);
+
+        // Legacy shape for the same history stays byte-for-byte unchanged.
+        let (legacy, legacy_input) = build_responses_input(&messages, "gpt-6.1");
+        assert_eq!(legacy.as_deref(), Some("stable prompt\n\nlate system"));
+        assert_eq!(legacy_input, input[1..]);
+    }
+
+    #[test]
+    fn build_responses_input_gpt62_keeps_fallback_identity_and_skips_empty_prompt() {
+        let messages = vec![ChatMessage::user("hi")];
+        let (instructions, input) = build_responses_input(&messages, "gpt-6.2-astra");
+        assert_eq!(instructions, None);
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[0]["content"][0]["text"], DEFAULT_CODEX_INSTRUCTIONS);
+        assert_eq!(input.len(), 2);
+
+        // An empty system prompt yields no developer item and no instructions.
+        let (instructions, input) =
+            build_responses_input(&[ChatMessage::system("")], "gpt-6.2-astra");
+        assert_eq!(instructions, None);
+        assert!(input.is_empty());
+
+        // Whitespace-only system content is never trimmed; legacy keeps it too.
+        let ws = [ChatMessage::system("  \n "), ChatMessage::user("hi")];
+        let (instructions, input) = build_responses_input(&ws, "gpt-6.2-astra");
+        assert_eq!(instructions, None);
+        assert_eq!(input[0]["content"][0]["text"], "  \n ");
+        let (legacy, _) = build_responses_input(&ws, "gpt-6.1");
+        assert_eq!(legacy.as_deref(), Some("  \n "));
+        let (legacy, _) = build_responses_input(&[ChatMessage::system("")], "gpt-6.1");
+        assert_eq!(legacy.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn build_responses_input_gpt62_image_suffix_matches_legacy() {
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("look [IMAGE:data:image/png;base64,abc]"),
+        ];
+        let (_, legacy) = build_responses_input(&messages, "gpt-6.1");
+        let (_, input) = build_responses_input(&messages, "gpt-6.2-sol");
+        assert_eq!(&input[1..], legacy.as_slice());
+        assert_eq!(input[1]["content"][1]["type"], "input_image");
+    }
+
+    #[test]
+    fn build_responses_input_gpt62_keeps_tool_and_reasoning_replay_order() {
+        let assistant = serde_json::json!({
+            "content": "calling",
+            "tool_calls": [{"id": "call_1", "name": "shell", "arguments": "{}"}],
+            "reasoning_content": encode_responses_history_items(
+                &[
+                    serde_json::json!({"type": "reasoning", "id": "rs_1", "summary": []}),
+                    serde_json::json!({"type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "{}"}),
+                ],
+                true,
+            ),
+        });
+        let tool = serde_json::json!({"tool_call_id": "call_1", "content": "done"});
+        let messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("run it"),
+            ChatMessage::assistant(assistant.to_string()),
+            ChatMessage::tool(tool.to_string()),
+        ];
+        let (_, legacy) = build_responses_input(&messages, "gpt-6.1");
+        let (instructions, input) = build_responses_input(&messages, "gpt-6.2-sol");
+        assert_eq!(instructions, None);
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(&input[1..], legacy.as_slice());
+        let kinds: Vec<_> = input[1..]
+            .iter()
+            .map(|item| response_item_type(item).unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "message",
+                "message",
+                "reasoning",
+                "function_call",
+                "function_call_output"
+            ]
+        );
+    }
+
+    fn assert_developer_shape(body: &serde_json::Value, prompt: &str) {
+        assert!(
+            body.get("instructions").is_none(),
+            "instructions key must be absent: {body}"
+        );
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[0]["content"][0]["text"], prompt);
+        assert_eq!(
+            body.to_string().matches(prompt).count(),
+            1,
+            "prompt must appear exactly once on the wire"
+        );
+        assert_eq!(input[1]["role"], "user");
+    }
+
+    async fn drain_stream(provider: &OpenAiCodexModelProvider, model: &str, tools: &[ToolSpec]) {
+        let messages = vec![
+            ChatMessage::system("PROMPT-UNIQUE"),
+            ChatMessage::user("hi"),
+        ];
+        let mut stream = provider.stream_chat(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: Some(tools),
+                thinking: None,
+            },
+            model,
+            None,
+            StreamOptions::new(true),
+        );
+        while let Some(event) = stream.next().await {
+            event.expect("stream event");
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_requests_use_developer_prompt_for_gpt62_and_legacy_otherwise() {
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) =
+            mock_codex_provider((0..6).map(|_| MockCodexReply::Sse(COMPLETED_SSE)).collect()).await;
+        let messages = vec![
+            ChatMessage::system("PROMPT-UNIQUE"),
+            ChatMessage::user("hi"),
+        ];
+        let tools = vec![ToolSpec::new(
+            "shell",
+            "run",
+            serde_json::json!({"type": "object"}),
+        )];
+        for model in ["gpt-6.2-sol", "openai/gpt-6.2-astra", "gpt-6.1"] {
+            provider
+                .chat(
+                    ProviderChatRequest {
+                        messages: &messages,
+                        tools: Some(&tools),
+                        thinking: None,
+                    },
+                    model,
+                    None,
+                )
+                .await
+                .expect("non-streaming chat");
+            drain_stream(&provider, model, &tools).await;
+        }
+        server_handle.abort();
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 6);
+        // Order: chat(sol), stream(sol), chat(astra), stream(astra), chat(6.1), stream(6.1).
+        for body in &requests[..4] {
+            assert_developer_shape(body, "PROMPT-UNIQUE");
+        }
+        for body in &requests[..] {
+            assert_eq!(body["tools"][0]["name"], "shell", "{body}");
+        }
+        assert_eq!(requests[2]["model"], "gpt-6.2-astra");
+        for body in &requests[4..] {
+            assert_eq!(body["instructions"], "PROMPT-UNIQUE");
+            assert_eq!(body["input"][0]["role"], "user");
+            assert_eq!(body["input"].as_array().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_gpt62_non_streaming_retry_preserves_developer_prompt() {
+        let (provider, captured, server, _temp_dir, _proxy_guard) = mock_codex_provider(vec![
+            MockCodexReply::Sse("data: not-json\n\n"),
+            MockCodexReply::Json(serde_json::json!({"output_text": "ok", "output": []})),
+        ])
+        .await;
+        let messages = [
+            ChatMessage::system("PROMPT-UNIQUE"),
+            ChatMessage::user("hi"),
+        ];
+        let result = provider
+            .chat_with_history(&messages, "gpt-6.2-astra", None)
+            .await
+            .expect("non-streaming recovery");
+        assert_eq!(result, "ok");
+        server.abort();
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["stream"], true);
+        assert_eq!(requests[1]["stream"], false);
+        for body in requests.iter() {
+            assert_developer_shape(body, "PROMPT-UNIQUE");
+        }
+        assert_eq!(requests[0]["input"], requests[1]["input"]);
+    }
+
     #[test]
     fn provider_construction_carries_operator_multimodal_policy() {
         let multimodal = zeroclaw_config::schema::MultimodalConfig {
@@ -1867,7 +2232,7 @@ mod tests {
                 "role": "user",
                 "content": "hello"
             })],
-            instructions: DEFAULT_CODEX_INSTRUCTIONS.to_string(),
+            instructions: Some(DEFAULT_CODEX_INSTRUCTIONS.to_string()),
             store: false,
             stream: true,
             text: ResponsesTextOptions {
@@ -2550,8 +2915,8 @@ data: [DONE]
                 content: "Thanks".into(),
             },
         ];
-        let (instructions, input) = build_responses_input(&messages);
-        assert_eq!(instructions, "You are helpful.");
+        let (instructions, input) = build_responses_input(&messages, "gpt-5");
+        assert_eq!(instructions.as_deref(), Some("You are helpful."));
         assert_eq!(input.len(), 3);
 
         let json: Vec<Value> = input
@@ -2572,8 +2937,8 @@ data: [DONE]
             role: "user".into(),
             content: "Hello".into(),
         }];
-        let (instructions, input) = build_responses_input(&messages);
-        assert_eq!(instructions, DEFAULT_CODEX_INSTRUCTIONS);
+        let (instructions, input) = build_responses_input(&messages, "gpt-5");
+        assert_eq!(instructions.as_deref(), Some(DEFAULT_CODEX_INSTRUCTIONS));
         assert_eq!(input.len(), 1);
     }
 
@@ -2589,8 +2954,8 @@ data: [DONE]
                 content: "Go".into(),
             },
         ];
-        let (instructions, input) = build_responses_input(&messages);
-        assert_eq!(instructions, DEFAULT_CODEX_INSTRUCTIONS);
+        let (instructions, input) = build_responses_input(&messages, "gpt-5");
+        assert_eq!(instructions.as_deref(), Some(DEFAULT_CODEX_INSTRUCTIONS));
         assert_eq!(input.len(), 2);
         assert_eq!(input[0]["type"], "function_call_output");
         assert_eq!(input[0]["call_id"], "call_123");
@@ -2605,7 +2970,7 @@ data: [DONE]
             content: "legacy plain text result".into(),
         }];
 
-        let (_, input) = build_responses_input(&messages);
+        let (_, input) = build_responses_input(&messages, "gpt-5");
 
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["type"], "message");
@@ -2625,7 +2990,7 @@ data: [DONE]
             content: r#"{"content":"legacy result","status":"ok"}"#.into(),
         }];
 
-        let (_, input) = build_responses_input(&messages);
+        let (_, input) = build_responses_input(&messages, "gpt-5");
 
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["type"], "message");
@@ -2651,7 +3016,7 @@ data: [DONE]
                 .to_string(),
             }];
 
-            let (_, input) = build_responses_input(&messages);
+            let (_, input) = build_responses_input(&messages, "gpt-5");
 
             assert_eq!(input.len(), 1);
             assert_eq!(input[0]["type"], "message");
@@ -2672,7 +3037,7 @@ data: [DONE]
         let messages = vec![ChatMessage::assistant(
             r#"{"content":"Using shell","tool_calls":[{"id":"call_abc","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#,
         )];
-        let (_, input) = build_responses_input(&messages);
+        let (_, input) = build_responses_input(&messages, "gpt-5");
 
         assert_eq!(input.len(), 2);
         assert_eq!(input[0]["type"], "message");
@@ -2726,7 +3091,7 @@ data: [DONE]
             ),
         ];
 
-        let (_, input) = build_responses_input(&messages);
+        let (_, input) = build_responses_input(&messages, "gpt-5");
         assert_eq!(input.len(), 3);
         assert_eq!(input[0]["type"], "reasoning");
         assert_eq!(input[0]["encrypted_content"], "enc_reasoning");
@@ -2782,7 +3147,7 @@ data: [DONE]
         let messages = vec![ChatMessage::user(
             "Describe this\n\n[IMAGE:data:image/png;base64,abc]",
         )];
-        let (_, input) = build_responses_input(&messages);
+        let (_, input) = build_responses_input(&messages, "gpt-5");
 
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["role"], "user");
@@ -2802,7 +3167,7 @@ data: [DONE]
     #[test]
     fn build_responses_input_preserves_text_only_messages() {
         let messages = vec![ChatMessage::user("Hello without images")];
-        let (_, input) = build_responses_input(&messages);
+        let (_, input) = build_responses_input(&messages, "gpt-5");
 
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["content"].as_array().unwrap().len(), 1);
@@ -2817,7 +3182,7 @@ data: [DONE]
         let messages = vec![ChatMessage::user(
             "Compare these: [IMAGE:data:image/png;base64,img1] and [IMAGE:data:image/jpeg;base64,img2]",
         )];
-        let (_, input) = build_responses_input(&messages);
+        let (_, input) = build_responses_input(&messages, "gpt-5");
 
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["content"].as_array().unwrap().len(), 3); // text + 2 images
