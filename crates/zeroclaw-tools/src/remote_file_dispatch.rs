@@ -411,8 +411,8 @@ pub async fn dispatch_vault_webdav_read<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn webdav_resolves_existing_encrypted_entry_only_with_a_live_dedicated_grant() {
+    #[tokio::test]
+    async fn webdav_resolves_existing_encrypted_entry_only_with_a_live_dedicated_grant() {
         use std::cell::Cell;
         use zeroclaw_config::{schema::Config, secrets::SecretStore};
 
@@ -531,6 +531,69 @@ mod tests {
                 assert!(result.unwrap().is_sensitive());
             } else {
                 assert!(matches!(result, Err(ReadDispatchError::Denied)));
+            }
+        }
+
+        use zeroclaw_api::tool::{
+            CredentialApprovalRequest, CredentialApprover, ToolExecutionContext,
+        };
+        use zeroclaw_config::remote_files::WebDavResourceConfig;
+
+        #[derive(Debug)]
+        struct Operator(bool);
+
+        #[async_trait::async_trait]
+        impl CredentialApprover for Operator {
+            async fn approve(&self, request: &CredentialApprovalRequest) -> bool {
+                assert_eq!(request.credential_alias, "REPORT_LOGIN");
+                assert_eq!(request.destination, "https://files.test/dav/");
+                assert!(request.operation.starts_with("List directory "));
+                self.0
+            }
+        }
+
+        let catalog = WebDavCatalog::from_resources(vec![WebDavResourceConfig {
+            alias: "REPORTS".into(),
+            root: root.to_string(),
+            credential_alias: "REPORT_LOGIN".into(),
+        }])
+        .unwrap();
+        let request = RemoteFilesRequest::ListDirectory {
+            resource: "REPORTS".into(),
+            path: None,
+        };
+        let rights = Rights {
+            operations: BTreeSet::from([Right::ListDirectory]),
+            require_human_approval: false,
+        };
+        let availability = BackendAvailability::Available(rights.operations.clone());
+        let proxy = ProxyConfig {
+            enabled: true,
+            scope: ProxyScope::Environment,
+            ..ProxyConfig::default()
+        };
+        let network = WebDavNetworkPolicy {
+            proxy: &proxy,
+            nat64_prefixes: &[],
+            allow_private_endpoint: false,
+        };
+        for approved in [false, true] {
+            let context = ToolExecutionContext::default()
+                .with_credential_approver(std::sync::Arc::new(Operator(approved)));
+            let result = context
+                .scope(dispatch_vault_webdav_read(
+                    &request,
+                    &catalog,
+                    &path,
+                    |_, _, _| Some(&rights),
+                    &availability,
+                    &network,
+                ))
+                .await;
+            if approved {
+                assert!(matches!(result, Err(ReadDispatchError::NetworkDenied)));
+            } else {
+                assert!(matches!(result, Err(ReadDispatchError::ApprovalRequired)));
             }
         }
     }
