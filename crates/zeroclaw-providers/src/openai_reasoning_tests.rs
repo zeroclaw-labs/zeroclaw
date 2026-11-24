@@ -244,6 +244,45 @@ mod native_effort {
     }
 
     #[test]
+    fn earlier_public_models_use_verified_effort_ranges() {
+        for (model, lowest) in [
+            ("gpt-5-mini", NativeEffort::Minimal),
+            ("gpt-5-mini-2025-08-07", NativeEffort::Minimal),
+            ("gpt-5-nano", NativeEffort::Minimal),
+            ("gpt-5-nano-2025-08-07", NativeEffort::Minimal),
+            ("o3", NativeEffort::Low),
+            ("o3-2025-04-16", NativeEffort::Low),
+        ] {
+            for (api, has_tools) in [
+                (ReasoningApi::Responses, true),
+                (ReasoningApi::ChatCompletions, false),
+            ] {
+                for (level, expected) in [
+                    (ThinkingLevel::Off, lowest),
+                    (ThinkingLevel::Max, NativeEffort::High),
+                ] {
+                    assert_eq!(
+                        resolve(ReasoningSurface::PublicApi, api, model, level, has_tools)
+                            .unwrap()
+                            .effort,
+                        expected
+                    );
+                }
+            }
+            assert_eq!(
+                resolve(
+                    ReasoningSurface::PublicApi,
+                    ReasoningApi::ChatCompletions,
+                    model,
+                    ThinkingLevel::Max,
+                    true
+                ),
+                Err(UnmappedReason::UnverifiedChatTools)
+            );
+        }
+    }
+
+    #[test]
     fn unknown_ids_and_undocumented_suffixes_do_not_guess_capabilities() {
         for model in ["gpt-4o", "gpt-5.4-unverified", "GPT-5.4", "other-model"] {
             assert_eq!(

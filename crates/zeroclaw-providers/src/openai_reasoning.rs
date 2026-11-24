@@ -77,6 +77,14 @@ struct ModelEfforts {
 }
 
 const PUBLIC_MODELS: &[ModelEfforts] = &[
+    // https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5.2
+    // https://developers.openai.com/api/docs/models/o3
+    ModelEfforts {
+        models: &["o3", "o3-2025-04-16"],
+        efforts: &[NativeEffort::Low, NativeEffort::Medium, NativeEffort::High],
+        chat_supported: true,
+        chat_tools: None,
+    },
     // https://developers.openai.com/api/docs/models/gpt-5.1
     ModelEfforts {
         models: &["gpt-5.1", "gpt-5.1-2025-11-13"],
@@ -332,6 +340,23 @@ const PUBLIC_MODELS: &[ModelEfforts] = &[
             NativeEffort::Medium,
             NativeEffort::High,
         ]),
+    },
+    // https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5
+    ModelEfforts {
+        models: &[
+            "gpt-5-mini",
+            "gpt-5-mini-2025-08-07",
+            "gpt-5-nano",
+            "gpt-5-nano-2025-08-07",
+        ],
+        efforts: &[
+            NativeEffort::Minimal,
+            NativeEffort::Low,
+            NativeEffort::Medium,
+            NativeEffort::High,
+        ],
+        chat_supported: true,
+        chat_tools: None,
     },
     // https://developers.openai.com/api/docs/models/gpt-6-astra
     // https://developers.openai.com/api/docs/guides/deployment-checklist
