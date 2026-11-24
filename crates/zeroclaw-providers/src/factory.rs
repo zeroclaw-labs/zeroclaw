@@ -1801,16 +1801,12 @@ impl FamilyProviderFactory for GrokCliModelProviderConfig {
         _api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        if has_api_key(key) {
-            anyhow::bail!(
-                "grok_cli does not accept api_key; use `grok login`, or export `XAI_API_KEY` and list it in the alias env_passthrough"
-            );
-        }
         Ok(Box::new(
             crate::grok_cli::GrokCliModelProvider::builder(alias)
                 .binary_path(self.binary_path.as_deref())
                 .working_directory(&self.working_directory)
                 .env_passthrough(self.env_passthrough.clone())
+                .api_key(key)
                 .extra_args(self.extra_args.clone())
                 .max_acp_stdout_bytes(self.max_acp_stdout_bytes)
                 .timeout_secs(self.base.timeout_secs)
@@ -2476,22 +2472,41 @@ mod tests {
     }
 
     #[test]
-    fn grok_cli_factory_rejects_typed_api_key_instead_of_ignoring_it() {
+    fn grok_cli_factory_accepts_typed_api_key_but_not_with_env_passthrough_key() {
         let working_directory = tempfile::tempdir().expect("temporary working directory");
         let config = GrokCliModelProviderConfig {
+            binary_path: Some(
+                std::env::current_exe()
+                    .expect("current test executable")
+                    .display()
+                    .to_string(),
+            ),
             working_directory: working_directory.path().display().to_string(),
             ..Default::default()
         };
-        let error = match config.create_provider(
+        config
+            .create_provider(
+                "default",
+                Some("typed-test-key"),
+                None,
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .expect("typed api_key builds the Grok CLI provider");
+
+        let both = GrokCliModelProviderConfig {
+            env_passthrough: vec!["XAI_API_KEY".to_string()],
+            ..config
+        };
+        let error = match both.create_provider(
             "default",
             Some("typed-test-key"),
             None,
             &ModelProviderRuntimeOptions::default(),
         ) {
-            Ok(_) => panic!("grok_cli api_key must not be silently ignored"),
+            Ok(_) => panic!("two API-key sources must be rejected"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("does not accept api_key"));
+        assert!(error.to_string().contains("not both"));
     }
 
     #[test]

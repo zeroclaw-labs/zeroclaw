@@ -3201,7 +3201,9 @@ pub struct GrokCliModelProviderConfig {
     /// at spawn time. The default is empty so unrelated daemon secrets remain
     /// blocked. `XAI_API_KEY` is the sole supported provider-owned name and
     /// enables API-key authentication when explicitly listed and non-empty;
-    /// other `XAI_*` and all `GROK_*` names are rejected.
+    /// other `XAI_*` and all `GROK_*` names are rejected. The typed alias
+    /// `api_key` is the alternative to listing `XAI_API_KEY`; setting both is
+    /// rejected.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[credential_class = "legacy_env_path"]
     pub env_passthrough: Vec<String>,
