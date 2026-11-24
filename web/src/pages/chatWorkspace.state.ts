@@ -1,6 +1,7 @@
 import type { WorkspaceLayout } from '@/components/ChatTabBar';
-import { getActiveSessionId, newSessionId } from '@/lib/chatSessions';
+import { gatewaySessionKey, getActiveSessionId, newSessionId } from '@/lib/chatSessions';
 import { generateUUID } from '@/lib/uuid';
+import type { Session } from '@/types/api';
 
 /**
  * Pane bookkeeping for the multi-tab chat workspace.
@@ -43,6 +44,34 @@ export interface PersistedStateV1 {
   activeAlias?: string;
   layout?: WorkspaceLayout;
   splitAliases?: [string, string | null];
+}
+
+/** Dashboard notification links address one conversation within an agent. */
+export function linkedSession(search: string): string | undefined {
+  const value = new URLSearchParams(search).get('session');
+  return value && /^[a-zA-Z0-9_-]{1,128}$/.test(value) ? value : undefined;
+}
+
+/** Only the gateway can attribute a saved conversation after its pane has closed. */
+export function ownedGatewaySession(sessions: Session[], alias: string, id: string): string | undefined {
+  const matches = sessions.filter((s) => s.session_id === id || s.session_key === id);
+  if (matches.length !== 1) return undefined;
+  const row = matches[0];
+  return row && row.agent_alias === alias && row.channel_id === null
+    && row.session_key === gatewaySessionKey(row.session_id) ? row.session_id : undefined;
+}
+
+export function tabForRoute(tabs: ChatTab[], alias: string, session?: string, preferredKey?: string): ChatTab {
+  if (session) {
+    const owner = tabs.find((tab) => tab.sessionId === session);
+    if (!owner) return makeTab(alias, session);
+    if (owner.alias === alias) return owner;
+  }
+  const existing = tabs.find((tab) => tab.alias === alias && tab.key === preferredKey)
+    ?? tabs.find((tab) => tab.alias === alias);
+  if (existing) return existing;
+  const tab = makeTab(alias);
+  return tabs.some((other) => other.sessionId === tab.sessionId) ? makeTab(alias, newSessionId()) : tab;
 }
 
 /** Build a tab for `alias`, resuming its last conversation unless one is given. */

@@ -12,7 +12,7 @@ import {
   WS_CLOSE_SESSION_ENDED,
   WebSocketClient,
 } from '@/lib/ws';
-import { getActiveSessionId, newSessionId, setActiveSessionId } from '@/lib/chatSessions';
+import { gatewaySessionKey, getActiveSessionId, newSessionId, setActiveSessionId } from '@/lib/chatSessions';
 import { getOidcSession } from '@/lib/auth';
 import { navAccessFor } from '@/lib/navAccess';
 import { generateUUID } from '@/lib/uuid';
@@ -261,9 +261,9 @@ export interface AgentSessionRuntime {
 
 const defaultSessionRuntime: AgentSessionRuntime = {
   createSocket: (options) => new WebSocketClient(options),
-  getMessages: getSessionMessages,
-  delete: deleteSession,
-  rename: renameSession,
+  getMessages: (id) => getSessionMessages(gatewaySessionKey(id)),
+  delete: (id) => deleteSession(gatewaySessionKey(id)),
+  rename: (id, name) => renameSession(gatewaySessionKey(id), name),
   mintId: newSessionId,
 };
 
@@ -1224,7 +1224,7 @@ export function AgentProvider({
       // down the socket. This prevents the old model from continuing to execute
       // tools or persisting its response into the session after we switch.
       if (typingRef.current) {
-        const sessionToAbort = perSocket ? conversationIdRef.current : activeSessionIdRef.current;
+        const sessionToAbort = perSocket ? conversationIdRef.current : gatewaySessionKey(activeSessionIdRef.current);
         try {
           await Promise.race([
             sessionToAbort ? abortSession(sessionToAbort) : Promise.resolve(),
@@ -1438,7 +1438,7 @@ export function AgentProvider({
     if (!force && sessionPersistenceRef.current !== true) return false;
 
     if (typingRef.current) {
-      void abortSession(currentSessionId).catch(() => {
+      void abortSession(gatewaySessionKey(currentSessionId)).catch(() => {
         // Best-effort: never block the switch on a failed abort.
       });
     }
@@ -1581,7 +1581,7 @@ export function AgentProvider({
       // backend on a late click anyway. Don't wait for the `aborted` frame
       // to round-trip; the user clicked Stop and expects the UI to follow.
       setPendingApproval(null);
-      const target = perSocket ? conversationIdRef.current : sessionId;
+      const target = perSocket ? conversationIdRef.current : gatewaySessionKey(sessionId);
       if (!target) return;
       try {
         await abortSession(target);
