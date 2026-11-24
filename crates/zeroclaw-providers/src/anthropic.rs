@@ -991,14 +991,22 @@ impl AnthropicModelProvider {
                         .and_then(|t| t.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let signature = block
+                    // Anthropic accepts only signed thinking: a block whose
+                    // signature never arrived (a stream cut off mid-thinking,
+                    // or reasoning recorded by another provider) would fail
+                    // the whole request with `thinking.signature: Field
+                    // required`, so it is left out.
+                    let Some(signature) = block
                         .get("signature")
                         .and_then(|s| s.as_str())
                         .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string());
+                        .map(|s| s.to_string())
+                    else {
+                        continue;
+                    };
                     blocks.push(NativeContentOut::Thinking {
                         thinking,
-                        signature,
+                        signature: Some(signature),
                     });
                 }
             }
@@ -5877,6 +5885,56 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(native_msgs[0].role, "user");
         assert_eq!(native_msgs[1].role, "assistant");
         assert_eq!(native_msgs[2].role, "user");
+    }
+
+    #[test]
+    fn convert_messages_leaves_out_thinking_that_has_no_signature() {
+        // A stream cut off by max_tokens mid-thinking stores the text with an
+        // empty signature; reasoning from another provider has none at all.
+        let reasoning = [
+            r#"{"thinking":"cut off","signature":""}"#,
+            r#"{"thinking":"from elsewhere"}"#,
+            r#"{"thinking":"kept","signature":"sig_ok"}"#,
+        ]
+        .join("\n");
+        let envelope = serde_json::json!({
+            "content": "",
+            "tool_calls": [{"id": "toolu_1", "name": "shell", "arguments": "{}"}],
+            "reasoning_content": reasoning,
+        })
+        .to_string();
+        let messages = vec![
+            ChatMessage::user("run it"),
+            ChatMessage::assistant(envelope),
+            ChatMessage::tool(
+                serde_json::json!({"content": "done", "tool_call_id": "toolu_1"}).to_string(),
+            ),
+        ];
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
+        let assistant = native_msgs
+            .iter()
+            .find(|m| m.role == "assistant")
+            .expect("assistant message survives conversion");
+        let thinking: Vec<_> = assistant
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                NativeContentOut::Thinking {
+                    thinking,
+                    signature,
+                } => Some((thinking.as_str(), signature.as_deref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking, [("kept", Some("sig_ok"))]);
+        assert!(
+            assistant
+                .content
+                .iter()
+                .any(|block| matches!(block, NativeContentOut::ToolUse { .. })),
+            "the tool call itself is still replayed"
+        );
     }
 
     // The seam sanitizer rewrites an assistant tool-call envelope

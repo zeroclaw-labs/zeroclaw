@@ -217,7 +217,8 @@ pub struct LedgerEntry {
     pub status: CertStatus,
     /// Join key to the pairing `devices.db` (empty for operator CLI issuance).
     pub token_hash: String,
-    /// Who authorized the issuance (`enroll:<prefix>` or `operator`).
+    /// Issuance actor, such as a canonical OIDC principal, `enroll:<prefix>`,
+    /// `operator`, or `renew`. Existing rows retain the recorded label.
     pub actor: String,
     /// When the cert was issued/recorded, unix seconds.
     pub issued_at: i64,
@@ -2154,6 +2155,30 @@ mod tests {
         assert_eq!(got.device_id, "dev1");
         assert_eq!(got.actor, "enroll:abcdef01");
         assert_eq!(led.device_of("fp1").unwrap().as_deref(), Some("dev1"));
+    }
+
+    #[test]
+    fn historical_oidc_actor_remains_listed_and_revocable_by_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = CertLedger::open(dir.path(), None).unwrap();
+        let mut legacy = entry("fp-legacy", "dev-legacy");
+        legacy.actor = "oidc:oidc:https%3A//sso.example.com:subject".into();
+        legacy.token_hash.clear();
+        ledger.record_issued(&legacy, false).unwrap();
+        assert!(ledger.mark_delivered(&legacy.fingerprint).unwrap());
+        drop(ledger);
+
+        let reopened = CertLedger::open(dir.path(), None).unwrap();
+        let active = reopened.list_active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].actor, legacy.actor);
+        assert_eq!(
+            reopened
+                .revoke_device(&active[0].device_id, "operator")
+                .unwrap(),
+            1
+        );
+        assert!(reopened.is_revoked(&legacy.fingerprint).unwrap());
     }
 
     #[test]
