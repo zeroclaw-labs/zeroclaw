@@ -13,6 +13,13 @@ use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 
+thread_local! {
+    /// End of the current connection preparation's lock wait window, read by
+    /// [`wait_within_preparation_window`]. Set only while
+    /// `initialize_schema` runs on this thread.
+    static PREPARATION_DEADLINE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
 #[cfg(test)]
 thread_local! {
     static PATCH_WRITER_WAIT: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
@@ -2314,15 +2321,17 @@ fn apply_run_completion_state(
 /// in any of them retries the whole preparation until one shared deadline.
 /// That covers the statements SQLite refuses at once without consulting the
 /// busy handler: a schema read overtaken by another connection's commit
-/// before its write. Each attempt's busy timeout is what remains of the
-/// window, so a writer that outlasts it is still refused once, at the window.
+/// before its write. Every lock wait during preparation, in any phase and
+/// any statement, ends at that same deadline, so a writer that outlasts the
+/// window is still refused once, at the window.
 fn initialize_schema(conn: &Connection, config: &Config) -> Result<()> {
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_millis(CRON_BUSY_TIMEOUT_MS);
+    let _window = PreparationWindow::open(conn, deadline)?;
     loop {
         let err = match apply_schema_and_migrations(conn, config, deadline) {
             Ok(()) => {
-                // The operation that follows gets the full window again.
+                // The operation that follows gets its own full window.
                 conn.busy_timeout(std::time::Duration::from_millis(CRON_BUSY_TIMEOUT_MS))
                     .context("Failed to set cron DB busy timeout")?;
                 return Ok(());
@@ -2343,10 +2352,40 @@ fn initialize_schema(conn: &Connection, config: &Config) -> Result<()> {
     }
 }
 
-/// Milliseconds left before `deadline`, at least 1 so SQLite still waits.
-fn remaining_ms(deadline: std::time::Instant) -> u64 {
-    let left = deadline.saturating_duration_since(std::time::Instant::now());
-    u64::try_from(left.as_millis()).unwrap_or(u64::MAX).max(1)
+/// Holds the preparation window open: while it lives, every SQLite lock
+/// wait on the connection ends at the deadline it was opened with. Dropping
+/// it clears the thread's deadline, so the handler stops waiting at once if
+/// the connection outlives a failed preparation.
+struct PreparationWindow;
+
+impl PreparationWindow {
+    fn open(conn: &Connection, deadline: std::time::Instant) -> Result<Self> {
+        PREPARATION_DEADLINE.set(Some(deadline));
+        let window = Self;
+        conn.busy_handler(Some(wait_within_preparation_window))
+            .context("Failed to set cron DB busy handler")?;
+        Ok(window)
+    }
+}
+
+impl Drop for PreparationWindow {
+    fn drop(&mut self) {
+        PREPARATION_DEADLINE.set(None);
+    }
+}
+
+/// SQLite busy handler for connection preparation: keep waiting in short
+/// steps until the thread's preparation deadline, then give up.
+fn wait_within_preparation_window(_attempt: i32) -> bool {
+    let Some(deadline) = PREPARATION_DEADLINE.get() else {
+        return false;
+    };
+    let now = std::time::Instant::now();
+    if now >= deadline {
+        return false;
+    }
+    std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(5)));
+    true
 }
 
 fn apply_schema_and_migrations(
@@ -2359,14 +2398,10 @@ fn apply_schema_and_migrations(
     // cert, and ACP stores do. Unlike them, synchronous stays FULL: a commit
     // lost to power failure here can re-run a one-shot job's side effect or
     // resurrect a removed job, so cron keeps the pre-WAL durability.
-    // Set before recovery below so its write transactions are covered too;
-    // contention that outlasts the busy window fails the open closed.
-    conn.execute_batch(&format!(
-        "PRAGMA busy_timeout = {};
-         PRAGMA synchronous = FULL;",
-        remaining_ms(deadline)
-    ))
-    .context("Failed to set cron DB connection pragmas")?;
+    // The busy handler `initialize_schema` installed covers every phase
+    // below; contention that outlasts the window fails the open closed.
+    conn.execute_batch("PRAGMA synchronous = FULL;")
+        .context("Failed to set cron DB connection pragmas")?;
     enable_wal(conn, deadline)?;
 
     // Before anything references cron_runs: in the between-DROP-and-RENAME
@@ -7573,12 +7608,19 @@ schedule = { kind = "every", every_ms = 300000 }
     #[test]
     fn a_writer_outlasting_the_window_is_refused_once_at_the_window() {
         // The retry loop ends at the shared deadline: a writer held past the
-        // window still gets one retryable refusal at the window, not a
-        // longer wait or a different error.
+        // window on a fresh file, where preparation must write, still gets
+        // one retryable refusal at the window, not a longer wait or a
+        // different error.
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
-        add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
-        let _holder = hold_write_lock(&config);
+        let path = cron_db(&config);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let holder = Connection::open(&path).unwrap();
+        holder
+            .execute_batch(
+                "CREATE TABLE warmup (x INTEGER); BEGIN IMMEDIATE; INSERT INTO warmup VALUES (1);",
+            )
+            .unwrap();
         let started = std::time::Instant::now();
         let result = add_job(&config, "test-agent", "*/5 * * * *", "echo again");
         let waited = started.elapsed();
@@ -7596,5 +7638,6 @@ schedule = { kind = "every", every_ms = 300000 }
             waited < window + std::time::Duration::from_millis(2500),
             "retries stretched the wait past the window: {waited:?}"
         );
+        drop(holder);
     }
 }
