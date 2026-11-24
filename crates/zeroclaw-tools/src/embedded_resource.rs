@@ -464,8 +464,9 @@ fn materializable_base64(item: &serde_json::Value) -> Option<&str> {
 ///
 /// Returns `None` unless every content item is exactly a plain text block and
 /// every top-level field is part of the known envelope. If `structuredContent`
-/// is present, the joined text must parse as semantically equal JSON. Anything
-/// else takes the preserving full-result path.
+/// is present, it must be a copy of the joined text (see
+/// [`structured_copy_of_text`]). Anything else takes the preserving full-result
+/// path.
 fn all_text_content(result: &serde_json::Value) -> Option<String> {
     let envelope = result.as_object()?;
     if envelope
@@ -494,14 +495,39 @@ fn all_text_content(result: &serde_json::Value) -> Option<String> {
         text.push_str(block);
     }
 
-    if let Some(structured) = envelope.get("structuredContent") {
-        let parsed: serde_json::Value = serde_json::from_str(&text).ok()?;
-        if &parsed != structured {
-            return None;
-        }
+    if let Some(structured) = envelope.get("structuredContent")
+        && !structured_copy_of_text(&text, structured)
+    {
+        return None;
     }
 
     (!text.is_empty()).then_some(text)
+}
+
+/// Whether `structured` carries nothing beyond the joined text, so sending the
+/// text alone loses nothing.
+///
+/// Two shapes qualify: the text parsed as JSON equals `structured`, or
+/// `structured` is the single-field `{"result": …}` wrapper that the MCP Python
+/// SDK's FastMCP adds when a tool's return type is not an object. A string
+/// return wraps the text itself; any other return wraps the value the text
+/// serializes.
+fn structured_copy_of_text(text: &str, structured: &serde_json::Value) -> bool {
+    let parsed = serde_json::from_str::<serde_json::Value>(text).ok();
+    if parsed.as_ref() == Some(structured) {
+        return true;
+    }
+    let Some(wrapper) = structured.as_object() else {
+        return false;
+    };
+    if wrapper.len() != 1 {
+        return false;
+    }
+    match wrapper.get("result") {
+        Some(serde_json::Value::String(value)) => value == text,
+        Some(value) => parsed.as_ref() == Some(value),
+        None => false,
+    }
 }
 
 /// Format an MCP `tools/call` result for the model, returning the model-facing
@@ -1359,6 +1385,60 @@ mod tests {
             "structured output dropped: {out}"
         );
         assert!(out.contains("\"value\": 42"), "record dropped: {out}");
+    }
+
+    #[test]
+    fn mcp_intake_wrapped_string_result_sends_the_text_alone() {
+        // FastMCP (MCP Python SDK) wraps a `-> str` return as {"result": text}
+        // beside the same text block.
+        let dir = tempdir().unwrap();
+        let payload = "Found 2 emails:\n1. Invoice\n2. Reminder";
+        let result = json!({
+            "content": [{ "type": "text", "text": payload }],
+            "structuredContent": { "result": payload },
+            "isError": false,
+        });
+
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn mcp_intake_wrapped_value_result_sends_the_text_alone() {
+        // A non-object, non-string return (list, number) is wrapped as the value
+        // the text serializes.
+        let dir = tempdir().unwrap();
+        let result = json!({
+            "content": [{ "type": "text", "text": "[1, 2, 3]" }],
+            "structuredContent": { "result": [1, 2, 3] },
+        });
+
+        let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+
+        assert_eq!(out, "[1, 2, 3]");
+    }
+
+    #[test]
+    fn mcp_intake_wrapper_that_differs_from_the_text_keeps_the_envelope() {
+        let dir = tempdir().unwrap();
+        for structured in [
+            json!({ "result": "Found 3 emails" }),
+            json!({ "result": "Found 2 emails", "total": 2 }),
+            json!({ "value": "Found 2 emails" }),
+        ] {
+            let result = json!({
+                "content": [{ "type": "text", "text": "Found 2 emails" }],
+                "structuredContent": structured,
+            });
+
+            let (out, _) = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+
+            assert!(
+                out.contains("structuredContent"),
+                "structured output dropped: {out}"
+            );
+        }
     }
 
     #[test]
