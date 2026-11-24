@@ -315,9 +315,32 @@ pub fn serde_set_prop<T: serde::Serialize + serde::de::DeserializeOwned>(
         } else {
             parse_prop_value(value_str, kind)?
         };
-        table.insert(serde_name, parsed);
+        table.insert(serde_name.clone(), parsed);
     }
-    *target = toml::from_str(&toml::to_string(&table)?)?;
+    let candidate: T = toml::from_str(&toml::to_string(&table)?)?;
+    // A finite `f64` can still overflow a narrower field (`f32`) when it is
+    // deserialized, which stores infinity. Refuse it as `parse_prop_value`
+    // refuses non-finite text, and keep the value already set.
+    if kind == PropKind::Float {
+        let stored: toml::Table = toml::from_str(&toml::to_string(&candidate)?)?;
+        if let Some(toml::Value::Float(v)) = stored.get(&serde_name)
+            && !v.is_finite()
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"kind": "float", "got_len": value_str.len()})),
+                "serde_set_prop rejected a value the field cannot hold as a finite number"
+            );
+            // "invalid value" classifies as `value_type_mismatch`, the code
+            // the config API gives any other text that is not a usable number.
+            anyhow::bail!(
+                "Invalid float value '{value_str}' (invalid value: too large for this field)"
+            );
+        }
+    }
+    *target = candidate;
     Ok(())
 }
 
@@ -494,13 +517,21 @@ fn parse_prop_value(value_str: &str, kind: PropKind) -> anyhow::Result<toml::Val
             );
             anyhow::Error::msg(format!("Invalid integer value '{value_str}'"))
         })?)),
-        PropKind::Float => Ok(toml::Value::Float(value_str.parse().map_err(|_| {
-            reject(
-                "float",
-                ::serde_json::json!({"kind": "float", "got_len": value_str.len()}),
-            );
-            anyhow::Error::msg(format!("Invalid float value '{value_str}'"))
-        })?)),
+        // `str::parse` also reads `inf`, `NaN` and out-of-range text such as
+        // `1e999` (as infinity); none is a value a float setting holds.
+        PropKind::Float => Ok(toml::Value::Float(
+            value_str
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| {
+                    reject(
+                        "float",
+                        ::serde_json::json!({"kind": "float", "got_len": value_str.len()}),
+                    );
+                    anyhow::Error::msg(format!("Invalid float value '{value_str}'"))
+                })?,
+        )),
         PropKind::String | PropKind::Enum | PropKind::AliasRef => {
             Ok(toml::Value::String(value_str.to_string()))
         }
@@ -932,6 +963,83 @@ mod tests {
                 inner_name: "mcp.servers.transport".to_string(),
             }
         );
+    }
+
+    /// Every text path that sets a float property (`config set`, RPC
+    /// `config/set`, the gateway's PATCH after coercion, env overrides,
+    /// Quickstart's field writes) reaches this parse. Text that `str::parse`
+    /// reads as infinity or NaN is refused like text that is not a number.
+    #[test]
+    fn parse_float_refuses_non_finite_text() {
+        for text in [
+            "inf", "+inf", "-inf", "Infinity", "infinity", "NaN", "nan", "1e999", "-1e999",
+        ] {
+            let err = parse_prop_value(text, PropKind::Float).expect_err(text);
+            assert_eq!(err.to_string(), format!("Invalid float value '{text}'"));
+        }
+        let err = parse_prop_value("abc", PropKind::Float).expect_err("abc");
+        assert_eq!(err.to_string(), "Invalid float value 'abc'");
+    }
+
+    #[test]
+    fn parse_float_keeps_finite_edge_values() {
+        for (text, want) in [
+            ("-0.0", -0.0_f64),
+            ("5e-324", 5e-324),
+            ("1.7976931348623157e308", f64::MAX),
+            ("-1.7976931348623157e308", f64::MIN),
+            ("5", 5.0),
+            ("0", 0.0),
+        ] {
+            let got = parse_prop_value(text, PropKind::Float)
+                .unwrap()
+                .as_float()
+                .unwrap();
+            assert_eq!(got.to_bits(), want.to_bits(), "{text}");
+        }
+    }
+
+    /// Text that is finite as an `f64` but too large for an `f32` field
+    /// would deserialize to infinity. It is refused like non-finite text,
+    /// and the value already set is kept. The largest finite `f32` stores.
+    #[test]
+    fn serde_set_prop_refuses_a_value_that_overflows_an_f32_field() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct Narrow {
+            threshold: f32,
+        }
+        let mut narrow = Narrow { threshold: 0.01 };
+        for text in ["1e39", "-1e39", "3.5e38"] {
+            let err = serde_set_prop(
+                &mut narrow,
+                "narrow",
+                "narrow.threshold",
+                text,
+                PropKind::Float,
+                false,
+            )
+            .expect_err(text);
+            assert_eq!(
+                err.to_string(),
+                format!("Invalid float value '{text}' (invalid value: too large for this field)")
+            );
+            assert_eq!(
+                crate::api_error::classify_validation_message(&err.to_string()),
+                crate::api_error::ConfigApiCode::ValueTypeMismatch,
+                "{text}"
+            );
+            assert_eq!(narrow.threshold.to_bits(), 0.01_f32.to_bits(), "{text}");
+        }
+        serde_set_prop(
+            &mut narrow,
+            "narrow",
+            "narrow.threshold",
+            "3.4028235e38",
+            PropKind::Float,
+            false,
+        )
+        .unwrap();
+        assert_eq!(narrow.threshold, f32::MAX);
     }
 
     #[test]
