@@ -560,26 +560,25 @@ impl AntigravityCliModelProvider {
     }
 
     async fn ensure_state_directory(&self) -> anyhow::Result<()> {
-        let mut builder = tokio::fs::DirBuilder::new();
-        builder.recursive(true);
         #[cfg(unix)]
-        builder.mode(0o700);
-        builder
-            .create(&self.state_directory)
+        let owner = Some(nix::unistd::geteuid().as_raw());
+        #[cfg(not(unix))]
+        let owner: Option<u32> = None;
+        prepare_state_directory(&self.state_directory, owner)
             .await
-            .map_err(|error| {
+            .map_err(|(refusal, detail)| {
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({
                             "phase": "state_directory",
-                            "error_key": "antigravity_cli_state_directory_failed",
-                            "error": format!("{error}"),
+                            "error_key": refusal.error_key(),
+                            "error": detail,
                         })),
-                    "antigravity_cli: failed to create state directory"
+                    "antigravity_cli: state directory refused"
                 );
-                anyhow::Error::msg("antigravity_cli could not create its state directory")
+                anyhow::Error::msg(refusal.message())
             })
     }
 
@@ -609,6 +608,7 @@ impl AntigravityCliModelProvider {
             session_meta: session_meta.as_ref(),
             model: Self::forwarded_model(model),
             session_check: Some(&session_check),
+            failure_marker: Some(AGENT_EXECUTOR_ERROR_PREFIX),
         };
         let api_key = self.api_key.as_deref();
         let outcome = run_oneshot_subprocess(cmd, self.timeout, &request, |initialize| {
@@ -751,9 +751,101 @@ fn authenticate_params(
     }
 }
 
+/// Why the alias state directory was not used. `agy` keeps its cached
+/// sign-in and session files there, so another local account must not be
+/// able to redirect the directory through a link or write into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateDirectoryRefusal {
+    Unavailable,
+    NotADirectory,
+    NotOwned,
+    NotPrivate,
+}
+
+impl StateDirectoryRefusal {
+    fn error_key(self) -> &'static str {
+        match self {
+            Self::Unavailable => "antigravity_cli_state_directory_failed",
+            Self::NotADirectory => "antigravity_cli_state_directory_not_directory",
+            Self::NotOwned => "antigravity_cli_state_directory_not_owned",
+            Self::NotPrivate => "antigravity_cli_state_directory_not_private",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::Unavailable => "antigravity_cli could not create its state directory",
+            Self::NotADirectory => {
+                "antigravity_cli state directory must be a directory, not a link or file"
+            }
+            Self::NotOwned => {
+                "antigravity_cli state directory must be owned by the user running ZeroClaw"
+            }
+            Self::NotPrivate => {
+                "antigravity_cli state directory is accessible to other users and could not be \
+                 made owner-only (chmod 700)"
+            }
+        }
+    }
+}
+
+/// Create the state directory owner-only, or admit an existing one only when
+/// it is a real directory (not a link) owned by `owner`, tightening it to
+/// owner-only if needed. `owner` is `None` where ownership is not checked.
+async fn prepare_state_directory(
+    path: &Path,
+    owner: Option<u32>,
+) -> Result<(), (StateDirectoryRefusal, String)> {
+    let unavailable =
+        |error: std::io::Error| (StateDirectoryRefusal::Unavailable, error.to_string());
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = tokio::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            builder.mode(0o700);
+            builder.create(path).await.map_err(unavailable)?;
+            tokio::fs::symlink_metadata(path)
+                .await
+                .map_err(unavailable)?
+        }
+        Err(error) => return Err(unavailable(error)),
+    };
+    // `symlink_metadata` does not follow a link, so a link reports as one here.
+    if !metadata.file_type().is_dir() {
+        return Err((
+            StateDirectoryRefusal::NotADirectory,
+            "state directory entry is a link or non-directory".to_string(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if let Some(owner) = owner
+            && metadata.uid() != owner
+        {
+            return Err((
+                StateDirectoryRefusal::NotOwned,
+                format!("state directory uid {} != {owner}", metadata.uid()),
+            ));
+        }
+        if metadata.mode() & 0o077 != 0 {
+            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .await
+                .map_err(|error| (StateDirectoryRefusal::NotPrivate, error.to_string()))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = owner;
+    Ok(())
+}
+
 /// Prefix `agy acp` (1.5.x) puts on a failed turn. The failure arrives as an
 /// ordinary `agent_message_chunk` followed by `stopReason: end_turn`, so there
-/// is no protocol-level signal to classify by.
+/// is no protocol-level signal to classify by. It can follow chunks of a
+/// partial answer, so it is passed to the shared reader as the
+/// `failure_marker`, which starts the reply at the chunk that carries it.
 const AGENT_EXECUTOR_ERROR_PREFIX: &str = "\u{26a0} agent executor error:";
 
 /// A failed Antigravity turn mapped to provider-owned public text.
@@ -1049,6 +1141,75 @@ mod tests {
         let cwd = std::env::current_dir().expect("current directory");
         assert!(resolved.is_absolute(), "{}", resolved.display());
         assert_eq!(resolved, cwd.join("config").join(FAMILY).join("work"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn state_directory_must_be_a_private_owned_real_directory() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+
+        let temp = TempDir::new().expect("tempdir");
+        let me = std::fs::metadata(temp.path())
+            .expect("tempdir metadata")
+            .uid();
+        let mode = |path: &Path| {
+            std::fs::symlink_metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        let fresh = temp.path().join("fresh").join("state");
+        prepare_state_directory(&fresh, Some(me))
+            .await
+            .expect("missing directory is created");
+        assert_eq!(mode(&fresh), 0o700);
+
+        let open = temp.path().join("open");
+        std::fs::create_dir(&open).expect("open dir");
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).expect("chmod 777");
+        prepare_state_directory(&open, Some(me))
+            .await
+            .expect("an owned, writable directory is tightened");
+        assert_eq!(mode(&open), 0o700);
+
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).expect("link target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o777))
+            .expect("chmod 777");
+        let link = temp.path().join("link");
+        symlink(&target, &link).expect("symlink");
+        let (refusal, _) = prepare_state_directory(&link, Some(me))
+            .await
+            .expect_err("a link must be refused");
+        assert_eq!(refusal, StateDirectoryRefusal::NotADirectory);
+        assert_eq!(mode(&target), 0o777, "a refused link target is untouched");
+
+        let dangling = temp.path().join("dangling");
+        symlink(temp.path().join("absent"), &dangling).expect("dangling symlink");
+        let (refusal, _) = prepare_state_directory(&dangling, Some(me))
+            .await
+            .expect_err("a dangling link must be refused");
+        assert_eq!(refusal, StateDirectoryRefusal::NotADirectory);
+        assert!(!temp.path().join("absent").exists());
+
+        let file = temp.path().join("file");
+        std::fs::write(&file, b"").expect("file");
+        let (refusal, _) = prepare_state_directory(&file, Some(me))
+            .await
+            .expect_err("a file must be refused");
+        assert_eq!(refusal, StateDirectoryRefusal::NotADirectory);
+
+        let foreign = temp.path().join("foreign");
+        std::fs::create_dir(&foreign).expect("foreign dir");
+        std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o777))
+            .expect("chmod 777");
+        let (refusal, _) = prepare_state_directory(&foreign, Some(me.wrapping_add(1)))
+            .await
+            .expect_err("a directory owned by another account must be refused");
+        assert_eq!(refusal, StateDirectoryRefusal::NotOwned);
+        assert_eq!(mode(&foreign), 0o777, "a refused directory is untouched");
     }
 
     #[test]
