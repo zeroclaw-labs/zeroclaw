@@ -2752,6 +2752,20 @@
         ],
         "type": "object"
       },
+      "PlanPersistenceOperation": {
+        "description": "Typed session update events pushed via `session/update` notifications.\nReplaces the hand-built `notification_for_turn_event` function.",
+        "enum": [
+          "load",
+          "write"
+        ],
+        "type": "string"
+      },
+      "PlanPersistenceStatus": {
+        "enum": [
+          "unavailable"
+        ],
+        "type": "string"
+      },
       "PlanPriority": {
         "description": "Relative importance of a plan entry. Defaults to `Medium` when a\ncaller omits it; ACP requires `priority` on the outward projection,\nso normalization to a concrete value happens at parse time here.",
         "enum": [
@@ -3907,7 +3921,6 @@
         "type": "object"
       },
       "SessionUpdateEvent": {
-        "description": "Typed session update events pushed via `session/update` notifications.\nReplaces the hand-built `notification_for_turn_event` function.",
         "oneOf": [
           {
             "properties": {
@@ -4109,6 +4122,31 @@
               "type",
               "session_id",
               "entries"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Emitted when the TodoWrite plan remains live in memory, but the ACP\ndurable store could not load or save the persisted projection. The\ndetails stay in logs; the client gets a stable status it can present\nwithout parsing storage errors.",
+            "properties": {
+              "operation": {
+                "$ref": "#/components/schemas/PlanPersistenceOperation"
+              },
+              "session_id": {
+                "type": "string"
+              },
+              "status": {
+                "$ref": "#/components/schemas/PlanPersistenceStatus"
+              },
+              "type": {
+                "const": "plan_persistence",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "session_id",
+              "operation",
+              "status"
             ],
             "type": "object"
           },
