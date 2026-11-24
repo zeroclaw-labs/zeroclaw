@@ -409,13 +409,15 @@ mod tests {
         })
         .unwrap();
         client.ask(json!({}), questions()).await.unwrap();
-        set_runtime_proxy_config(ProxyConfig {
+        let proxy_config = ProxyConfig {
             enabled: true,
             http_proxy: Some(proxy.uri()),
             scope: ProxyScope::Services,
             services: vec!["decision".to_owned()],
             ..Default::default()
-        });
+        };
+        proxy_config.validate().unwrap();
+        set_runtime_proxy_config(proxy_config);
         client.ask(json!({}), questions()).await.unwrap();
         direct.verify().await;
         proxy.verify().await;

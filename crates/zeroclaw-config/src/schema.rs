@@ -96,6 +96,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "tool.pushover",
     "tool.web_search",
     "memory.embeddings",
+    "decision",
     "tunnel.custom",
     "transcription.groq",
     "transcription.openai",
