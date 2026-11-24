@@ -216,7 +216,7 @@ Family-specific entries add their own typed fields on top of these shared fields
 
 The chat `options` object accepts two ordinary boolean extraction switches:
 
-- `extract_text_reasoning`: remove `<think>...</think>` blocks from textual content. When omitted, the historical semantic-empty handling remains active; set it to `false` only when the literal tags must be preserved. `minimax` and `groq` opt in by default because their documented output formats can carry inline reasoning. Native reasoning fields are unaffected.
+- `extract_text_reasoning`: remove `<think>...</think>` blocks in the shared response normalizer. When omitted, the historical semantic-empty handling remains active. An explicit `false` preserves tags that reach this boundary, subject to the native adapter limits below. `minimax` and `groq` opt in by default because their documented output formats can carry inline reasoning. Native reasoning fields are unaffected.
 - `extract_text_tool_calls`: recognize XML/JSON tool-call envelopes in textual content. Defaults to `false`, with the adapter-specific defaults below. Native structured tool calls are unaffected.
 
 | Connection kind | Reasoning extraction | Text tool-call extraction |
@@ -237,6 +237,14 @@ extractor explicitly in its options or preset.
 Both fields can be shared through `providers.model_presets.<id>.options`, set as
 connection defaults in `api.chat.options`, and overridden in each chat model's
 `options`. They accept `true` or `false`; the `"null"` sentinel is not supported.
+
+Native adapter limits: Ollama's non-streaming adapter still removes inline think
+tags before this shared boundary and can use its separate `thinking` field when
+ordinary content is empty. The native OpenAI scalar completion path still
+rejects reasoning-only text as a semantic-empty response. Setting
+`extract_text_reasoning = false` does not override those earlier adapter rules
+or recover content they have already removed.
+
 The former runtime-profile `strict_tool_parsing` setting has been removed.
 V4 migration transfers this policy to the models used by each agent, including
 reachable effort and classifier routes. Non-strict agents retain text tool

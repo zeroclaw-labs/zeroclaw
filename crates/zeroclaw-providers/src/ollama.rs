@@ -517,9 +517,9 @@ impl OllamaModelProvider {
     }
 
     fn raw_response_text(content: &str, thinking: Option<&str>) -> Option<String> {
-        // Keep the legacy adapter contract until the runtime extraction policy
-        // is activated by the later registry-consumer layer. This also keeps
-        // tool-call XML visible after removing only the reasoning envelope.
+        // Preserve the native Ollama adapter's content/thinking fallback.
+        // Inline reasoning is removed here, before shared model policy runs;
+        // the configuration guide documents this native-adapter limit.
         let content = strip_think_tags(content);
         if !content.trim().is_empty() {
             return Some(content);
@@ -1499,7 +1499,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_response_text_strips_think_tags_before_runtime_cutover() {
+    fn raw_response_text_preserves_native_ollama_reasoning_contract() {
         assert_eq!(
             OllamaModelProvider::raw_response_text("<think>reasoning</think> hello", None,),
             Some("hello".to_string())

@@ -11266,14 +11266,13 @@ impl RpcDispatcher {
                 },
                 _ => LiveSessionRefreshScope::SharedConstruction,
             };
-            let _revision = self
-                .commit_config_with_live_session_refresh(
-                    working,
-                    config_commit,
-                    &scope,
-                    RpcConfigCommitEffects::default(),
-                )
-                .await?;
+            self.commit_config_with_live_session_refresh(
+                working,
+                config_commit,
+                &scope,
+                RpcConfigCommitEffects::default(),
+            )
+            .await?;
             to_result(ConfigMapKeyRenameResult {
                 path: req.path,
                 from: req.from,
