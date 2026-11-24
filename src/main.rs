@@ -7842,7 +7842,8 @@ mod wss_client_auth_tests {
                 "relay.example.test".to_string(),
             ]
         );
-        assert!(wss_server_sans(&zeroclaw_config::schema::WssConfig::default(), &[]).is_empty());
+        let sans = wss_server_sans(&zeroclaw_config::schema::WssConfig::default(), &[]);
+        assert!(sans.is_empty(), "{sans:?}");
     }
 
     #[test]
@@ -8193,17 +8194,15 @@ mod wss_client_auth_tests {
         .unwrap();
         assert_eq!(sans, vec!["localhost", "127.0.0.1", "zero.tail1234.ts.net"]);
         // Default config, nothing known: empty keeps the default leaf path.
-        assert!(
-            effective_server_sans(
-                dir.path(),
-                &wss_with_sans(&[]),
-                TailnetSans::Unavailable {
-                    hostname_override: None
-                },
-            )
-            .unwrap()
-            .is_empty()
-        );
+        let sans = effective_server_sans(
+            dir.path(),
+            &wss_with_sans(&[]),
+            TailnetSans::Unavailable {
+                hostname_override: None,
+            },
+        )
+        .unwrap();
+        assert!(sans.is_empty(), "{sans:?}");
     }
 
     #[test]
@@ -10562,6 +10561,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 )
                             );
                             println!("     zeroclaw gateway start"); // i18n-exempt: literal command/identifier example
+                            // Surface the fetch failure to the process exit status so
+                            // scripts/automation can tell that no code was obtained.
+                            // Exit here (instead of `return Err(e)`) so anyhow does not
+                            // reprint the same error after the human-readable guidance.
+                            std::process::exit(1);
                         }
                     }
                     Ok(())
@@ -12950,6 +12954,12 @@ Add pricing to the active provider profile or supply a catalog entry."
                     !no_interactive && plugin_setting_is_plain(&config, &path);
                 #[cfg(not(feature = "plugins-wasm"))]
                 let plain_plugin_setting = false;
+                let value_prompt = || {
+                    i18n::get_required_cli_string_with_args(
+                        "cli-config-value-prompt",
+                        &[("path", &path)],
+                    )
+                };
                 let selected_value = if no_interactive {
                     value.ok_or_else(|| {
                         ::zeroclaw_log::record!(
@@ -12969,9 +12979,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                             "  \u{26a0} {path} is an encrypted secret \u{2014} using masked input."
                         );
                     }
-                    let secret_value = secret_prompt(&format!("Enter value for {path}"), false)?
-                        .trim()
-                        .to_string();
+                    let secret_value = secret_prompt(&value_prompt(), false)?.trim().to_string();
                     if !secret_value.is_empty() {
                         eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
                     }
@@ -12983,7 +12991,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     val
                 } else if plain_plugin_setting {
                     dialoguer::Input::<String>::new()
-                        .with_prompt(format!("Enter value for {path}"))
+                        .with_prompt(value_prompt())
                         .interact_text()?
                 } else if let Some(provider_type) = model_path_provider_type(&path) {
                     use dialoguer::{FuzzySelect, Input};
@@ -19777,8 +19785,8 @@ mod tests {
             } => {
                 assert!(estop_command.is_none());
                 assert!(level.is_none());
-                assert!(domains.is_empty());
-                assert!(tools.is_empty());
+                assert!(domains.is_empty(), "{domains:?}");
+                assert!(tools.is_empty(), "{tools:?}");
             }
             other => panic!("expected estop command, got {other:?}"),
         }
@@ -20682,7 +20690,11 @@ mod tests {
             assert_eq!(supervisor.drivers.lock().unwrap().len(), 1);
             let teardown = supervisor.shutdown().await;
             assert!(teardown.still_running.is_empty());
-            assert!(teardown.unsettled_runs.is_empty());
+            assert!(
+                teardown.unsettled_runs.is_empty(),
+                "{:?}",
+                teardown.unsettled_runs
+            );
             assert_eq!(store.claim_counts(name).unwrap().0, 1);
 
             let reopened =
@@ -22029,7 +22041,11 @@ mod tests {
 
         // Clean posture: no gate, no nag.
         let clean = Config::default();
-        assert!(clean.degraded_security.is_empty());
+        assert!(
+            clean.degraded_security.is_empty(),
+            "{:?}",
+            clean.degraded_security
+        );
         let handle = gate_security_posture(&clean, false).expect("clean posture must pass");
         assert!(handle.is_none(), "clean posture must not spawn a nag");
 
@@ -23917,11 +23933,8 @@ type = "string"
             runtime_accepts_row(&config, &instance_key),
             "the repaired row must be one the runtime's own constructor accepts"
         );
-        assert!(
-            egress_grant_gap_lines(&config, &manifest)
-                .expect("gap lines must build")
-                .is_empty()
-        );
+        let gap_lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        assert!(gap_lines.is_empty(), "{gap_lines:?}");
     }
 
     /// REGRESSION (deployment-wide refusal blamed on a row): the row is valid
@@ -23985,10 +23998,11 @@ type = "string"
         // A row that grants nothing has nothing to inherit or keep.
         config.plugins.entries[0].egress_hosts.clear();
         config.plugins.entries[0].egress_allow_private.clear();
-        assert!(
-            existing_egress_grant_lines(&config, "weather-tool", &instance_key, &[]).is_empty()
-        );
-        assert!(removed_plugin_kept_grant_lines(&config, "weather-tool", &rows).is_empty());
+        let existing_lines =
+            existing_egress_grant_lines(&config, "weather-tool", &instance_key, &[]);
+        assert!(existing_lines.is_empty(), "{existing_lines:?}");
+        let kept_lines = removed_plugin_kept_grant_lines(&config, "weather-tool", &rows);
+        assert!(kept_lines.is_empty(), "{kept_lines:?}");
     }
 
     #[test]
@@ -24353,7 +24367,8 @@ type = "string"
         let mut config = crate::config::schema::Config::default();
         bind_channel_alias(&mut config, "elsewhere", "other-bridge", true);
 
-        assert!(bound_channel_aliases(&config, "chat-bridge").is_empty());
+        let bound_aliases = bound_channel_aliases(&config, "chat-bridge");
+        assert!(bound_aliases.is_empty(), "{bound_aliases:?}");
         let rows = instance_rows(&config, &manifest).expect("rows must derive");
         assert!(rows.is_empty(), "no binding, no instance, no row: {rows:?}");
     }
@@ -25475,7 +25490,8 @@ hosts = ["irc.example.net"]
             config.plugins.entry_egress(&key).0.is_empty(),
             "the existing grant stays empty"
         );
-        assert!(granted_on_disk(&config.config_path, &key).is_empty());
+        let granted = granted_on_disk(&config.config_path, &key);
+        assert!(granted.is_empty(), "{granted:?}");
         let name = "chat-bridge (plugin.operations)";
         for expected in [
             format!(
@@ -26593,7 +26609,7 @@ maxLength = 1
         )
         .expect("staging must succeed");
         assert_eq!(staged.granted, canonical);
-        assert!(staged.withheld.is_empty());
+        assert!(staged.withheld.is_empty(), "{:?}", staged.withheld);
         let ceremony = egress_grant_ceremony_lines(
             egress_command_config_dir(&config),
             "weather-tool",
@@ -27533,7 +27549,7 @@ hosts = ["api.example.com", "api2.example.com"]
         .await
         .expect("existing row needs no persistence")
         .expect("rows");
-        assert!(rows.created.is_empty());
+        assert!(rows.created.is_empty(), "{:?}", rows.created);
         assert_eq!(rows.existing.len(), first_entries.len());
         assert_eq!(config.dirty_paths, before.dirty_paths);
         assert_eq!(
@@ -28268,7 +28284,8 @@ type = "integer"
         config.plugins.entries[0]
             .config
             .insert("retries".to_string(), "3".to_string());
-        assert!(plugin_config_rejections(&config, &manifest).is_empty());
+        let rejections = plugin_config_rejections(&config, &manifest);
+        assert!(rejections.is_empty(), "{rejections:?}");
     }
 
     /// An update to a lower version says so instead of reading as a normal

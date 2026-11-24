@@ -937,6 +937,46 @@ pub struct ToolLoop<'a> {
     pub capability_binding: Option<&'a crate::composition::BoundCapabilities>,
 }
 
+/// Which tool rows the next request leaves out: those of turns older than
+/// the newest `keep_prior_turns + 1` (`keep_tool_context_turns`). Every path
+/// that estimates or builds a request from the working history applies it, so
+/// it counts and sends what the ordinary request build does.
+#[derive(Clone, Copy)]
+pub(crate) struct ToolContextRetention<'a> {
+    pub(crate) keep_prior_turns: usize,
+    pub(crate) known_tools: &'a std::collections::HashSet<String>,
+}
+
+#[cfg(test)]
+impl ToolContextRetention<'static> {
+    /// Keep every turn's tool rows, so a projection counts the working history
+    /// as it did before the collapse existed.
+    pub(crate) fn keep_all() -> Self {
+        static NO_TOOLS: std::sync::LazyLock<std::collections::HashSet<String>> =
+            std::sync::LazyLock::new(std::collections::HashSet::new);
+        Self {
+            keep_prior_turns: usize::MAX,
+            known_tools: &NO_TOOLS,
+        }
+    }
+}
+
+impl ToolContextRetention<'_> {
+    /// `history` as the next request sends it.
+    pub(crate) fn request_view(
+        &self,
+        history: &[ChatMessage],
+        crumb_present: bool,
+    ) -> crate::agent::history_trim::CollapsedToolContext {
+        crate::agent::history_trim::collapse_tool_context_older_than(
+            history,
+            self.keep_prior_turns,
+            crumb_present,
+            self.known_tools,
+        )
+    }
+}
+
 /// Project the token population of the NEXT provider request that would be
 /// built from `history`: prepare the messages through the multimodal boundary,
 /// add the next iteration's native tool-schema population, and scale by the
@@ -1244,6 +1284,9 @@ async fn enforce_reported_budget(
     // as synthetic for the whole runtime lifetime. Set to true when this pass
     // inserts a fresh crumb so the owner stays authoritative.
     crumb_present: &mut bool,
+    // The next request leaves out older turns' tool rows. Every projection
+    // below counts that collapsed view, not the full working history.
+    tool_context: ToolContextRetention<'_>,
 ) {
     if context_token_budget == 0 {
         return;
@@ -1279,7 +1322,9 @@ async fn enforce_reported_budget(
     let calibrated_hook_reserve = (hook_reserve_tokens as f64 * ratio).round() as usize;
     let decision_budget = context_token_budget.saturating_sub(calibrated_hook_reserve);
     let projected_pre_trim = projected_provider_facing_tokens(
-        &taken_for_before,
+        &tool_context
+            .request_view(&taken_for_before, taken_had_crumb)
+            .messages,
         multimodal_config,
         degrade_strip_images,
         image_cache.as_deref_mut(),
@@ -1287,14 +1332,35 @@ async fn enforce_reported_budget(
         ratio,
     )
     .await;
-    let mut result = crate::agent::history_trim::trim_to_reported_budget_with_crumb(
-        taken,
-        context_token_budget,
-        reported_input_tokens,
-        reported_population_estimated,
-        tool_schema_tokens,
-        taken_had_crumb,
-    );
+    // The raw selection counts every row of the working history against the
+    // calibrated budget. When the next request leaves older tool rows out, that
+    // count charges for rows it never sends and can drop whole turns whose
+    // collapsed form fits, so the projection loop below, which counts the
+    // collapsed view, is the only one to select drops.
+    let collapse_hides_rows = tool_context
+        .request_view(&taken, taken_had_crumb)
+        .dropped_messages
+        > 0;
+    let mut result = if collapse_hides_rows {
+        crate::agent::history_trim::TrimResult {
+            history: taken,
+            dropped_messages: 0,
+            dropped_turns: 0,
+            kept_turns: taken_turns,
+            tokens_before: reported_input_tokens,
+            tokens_after: reported_input_tokens,
+            trimmed: false,
+        }
+    } else {
+        crate::agent::history_trim::trim_to_reported_budget_with_crumb(
+            taken,
+            context_token_budget,
+            reported_input_tokens,
+            reported_population_estimated,
+            tool_schema_tokens,
+            taken_had_crumb,
+        )
+    };
     let mut trimmed = result.history;
     let mut trimmed_any = result.trimmed;
     // Align the projected population with the request the NEXT iteration will
@@ -1331,7 +1397,9 @@ async fn enforce_reported_budget(
     // varies between iterations converge at the next enforcement pass.
     loop {
         tokens_after = projected_provider_facing_tokens(
-            &trimmed,
+            &tool_context
+                .request_view(&trimmed, taken_had_crumb)
+                .messages,
             multimodal_config,
             degrade_strip_images,
             image_cache.as_deref_mut(),
@@ -1359,7 +1427,7 @@ async fn enforce_reported_budget(
         *crumb_present = true;
         loop {
             tokens_after = projected_provider_facing_tokens(
-                &trimmed,
+                &tool_context.request_view(&trimmed, true).messages,
                 multimodal_config,
                 degrade_strip_images,
                 image_cache.as_deref_mut(),
@@ -1395,7 +1463,7 @@ async fn enforce_reported_budget(
         // back on top. A protected newest turn may remain above the soft target;
         // only the next actual dispatch can decide whether model capacity fits.
         result.tokens_after = projected_provider_facing_tokens(
-            &trimmed,
+            &tool_context.request_view(&trimmed, true).messages,
             multimodal_config,
             degrade_strip_images,
             image_cache,
@@ -2134,6 +2202,10 @@ async fn run_tool_call_loop_impl<'a>(
                         pending_reported_usage,
                         observer,
                         turn_vision_source,
+                        ToolContextRetention {
+                            keep_prior_turns: keep_tool_context_turns,
+                            known_tools: &known_tool_names,
+                        },
                     )
                     .await;
                     *history_has_trim_breadcrumb = turn_state.crumb_present;
@@ -3336,6 +3408,10 @@ async fn run_tool_call_loop_impl<'a>(
                     use_native_tools,
                     0,
                     &mut turn_state.crumb_present,
+                    ToolContextRetention {
+                        keep_prior_turns: keep_tool_context_turns,
+                        known_tools: &known_tool_names,
+                    },
                 ))
                 .await;
             }
@@ -3395,12 +3471,20 @@ async fn run_tool_call_loop_impl<'a>(
                 .await;
         }
 
+        // A cancel that lands while a call waits for approval ends preparation
+        // before anything ran. Preparation has already abandoned its hook
+        // contexts and hands back the results it had settled (for example an
+        // operator denial), so the round continues below as an interrupted
+        // batch: settled calls keep their result, every other call gets the
+        // interrupted result, and the round is still recorded, keeping each
+        // tool call paired with a result.
+        let mut cancelled_in_preparation = false;
         let PreparedToolCalls {
             mut ordered_results,
             mut executable_indices,
             mut executable_calls,
             mut stream_calls,
-        } = prepare_tool_calls(
+        } = match prepare_tool_calls(
             &ctx,
             tools_registry,
             activated_tools,
@@ -3411,7 +3495,20 @@ async fn run_tool_call_loop_impl<'a>(
             iteration,
             knobs.dedup_enabled,
         )
-        .await?;
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(aborted) if is_tool_loop_cancelled(&aborted.error) => {
+                cancelled_in_preparation = true;
+                PreparedToolCalls {
+                    ordered_results: aborted.ordered_results,
+                    executable_indices: Vec::new(),
+                    executable_calls: Vec::new(),
+                    stream_calls: Vec::new(),
+                }
+            }
+            Err(aborted) => return Err(aborted.error),
+        };
 
         // Hooks and approvals have resolved the effective call. Admit one
         // recovery dispatch for the warned identity; record the remaining
@@ -3536,9 +3633,13 @@ async fn run_tool_call_loop_impl<'a>(
             knobs.provider_attempt_allowlist.clone(),
             execution,
         );
-        let execution_result = match shared_budget.clone() {
-            Some(budget) => ExecutionTreeBudget::scope(budget, Box::pin(execution)).await,
-            None => execution.await,
+        let execution_result = if cancelled_in_preparation {
+            Ok(Vec::new())
+        } else {
+            match shared_budget.clone() {
+                Some(budget) => ExecutionTreeBudget::scope(budget, Box::pin(execution)).await,
+                None => execution.await,
+            }
         };
         let executed_slots = match execution_result {
             Ok(slots) => slots,
@@ -3561,7 +3662,8 @@ async fn run_tool_call_loop_impl<'a>(
             }
         };
 
-        let cancelled_mid_batch = executed_slots.iter().any(Option::is_none);
+        let cancelled_mid_batch =
+            cancelled_in_preparation || executed_slots.iter().any(Option::is_none);
 
         let mut executed_completed_indices: Vec<usize> = Vec::new();
         let mut executed_completed_calls = Vec::new();
@@ -3871,6 +3973,10 @@ async fn run_tool_call_loop_impl<'a>(
         pending_reported_usage,
         observer,
         turn_vision_source,
+        ToolContextRetention {
+            keep_prior_turns: keep_tool_context_turns,
+            known_tools: &known_tool_names,
+        },
     )
     .await;
     *history_has_trim_breadcrumb = turn_state.crumb_present;
@@ -5548,6 +5654,7 @@ mod reported_budget_tests {
             next_use_native_tools,
             hook_reserve_tokens,
             crumb_present,
+            super::ToolContextRetention::keep_all(),
         )
         .await;
     }
@@ -5586,6 +5693,132 @@ mod reported_budget_tests {
         ]
     }
 
+    /// Turns with large tool output and a short prompt and answer.
+    fn tool_heavy_history(turns: usize) -> Vec<ChatMessage> {
+        let output = "x".repeat(4_000);
+        let mut history = vec![ChatMessage::system("s")];
+        for n in 1..=turns {
+            history.push(ChatMessage::user(format!("request {n}")));
+            history.push(ChatMessage::assistant(format!(
+                r#"{{"tool_calls":[{{"id":"call_{n}","name":"shell","arguments":"{{}}"}}]}}"#
+            )));
+            history.push(ChatMessage::tool(format!(
+                r#"{{"tool_call_id":"call_{n}","content":"{output}"}}"#
+            )));
+            history.push(ChatMessage::assistant(format!("answer {n}")));
+        }
+        history
+    }
+
+    #[tokio::test]
+    async fn reported_budget_counts_the_collapsed_request_not_hidden_tool_output() {
+        let known = std::collections::HashSet::from(["shell".to_string()]);
+        let retention = super::ToolContextRetention {
+            keep_prior_turns: 1,
+            known_tools: &known,
+        };
+        let history = tool_heavy_history(6);
+        // The provider reported the request it was sent: the collapsed view.
+        let sent = crate::agent::history::estimate_history_tokens(
+            &retention.request_view(&history, false).messages,
+        );
+        let full = crate::agent::history::estimate_history_tokens(&history);
+        let budget = sent * 3 / 2;
+        assert!(full > budget, "the full history must exceed the budget");
+
+        let observer = TrimObserver::default();
+        let mut kept = history.clone();
+        super::enforce_reported_budget(
+            &mut None,
+            &mut kept,
+            sent,
+            sent,
+            0,
+            budget,
+            None,
+            &observer,
+            None,
+            "turn-collapsed",
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            false,
+            None,
+            false,
+            0,
+            &mut false,
+            retention,
+        )
+        .await;
+        assert_eq!(
+            kept.len(),
+            history.len(),
+            "the collapsed request fits, so no turn is dropped"
+        );
+
+        // Counting the full history instead drops whole turns that fit.
+        let mut counted_in_full = history.clone();
+        super::enforce_reported_budget(
+            &mut None,
+            &mut counted_in_full,
+            sent,
+            sent,
+            0,
+            budget,
+            None,
+            &observer,
+            None,
+            "turn-full",
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            false,
+            None,
+            false,
+            0,
+            &mut false,
+            super::ToolContextRetention::keep_all(),
+        )
+        .await;
+        assert!(counted_in_full.len() < history.len());
+    }
+
+    #[tokio::test]
+    async fn reported_budget_still_trims_when_the_collapsed_request_is_over() {
+        let known = std::collections::HashSet::from(["shell".to_string()]);
+        let retention = super::ToolContextRetention {
+            keep_prior_turns: 1,
+            known_tools: &known,
+        };
+        let history = tool_heavy_history(6);
+        let sent = crate::agent::history::estimate_history_tokens(
+            &retention.request_view(&history, false).messages,
+        );
+        let mut trimmed = history.clone();
+        let mut crumb_present = false;
+        super::enforce_reported_budget(
+            &mut None,
+            &mut trimmed,
+            sent,
+            sent,
+            0,
+            sent / 2,
+            None,
+            &TrimObserver::default(),
+            None,
+            "turn-over",
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            false,
+            None,
+            false,
+            0,
+            &mut crumb_present,
+            retention,
+        )
+        .await;
+        assert!(
+            trimmed.len() < history.len(),
+            "an over-budget request still trims"
+        );
+        assert!(crumb_present, "a real trim leaves the breadcrumb");
+    }
+
     #[tokio::test]
     async fn reported_budget_observer_identifies_the_effective_turn() {
         let mut history = big_history();
@@ -5608,6 +5841,7 @@ mod reported_budget_tests {
             false,
             0,
             &mut false,
+            super::ToolContextRetention::keep_all(),
         )
         .await;
         let events = observer.0.lock().expect("trim events lock");
