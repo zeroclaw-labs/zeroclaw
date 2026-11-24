@@ -276,9 +276,10 @@ native_thinking = true
 Profiles can share the same `openai` provider alias and endpoint. With native
 thinking enabled, the selected level overrides the global reasoning effort for
 that request. Otherwise, the provider's existing global/default behavior stays
-in effect. Existing CLI and channel selection precedence is inline directive,
-then session override, then profile default. Resetting a channel session restores
-its profile default. Direct Agent/RPC turns use the profile default resolved
+in effect. CLI turns use an inline directive when present, then the profile
+default. Channels use an inline directive, then the session override, then the
+profile default. Resetting a channel session restores its profile default.
+Direct Agent/RPC turns use the profile default resolved
 when the Agent is constructed. Recreate or reconnect existing Agent/RPC
 sessions after changing those defaults. This does not add directives or session
 overrides to that surface.
