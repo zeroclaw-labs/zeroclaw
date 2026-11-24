@@ -26,7 +26,15 @@ impl Drop for SpeechJob {
 }
 
 impl SpeechJob {
+    #[cfg(any(feature = "channel-telegram", test))]
     pub(crate) fn start(manager: std::sync::Arc<TtsManager>) -> Self {
+        Self::start_guarded(manager, || Ok(()))
+    }
+
+    pub(crate) fn start_guarded(
+        manager: std::sync::Arc<TtsManager>,
+        check_policy: impl Fn() -> Result<()> + Send + 'static,
+    ) -> Self {
         let (updates, mut rx) = tokio::sync::watch::channel(SpeechSnapshot::default());
         let worker = zeroclaw_spawn::spawn!(async move {
             let cfg = crate::speech_segment::SpeechSegmentConfig::default()
@@ -44,7 +52,9 @@ impl SpeechJob {
                     audio.clear();
                 }
                 if let Some(segment) = segments.get(completed.len()) {
+                    check_policy()?;
                     let part = manager.synthesize(segment).await?;
+                    check_policy()?;
                     let latest = rx.borrow().clone();
                     let current =
                         crate::speech_segment::ready_segments(&latest.text, &cfg, latest.finished);
@@ -58,6 +68,7 @@ impl SpeechJob {
                     continue;
                 }
                 if snapshot.finished {
+                    check_policy()?;
                     return Ok(audio);
                 }
                 if rx.changed().await.is_err() {

@@ -19,7 +19,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::channel::{Channel, ChannelControl, ChannelMessage, ProgressEvent, SendMessage};
-use zeroclaw_config::live::LiveConfigHandle;
+use zeroclaw_config::live::{ConfigRevision, LiveConfigHandle};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME: u64 = 8 * 1024 * 1024;
@@ -313,6 +313,30 @@ impl SimplexChannel {
             .context("simplex_unowned_channel")?;
         crate::tts::TtsManager::from_config_for_agent(&config, Some(owner))
     }
+    fn start_note(&self, recipient: &str, force: bool) -> Result<NoteSpeech> {
+        // Permissions, modality and the selected provider all come from this
+        // publication. A later publication invalidates speculative audio.
+        let config = self.inner.config.clone();
+        let revision = config.revision();
+        ensure!(
+            self.wants_note(recipient, force),
+            "simplex_voice_not_selected"
+        );
+        let manager = Arc::new(self.manager(recipient, false)?);
+        let check = move || {
+            ensure!(
+                config.revision() == revision,
+                "simplex_voice_policy_changed"
+            );
+            Ok(())
+        };
+        check()?;
+        Ok(NoteSpeech {
+            revision,
+            job: crate::tts::SpeechJob::start_guarded(manager.clone(), check),
+            manager,
+        })
+    }
     fn wants_note(&self, contact: &str, force: bool) -> bool {
         use zeroclaw_config::multi_agent::OutputModality;
         let config = self.inner.config.read();
@@ -413,12 +437,10 @@ impl SimplexChannel {
         if !is_call && !suppress_voice && self.wants_note(recipient, force_voice) {
             let prepared = draft.as_mut().and_then(|d| d.note.take());
             let result = async {
-                // Recheck live permission and provider configuration at finalization.
-                let current = Arc::new(self.manager(recipient, false)?);
-                let note = prepared.unwrap_or_else(|| NoteSpeech {
-                    job: crate::tts::SpeechJob::start(current.clone()),
-                    manager: current,
-                });
+                let note = match prepared {
+                    Some(note) if note.revision == self.inner.config.revision() => note,
+                    _ => self.start_note(recipient, force_voice)?,
+                };
                 let parts = note.job.finish(text).await?;
                 let audio = note.manager.concat_parts_to_m4a(&parts).await?;
                 ensure!(audio.len() <= 5 * 1024 * 1024, "simplex_voice_size_limit");
@@ -426,7 +448,10 @@ impl SimplexChannel {
                     self.allowed(recipient, false),
                     "simplex_contact_not_authorized"
                 );
-                Ok::<_, anyhow::Error>(base64::engine::general_purpose::STANDARD.encode(audio))
+                Ok::<_, anyhow::Error>((
+                    note.revision,
+                    base64::engine::general_purpose::STANDARD.encode(audio),
+                ))
             }
             .await;
             match result {
@@ -458,9 +483,9 @@ impl SimplexChannel {
         }
         if text_committed {
             if self.allowed(recipient, false)
-                && let Some(audio) = voice
+                && let Some((revision, audio)) = voice
                 && self.wants_note(recipient, force_voice)
-                && self.manager(recipient, false).is_ok()
+                && revision == self.inner.config.revision()
                 && self
                     .request(json!({"type":"send","contact":recipient,"text":"","voice":audio}))
                     .await
@@ -481,11 +506,10 @@ impl SimplexChannel {
             self.allowed(recipient, false),
             "simplex_contact_not_authorized"
         );
-        if voice.is_some()
-            && (!self.wants_note(recipient, force_voice) || self.manager(recipient, false).is_err())
-        {
-            voice = None;
-        }
+        let voice = voice.and_then(|(revision, audio)| {
+            (self.wants_note(recipient, force_voice) && revision == self.inner.config.revision())
+                .then_some(audio)
+        });
         self.request(json!({"type": "send", "contact": recipient, "text": text, "voice":voice}))
             .await
     }
@@ -1593,12 +1617,12 @@ impl Channel for SimplexChannel {
                 return Ok(());
             }
             if draft.scope.is_empty() && self.wants_note(recipient, draft.force_voice) {
-                if draft.note.is_none() {
-                    let manager = Arc::new(self.manager(recipient, false)?);
-                    draft.note = Some(NoteSpeech {
-                        job: crate::tts::SpeechJob::start(manager.clone()),
-                        manager,
-                    });
+                if draft
+                    .note
+                    .as_ref()
+                    .is_none_or(|note| note.revision != self.inner.config.revision())
+                {
+                    draft.note = Some(self.start_note(recipient, draft.force_voice)?);
                 }
                 if let Some(note) = &draft.note {
                     note.job.update(text);
@@ -1831,6 +1855,7 @@ struct SpeechSnapshot {
 // A draft owns its synthesis job and the same per-turn manager needed to join
 // its output format. Neither is an additional policy authority.
 struct NoteSpeech {
+    revision: ConfigRevision,
     manager: Arc<crate::tts::TtsManager>,
     job: crate::tts::SpeechJob,
 }
@@ -1985,6 +2010,10 @@ impl VoiceDraft {
 
 #[cfg(test)]
 mod tests {
+    mod note_policy_tests {
+        include!("simplex/note_policy_tests.rs");
+    }
+
     use super::*;
     use zeroclaw_config::{
         live::LiveConfig,
