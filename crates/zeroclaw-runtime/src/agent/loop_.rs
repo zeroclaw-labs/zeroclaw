@@ -2244,7 +2244,9 @@ async fn run_inner(
             &tools_registry,
             &prompt_excluded_tools,
             activated_handle.as_ref(),
-            !config.model_text_extraction(&capacity_ref).tool_calls,
+            !config
+                .model_input_text_extraction(Some(agent_alias), &capacity_ref)
+                .tool_calls,
             eff_prompt_injection_mode,
             eff_compact_context,
             eff_max_system_prompt_chars,
@@ -2346,7 +2348,9 @@ async fn run_inner(
                 &tools_registry,
                 &excluded_tools,
                 activated_handle.as_ref(),
-                !config.model_text_extraction(&capacity_ref).tool_calls,
+                !config
+                    .model_input_text_extraction(Some(agent_alias), &capacity_ref)
+                    .tool_calls,
                 eff_prompt_injection_mode,
                 eff_compact_context,
                 eff_max_system_prompt_chars,
@@ -2482,7 +2486,9 @@ async fn run_inner(
                         &tools_registry,
                         &excluded_tools,
                         activated_handle.as_ref(),
-                        !config.model_text_extraction(&capacity_ref).tool_calls,
+                        !config
+                            .model_input_text_extraction(Some(agent_alias), &capacity_ref)
+                            .tool_calls,
                         eff_prompt_injection_mode,
                         eff_compact_context,
                         eff_max_system_prompt_chars,
@@ -2524,7 +2530,7 @@ async fn run_inner(
                                         excluded_tools: &excluded_tools,
                                         dedup_exempt_tools: &agent.resolved.tool_call_dedup_exempt,
                                         pacing: &config.pacing,
-                                        text_tool_calls_disabled: !config.model_text_extraction(&capacity_ref).tool_calls,
+                                        text_tool_calls_disabled: !config.model_input_text_extraction(Some(agent_alias), &capacity_ref).tool_calls,
                                         parallel_tools: agent.resolved.parallel_tools,
                                         max_tool_result_chars: agent.resolved.max_tool_result_chars,
                                         keep_tool_context_turns: agent.resolved.keep_tool_context_turns,
@@ -2676,9 +2682,11 @@ async fn run_inner(
                             temperature: temperature_input,
                         };
                         let policy_config = Arc::clone(&config);
-                        let resolver =
-                            Arc::new(move |model: &str| policy_config.model_text_extraction(model))
-                                as Arc<dyn Fn(&str) -> zeroclaw_api::TextExtraction + Send + Sync>;
+                        let policy_agent = agent_alias.to_owned();
+                        let resolver = Arc::new(move |model: &str| {
+                            policy_config.model_input_text_extraction(Some(&policy_agent), model)
+                        })
+                            as Arc<dyn Fn(&str) -> zeroclaw_api::TextExtraction + Send + Sync>;
                         TOOL_LOOP_COST_TRACKING_CONTEXT
                             .scope(
                                 cost_tracking_context.clone(),
@@ -3169,7 +3177,9 @@ async fn run_inner(
                             &tools_registry,
                             &excluded_tools,
                             activated_handle.as_ref(),
-                            !config.model_text_extraction(&capacity_ref).tool_calls,
+                            !config
+                                .model_input_text_extraction(Some(agent_alias), &capacity_ref)
+                                .tool_calls,
                             eff_prompt_injection_mode,
                             eff_compact_context,
                             eff_max_system_prompt_chars,
@@ -3213,7 +3223,7 @@ async fn run_inner(
                                                 .resolved
                                                 .tool_call_dedup_exempt,
                                             pacing: &config.pacing,
-                                            text_tool_calls_disabled: !config.model_text_extraction(&capacity_ref).tool_calls,
+                                            text_tool_calls_disabled: !config.model_input_text_extraction(Some(agent_alias), &capacity_ref).tool_calls,
                                             parallel_tools: agent.resolved.parallel_tools,
                                             max_tool_result_chars: agent
                                                 .resolved
@@ -4258,7 +4268,9 @@ async fn process_message_inner(
         )?;
         let expose_text_tool_protocol = apply_text_tool_prompt_policy(
             native_tools,
-            !config.model_text_extraction(&model_provider_ref).tool_calls,
+            !config
+                .model_input_text_extraction(Some(agent_alias), &model_provider_ref)
+                .tool_calls,
             &mut tool_descs,
             &mut deferred_section,
         );
@@ -4437,7 +4449,9 @@ async fn process_message_inner(
                     &agent.resolved.tool_call_dedup_exempt,
                     activated_handle_pm.as_ref(),
                     None,
-                    !config.model_text_extraction(&model_provider_ref).tool_calls,
+                    !config
+                        .model_input_text_extraction(Some(agent_alias), &model_provider_ref)
+                        .tool_calls,
                     agent.resolved.parallel_tools,
                     agent.resolved.max_tool_result_chars,
                     agent.resolved.keep_tool_context_turns,
@@ -13889,6 +13903,16 @@ This is an example, not an invocation."#;
 
     #[tokio::test]
     async fn run_tool_call_loop_sanitizes_native_tool_call_text_before_display_and_history() {
+        for reference in [
+            "mock-provider",
+            "custom",
+            "custom:https://override.invalid/v1",
+        ] {
+            assert_native_tool_text_policy(reference).await;
+        }
+    }
+
+    async fn assert_native_tool_text_policy(reference: &str) {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider = ScriptedModelProvider {
             responses: Arc::new(Mutex::new(VecDeque::from(vec![
@@ -13932,7 +13956,7 @@ This is an example, not an invocation."#;
         let observer = NoopObserver;
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
 
-        let config = zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config {
             providers: toml::from_str(
                 r#"
 [connections.fixture]
@@ -13949,6 +13973,13 @@ options = { extract_text_reasoning = true }
             ..Default::default()
         };
 
+        config.agents.insert(
+            "parser-agent".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "mock-provider".into(),
+                ..Default::default()
+            },
+        );
         let result = run_tool_call_loop(ToolLoop {
             parent_agent_alias: None,
             served_route_sink: None,
@@ -13957,7 +13988,7 @@ options = { extract_text_reasoning = true }
             exec: ResolvedAgentExecution {
                 model_access: ResolvedModelAccess {
                     model_provider: &model_provider,
-                    provider_name: "mock-provider",
+                    provider_name: reference,
                     model: "mock-model",
                     dispatch_model: "mock-model",
                     temperature: Some(0.0).into(),
@@ -14004,7 +14035,7 @@ options = { extract_text_reasoning = true }
             // stamping lands.
             memory: None,
             ingress: IngressContext::sub_turn(),
-            agent_alias: None,
+            agent_alias: Some("parser-agent"),
             turn_id: &turn_id,
         })
         .await

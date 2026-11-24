@@ -401,6 +401,69 @@ mod tests {
     }
 
     #[test]
+    fn temporary_chat_inputs_resolve_extraction_from_the_executing_agent() {
+        let config: Config = serde_json::from_value(json!({
+            "providers": {
+                "connections": {"gateway.prod": {"kind": "custom"}},
+                "model_presets": {"text.tools": {
+                    "capability": "chat",
+                    "options": {"extract_text_reasoning": true, "extract_text_tool_calls": true}
+                }},
+                "models": {
+                    "chat.text": {
+                        "capability": "chat", "provider": "gateway.prod", "model": "wire",
+                        "preset": "text.tools"
+                    },
+                    "chat.native": {
+                        "capability": "chat", "provider": "gateway.prod", "model": "wire",
+                        "options": {"extract_text_reasoning": false, "extract_text_tool_calls": false}
+                    }
+                }
+            },
+            "agents": {
+                "text-agent": {"model_provider": "chat.text"},
+                "native-agent": {"model_provider": "chat.native"}
+            }
+        })).unwrap();
+        for (agent, enabled) in [("text-agent", true), ("native-agent", false)] {
+            for input in [
+                "custom",
+                "custom:https://override.invalid/v1",
+                "openai",
+                "openai:https://override.invalid/v1",
+            ] {
+                let registry = config.chat_registry_for_input(Some(agent), input).unwrap();
+                let expected = registry
+                    .resolve_chat(&input.into())
+                    .unwrap()
+                    .text_extraction();
+                let actual = config.model_input_text_extraction(Some(agent), input);
+                assert_eq!(actual, expected, "{agent}: {input}");
+                assert_eq!(actual.reasoning, Some(enabled), "{agent}: {input}");
+                assert_eq!(actual.tool_calls, enabled, "{agent}: {input}");
+            }
+        }
+        // Exact model keys retain their own options, regardless of the agent.
+        assert!(
+            config
+                .model_input_text_extraction(Some("native-agent"), "chat.text")
+                .tool_calls
+        );
+        assert!(
+            !config
+                .model_input_text_extraction(Some("text-agent"), "chat.native")
+                .tool_calls
+        );
+        assert!(
+            !config
+                .provider_registry()
+                .unwrap()
+                .models
+                .contains_key("custom")
+        );
+    }
+
+    #[test]
     fn explicit_url_keeps_connection_associated_model_extra() {
         let config: Config = serde_json::from_value(json!({
             "providers": {

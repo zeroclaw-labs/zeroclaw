@@ -3987,7 +3987,10 @@ impl Agent {
     ) -> Result<String> {
         let expose_text_tool_protocol = self.full_config().is_none_or(|config| {
             config
-                .model_text_extraction(&self.selected_model_provider_ref())
+                .model_input_text_extraction(
+                    self.observer_agent_alias().as_deref(),
+                    &self.selected_model_provider_ref(),
+                )
                 .tool_calls
         }) || dispatcher.should_send_tool_specs();
         let no_tools: Vec<Box<dyn Tool>> = Vec::new();

@@ -1302,7 +1302,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_total_deadline_is_independent_of_read_progress() {
+    async fn stream_outlives_legacy_timeout_secs() {
         use axum::{Json, Router, body::Body, http::header, response::IntoResponse, routing::post};
         use futures_util::StreamExt as _;
         use std::convert::Infallible;

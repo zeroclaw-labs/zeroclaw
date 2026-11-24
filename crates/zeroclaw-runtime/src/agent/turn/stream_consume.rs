@@ -239,7 +239,11 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
         {
             let model_ref = route.selection_ref().unwrap_or(route.provider_ref());
             if extraction_model_ref.as_deref() != Some(model_ref) {
-                extraction = config.model_text_extraction(model_ref);
+                extraction = zeroclaw_api::TEXT_EXTRACTION_RESOLVER
+                    .try_with(|resolver| resolver.as_ref().map(|resolve| resolve(model_ref)))
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| config.model_text_extraction(model_ref));
                 extraction_model_ref = Some(model_ref.to_owned());
             }
         }

@@ -328,10 +328,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_decision_observes_proxy_changes_between_calls() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::{ProxyConfig, ProxyScope, set_runtime_proxy_config};
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let direct = MockServer::start().await;
+        let proxy = MockServer::start().await;
+        for server in [&direct, &proxy] {
+            Mock::given(method("POST"))
+                .and(path("/v1/decisions"))
+                .and(header("Authorization", "Bearer test-key"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(native_response()))
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+        let client = build_decision_provider(DecisionProviderConfig {
+            transport: HttpTransportConfig::with_base_url(
+                direct.uri(),
+                Some("test-key".to_owned()),
+            )
+            .without_redirects(),
+            model: "requested-model".to_owned(),
+            wire_api: DecisionWireApi::OpenAiDecisions,
+        })
+        .unwrap();
+        client.ask(json!({}), questions()).await.unwrap();
+        let proxy_config = ProxyConfig {
+            enabled: true,
+            http_proxy: Some(proxy.uri()),
+            scope: ProxyScope::Services,
+            services: vec!["decision".to_owned()],
+            ..Default::default()
+        };
+        proxy_config.validate().unwrap();
+        set_runtime_proxy_config(proxy_config);
+        client.ask(json!({}), questions()).await.unwrap();
+        direct.verify().await;
+        proxy.verify().await;
+    }
+
+    #[tokio::test]
     async fn native_protocols_use_decision_endpoints_and_share_transport_settings() {
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
         let server = MockServer::start().await;
         for kind in [
             "openai",
