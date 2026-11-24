@@ -27,16 +27,17 @@ import { pair as apiPair, getPublicHealth } from '../lib/api';
 import {
   AUTH_CHANNEL,
   REAUTH_WARNING_MS,
-  currentReturnPath,
   expiryPhase,
   fetchAuthMethods,
   fetchAuthSession,
+  fullPageSignInUrl,
   msUntilExpiry,
   parseChannelMessage,
   postSignOut,
   refreshOidcSession,
   resolveInitialAuth,
   signInUrl,
+  takeSignInNotice,
   type AuthChannelMessage,
   type OidcMethod,
 } from '../lib/authSession';
@@ -203,6 +204,10 @@ export function AuthProvider({ children }: AuthProviderProps) {
     })
       .then((initial) => {
         if (cancelled) return;
+        if (initial.kind !== 'signed-in') {
+          const retry = initial.kind === 'signed-out' && (!initial.methodsKnown || initial.sessionCheckFailed);
+          takeSignInNotice(retry ? 'retry' : 'consume');
+        }
         switch (initial.kind) {
           case 'open':
             setPhase('open');
@@ -214,6 +219,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
             setProviders(initial.providers);
             setProvidersKnown(true);
             setOidcSession(initial.session, initial.clockOffsetMs);
+            if (takeSignInNotice()) post({ type: 'signed-in' });
             break;
           case 'signed-out':
             setProviders(initial.providers);
@@ -230,7 +236,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [post]);
 
   // A paired browser that lost its token never asked which providers exist,
   // and a first answer may not have come. The answer marks them known:
@@ -337,6 +343,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
     channel.onmessage = (event: MessageEvent) => {
       const message = parseChannelMessage(event.data);
       if (!message) return;
+      // Another tab has already announced its session change. A completion
+      // left here by an earlier callback must not announce again on reload.
+      takeSignInNotice('supersede');
       const current = phaseRef.current;
       if (message.type === 'signed-in') {
         if (current === 'oidc' || (current === 'signed-out' && providersRef.current.length > 0)) {
@@ -424,7 +433,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   }, []);
 
   const signIn = useCallback((alias: string) => {
-    window.location.assign(signInUrl(alias, { returnPath: currentReturnPath() }));
+    window.location.assign(fullPageSignInUrl(alias));
   }, []);
 
   const signOut = useCallback(async (): Promise<void> => {
@@ -475,9 +484,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const continueReauthHere = useCallback(() => {
     const held = getOidcSession();
     if (!held) return;
-    window.location.assign(
-      signInUrl(providerAlias(held.provider), { returnPath: currentReturnPath() }),
-    );
+    window.location.assign(fullPageSignInUrl(providerAlias(held.provider)));
   }, []);
 
   const checkSession = useCallback(() => {
