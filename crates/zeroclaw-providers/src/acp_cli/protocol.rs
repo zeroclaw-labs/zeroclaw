@@ -218,6 +218,58 @@ pub(crate) struct OneshotPrompt<'a> {
     pub(crate) model: Option<&'a str>,
     /// Optional policy check on the `session/new` result.
     pub(crate) session_check: Option<SessionCheck<'a>>,
+    /// Text an agent puts at the start of a message chunk to report a failed
+    /// turn in band. When a chunk begins with it (after leading whitespace),
+    /// the reply starts there and any partial answer before it is dropped, so
+    /// the provider classifies the failure instead of returning a truncated
+    /// answer. The marker may span chunks; it is matched only at a chunk start.
+    pub(crate) failure_marker: Option<&'a str>,
+}
+
+/// Agent message text for the current turn plus the byte offset where each
+/// `agent_message_chunk` began, so a failure marker is recognized only at a
+/// chunk boundary and never inside the model's own text.
+#[derive(Debug, Default)]
+struct AssistantOutput {
+    text: String,
+    chunk_starts: Vec<usize>,
+}
+
+impl AssistantOutput {
+    fn clear(&mut self) {
+        self.text.clear();
+        self.chunk_starts.clear();
+    }
+
+    fn push_chunk(&mut self, chunk: &str) -> Result<(), AcpError> {
+        let next_len =
+            self.text
+                .len()
+                .checked_add(chunk.len())
+                .ok_or(AcpError::AssistantLimit {
+                    limit: MAX_ACP_ASSISTANT_BYTES,
+                })?;
+        if next_len > MAX_ACP_ASSISTANT_BYTES {
+            return Err(AcpError::AssistantLimit {
+                limit: MAX_ACP_ASSISTANT_BYTES,
+            });
+        }
+        self.chunk_starts.push(self.text.len());
+        self.text.push_str(chunk);
+        Ok(())
+    }
+
+    /// The trimmed reply, starting at the first chunk that opens with
+    /// `failure_marker` when one is declared and present.
+    fn reply(&self, failure_marker: Option<&str>) -> &str {
+        let failure_start = failure_marker.and_then(|marker| {
+            self.chunk_starts
+                .iter()
+                .copied()
+                .find(|&start| self.text[start..].trim_start().starts_with(marker))
+        });
+        self.text[failure_start.unwrap_or(0)..].trim()
+    }
 }
 
 /// Map a small set of well-known integer JSON-RPC codes to fixed public
@@ -303,10 +355,11 @@ where
         session_meta,
         model,
         session_check,
+        failure_marker,
     } = *request;
     let mut reader = AcpReader::new(stdout, max_stdout_bytes);
     let mut next_id = 1_u64;
-    let mut assistant = String::new();
+    let mut assistant = AssistantOutput::default();
 
     let initialize = rpc_request(
         stdin,
@@ -413,7 +466,7 @@ where
         Some(session_id.as_str()),
     )
     .await?;
-    let trimmed = assistant.trim();
+    let trimmed = assistant.reply(failure_marker);
     if trimmed.is_empty() {
         return Err(AcpError::EmptyOutput);
     }
@@ -526,7 +579,7 @@ async fn rpc_request<W, R>(
     next_id: &mut u64,
     method: &'static str,
     params: Value,
-    assistant: &mut String,
+    assistant: &mut AssistantOutput,
     permission_policy: AcpPermissionPolicy,
     session_id: Option<&str>,
 ) -> Result<Value, AcpError>
@@ -758,7 +811,7 @@ fn permission_outcome(message: &Value, permission_policy: AcpPermissionPolicy) -
 async fn settle_trailing_output<W, R>(
     stdin: &mut W,
     reader: &mut AcpReader<R>,
-    assistant: &mut String,
+    assistant: &mut AssistantOutput,
     permission_policy: AcpPermissionPolicy,
     session_id: Option<&str>,
 ) -> Result<(), AcpError>
@@ -793,30 +846,21 @@ where
     Ok(())
 }
 
-fn append_agent_message_chunk(message: &Value, assistant: &mut String) -> Result<(), AcpError> {
+fn append_agent_message_chunk(
+    message: &Value,
+    assistant: &mut AssistantOutput,
+) -> Result<(), AcpError> {
     let Some(chunk) = extract_agent_message_chunk(message) else {
         return Ok(());
     };
-    let next_len = assistant
-        .len()
-        .checked_add(chunk.len())
-        .ok_or(AcpError::AssistantLimit {
-            limit: MAX_ACP_ASSISTANT_BYTES,
-        })?;
-    if next_len > MAX_ACP_ASSISTANT_BYTES {
-        return Err(AcpError::AssistantLimit {
-            limit: MAX_ACP_ASSISTANT_BYTES,
-        });
-    }
-    assistant.push_str(chunk);
-    Ok(())
+    assistant.push_chunk(chunk)
 }
 
 /// Agents can emit user-visible progress as `agent_message_chunk` before it
 /// starts a plan or tool call. That text is not the completed answer for a
 /// one-shot provider. Keep only the latest message segment after a non-final
 /// ACP update; classify by protocol event, never by the model's wording.
-fn discard_non_final_output(message: &Value, assistant: &mut String) {
+fn discard_non_final_output(message: &Value, assistant: &mut AssistantOutput) {
     if is_permission_request(message) {
         assistant.clear();
         return;
@@ -910,7 +954,7 @@ mod tests {
 
     #[test]
     fn non_final_updates_discard_preceding_progress_text() {
-        let mut assistant = String::new();
+        let mut assistant = AssistantOutput::default();
         let progress = json!({
             "method": "session/update",
             "params": {
@@ -921,14 +965,15 @@ mod tests {
             }
         });
         append_agent_message_chunk(&progress, &mut assistant).expect("progress text");
-        assert_eq!(assistant, "internal progress");
+        assert_eq!(assistant.text, "internal progress");
 
         let tool_call = json!({
             "method": "session/update",
             "params": { "update": { "sessionUpdate": "tool_call" } }
         });
         discard_non_final_output(&tool_call, &mut assistant);
-        assert!(assistant.is_empty());
+        assert!(assistant.text.is_empty());
+        assert!(assistant.chunk_starts.is_empty());
 
         let final_message = json!({
             "method": "session/update",
@@ -940,19 +985,84 @@ mod tests {
             }
         });
         append_agent_message_chunk(&final_message, &mut assistant).expect("final text");
-        assert_eq!(assistant, "final answer");
+        assert_eq!(assistant.text, "final answer");
+    }
+
+    #[test]
+    fn failure_marker_is_matched_only_at_a_chunk_start() {
+        const MARKER: &str = "!! failed:";
+        let reply_for = |chunks: &[&str], marker: Option<&str>| {
+            let mut assistant = AssistantOutput::default();
+            for chunk in chunks {
+                assistant.push_chunk(chunk).expect("chunk");
+            }
+            assistant.reply(marker).to_string()
+        };
+
+        assert_eq!(
+            reply_for(&["Partial ans", "wer.", "\n!! failed: quota"], Some(MARKER)),
+            "!! failed: quota",
+            "a failure after a partial answer must replace it"
+        );
+        assert_eq!(
+            reply_for(&["Partial.", "\n!! fai", "led: quota"], Some(MARKER)),
+            "!! failed: quota",
+            "the marker may span chunks"
+        );
+        assert_eq!(
+            reply_for(&["Quoting it: !! failed: x"], Some(MARKER)),
+            "Quoting it: !! failed: x",
+            "a marker inside a chunk is the model's own text"
+        );
+        assert_eq!(
+            reply_for(&["Answer.", "\n!! failed: x"], None),
+            "Answer.\n!! failed: x",
+            "without a declared marker the reply is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn oneshot_reply_starts_at_a_failure_chunk_after_partial_output() {
+        let (mut client_in, server_in) = duplex(65_536);
+        let (server_out, client_out) = duplex(65_536);
+        let agent = ::zeroclaw_spawn::spawn!(fake_agent_with_chunks(
+            server_in,
+            server_out,
+            &["Here is half an ans", "wer", "\n!! fai", "led: Error 400"],
+        ));
+
+        let prompt = [AcpPromptContent::Text("hello".to_string())];
+        let request = OneshotPrompt {
+            prompt: &prompt,
+            cwd: Path::new("/"),
+            permission_policy: AcpPermissionPolicy::RejectOnce,
+            max_stdout_bytes: DEFAULT_ACP_STDOUT_LIMIT_BYTES,
+            session_meta: None,
+            model: None,
+            session_check: None,
+            failure_marker: Some("!! failed:"),
+        };
+        let reply = run_oneshot_prompt(&mut client_in, client_out, &request, |_| Ok(None))
+            .await
+            .expect("one-shot reply");
+        assert_eq!(reply, "!! failed: Error 400");
+        drop(client_in);
+        agent.await.expect("fake agent");
     }
 
     #[test]
     fn permission_requests_discard_preceding_progress_text() {
-        let mut assistant = "internal progress".to_string();
+        let mut assistant = AssistantOutput::default();
+        assistant
+            .push_chunk("internal progress")
+            .expect("progress text");
         let permission = json!({
             "method": "session/request_permission",
             "id": 7,
             "params": { "options": [] }
         });
         discard_non_final_output(&permission, &mut assistant);
-        assert!(assistant.is_empty());
+        assert!(assistant.text.is_empty());
     }
 
     #[test]
@@ -1022,7 +1132,17 @@ mod tests {
     /// returns every request it received.
     async fn fake_agent(
         server_in: tokio::io::DuplexStream,
+        server_out: tokio::io::DuplexStream,
+    ) -> Vec<Value> {
+        fake_agent_with_chunks(server_in, server_out, &["ONESHOT_OK"]).await
+    }
+
+    /// `fake_agent` that streams `chunks` as separate `agent_message_chunk`
+    /// updates before answering `session/prompt`.
+    async fn fake_agent_with_chunks(
+        server_in: tokio::io::DuplexStream,
         mut server_out: tokio::io::DuplexStream,
+        chunks: &'static [&'static str],
     ) -> Vec<Value> {
         let mut lines = BufReader::new(server_in).lines();
         let mut received = Vec::new();
@@ -1046,21 +1166,23 @@ mod tests {
                     }
                 }),
                 Some("session/prompt") => {
-                    let chunk = json!({
-                        "jsonrpc": "2.0",
-                        "method": "session/update",
-                        "params": {
-                            "sessionId": "s1",
-                            "update": {
-                                "sessionUpdate": "agent_message_chunk",
-                                "content": { "type": "text", "text": "ONESHOT_OK" }
+                    for text in chunks {
+                        let chunk = json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/update",
+                            "params": {
+                                "sessionId": "s1",
+                                "update": {
+                                    "sessionUpdate": "agent_message_chunk",
+                                    "content": { "type": "text", "text": text }
+                                }
                             }
-                        }
-                    });
-                    server_out
-                        .write_all(format!("{chunk}\n").as_bytes())
-                        .await
-                        .expect("write chunk");
+                        });
+                        server_out
+                            .write_all(format!("{chunk}\n").as_bytes())
+                            .await
+                            .expect("write chunk");
+                    }
                     json!({ "jsonrpc": "2.0", "id": id, "result": { "stopReason": "end_turn" } })
                 }
                 _ => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
@@ -1089,6 +1211,7 @@ mod tests {
             session_meta: None,
             model: None,
             session_check: None,
+            failure_marker: None,
         };
         let reply = run_oneshot_prompt(&mut client_in, client_out, &request, |initialize| {
             assert_eq!(initialize["authMethods"][1]["id"], "method-b");
@@ -1141,6 +1264,7 @@ mod tests {
             session_meta: Some(&meta),
             model: Some("model-x"),
             session_check: Some(&check),
+            failure_marker: None,
         };
         let reply = run_oneshot_prompt(&mut client_in, client_out, &request, |_| Ok(None))
             .await
@@ -1191,6 +1315,7 @@ mod tests {
             session_meta: None,
             model: Some("model-x"),
             session_check: Some(&check),
+            failure_marker: None,
         };
         let error = run_oneshot_prompt(&mut client_in, client_out, &request, |_| Ok(None))
             .await
@@ -1222,6 +1347,7 @@ mod tests {
             session_meta: None,
             model: None,
             session_check: None,
+            failure_marker: None,
         };
         let error = run_oneshot_prompt(&mut client_in, client_out, &request, |_| {
             Err(AcpError::NoAuthenticationMethod)
@@ -1555,7 +1681,10 @@ mod tests {
 
     #[test]
     fn assistant_limit_is_hard_not_posthoc_truncation() {
-        let mut assistant = "x".repeat(MAX_ACP_ASSISTANT_BYTES);
+        let mut assistant = AssistantOutput::default();
+        assistant
+            .push_chunk(&"x".repeat(MAX_ACP_ASSISTANT_BYTES))
+            .expect("chunk at the limit");
         let message = json!({
             "method": "session/update",
             "params": {
@@ -1568,6 +1697,7 @@ mod tests {
         let error = append_agent_message_chunk(&message, &mut assistant)
             .expect_err("assistant overflow must fail");
         assert!(matches!(error, AcpError::AssistantLimit { .. }));
-        assert_eq!(assistant.len(), MAX_ACP_ASSISTANT_BYTES);
+        assert_eq!(assistant.text.len(), MAX_ACP_ASSISTANT_BYTES);
+        assert_eq!(assistant.chunk_starts, [0]);
     }
 }

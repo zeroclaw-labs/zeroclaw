@@ -3275,7 +3275,9 @@ pub struct AntigravityCliModelProviderConfig {
     pub auth_method: AntigravityCliAuthMethod,
     /// Absolute directory for this alias's Antigravity state (`agy
     /// --gemini-dir`). Defaults to `<zeroclaw dir>/antigravity_cli/<alias>`
-    /// so a personal sign-in cached in `~/.gemini` is never reused. For
+    /// so a personal sign-in cached in `~/.gemini` is never reused. It must
+    /// be a real directory (not a link) owned by the user running ZeroClaw;
+    /// it is created, or tightened, to owner-only access. For
     /// `oauth_business`, sign in once with `agy acp --login --gemini-dir
     /// <this directory>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
