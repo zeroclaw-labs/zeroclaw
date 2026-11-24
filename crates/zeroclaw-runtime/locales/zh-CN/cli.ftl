@@ -1063,6 +1063,7 @@ cli-desktop-download-at = {"  "}下载地址：{$url}
 cli-config-legend = 图例：💉 env 已覆盖  🔒 密钥
 cli-config-secret-set = {$path} 已设置（加密密钥——不显示值）
 cli-config-secret-unset = {$path} 未设置（加密密钥）
+cli-config-value-prompt = 请输入 {$path} 的值
 cli-config-updated = {$path} 已更新。
 cli-config-review-hint = 运行 `zeroclaw config list` 进行查看，然后设置必填字段。
 cli-config-catalog-unavailable-manual = {"  "}⚠ 无法使用 {$provider} 的模型目录（{$error}）；请手动输入模型 ID。
@@ -1356,6 +1357,12 @@ sop-rpc-policy-unavailable = 暂停的 SOP 策略不可用：{$reason}。
 tool-runtime-command-build-failed = 无法构建运行时命令：{$error}
 tool-runtime-command-docker-workspace-path = 无法构建运行时命令：无法规范化 Docker 工作区路径 {$path}：{$cause}
 tool-runtime-command-docker-allowed-root = 构建运行时命令失败：无法规范化 Docker 工作区根目录 {$path}：{$cause}
+
+# ── Shell tool failure labels (user-facing ToolComplete.error) ──
+tool-shell-exit-status = 退出状态 { $code }
+tool-shell-killed-by-signal = 被信号 { $signal } 终止
+tool-shell-exited-unsuccessfully = 未成功退出
+tool-shell-failure-with-detail = { $status }: { $detail }
 cli-approval-request = 🔧 代理想要执行：{$tool}
 cli-approval-prompt = { "   " }[Y] 是 / [N] 否 / [A] 始终允许 {$tool}：{ " " }
 channel-approval-heading = 需要工具批准

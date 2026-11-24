@@ -44659,6 +44659,91 @@ mod tests {
         assert_eq!(tracker.get_daily_cost(today).unwrap(), 3.0);
     }
 
+    /// `config/set` hands a string value to `set_prop` as typed, the same
+    /// parse `zeroclaw config set` text reaches. Text that `str::parse` reads
+    /// as infinity or NaN is refused for a float field, and the value already
+    /// set is unchanged in the daemon and on disk. A finite string still
+    /// stores. Covers a plain float (`memory.vector_weight`) and an optional
+    /// one (`runtime.docker.cpu_limit`).
+    #[tokio::test]
+    async fn config_set_refuses_non_finite_float_text_and_keeps_the_stored_value() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let config = zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.expect("seed config.toml");
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        let (vector_weight, cpu_limit) =
+            (config.memory.vector_weight, config.runtime.docker.cpu_limit);
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, sessions);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-cap:pid=1".into());
+        dispatcher.set_authenticated_for_test();
+
+        for text in [
+            "inf", "+inf", "-inf", "Infinity", "infinity", "NaN", "nan", "1e999", "-1e999",
+        ] {
+            for prop in ["memory.vector_weight", "runtime.docker.cpu_limit"] {
+                let response = rpc_roundtrip(
+                    &mut dispatcher,
+                    &mut rx,
+                    "config/set",
+                    json!({"prop": prop, "value": text}),
+                )
+                .await;
+                let message = response["error"]["message"].as_str().unwrap_or_default();
+                assert!(
+                    message.contains("Invalid float value"),
+                    "{text} {prop}: {response}"
+                );
+                {
+                    let live = dispatcher.ctx.config.read();
+                    assert_eq!(
+                        live.memory.vector_weight.to_bits(),
+                        vector_weight.to_bits(),
+                        "{text} {prop}"
+                    );
+                    assert_eq!(live.runtime.docker.cpu_limit, cpu_limit, "{text} {prop}");
+                }
+                assert_eq!(
+                    std::fs::read_to_string(&config_path).unwrap(),
+                    saved,
+                    "{text} {prop}"
+                );
+            }
+        }
+
+        for (prop, text) in [
+            ("memory.vector_weight", "0.6"),
+            ("runtime.docker.cpu_limit", "2.5"),
+        ] {
+            let response = rpc_roundtrip(
+                &mut dispatcher,
+                &mut rx,
+                "config/set",
+                json!({"prop": prop, "value": text}),
+            )
+            .await;
+            assert!(response.get("error").is_none(), "{prop}: {response}");
+        }
+        assert_eq!(dispatcher.ctx.config.read().memory.vector_weight, 0.6);
+        assert_eq!(
+            dispatcher.ctx.config.read().runtime.docker.cpu_limit,
+            Some(2.5)
+        );
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(written.contains("vector_weight = 0.6"), "{written}");
+        assert!(written.contains("cpu_limit = 2.5"), "{written}");
+    }
+
     /// Send one request through `process_line` (the wire dispatch path, not
     /// the handler) and return the parsed response frame.
     async fn rpc_roundtrip(
@@ -47514,7 +47599,7 @@ mod tests {
             // fallback; both must fail before the loop can trim and retry.
             if self
                 .overflows_left
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::SeqCst,
                     std::sync::atomic::Ordering::SeqCst,
                     |left| left.checked_sub(1),
