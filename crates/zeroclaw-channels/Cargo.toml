@@ -60,7 +60,7 @@ image = { version = "0.25", default-features = false, features = [
   "png",
   "webp",
 ], optional = true }
-lettre = { version = "0.11.22", default-features = false, features = [
+lettre = { version = "0.11.24", default-features = false, features = [
   "builder",
   "rustls-tls",
   "smtp-transport",
