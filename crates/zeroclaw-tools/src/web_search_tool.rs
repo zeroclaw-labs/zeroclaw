@@ -265,9 +265,8 @@ impl SerplyConfigParseFailure {
 /// `ZEROCLAW_web_search__serply_api_key`, `ZEROCLAW_web_search__keenable_api_key`,
 /// `ZEROCLAW_web_search__firecrawl_api_key`, `ZEROCLAW_web_search__deepseek_api_key`):
 /// the loader applies it to the
-/// in-memory `Config` only, so the runtime hands the effective value to the
-/// tool and the resolver uses it instead of the on-disk field for the lifetime
-/// of the process.
+/// in-memory `Config` only, so the tool uses the effective override instead of
+/// the on-disk field for the lifetime of the process.
 pub struct WebSearchTool {
     /// ModelProvider selector as configured by user. Routed via model_provider aliases at runtime.
     model_provider: String,
@@ -312,6 +311,38 @@ pub struct WebSearchTool {
 }
 
 impl WebSearchTool {
+    /// Build the web search tool from loaded config and its applied overrides.
+    pub fn from_config(config: &Config) -> Self {
+        let search = &config.web_search;
+        let mut tool = Self::new_with_config_and_anysearch_override(
+            search.search_provider.clone(),
+            search.brave_api_key.clone(),
+            search.tavily_api_key.clone(),
+            search.jina_api_key.clone(),
+            config
+                .pre_override_snapshots
+                .contains_key("web_search.anysearch_api_key")
+                .then(|| search.anysearch_api_key.clone()),
+            search.searxng_instance_url.clone(),
+            search.max_results,
+            search.timeout_secs,
+            config.config_path.clone(),
+            config.secrets.encrypt,
+        )
+        .with_serply_api_key_override(
+            config
+                .prop_is_env_overridden("web_search.serply_api_key")
+                .then(|| search.serply_api_key.clone()),
+        )
+        .with_keenable_api_key_override(Self::keenable_api_key_override(config))
+        .with_firecrawl_api_key_override(Self::firecrawl_api_key_override(config));
+
+        tool.deepseek_api_key_override = config
+            .prop_is_env_overridden("web_search.deepseek_api_key")
+            .then(|| search.deepseek_api_key.clone().unwrap_or_default());
+        tool
+    }
+
     pub fn new(
         model_provider: String,
         brave_api_key: Option<String>,
@@ -371,25 +402,10 @@ impl WebSearchTool {
             .then(|| config.web_search.firecrawl_api_key.clone())
     }
 
-    /// Carry the Keenable env override into the tool. The runtime factory
-    /// passes `Self::keenable_api_key_override(config)`; without this call
-    /// the tool resolves the key from `config.toml` on every request.
+    /// Use the Keenable env override when active. Otherwise resolve the key
+    /// from `config.toml` on every request.
     pub fn with_keenable_api_key_override(mut self, override_value: Option<String>) -> Self {
         self.keenable_api_key_override = override_value;
-        self
-    }
-
-    /// Carry only the applied environment override. Resolve the disk key at use time.
-    pub fn with_deepseek_api_key_override(mut self, config: &Config) -> Self {
-        self.deepseek_api_key_override = config
-            .prop_is_env_overridden("web_search.deepseek_api_key")
-            .then(|| {
-                config
-                    .web_search
-                    .deepseek_api_key
-                    .clone()
-                    .unwrap_or_default()
-            });
         self
     }
 
@@ -2957,19 +2973,28 @@ impl WebSearchTool {
 mod tests {
     use super::*;
 
-    fn configured_deepseek_tool(config: &Config) -> WebSearchTool {
-        WebSearchTool::new_with_config(
-            config.web_search.search_provider.clone(),
-            None,
-            None,
-            None,
-            None,
-            config.web_search.max_results,
-            config.web_search.timeout_secs,
-            config.config_path.clone(),
-            config.secrets.encrypt,
-        )
-        .with_deepseek_api_key_override(config)
+    #[test]
+    fn web_search_from_config_preserves_serply_override_state() {
+        let mut config = Config::default();
+        let path = "web_search.serply_api_key";
+        config.set_prop(path, "stored-key").unwrap();
+        assert_eq!(
+            WebSearchTool::from_config(&config).serply_api_key_override,
+            None
+        );
+
+        config.set_prop(path, "env-key").unwrap();
+        config.env_overridden_paths.insert(path.into());
+        assert_eq!(
+            WebSearchTool::from_config(&config).serply_api_key_override,
+            Some(Some("env-key".into()))
+        );
+
+        config.set_prop(path, "").unwrap();
+        assert_eq!(
+            WebSearchTool::from_config(&config).serply_api_key_override,
+            Some(None)
+        );
     }
 
     #[tokio::test]
@@ -2993,7 +3018,7 @@ mod tests {
             saved.web_search.deepseek_api_key.as_deref().unwrap()
         ));
 
-        let tool = configured_deepseek_tool(&config);
+        let tool = WebSearchTool::from_config(&config);
         let server = MockServer::start().await;
         let query = "\"async Rust\" site:example.com";
         Mock::given(method("POST"))
@@ -3050,7 +3075,7 @@ mod tests {
         let query = "界".repeat(128);
         for (configured_count, expected_count) in [(0, 1), (50, 10)] {
             config.web_search.max_results = configured_count;
-            let tool = configured_deepseek_tool(&config);
+            let tool = WebSearchTool::from_config(&config);
             Mock::given(method("POST"))
                 .and(path("/v1/tools/search"))
                 .and(header("authorization", "Bearer override-key"))
@@ -3066,7 +3091,7 @@ mod tests {
             assert_eq!(result.output.as_str(), no_results_message(&query));
         }
 
-        let tool = configured_deepseek_tool(&config);
+        let tool = WebSearchTool::from_config(&config);
         let too_long = tool
             .execute_with_deepseek_origin(json!({"query": format!("{query}界")}), &server.uri())
             .await
@@ -3098,7 +3123,7 @@ mod tests {
         config
             .env_overridden_paths
             .insert("web_search.deepseek_api_key".into());
-        let error = configured_deepseek_tool(&config)
+        let error = WebSearchTool::from_config(&config)
             .execute_with_deepseek_origin(json!({"query": "rust"}), &server.uri())
             .await
             .unwrap_err();
@@ -3108,7 +3133,7 @@ mod tests {
         );
 
         config.env_overridden_paths.clear();
-        let tool = configured_deepseek_tool(&config);
+        let tool = WebSearchTool::from_config(&config);
         for (contents, message) in [
             (
                 "[web_search]\ndeepseek_api_key = \"private-marker\n",
@@ -3142,7 +3167,7 @@ mod tests {
         config
             .env_overridden_paths
             .insert("web_search.deepseek_api_key".into());
-        let tool = configured_deepseek_tool(&config);
+        let tool = WebSearchTool::from_config(&config);
         let server = MockServer::start().await;
         for (response, expected_error) in [
             (
@@ -7630,8 +7655,16 @@ mod tests {
             "[web_search]\nfirecrawl_api_key = \"stored-key\"\n",
         )
         .unwrap();
-        let tool = firecrawl_tool(config_path, false)
-            .with_firecrawl_api_key_override(Some(Some("env-key".to_string())));
+        let mut config = Config {
+            config_path,
+            ..Config::default()
+        };
+        config.web_search.search_provider = "firecrawl".into();
+        config.web_search.firecrawl_api_key = Some("env-key".into());
+        config
+            .env_overridden_paths
+            .insert(FIRECRAWL_API_KEY_PROP_PATH.into());
+        let tool = WebSearchTool::from_config(&config);
 
         tool.search_firecrawl_with_client(
             &firecrawl_test_client(),

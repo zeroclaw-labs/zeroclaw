@@ -277,21 +277,6 @@ impl Tool for ArcToolRef {
     }
 }
 
-/// Serply credential override state for `WebSearchTool`.
-///
-/// `Some(_)` when the config loader applied `ZEROCLAW_web_search__serply_api_key`
-/// (the inner value is the in-memory credential, `None` for a blank override),
-/// so the schema-mirror value wins for this process. `None` when no override is
-/// active, in which case the tool keeps resolving `[web_search] serply_api_key`
-/// from `config.toml` at use time so rotation and removal take effect without a
-/// restart.
-#[cfg(feature = "tools-external")]
-fn serply_api_key_override(root_config: &Config) -> Option<Option<String>> {
-    root_config
-        .prop_is_env_overridden("web_search.serply_api_key")
-        .then(|| root_config.web_search.serply_api_key.clone())
-}
-
 fn any_coding_cli_tool_enabled(root_config: &Config) -> bool {
     (cfg!(feature = "tool-claude-code") && root_config.claude_code.enabled)
         || (cfg!(feature = "tool-codex-cli") && root_config.codex_cli.enabled)
@@ -2965,33 +2950,7 @@ fn all_tools_with_runtime_on_thread(
         register_tool!(
             "web_search_tool",
             Arc::new(RateLimitedTool::new(
-                WebSearchTool::new_with_config_and_anysearch_override(
-                root_config.web_search.search_provider.clone(),
-                root_config.web_search.brave_api_key.clone(),
-                root_config.web_search.tavily_api_key.clone(),
-                root_config.web_search.jina_api_key.clone(),
-                root_config
-                    .pre_override_snapshots
-                    .contains_key("web_search.anysearch_api_key")
-                    .then(|| root_config.web_search.anysearch_api_key.clone()),
-                root_config.web_search.searxng_instance_url.clone(),
-                root_config.web_search.max_results,
-                root_config.web_search.timeout_secs,
-                root_config.config_path.clone(),
-                root_config.secrets.encrypt,
-            )
-            .with_serply_api_key_override(serply_api_key_override(root_config))
-            // The loader applies `ZEROCLAW_web_search__keenable_api_key` in
-            // memory only. Without handing it over, the tool would reread
-            // `config.toml` and miss an env-only key, or send a stored key
-            // that a blank override was meant to suppress.
-            .with_keenable_api_key_override(WebSearchTool::keenable_api_key_override(
-                root_config,
-            ))
-            .with_firecrawl_api_key_override(WebSearchTool::firecrawl_api_key_override(
-                root_config,
-            ))
-            .with_deepseek_api_key_override(root_config),
+                WebSearchTool::from_config(root_config),
                 security.clone(),
             ))
         );
@@ -4396,37 +4355,6 @@ mod tests {
         for name in &built {
             assert!(reserved.contains(name), "{name}");
         }
-    }
-
-    /// The Serply resolver only honours `ZEROCLAW_web_search__serply_api_key`
-    /// if the runtime hands it the loader's override state. Pin the mapping for
-    /// the three states the loader can produce (no override, non-empty
-    /// override, blank override) using the same `set_prop` path the loader
-    /// uses, so a schema-mirror value wins for the process while on-disk
-    /// rotation stays in force when no override is active.
-    #[test]
-    #[cfg(feature = "tools-external")]
-    fn serply_api_key_override_mirrors_env_override_state() {
-        let mut cfg = Config::default();
-
-        // No override: the tool keeps resolving the key from config.toml.
-        cfg.web_search.serply_api_key = Some("stored-key".to_string());
-        assert_eq!(serply_api_key_override(&cfg), None);
-
-        // `ZEROCLAW_web_search__serply_api_key=env-key` applied by the loader.
-        cfg.set_prop("web_search.serply_api_key", "env-key")
-            .unwrap();
-        cfg.env_overridden_paths
-            .insert("web_search.serply_api_key".to_string());
-        assert_eq!(
-            serply_api_key_override(&cfg),
-            Some(Some("env-key".to_string()))
-        );
-
-        // A blank override clears the in-memory value but stays overridden, so
-        // the tool must report "not configured" rather than read the disk key.
-        cfg.set_prop("web_search.serply_api_key", "").unwrap();
-        assert_eq!(serply_api_key_override(&cfg), Some(None));
     }
 
     #[test]
