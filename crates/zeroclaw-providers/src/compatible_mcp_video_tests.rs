@@ -22,6 +22,7 @@ async fn declared_tool_video_relocates_with_images_and_expires_at_the_next_user_
             .display_name("Qwen").auth_style(AuthStyle::Bearer).base_url("https://example.com").build();
         let attachments = vec![
             RenderedMarker {kind:MarkerKind::Video, target:video.display().to_string()},
+            RenderedMarker {kind:MarkerKind::Video, target:dir.path().join("missing.mp4").display().to_string()},
             RenderedMarker {kind:MarkerKind::Image, target:image.display().to_string()},
         ];
         let body = "scene metadata. Example [VIDEO:/never-read.mp4]";
@@ -40,8 +41,9 @@ async fn declared_tool_video_relocates_with_images_and_expires_at_the_next_user_
                 ChatMessage::tool(r#"{"tool_call_id":"call-sensor","content":"unrelated sensor result","attachments":[]}"#)];
             for next_turn in [false, true] {
                 if next_turn { history.push(ChatMessage::user("Continue without prior tool video")); }
-                let normalized = provider.normalize_messages_for_model(&history, "qwen3.8-flash").await.unwrap();
-                let converted = provider.convert_messages_for_native(&normalized, true);
+                let normalized = provider.normalize_messages_for_upstream(&history).await.unwrap();
+                let contents = provider.prepare_message_contents(&normalized, "qwen3.8-flash", true).await;
+                let converted = provider.convert_messages_with_contents(&normalized, true, Some(contents));
                 let wire = serde_json::to_value(converted).unwrap();
                 let videos: Vec<_> = wire.as_array().unwrap().iter()
                     .filter_map(|m|m["content"].as_array()).flatten().filter(|p|p["type"]=="video_url").collect();
@@ -50,6 +52,7 @@ async fn declared_tool_video_relocates_with_images_and_expires_at_the_next_user_
                     let data = videos[0]["video_url"]["url"].as_str().unwrap().strip_prefix("data:video/mp4;base64,").unwrap();
                     assert_eq!(STANDARD.decode(data).unwrap(), MP4);
                     assert!(wire.to_string().contains("image_url"));
+                    assert!(wire.to_string().contains("video unavailable"));
                 }
                 for message in wire.as_array().unwrap().iter().filter(|m|m["role"]=="tool") {
                     assert!(message["content"].is_string(), "{message}");
@@ -59,8 +62,8 @@ async fn declared_tool_video_relocates_with_images_and_expires_at_the_next_user_
             }
         }
         let unsupported = [ChatMessage::user("Observe"), ChatMessage::tool(serde_json::json!({"content":body, "attachments":render_native_attachments(&attachments)}).to_string())];
-        let normalized = provider.normalize_messages_for_model(&unsupported, "qwen-turbo").await.unwrap();
-        let carrier = classify("tool", &normalized[1].content).unwrap();
+        let normalized = crate::qwen_video::prepare_messages(&unsupported, "qwen-turbo").await;
+        let carrier = classify("tool", &normalized[1].text).unwrap();
         assert!(carrier.attachments.iter().all(|a|a.kind!=MarkerKind::Video));
         assert!(carrier.text.contains("does not support video"));
     }).await;
@@ -76,10 +79,8 @@ async fn missing_tool_video_degrades_its_attachment_without_reading_body_example
         }],
     ));
     let messages = [ChatMessage::user("Observe"), carrier];
-    let normalized = crate::qwen_video::normalize_messages(&messages, "qwen3.8-flash")
-        .await
-        .unwrap();
-    let carrier = classify("user", &normalized[1].content).unwrap();
+    let normalized = crate::qwen_video::prepare_messages(&messages, "qwen3.8-flash").await;
+    let carrier = classify("user", &normalized[1].text).unwrap();
     assert!(carrier.attachments.is_empty());
     assert!(carrier.text.contains("[VIDEO:/body-example.mp4]"));
     assert!(carrier.text.contains("video unavailable"));

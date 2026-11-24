@@ -3176,7 +3176,8 @@ enum JpegFirstScan {
 /// reads a 5-byte probe whenever the length exceeds 5 and then skips the
 /// saturating remainder, so a declared length of exactly 6 consumes one byte
 /// more than declared. Every other segment it accepts consumes exactly the
-/// declared length.
+/// declared length. `jpeg_projection_matches_locked_decoder_version` guards
+/// the decoder version modeled by these walks.
 fn zune_jpeg_segment_overread(marker: u8, declared: usize) -> usize {
     usize::from(marker == 0xe0 && declared == 6)
 }
@@ -4457,6 +4458,37 @@ fn normalize_content_type(content_type: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jpeg_projection_matches_locked_decoder_version() {
+        let lock_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock");
+        let contents = match std::fs::read_to_string(&lock_path) {
+            Ok(contents) => contents,
+            // The published crate is tested outside the repository's workspace.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("could not read {}: {error}", lock_path.display()),
+        };
+        let lock: toml::Table = contents.parse().expect("valid workspace Cargo.lock");
+        let versions: Vec<_> = lock["package"]
+            .as_array()
+            .expect("Cargo.lock package array")
+            .iter()
+            .filter(|package| package["name"].as_str() == Some("zune-jpeg"))
+            .map(|package| {
+                package["version"]
+                    .as_str()
+                    .expect("Cargo.lock package version")
+            })
+            .collect();
+        assert_eq!(
+            versions,
+            ["0.5.15"],
+            "Recheck jpeg_frame_header, jpeg_first_scan, jpeg_retained_metadata_allocation, and \
+             zune_jpeg_segment_overread against the locked decoder before updating this test. \
+             See https://github.com/zeroclaw-labs/zeroclaw/pull/11637 for the measurement harness \
+             and decoder source references."
+        );
+    }
 
     /// A real 1x1 PNG. Tests that need a *loadable* image must use this: a
     /// bare 8-byte PNG signature passes header sniffing but is not decodable,

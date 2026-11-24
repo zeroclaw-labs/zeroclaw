@@ -525,6 +525,27 @@ model = "..."
 api_key = "..."
 ```
 
+**Cheaper Inference**: slot `cheaperinference`. An OpenAI-compatible LLM
+gateway with one endpoint for models from several labs. Current models and
+prices are on [cheaperinference.com](https://cheaperinference.com/#models). The
+endpoint is `https://api.cheaperinference.com/v1` with bearer-token auth.
+Model IDs are bare, for example `gpt-5.4-mini`, `gpt-5.4`, `claude-sonnet-5`,
+or `gemini-3.1-pro`.
+The `/v1/models` endpoint requires a key. Key from
+[cheaperinference.com](https://cheaperinference.com/signup). Use the canonical
+`cheaperinference` slot only; `cheaper-inference` and `cheaper_inference` are
+not runtime aliases.
+
+```toml
+[providers.models.cheaperinference.default]
+model = "gpt-5.4-mini"
+api_key = "..."
+```
+
+To bridge an existing `CHEAPER_INFERENCE_API_KEY` shell variable into
+ZeroClaw's schema-mirror env surface, set
+`ZEROCLAW_providers__models__cheaperinference__default__api_key="$CHEAPER_INFERENCE_API_KEY"`.
+
 > Credentials come only from config (`api_key`) or the `--credential` override at run
 > time, these slots do **not** read a per-provider `*_API_KEY` environment variable.
 
@@ -576,8 +597,11 @@ default. Existing image inputs can accompany the video.
 The supported IDs and dated snapshots are defined by `qwen_video::supports_model`
 in `zeroclaw-providers`. The request-wide raw-video budget is strictly below
 7,000,000 bytes, including videos retained in history. Container checks validate
-the MP4 signature; the service validates codec decodability. Missing files,
-invalid Base64, unsupported models and exhausted budgets return input errors.
+the MP4 signature; the service validates codec decodability. References that
+cannot be loaded, unsupported models, invalid Base64 and
+exhausted budgets retain their literal video-marker text so the request can
+continue. Video history is processed newest-first, with successful loads alone
+spending the request budget. Older references that no longer load remain text.
 Files remain in their original location. Low-level provider callers must scope
 local reads with `with_video_read_policy`; an unscoped caller can supply inline
 video bytes. Video reference syntax in tool-result
