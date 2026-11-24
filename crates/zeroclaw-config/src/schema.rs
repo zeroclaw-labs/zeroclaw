@@ -2954,13 +2954,26 @@ mod cheaperinference_tests {
 model = "gpt-5.4-mini"
 "#;
         let config: Config = toml::from_str(toml).expect("cheaperinference alias deserializes");
-        let alias = config
-            .providers
-            .models
-            .cheaperinference
-            .get("default")
-            .expect("cheaperinference.default present");
-        assert_eq!(alias.base.model.as_deref(), Some("gpt-5.4-mini"));
+        let registry = config.provider_registry().unwrap();
+        let selected = registry
+            .resolve_chat(&"cheaperinference.default".into())
+            .unwrap();
+        assert_eq!(selected.upstream_model(), Some("gpt-5.4-mini"));
+        assert_eq!(selected.selection.connection.kind(), "cheaperinference");
+        assert_eq!(
+            selected.selection.connection.uri(),
+            Some(CheaperInferenceEndpoint::DEFAULT_URI)
+        );
+        assert!(config.providers.models.cheaperinference.is_empty());
+
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded: Config = toml::from_str(&encoded).unwrap();
+        assert_eq!(
+            decoded
+                .resolve_model_id("cheaperinference.default")
+                .as_deref(),
+            Some("gpt-5.4-mini")
+        );
     }
 }
 
