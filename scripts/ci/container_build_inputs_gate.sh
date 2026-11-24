@@ -32,7 +32,11 @@ else:
     )
 
 CARGO_BUILD = re.compile(r"cargo\s+(?:build|install|zigbuild|check|nextest)\b")
-ROOT_PACKAGE = re.compile(r"(?:-p[ =]zeroclaw\b|--bin\s+zeroclaw\b)")
+ROOT_SPEC = r"zeroclaw(?:[@:][0-9][0-9A-Za-z.+-]*)?"
+ROOT_PACKAGE = re.compile(
+    r"(?:^|\s)(?:-p(?:\s+|=)?|--(?:package|bin)(?:\s+|=))"
+    rf"(?:{ROOT_SPEC}|\"{ROOT_SPEC}\"|'{ROOT_SPEC}')(?=\s|[;&|]|$)"
+)
 COPIES_RS = re.compile(
     r"^\s*(?:COPY|ADD)\s+(?:\*\.rs|build\.rs)\b", re.IGNORECASE | re.MULTILINE
 )
