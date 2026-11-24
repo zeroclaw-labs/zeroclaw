@@ -66,6 +66,32 @@ tokio::task_local! {
     static STREAM_REFUSAL_RECOVERY: RefCell<Option<AnthropicRefusalError>>;
 }
 
+tokio::task_local! {
+    static PROVIDER_ATTEMPT_ALLOWLIST: Option<Arc<HashSet<String>>>;
+}
+
+/// Restrict physical provider attempts for one automatically routed turn.
+/// `None` preserves the existing unrestricted reliability behavior.
+pub async fn scope_provider_attempt_allowlist<F: std::future::Future>(
+    allowed: Option<Arc<HashSet<String>>>,
+    future: F,
+) -> F::Output {
+    PROVIDER_ATTEMPT_ALLOWLIST.scope(allowed, future).await
+}
+
+/// Return whether a physical provider reference is eligible in the current
+/// turn. Direct side routes (for example the configured vision provider) use
+/// this before dispatch so they cannot bypass Reliable's candidate filter.
+pub fn provider_ref_allowed_for_turn(provider_ref: &str) -> bool {
+    PROVIDER_ATTEMPT_ALLOWLIST
+        .try_with(|allowed| {
+            allowed
+                .as_ref()
+                .is_none_or(|candidates| candidates.contains(provider_ref))
+        })
+        .unwrap_or(true)
+}
+
 /// Seed a non-streaming recovery with the refusal that ended a pre-output
 /// stream. Reliable consumes it to skip the exact already-billed candidate;
 /// a direct Anthropic provider consumes it to return the same refusal without
@@ -823,6 +849,8 @@ pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
         "context window of this model",
         "maximum context length",
         "context length exceeded",
+        // snake_case form used by local OpenAI-compatible servers.
+        "context_length_exceeded",
         "too many tokens",
         "token limit exceeded",
         "prompt is too long",
@@ -933,6 +961,35 @@ fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
     }
 
     false
+}
+
+/// Try to extract the time until a quota resets (in milliseconds) from an
+/// error body that states it. OpenAI Codex's `usage_limit_reached` 429 carries
+/// `"resets_in_seconds": <n>` (and `"resets_at": <unix seconds>`) for a rolling
+/// window that lasts hours; this is distinct from Retry-After, which asks for
+/// a short wait before retrying the same request.
+fn parse_stated_reset_ms(err: &anyhow::Error) -> Option<u64> {
+    let msg = err.to_string();
+    let number_after = |key: &str| -> Option<u64> {
+        let start = msg.find(key)? + key.len();
+        let rest =
+            msg[start..].trim_start_matches(|c: char| c == '"' || c == ':' || c.is_whitespace());
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse::<u64>().ok()
+    };
+    let ms = if let Some(secs) = number_after("\"resets_in_seconds\"") {
+        secs.saturating_mul(1000)
+    } else {
+        let resets_at = number_after("\"resets_at\"")?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        resets_at.saturating_sub(now).saturating_mul(1000)
+    };
+    // A reset that is already due says nothing about how long to wait, so
+    // leave the choice to Retry-After or the default cooldown.
+    (ms > 0).then_some(ms)
 }
 
 /// Try to extract a Retry-After value (in milliseconds) from an error message.
@@ -2159,8 +2216,37 @@ impl ReliableModelProvider {
             .filter(|provider| !provider.is_empty())
     }
 
+    fn provider_allowed_for_turn(entry: &ReliableModelProviderEntry) -> bool {
+        provider_ref_allowed_for_turn(entry.candidate_name())
+    }
+
+    fn eligible_provider_count(&self) -> usize {
+        self.model_providers
+            .iter()
+            .filter(|entry| Self::provider_allowed_for_turn(entry))
+            .count()
+    }
+
+    fn log_provider_policy_skip(entry: &ReliableModelProviderEntry) {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "model_provider": entry.candidate_name(),
+                    "reason": "effort_routing_policy",
+                })),
+            "Skipping model_provider outside the turn routing policy"
+        );
+    }
+
     /// Default cooldown after a retryable 429 when Retry-After is absent.
     const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(10);
+
+    /// Upper bound on a cooldown taken from a quota's stated reset time.
+    /// Long enough for a rolling five-hour subscription window, short
+    /// enough that a wrong or stale value cannot sideline a provider for days.
+    const STATED_RESET_COOLDOWN_CAP: Duration = Duration::from_secs(6 * 60 * 60);
 
     /// Minimum wait between attempts after an overload when no Retry-After
     /// is parsed. Overload sheds typically outlast one round trip.
@@ -2185,7 +2271,7 @@ impl ReliableModelProvider {
     }
 
     fn provider_should_skip_for_cooldown(&self, entry: &ReliableModelProviderEntry) -> bool {
-        self.model_providers.len() > 1 && self.provider_cooldown_active(&entry.cooldown_key)
+        self.eligible_provider_count() > 1 && self.provider_cooldown_active(&entry.cooldown_key)
     }
 
     /// Admit an entry with its configured retry budget, except for the exact
@@ -2316,8 +2402,11 @@ impl ReliableModelProvider {
     }
 
     fn set_rate_limit_cooldown(&self, cooldown_key: &str, err: &anyhow::Error) -> Duration {
-        let cooldown = parse_retry_after_ms(err)
-            .map(|ms| Duration::from_millis(ms.min(60_000)))
+        // A quota that says when it resets is out until then: re-trying it on
+        // every call before that only adds a refused round trip and latency.
+        let cooldown = parse_stated_reset_ms(err)
+            .map(|ms| Duration::from_millis(ms).min(Self::STATED_RESET_COOLDOWN_CAP))
+            .or_else(|| parse_retry_after_ms(err).map(|ms| Duration::from_millis(ms.min(60_000))))
             .unwrap_or(Self::RATE_LIMIT_COOLDOWN);
 
         let mut cooldowns = self
@@ -2488,6 +2577,10 @@ impl ModelProvider for ReliableModelProvider {
         // retryable error, sleep with exponential backoff and retry.
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
+                if !Self::provider_allowed_for_turn(entry) {
+                    Self::log_provider_policy_skip(entry);
+                    continue;
+                }
                 if terminal_provider_keys.contains(&entry.cooldown_key) {
                     continue;
                 }
@@ -2688,6 +2781,15 @@ impl ModelProvider for ReliableModelProvider {
                                 if has_typed_non_retryable_marker(&e) {
                                     terminal_provider_keys.insert(entry.cooldown_key.clone());
                                 }
+                                // A quota refusal that states its reset time
+                                // keeps the provider out until then, not only
+                                // for this call.
+                                if rate_limited
+                                    && self.model_providers.len() > 1
+                                    && parse_stated_reset_ms(&e).is_some()
+                                {
+                                    self.cool_down_rate_limited_provider(entry, served_model, &e);
+                                }
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
@@ -2781,6 +2883,10 @@ impl ModelProvider for ReliableModelProvider {
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
+                if !Self::provider_allowed_for_turn(entry) {
+                    Self::log_provider_policy_skip(entry);
+                    continue;
+                }
                 if terminal_provider_keys.contains(&entry.cooldown_key) {
                     continue;
                 }
@@ -2998,6 +3104,15 @@ impl ModelProvider for ReliableModelProvider {
                                 if has_typed_non_retryable_marker(&e) {
                                     terminal_provider_keys.insert(entry.cooldown_key.clone());
                                 }
+                                // A quota refusal that states its reset time
+                                // keeps the provider out until then, not only
+                                // for this call.
+                                if rate_limited
+                                    && self.model_providers.len() > 1
+                                    && parse_stated_reset_ms(&e).is_some()
+                                {
+                                    self.cool_down_rate_limited_provider(entry, served_model, &e);
+                                }
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
@@ -3067,25 +3182,39 @@ impl ModelProvider for ReliableModelProvider {
         )))
     }
 
+    fn supports_single_tool_rounds(&self, model: &str) -> bool {
+        !self.model_providers.is_empty()
+            && self.model_chain(model).iter().all(|model| {
+                self.model_providers.iter().all(|entry| {
+                    entry
+                        .provider()
+                        .supports_single_tool_rounds(entry.served_model(model))
+                })
+            })
+    }
+
     fn capabilities(&self) -> crate::traits::ProviderCapabilities {
         let mut capabilities = self
             .model_providers
-            .first()
+            .iter()
+            .find(|entry| Self::provider_allowed_for_turn(entry))
             .map(|entry| entry.provider().capabilities())
             .unwrap_or_default();
         // A request may advance past the primary after a retryable failure.
         // Report vision only when every reachable provider can accept images;
         // otherwise the turn engine must select a dedicated vision route before
         // dispatch instead of admitting an image that a fallback could reject.
-        capabilities.vision = !self.model_providers.is_empty()
+        capabilities.vision = self.eligible_provider_count() > 0
             && self
                 .model_providers
                 .iter()
+                .filter(|entry| Self::provider_allowed_for_turn(entry))
                 .all(|entry| entry.provider().supports_vision());
-        capabilities.native_tool_calling = !self.model_providers.is_empty()
+        capabilities.native_tool_calling = self.eligible_provider_count() > 0
             && self
                 .model_providers
                 .iter()
+                .filter(|entry| Self::provider_allowed_for_turn(entry))
                 .all(|entry| entry.provider().supports_native_tools());
         capabilities
     }
@@ -3093,21 +3222,27 @@ impl ModelProvider for ReliableModelProvider {
     fn capabilities_for_model(&self, model: &str) -> crate::traits::ProviderCapabilities {
         let mut capabilities = self
             .model_providers
-            .first()
+            .iter()
+            .find(|entry| Self::provider_allowed_for_turn(entry))
             .map(|entry| entry.provider().capabilities_for_model(model))
             .unwrap_or_default();
-        capabilities.vision = !self.model_providers.is_empty()
+        capabilities.vision = self.eligible_provider_count() > 0
             && self
                 .model_providers
                 .iter()
+                .filter(|entry| Self::provider_allowed_for_turn(entry))
                 .all(|entry| entry.provider().capabilities_for_model(model).vision);
-        capabilities.native_tool_calling = !self.model_providers.is_empty()
-            && self.model_providers.iter().all(|entry| {
-                entry
-                    .provider()
-                    .capabilities_for_model(model)
-                    .native_tool_calling
-            });
+        capabilities.native_tool_calling = self.eligible_provider_count() > 0
+            && self
+                .model_providers
+                .iter()
+                .filter(|entry| Self::provider_allowed_for_turn(entry))
+                .all(|entry| {
+                    entry
+                        .provider()
+                        .capabilities_for_model(model)
+                        .native_tool_calling
+                });
         capabilities
     }
 
@@ -3120,6 +3255,7 @@ impl ModelProvider for ReliableModelProvider {
         // the primary's own limitation as a fallback's.
         self.model_providers
             .iter()
+            .filter(|entry| Self::provider_allowed_for_turn(entry))
             .enumerate()
             .find(|(_, entry)| !entry.provider().capabilities_for_model(model).vision)
             .and_then(|(index, entry)| (index != 0).then(|| entry.candidate_name().to_string()))
@@ -3129,7 +3265,11 @@ impl ModelProvider for ReliableModelProvider {
         let mut has_native = false;
         let mut has_text_only = false;
 
-        for entry in &self.model_providers {
+        for entry in self
+            .model_providers
+            .iter()
+            .filter(|entry| Self::provider_allowed_for_turn(entry))
+        {
             let provider = entry.provider();
             if provider.has_mixed_native_tool_support_for_model(model) {
                 return true;
@@ -3151,10 +3291,11 @@ impl ModelProvider for ReliableModelProvider {
         // The turn loop selects one tool protocol before Reliable chooses a
         // candidate. A native request is therefore safe only when every
         // candidate the request may reach accepts native tool specifications.
-        !self.model_providers.is_empty()
+        self.eligible_provider_count() > 0
             && self
                 .model_providers
                 .iter()
+                .filter(|entry| Self::provider_allowed_for_turn(entry))
                 .all(|entry| entry.provider().supports_native_tools())
     }
 
@@ -3181,10 +3322,14 @@ impl ModelProvider for ReliableModelProvider {
         let mut final_cause = None;
         let mut final_cause_provider = None;
 
-        let has_other_candidate = models.len().saturating_mul(self.model_providers.len()) > 1;
+        let has_other_candidate = models.len().saturating_mul(self.eligible_provider_count()) > 1;
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
+                if !Self::provider_allowed_for_turn(entry) {
+                    Self::log_provider_policy_skip(entry);
+                    continue;
+                }
                 let Some(retry_limit) =
                     self.effective_retry_limit(model_slot, entry_index, has_other_candidate)
                 else {
@@ -3417,6 +3562,15 @@ impl ModelProvider for ReliableModelProvider {
                                 if has_typed_non_retryable_marker(&e) {
                                     terminal_provider_keys.insert(entry.cooldown_key.clone());
                                 }
+                                // A quota refusal that states its reset time
+                                // keeps the provider out until then, not only
+                                // for this call.
+                                if rate_limited
+                                    && self.model_providers.len() > 1
+                                    && parse_stated_reset_ms(&e).is_some()
+                                {
+                                    self.cool_down_rate_limited_provider(entry, served_model, &e);
+                                }
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
@@ -3492,6 +3646,22 @@ impl ModelProvider for ReliableModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+        .await
+    }
+
+    async fn chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
         mark_current_dispatch_composite();
         let models = self.model_chain(model);
         let mut failures = FailureEvents::default();
@@ -3513,10 +3683,14 @@ impl ModelProvider for ReliableModelProvider {
             .as_ref()
             .and_then(|refusal| refusal.attempted_candidate.clone());
 
-        let has_other_candidate = models.len().saturating_mul(self.model_providers.len()) > 1;
+        let has_other_candidate = models.len().saturating_mul(self.eligible_provider_count()) > 1;
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
+                if !Self::provider_allowed_for_turn(entry) {
+                    Self::log_provider_policy_skip(entry);
+                    continue;
+                }
                 let skip_streamed_refusal = streamed_refusal.as_ref().is_some_and(|refusal| {
                     refusal.requested_model == *current_model
                         && model_slot == 0
@@ -3568,10 +3742,11 @@ impl ModelProvider for ReliableModelProvider {
                     match with_exact_dispatch_route(
                         entry.cooldown_key.clone(),
                         entry.served_model(current_model).to_string(),
-                        ProviderDispatch::from_ref(entry.provider()).chat(
+                        ProviderDispatch::from_ref(entry.provider()).chat_with_tool_round_policy(
                             req,
                             current_model,
                             temperature,
+                            policy,
                         ),
                     )
                     .await
@@ -3773,6 +3948,15 @@ impl ModelProvider for ReliableModelProvider {
                                 if has_typed_non_retryable_marker(&e) {
                                     terminal_provider_keys.insert(entry.cooldown_key.clone());
                                 }
+                                // A quota refusal that states its reset time
+                                // keeps the provider out until then, not only
+                                // for this call.
+                                if rate_limited
+                                    && self.model_providers.len() > 1
+                                    && parse_stated_reset_ms(&e).is_some()
+                                {
+                                    self.cool_down_rate_limited_provider(entry, served_model, &e);
+                                }
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
@@ -3847,23 +4031,19 @@ impl ModelProvider for ReliableModelProvider {
     }
 
     fn supports_streaming(&self) -> bool {
-        // Aggregation stays any(): a streaming-capable fallback may serve a
-        // turn whose selected primary disclaims streaming, surfacing the
-        // standard fallback notice (runtime contract, verified by
-        // streamed_turn_surfaces_streaming_provider_fallback_notice). The
-        // audit's stream-into-disclaiming-route hazard is closed at the
-        // dispatch layer instead: RouterModelProvider never streams a
-        // resolved route that disclaims streaming, and the passthrough
-        // leaf's streaming builders never attach thinking params to the
-        // streamed wire (unverified SSE frames, no signed capture there).
+        // A streaming-capable fallback may serve a turn whose selected
+        // primary disclaims streaming, but effort routing narrows that set.
+        // Capability discovery and dispatch must inspect the same candidates.
         self.model_providers
             .iter()
+            .filter(|entry| Self::provider_allowed_for_turn(entry))
             .any(|entry| entry.provider().supports_streaming())
     }
 
     fn supports_streaming_tool_events(&self) -> bool {
         self.model_providers
             .iter()
+            .filter(|entry| Self::provider_allowed_for_turn(entry))
             .any(|entry| entry.provider().supports_streaming_tool_events())
     }
 
@@ -3874,11 +4054,32 @@ impl ModelProvider for ReliableModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
+        )
+    }
+
+    fn stream_chat_with_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         mark_current_dispatch_composite();
         commit_safeguard_fallback(None);
         let needs_tool_events = request.tools.is_some_and(|tools| !tools.is_empty());
 
         for (entry_index, entry) in self.model_providers.iter().enumerate() {
+            if !Self::provider_allowed_for_turn(entry) {
+                Self::log_provider_policy_skip(entry);
+                continue;
+            }
             let provider_name = entry.display_name.as_str();
             let model_provider = entry.provider();
             if !model_provider.supports_streaming() || !options.enabled {
@@ -3925,11 +4126,12 @@ impl ModelProvider for ReliableModelProvider {
             let stream = stream_with_exact_dispatch_route(
                 entry.cooldown_key.clone(),
                 served_model.clone(),
-                ProviderDispatch::from_ref(model_provider).stream_chat(
+                ProviderDispatch::from_ref(model_provider).stream_chat_with_tool_round_policy(
                     req,
                     &served_model,
                     temperature,
                     options,
+                    policy,
                 ),
             );
             let stream = stream
@@ -3984,6 +4186,10 @@ impl ModelProvider for ReliableModelProvider {
         // Try each model_provider/model combination for streaming
         // For streaming, we use the first model_provider that supports it and has streaming enabled
         for (provider_index, entry) in self.model_providers.iter().enumerate() {
+            if !Self::provider_allowed_for_turn(entry) {
+                Self::log_provider_policy_skip(entry);
+                continue;
+            }
             let provider_name = entry.display_name.as_str();
             let model_provider = entry.provider();
             if !model_provider.supports_streaming() || !options.enabled {
@@ -4070,6 +4276,10 @@ impl ModelProvider for ReliableModelProvider {
         // Mirrors stream_chat_with_system but delegates to the underlying
         // model_provider's stream_chat_with_history, preserving the full conversation.
         for (provider_index, entry) in self.model_providers.iter().enumerate() {
+            if !Self::provider_allowed_for_turn(entry) {
+                Self::log_provider_policy_skip(entry);
+                continue;
+            }
             let provider_name = entry.display_name.as_str();
             let model_provider = entry.provider();
             if !model_provider.supports_streaming() || !options.enabled {
@@ -4167,6 +4377,156 @@ mod tests {
     use futures_util::StreamExt;
     use std::sync::Arc;
     use zeroclaw_api::tool::ToolSpec;
+
+    struct PolicyProbeProvider {
+        fail: bool,
+        stream_calls: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for PolicyProbeProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                anyhow::bail!("provider unavailable");
+            }
+            Ok("cloud response".into())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                stream::once(async { Err(StreamError::ModelProvider("stream unavailable".into())) })
+                    .boxed()
+            } else {
+                stream::iter(vec![Ok(StreamChunk::final_chunk())]).boxed()
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for PolicyProbeProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "PolicyProbeProvider"
+        }
+    }
+
+    fn effort_policy_probe_provider() -> (
+        ReliableModelProvider,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        let local_stream = Arc::new(AtomicUsize::new(0));
+        let local_chat = Arc::new(AtomicUsize::new(0));
+        let cloud_stream = Arc::new(AtomicUsize::new(0));
+        let cloud_chat = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "effort",
+            vec![
+                (
+                    "ollama.local".into(),
+                    Box::new(PolicyProbeProvider {
+                        fail: true,
+                        stream_calls: Arc::clone(&local_stream),
+                        chat_calls: Arc::clone(&local_chat),
+                    }),
+                ),
+                (
+                    "openai.backup".into(),
+                    Box::new(PolicyProbeProvider {
+                        fail: false,
+                        stream_calls: Arc::clone(&cloud_stream),
+                        chat_calls: Arc::clone(&cloud_chat),
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+        (provider, local_stream, local_chat, cloud_stream, cloud_chat)
+    }
+
+    #[tokio::test]
+    async fn effort_policy_blocks_cloud_fallback_and_stream_recovery() {
+        let (provider, local_stream, local_chat, cloud_stream, cloud_chat) =
+            effort_policy_probe_provider();
+        let allowed = Arc::new(HashSet::from(["ollama.local".to_string()]));
+        let messages = vec![ChatMessage::user("private prompt")];
+
+        scope_provider_attempt_allowlist(Some(allowed), async {
+            let mut stream = provider.stream_chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "local-model",
+                None,
+                StreamOptions::new(true),
+            );
+            assert!(stream.next().await.unwrap().is_err());
+            assert!(
+                provider
+                    .chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "local-model",
+                        None,
+                    )
+                    .await
+                    .is_err()
+            );
+        })
+        .await;
+
+        assert_eq!(local_stream.load(Ordering::SeqCst), 1);
+        assert_eq!(local_chat.load(Ordering::SeqCst), 1);
+        assert_eq!(cloud_stream.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            cloud_chat.load(Ordering::SeqCst),
+            0,
+            "a local decision must not disclose the prompt through fallback"
+        );
+
+        assert_eq!(
+            provider
+                .chat_with_system(None, "ordinary prompt", "local-model", None)
+                .await
+                .expect("unrestricted reliability still reaches fallback"),
+            "cloud response"
+        );
+        assert_eq!(cloud_chat.load(Ordering::SeqCst), 1);
+    }
 
     fn drain_captured_events(
         rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
@@ -7383,6 +7743,21 @@ mod tests {
     }
 
     #[test]
+    fn an_unsigned_thinking_rejection_is_not_retried() {
+        // The same history fails the same way on every attempt, streamed or not.
+        let message = r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.3.content.0.thinking.signature: Field required"}}"#;
+        assert!(is_non_retryable(&anyhow::Error::msg(format!(
+            "Anthropic API error (400 Bad Request): {message}"
+        ))));
+        assert!(is_non_retryable(&anyhow::Error::new(
+            StreamError::HttpStatus {
+                status: 400,
+                message: message.to_string(),
+            }
+        )));
+    }
+
+    #[test]
     fn non_retryable_detects_common_patterns() {
         assert!(is_non_retryable(&anyhow::Error::msg("400 Bad Request")));
         assert!(is_non_retryable(&anyhow::Error::msg("401 Unauthorized")));
@@ -9030,6 +9405,157 @@ mod tests {
         );
     }
 
+    /// The 429 body OpenAI Codex returns when a subscription seat's rolling
+    /// window is used up, as the shared `api_error` renders it.
+    const CODEX_USAGE_LIMIT_429: &str = "OpenAI Codex API error (429 Too Many Requests): {\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"The usage limit has been reached\",\"plan_type\":\"team\",\"limit_window_minutes\":300,\"resets_in_seconds\":7144}}";
+
+    #[test]
+    fn stated_reset_is_read_from_the_quota_body() {
+        let codex = anyhow::Error::msg(CODEX_USAGE_LIMIT_429);
+        assert_eq!(parse_stated_reset_ms(&codex), Some(7_144_000));
+
+        let in_ten_minutes = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        let at = anyhow::Error::msg(format!(
+            "429 Too Many Requests: {{\"error\":{{\"resets_at\":{in_ten_minutes}}}}}"
+        ));
+        let ms = parse_stated_reset_ms(&at).unwrap();
+        assert!((595_000..=600_000).contains(&ms), "{ms}");
+
+        let plain = anyhow::Error::msg("429 Too Many Requests, Retry-After: 30");
+        assert_eq!(parse_stated_reset_ms(&plain), None);
+
+        let due_now = anyhow::Error::msg("429: {\"resets_in_seconds\":0}");
+        assert_eq!(parse_stated_reset_ms(&due_now), None);
+        let in_the_past = anyhow::Error::msg("429: {\"resets_at\":1000}");
+        assert_eq!(parse_stated_reset_ms(&in_the_past), None);
+    }
+
+    #[test]
+    fn a_stated_reset_sets_a_long_bounded_cooldown() {
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: 0,
+                    response: "ok",
+                    error: "boom",
+                }),
+            )],
+            0,
+            1,
+        );
+
+        let codex = anyhow::Error::msg(CODEX_USAGE_LIMIT_429);
+        assert_eq!(
+            model_provider.set_rate_limit_cooldown("primary", &codex),
+            Duration::from_secs(7144)
+        );
+
+        let days = anyhow::Error::msg("429: {\"resets_in_seconds\":999999}");
+        assert_eq!(
+            model_provider.set_rate_limit_cooldown("primary", &days),
+            ReliableModelProvider::STATED_RESET_COOLDOWN_CAP
+        );
+
+        // A reset already in the past leaves Retry-After in charge.
+        let stale = anyhow::Error::msg("429: {\"resets_at\":1000}, Retry-After: 30");
+        assert_eq!(
+            model_provider.set_rate_limit_cooldown("primary", &stale),
+            Duration::from_secs(30)
+        );
+
+        // Retry-After keeps its own, shorter cap.
+        let retry_after = anyhow::Error::msg("429 Too Many Requests, Retry-After: 600");
+        assert_eq!(
+            model_provider.set_rate_limit_cooldown("primary", &retry_after),
+            Duration::from_secs(60)
+        );
+    }
+
+    /// Two calls through a primary that keeps refusing with `error` and a
+    /// working fallback; returns how often the primary was tried.
+    async fn primary_calls_over_two_turns(error: &'static str) -> (usize, bool) {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&primary_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error,
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "from fallback",
+                        error: "fallback down",
+                    }),
+                ),
+            ],
+            2,
+            1,
+        );
+        for _ in 0..2 {
+            let reply = model_provider
+                .simple_chat("hello", "test", Some(0.0))
+                .await
+                .unwrap();
+            assert_eq!(reply, "from fallback");
+        }
+        (
+            primary_calls.load(Ordering::SeqCst),
+            model_provider.provider_cooldown_active("primary"),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_seat_is_skipped_until_its_stated_reset() {
+        // Retryable classification (the type string alone): the cooldown now
+        // lasts until the stated reset instead of ten seconds, so the second
+        // turn goes straight to the fallback.
+        let (calls, cooling) = primary_calls_over_two_turns(CODEX_USAGE_LIMIT_429).await;
+        assert_eq!(
+            calls, 1,
+            "the second turn must not re-try the exhausted seat"
+        );
+        assert!(cooling);
+    }
+
+    #[tokio::test]
+    async fn a_business_quota_refusal_with_a_stated_reset_is_skipped_until_then() {
+        // Non-retryable classification (business-quota wording): it already
+        // moved on at once; with a stated reset it now also stays out.
+        let (calls, cooling) = primary_calls_over_two_turns(
+            "API error (429 Too Many Requests): {\"error\":{\"type\":\"insufficient_quota\",\"resets_in_seconds\":600}}",
+        )
+        .await;
+        assert_eq!(calls, 1);
+        assert!(cooling);
+    }
+
+    #[tokio::test]
+    async fn a_business_quota_refusal_without_a_reset_is_still_tried_each_turn() {
+        // Unchanged: no stated reset, no cooldown; one attempt per turn.
+        let (calls, cooling) = primary_calls_over_two_turns(
+            "API error (429 Too Many Requests): {\"error\":{\"type\":\"insufficient_quota\"}}",
+        )
+        .await;
+        assert_eq!(calls, 2);
+        assert!(!cooling);
+    }
+
     #[tokio::test]
     async fn retryable_rate_limit_cools_down_provider_and_uses_fallback() {
         let primary_calls = Arc::new(AtomicUsize::new(0));
@@ -9843,6 +10369,20 @@ mod tests {
         assert!(is_context_window_exceeded(&anyhow::Error::msg(
             "request (8968 tokens) exceeds the available context size (8448 tokens), try increasing it"
         )));
+    }
+
+    #[test]
+    fn is_context_window_exceeded_detects_snake_case_error_code() {
+        // The reply arrives nested under the fallback wrapper, so the detector
+        // must look through the cause chain; a spaced-prose-only list misses it
+        // and the turn fails instead of trimming the oldest turns and retrying.
+        let err = anyhow::Error::msg(
+            "Custom API error (400 Bad Request): {\"error\":{\"message\":\"context_length_exceeded: prompt is 32866 tokens, over the configured 32768-token prompt-plus-reply window.\",\"code\":\"context_length_exceeded\"}}",
+        )
+        .context("All model providers/models failed after 1 failure event(s)");
+
+        assert!(!err.to_string().contains("context_length_exceeded"));
+        assert!(is_context_window_exceeded(&err));
     }
 
     #[test]
@@ -13680,6 +14220,97 @@ mod tests {
             0,
         );
         assert!(provider.supports_vision());
+    }
+
+    #[tokio::test]
+    async fn capabilities_ignore_candidates_excluded_by_turn_policy() {
+        struct CapabilityMock {
+            vision: bool,
+            native_tools: bool,
+            streaming: bool,
+            streaming_tool_events: bool,
+        }
+
+        #[async_trait]
+        impl ModelProvider for CapabilityMock {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+
+            fn supports_vision(&self) -> bool {
+                self.vision
+            }
+
+            fn supports_native_tools(&self) -> bool {
+                self.native_tools
+            }
+
+            fn supports_streaming(&self) -> bool {
+                self.streaming
+            }
+
+            fn supports_streaming_tool_events(&self) -> bool {
+                self.streaming_tool_events
+            }
+        }
+
+        impl ::zeroclaw_api::attribution::Attributable for CapabilityMock {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "CapabilityMock"
+            }
+        }
+
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "custom.local".into(),
+                    Box::new(CapabilityMock {
+                        vision: true,
+                        native_tools: true,
+                        streaming: false,
+                        streaming_tool_events: false,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "custom.cloud".into(),
+                    Box::new(CapabilityMock {
+                        vision: false,
+                        native_tools: false,
+                        streaming: true,
+                        streaming_tool_events: true,
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+
+        let allowed = Arc::new(HashSet::from(["custom.local".to_string()]));
+        scope_provider_attempt_allowlist(Some(allowed), async {
+            assert!(provider.supports_vision());
+            assert!(provider.supports_native_tools());
+            assert!(!provider.supports_streaming());
+            assert!(!provider.supports_streaming_tool_events());
+            assert!(provider.capabilities_for_model("model").vision);
+            assert!(provider.capabilities_for_model("model").native_tool_calling);
+            assert_eq!(provider.vision_limited_by("model"), None);
+        })
+        .await;
     }
 
     // `vision_limited_by` names the entry an error site should blame for a

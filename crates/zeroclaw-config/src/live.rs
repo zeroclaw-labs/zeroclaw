@@ -52,6 +52,12 @@ impl Default for ConfigEpoch {
     }
 }
 
+impl std::fmt::Display for ConfigEpoch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
 /// Identity of one published config: authority epoch plus sequence.
 ///
 /// Copyable and comparable for equality only. Order-sensitive questions
@@ -65,6 +71,16 @@ pub struct ConfigRevision {
 }
 
 impl ConfigRevision {
+    /// The authority generation that owns this revision.
+    pub fn epoch(&self) -> ConfigEpoch {
+        self.epoch
+    }
+
+    /// Publication sequence within this revision's epoch.
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
     /// The first revision of a fresh epoch.
     pub(crate) fn initial(epoch: ConfigEpoch) -> Self {
         Self { epoch, sequence: 0 }
@@ -229,6 +245,15 @@ impl LiveConfigHandle {
         }
     }
 
+    /// Re-enter a short config read while this thread already holds an effect
+    /// read guard. A queued publisher must not block this nested read behind
+    /// the outer guard it is waiting for. Never retain it across an await.
+    pub fn read_recursive(&self) -> LiveConfigReadGuard<'_> {
+        LiveConfigReadGuard {
+            guard: self.pair.read_recursive(),
+        }
+    }
+
     /// Clone the currently published config.
     pub fn snapshot(&self) -> Config {
         self.pair.read().config.clone()
@@ -283,6 +308,20 @@ impl LiveConfigReadGuard<'_> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn config_application_revision_getters_project_the_published_identity() {
+        let live = LiveConfig::new(Config::default());
+        let initial = live.published_revision();
+        assert_eq!(initial.epoch(), live.epoch());
+        assert_eq!(initial.sequence(), 0);
+        assert_eq!(initial.epoch().to_string(), live.epoch().0.to_string());
+
+        let next = live.next_revision().unwrap();
+        live.publish(next, Config::default()).unwrap();
+        assert_eq!(next.epoch(), initial.epoch());
+        assert_eq!(next.sequence(), 1);
+    }
+
     fn config_with_agent(alias: &str) -> Config {
         let mut config = Config::default();
         config.agents.insert(alias.to_string(), Default::default());
@@ -313,6 +352,38 @@ mod tests {
         assert_eq!(cloned.published_revision(), next);
         assert_eq!(handle.snapshot().agents.len(), 1);
         assert!(handle.snapshot().agents.contains_key("beta"));
+    }
+
+    #[test]
+    fn recursive_read_finishes_while_publication_waits_for_effect_read() {
+        let live = LiveConfig::new(config_with_agent("alpha"));
+        let handle = live.handle();
+        let revision = live.next_revision().unwrap();
+        let held = handle.read();
+        let writer_live = live.clone();
+        let writer = std::thread::spawn(move || {
+            writer_live
+                .publish(revision, config_with_agent("beta"))
+                .unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while live.pair.try_read().is_some() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        let queued = live.pair.try_read().is_none();
+        let (sent, received) = std::sync::mpsc::channel();
+        let reader_handle = handle.clone();
+        let reader = std::thread::spawn(move || {
+            let nested = reader_handle.read_recursive();
+            sent.send(nested.agents.contains_key("alpha")).unwrap();
+        });
+        let captured = received.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        writer.join().unwrap();
+        reader.join().unwrap();
+        assert!(queued, "the publisher reached the real config write lock");
+        assert!(captured.expect("recursive read must not wait behind the effect guard"));
+        assert!(handle.read().agents.contains_key("beta"));
     }
 
     #[test]

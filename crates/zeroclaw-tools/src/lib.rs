@@ -4,31 +4,41 @@ pub mod attribution;
 pub mod helpers;
 pub(crate) mod i18n;
 pub mod inventory;
+#[cfg(feature = "tool-microsoft365")]
 pub mod microsoft365;
 pub mod util_helpers;
 
 pub mod a2a_client;
 pub mod ask_user;
 pub mod backup_tool;
+#[cfg(feature = "tools-external")]
 pub mod browser;
+#[cfg(feature = "tools-external")]
 pub mod browser_delegate;
+#[cfg(feature = "tools-external")]
 pub mod browser_open;
 pub mod calculator;
 pub mod canvas;
 pub mod channel_room;
+#[cfg(feature = "tool-claude-code")]
 pub mod claude_code;
+#[cfg(feature = "tool-claude-code-runner")]
 pub mod claude_code_runner;
 pub mod cli_discovery;
 pub mod cloud_ops;
 pub mod cloud_patterns;
+#[cfg(feature = "tool-codex-cli")]
 pub mod codex_cli;
 pub mod coding_cli;
+#[cfg(feature = "tool-composio")]
 pub mod composio;
 pub mod content_search;
 pub mod data_management;
 pub mod discord_search;
 pub mod email_imap;
+#[cfg(feature = "tools-external")]
 pub mod email_read;
+#[cfg(feature = "tools-external")]
 pub mod email_search;
 pub mod embedded_resource;
 pub mod escalate;
@@ -37,21 +47,27 @@ pub mod file_edit;
 pub mod file_upload;
 pub mod file_upload_bundle;
 pub mod file_write;
+#[cfg(feature = "tool-gemini-cli")]
 pub mod gemini_cli;
 pub mod git_forge;
 pub mod git_operations;
 pub mod glob_search;
+#[cfg(feature = "tool-google-workspace")]
 pub mod google_workspace;
 pub mod hardware_board_info;
 pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 mod http_decode;
 pub mod http_request;
+#[cfg(feature = "tools-external")]
 pub mod image_gen;
 pub mod image_info;
+#[cfg(feature = "tool-jira")]
 pub mod jira_tool;
 pub mod knowledge_tool;
+#[cfg(feature = "tool-linkedin")]
 pub mod linkedin;
+#[cfg(feature = "tool-linkedin")]
 pub mod linkedin_client;
 pub mod llm_task;
 pub mod mcp_client;
@@ -71,28 +87,47 @@ pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
 pub mod node_capabilities;
+#[cfg(feature = "tool-notion")]
 pub mod notion_tool;
+#[cfg(feature = "tool-opencode-cli")]
 pub mod opencode_cli;
 pub mod pipeline;
 pub mod poll;
+#[cfg(feature = "tool-project-intel")]
 pub mod project_intel;
 pub mod proxy_config;
+#[cfg(feature = "tools-external")]
 pub mod pushover;
 pub mod reaction;
+#[cfg(feature = "tool-project-intel")]
 pub mod report_template_tool;
+#[cfg(feature = "tool-project-intel")]
 pub mod report_templates;
+#[cfg(feature = "tools-external")]
 pub mod screenshot;
 pub mod send_via;
+pub mod session_memory;
 pub mod sessions;
+#[cfg(feature = "tools-external")]
 pub mod text_browser;
 pub mod tool_search;
+#[cfg(feature = "tools-external")]
 pub mod weather_tool;
 pub mod web_fetch;
 pub mod web_search_provider_routing;
+#[cfg(feature = "tools-external")]
 pub mod web_search_tool;
 pub mod wrappers;
 
-#[cfg(all(test, unix))]
+#[cfg(all(
+    test,
+    unix,
+    feature = "tool-claude-code",
+    feature = "tool-claude-code-runner",
+    feature = "tool-codex-cli",
+    feature = "tool-gemini-cli",
+    feature = "tool-opencode-cli"
+))]
 mod coding_agent_budget_tests;
 
 pub const MEMORY_TOOL_NAMES: &[&str] = &[
@@ -177,6 +212,56 @@ mod memory_tool_names_guard {
             actual, listed,
             "MEMORY_TOOL_NAMES is out of sync with the constructed memory tools — \
              update the const in zeroclaw-tools/src/lib.rs"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_tool_marker_guard {
+    use std::sync::Arc;
+    use zeroclaw_api::tool::Tool;
+    use zeroclaw_config::policy::SecurityPolicy;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_store::SessionStore;
+
+    /// Every session tool that addresses a session other than the caller's
+    /// own has no ownership check, so it must require an unrestricted
+    /// principal. `sessions_current` reports only the caller's own session.
+    #[test]
+    fn cross_session_tools_require_an_unrestricted_principal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        let security = Arc::new(SecurityPolicy::default());
+        let cross_session: Vec<Box<dyn Tool>> = vec![
+            Box::new(crate::sessions::SessionsListTool::new(backend.clone())),
+            Box::new(crate::sessions::SessionsHistoryTool::new(
+                backend.clone(),
+                security.clone(),
+            )),
+            Box::new(crate::sessions::SessionsSendTool::new(
+                backend.clone(),
+                security.clone(),
+            )),
+            Box::new(crate::sessions::SessionResetTool::new(
+                backend.clone(),
+                security.clone(),
+            )),
+            Box::new(crate::sessions::SessionDeleteTool::new(
+                backend.clone(),
+                security,
+            )),
+        ];
+        for tool in &cross_session {
+            assert!(
+                tool.requires_unrestricted_principal(),
+                "{} must require an unrestricted principal",
+                tool.name()
+            );
+        }
+        let current = crate::sessions::SessionsCurrentTool::new(backend);
+        assert!(
+            !current.requires_unrestricted_principal(),
+            "sessions_current addresses only the caller's own session"
         );
     }
 }

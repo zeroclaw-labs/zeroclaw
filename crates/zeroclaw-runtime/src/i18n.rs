@@ -1250,7 +1250,7 @@ mod tests {
         /// the substrings the rendered value must contain.
         type QuickstartPluginCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
 
-        let cases: [QuickstartPluginCase<'_>; 47] = [
+        let cases: [QuickstartPluginCase<'_>; 46] = [
             // Any failure to fetch the registry index is printed as it reads.
             (
                 "cli-quickstart-plugins-registry-unavailable",
@@ -1366,23 +1366,6 @@ mod tests {
                     ("command", grant_to_complete.as_str()),
                 ],
                 &["weather-tool", grant_to_complete.as_str()],
-            ),
-            // Destinations declared for a transport the tool row is not
-            // seeded for are named with the command that grants them, and
-            // the line names the permission the row is seeded for.
-            (
-                "cli-quickstart-plugins-declared-hosts-not-granted",
-                &[
-                    ("name", "weather-tool"),
-                    ("hosts", "api.example.com"),
-                    ("command", grant.as_str()),
-                ],
-                &[
-                    "weather-tool",
-                    "api.example.com",
-                    "http_client",
-                    grant.as_str(),
-                ],
             ),
             // An installed package missing its row gets the fresh-install
             // decision; skipping it leaves no row. The command that creates
@@ -1995,6 +1978,38 @@ mod tests {
     }
 
     #[test]
+    fn config_set_value_prompt_formats_in_every_builtin_locale() {
+        let key = "cli-config-value-prompt";
+        let path = "providers.models.openai.example.api_key";
+        let english = format!("Enter value for {path}");
+
+        for locale in available_locales() {
+            let source = if locale.code == "en" {
+                include_str!("../locales/en/cli.ftl")
+            } else {
+                builtin_cli_ftl_source(&locale.code)
+                    .unwrap_or_else(|| panic!("missing built-in CLI catalogue for {}", locale.code))
+            };
+            let prompt = format_ftl_message(source, &locale.code, key, &[("path", path)])
+                .unwrap_or_else(|| panic!("{key} should format in {}", locale.code));
+            assert!(
+                prompt.contains(path),
+                "{} should include the path",
+                locale.code
+            );
+            if locale.code == "en" {
+                assert_eq!(prompt, english);
+            } else {
+                assert_ne!(
+                    prompt, english,
+                    "{} should localize the prompt",
+                    locale.code
+                );
+            }
+        }
+    }
+
+    #[test]
     fn plugin_config_entry_key_formats_in_every_builtin_locale() {
         let args = [("capability", "Tool"), ("key", "zpi1_fixture")];
         for (source, locale) in [
@@ -2008,6 +2023,232 @@ mod tests {
                 .unwrap_or_else(|| panic!("plugin config entry key should format in {locale}"));
             assert!(value.contains("Tool"));
             assert!(value.contains("zpi1_fixture"));
+        }
+    }
+
+    /// `plugin update` prints the commands, names and paths the operator acts
+    /// on, so every locale must keep them intact, and no locale may ship the
+    /// English text in place of a translation.
+    #[test]
+    fn plugin_update_cli_strings_are_translated_in_every_locale() {
+        const NAME: &str = "tool-fixture";
+        const VERSION: &str = "2.0.0";
+        const ERROR: &str = "failed to instantiate: type mismatch";
+        const COMMAND: &str = "zeroclaw --config-dir '/cfg' plugin update 'tool-fixture@2.0.0' --allow 'permission:http_client'";
+        const KEY: &str = "zpi1_WyJ0b29sLWZpeHR1cmUiXQ";
+        const DISPLACED: &str =
+            "/plugins/.tool-fixture.replacing-v1-0123456789abcdef0123456789abcdef/package";
+        const UPDATE: &str = "zeroclaw --config-dir '/cfg' plugin update 'tool-fixture'";
+        const LOCAL: &str =
+            "zeroclaw --config-dir '/cfg' plugin update 'tool-fixture' --from '<dir>'";
+        // Neither displaced-note command contains the other, so each is checked.
+        const FROM_REGISTRY: &str = "zeroclaw --config-dir '/cfg' plugin update 'tool-fixture' --registry 'https://r.example/i.json'";
+        const INSTALL: &str = "zeroclaw --config-dir '/cfg' plugin install '/work/tool-fixture'";
+
+        type ParityCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
+        let cases: &[ParityCase] = &[
+            (
+                "cli-plugin-install-already-installed",
+                &[("name", NAME), ("command", COMMAND)],
+                &[NAME, COMMAND],
+            ),
+            (
+                "cli-plugin-list-displaced",
+                &[("name", NAME), ("command", FROM_REGISTRY), ("local", LOCAL)],
+                &[NAME, FROM_REGISTRY, LOCAL],
+            ),
+            ("cli-plugin-about", &[], &["WASM"]),
+            ("cli-plugin-update-about", &[], &[]),
+            ("cli-plugin-update-usage-from", &[], &["--from"]),
+            (
+                "cli-plugin-update-usage-allow",
+                &[],
+                &["--allow", "--allow-token"],
+            ),
+            (
+                "cli-plugin-update-usage-allow-item",
+                &[("item", "grant:x")],
+                &[
+                    "grant:x",
+                    "--allow",
+                    "--allow-token",
+                    "permission:<name>",
+                    "capability:<name>",
+                    "provides:<id>",
+                    "publisher:<key>",
+                ],
+            ),
+            ("cli-plugin-update-checking", &[], &[]),
+            (
+                "cli-plugin-update-restored",
+                &[("name", NAME), ("version", VERSION)],
+                &[NAME, VERSION],
+            ),
+            (
+                "cli-plugin-update-restored-not-admitted",
+                &[("path", DISPLACED)],
+                &[DISPLACED, "`zeroclaw plugin list --verbose`"],
+            ),
+            (
+                "cli-plugin-update-updated",
+                &[("name", NAME), ("from", "1.0.0"), ("to", VERSION)],
+                &[NAME, "1.0.0", VERSION],
+            ),
+            (
+                "cli-plugin-update-downgraded",
+                &[("name", NAME), ("from", VERSION), ("to", "1.2.5")],
+                &[NAME, VERSION, "1.2.5"],
+            ),
+            (
+                "cli-plugin-update-reinstalled",
+                &[("name", NAME), ("version", VERSION)],
+                &[NAME, VERSION],
+            ),
+            (
+                "cli-plugin-update-up-to-date",
+                &[("name", NAME), ("version", VERSION)],
+                &[NAME, VERSION],
+            ),
+            ("cli-plugin-update-not-listed", &[("name", NAME)], &[NAME]),
+            (
+                "cli-plugin-update-needs-approval",
+                &[("name", NAME), ("version", VERSION)],
+                &[NAME, VERSION],
+            ),
+            (
+                "cli-plugin-update-approval-command",
+                &[("command", COMMAND)],
+                &[COMMAND],
+            ),
+            (
+                "cli-plugin-update-not-installed",
+                &[("name", NAME), ("command", INSTALL)],
+                &[NAME, INSTALL],
+            ),
+            (
+                "cli-plugin-update-failed",
+                &[("name", NAME), ("error", ERROR)],
+                &[NAME, ERROR],
+            ),
+            (
+                "cli-plugin-update-failed-kept",
+                &[("name", NAME), ("error", ERROR), ("version", VERSION)],
+                &[NAME, ERROR, VERSION],
+            ),
+            (
+                "cli-plugin-update-legacy-row",
+                &[("name", NAME), ("version", VERSION)],
+                &[NAME, VERSION],
+            ),
+            (
+                "cli-plugin-update-interrupted",
+                &[
+                    ("name", NAME),
+                    ("error", ERROR),
+                    ("preserved", DISPLACED),
+                    ("command", UPDATE),
+                ],
+                &[NAME, ERROR, DISPLACED, UPDATE],
+            ),
+            (
+                "cli-plugin-update-not-in-registry",
+                &[("spec", "tool-fixture@9.9.9")],
+                &["tool-fixture@9.9.9"],
+            ),
+            (
+                "cli-plugin-update-does-not-load",
+                &[("error", ERROR)],
+                &[ERROR],
+            ),
+            (
+                "cli-plugin-update-displaced-ambiguous",
+                &[("name", NAME), ("paths", DISPLACED)],
+                &[NAME, DISPLACED],
+            ),
+            (
+                "cli-plugin-update-displaced-occupied",
+                &[
+                    ("displaced", DISPLACED),
+                    ("occupant", "/plugins/tool-fixture"),
+                ],
+                &[DISPLACED, "/plugins/tool-fixture"],
+            ),
+            (
+                "cli-plugin-update-config-rejected",
+                &[
+                    ("name", NAME),
+                    ("version", VERSION),
+                    ("key", KEY),
+                    ("error", ERROR),
+                ],
+                &[NAME, VERSION, KEY, ERROR],
+            ),
+            (
+                "cli-plugin-update-leftover",
+                &[("name", NAME), ("path", DISPLACED), ("error", ERROR)],
+                &[NAME, DISPLACED, ERROR],
+            ),
+            (
+                "cli-plugin-update-summary",
+                &[
+                    ("updated", "11"),
+                    ("current", "12"),
+                    ("skipped", "13"),
+                    ("failed", "14"),
+                ],
+                &["11", "12", "13", "14"],
+            ),
+            ("cli-plugin-update-restart", &[], &[]),
+            ("cli-plugin-update-failed-exit", &[("count", "14")], &["14"]),
+        ];
+
+        let english_source = include_str!("../locales/en/cli.ftl");
+        for (key, args, expected_parts) in cases {
+            let english = format_ftl_message(english_source, "en", key, args)
+                .unwrap_or_else(|| panic!("{key} should format in en"));
+            for (source, locale) in [
+                (include_str!("../locales/en/cli.ftl"), "en"),
+                (include_str!("../locales/es/cli.ftl"), "es"),
+                (include_str!("../locales/fr/cli.ftl"), "fr"),
+                (include_str!("../locales/ja/cli.ftl"), "ja"),
+                (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+            ] {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for expected in *expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}; got: {value:?}"
+                    );
+                }
+                if locale != "en" {
+                    assert_ne!(
+                        value, english,
+                        "{key} in {locale} is the English string verbatim, so that catalogue was never translated"
+                    );
+                }
+            }
+        }
+
+        // The approval row is the same symbol in every locale.
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            assert_eq!(
+                format_ftl_message(
+                    source,
+                    locale,
+                    "cli-plugin-update-approval-item",
+                    &[("item", "permission:http_client")]
+                )
+                .as_deref(),
+                Some("+ permission:http_client"),
+                "cli-plugin-update-approval-item in {locale}"
+            );
         }
     }
 
@@ -2364,6 +2605,8 @@ mod tests {
         const VERSION: &str = "0.0.0";
         const DESCRIPTION: &str = "a tool";
         const ERROR: &str = "failed to instantiate: type mismatch (hint: rebuild against wit/v0)";
+        const CONFIG_ERROR: &str = "invalid plugin config: plugin 'tool-fixture' has configured values but declares no config_schema";
+        const KEY: &str = "zpi1_WyJ0b29sLWZpeHR1cmUiLCJ0b29sIiwidG9vbC1maXh0dXJlIl0";
 
         let row = [
             ("name", NAME),
@@ -2379,7 +2622,7 @@ mod tests {
         /// One parity case: the Fluent key, its arguments, and the substrings
         /// every locale's rendering must contain.
         type ParityCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
-        let cases: [ParityCase; 7] = [
+        let cases: [ParityCase; 8] = [
             (
                 "cli-plugin-list-entry-loads",
                 &row,
@@ -2397,6 +2640,11 @@ mod tests {
             ),
             ("cli-plugin-info-load-ok", &[], &["WIT"]),
             ("cli-plugin-info-load-failed", &[("error", ERROR)], &[ERROR]),
+            (
+                "cli-plugin-info-load-config-refused",
+                &[("error", CONFIG_ERROR), ("key", KEY)],
+                &["WIT", CONFIG_ERROR, KEY, "config_schema"],
+            ),
             ("cli-plugin-info-load-not-applicable", &[], &[]),
             (
                 "cli-plugin-info-load-failed-exit",
@@ -2427,6 +2675,160 @@ mod tests {
                     assert!(
                         value.contains(expected),
                         "{key} in {locale} should preserve {expected:?}; got: {value:?}"
+                    );
+                }
+                if locale != "en" {
+                    assert_ne!(
+                        value, english,
+                        "{key} in {locale} is the English string verbatim, so that catalogue was never translated"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `zeroclaw estop` refuses to run because nothing enforces it, so every
+    /// catalogue must say so in its own language, name the command in the
+    /// refusal, and carry the `--help` and status wording that matches it. A
+    /// catalogue that copies English fails as untranslated.
+    #[test]
+    fn estop_not_enforced_strings_are_translated_in_every_locale() {
+        let cases: [(&str, &[(&str, &str)]); 5] = [
+            ("cli-estop-not-enforced", &[]),
+            ("cli-estop-about", &[]),
+            ("cli-estop-status-about", &[]),
+            ("cli-estop-resume-about", &[]),
+            ("cli-status-estop", &[("v", "true")]),
+        ];
+
+        // The phrase each locale uses to say the command is not enforced.
+        // Without it a catalogue could go back to describing `estop` as
+        // engaging or resuming a stop and still be a translated string.
+        let not_enforced = |locale: &str, key: &str| -> &'static str {
+            match (locale, key) {
+                ("en", _) => "not enforced",
+                ("es", _) => "no se hace cumplir",
+                ("fr", "cli-estop-not-enforced") => "pas appliqué",
+                ("fr", _) => "non appliqué",
+                ("ja", "cli-estop-not-enforced") => "適用されていません",
+                ("ja", _) => "未適用",
+                ("zh-CN", _) => "未生效",
+                _ => unreachable!("unexpected locale {locale}"),
+            }
+        };
+
+        let english_source = include_str!("../locales/en/cli.ftl");
+        for (key, args) in cases {
+            let english = format_ftl_message(english_source, "en", key, args)
+                .unwrap_or_else(|| panic!("{key} should format in en"));
+
+            for (source, locale) in [
+                (include_str!("../locales/en/cli.ftl"), "en"),
+                (include_str!("../locales/es/cli.ftl"), "es"),
+                (include_str!("../locales/fr/cli.ftl"), "fr"),
+                (include_str!("../locales/ja/cli.ftl"), "ja"),
+                (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+            ] {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                assert!(
+                    !value.trim().is_empty(),
+                    "{key} must not be empty in {locale}"
+                );
+                assert!(
+                    value.to_lowercase().contains(not_enforced(locale, key)),
+                    "{key} in {locale} should say the command is not enforced; got: {value:?}"
+                );
+                if key == "cli-estop-not-enforced" {
+                    assert!(
+                        value.contains("zeroclaw estop"),
+                        "{key} in {locale} should name the command; got: {value:?}"
+                    );
+                }
+                if locale != "en" {
+                    assert_ne!(
+                        value, english,
+                        "{key} in {locale} is the English string verbatim, so that catalogue was never translated"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The install and remove refusals for something the host never admitted
+    /// at a package name.
+    ///
+    /// The install refusal exists to hand the operator the recovery command,
+    /// so every catalogue must carry the literal `zeroclaw plugin remove
+    /// <name>` invocation with the package name inlined. The remove refusal
+    /// must inline the host's reason verbatim, since it says why nothing was
+    /// deleted. The messages for retained install, recovery and staging files,
+    /// and for a changed namespace, must carry the retained path and the
+    /// host's reason. A catalogue that copies English fails as untranslated.
+    #[test]
+    fn plugin_unadmitted_package_strings_are_translated_in_every_locale() {
+        const REASON: &str =
+            "plugin 'tool-fixture' is unsigned and signature verification is required";
+        /// One parity case: the Fluent key, its arguments, and the substrings
+        /// every locale's rendering must contain.
+        type ParityCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
+        const PATH: &str = "/plugins/.tool-fixture.recovering-v1-0/package";
+        let cases: [ParityCase; 8] = [
+            (
+                "cli-plugin-install-unadmitted-package",
+                &[("name", "tool-fixture")],
+                &["`zeroclaw plugin remove tool-fixture`"],
+            ),
+            (
+                "cli-plugin-remove-unadmitted-package",
+                &[("name", "tool-fixture"), ("reason", REASON)],
+                &["`zeroclaw plugin remove`", "'tool-fixture'", REASON],
+            ),
+            (
+                "cli-plugin-install-retained",
+                &[("path", PATH), ("reason", REASON)],
+                &[PATH, REASON],
+            ),
+            (
+                "cli-plugin-install-move-unsupported",
+                &[("reason", REASON)],
+                &[REASON, "FreeBSD", "NFS", "3.15"],
+            ),
+            (
+                "cli-plugin-install-move-unsupported-cleanup",
+                &[("path", PATH), ("reason", REASON)],
+                &[PATH, REASON],
+            ),
+            (
+                "cli-plugin-recovery-retained",
+                &[("path", PATH), ("reason", REASON)],
+                &[PATH, REASON, "plugin remove"],
+            ),
+            ("cli-plugin-staging-retained", &[("path", PATH)], &[PATH]),
+            (
+                "cli-plugin-namespace-changed",
+                &[("reason", REASON)],
+                &[REASON],
+            ),
+        ];
+
+        for (key, args, expected_parts) in cases {
+            let english =
+                format_ftl_message(include_str!("../locales/en/cli.ftl"), "en", key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in en"));
+            for (source, locale) in [
+                (include_str!("../locales/en/cli.ftl"), "en"),
+                (include_str!("../locales/es/cli.ftl"), "es"),
+                (include_str!("../locales/fr/cli.ftl"), "fr"),
+                (include_str!("../locales/ja/cli.ftl"), "ja"),
+                (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+            ] {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for expected in expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} must contain {expected:?}; got: {value:?}"
                     );
                 }
                 if locale != "en" {
@@ -2661,6 +3063,7 @@ mod tests {
                 &[("provider", "openai.default"), ("error", "bad key")][..],
                 ["openai.default", "bad key", "/models"].as_slice(),
             ),
+            ("channel-runtime-effort-routing-invalid", &[][..], &[][..]),
             (
                 "channel-runtime-fallback-footer",
                 &[

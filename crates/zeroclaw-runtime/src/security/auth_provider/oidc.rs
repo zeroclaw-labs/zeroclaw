@@ -18,7 +18,8 @@
 //!   operation must re-verify or fail closed.
 //! - JWKS refresh is bounded: an unknown `kid` may trigger at most one
 //!   fetch per cooldown window, so a stream of bad tokens cannot hammer
-//!   the IdP.
+//!   the IdP. One fetch runs at a time: a check that needs the keys while
+//!   a fetch is in flight waits for that fetch and gets its result.
 //! - Actor class (human vs. service) is declared, never inferred from the
 //!   `sub`/`client_id` relationship: `service_clients` and
 //!   `interactive_clients` classify by verified `client_id`, and
@@ -29,6 +30,7 @@
 //!   claims, unmatched audience — is a denial, never a fallback.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -36,10 +38,13 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use parking_lot::{Mutex, RwLock};
 use serde::Deserialize;
+use tokio::sync::watch;
 use zeroclaw_api::principal::{
     AuthMethod, AuthOutcome, AuthenticatedIdentity, DenyReason, IdentitySubject,
 };
-use zeroclaw_config::schema::{OidcActorKind, OidcConfig, OidcValidation};
+use zeroclaw_config::schema::{
+    DEFAULT_OIDC_CLIENT_ID_CLAIM, OidcActorKind, OidcConfig, OidcValidation,
+};
 
 use super::{AuthProvider, Credential};
 
@@ -126,8 +131,6 @@ struct Claims {
     #[serde(default)]
     exp: Option<u64>,
     #[serde(default)]
-    jti: Option<String>,
-    #[serde(default)]
     iat: Option<u64>,
     #[serde(default)]
     nbf: Option<u64>,
@@ -160,7 +163,7 @@ struct Claims {
 enum VerifiedVia {
     /// Offline JWKS signature validation: the token itself is the only
     /// evidence, so `iss`/`aud`/`exp` are all mandatory.
-    Jwks,
+    Jwks { typed: bool },
     /// A positive verdict from the configured issuer's authenticated
     /// introspection endpoint. The endpoint is the authority, but its
     /// `active` flag alone binds nothing: the response must also carry
@@ -256,7 +259,7 @@ fn oauth_basic_authorization(client_id: &str, secret: &str) -> String {
 /// and every other byte becomes `%XX`. This matches the `x-www-form-urlencoded`
 /// serialization RFC 6749 §2.3.1 (via appendix B) requires for the Basic
 /// credentials.
-fn form_urlencode_component(input: &str) -> String {
+pub(super) fn form_urlencode_component(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for &byte in input.as_bytes() {
         match byte {
@@ -295,6 +298,29 @@ fn audience_matches(aud: Option<&serde_json::Value>, expected: &str) -> bool {
         Some(serde_json::Value::Array(items)) => items.iter().any(|v| v.as_str() == Some(expected)),
         _ => false,
     }
+}
+
+/// Whether `aud` names `expected` and no other audience: the string itself,
+/// or an array holding exactly that one value.
+fn audience_is_exactly(aud: Option<&serde_json::Value>, expected: &str) -> bool {
+    match aud {
+        Some(serde_json::Value::String(s)) => s == expected,
+        Some(serde_json::Value::Array(items)) => {
+            matches!(items.as_slice(), [only] if only.as_str() == Some(expected))
+        }
+        _ => false,
+    }
+}
+
+/// The verified top-level claim `name` when it is a nonblank string. Any
+/// other shape (absent, null, number, object, blank) counts as absent.
+fn nonblank_str_claim<'a>(
+    raw: &'a serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Option<&'a str> {
+    raw.get(name)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -439,24 +465,89 @@ fn verify_signature(header: &JwtHeader, jwk: &Jwk, signed: &str, sig: &[u8]) -> 
     }
 }
 
+async fn discover(
+    http: &reqwest::Client,
+    issuer: &str,
+    alias: &str,
+    cache: &RwLock<Option<Discovery>>,
+) -> anyhow::Result<Discovery> {
+    if let Some(d) = cache.read().clone() {
+        return Ok(d);
+    }
+    let url = format!(
+        "{}/.well-known/openid-configuration",
+        issuer.trim_end_matches('/')
+    );
+    let response = http.get(&url).send().await?.error_for_status()?;
+    let body = read_response_limited(response).await?;
+    let d: Discovery = serde_json::from_slice(&body)?;
+    // The document must assert the issuer we configured, or we fetched
+    // somebody else's metadata (or a spoofed/misrouted endpoint).
+    if d.issuer.as_deref() != Some(issuer) {
+        anyhow::bail!(
+            "discovery document issuer does not match the configured issuer for oidc.{alias}"
+        );
+    }
+    if let Some(uri) = d.jwks_uri.as_deref() {
+        validate_discovered_endpoint(uri, "jwks_uri")?;
+    }
+    if let Some(endpoint) = d.introspection_endpoint.as_deref() {
+        validate_discovered_endpoint(endpoint, "introspection_endpoint")?;
+    }
+    *cache.write() = Some(d.clone());
+    Ok(d)
+}
+
+async fn fetch_jwks(
+    http: &reqwest::Client,
+    issuer: &str,
+    alias: &str,
+    discovery: &RwLock<Option<Discovery>>,
+) -> anyhow::Result<HashMap<String, Jwk>> {
+    let discovery = discover(http, issuer, alias, discovery).await?;
+    let uri = discovery
+        .jwks_uri
+        .ok_or_else(|| anyhow::Error::msg("issuer discovery has no jwks_uri"))?;
+    let response = http.get(&uri).send().await?.error_for_status()?;
+    let body = read_response_limited(response).await?;
+    let set: JwkSet = serde_json::from_slice(&body)?;
+    select_verification_keys(set)
+}
+
+/// Test-only hold point: the next check that finds the key cache stale stops
+/// there until the test releases it.
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct StalePause {
+    reached: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
 pub struct OidcAuthProvider {
     /// Registry selection key: `oidc.<alias>`.
     name: String,
     alias: String,
     config: OidcConfig,
     http: reqwest::Client,
-    discovery: RwLock<Option<Discovery>>,
-    jwks: RwLock<HashMap<String, Jwk>>,
+    discovery: Arc<RwLock<Option<Discovery>>>,
+    jwks: Arc<RwLock<HashMap<String, Jwk>>>,
     /// Earliest moment the next unknown-`kid` JWKS refresh may run.
     jwks_refresh_after: Mutex<Option<Instant>>,
     /// A cached key set becomes stale after this deadline even when its
     /// current token `kid` is known.
-    jwks_fresh_until: Mutex<Option<Instant>>,
+    jwks_fresh_until: Arc<Mutex<Option<Instant>>>,
+    /// The latest JWKS fetch. It holds `None` while the fetch is in flight
+    /// and `Some(fetched)` once it has ended.
+    jwks_fetch: Mutex<Option<watch::Receiver<Option<bool>>>>,
+    /// Test-only: see [`StalePause`].
+    #[cfg(test)]
+    stale_check_pause: Mutex<Option<StalePause>>,
 }
 
 impl OidcAuthProvider {
     pub fn new(alias: impl Into<String>, config: OidcConfig) -> anyhow::Result<Self> {
         let alias = alias.into();
+        config.validate_actor_claim(&alias)?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::none())
@@ -466,10 +557,13 @@ impl OidcAuthProvider {
             alias,
             config,
             http,
-            discovery: RwLock::new(None),
-            jwks: RwLock::new(HashMap::new()),
+            discovery: Arc::new(RwLock::new(None)),
+            jwks: Arc::new(RwLock::new(HashMap::new())),
             jwks_refresh_after: Mutex::new(None),
-            jwks_fresh_until: Mutex::new(None),
+            jwks_fresh_until: Arc::new(Mutex::new(None)),
+            jwks_fetch: Mutex::new(None),
+            #[cfg(test)]
+            stale_check_pause: Mutex::new(None),
         })
     }
 
@@ -484,63 +578,108 @@ impl OidcAuthProvider {
     }
 
     async fn discovery(&self) -> anyhow::Result<Discovery> {
-        if let Some(d) = self.discovery.read().clone() {
-            return Ok(d);
-        }
-        let url = format!(
-            "{}/.well-known/openid-configuration",
-            self.config.issuer.trim_end_matches('/')
-        );
-        let response = self.http.get(&url).send().await?.error_for_status()?;
-        let body = read_response_limited(response).await?;
-        let d: Discovery = serde_json::from_slice(&body)?;
-        // The document must assert the issuer we configured, or we fetched
-        // somebody else's metadata (or a spoofed/misrouted endpoint).
-        if d.issuer.as_deref() != Some(self.config.issuer.as_str()) {
-            anyhow::bail!(
-                "discovery document issuer does not match the configured issuer for oidc.{}",
-                self.alias
-            );
-        }
-        if let Some(uri) = d.jwks_uri.as_deref() {
-            validate_discovered_endpoint(uri, "jwks_uri")?;
-        }
-        if let Some(endpoint) = d.introspection_endpoint.as_deref() {
-            validate_discovered_endpoint(endpoint, "introspection_endpoint")?;
-        }
-        *self.discovery.write() = Some(d.clone());
-        Ok(d)
+        discover(
+            &self.http,
+            &self.config.issuer,
+            &self.alias,
+            &self.discovery,
+        )
+        .await
     }
 
     /// Refresh the JWKS cache, rate-limited to one fetch per cooldown
     /// window. Returns whether a refresh actually ran.
+    ///
+    /// Only one fetch runs at a time. A check that arrives while one is in
+    /// flight waits for it and gets its result, whatever the cooldown says.
+    /// The fetch runs on its own task, so it ends even when the check that
+    /// started it is dropped, and a waiter waits no longer than the fetch's
+    /// own HTTP timeouts allow.
     async fn refresh_jwks_bounded(&self) -> anyhow::Result<bool> {
-        {
-            let mut after = self.jwks_refresh_after.lock();
-            if let Some(after) = *after
-                && Instant::now() < after
-            {
-                return Ok(false);
+        let mut fetch = {
+            let mut latest = self.jwks_fetch.lock();
+            let in_flight = latest
+                .as_ref()
+                .filter(|fetch| fetch.borrow().is_none())
+                .cloned();
+            match in_flight {
+                Some(fetch) => fetch,
+                None => {
+                    {
+                        let mut after = self.jwks_refresh_after.lock();
+                        if let Some(after) = *after
+                            && Instant::now() < after
+                        {
+                            return Ok(false);
+                        }
+                        // Claim the slot before the network call, so a failed
+                        // or slow fetch still counts against the cooldown.
+                        *after = Some(Instant::now() + JWKS_REFRESH_COOLDOWN);
+                    }
+                    let fetch = self.spawn_jwks_fetch();
+                    *latest = Some(fetch.clone());
+                    fetch
+                }
             }
-            // Claim the slot before the network call so concurrent bad
-            // tokens cannot trigger parallel fetch storms.
-            *after = Some(Instant::now() + JWKS_REFRESH_COOLDOWN);
+        };
+        match fetch.wait_for(Option::is_some).await.map(|ended| *ended) {
+            Ok(Some(true)) => Ok(true),
+            _ => Err(anyhow::Error::msg("the JWKS fetch failed")),
         }
-        let discovery = self.discovery().await?;
-        let uri = discovery
-            .jwks_uri
-            .ok_or_else(|| anyhow::Error::msg("issuer discovery has no jwks_uri"))?;
-        let response = self.http.get(&uri).send().await?.error_for_status()?;
-        let body = read_response_limited(response).await?;
-        let set: JwkSet = serde_json::from_slice(&body)?;
-        let next = select_verification_keys(set)?;
-        *self.jwks.write() = next;
-        *self.jwks_fresh_until.lock() = Some(Instant::now() + JWKS_CACHE_TTL);
-        Ok(true)
+    }
+
+    /// Start a JWKS fetch on its own task. The receiver reports whether it
+    /// replaced the cached keys; a fetch that ends early, for example at
+    /// shutdown, reports nothing and counts as failed.
+    fn spawn_jwks_fetch(&self) -> watch::Receiver<Option<bool>> {
+        let (report, fetch) = watch::channel(None);
+        let http = self.http.clone();
+        let issuer = self.config.issuer.clone();
+        let alias = self.alias.clone();
+        let discovery = Arc::clone(&self.discovery);
+        let jwks = Arc::clone(&self.jwks);
+        let fresh_until = Arc::clone(&self.jwks_fresh_until);
+        ::zeroclaw_spawn::spawn!(async move {
+            let fetched = match fetch_jwks(&http, &issuer, &alias, &discovery).await {
+                Ok(next) => {
+                    *jwks.write() = next;
+                    *fresh_until.lock() = Some(Instant::now() + JWKS_CACHE_TTL);
+                    true
+                }
+                Err(_) => false,
+            };
+            report.send_replace(Some(fetched));
+        });
+        fetch
+    }
+
+    #[cfg(test)]
+    async fn hold_after_stale_check(&self) {
+        let pause = self.stale_check_pause.lock().take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
     }
 
     fn cached_key(&self, kid: &str) -> Option<Jwk> {
         self.jwks.read().get(kid).cloned()
+    }
+
+    /// Whether this entry may accept an access token without the RFC 9068
+    /// type. Re-checks the audience separation config validation enforces,
+    /// because a provider can be built from configuration that never went
+    /// through validation.
+    fn accepts_untyped_access_tokens(&self) -> bool {
+        !self.config.require_at_jwt && self.config.audience_shared_with_a_client().is_none()
+    }
+
+    /// The operator-declared claim naming the client, when it replaces the
+    /// RFC 9068 default. JWKS only: introspection answers follow RFC 7662.
+    fn declared_client_id_claim(&self, via: VerifiedVia) -> Option<&str> {
+        (via != VerifiedVia::Introspection
+            && self.config.client_id_claim != DEFAULT_OIDC_CLIENT_ID_CLAIM)
+            .then_some(self.config.client_id_claim.as_str())
     }
 
     fn jwks_is_fresh(&self) -> bool {
@@ -561,17 +700,31 @@ impl OidcAuthProvider {
             Some(h) => h,
             None => return deny(DenyReason::BadCredential),
         };
-        // The bearer profile accepts RFC 9068 typed access tokens only. A
-        // nonce-less ID token is not a safe discriminator.
-        if !is_access_token_type(header.typ.as_deref()) {
+        // The bearer profile accepts RFC 9068 typed access tokens. A
+        // nonce-less ID token is not a safe discriminator, so an untyped
+        // token (no `typ`, or the generic `JWT`) is accepted only when the
+        // operator waived typing AND the audience is one no client signs in
+        // as, which no ID token can carry. Any other type is never an
+        // access token.
+        let typed = is_access_token_type(header.typ.as_deref());
+        let untyped = header
+            .typ
+            .as_deref()
+            .is_none_or(|typ| typ.eq_ignore_ascii_case("JWT"));
+        if !typed && !(untyped && self.accepts_untyped_access_tokens()) {
             return deny(DenyReason::BadCredential);
         }
         let Some(kid) = header.kid.as_deref().filter(|kid| !kid.trim().is_empty()) else {
             return deny(DenyReason::BadCredential);
         };
         if !self.jwks_is_fresh() {
+            #[cfg(test)]
+            self.hold_after_stale_check().await;
             match self.refresh_jwks_bounded().await {
                 Ok(true) => {}
+                // A fetch that ended after this check found the cache stale
+                // may have refreshed it; its cooldown is no reason to refuse.
+                Ok(false) if self.jwks_is_fresh() => {}
                 Ok(false) => return deny(DenyReason::Misconfigured),
                 Err(_) => return deny(DenyReason::Misconfigured),
             };
@@ -603,7 +756,19 @@ impl OidcAuthProvider {
         ) else {
             return deny(DenyReason::BadCredential);
         };
-        self.claims_to_identity(&claims, raw, VerifiedVia::Jwks)
+        // An ID token's `aud` must contain its client and may list other
+        // audiences too (OIDC Core §2), so an untyped token must name the
+        // configured audience and nothing else: an identifier no client
+        // uses, alone, cannot be an ID token's `aud`. A Security Event Token
+        // such as a back-channel logout token may also be typed `JWT`; its
+        // `events` claim marks it as not an access token.
+        if !typed
+            && (!audience_is_exactly(claims.aud.as_ref(), &self.config.audience)
+                || raw.contains_key("events"))
+        {
+            return deny(DenyReason::BadCredential);
+        }
+        self.claims_to_identity(&claims, raw, VerifiedVia::Jwks { typed })
     }
 
     async fn verify_introspection(&self, token: &str) -> AuthOutcome {
@@ -679,22 +844,41 @@ impl OidcAuthProvider {
         }
     }
 
-    /// What the configured `actor_claim` says about this token: presence
-    /// proves the configured kind, absence proves the other. `None` when no
-    /// claim is configured.
-    fn actor_evidence(
+    /// Reconcile the issuer's evidence about this token with the operator's
+    /// declaration about its client. A shared app ID identifies both flows.
+    fn verified_actor(
         &self,
+        client_id: &str,
         raw: &serde_json::Map<String, serde_json::Value>,
+        require_token_evidence: bool,
     ) -> Option<ActorClass> {
-        if self.config.actor_claim.is_empty() {
-            return None;
+        let declared = self.declared_actor(client_id);
+        let path = self.config.actor_claim.as_str();
+        if path.is_empty() {
+            return if require_token_evidence {
+                None
+            } else {
+                declared
+            };
         }
+        let marker = claim_at_path(raw, path);
         let marked = ActorClass::from(self.config.actor_claim_marks);
-        Some(if claim_at_path(raw, &self.config.actor_claim).is_some() {
+        let actor = if !self.config.actor_claim_values.is_empty() {
+            let value = marker?.as_str()?;
+            ActorClass::from(*self.config.actor_claim_values.get(value)?)
+        } else if require_token_evidence {
+            // On the compatibility path only a positive, issuer-specific
+            // human marker establishes a person (e.g. Entra delegated scopes).
+            if marked != ActorClass::Human || marker?.as_str()?.trim().is_empty() {
+                return None;
+            }
+            ActorClass::Human
+        } else if marker.is_some() {
             marked
         } else {
             marked.other()
-        })
+        };
+        declared.is_none_or(|kind| kind == actor).then_some(actor)
     }
 
     /// Shared claim checks + identity assembly. `via` decides which absent
@@ -762,32 +946,72 @@ impl OidcAuthProvider {
             return deny(DenyReason::MfaRequired);
         }
 
-        // A verified client_id is mandatory (RFC 9068 §2.2; the introspection
-        // contract). It keys the operator's actor declarations; the
-        // `sub`/`client_id` relationship is never consulted because
-        // service-token subjects are provider-specific (`<client>@clients`,
-        // a service-account user id, or the client id itself).
-        let Some(client_id) = claims
-            .client_id
-            .as_deref()
-            .filter(|client_id| !client_id.trim().is_empty())
-        else {
+        // RFC 9068 uses client_id; Keycloak also issues typed access tokens
+        // identifying the OAuth client only by signed azp. Accept that narrow
+        // JWKS interoperability spelling after signature/purpose/audience checks,
+        // never from unverified headers or subject shape. Introspection keeps
+        // its required client_id contract. Two contradictory labels fail closed.
+        //
+        // An operator-declared `client_id_claim` (JWKS only) replaces that
+        // default: the declared claim must name the client, it has no `azp`
+        // fallback, and a present `client_id` or `azp` must agree with it
+        // (a blank one disagrees rather than counting as absent).
+        let declared_client_claim = self.declared_client_id_claim(via);
+        let named_client = match declared_client_claim {
+            Some(name) => {
+                let Some(declared) = nonblank_str_claim(&raw, name) else {
+                    return deny(DenyReason::BadCredential);
+                };
+                if [claims.client_id.as_deref(), claims.azp.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|named| named != declared)
+                {
+                    return deny(DenyReason::BadCredential);
+                }
+                Some(declared)
+            }
+            None => claims
+                .client_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty()),
+        };
+        let party = claims.azp.as_deref().filter(|id| !id.trim().is_empty());
+        if named_client
+            .zip(party)
+            .is_some_and(|(client, party)| client != party)
+        {
+            return deny(DenyReason::BadCredential);
+        }
+        let Some(client_id) = named_client.or_else(|| {
+            if via != VerifiedVia::Introspection
+                && declared_client_claim.is_none()
+                && claims.client_id.is_none()
+            {
+                party
+            } else {
+                None
+            }
+        }) else {
             return deny(DenyReason::BadCredential);
         };
-        let actor = match (self.declared_actor(client_id), self.actor_evidence(&raw)) {
-            // Evidence contradicting a declaration is ambiguity: deny rather
-            // than let either side win.
-            (Some(declared), Some(evidence)) if declared != evidence => {
-                return deny(DenyReason::BadCredential);
-            }
-            (Some(declared), _) => declared,
-            // A client declared nowhere is classified by the operator's
-            // actor claim alone (a shared human+machine client).
-            (None, Some(evidence)) => evidence,
-            // No declaration and no claim evidence: nothing positively
-            // establishes the actor class, so the token authenticates nobody.
-            (None, None) => return deny(DenyReason::BadCredential),
+        // RFC 9068 requires a token identifier; the issuer may spell it
+        // differently (`token_id_claim`, JWKS only).
+        if via != VerifiedVia::Introspection
+            && nonblank_str_claim(&raw, &self.config.token_id_claim).is_none()
+        {
+            return deny(DenyReason::BadCredential);
+        }
+        let require_token_evidence =
+            matches!(via, VerifiedVia::Jwks { typed: false }) || declared_client_claim.is_some();
+        let Some(actor) = self.verified_actor(client_id, &raw, require_token_evidence) else {
+            return deny(DenyReason::BadCredential);
         };
+        // The implicit azp fallback is restricted to people. Service tokens
+        // must identify a client through the configured client claim as well.
+        if named_client.is_none() && actor != ActorClass::Human {
+            return deny(DenyReason::BadCredential);
+        }
         let subject = match actor {
             ActorClass::Service => IdentitySubject::Service {
                 issuer: self.config.issuer.clone(),
@@ -810,20 +1034,13 @@ impl OidcAuthProvider {
             .with_claims(raw)
             .with_mfa_verified(mfa_verified);
         match via {
-            VerifiedVia::Jwks => {
+            VerifiedVia::Jwks { .. } => {
                 // The RFC 9068 profile requires iat. Cap lifetime from token
                 // issuance (not from every verification) so an old valid
                 // token cannot be extended indefinitely.
                 let Some(iat) = claims.iat else {
                     return deny(DenyReason::BadCredential);
                 };
-                if claims
-                    .jti
-                    .as_deref()
-                    .is_none_or(|jti| jti.trim().is_empty())
-                {
-                    return deny(DenyReason::BadCredential);
-                }
                 if iat > now.saturating_add(CLOCK_LEEWAY_SECS) {
                     return deny(DenyReason::BadCredential);
                 }
@@ -1455,6 +1672,461 @@ mod tests {
             }
             drop(response);
         }
+    }
+
+    const UNTYPED_JWT_HEADER: &str = r#"{"alg":"ES256","kid":"test-key","typ":"JWT"}"#;
+    const NO_TYP_HEADER: &str = r#"{"alg":"ES256","kid":"test-key"}"#;
+
+    fn is_bad_credential(outcome: &AuthOutcome) -> bool {
+        matches!(
+            outcome,
+            AuthOutcome::Denied {
+                reason: DenyReason::BadCredential
+            }
+        )
+    }
+
+    impl TestIdp {
+        /// JWKS entry that waives RFC 9068 typing: the daemon's own client
+        /// (`zeroclaw-daemon`) differs from the API audience (`zeroclaw`), and
+        /// no declared client is the audience either.
+        fn untyped_config(&self) -> OidcConfig {
+            let mut config = self.config(OidcValidation::Jwks);
+            config.require_at_jwt = false;
+            config.client_id = "zeroclaw-daemon".into();
+            config.actor_claim = "uid".into();
+            config.actor_claim_marks = OidcActorKind::Human;
+            config
+        }
+
+        fn untyped_user_claims(&self) -> serde_json::Value {
+            let mut claims = self.good_claims();
+            claims["uid"] = serde_json::json!("00u-alice");
+            claims
+        }
+    }
+
+    #[tokio::test]
+    async fn untyped_access_tokens_are_refused_while_typing_is_required() {
+        let idp = start_idp().await;
+        let provider = idp.provider(OidcValidation::Jwks);
+        for header in [UNTYPED_JWT_HEADER, NO_TYP_HEADER] {
+            let token = idp.mint_with_header(header, &idp.untyped_user_claims());
+            let outcome = provider.verify(&bearer(token)).await;
+            assert!(is_bad_credential(&outcome), "{header}: {outcome:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn untyped_access_tokens_verify_once_typing_is_waived_for_a_separate_audience() {
+        // Okta (no `typ`) and Entra ID (`typ: JWT`) header shapes.
+        let idp = start_idp().await;
+        let provider = OidcAuthProvider::new("test", idp.untyped_config()).unwrap();
+        for header in [UNTYPED_JWT_HEADER, NO_TYP_HEADER] {
+            let token = idp.mint_with_header(header, &idp.untyped_user_claims());
+            let outcome = provider.verify(&bearer(token)).await;
+            let identity = outcome.identity().unwrap_or_else(|| panic!("{header}"));
+            assert_eq!(
+                identity.subject,
+                IdentitySubject::Oidc {
+                    issuer: idp.issuer.clone(),
+                    subject: "alice".into(),
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn waived_typing_refuses_an_id_token_that_also_lists_the_api_audience() {
+        // OIDC Core §2: an ID token's `aud` MUST contain its client and MAY
+        // list other audiences. A nonce-free ID token naming both the
+        // signing-in client and the API identifier must not pass as an
+        // untyped access token.
+        let idp = start_idp().await;
+        let provider = OidcAuthProvider::new("test", idp.untyped_config()).unwrap();
+        for aud in [
+            serde_json::json!(["zerocode-cli", "zeroclaw"]),
+            serde_json::json!(["zeroclaw", "zerocode-cli"]),
+            serde_json::json!(["zeroclaw", "some-other-api"]),
+            serde_json::json!(["zeroclaw", "zeroclaw"]),
+        ] {
+            let mut claims = idp.untyped_user_claims();
+            claims["aud"] = aud.clone();
+            claims["azp"] = serde_json::json!("zerocode-cli");
+            for header in [UNTYPED_JWT_HEADER, NO_TYP_HEADER] {
+                let token = idp.mint_with_header(header, &claims);
+                let outcome = provider.verify(&bearer(token)).await;
+                assert!(is_bad_credential(&outcome), "{aud} {header}: {outcome:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn waived_typing_accepts_exactly_the_configured_audience_as_string_or_array() {
+        let idp = start_idp().await;
+        let provider = OidcAuthProvider::new("test", idp.untyped_config()).unwrap();
+        for aud in [
+            serde_json::json!("zeroclaw"),
+            serde_json::json!(["zeroclaw"]),
+        ] {
+            let mut claims = idp.untyped_user_claims();
+            claims["aud"] = aud.clone();
+            let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &claims);
+            let outcome = provider.verify(&bearer(token)).await;
+            assert!(outcome.identity().is_some(), "{aud}: {outcome:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_access_tokens_keep_accepting_a_multi_valued_audience() {
+        // RFC 9068 typing already distinguishes the token's purpose, so the
+        // single-audience rule applies only to untyped tokens.
+        let idp = start_idp().await;
+        let provider = idp.provider(OidcValidation::Jwks);
+        let mut claims = idp.good_claims();
+        claims["aud"] = serde_json::json!(["zeroclaw", "some-other-api"]);
+        let outcome = provider.verify(&bearer(idp.mint(claims))).await;
+        assert!(outcome.identity().is_some(), "{outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn waived_typing_still_refuses_other_token_types_and_id_tokens() {
+        let idp = start_idp().await;
+        let provider = OidcAuthProvider::new("test", idp.untyped_config()).unwrap();
+        // A header naming any other JWT type is not an access token.
+        for typ in ["logout+jwt", "dpop+jwt", "secevent+jwt", "JOSE"] {
+            let header = format!(r#"{{"alg":"ES256","kid":"test-key","typ":"{typ}"}}"#);
+            let token = idp.mint_with_header(&header, &idp.untyped_user_claims());
+            let outcome = provider.verify(&bearer(token)).await;
+            assert!(is_bad_credential(&outcome), "typ {typ}: {outcome:?}");
+        }
+        // An untyped ID token: its `aud` is the client it was issued to, and
+        // it echoes the sign-in nonce. Either alone refuses it.
+        let mut id_token = idp.untyped_user_claims();
+        id_token["aud"] = serde_json::json!("zerocode-cli");
+        let mut nonce_only = idp.untyped_user_claims();
+        nonce_only["nonce"] = serde_json::json!("n-0S6_WzA2Mj");
+        for claims in [id_token, nonce_only] {
+            let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &claims);
+            let outcome = provider.verify(&bearer(token)).await;
+            assert!(is_bad_credential(&outcome), "{claims}: {outcome:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn waived_typing_refuses_a_back_channel_logout_token_even_for_the_api_audience() {
+        // OIDC Back-Channel Logout allows a logout token typed `JWT`. It
+        // carries no `nonce`, so its `events` claim is the marker that keeps
+        // it out even when its `aud` happens to be the configured audience.
+        let idp = start_idp().await;
+        let provider = OidcAuthProvider::new("test", idp.untyped_config()).unwrap();
+        let accepted = idp.untyped_user_claims();
+        let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &accepted);
+        assert!(provider.verify(&bearer(token)).await.identity().is_some());
+
+        let mut logout = accepted;
+        logout["sid"] = serde_json::json!("08a5019c-17e1-4977-8f42-65a12843ea02");
+        for events in [
+            serde_json::json!({"http://schemas.openid.net/event/backchannel-logout": {}}),
+            serde_json::json!({}),
+            serde_json::json!(null),
+        ] {
+            logout["events"] = events.clone();
+            for header in [UNTYPED_JWT_HEADER, NO_TYP_HEADER] {
+                let token = idp.mint_with_header(header, &logout);
+                let outcome = provider.verify(&bearer(token)).await;
+                assert!(
+                    is_bad_credential(&outcome),
+                    "{events} {header}: {outcome:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn waived_typing_without_audience_separation_is_refused_by_the_verifier() {
+        // Config validation refuses this entry; the verifier must not rely
+        // on that, since a provider can be built from unvalidated config.
+        let idp = start_idp().await;
+        for client_id in ["", "zeroclaw"] {
+            let mut config = idp.untyped_config();
+            config.client_id = client_id.into();
+            let provider = OidcAuthProvider::new("test", config).unwrap();
+            let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &idp.untyped_user_claims());
+            let outcome = provider.verify(&bearer(token)).await;
+            assert!(is_bad_credential(&outcome), "{client_id:?}: {outcome:?}");
+        }
+        let mut config = idp.untyped_config();
+        config.interactive_clients.push("zeroclaw".into());
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+        let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &idp.untyped_user_claims());
+        assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
+    }
+
+    /// Okta custom authorization server access token: no `typ`, client in
+    /// `cid`, user marker in `uid`, no `client_id`.
+    fn okta_claims(idp: &TestIdp) -> serde_json::Value {
+        let mut claims = idp.untyped_user_claims();
+        let object = claims.as_object_mut().unwrap();
+        object.remove("client_id");
+        object.insert("cid".into(), serde_json::json!("zerocode-cli"));
+        claims
+    }
+
+    #[tokio::test]
+    async fn a_declared_client_id_claim_names_the_client() {
+        let idp = start_idp().await;
+        let mut config = idp.untyped_config();
+        config.client_id_claim = "cid".into();
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+        let token = idp.mint_with_header(NO_TYP_HEADER, &okta_claims(&idp));
+        let outcome = provider.verify(&bearer(token)).await;
+        assert!(outcome.identity().is_some(), "{outcome:?}");
+
+        // Undeclared, the same token names no client and is refused.
+        let provider = OidcAuthProvider::new("test", idp.untyped_config()).unwrap();
+        let token = idp.mint_with_header(NO_TYP_HEADER, &okta_claims(&idp));
+        assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
+    }
+
+    #[tokio::test]
+    async fn a_declared_client_id_claim_contradicted_by_client_id_is_refused() {
+        let idp = start_idp().await;
+        let mut config = idp.untyped_config();
+        config.client_id_claim = "cid".into();
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+        let mut claims = okta_claims(&idp);
+        claims["client_id"] = serde_json::json!("someone-else");
+        let token = idp.mint_with_header(NO_TYP_HEADER, &claims);
+        assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
+    }
+
+    #[tokio::test]
+    async fn a_declared_client_id_claim_contradicted_by_a_present_azp_is_refused() {
+        // A present `azp` must agree with the declared claim; a blank one is
+        // not treated as absent.
+        let idp = start_idp().await;
+        let mut config = idp.untyped_config();
+        config.client_id_claim = "cid".into();
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+        let mut claims = okta_claims(&idp);
+        claims["azp"] = serde_json::json!("zerocode-cli");
+        let token = idp.mint_with_header(NO_TYP_HEADER, &claims);
+        assert!(provider.verify(&bearer(token)).await.identity().is_some());
+        for azp in ["", "  ", "someone-else"] {
+            claims["azp"] = serde_json::json!(azp);
+            let token = idp.mint_with_header(NO_TYP_HEADER, &claims);
+            let outcome = provider.verify(&bearer(token)).await;
+            assert!(is_bad_credential(&outcome), "azp {azp:?}: {outcome:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_declared_client_id_claim_has_no_azp_fallback() {
+        // The Keycloak `azp` fallback applies only to the default claim: an
+        // operator who named the client claim has said where it lives.
+        let idp = start_idp().await;
+        let mut config = idp.untyped_config();
+        config.client_id_claim = "cid".into();
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+        let mut claims = okta_claims(&idp);
+        claims.as_object_mut().unwrap().remove("cid");
+        claims["azp"] = serde_json::json!("zerocode-cli");
+        let token = idp.mint_with_header(NO_TYP_HEADER, &claims);
+        assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
+    }
+
+    /// Entra ID v2.0 app-only (client_credentials) access token: `typ: JWT`,
+    /// client only in `azp`, token id in `uti`, `sub` is the service
+    /// principal's object id.
+    fn entra_service_claims(idp: &TestIdp) -> serde_json::Value {
+        serde_json::json!({
+            "iss": idp.issuer,
+            "sub": "sp-object-id",
+            "aud": "zeroclaw",
+            "exp": now_unix() + 600,
+            "iat": now_unix(),
+            "uti": "entra-token-id",
+            "azp": "batch-app",
+            "ver": "2.0",
+        })
+    }
+
+    #[tokio::test]
+    async fn entra_compatibility_requires_positive_human_evidence() {
+        let idp = start_idp().await;
+        let mut config = idp.untyped_config();
+        config.client_id_claim = "azp".into();
+        config.token_id_claim = "uti".into();
+        config.actor_claim = "scp".into();
+        let provider = OidcAuthProvider::new("test", config.clone()).unwrap();
+
+        let machine = entra_service_claims(&idp);
+        let mut user = machine.clone();
+        user["sub"] = serde_json::json!("employee");
+        user["scp"] = serde_json::json!("reports.read");
+        let outcome = provider
+            .verify(&bearer(idp.mint_with_header(UNTYPED_JWT_HEADER, &user)))
+            .await;
+        assert_eq!(
+            outcome.identity().expect("delegated user").subject,
+            IdentitySubject::Oidc {
+                issuer: idp.issuer.clone(),
+                subject: "employee".into(),
+            }
+        );
+        let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &machine);
+        assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
+
+        // A service declaration cannot supply the missing per-token evidence,
+        // even when the issuer types its token but uses an alternate client claim.
+        config.service_clients = vec!["batch-app".into()];
+        config.actor_claim.clear();
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+        for token in [
+            idp.mint_with_header(UNTYPED_JWT_HEADER, &user),
+            idp.mint(user),
+        ] {
+            assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
+        }
+    }
+
+    fn entra_actor_config(idp: &TestIdp) -> OidcConfig {
+        let mut config = idp.untyped_config();
+        config.client_id_claim = "azp".into();
+        config.token_id_claim = "uti".into();
+        config.actor_claim = "idtyp".into();
+        config.actor_claim_values = HashMap::from([
+            ("app".into(), OidcActorKind::Service),
+            ("user".into(), OidcActorKind::Human),
+        ]);
+        config
+    }
+
+    #[tokio::test]
+    async fn untyped_service_needs_actor_evidence_even_with_the_standard_client_claim() {
+        let idp = start_idp().await;
+        let mut config = idp.untyped_config();
+        config.actor_claim.clear();
+        config.service_clients = vec!["reporting-batch".into()];
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+        let mut claims = idp.good_claims();
+        claims["client_id"] = serde_json::json!("reporting-batch");
+        let typed = provider.verify(&bearer(idp.mint(claims.clone()))).await;
+        assert!(matches!(
+            typed.identity().unwrap().subject,
+            IdentitySubject::Service { .. }
+        ));
+        let untyped = idp.mint_with_header(UNTYPED_JWT_HEADER, &claims);
+        assert!(is_bad_credential(&provider.verify(&bearer(untyped)).await));
+    }
+
+    #[tokio::test]
+    async fn shared_entra_app_gets_only_the_grants_for_its_signed_actor_type() {
+        use crate::security::principal_resolver::PrincipalResolver;
+        use zeroclaw_api::grants::ResolvedGrants;
+
+        let idp = start_idp().await;
+        let provider = OidcAuthProvider::new("test", entra_actor_config(&idp)).unwrap();
+        let mut policy = resolver_policy(&idp, "batch-app");
+        let mut service_grants = ResolvedGrants::none();
+        service_grants
+            .resources
+            .insert(Resource::Config, [Verb::Read].into());
+        policy.profiles.insert("reporter".into(), service_grants);
+        policy
+            .oidc
+            .get_mut("test")
+            .unwrap()
+            .service_profile_map
+            .insert("batch-app".into(), "reporter".into());
+        let resolver = PrincipalResolver::new(policy);
+
+        // Both tokens name the same application and carry the mapped human
+        // role. Only the signed actor type selects the applicable mapping.
+        for (value, subject, actor) in [
+            ("user", "employee", ActorKind::Human),
+            ("app", "sp-object-id", ActorKind::Service),
+        ] {
+            let mut claims = entra_service_claims(&idp);
+            claims["idtyp"] = serde_json::json!(value);
+            claims["sub"] = serde_json::json!(subject);
+            claims["realm_access"] = serde_json::json!({"roles": ["ops"]});
+            let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &claims);
+            let outcome = provider.verify(&bearer(token)).await;
+            let resolved = resolver
+                .resolve(outcome.identity().expect("verified actor"))
+                .unwrap();
+            assert_eq!(resolved.principal.actor, actor);
+            assert_eq!(
+                resolved.grants.permits(Resource::Sessions, Verb::Read),
+                actor == ActorKind::Human
+            );
+            assert_eq!(
+                resolved.grants.permits(Resource::Config, Verb::Read),
+                actor == ActorKind::Service
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_service_declaration_cannot_override_missing_or_conflicting_actor_evidence() {
+        let idp = start_idp().await;
+        let mut config = entra_actor_config(&idp);
+        config.service_clients = vec!["batch-app".into()];
+        let provider = OidcAuthProvider::new("test", config.clone()).unwrap();
+        let mut claims = entra_service_claims(&idp);
+        let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &claims);
+        assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
+        for marker in [
+            serde_json::json!("user"),
+            serde_json::json!("device"),
+            serde_json::json!("APP"),
+            serde_json::json!(null),
+            serde_json::json!(["app"]),
+            serde_json::json!(true),
+        ] {
+            claims["idtyp"] = marker;
+            let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &claims);
+            assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
+        }
+
+        // Even positive service evidence still needs the configured client
+        // claim. The implicit Keycloak azp fallback remains human-only.
+        config.client_id_claim = DEFAULT_OIDC_CLIENT_ID_CLAIM.into();
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+        claims["idtyp"] = serde_json::json!("app");
+        let token = idp.mint_with_header(UNTYPED_JWT_HEADER, &claims);
+        assert!(is_bad_credential(&provider.verify(&bearer(token)).await));
+    }
+
+    #[tokio::test]
+    async fn the_token_id_is_read_from_the_declared_claim_only() {
+        let idp = start_idp().await;
+        let mut uti_only = idp.good_claims();
+        uti_only.as_object_mut().unwrap().remove("jti");
+        uti_only["uti"] = serde_json::json!("entra-token-id");
+
+        let mut config = idp.config(OidcValidation::Jwks);
+        let provider = OidcAuthProvider::new("test", config.clone()).unwrap();
+        assert!(
+            is_bad_credential(&provider.verify(&bearer(idp.mint(uti_only.clone()))).await),
+            "the default `jti` is required"
+        );
+
+        config.token_id_claim = "uti".into();
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+        assert!(
+            provider
+                .verify(&bearer(idp.mint(uti_only)))
+                .await
+                .identity()
+                .is_some()
+        );
+        // Declared `uti`: a token carrying only `jti` lacks the declared id.
+        assert!(is_bad_credential(
+            &provider.verify(&bearer(idp.mint(idp.good_claims()))).await
+        ));
     }
 
     #[tokio::test]
@@ -2140,6 +2812,417 @@ mod tests {
         assert_eq!(after, before + 1, "a stale known kid must refresh");
     }
 
+    /// How the JWKS gate answers a request it holds.
+    enum GateAnswer {
+        /// The fixture's key set, with this status.
+        Keys(u16),
+        /// Nothing at all.
+        Stall,
+        /// The headers and half the body, then nothing more.
+        StallBody,
+    }
+
+    /// A JWKS endpoint under the test's control: it reports each request as
+    /// it arrives and answers only when the test says how.
+    struct JwksGate {
+        arrivals: tokio::sync::mpsc::UnboundedReceiver<()>,
+        answers: tokio::sync::mpsc::UnboundedSender<GateAnswer>,
+        fetches: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl JwksGate {
+        /// Serve `idp`'s key set from the gate, and point its discovery there.
+        async fn start(idp: &TestIdp) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let jwks_uri = format!("http://{}/jwks", listener.local_addr().unwrap());
+            Mock::given(method("GET"))
+                .and(path("/.well-known/openid-configuration"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "issuer": idp.issuer,
+                    "jwks_uri": jwks_uri,
+                })))
+                .with_priority(1)
+                .mount(&idp.server)
+                .await;
+            let body = serde_json::json!({"keys": [public_jwk(&idp.key, "test-key")]}).to_string();
+            let (arrived, arrivals) = tokio::sync::mpsc::unbounded_channel();
+            let (answers, mut answer) = tokio::sync::mpsc::unbounded_channel();
+            let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = Arc::clone(&fetches);
+            ::zeroclaw_spawn::spawn!(async move {
+                // Stalled connections stay open for as long as the gate runs.
+                let mut held = Vec::new();
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(count) => request.extend_from_slice(&buf[..count]),
+                        }
+                    }
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = arrived.send(());
+                    let Some(answer) = answer.recv().await else {
+                        return;
+                    };
+                    let response = match answer {
+                        GateAnswer::Keys(status) => format!(
+                            "HTTP/1.1 {status} Gate\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        ),
+                        GateAnswer::Stall => String::new(),
+                        GateAnswer::StallBody => format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                            body.len(),
+                            &body[..body.len() / 2]
+                        ),
+                    };
+                    // The client may have gone already; its test checks that.
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    held.push(socket);
+                }
+            });
+            Self {
+                arrivals,
+                answers,
+                fetches,
+            }
+        }
+
+        /// Wait until the gate holds a request.
+        async fn arrival(&mut self) {
+            tokio::time::timeout(Duration::from_secs(5), self.arrivals.recv())
+                .await
+                .expect("a JWKS request reaches the gate")
+                .unwrap();
+        }
+
+        fn answer(&self, answer: GateAnswer) {
+            self.answers.send(answer).unwrap();
+        }
+
+        fn fetches(&self) -> usize {
+            self.fetches.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    type Check<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = AuthOutcome> + Send + 'a>>;
+
+    /// Drive `check` until its JWKS request is held at the gate.
+    async fn hold_at_gate(check: &mut Check<'_>, gate: &mut JwksGate) {
+        tokio::select! {
+            outcome = check.as_mut() => panic!("the check ended before its fetch was answered: {outcome:?}"),
+            () = gate.arrival() => {}
+        }
+    }
+
+    /// Poll each check once. A check waiting for the fetch in flight is
+    /// still pending; one that was answered at once is returned.
+    async fn ended_at_once(checks: &mut [Check<'_>]) -> Vec<AuthOutcome> {
+        let mut ended = Vec::new();
+        for check in checks {
+            if let std::task::Poll::Ready(outcome) = futures_util::poll!(check.as_mut()) {
+                ended.push(outcome);
+            }
+        }
+        ended
+    }
+
+    /// Check `credential` once, answering its fetch through the gate.
+    async fn prime(provider: &OidcAuthProvider, credential: &Credential, gate: &mut JwksGate) {
+        let mut check = provider.verify(credential);
+        hold_at_gate(&mut check, gate).await;
+        gate.answer(GateAnswer::Keys(200));
+        assert!(check.await.is_allowed());
+    }
+
+    fn denied(outcome: &AuthOutcome, expected: DenyReason) -> bool {
+        matches!(outcome, AuthOutcome::Denied { reason } if *reason == expected)
+    }
+
+    #[tokio::test]
+    async fn verifications_during_a_jwks_fetch_are_not_refused() {
+        // A fresh provider (every daemon start and config reload builds one)
+        // or an expired cache has to fetch the JWKS. A check made while that
+        // fetch is in flight waits for it instead of being refused, and starts
+        // no fetch of its own.
+        for primed in [false, true] {
+            let idp = start_idp().await;
+            let mut gate = JwksGate::start(&idp).await;
+            let provider = idp.provider(OidcValidation::Jwks);
+            let credential = bearer(idp.mint(idp.good_claims()));
+            if primed {
+                prime(&provider, &credential, &mut gate).await;
+                expire_jwks(&provider);
+            }
+            let mut first = provider.verify(&credential);
+            hold_at_gate(&mut first, &mut gate).await;
+            let mut second = vec![provider.verify(&credential)];
+            let ended = ended_at_once(&mut second).await;
+            assert!(
+                ended.is_empty(),
+                "primed={primed}: the second check did not wait: {ended:?}"
+            );
+            gate.answer(GateAnswer::Keys(200));
+            let (first, second) = tokio::join!(first, second.pop().unwrap());
+            assert!(first.is_allowed(), "primed={primed}: {first:?}");
+            assert!(second.is_allowed(), "primed={primed}: {second:?}");
+            assert_eq!(
+                gate.fetches(),
+                if primed { 2 } else { 1 },
+                "primed={primed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_checks_shares_one_jwks_fetch() {
+        let idp = start_idp().await;
+        let mut gate = JwksGate::start(&idp).await;
+        let provider = idp.provider(OidcValidation::Jwks);
+        let credential = bearer(idp.mint(idp.good_claims()));
+        let mut first = provider.verify(&credential);
+        hold_at_gate(&mut first, &mut gate).await;
+        let mut burst: Vec<_> = (0..31).map(|_| provider.verify(&credential)).collect();
+        let ended = ended_at_once(&mut burst).await;
+        assert!(
+            ended.is_empty(),
+            "{} of 31 did not wait: {:?}",
+            ended.len(),
+            ended[0]
+        );
+        gate.answer(GateAnswer::Keys(200));
+        let (first, mut outcomes) = tokio::join!(first, futures_util::future::join_all(burst));
+        outcomes.push(first);
+        assert!(outcomes.iter().all(AuthOutcome::is_allowed), "{outcomes:?}");
+        assert_eq!(gate.fetches(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_jwks_fetch_denies_every_check_waiting_for_it() {
+        // The expired cache still holds the token's key; no check may fall
+        // back to it when the refresh fails.
+        let idp = start_idp().await;
+        let mut gate = JwksGate::start(&idp).await;
+        let provider = idp.provider(OidcValidation::Jwks);
+        let credential = bearer(idp.mint(idp.good_claims()));
+        prime(&provider, &credential, &mut gate).await;
+        expire_jwks(&provider);
+        let mut first = provider.verify(&credential);
+        hold_at_gate(&mut first, &mut gate).await;
+        let mut waiting: Vec<_> = (0..15).map(|_| provider.verify(&credential)).collect();
+        let ended = ended_at_once(&mut waiting).await;
+        assert!(
+            ended.is_empty(),
+            "{} of 15 did not wait: {:?}",
+            ended.len(),
+            ended[0]
+        );
+        gate.answer(GateAnswer::Keys(503));
+        let (first, mut outcomes) = tokio::join!(first, futures_util::future::join_all(waiting));
+        outcomes.push(first);
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| denied(outcome, DenyReason::Misconfigured)),
+            "{outcomes:?}"
+        );
+        assert_eq!(gate.fetches(), 2, "the priming fetch and one refresh");
+    }
+
+    #[tokio::test]
+    async fn unknown_kids_share_the_fetch_in_flight_then_the_cooldown_holds() {
+        let idp = start_idp().await;
+        let mut gate = JwksGate::start(&idp).await;
+        let provider = idp.provider(OidcValidation::Jwks);
+        prime(&provider, &bearer(idp.mint(idp.good_claims())), &mut gate).await;
+        // Past the priming fetch's cooldown, an unknown kid may fetch once.
+        *provider.jwks_refresh_after.lock() = None;
+        let unknown = bearer(idp.mint_with_header(
+            r#"{"alg":"ES256","kid":"rotated-away","typ":"at+jwt"}"#,
+            &idp.good_claims(),
+        ));
+        let mut first = provider.verify(&unknown);
+        hold_at_gate(&mut first, &mut gate).await;
+        let mut waiting: Vec<_> = (0..15).map(|_| provider.verify(&unknown)).collect();
+        let ended = ended_at_once(&mut waiting).await;
+        assert!(
+            ended.is_empty(),
+            "{} of 15 did not wait: {:?}",
+            ended.len(),
+            ended[0]
+        );
+        gate.answer(GateAnswer::Keys(200));
+        let (first, mut outcomes) = tokio::join!(first, futures_util::future::join_all(waiting));
+        outcomes.push(first);
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| denied(outcome, DenyReason::BadCredential)),
+            "{outcomes:?}"
+        );
+        assert_eq!(gate.fetches(), 2, "the priming fetch and one refresh");
+        // Within the cooldown that fetch claimed, more unknown kids are denied
+        // without a fetch. An answer is queued so a fetch made anyway is
+        // counted rather than stuck.
+        gate.answer(GateAnswer::Keys(200));
+        let outcomes =
+            futures_util::future::join_all((0..16).map(|_| provider.verify(&unknown))).await;
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| denied(outcome, DenyReason::BadCredential)),
+            "{outcomes:?}"
+        );
+        assert_eq!(gate.fetches(), 2, "no fetch during the cooldown");
+    }
+
+    #[tokio::test]
+    async fn a_jwks_fetch_outlives_the_check_that_started_it() {
+        // The check that starts a fetch can be dropped mid-fetch, as when its
+        // client goes away. Checks already waiting and checks arriving after
+        // the drop must neither hang nor be refused, and no second fetch
+        // starts.
+        let idp = start_idp().await;
+        let mut gate = JwksGate::start(&idp).await;
+        let provider = idp.provider(OidcValidation::Jwks);
+        let credential = bearer(idp.mint(idp.good_claims()));
+        let mut starter = provider.verify(&credential);
+        hold_at_gate(&mut starter, &mut gate).await;
+        let mut waiting = vec![provider.verify(&credential)];
+        let ended = ended_at_once(&mut waiting).await;
+        assert!(ended.is_empty(), "an earlier check did not wait: {ended:?}");
+        drop(starter);
+        waiting.push(provider.verify(&credential));
+        let ended = ended_at_once(&mut waiting[1..]).await;
+        assert!(ended.is_empty(), "a later check did not wait: {ended:?}");
+        gate.answer(GateAnswer::Keys(200));
+        let outcomes = tokio::time::timeout(
+            Duration::from_secs(5),
+            futures_util::future::join_all(waiting),
+        )
+        .await
+        .expect("checks waiting on a dropped starter's fetch must not hang");
+        assert!(outcomes.iter().all(AuthOutcome::is_allowed), "{outcomes:?}");
+        assert_eq!(gate.fetches(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_check_that_saw_the_cache_stale_as_a_fetch_ended_is_not_refused() {
+        // A check finds the cache stale; before it reaches the fetch, another
+        // check's fetch ends and refreshes the cache. It must use the fresh
+        // cache, not be refused by the cooldown that fetch claimed.
+        for primed in [false, true] {
+            let idp = start_idp().await;
+            let mut gate = JwksGate::start(&idp).await;
+            let provider = idp.provider(OidcValidation::Jwks);
+            let credential = bearer(idp.mint(idp.good_claims()));
+            if primed {
+                prime(&provider, &credential, &mut gate).await;
+                expire_jwks(&provider);
+            }
+            let pause = StalePause::default();
+            *provider.stale_check_pause.lock() = Some(pause.clone());
+            let mut late = provider.verify(&credential);
+            assert!(
+                futures_util::poll!(late.as_mut()).is_pending(),
+                "primed={primed}: the late check is held after finding the cache stale"
+            );
+            pause.reached.notified().await;
+            let mut first = provider.verify(&credential);
+            hold_at_gate(&mut first, &mut gate).await;
+            gate.answer(GateAnswer::Keys(200));
+            let first = first.await;
+            assert!(first.is_allowed(), "primed={primed}: {first:?}");
+            // An answer is queued so a second fetch is counted rather than stuck.
+            gate.answer(GateAnswer::Keys(200));
+            pause.release.notify_one();
+            let late = tokio::time::timeout(Duration::from_secs(5), late)
+                .await
+                .expect("the late check must not hang");
+            assert!(late.is_allowed(), "primed={primed}: {late:?}");
+            assert_eq!(
+                gate.fetches(),
+                if primed { 2 } else { 1 },
+                "primed={primed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_key_fetch_denies_every_check_within_the_client_timeout() {
+        // A check waits as long as the fetch in flight, and the provider's HTTP
+        // client timeout bounds that fetch (15 s per request, so about 30 s
+        // when discovery isn't cached yet). The test shortens it to 300 ms.
+        for stall in ["jwks headers", "jwks body", "discovery"] {
+            let idp = start_idp().await;
+            let mut gate = None;
+            if stall == "discovery" {
+                Mock::given(method("GET"))
+                    .and(path("/.well-known/openid-configuration"))
+                    .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+                    .with_priority(1)
+                    .mount(&idp.server)
+                    .await;
+            } else {
+                gate = Some(JwksGate::start(&idp).await);
+            }
+            let provider = OidcAuthProvider {
+                http: reqwest::Client::builder()
+                    .timeout(Duration::from_millis(300))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .unwrap(),
+                ..idp.provider(OidcValidation::Jwks)
+            };
+            let credential = bearer(idp.mint(idp.good_claims()));
+            let mut first = provider.verify(&credential);
+            if let Some(gate) = gate.as_mut() {
+                hold_at_gate(&mut first, gate).await;
+                gate.answer(if stall == "jwks body" {
+                    GateAnswer::StallBody
+                } else {
+                    GateAnswer::Stall
+                });
+            } else {
+                assert!(futures_util::poll!(first.as_mut()).is_pending(), "{stall}");
+            }
+            let mut waiting: Vec<_> = (0..7).map(|_| provider.verify(&credential)).collect();
+            let ended = ended_at_once(&mut waiting).await;
+            assert!(ended.is_empty(), "{stall}: did not wait: {ended:?}");
+            let (first, mut outcomes) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(first, futures_util::future::join_all(waiting))
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{stall}: a stalled fetch must end at the client timeout"));
+            outcomes.push(first);
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|outcome| denied(outcome, DenyReason::Misconfigured)),
+                "{stall}: {outcomes:?}"
+            );
+            let requests = idp.server.received_requests().await.unwrap();
+            let discoveries = requests
+                .iter()
+                .filter(|request| request.url.path() == "/.well-known/openid-configuration")
+                .count();
+            assert_eq!(discoveries, 1, "{stall}: one discovery request");
+            let jwks_fetches = gate.as_ref().map_or(0, JwksGate::fetches)
+                + requests
+                    .iter()
+                    .filter(|request| request.url.path() == "/jwks")
+                    .count();
+            assert_eq!(
+                jwks_fetches,
+                usize::from(stall != "discovery"),
+                "{stall}: JWKS requests"
+            );
+        }
+    }
+
     #[test]
     fn discovered_endpoints_require_https_or_exact_loopback() {
         assert!(validate_discovered_endpoint("https://idp.example.com/jwks", "jwks_uri").is_ok());
@@ -2610,5 +3693,166 @@ mod tests {
             PrincipalResolver::new(human_only_policy).resolve(&service_identity),
             Err(DenyReason::NotEntitled)
         ));
+    }
+    #[tokio::test]
+    async fn signed_keycloak_azp_identifies_the_declared_client_without_client_id() {
+        let idp = start_idp().await;
+        let provider = idp.provider(OidcValidation::Jwks);
+        let mut claims = idp.good_claims();
+        claims.as_object_mut().unwrap().remove("client_id");
+        claims["azp"] = serde_json::json!("zerocode-cli");
+        assert!(
+            provider
+                .verify(&bearer(idp.mint(claims.clone())))
+                .await
+                .is_allowed()
+        );
+        for client in ["undeclared-client", ""] {
+            claims["azp"] = serde_json::json!(client);
+            assert!(
+                !provider
+                    .verify(&bearer(idp.mint(claims.clone())))
+                    .await
+                    .is_allowed()
+            );
+        }
+        claims["azp"] = serde_json::json!("zerocode-cli");
+        claims["client_id"] = serde_json::json!("another-client");
+        assert!(
+            !provider
+                .verify(&bearer(idp.mint(claims.clone())))
+                .await
+                .is_allowed()
+        );
+        claims["client_id"] = serde_json::json!("");
+        assert!(
+            !provider
+                .verify(&bearer(idp.mint(claims)))
+                .await
+                .is_allowed()
+        );
+    }
+    #[tokio::test]
+    async fn azp_does_not_replace_the_introspection_client_id_contract() {
+        let idp = start_idp().await;
+        let provider = idp.provider(OidcValidation::Introspection);
+        let mut raw = idp.good_claims();
+        raw.as_object_mut().unwrap().remove("client_id");
+        raw["azp"] = serde_json::json!("zerocode-cli");
+        let claims: Claims = serde_json::from_value(raw.clone()).unwrap();
+        assert!(
+            !provider
+                .claims_to_identity(
+                    &claims,
+                    raw.as_object().unwrap().clone(),
+                    VerifiedVia::Introspection
+                )
+                .is_allowed()
+        );
+    }
+    /// Exercise the verifier and the real resolver together, with a privileged
+    /// service mapping that would make accidental service classification useful.
+    async fn assert_azp_only_cannot_receive_service_grants(
+        idp: &TestIdp,
+        config: OidcConfig,
+        mut claims: serde_json::Value,
+    ) {
+        use crate::security::principal_resolver::PrincipalResolver;
+        use zeroclaw_api::grants::ResolvedGrants;
+
+        let mut policy = resolver_policy(idp, "reporting-batch");
+        let mut service_grants = ResolvedGrants::none();
+        service_grants
+            .resources
+            .insert(Resource::Config, [Verb::Read].into());
+        policy
+            .profiles
+            .insert("service-reader".into(), service_grants);
+        policy
+            .oidc
+            .get_mut("test")
+            .unwrap()
+            .service_profile_map
+            .insert("reporting-batch".into(), "service-reader".into());
+        let resolver = PrincipalResolver::new(policy);
+        let provider = OidcAuthProvider::new("test", config).unwrap();
+
+        // A genuine client_id service token still receives its service grants.
+        claims["client_id"] = serde_json::json!("reporting-batch");
+        claims["azp"] = serde_json::json!("reporting-batch");
+        let control = provider.verify(&bearer(idp.mint(claims.clone()))).await;
+        let service = resolver
+            .resolve(control.identity().expect("client_id service verifies"))
+            .expect("client_id service resolves");
+        assert_eq!(service.principal.actor, ActorKind::Service);
+        assert!(service.grants.permits(Resource::Config, Verb::Read));
+
+        // Same signed token/role/subject, only missing client_id: azp must not
+        // reach the service profile regardless of how the actor was classified.
+        claims.as_object_mut().unwrap().remove("client_id");
+        let outcome = provider.verify(&bearer(idp.mint(claims))).await;
+        let resolved = outcome
+            .identity()
+            .ok_or(DenyReason::BadCredential)
+            .and_then(|identity| resolver.resolve(identity));
+        assert!(
+            matches!(resolved, Err(DenyReason::BadCredential)),
+            "azp-only token must never acquire service grants: {resolved:?}"
+        );
+        assert!(matches!(
+            outcome,
+            AuthOutcome::Denied {
+                reason: DenyReason::BadCredential
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn azp_only_service_client_cannot_resolve_to_service_grants() {
+        let idp = start_idp().await;
+        let mut config = idp.config(OidcValidation::Jwks);
+        config.service_clients = vec!["reporting-batch".into()];
+        assert_azp_only_cannot_receive_service_grants(&idp, config, idp.good_claims()).await;
+    }
+
+    #[tokio::test]
+    async fn azp_only_actor_claim_service_cannot_resolve_to_service_grants() {
+        let idp = start_idp().await;
+        for marks in [OidcActorKind::Service, OidcActorKind::Human] {
+            let mut config = idp.config(OidcValidation::Jwks);
+            config.actor_claim = "actor_marker".into();
+            config.actor_claim_marks = marks;
+            let mut claims = idp.good_claims();
+            // Service classification can come from presence OR absence.
+            if matches!(marks, OidcActorKind::Service) {
+                claims["actor_marker"] = serde_json::json!("service");
+            }
+            assert_azp_only_cannot_receive_service_grants(&idp, config, claims).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn azp_only_human_still_resolves_through_the_human_profile_map() {
+        use crate::security::principal_resolver::PrincipalResolver;
+        let idp = start_idp().await;
+        for actor_claim in [false, true] {
+            let mut config = idp.config(OidcValidation::Jwks);
+            if actor_claim {
+                config.interactive_clients.clear();
+                config.actor_claim = "actor_marker".into();
+                config.actor_claim_marks = OidcActorKind::Service;
+            }
+            let provider = OidcAuthProvider::new("test", config).unwrap();
+            let mut claims = idp.good_claims();
+            claims.as_object_mut().unwrap().remove("client_id");
+            claims["azp"] = serde_json::json!("zerocode-cli");
+            let outcome = provider.verify(&bearer(idp.mint(claims))).await;
+            let resolved = PrincipalResolver::new(resolver_policy(&idp, "reporting-batch"))
+                .resolve(outcome.identity().expect("azp-only human verifies"))
+                .expect("human resolves");
+            assert_eq!(resolved.principal.actor, ActorKind::Human);
+            assert!(resolved.grants.permits(Resource::Sessions, Verb::Read));
+            assert!(!resolved.grants.permits(Resource::Config, Verb::Read));
+        }
     }
 }

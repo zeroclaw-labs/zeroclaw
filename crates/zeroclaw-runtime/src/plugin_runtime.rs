@@ -725,13 +725,81 @@ fn decide_tool_binding(
             ToolInstanceAdmission::PackageNotATool,
         ));
     }
-    Ok(ToolBindingDecision::Candidate(
-        PluginInstanceScope::for_package_binding(
-            manifest,
-            PluginCapability::Tool,
-            manifest.permissions.iter().copied(),
-        )?,
-    ))
+    Ok(ToolBindingDecision::Candidate(tool_binding_scope(
+        manifest,
+    )?))
+}
+
+/// The scope the plan admits a package's default tool instance under: the
+/// package binding, holding every permission the manifest requests.
+#[cfg(feature = "plugins-wasm")]
+fn tool_binding_scope(
+    manifest: &zeroclaw_plugins::PluginManifest,
+) -> Result<PluginInstanceScope, PluginError> {
+    PluginInstanceScope::for_package_binding(
+        manifest,
+        PluginCapability::Tool,
+        manifest.permissions.iter().copied(),
+    )
+}
+
+/// The runtime's verdict on the configuration of one installed package's
+/// default tool instance.
+#[cfg(feature = "plugins-wasm")]
+#[derive(Debug)]
+pub enum ToolConfigVerdict {
+    /// The config resolver accepts the instance's configuration.
+    Accepted,
+    /// The manifest does not declare the tool capability, so the runtime
+    /// builds no tool instance of the package.
+    NotATool,
+    /// The config resolver refuses it, so the runtime skips the tool.
+    Refused {
+        /// Name of the `[[plugins.entries]]` row the configuration is read from.
+        instance_key: String,
+        /// The resolver's refusal, as the runtime records it when it skips
+        /// the tool.
+        error: PluginError,
+    },
+}
+
+/// Whether the runtime accepts the configuration of `manifest`'s default tool
+/// instance under `config`.
+///
+/// The runtime resolves a tool instance's configuration before it runs any
+/// guest code, and skips the tool when that fails. This runs the same
+/// resolution, [`crate::tools::resolve_instance_config`], under the scope the
+/// plan's tool pass admits. A report of whether a tool loads, such as
+/// `plugin info`, asks this so it gives the runtime's answer for the
+/// configuration as well as for the component.
+///
+/// Like [`tool_instance_admission`], this is guest-free and describes `config`
+/// as given. It does not consult `plugins.enabled`, `plugins.auto_discover` or
+/// the instance ceiling: those decide whether the instance is admitted, this
+/// decides whether an admitted instance's configuration is accepted.
+///
+/// # Errors
+///
+/// Returns the plan's own error when the instance identity cannot be formed.
+#[cfg(feature = "plugins-wasm")]
+pub fn tool_instance_config_verdict(
+    config: &Config,
+    manifest: &zeroclaw_plugins::PluginManifest,
+) -> Result<ToolConfigVerdict, PluginError> {
+    if !manifest.capabilities.contains(&PluginCapability::Tool) {
+        return Ok(ToolConfigVerdict::NotATool);
+    }
+    let scope = tool_binding_scope(manifest)?;
+    let instance_key = scope.id().config_entry_key()?;
+    let resolved =
+        crate::tools::resolve_instance_config(manifest, &scope, &instance_key, || config);
+    Ok(match resolved {
+        Ok(_) => ToolConfigVerdict::Accepted,
+        Err(error) => ToolConfigVerdict::Refused {
+            instance_key,
+            error,
+        },
+    })
 }
 
 /// Names of the admitted packages whose default tool binding the plan can
@@ -1923,6 +1991,114 @@ mod tests {
         // Not vacuous: the cases reach every verdict a package can get, so
         // agreement is shown for each one.
         assert_eq!(reached.len(), 6, "every verdict is reached");
+    }
+
+    /// The config verdict is the runtime's own: for each set of rows a tool
+    /// instance can meet, it gives the answer of the config resolver the
+    /// runtime constructs tools with, with the same message and the row it
+    /// read. Both run one function, so this pins that they keep doing so.
+    #[test]
+    fn tool_config_verdict_agrees_with_the_runtime_config_resolver() {
+        let plugins = TempDir::new().unwrap();
+        let write = |name: &str, capability: &str, extra: &str| {
+            let plugin_dir = plugins.path().join(name);
+            std::fs::create_dir_all(&plugin_dir).unwrap();
+            std::fs::write(
+                plugin_dir.join("manifest.toml"),
+                format!(
+                    "name = \"{name}\"\nversion = \"0.1.0\"\nwasm_path = \"plugin.wasm\"\ncapabilities = [\"{capability}\"]\n{extra}"
+                ),
+            )
+            .unwrap();
+            std::fs::write(plugin_dir.join("plugin.wasm"), b"not a component").unwrap();
+        };
+        write("schemaless", "tool", "permissions = []\n");
+        write(
+            "labelled",
+            "tool",
+            "permissions = [\"config_read\"]\n\
+             config_schema = { type = \"object\", additionalProperties = false, \
+             properties = { label = { type = \"string\" } } }\n",
+        );
+        write("relay", "channel", "permissions = []\n");
+        // `config_read` without a schema never reaches either path: package
+        // admission refuses it, so no host loads it.
+        write("readless", "tool", "permissions = [\"config_read\"]\n");
+        let host = Arc::new(PluginHost::from_plugins_dir(plugins.path()).unwrap());
+        assert!(host.manifest("readless").is_none());
+
+        let values = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect()
+        };
+        /// The package, the `config` maps of the rows under its instance key
+        /// (none, one, or a duplicate pair), and whether the runtime accepts
+        /// them.
+        type Case = (&'static str, Vec<HashMap<String, String>>, bool);
+        let cases: [Case; 7] = [
+            // Values left on the row for a package without a schema.
+            ("schemaless", vec![values(&[("label", "masked")])], false),
+            ("schemaless", vec![HashMap::new()], true),
+            ("schemaless", Vec::new(), true),
+            ("labelled", vec![values(&[("label", "masked")])], true),
+            ("labelled", vec![values(&[("colour", "red")])], false),
+            ("labelled", Vec::new(), true),
+            ("labelled", vec![HashMap::new(), HashMap::new()], false),
+        ];
+        for (package, rows, accepted) in cases {
+            let manifest = host.manifest(package).unwrap();
+            let scope = tool_binding_scope(manifest).unwrap();
+            let key = scope.id().config_entry_key().unwrap();
+            let mut config = Config::default();
+            for row in &rows {
+                config
+                    .plugins
+                    .entries
+                    .push(zeroclaw_config::schema::PluginEntryConfig {
+                        name: key.clone(),
+                        config: row.clone(),
+                        ..zeroclaw_config::schema::PluginEntryConfig::default()
+                    });
+            }
+            let runtime = crate::tools::plugin_host_services(
+                Arc::clone(&host),
+                Arc::new(config.clone()),
+                None,
+            )
+            .resolve_config(&scope)
+            .map(drop);
+
+            match (
+                tool_instance_config_verdict(&config, manifest).unwrap(),
+                runtime,
+            ) {
+                (ToolConfigVerdict::Accepted, Ok(())) => {
+                    assert!(accepted, "{package} {rows:?}: both accept");
+                }
+                (
+                    ToolConfigVerdict::Refused {
+                        instance_key,
+                        error,
+                    },
+                    Err(runtime),
+                ) => {
+                    assert!(!accepted, "{package} {rows:?}: both refuse");
+                    assert_eq!(instance_key, key, "the refusal names the row it read");
+                    assert_eq!(error.to_string(), runtime.to_string());
+                }
+                (verdict, runtime) => {
+                    panic!("{package} {rows:?}: verdict {verdict:?}, runtime {runtime:?}")
+                }
+            }
+        }
+
+        let relay = host.manifest("relay").unwrap();
+        assert!(matches!(
+            tool_instance_config_verdict(&Config::default(), relay).unwrap(),
+            ToolConfigVerdict::NotATool
+        ));
     }
 
     #[test]

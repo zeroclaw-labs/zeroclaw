@@ -9,6 +9,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from urllib.parse import unquote
 
 
 INLINE_LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
@@ -53,7 +54,7 @@ def _local_target(raw: str, source: Path) -> str | None:
     path = target.split("#", 1)[0].split("?", 1)[0]
     if not path:
         return None
-    resolved = os.path.normpath(os.path.join(source.parent.as_posix(), path))
+    resolved = os.path.normpath(os.path.join(source.parent.as_posix(), unquote(path)))
     return resolved if resolved != "." else None
 
 

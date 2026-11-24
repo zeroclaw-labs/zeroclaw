@@ -53,19 +53,10 @@ const KNOWN_UPDATE_EXTRA_TARGETS: &[(&str, &str)] = &[
 
 /// Published targets `src/commands/update.rs target_triple_for` cannot emit.
 ///
-/// The musl entries are more severe than ordinary unsupported targets: the
-/// updater currently maps those hosts to the corresponding glibc triples
-/// because its resolver has no libc input. The follow-up updater PR must make
-/// libc part of resolution before it consumes this canonical registry.
+/// Musl Linux hosts are resolved via `cfg!(target_env = "musl")` and are no
+/// longer listed here. Remaining entries need architecture/OS match arms in a
+/// follow-up updater change.
 const KNOWN_UPDATE_MISSING_TARGETS: &[(&str, &str)] = &[
-    (
-        "x86_64-unknown-linux-musl",
-        "update.rs has no libc input and mis-resolves x86_64 musl hosts to the glibc target; the follow-up updater PR must detect libc",
-    ),
-    (
-        "aarch64-unknown-linux-musl",
-        "update.rs has no libc input and mis-resolves aarch64 musl hosts to the glibc target; the follow-up updater PR must detect libc",
-    ),
     (
         "armv7-unknown-linux-gnueabihf",
         "update.rs receives the generic arm architecture and returns no target; the follow-up updater PR must distinguish supported ARM variants",
@@ -146,20 +137,34 @@ struct MatrixEntry {
     experimental: bool,
 }
 
-/// Parses the single `matrix.include` block of the release workflow into its
-/// entries, keyed by the fields this registry mirrors.
+/// Parses the `build` job's `matrix.include` block of the release workflow
+/// into its entries, keyed by the fields this registry mirrors. Other jobs
+/// carry include blocks of their own (the per-target plugin smoke runs one
+/// leg per archive), so the parser scopes itself to the job that produces
+/// the archives.
 fn release_matrix_entries(workflow: &str) -> Vec<MatrixEntry> {
     let lines: Vec<&str> = workflow.lines().collect();
-    let include_lines: Vec<usize> = lines
+    let build_index = lines
+        .iter()
+        .position(|line| *line == "  build:")
+        .expect("release workflow has no top-level build job");
+    let build_end = lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| line.trim() == "include:")
+        .skip(build_index + 1)
+        .find(|(_, line)| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with('#') && indent_of(line) <= 2
+        })
         .map(|(index, _)| index)
+        .unwrap_or(lines.len());
+    let include_lines: Vec<usize> = (build_index..build_end)
+        .filter(|index| lines[*index].trim() == "include:")
         .collect();
     assert_eq!(
         include_lines.len(),
         1,
-        "expected exactly one matrix include block in the release workflow"
+        "expected exactly one matrix include block in the release build job"
     );
     let include_index = include_lines[0];
     let include_indent = indent_of(lines[include_index]);

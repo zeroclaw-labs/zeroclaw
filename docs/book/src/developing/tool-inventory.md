@@ -20,6 +20,21 @@ The runtime registry source of truth is
 `all_tools_with_runtime`, and `register_skill_tools_with_context_and_runtime`.
 The shared tool implementations live primarily under `crates/zeroclaw-tools/`.
 
+## Default model-visible selection
+
+The canonical minimal selection is `CORE_TOOL_NAMES` in
+`crates/zeroclaw-config/src/builtin_tools.rs`: eleven built-ins, narrowed by
+existing agent and caller policy. The default, `[tools].optional = ["*"]`, is
+full; under minimal, additional built-ins must be named in `[tools].optional`
+before construction. See [Minimal and full tools](../tools/overview.md#minimal-and-full-tools)
+for compiled availability and recovery instructions. Configured plugins, MCP
+servers, skills and peripherals keep their own activation and permission paths.
+
+The buckets below describe implementation ownership and possible future homes.
+They do not declare either model catalog or authorize removing an existing
+implementation. `git_operations` remains in the approved eleven while its
+long-term classification and replacement-first requirements remain below.
+
 ## Classification Buckets
 
 | Bucket | Meaning | Next action |
@@ -56,6 +71,8 @@ product integrations.
 | `model_routing_config`, `model_switch`, `proxy_config` | These expose the current model/proxy routing control plane and should not drift from config-source behavior. |
 | `TodoWrite` | Maintains the agent's structured task list inside the runtime tool surface; keep its stable tool name and lifecycle behavior in core. |
 | `read_skill` and skill-defined tools with `kind = "shell"`, `kind = "http"`, or `kind = "builtin"` | Skills are an intended extension surface, but the runtime bridge that turns installed skills into tools is core. |
+
+`model_routing_config upsert_agent` is a partial-update surface: omitted agent, risk-profile, and runtime-profile fields remain unchanged, and its dirty-path save preserves unrelated TOML values and comments. Explicit risk or runtime controls isolate the named agent's profile before mutation rather than changing a shared profile. Because same-risk automatic delegation compares profile names, isolating an explicit risk-profile change can remove that implicit relationship with former profile peers; configure the peers as explicit delegates when that reach should remain. The tool refuses to modify an older on-disk schema until `zeroclaw config migrate` updates it. The tool still writes outside config-commit admission, so runtime publication and same-path concurrent-writer coordination remain separate concerns.
 
 ## Feature-Gate Candidates
 

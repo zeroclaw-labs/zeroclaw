@@ -15,7 +15,7 @@ Common failure mode this guide targets:
 If Matrix appears connected but there's no reply, validate these first:
 
 1. Sender is in the agent's peer set (for testing: `external_peers = ["*"]`).
-2. Bot account has joined the exact target room.
+2. Bot account has joined the exact target room: invite it from your client, see [Adding the bot to a room](#adding-the-bot-to-a-room). With only `*` in the peer set and an empty `allowed_rooms`, the invite is declined: add your own user ID next to `*` (`external_peers = ["*", "@you:example.org"]`).
 3. Credentials belong to the bot account (`whoami` check on the token path, see [§5C](#c-token-and-identity)).
 4. Encrypted room can be decrypted: `recovery_key` set (recommended) or keys shared to the bot device.
 5. Daemon was restarted after config changes.
@@ -24,11 +24,39 @@ If Matrix appears connected but there's no reply, validate these first:
 
 Before testing message flow:
 
-1. The bot account is joined to the target room.
+1. The bot account is joined to the target room (see [Adding the bot to a room](#adding-the-bot-to-a-room)).
 2. Credentials authenticate the bot account: either `user_id` + `password` (recommended, see [§2](#2-configuration)) or an `access_token` (token path, [§3](#3-token-path-alternative-obtaining-access_token-and-device_id)).
 3. `allowed_rooms` includes the target room (or is empty to allow all rooms the bot has joined). Entries are matched literally against the canonical room ID (`!room:server`) of each incoming message, so list canonical room IDs here: ZeroClaw does **not** resolve a `#alias:server` entry for this allowlist. (Aliases are resolved only for outbound delivery targets such as cron `delivery.to`.) Find a room's canonical ID in its client (in Element: Room settings → Advanced → Internal room ID).
 4. A peer group authorizes the sender (`external_peers = ["*"]` for open testing, see [§6](#b-sender-allowlist-peer-groups)).
 5. For E2EE rooms, the bot can decrypt: a `recovery_key` (recommended) restores keys automatically, or keys are shared to the bot device manually.
+
+### Adding the bot to a room
+
+Invite the bot's user ID (for example `@zeroclaw:example.org`) to the room
+from any Matrix client, the same way you would invite a person (in Element:
+room info → People → Invite). A direct message works the same way: start a
+DM with the bot's user ID. While the daemon is running, ZeroClaw accepts the
+invite and joins the room on its own.
+
+ZeroClaw accepts an invite only when both of these hold, which are the same
+checks it applies to every inbound message:
+
+- The **inviter** is in the agent's peer set ([Who can talk to the agent](#who-can-talk-to-the-agent)).
+- The room is listed in `allowed_rooms`, or `allowed_rooms` is empty.
+
+When `allowed_rooms` is empty, there is one more condition: the inviter must
+be **named** in the peer set. A `*` grant lets anyone talk to the bot in rooms
+it is already in, but it does not let anyone choose new rooms for it.
+Otherwise, with `external_peers = ["*"]` and no room allowlist, any Matrix user
+on any federated homeserver could pull the bot into a room of their choosing.
+To use invites with an open peer set, name the inviters alongside `*` (for
+example `external_peers = ["*", "@you:example.org"]`) or list the target rooms
+in `allowed_rooms`.
+
+Any other invite is declined silently: it stays pending in the room, and the
+inviter gets no rejection. ZeroClaw does not retry it later, so after fixing
+the peer set or `allowed_rooms`, cancel the pending invite and send a new one
+(see [§5A](#a-room-and-membership)).
 
 ## 2. Configuration
 
@@ -153,7 +181,7 @@ Work through in order.
 
 ### A. Room and membership
 
-- Confirm the bot account has joined the room.
+- Confirm the bot account has joined the room. If the bot's invite is still pending, ZeroClaw declined it: the inviter is not in the peer set, the room is not in a non-empty `allowed_rooms`, or the inviter is admitted only by `*` while `allowed_rooms` is empty. Declined invites are not retried. Fix the config, restart the daemon, then cancel the pending invite and invite the bot again. With debug logging on ([§6](#6-debug-logging)), each declined invite logs `matrix: decline invite from non-allowed sender or room` with the inviter and room ID. An invite declined because only `*` admits the inviter logs `matrix: decline invite admitted only by wildcard peer grant` at the default (info) level.
 - If you put a room in `allowed_rooms`, it must be the **canonical** room ID (`!room:server`), not a `#alias:server`. Aliases are not resolved for the allowlist, so an alias entry silently matches nothing. Find the canonical ID in Element via Room settings → Advanced → Internal room ID.
 
 ### B. Sender allowlist (peer groups)
@@ -417,7 +445,7 @@ RUST_LOG=zeroclaw::channels::matrix=debug,matrix_sdk_crypto=debug zeroclaw daemo
 - **Spoken replies:** with `tts.enabled` and the owning agent's `tts_provider` set, a reply is synthesized and posted as a voice note *alongside* its text, in the same thread, so the room keeps a searchable transcript either way. Which replies get spoken is decided by configuration, never guessed from the reply text:
   - A sender in a `[peer_groups.*]` group with `output_modality = "voice"` on this channel. Matrix peers are named by user ID (`@user:server`, the form `peer-groups.toml` documents), matched case-insensitively with a leading `@` optional, and `["*"]` covers everyone. Both the reply path and the proactive path below accept the same shapes. Room IDs belong in `allowed_rooms` and are never peer identities.
   - Proactive delivery (cron `delivery.to`, announcements) has no sender to consult, so a target room is voiced when one of its joined members belongs to such a group.
-  - `output_modality = "mirror"`, the default, replies in kind: a voice message gets the text reply plus a voice note, a text message gets text only. The choice is made per message from the inbound event's voice flag (`org.matrix.msc3245.voice`), never from the transcript or from earlier messages in the room, so one sender's voice note cannot voice another sender's reply. A `text` group is always text-only. Because `mirror` is the default, a group that never set `output_modality` answers voice messages with a voice note alongside the text as soon as TTS is configured; set `output_modality = "text"` to keep text-only replies.
+  - `output_modality = "mirror"`, the default, replies in kind: a voice message gets the text reply plus a voice note, a text message gets text only. The choice is made per message from the inbound event's voice flag (`org.matrix.msc3245.voice`), never from the transcript or from earlier messages in the room, so one sender's voice note cannot voice another sender's reply. With `[channels] debounce_ms` set, messages combined into one turn are answered in the modality of the first of them. A `text` group is always text-only. Because `mirror` is the default, a group that never set `output_modality` answers voice messages with a voice note alongside the text as soon as TTS is configured; set `output_modality = "text"` to keep text-only replies.
 - **Outbound voice markers:** the agent can also emit `[voice:<url|path>]` explicitly, which uploads that file as a voice note whatever the peer group says.
 - **Acknowledgement reactions:** controlled by `channels.matrix.ack_reactions` (default `true`). When on, the bot reacts with 👀 while processing and ✅ when done. Set to `false` to keep rooms reaction-free.
 - **Persistent sessions:** on first successful login, ZeroClaw writes `~/.zeroclaw/state/matrix/session.json` (user_id + device_id + access_token + optional refresh_token). Subsequent restarts call `restore_session()` from that blob: no re-login. The matrix-rust-sdk SQLite crypto store lives alongside it at `~/.zeroclaw/state/matrix/store/`. **Once `session.json` exists, rotating `access_token` in config has no effect until the file is deleted**: the saved token wins. Delete `session.json` to force a re-login from config values.
