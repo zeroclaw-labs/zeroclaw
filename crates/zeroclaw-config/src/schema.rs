@@ -2960,10 +2960,9 @@ model = "gpt-5.4-mini"
             .unwrap();
         assert_eq!(selected.upstream_model(), Some("gpt-5.4-mini"));
         assert_eq!(selected.selection.connection.kind(), "cheaperinference");
-        assert_eq!(
-            selected.selection.connection.uri(),
-            Some(CheaperInferenceEndpoint::DEFAULT_URI)
-        );
+        // The fixed endpoint remains a factory default; migration must not
+        // duplicate it into an otherwise unset connection URI.
+        assert_eq!(selected.selection.connection.uri(), None);
         assert!(config.providers.models.cheaperinference.is_empty());
 
         let encoded = toml::to_string(&config).unwrap();
