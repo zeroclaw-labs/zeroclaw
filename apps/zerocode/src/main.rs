@@ -207,6 +207,20 @@ struct Cli {
     enroll_port: Option<u16>,
 }
 
+impl Cli {
+    fn initial_reconnect_state(&self) -> app::SharedReconnectState {
+        // Shared state that survives a reconnect. Quickstart's Stage 2 writes
+        // the new agent's alias here so the recovering app loop drops the user
+        // into Chat. The startup flag uses the same Immediate handoff.
+        Arc::new(std::sync::Mutex::new(app::CrossReconnectState {
+            pending_quickstart_chat: self
+                .agent
+                .clone()
+                .map(app::PendingQuickstartChat::Immediate),
+        }))
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Sign in through the remote gateway and save a URL-scoped OIDC login.
@@ -894,6 +908,12 @@ async fn run() -> anyhow::Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let local_config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
+    // A missing file is created with defaults inside `ensure_and_load`. An
+    // existing file that cannot be read or parsed must not fall back: defaults
+    // have no saved remote connection, so the next step would talk to (or
+    // spawn) a local daemon instead of the operator's chosen target.
+    // InvalidSavedLogin is already fail-closed; other load errors must not
+    // start with empty defaults either.
     let loaded_config = match config::ensure_and_load(&local_config_dir) {
         Ok(cfg) => cfg,
         Err(e) if e.downcast_ref::<config::InvalidSavedLogin>().is_some() => {
@@ -901,8 +921,7 @@ async fn run() -> anyhow::Result<()> {
             return Err(e);
         }
         Err(e) => {
-            eprintln!("zerocode: config load failed ({e:#}); starting with defaults");
-            config::ZerocodeConfig::default()
+            return Err(anyhow::Error::msg(format!("config load failed ({e:#})")));
         }
     };
     let resolved_locale = loaded_config
@@ -1321,6 +1340,7 @@ async fn run() -> anyhow::Result<()> {
         &local_config_dir,
         owned_daemon_pid,
         initial_leg,
+        cli.initial_reconnect_state(),
         #[cfg(unix)]
         shutdown_signals
             .as_mut()
@@ -1344,14 +1364,9 @@ async fn run_until_exit(
     config_dir: &std::path::Path,
     owned_daemon_pid: Option<u32>,
     initial_leg: ActiveLeg,
+    reconnect_state: app::SharedReconnectState,
     #[cfg(unix)] shutdown_signals: &mut ShutdownSignals,
 ) -> anyhow::Result<()> {
-    // Shared state that survives a reconnect. Quickstart's Stage 2 writes
-    // the new agent's alias here so the recovering `app::run` loop drops
-    // the user into Chat once the daemon is back up.
-    let reconnect_state: app::SharedReconnectState =
-        Arc::new(std::sync::Mutex::new(app::CrossReconnectState::default()));
-
     let label = target.label();
     let insecure_tls = target.insecure_tls();
 
@@ -2779,6 +2794,18 @@ mod connection_tests {
             before,
             "a refused lock must leave the file unchanged"
         );
+    }
+
+    #[test]
+    fn agent_short_and_long_flags_parse() {
+        let short = Cli::parse_from(["zerocode", "-a", "chiefofstaff"]);
+        assert_eq!(short.agent.as_deref(), Some("chiefofstaff"));
+
+        let long = Cli::parse_from(["zerocode", "--agent", "scout"]);
+        assert_eq!(long.agent.as_deref(), Some("scout"));
+
+        let omitted = Cli::parse_from(["zerocode"]);
+        assert!(omitted.agent.is_none());
     }
 
     #[test]
