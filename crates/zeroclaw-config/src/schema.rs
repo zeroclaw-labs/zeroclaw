@@ -723,6 +723,7 @@ pub struct Config {
     /// Operator-managed Remote Files resources. Configuring an endpoint grants no access.
     #[serde(default, skip_serializing_if = "RemoteFilesConfig::is_empty")]
     #[nested]
+    #[group = "Storage"]
     pub remote_files: RemoteFilesConfig,
 
     /// Plugin system configuration (`[plugins]`).
