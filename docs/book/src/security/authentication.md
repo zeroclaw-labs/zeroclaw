@@ -818,6 +818,10 @@ What a signed-in account can do follows its permission profile:
     open it. Use zerocode when an account needs history that outlasts its
     chat.
 
+Completing sign-in in one dashboard tab tells the other open dashboard
+tabs to check their session. A tab showing the sign-in screen then opens
+the dashboard. Ordinary reloads keep other tabs quiet.
+
 Sign-out ends the session in this ZeroClaw and drops its cookie, also
 when the session had already ended; it does not sign the user out of the
 identity provider. When a session ends (sign-out, expiry, or a
