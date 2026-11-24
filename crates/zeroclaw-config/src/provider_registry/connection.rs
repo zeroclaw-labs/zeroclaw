@@ -702,6 +702,7 @@ provider_connections! {
     Astrai(HttpChatConnection) = "astrai" [Chat],
     Avian(HttpChatConnection) = "avian" [Chat],
     Deepmyst(HttpChatConnection) = "deepmyst" [Chat],
+    CheaperInference(HttpChatConnection) = "cheaperinference" [Chat],
     Venice(HttpChatConnection) = "venice" [Chat],
     Nearai(HttpChatConnection) = "nearai" [Chat],
     Novita(HttpChatConnection) = "novita" [Chat],

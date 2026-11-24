@@ -7323,6 +7323,15 @@ model_provider = "gemini.work"
                 PropKind::Float => current
                     .parse::<f64>()
                     .map_or_else(|_| "1.5".to_string(), |x| (x + 0.5).to_string()),
+                // V5 admission parses the retired decision endpoint while
+                // deriving its native protocol path. Keep the layout probe
+                // a valid URL rather than testing malformed input here.
+                PropKind::String
+                    if field.name.starts_with("decision_models.")
+                        && field.name.ends_with(".base_url") =>
+                {
+                    "https://decision-probe.invalid".to_string()
+                }
                 // A provider reference is current content only in the dotted
                 // `<family>.<alias>` form; a bare one is the form the older
                 // layouts' migration completes.

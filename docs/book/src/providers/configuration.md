@@ -216,15 +216,18 @@ Family-specific entries add their own typed fields on top of these shared fields
 
 The chat `options` object accepts two ordinary boolean extraction switches:
 
-- `extract_text_reasoning`: remove `<think>...</think>` blocks from textual content. When omitted, the historical semantic-empty handling remains active; set it to `false` only when the literal tags must be preserved. `minimax` and `groq` opt in by default because their documented output formats can carry inline reasoning. Native reasoning fields are unaffected.
+- `extract_text_reasoning`: remove `<think>...</think>` blocks in the shared response normalizer. When omitted, the historical semantic-empty handling remains active. An explicit `false` preserves tags that reach this boundary, subject to the native adapter limits below. `minimax` and `groq` opt in by default because their documented output formats can carry inline reasoning. Native reasoning fields are unaffected.
 - `extract_text_tool_calls`: recognize XML/JSON tool-call envelopes in textual content. Defaults to `false`, with the adapter-specific defaults below. Native structured tool calls are unaffected.
 
 | Connection kind | Reasoning extraction | Text tool-call extraction |
 | --- | --- | --- |
 | `minimax` | `true` | `false` |
 | `groq` | `true` | `true` |
-| `ollama`, `hailo_ollama`, `gemini`, `gemini_cli`, `grok_cli`, `kilocli`, `venice`, `atomic_chat` | `false` | `true` |
-| All other kinds, including `openai`, `openai-compatible`, `vllm`, `deepseek`, and `qwen` | `false` | `false` |
+| `ollama`, `hailo_ollama`, `gemini`, `gemini_cli`, `grok_cli`, `kilocli`, `venice`, `atomic_chat` | unset | `true` |
+| All other kinds, including `openai`, `openai-compatible`, `vllm`, `deepseek`, and `qwen` | unset | `false` |
+
+Unset reasoning policy preserves historical normalization; it is distinct from
+an explicit `extract_text_reasoning = false` opt-out.
 
 Text tool-call defaults preserve the listed adapters' current prompt-guided
 tool protocol. They do not imply that the upstream lacks native function
@@ -237,6 +240,14 @@ extractor explicitly in its options or preset.
 Both fields can be shared through `providers.model_presets.<id>.options`, set as
 connection defaults in `api.chat.options`, and overridden in each chat model's
 `options`. They accept `true` or `false`; the `"null"` sentinel is not supported.
+
+Native adapter limits: Ollama's non-streaming adapter still removes inline think
+tags before this shared boundary and can use its separate `thinking` field when
+ordinary content is empty. The native OpenAI scalar completion path still
+rejects reasoning-only text as a semantic-empty response. Setting
+`extract_text_reasoning = false` does not override those earlier adapter rules
+or recover content they have already removed.
+
 The former runtime-profile `strict_tool_parsing` setting has been removed.
 V4 migration transfers this policy to the models used by each agent, including
 reachable effort and classifier routes. Non-strict agents retain text tool
@@ -423,7 +434,9 @@ For most families, the URL is resolved in this order:
 2. **Family endpoint**: the family's `*Endpoint` enum supplies the URL (e.g. `OpenAIEndpoint::Default` -> `https://api.openai.com/v1`). Multi-region families have an `extra.endpoint` field on the connection entry that picks the variant (e.g. `extra.endpoint = "cn"` for Moonshot).
 3. **Templated families**: Azure takes typed inputs (`resource`, `deployment`, `api_version`) and substitutes them into the family's URI template. Missing fields fail loud at runtime.
 
-Bedrock is an exception: its endpoint hostname is constructed at request time from the signing region resolved through the AWS credential chain (`AWS_REGION`, `AWS_DEFAULT_REGION`, or the `region` from the active `credential_process` or IMDS profile). A canonical `providers.connections.<name>.extra.region` overrides that region for both Bearer-token routing and SigV4 signing. The legacy `uri` alias field and `providers.connections.<connection>.extra.region` field have no effect.
+Gemini now honors the alias `uri` for both OAuth project discovery and generation. Older versions ignored this override for Gemini and Bedrock; remove any stale `uri` from those entries before upgrading if you intend to keep using the default service endpoint.
+
+Bedrock uses the connection `uri` as an optional service-root override and appends the model's Converse path. Without an override, its endpoint hostname is constructed at request time from the signing region resolved through the AWS credential chain (`AWS_REGION`, `AWS_DEFAULT_REGION`, or the `region` from the active `credential_process` or IMDS profile). A canonical `providers.connections.<name>.extra.region` overrides that region for both Bearer-token routing and SigV4 signing. A URI override does not change the signing region.
 
 ## Family slots
 

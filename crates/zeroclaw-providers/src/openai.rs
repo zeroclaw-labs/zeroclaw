@@ -1129,7 +1129,8 @@ impl OpenAiResponsesBuilder {
         self
     }
 
-    /// Override the total HTTP request timeout, including streaming. Values of 0 are
+    /// Override the HTTP request timeout for non-streaming calls. Streaming calls
+    /// retain an independent read-idle bound without a total deadline. Values of 0 are
     /// ignored (the default 120 s is kept) so a stray `Some(0)` from
     /// config cannot silently disable the safety timeout — same guard
     /// applied by [`OpenAiBuilder::timeout_secs`],
