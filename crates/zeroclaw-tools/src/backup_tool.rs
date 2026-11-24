@@ -1441,6 +1441,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backup_restores_unicode_paths_and_binary_bytes_with_exact_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let binary_path = Path::new("config").join("资料 space").join("[draft]🦀.bin");
+        let text_path = Path::new("memory").join("偏好.md");
+        let binary = b"\x00\xff\x80\n\r\\\"";
+        let text = "中文 e\u{301}\n\n🦀\r\n".as_bytes();
+        std::fs::create_dir_all(tmp.path().join(binary_path.parent().unwrap())).unwrap();
+        std::fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        std::fs::write(tmp.path().join(&binary_path), binary).unwrap();
+        std::fs::write(tmp.path().join(&text_path), text).unwrap();
+        let tool = make_tool(&tmp);
+
+        let created = tool.execute(json!({"command": "create"})).await.unwrap();
+        assert!(created.success, "{:?}", created.error);
+        let created: serde_json::Value = serde_json::from_str(&created.output).unwrap();
+        assert_eq!(created["file_count"], 2);
+        let name = created["backup"].as_str().unwrap();
+        let archive = tmp.path().join("backups").join(name);
+        assert_eq!(std::fs::read(archive.join(&binary_path)).unwrap(), binary);
+        assert_eq!(std::fs::read(archive.join(&text_path)).unwrap(), text);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(archive.join("manifest.json")).unwrap()).unwrap();
+        // Fixed SHA-256 values for the literal fixtures, independent of the manifest writer.
+        assert_eq!(
+            manifest,
+            json!({
+                "config/资料 space/[draft]🦀.bin": "90d4f813605c074b284de8606df52214273aa245bca677043616d2009798d612",
+                "memory/偏好.md": "fde24f6991ececf2465a263365f8bdd06edd4aa209c9bf32522bb284cd2a32d1"
+            })
+        );
+
+        let verified = tool
+            .execute(json!({"command": "verify", "backup_name": name}))
+            .await
+            .unwrap();
+        assert!(verified.success, "{:?}", verified.error);
+        std::fs::write(tmp.path().join(&binary_path), b"changed").unwrap();
+        std::fs::remove_file(tmp.path().join(&text_path)).unwrap();
+        let restored = tool
+            .execute(json!({
+                "command": "restore", "backup_name": name, "confirm": true
+            }))
+            .await
+            .unwrap();
+        assert!(restored.success, "{:?}", restored.error);
+        assert_eq!(
+            std::fs::read(tmp.path().join(&binary_path)).unwrap(),
+            binary
+        );
+        assert_eq!(std::fs::read(tmp.path().join(&text_path)).unwrap(), text);
+    }
+
+    #[tokio::test]
     async fn create_backup_produces_manifest() {
         let tmp = TempDir::new().unwrap();
         // Seed workspace subdirectories.
