@@ -360,6 +360,58 @@ Rule 3: Protect the user.
         assert_eq!(count, 0);
     }
 
+    #[tokio::test]
+    async fn unicode_core_memory_survives_export_and_fresh_workspace_recovery() {
+        use crate::{Memory, MemoryCategory};
+
+        let source = TempDir::new().unwrap();
+        let recovered = TempDir::new().unwrap();
+        let key = "preference_中文🦀";
+        let content = "中文 e\u{301}\n\nsecond paragraph 🦀";
+        let memory = SqliteMemory::new("default", source.path()).unwrap();
+        memory
+            .store(key, content, MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        memory
+            .store(
+                "conversation",
+                "not exported",
+                MemoryCategory::Conversation,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(memory.count().await.unwrap(), 2);
+        drop(memory);
+
+        assert_eq!(export_snapshot(source.path()).unwrap(), 1);
+        let snapshot = fs::read_to_string(snapshot_path(source.path())).unwrap();
+        assert!(snapshot.contains(key));
+        assert!(snapshot.contains(content));
+        assert!(!snapshot.contains("not exported"));
+        fs::copy(
+            snapshot_path(source.path()),
+            snapshot_path(recovered.path()),
+        )
+        .unwrap();
+        assert!(should_hydrate(recovered.path()));
+        assert_eq!(hydrate_from_snapshot(recovered.path()).unwrap(), 1);
+
+        let conn = Connection::open(recovered.path().join("memory/brain.db")).unwrap();
+        let row: (String, String, String) = conn
+            .query_row("SELECT key, content, category FROM memories", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(row, (key.into(), content.into(), "core".into()));
+        let count: usize = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(!should_hydrate(recovered.path()));
+    }
+
     #[test]
     fn export_decode_failure_does_not_replace_snapshot() {
         let tmp = TempDir::new().unwrap();

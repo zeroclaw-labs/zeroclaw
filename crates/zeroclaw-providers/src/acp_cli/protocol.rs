@@ -1,11 +1,13 @@
-//! Internal bounded one-shot ACP client for `grok agent stdio`.
+//! Bounded one-shot ACP client for CLI agents that speak ACP over stdio.
 //!
-//! The wire sequence follows Grok Build's documented example:
-//! initialize → authenticate → session/new → session/prompt. Assistant text
-//! arrives in `session/update` notifications. Every input frame and aggregate
-//! byte count is bounded before allocation grows. Server permission requests
-//! follow the explicit per-alias policy supplied by the provider and otherwise
-//! select reject-once so the tool fails closed.
+//! The wire sequence is initialize → authenticate → session/new →
+//! session/prompt. Assistant text arrives in `session/update` notifications.
+//! Every input frame and aggregate byte count is bounded before allocation
+//! grows. Server permission requests follow the explicit per-alias policy
+//! supplied by the provider and otherwise select reject-once so the tool fails
+//! closed. Authentication method selection is provider-owned: the caller
+//! supplies a selector that maps the `initialize` result to `authenticate`
+//! params.
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -22,27 +24,25 @@ use zeroclaw_api::jsonrpc::{
 
 /// Maximum size of one newline-delimited JSON-RPC frame.
 ///
-/// Bounded independently of Grok's published CLI limits so a single oversized
-/// NDJSON line cannot grow without bound. See the Grok Build sandbox/settings
-/// reference for the agent subprocess model:
-/// <https://docs.x.ai/build/settings/reference>
+/// Bounded independently of any agent's published CLI limits so a single
+/// oversized NDJSON line cannot grow without bound.
 const MAX_ACP_FRAME_BYTES: usize = 1_048_576;
 
 /// Default aggregate stdout budget consumed during one ACP request (4 MiB).
 ///
 /// Caps protocol frames plus native-tool updates for one one-shot turn. Alias
 /// `max_acp_stdout_bytes` may raise this up to [`MAX_ACP_STDOUT_LIMIT_BYTES`].
-pub(super) const DEFAULT_ACP_STDOUT_LIMIT_BYTES: usize = 4_194_304;
+pub(crate) const DEFAULT_ACP_STDOUT_LIMIT_BYTES: usize = 4_194_304;
 
 /// The aggregate stdout budget must admit at least one valid ACP frame.
-pub(super) const MIN_ACP_STDOUT_LIMIT_BYTES: usize = MAX_ACP_FRAME_BYTES;
+pub(crate) const MIN_ACP_STDOUT_LIMIT_BYTES: usize = MAX_ACP_FRAME_BYTES;
 
 /// Keep a configured transport budget bounded even for tool-heavy aliases (64 MiB).
-pub(super) const MAX_ACP_STDOUT_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_ACP_STDOUT_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 /// How the headless ACP client answers interactive permission requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum AcpPermissionPolicy {
+pub(crate) enum AcpPermissionPolicy {
     RejectOnce,
     AllowOnce,
 }
@@ -59,23 +59,24 @@ impl AcpPermissionPolicy {
 /// Maximum assistant text returned to the channel/runtime.
 const MAX_ACP_ASSISTANT_BYTES: usize = 1_048_576;
 
-/// Grok's published example waits for two stable 150 ms intervals after the
-/// prompt response so trailing `session/update` chunks are not lost.
+/// Wait for two stable 150 ms intervals after the prompt response so trailing
+/// `session/update` chunks are not lost (the shape of Grok Build's published
+/// ACP example).
 const OUTPUT_SETTLE_INTERVAL: Duration = Duration::from_millis(150);
 const OUTPUT_SETTLE_INTERVALS: usize = 2;
 
-/// One content block sent to Grok Build's ACP `session/prompt` endpoint.
+/// One content block sent to the agent's ACP `session/prompt` endpoint.
 ///
 /// Keep this representation typed until the JSON-RPC boundary so image bytes
 /// cannot accidentally be embedded in a text block.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum AcpPromptContent {
+pub(crate) enum AcpPromptContent {
     Text(String),
     Image { data: String, mime_type: String },
 }
 
 impl AcpPromptContent {
-    pub(super) fn image_from_data_uri(data_uri: &str) -> Option<Self> {
+    pub(crate) fn image_from_data_uri(data_uri: &str) -> Option<Self> {
         let (header, data) = data_uri.trim().split_once(',')?;
         let mime_type = header
             .strip_prefix("data:")?
@@ -102,65 +103,106 @@ impl AcpPromptContent {
 }
 
 #[derive(Debug, Error)]
-pub(super) enum AcpError {
-    #[error("Grok ACP transport failed while writing {phase}")]
+pub(crate) enum AcpError {
+    #[error("ACP transport failed while writing {phase}")]
     Write { phase: &'static str },
-    #[error("Grok ACP transport failed while reading {phase}")]
+    #[error("ACP transport failed while reading {phase}")]
     Read { phase: &'static str },
-    #[error("Grok ACP process closed before {phase} completed")]
+    #[error("ACP process closed before {phase} completed")]
     Closed { phase: &'static str },
-    #[error("Grok ACP stdout frame exceeded {limit} bytes")]
+    #[error("ACP stdout frame exceeded {limit} bytes")]
     FrameLimit { limit: usize },
-    #[error("Grok ACP outbound frame exceeded {limit} bytes")]
+    #[error("ACP outbound frame exceeded {limit} bytes")]
     OutboundFrameLimit { limit: usize },
-    #[error("Grok ACP stdout exceeded {limit} bytes")]
+    #[error("ACP stdout exceeded {limit} bytes")]
     StdoutLimit { limit: usize },
-    #[error("Grok ACP assistant output exceeded {limit} bytes")]
+    #[error("ACP assistant output exceeded {limit} bytes")]
     AssistantLimit { limit: usize },
-    #[error("Grok ACP returned invalid JSON during {phase}")]
+    #[error("ACP returned invalid JSON during {phase}")]
     InvalidJson { phase: &'static str },
     /// Remote JSON-RPC error. Public text stays phase-stable; only a sanitized
     /// integer JSON-RPC code is retained when present (never child free-text).
-    #[error("Grok ACP returned an error during {phase}{code}")]
+    #[error("ACP returned an error during {phase}{code}")]
     Remote {
         phase: &'static str,
         /// Empty, or `" (code N)"` for an integer JSON-RPC error code only.
         code: &'static str,
     },
-    #[error("Grok ACP {phase} response was incomplete")]
+    #[error("ACP {phase} response was incomplete")]
     Incomplete { phase: &'static str },
-    #[error("Grok ACP initialize returned no usable authentication method")]
+    #[error("ACP initialize returned no usable authentication method")]
     NoAuthenticationMethod,
-    #[error("Grok ACP initialize protocolVersion mismatch")]
+    #[error("ACP initialize protocolVersion mismatch")]
     ProtocolVersion,
-    #[error("Grok ACP session/prompt completed without agent message text")]
+    #[error("ACP session/prompt completed without agent message text")]
     EmptyOutput,
-    #[error("Grok ACP session/prompt ended with a non-success stopReason")]
+    #[error("ACP session/prompt ended with a non-success stopReason")]
     StopReason,
-    #[error("Grok ACP could not encode an internal request")]
+    #[error("ACP could not encode an internal request")]
     Encode,
 }
 
 impl AcpError {
-    pub(super) fn error_key(&self) -> &'static str {
+    pub(crate) fn error_key(&self) -> &'static str {
         match self {
-            Self::Write { .. } => "grok_cli_acp_write_failed",
-            Self::Read { .. } => "grok_cli_acp_read_failed",
-            Self::Closed { .. } => "grok_cli_acp_closed",
-            Self::FrameLimit { .. } => "grok_cli_acp_frame_limit",
-            Self::OutboundFrameLimit { .. } => "grok_cli_acp_outbound_frame_limit",
-            Self::StdoutLimit { .. } => "grok_cli_acp_stdout_limit",
-            Self::AssistantLimit { .. } => "grok_cli_acp_assistant_limit",
-            Self::InvalidJson { .. } => "grok_cli_acp_invalid_json",
-            Self::Remote { .. } => "grok_cli_acp_remote_error",
-            Self::Incomplete { .. } => "grok_cli_acp_incomplete_response",
-            Self::NoAuthenticationMethod => "grok_cli_acp_auth_unavailable",
-            Self::ProtocolVersion => "grok_cli_acp_protocol_version",
-            Self::EmptyOutput => "grok_cli_acp_empty_output",
-            Self::StopReason => "grok_cli_acp_stop_reason",
-            Self::Encode => "grok_cli_acp_encode_failed",
+            Self::Write { .. } => "acp_write_failed",
+            Self::Read { .. } => "acp_read_failed",
+            Self::Closed { .. } => "acp_closed",
+            Self::FrameLimit { .. } => "acp_frame_limit",
+            Self::OutboundFrameLimit { .. } => "acp_outbound_frame_limit",
+            Self::StdoutLimit { .. } => "acp_stdout_limit",
+            Self::AssistantLimit { .. } => "acp_assistant_limit",
+            Self::InvalidJson { .. } => "acp_invalid_json",
+            Self::Remote { .. } => "acp_remote_error",
+            Self::Incomplete { .. } => "acp_incomplete_response",
+            Self::NoAuthenticationMethod => "acp_auth_unavailable",
+            Self::ProtocolVersion => "acp_protocol_version",
+            Self::EmptyOutput => "acp_empty_output",
+            Self::StopReason => "acp_stop_reason",
+            Self::Encode => "acp_encode_failed",
         }
     }
+}
+
+/// Provider identity used to label public ACP errors and stable log keys.
+///
+/// `label` prefixes public error text (for example `"Grok"` yields
+/// `"Grok ACP ..."`); `key_prefix` prefixes stable error keys (for example
+/// `"grok_cli"` yields `"grok_cli_acp_..."`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AcpCliFlavor {
+    pub(crate) label: &'static str,
+    pub(crate) key_prefix: &'static str,
+}
+
+impl AcpCliFlavor {
+    /// Stable log key for a provider-scoped event suffix.
+    pub(crate) fn error_key(self, suffix: &str) -> String {
+        format!("{}_{}", self.key_prefix, suffix)
+    }
+}
+
+/// An [`AcpError`] carrying the provider label for public display.
+#[derive(Debug, Error)]
+#[error("{} {error}", flavor.label)]
+pub(crate) struct LabeledAcpError {
+    pub(crate) flavor: AcpCliFlavor,
+    #[source]
+    pub(crate) error: AcpError,
+}
+
+impl LabeledAcpError {
+    pub(crate) fn error_key(&self) -> String {
+        self.flavor.error_key(self.error.error_key())
+    }
+}
+
+/// Inputs for one bounded ACP prompt against an already-spawned child.
+pub(crate) struct OneshotPrompt<'a> {
+    pub(crate) prompt: &'a [AcpPromptContent],
+    pub(crate) cwd: &'a Path,
+    pub(crate) permission_policy: AcpPermissionPolicy,
+    pub(crate) max_stdout_bytes: usize,
 }
 
 /// Map a small set of well-known integer JSON-RPC codes to fixed public
@@ -221,20 +263,28 @@ fn session_matches(message: &Value, session_id: Option<&str>) -> bool {
     message_session_id(message) == Some(expected)
 }
 
-/// Run one prompt against an already-spawned `grok agent stdio` child.
-pub(super) async fn run_oneshot_prompt<W, R>(
+/// Run one prompt against an already-spawned ACP stdio child.
+///
+/// `select_auth` maps the `initialize` result to the complete `authenticate`
+/// params. It must fail with [`AcpError::NoAuthenticationMethod`] rather than
+/// guess when no acceptable method is advertised.
+pub(crate) async fn run_oneshot_prompt<W, R, A>(
     stdin: &mut W,
     stdout: R,
-    prompt: &[AcpPromptContent],
-    cwd: &Path,
-    xai_api_key_available: bool,
-    permission_policy: AcpPermissionPolicy,
-    max_stdout_bytes: usize,
+    request: &OneshotPrompt<'_>,
+    select_auth: A,
 ) -> Result<String, AcpError>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
+    A: FnOnce(&Value) -> Result<Value, AcpError>,
 {
+    let OneshotPrompt {
+        prompt,
+        cwd,
+        permission_policy,
+        max_stdout_bytes,
+    } = *request;
     let mut reader = AcpReader::new(stdout, max_stdout_bytes);
     let mut next_id = 1_u64;
     let mut assistant = String::new();
@@ -258,16 +308,13 @@ where
     .await?;
     validate_protocol_version(&initialize)?;
 
-    let method_id = select_auth_method_id(&initialize, xai_api_key_available)?;
+    let authenticate = select_auth(&initialize)?;
     rpc_request(
         stdin,
         &mut reader,
         &mut next_id,
         "authenticate",
-        json!({
-            "methodId": method_id,
-            "_meta": { "headless": true }
-        }),
+        authenticate,
         &mut assistant,
         permission_policy,
         None,
@@ -721,7 +768,7 @@ fn append_agent_message_chunk(message: &Value, assistant: &mut String) -> Result
     Ok(())
 }
 
-/// Grok can emit user-visible progress as `agent_message_chunk` before it
+/// Agents can emit user-visible progress as `agent_message_chunk` before it
 /// starts a plan or tool call. That text is not the completed answer for a
 /// one-shot provider. Keep only the latest message segment after a non-final
 /// ACP update; classify by protocol event, never by the model's wording.
@@ -753,35 +800,6 @@ fn is_permission_request(message: &Value) -> bool {
         return false;
     };
     method == "session/request_permission" || method.ends_with("/session/request_permission")
-}
-
-fn select_auth_method_id(
-    initialize: &Value,
-    xai_api_key_available: bool,
-) -> Result<String, AcpError> {
-    let ids: Vec<&str> = initialize
-        .get("authMethods")
-        .or_else(|| initialize.get("auth_methods"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|method| {
-            method
-                .get("id")
-                .or_else(|| method.get("methodId"))
-                .and_then(Value::as_str)
-        })
-        .collect();
-
-    if xai_api_key_available && ids.contains(&"xai.api_key") {
-        return Ok("xai.api_key".to_string());
-    }
-    for preferred in ["cached_token", "xai.oauth"] {
-        if ids.contains(&preferred) {
-            return Ok(preferred.to_string());
-        }
-    }
-    Err(AcpError::NoAuthenticationMethod)
 }
 
 /// Extract only documented agent text chunks. User-message echoes, thoughts,
@@ -926,16 +944,157 @@ mod tests {
         let version_err = AcpError::ProtocolVersion;
         assert_eq!(
             version_err.to_string(),
-            "Grok ACP initialize protocolVersion mismatch"
+            "ACP initialize protocolVersion mismatch"
         );
         assert!(!version_err.to_string().contains("999"));
 
         let stop_err = AcpError::StopReason;
         assert_eq!(
             stop_err.to_string(),
-            "Grok ACP session/prompt ended with a non-success stopReason"
+            "ACP session/prompt ended with a non-success stopReason"
         );
         assert!(!stop_err.to_string().contains("hostile"));
+    }
+
+    #[test]
+    fn labeled_errors_preserve_provider_display_and_keys() {
+        let flavor = AcpCliFlavor {
+            label: "Grok",
+            key_prefix: "grok_cli",
+        };
+        let error = LabeledAcpError {
+            flavor,
+            error: AcpError::ProtocolVersion,
+        };
+        assert_eq!(
+            error.to_string(),
+            "Grok ACP initialize protocolVersion mismatch"
+        );
+        assert_eq!(error.error_key(), "grok_cli_acp_protocol_version");
+        assert_eq!(flavor.error_key("timeout"), "grok_cli_timeout");
+    }
+
+    /// Minimal in-memory ACP agent: answers the four one-shot requests and
+    /// returns every request it received.
+    async fn fake_agent(
+        server_in: tokio::io::DuplexStream,
+        mut server_out: tokio::io::DuplexStream,
+    ) -> Vec<Value> {
+        let mut lines = BufReader::new(server_in).lines();
+        let mut received = Vec::new();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let request: Value = serde_json::from_str(&line).expect("client frame is JSON");
+            let id = request["id"].clone();
+            let reply = match request["method"].as_str() {
+                Some("initialize") => json!({
+                    "jsonrpc": "2.0", "id": id,
+                    "result": {
+                        "protocolVersion": ACP_PROTOCOL_VERSION,
+                        "authMethods": [{ "id": "method-a" }, { "id": "method-b" }]
+                    }
+                }),
+                Some("authenticate") => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+                Some("session/new") => json!({
+                    "jsonrpc": "2.0", "id": id, "result": { "sessionId": "s1" }
+                }),
+                Some("session/prompt") => {
+                    let chunk = json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": "s1",
+                            "update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": { "type": "text", "text": "ONESHOT_OK" }
+                            }
+                        }
+                    });
+                    server_out
+                        .write_all(format!("{chunk}\n").as_bytes())
+                        .await
+                        .expect("write chunk");
+                    json!({ "jsonrpc": "2.0", "id": id, "result": { "stopReason": "end_turn" } })
+                }
+                _ => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+            };
+            received.push(request);
+            server_out
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .expect("write reply");
+        }
+        received
+    }
+
+    #[tokio::test]
+    async fn oneshot_sends_provider_selected_authenticate_params_verbatim() {
+        let (mut client_in, server_in) = duplex(65_536);
+        let (server_out, client_out) = duplex(65_536);
+        let agent = ::zeroclaw_spawn::spawn!(fake_agent(server_in, server_out));
+
+        let prompt = [AcpPromptContent::Text("hello".to_string())];
+        let request = OneshotPrompt {
+            prompt: &prompt,
+            cwd: Path::new("/"),
+            permission_policy: AcpPermissionPolicy::RejectOnce,
+            max_stdout_bytes: DEFAULT_ACP_STDOUT_LIMIT_BYTES,
+        };
+        let reply = run_oneshot_prompt(&mut client_in, client_out, &request, |initialize| {
+            assert_eq!(initialize["authMethods"][1]["id"], "method-b");
+            Ok(json!({ "methodId": "method-b", "_meta": { "marker": 7 } }))
+        })
+        .await
+        .expect("one-shot reply");
+        assert_eq!(reply, "ONESHOT_OK");
+        drop(client_in);
+
+        let received = agent.await.expect("fake agent");
+        let methods: Vec<&str> = received
+            .iter()
+            .filter_map(|request| request["method"].as_str())
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                "initialize",
+                "authenticate",
+                "session/new",
+                "session/prompt"
+            ]
+        );
+        assert_eq!(
+            received[1]["params"],
+            json!({ "methodId": "method-b", "_meta": { "marker": 7 } })
+        );
+    }
+
+    #[tokio::test]
+    async fn oneshot_stops_before_session_when_auth_selection_fails() {
+        let (mut client_in, server_in) = duplex(65_536);
+        let (server_out, client_out) = duplex(65_536);
+        let agent = ::zeroclaw_spawn::spawn!(fake_agent(server_in, server_out));
+
+        let prompt = [AcpPromptContent::Text("hello".to_string())];
+        let request = OneshotPrompt {
+            prompt: &prompt,
+            cwd: Path::new("/"),
+            permission_policy: AcpPermissionPolicy::RejectOnce,
+            max_stdout_bytes: DEFAULT_ACP_STDOUT_LIMIT_BYTES,
+        };
+        let error = run_oneshot_prompt(&mut client_in, client_out, &request, |_| {
+            Err(AcpError::NoAuthenticationMethod)
+        })
+        .await
+        .expect_err("auth selection failure must stop the request");
+        assert!(matches!(error, AcpError::NoAuthenticationMethod));
+        drop(client_in);
+
+        let received = agent.await.expect("fake agent");
+        assert_eq!(
+            received.len(),
+            1,
+            "only initialize may be sent: {received:?}"
+        );
     }
 
     #[test]
@@ -953,36 +1112,6 @@ mod tests {
         assert!(!session_matches(&other, Some("own-session")));
         assert!(!session_matches(&missing, Some("own-session")));
         assert!(session_matches(&other, None));
-    }
-
-    #[test]
-    fn auth_selection_uses_explicit_api_key_then_cli_login() {
-        let initialize = json!({
-            "authMethods": [
-                { "id": "xai.api_key" },
-                { "id": "cached_token" }
-            ]
-        });
-        assert_eq!(
-            select_auth_method_id(&initialize, true).expect("API-key auth"),
-            "xai.api_key"
-        );
-        assert_eq!(
-            select_auth_method_id(&initialize, false).expect("cached auth"),
-            "cached_token"
-        );
-
-        let api_key_only = json!({
-            "authMethods": [{ "id": "xai.api_key" }]
-        });
-        assert_eq!(
-            select_auth_method_id(&api_key_only, true).expect("API-key auth"),
-            "xai.api_key"
-        );
-        assert!(matches!(
-            select_auth_method_id(&api_key_only, false),
-            Err(AcpError::NoAuthenticationMethod)
-        ));
     }
 
     #[tokio::test]
@@ -1196,7 +1325,7 @@ mod tests {
                 limit: MAX_ACP_FRAME_BYTES
             }
         ));
-        assert_eq!(error.error_key(), "grok_cli_acp_outbound_frame_limit");
+        assert_eq!(error.error_key(), "acp_outbound_frame_limit");
         assert!(!error.to_string().contains(sentinel));
         assert!(!error.error_key().contains(sentinel));
 
