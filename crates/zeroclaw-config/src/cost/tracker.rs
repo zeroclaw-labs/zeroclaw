@@ -681,6 +681,16 @@ impl CostTracker {
 
         let usage = &record.usage;
         if !usage.cost_usd.is_finite() || usage.cost_usd < 0.0 {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"cost_usd": usage.cost_usd})),
+                "token usage record rejected: cost is not finite or is negative"
+            );
+            // A rejected write leaves saved spend unverified, so the prior
+            // estimate must not keep looking complete.
+            self.lock_storage().persistence_uncertain = true;
             anyhow::bail!("Token usage cost must be a finite, non-negative value");
         }
         if record.is_coverage_only()
