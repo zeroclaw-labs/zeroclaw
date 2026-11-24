@@ -2792,6 +2792,13 @@ fn all_tools_with_runtime_on_thread(
         }
     }
 
+    if !root_config.remote_files.is_empty() && select_tool!("remote_files") {
+        let tool = zeroclaw_tools::remote_file_dispatch::RemoteFilesTool::new(
+            root_config.config_path.clone(),
+        );
+        tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
+    }
+
     if http_config.enabled && select_tool!("http_request") {
         match HttpRequestTool::new_with_config(
             security.clone(),

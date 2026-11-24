@@ -487,6 +487,11 @@ pub const BUILTIN_TOOLS: &[BuiltinToolSpec] = &[
     },
     // Network.
     BuiltinToolSpec {
+        name: "remote_files",
+        tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::Always,
+    },
+    BuiltinToolSpec {
         name: "http_request",
         tier: ToolTier::Optional,
         compilation: BuiltinToolCompilation::Always,

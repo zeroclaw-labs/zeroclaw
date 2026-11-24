@@ -143,4 +143,13 @@ The vault-backed WebDAV read dispatcher can request a one-time approval in
 the originating WebUI conversation. It rechecks the live operation right and
 the approved credential revision before sending the authorization header.
 A missing approval channel or a denied request prevents the operation.
-Agent tool registration, live verification, and other consumers remain pending.
+Live verification and other consumers remain pending.
+
+## Enable WebDAV reads for an agent
+
+Add `remote_files` to the existing `[tools].optional` list, configure a
+WebDAV resource, and grant **List directory** or **Get file info** in
+**Secrets → Usage permissions**. The tool accepts the resource alias and
+a relative path. This opt-in exposes only listing and metadata, using a local
+encrypted credential and a public HTTPS endpoint with direct, pinned egress.
+Other grant rights do not enable write or transfer operations in this slice.
