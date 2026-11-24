@@ -5254,6 +5254,66 @@ impl Config {
         }
     }
 
+    /// One warning per agent whose explicit `delegates` roster can never fire:
+    /// the resolved risk profile forbids delegation, or its tool policy
+    /// blocks `delegate` (a closed `allowed_tools` list without it,
+    /// `deny_all_tools = true`, or `excluded_tools` naming it). The
+    /// configuration is coherent but inert, and operators otherwise only
+    /// discover that at the first delegation attempt.
+    fn collect_dead_delegate_grant_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for (alias, agent) in &self.agents {
+            if !agent.enabled || agent.delegates.is_empty() {
+                continue;
+            }
+            let Some(profile) = self.risk_profile_for_agent(alias) else {
+                continue;
+            };
+            let profile_alias = agent.risk_profile.trim();
+            let grant_count = agent.delegates.len();
+            let policy_blocks = !profile.delegation_policy.permits();
+            // `effective_allowed_tools()` folds in `deny_all_tools` and the
+            // legacy deny-all sentinel: `Some([])` denies every tool, `None`
+            // is unrestricted.
+            let allowlist_blocks = profile
+                .effective_allowed_tools()
+                .is_some_and(|allowed| !allowed.iter().any(|name| name == "delegate"));
+            let excluded = profile.excluded_tools.iter().any(|name| name == "delegate");
+            let tools_block = allowlist_blocks || excluded;
+            if !policy_blocks && !tools_block {
+                continue;
+            }
+            let tool_reason = if profile.deny_all_tools {
+                "sets deny_all_tools"
+            } else if excluded {
+                "lists `delegate` in excluded_tools"
+            } else {
+                "has an allowed_tools list that omits `delegate`"
+            };
+            let reason = match (policy_blocks, tools_block) {
+                (true, true) => format!(
+                    "risk profile `{profile_alias}` has a delegation_policy.mode that does not \
+                     permit delegation and {tool_reason}"
+                ),
+                (true, false) => format!(
+                    "risk profile `{profile_alias}` has a delegation_policy.mode that does not \
+                     permit delegation"
+                ),
+                (false, _) => format!("risk profile `{profile_alias}` {tool_reason}"),
+            };
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                crate::validation_warnings::DEAD_DELEGATE_GRANTS,
+                format!(
+                    "agents.{alias} has {grant_count} delegate grant(s) but {reason}, so the \
+                     grants are unreachable at runtime"
+                ),
+                format!("agents.{alias}.delegates"),
+            ));
+        }
+    }
+
     /// One warning per cron job id that more than one enabled agent claims:
     /// such a job is refused at runtime rather than run under an arbitrary
     /// claimant, and that should surface at validation time, not in the
@@ -14491,6 +14551,21 @@ pub struct OidcConfig {
     /// was issued TO. Empty = no restriction; non-empty = the token must carry
     /// an `azp` claim listed here or authentication fails closed.
     pub allowed_authorized_parties: Vec<String>,
+    /// OAuth scopes requested by the interactive flows ZeroClaw starts with
+    /// this issuer: the device grant (`zerocode login`, `zeroclaw oidc
+    /// login`) and browser Authorization Code with PKCE (including dashboard
+    /// sign-in). Sent space-separated in order. Empty = `["openid"]`. When
+    /// set, must include `openid`, because browser sign-in validates an ID
+    /// token. Some issuers derive the access token's audience from the
+    /// requested scope (Entra ID: `api://<app>/<scope>`); none of them are
+    /// added implicitly, including `offline_access`, whose meaning varies by
+    /// issuer.
+    pub scopes: Vec<String>,
+    /// OAuth scopes requested by `client_credentials` service enrollment.
+    /// Sent space-separated in order. Empty = `["openid"]`. Kept separate
+    /// from `scopes` because some issuers accept only a resource scope here
+    /// (Entra ID: `api://<app>/.default`, without `openid`).
+    pub service_scopes: Vec<String>,
     /// Client identities whose tokens are ALWAYS service principals
     /// (`client_credentials` callers), matched against the token's
     /// verified `client_id` claim. Service tokens always need `client_id`:
@@ -14561,6 +14636,8 @@ impl std::fmt::Debug for OidcConfig {
                 "allowed_authorized_parties",
                 &self.allowed_authorized_parties,
             )
+            .field("scopes", &self.scopes)
+            .field("service_scopes", &self.service_scopes)
             .field("service_clients", &self.service_clients)
             .field("interactive_clients", &self.interactive_clients)
             .field("actor_claim", &self.actor_claim)
@@ -14594,6 +14671,8 @@ impl Default for OidcConfig {
             require_mfa: false,
             required_acr: Vec::new(),
             allowed_authorized_parties: Vec::new(),
+            scopes: Vec::new(),
+            service_scopes: Vec::new(),
             service_clients: Vec::new(),
             interactive_clients: Vec::new(),
             actor_claim: String::new(),
@@ -14994,6 +15073,30 @@ impl OidcConfig {
                 anyhow::bail!("oidc.{alias}.{field} must not contain a blank client id");
             }
         }
+        for (field, scopes) in [
+            ("scopes", &self.scopes),
+            ("service_scopes", &self.service_scopes),
+        ] {
+            let mut seen = std::collections::HashSet::new();
+            for scope in scopes {
+                if !is_scope_token(scope) {
+                    anyhow::bail!(
+                        "oidc.{alias}.{field} contains {scope:?}, which is not an OAuth scope: \
+                         each entry is one nonblank scope of printable ASCII without spaces, \
+                         `\"`, or `\\` (RFC 6749 section 3.3)"
+                    );
+                }
+                if !seen.insert(scope.as_str()) {
+                    anyhow::bail!("oidc.{alias}.{field} lists {scope:?} more than once");
+                }
+            }
+        }
+        if !self.scopes.is_empty() && !self.scopes.iter().any(|scope| scope == "openid") {
+            anyhow::bail!(
+                "oidc.{alias}.scopes must include \"openid\": browser sign-in validates an \
+                 ID token, which the issuer returns only for that scope"
+            );
+        }
         if let Some(shared) = self
             .service_clients
             .iter()
@@ -15021,6 +15124,37 @@ impl OidcConfig {
             &self.client_id
         }
     }
+
+    /// The `scope` parameter for the interactive flows (device grant and
+    /// browser Authorization Code): `scopes` space-joined, or `openid`.
+    #[must_use]
+    pub fn effective_scope(&self) -> String {
+        join_scopes(&self.scopes)
+    }
+
+    /// The `scope` parameter for `client_credentials`: `service_scopes`
+    /// space-joined, or `openid`.
+    #[must_use]
+    pub fn effective_service_scope(&self) -> String {
+        join_scopes(&self.service_scopes)
+    }
+}
+
+fn join_scopes(scopes: &[String]) -> String {
+    if scopes.is_empty() {
+        "openid".to_string()
+    } else {
+        scopes.join(" ")
+    }
+}
+
+/// RFC 6749 §3.3: `scope-token = 1*( %x21 / %x23-5B / %x5D-7E )`, i.e.
+/// nonblank printable ASCII other than space, `"`, and `\`.
+fn is_scope_token(scope: &str) -> bool {
+    !scope.is_empty()
+        && scope
+            .bytes()
+            .all(|b| matches!(b, 0x21 | 0x23..=0x5B | 0x5D..=0x7E))
 }
 
 /// One local roster identity (`[users.<name>]`) for the local auth
@@ -18316,6 +18450,9 @@ pub struct MatrixConfig {
     #[serde(default)]
     pub device_id: Option<String>,
     /// Allowed Matrix room IDs. Empty = allow all rooms the bot has joined.
+    /// Also gates room invites: an invite from an allowed peer is accepted
+    /// only for a listed room. When empty, an invite is accepted into any
+    /// room, but only from a peer named explicitly (not just via `*`).
     /// Entries are matched literally against the canonical room ID
     /// (`!abc:server`) of each incoming message; `#room:server` aliases are
     /// not resolved for this allowlist (they are resolved only for outbound
@@ -24151,6 +24288,7 @@ impl Config {
         self.collect_verifiable_intent_warnings(&mut warnings);
         self.collect_cron_claim_warnings(&mut warnings);
         self.collect_compiled_out_tool_warnings(&mut warnings);
+        self.collect_dead_delegate_grant_warnings(&mut warnings);
         warnings.extend(validate_memory_semantics(&self.memory));
         for (alias, wa) in &self.channels.whatsapp {
             warnings.extend(validate_whatsapp_semantics(alias, wa));
@@ -24301,6 +24439,24 @@ impl Config {
                      checked. Use a build that includes `{feature}`, or disable the section."
                 ),
                 format!("{section}.enabled"),
+            ));
+        }
+        // Web search defaults to enabled, so unlike the sections above its
+        // absence in a lean build is the norm, not a config written for a
+        // fuller build — report it the same way rather than dropping it
+        // silently. It stands outside `OptInTool::ALL` because the inventory
+        // files `web_search_tool` under `External`; see the variant's note.
+        let web_search = crate::opt_in_tools::OptInTool::WebSearch;
+        if !web_search.compiled() && web_search.enabled_in(self) {
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                crate::validation_warnings::TOOL_COMPILED_OUT,
+                format!(
+                    "[web_search] is enabled, but this build was compiled without the \
+                     `tools-external` feature, so the tool is unavailable and its settings \
+                     are not checked. Use a build that includes `tools-external` (the \
+                     `tools-compat` bundle), or disable the section."
+                ),
+                "web_search.enabled".to_string(),
             ));
         }
     }
@@ -31610,6 +31766,111 @@ zeroclaw-operators = "operator"
         config.oidc.get_mut("corp").unwrap().require_at_jwt = false;
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("require_at_jwt"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_request_scopes_default_to_openid_for_every_flow() {
+        let defaults = OidcConfig::default();
+        assert!(defaults.scopes.is_empty());
+        assert!(defaults.service_scopes.is_empty());
+        assert_eq!(defaults.effective_scope(), "openid");
+        assert_eq!(defaults.effective_service_scope(), "openid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_request_scopes_roundtrip_from_toml_and_join_in_order() {
+        // Entra ID shape: the API scope sets the access token's audience, and
+        // client_credentials accepts only the `.default` scope (no `openid`).
+        let toml_src = r#"
+[permission_profiles.operator]
+allowed_agents = ["*"]
+
+[oidc.entra]
+issuer = "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0"
+audience = "11111111-1111-1111-1111-111111111111"
+claim_path = "roles"
+scopes = ["openid", "offline_access", "api://zeroclaw/zeroclaw.access"]
+service_scopes = ["api://zeroclaw/.default"]
+
+[oidc.entra.profile_map]
+"ZeroClaw.Operator" = "operator"
+"#;
+        let config: Config = toml::from_str(toml_src).expect("scopes parse");
+        config.validate().expect("scopes validate");
+        let oidc = &config.oidc["entra"];
+        assert_eq!(
+            oidc.effective_scope(),
+            "openid offline_access api://zeroclaw/zeroclaw.access"
+        );
+        assert_eq!(oidc.effective_service_scope(), "api://zeroclaw/.default");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_interactive_scopes_must_include_openid() {
+        // Browser sign-in validates an ID token, which only `openid` yields.
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().scopes = vec!["offline_access".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("oidc.corp.scopes") && err.contains("openid"),
+            "got: {err}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_service_scopes_do_not_require_openid() {
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().service_scopes =
+            vec!["api://zeroclaw/.default".to_string()];
+        config
+            .validate()
+            .expect("client_credentials scopes need not include openid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_request_scopes_must_be_rfc6749_scope_tokens() {
+        // RFC 6749 §3.3: scope-token = 1*( %x21 / %x23-5B / %x5D-7E ).
+        // Blank, whitespace (which would split one entry into two scopes),
+        // `"`, `\`, control, and non-ASCII characters are all refused.
+        for bad in [
+            "",
+            " ",
+            "openid profile",
+            "a\"b",
+            "a\\b",
+            "tab\there",
+            "naïve",
+        ] {
+            for field in ["scopes", "service_scopes"] {
+                let mut config = auth_config();
+                {
+                    let oidc = config.oidc.get_mut("corp").unwrap();
+                    let list = vec!["openid".to_string(), bad.to_string()];
+                    if field == "scopes" {
+                        oidc.scopes = list;
+                    } else {
+                        oidc.service_scopes = list;
+                    }
+                }
+                let err = config.validate().unwrap_err().to_string();
+                assert!(
+                    err.contains(&format!("oidc.corp.{field}")),
+                    "{field} = {bad:?} must be refused; got: {err}"
+                );
+            }
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_request_scopes_refuse_duplicates() {
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().scopes =
+            vec!["openid".to_string(), "openid".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("oidc.corp.scopes") && err.contains("openid"),
+            "got: {err}"
+        );
     }
 
     #[::core::prelude::v1::test]
@@ -40751,8 +41012,13 @@ runtime_profile = "default"
     )))]
     #[test]
     async fn a_lean_build_validates_enabled_sections_for_tools_it_lacks() {
+        let mut quiet = Config::default();
+        // `[web_search]` defaults to enabled and reports compiled out in a
+        // build without `tools-external`; this assertion is about the
+        // sections enabled below, so keep the default noise out.
+        quiet.web_search.enabled = false;
         assert!(
-            !Config::default()
+            !quiet
                 .collect_warnings()
                 .iter()
                 .any(|warning| warning.code == crate::validation_warnings::TOOL_COMPILED_OUT),
@@ -40760,6 +41026,7 @@ runtime_profile = "default"
         );
 
         let mut config = Config::default();
+        config.web_search.enabled = false;
         config.microsoft365.enabled = true;
         config.project_intel.enabled = true;
         config.project_intel.templates_dir = Some("/nonexistent/zeroclaw-templates".into());
@@ -40796,6 +41063,10 @@ runtime_profile = "default"
     async fn google_workspace_allowlist_is_checked_only_where_the_tool_is_compiled() {
         use crate::opt_in_tools::OptInTool;
         let mut config = Config::default();
+        // `[web_search]` defaults to enabled and stands outside this test's
+        // focus; it reports compiled out in any build without
+        // `tools-external`, which the assertion below is not about.
+        config.web_search.enabled = false;
         config.google_workspace.enabled = true;
         config.google_workspace.allowed_services = vec!["drive".into()];
         config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
@@ -40827,6 +41098,28 @@ runtime_profile = "default"
         }
     }
 
+    /// `web_search` defaults to enabled, so a build without `tools-external`
+    /// must say the tool is compiled out instead of silently dropping it;
+    /// a build that carries the feature reports nothing.
+    #[test]
+    async fn web_search_section_reports_compiled_out_without_tools_external() {
+        use crate::opt_in_tools::OptInTool;
+        let mut config = Config::default();
+        config.web_search.enabled = true;
+
+        let compiled_out: Vec<String> = config
+            .collect_warnings()
+            .into_iter()
+            .filter(|warning| warning.code == crate::validation_warnings::TOOL_COMPILED_OUT)
+            .map(|warning| warning.path)
+            .collect();
+        if OptInTool::WebSearch.compiled() {
+            assert!(compiled_out.is_empty(), "{compiled_out:?}");
+        } else {
+            assert_eq!(compiled_out, ["web_search.enabled"]);
+        }
+    }
+
     /// The counterpart in a build that carries the tools: their settings are
     /// still checked, and nothing is reported as compiled out.
     #[cfg(all(
@@ -40849,6 +41142,10 @@ runtime_profile = "default"
         ];
         for (field, enable) in cases {
             let mut config = Config::default();
+            // `[web_search]` defaults to enabled and stands outside this
+            // test's focus; in a build without `tools-external` it would
+            // report compiled out and trip the assertion below.
+            config.web_search.enabled = false;
             enable(&mut config);
             let err = config
                 .validate()
@@ -43802,6 +44099,163 @@ group_policy = "disabled"
 
         let config: Config = toml::from_str("").expect("empty TOML loads with defaults");
         assert!(config.security.audit.enabled);
+    }
+
+    #[test]
+    async fn collect_warnings_flags_dead_delegate_grants_under_forbidden_policy() {
+        let mut config: Config = toml::from_str(
+            r#"
+[risk_profiles.worker_project]
+[risk_profiles.worker_project.delegation_policy]
+mode = "forbidden"
+
+[agents.projects_assistant]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[[agents.projects_assistant.delegates]]
+agent = "demiurge"
+mode = "independent"
+
+[agents.demiurge]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[providers.models.openai.gpt]
+model = "gpt-4o-mini"
+"#,
+        )
+        .expect("dead-grant fixture loads");
+        suppress_semantic_memory_warning(&mut config);
+
+        let warnings =
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let w = &warnings[0];
+        assert_eq!(w.path, "agents.projects_assistant.delegates");
+        assert!(
+            w.message.contains("delegation_policy.mode")
+                && w.message.contains("projects_assistant")
+                && w.message.contains("unreachable"),
+            "unexpected message: {}",
+            w.message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_silent_when_delegate_grants_match_allow_policy() {
+        let mut config: Config = toml::from_str(
+            r#"
+[risk_profiles.worker_project]
+[risk_profiles.worker_project.delegation_policy]
+mode = "allow"
+
+[agents.projects_assistant]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[[agents.projects_assistant.delegates]]
+agent = "demiurge"
+mode = "independent"
+
+[agents.demiurge]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[providers.models.openai.gpt]
+model = "gpt-4o-mini"
+"#,
+        )
+        .expect("reachable-grant fixture loads");
+        suppress_semantic_memory_warning(&mut config);
+
+        assert!(
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS)
+                .is_empty()
+        );
+    }
+
+    fn dead_grant_fixture(profile_body: &str) -> Config {
+        let mut config: Config = toml::from_str(&format!(
+            r#"
+[risk_profiles.worker_project]
+{profile_body}
+[risk_profiles.worker_project.delegation_policy]
+mode = "allow"
+
+[agents.projects_assistant]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[[agents.projects_assistant.delegates]]
+agent = "demiurge"
+mode = "independent"
+
+[agents.demiurge]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[providers.models.openai.gpt]
+model = "gpt-4o-mini"
+"#
+        ))
+        .expect("dead-grant fixture loads");
+        suppress_semantic_memory_warning(&mut config);
+        config
+    }
+
+    #[test]
+    async fn collect_warnings_flags_dead_delegate_grants_under_deny_all_tools() {
+        let config = dead_grant_fixture("deny_all_tools = true");
+        let warnings =
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.contains("deny_all_tools"),
+            "unexpected message: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_dead_delegate_grants_when_delegate_excluded() {
+        let config = dead_grant_fixture(r#"excluded_tools = ["delegate"]"#);
+        let warnings =
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.contains("excluded_tools"),
+            "unexpected message: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_dead_delegate_grants_when_allowlist_omits_delegate() {
+        let config = dead_grant_fixture(r#"allowed_tools = ["shell"]"#);
+        let warnings =
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.contains("allowed_tools") && !warnings[0].message.contains("  "),
+            "unexpected message: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_silent_when_allowlist_admits_delegate() {
+        let config = dead_grant_fixture(r#"allowed_tools = ["shell", "delegate"]"#);
+        assert!(
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS)
+                .is_empty()
+        );
     }
 
     // Disabling the section silently stops the certificate trail:
@@ -48815,6 +49269,80 @@ stream_tool_arguments = [
             mx.set_prop("channels.matrix.draft_update_interval_ms", "abc")
                 .is_err()
         );
+    }
+
+    /// `config set`, RPC `config/set`, the gateway PATCH and env overrides
+    /// all reach `set_prop`. Text that reads as infinity or NaN is refused
+    /// for a plain float field and for an optional one, and the value already
+    /// set is kept. Finite edge values still store exactly.
+    #[test]
+    async fn set_prop_float_refuses_non_finite_text_and_keeps_the_stored_value() {
+        let mut config = Config::default();
+        let vector_weight = config.memory.vector_weight;
+        config
+            .set_prop_persistent("runtime.docker.cpu_limit", "2.5")
+            .unwrap();
+        for text in [
+            "inf", "+inf", "-inf", "Infinity", "infinity", "NaN", "nan", "1e999", "-1e999",
+        ] {
+            for prop in ["memory.vector_weight", "runtime.docker.cpu_limit"] {
+                let err = config.set_prop_persistent(prop, text).expect_err(text);
+                assert!(
+                    format!("{err:#}").contains("Invalid float value"),
+                    "{prop} {text}: {err:#}"
+                );
+            }
+            assert_eq!(
+                config.memory.vector_weight.to_bits(),
+                vector_weight.to_bits(),
+                "{text}"
+            );
+            assert_eq!(config.runtime.docker.cpu_limit, Some(2.5), "{text}");
+        }
+        for (text, want) in [
+            ("-0.0", -0.0_f64),
+            ("5e-324", 5e-324),
+            ("1.7976931348623157e308", f64::MAX),
+            ("5", 5.0),
+        ] {
+            config
+                .set_prop_persistent("memory.vector_weight", text)
+                .unwrap();
+            assert_eq!(
+                config.memory.vector_weight.to_bits(),
+                want.to_bits(),
+                "{text}"
+            );
+            config
+                .set_prop_persistent("runtime.docker.cpu_limit", text)
+                .unwrap();
+            assert_eq!(
+                config.runtime.docker.cpu_limit.map(f64::to_bits),
+                Some(want.to_bits()),
+                "{text}"
+            );
+        }
+    }
+
+    /// `energy_threshold` is an `f32`: `1e39` is finite as an `f64` but
+    /// would be stored as infinity, so it is refused too.
+    #[test]
+    async fn set_prop_f32_refuses_a_value_too_large_for_the_field() {
+        let mut wake = VoiceWakeConfig::default();
+        let before = wake.energy_threshold;
+        for text in ["1e39", "-1e39", "inf", "NaN"] {
+            let err = wake
+                .set_prop("voice_wake.energy_threshold", text)
+                .expect_err(text);
+            assert!(
+                format!("{err:#}").contains("Invalid float value"),
+                "{text}: {err:#}"
+            );
+            assert_eq!(wake.energy_threshold.to_bits(), before.to_bits(), "{text}");
+        }
+        wake.set_prop("voice_wake.energy_threshold", "0.05")
+            .unwrap();
+        assert_eq!(wake.energy_threshold, 0.05_f32);
     }
 
     #[test]
@@ -54424,6 +54952,9 @@ group_policy = "all"
 
     fn suppress_semantic_memory_warning(config: &mut Config) {
         config.memory.search_mode = SearchMode::Bm25;
+        // Default-on `[web_search]` reports TOOL_COMPILED_OUT in builds
+        // without `tools-external`; these tests count unrelated warnings.
+        config.web_search.enabled = false;
     }
 
     #[test]

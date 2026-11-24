@@ -132,8 +132,9 @@ device or stop renewal.
 Revoking the device is a separate operator step:
 
 1. Run `zeroclaw security list-client-certs`. The certificate issued at
-   sign-in has an `actor` that starts with `oidc:` and names the user's
-   issuer and subject. Note its `device`.
+   sign-in records the user's canonical `oidc:<issuer>:<subject>` principal
+   as its `actor`. Older rows may show `oidc:oidc:<issuer>:<subject>`.
+   Note the `device` for each matching certificate in either format.
 2. Run `zeroclaw security revoke-client-cert --device <id>`. That revokes
    every active certificate the device holds.
 
