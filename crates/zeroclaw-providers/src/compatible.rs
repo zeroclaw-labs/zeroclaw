@@ -1532,17 +1532,21 @@ impl OpenAiCompatibleModelProvider {
     )> {
         let credential = self.resolve_credential().await?;
 
-        let normalized = self.normalize_messages_for_model(messages, model).await?;
+        let normalized = self.normalize_messages_for_upstream(messages).await?;
         let merge = self.effective_merge_system(model);
         let (effective_messages, _system_merged) =
             Self::flatten_system_messages(&normalized, merge);
         // Strip native tool constructs for non-native-tool model_providers.
         let effective_messages = self.strip_native_tool_messages(&effective_messages);
+        let prepared_contents = self
+            .prepare_message_contents(&effective_messages, model, !merge)
+            .await;
         let api_messages: Vec<Message> = effective_messages
             .iter()
-            .map(|m| Message {
+            .zip(prepared_contents)
+            .map(|(m, content)| Message {
                 role: m.role.clone(),
-                content: self.message_content_for_role(&m.role, &m.content, !merge),
+                content,
                 thinking_blocks: self.fallback_thinking_replay(m),
             })
             .collect();
@@ -3222,11 +3226,15 @@ impl OpenAiCompatibleModelProvider {
         allow_user_image_parts: bool,
         system_merged: bool,
         thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+        contents: Option<Vec<MessageContent>>,
     ) -> NativeChatRequest {
         let has_tool_entries = tools.as_ref().is_some_and(|tools| !tools.is_empty());
         let tool_choice = has_tool_entries.then(|| "auto".to_string());
-        let mut messages =
-            self.convert_messages_for_native(effective_messages, allow_user_image_parts);
+        let mut messages = self.convert_messages_with_contents(
+            effective_messages,
+            allow_user_image_parts,
+            contents,
+        );
         let carrier = Self::merged_system_carrier_index(&messages, system_merged);
         self.apply_cache_breakpoints(&mut messages, carrier);
 
@@ -3257,10 +3265,14 @@ impl OpenAiCompatibleModelProvider {
         allow_user_image_parts: bool,
         system_merged: bool,
         thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+        contents: Option<Vec<MessageContent>>,
     ) -> NativeChatRequest<&'a [serde_json::Value]> {
         let has_tool_entries = tools.is_some_and(|tools| !tools.is_empty());
-        let mut messages =
-            self.convert_messages_for_native(effective_messages, allow_user_image_parts);
+        let mut messages = self.convert_messages_with_contents(
+            effective_messages,
+            allow_user_image_parts,
+            contents,
+        );
         let carrier = Self::merged_system_carrier_index(&messages, system_merged);
         self.apply_cache_breakpoints(&mut messages, carrier);
         let shape = self.resolve_request_shape(model, thinking, temperature, self.max_tokens);
@@ -3310,6 +3322,7 @@ impl OpenAiCompatibleModelProvider {
         merge: bool,
         system_merged: bool,
         thinking: Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+        contents: Option<Vec<MessageContent>>,
     ) -> NativeChatRequest {
         // Guard on the converted tools being non-empty (not just the raw
         // input being non-empty): convert_tool_specs_for_model can sanitize
@@ -3319,7 +3332,8 @@ impl OpenAiCompatibleModelProvider {
         let tool_choice = tools
             .as_ref()
             .and_then(|t| (!t.is_empty()).then(|| "auto".to_string()));
-        let mut messages = self.convert_messages_for_native(effective_messages, !merge);
+        let mut messages =
+            self.convert_messages_with_contents(effective_messages, !merge, contents);
         let carrier = Self::merged_system_carrier_index(&messages, system_merged);
         self.apply_cache_breakpoints(&mut messages, carrier);
         // Streamed requests are thinking-off under passthrough (see
@@ -3364,23 +3378,47 @@ impl OpenAiCompatibleModelProvider {
         }
     }
 
-    async fn normalize_messages_for_model(
+    async fn prepare_message_contents(
         &self,
         messages: &[ChatMessage],
         model: &str,
-    ) -> anyhow::Result<Vec<ChatMessage>> {
-        let messages = self.normalize_messages_for_upstream(messages).await?;
-        if matches!(self.name.as_str(), "Qwen" | "Qwen Code") {
-            return crate::qwen_video::normalize_messages(&messages, model)
-                .await
-                .map_err(|error| {
-                    crate::traits::NonRetryableProviderError::new(format!(
-                        "Qwen video input validation failed: {error:#}"
-                    ))
-                    .into()
-                });
+        allow: bool,
+    ) -> Vec<MessageContent> {
+        if !allow || !matches!(self.name.as_str(), "Qwen" | "Qwen Code") {
+            return messages
+                .iter()
+                .map(|message| {
+                    self.message_content_for_role(&message.role, &message.content, allow)
+                })
+                .collect();
         }
-        Ok(messages)
+        let prepared = crate::qwen_video::prepare_messages(messages, model).await;
+        messages
+            .iter()
+            .zip(prepared)
+            .map(|(message, prepared)| {
+                let content = self.message_content_for_role(&message.role, &prepared.text, allow);
+                if prepared.videos.is_empty() {
+                    return content;
+                }
+                let mut parts = match content {
+                    MessageContent::Text(text) => vec![MessagePart::Text {
+                        text,
+                        cache_control: None,
+                    }],
+                    MessageContent::Parts(parts) => parts,
+                };
+                parts.extend(
+                    prepared
+                        .videos
+                        .into_iter()
+                        .map(|url| MessagePart::VideoUrl {
+                            video_url: ImageUrlPart { url },
+                        }),
+                );
+                MessageContent::Parts(parts)
+            })
+            .collect()
     }
 
     /// Normalize image markers into inline data URIs for the upstream request.
@@ -3570,34 +3608,25 @@ impl OpenAiCompatibleModelProvider {
             };
             return self.tool_carrier_content(&parts.text, &attachments, allow_user_image_parts);
         }
-        if matches!(self.name.as_str(), "Qwen" | "Qwen Code")
-            && role == "user"
-            && allow_user_image_parts
-            && !is_tool_result_carrier(role, content)
-        {
-            let (text, videos) = crate::qwen_video::parse_markers(content);
-            if !videos.is_empty() {
-                let mut parts = match Self::content_with_image_parts(&text) {
-                    MessageContent::Text(text) => vec![MessagePart::Text {
-                        text,
-                        cache_control: None,
-                    }],
-                    MessageContent::Parts(parts) => parts,
-                };
-                parts.extend(videos.into_iter().map(|url| MessagePart::VideoUrl {
-                    video_url: ImageUrlPart { url },
-                }));
-                return MessageContent::Parts(parts);
-            }
-        }
         Self::to_message_content(role, content, allow_user_image_parts)
     }
 
+    #[cfg(test)]
     fn convert_messages_for_native(
         &self,
         messages: &[ChatMessage],
-        allow_user_image_parts: bool,
+        allow: bool,
     ) -> Vec<NativeMessage> {
+        self.convert_messages_with_contents(messages, allow, None)
+    }
+
+    fn convert_messages_with_contents(
+        &self,
+        messages: &[ChatMessage],
+        allow_user_image_parts: bool,
+        contents: Option<Vec<MessageContent>>,
+    ) -> Vec<NativeMessage> {
+        let mut contents = contents.map(Vec::into_iter);
         let targets_mistral_tool_call_contract = self.targets_mistral_tool_call_contract();
         let requires_string_tool_call_content = self.requires_string_tool_call_content();
         let mut used_tool_call_ids = std::collections::HashSet::new();
@@ -3608,6 +3637,7 @@ impl OpenAiCompatibleModelProvider {
         let native: Vec<NativeMessage> = messages
             .iter()
             .map(|message| {
+                let prepared = contents.as_mut().and_then(Iterator::next);
                 if message.role == "assistant"
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
                     && let Some(tool_calls_value) = value.get("tool_calls")
@@ -3773,11 +3803,13 @@ impl OpenAiCompatibleModelProvider {
 
                 NativeMessage {
                     role: message.role.clone(),
-                    content: Some(self.message_content_for_role(
-                        &message.role,
-                        &message.content,
-                        allow_user_image_parts,
-                    )),
+                    content: Some(prepared.unwrap_or_else(|| {
+                        self.message_content_for_role(
+                            &message.role,
+                            &message.content,
+                            allow_user_image_parts,
+                        )
+                    })),
                     tool_call_id: None,
                     tool_calls: None,
                     reasoning_content: None,
@@ -3996,7 +4028,10 @@ impl OpenAiCompatibleModelProvider {
                         && msg.role != "system"
                         && !(matches!(self.name.as_str(), "Qwen" | "Qwen Code")
                             && (is_tool_result_carrier(&last.role, &last.content)
-                                || is_tool_result_carrier(&msg.role, &msg.content))) =>
+                                || is_tool_result_carrier(&msg.role, &msg.content)
+                                || (msg.role == "user"
+                                    && (last.content.contains("[VIDEO:")
+                                        || msg.content.contains("[VIDEO:"))))) =>
                 {
                     if !last.content.is_empty() && !msg.content.is_empty() {
                         last.content.push_str("\n\n");
@@ -4478,13 +4513,16 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             content: message.to_string(),
         };
         let normalized_user = self
-            .normalize_messages_for_model(std::slice::from_ref(&user_msg), model)
+            .normalize_messages_for_upstream(std::slice::from_ref(&user_msg))
             .await?
             .pop()
             .unwrap_or(user_msg);
-        let normalized_message = normalized_user.content;
+        let normalized_message = normalized_user.content.clone();
 
         let merge = self.effective_merge_system(model);
+        let mut prepared_contents = self
+            .prepare_message_contents(std::slice::from_ref(&normalized_user), model, !merge)
+            .await;
         let mut messages = Vec::new();
 
         if merge {
@@ -4507,7 +4545,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             }
             messages.push(Message {
                 role: "user".to_string(),
-                content: self.message_content_for_role("user", &normalized_message, true),
+                content: prepared_contents.remove(0),
                 thinking_blocks: None,
             });
         }
@@ -4609,7 +4647,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let exact_request_replay = exact_request_replay_active();
         let credential = self.resolve_credential().await?;
 
-        let normalized = self.normalize_messages_for_model(messages, model).await?;
+        let normalized = self.normalize_messages_for_upstream(messages).await?;
         let merge = self.effective_merge_system(model);
         let (effective_messages, system_merged) = Self::flatten_system_messages(&normalized, merge);
         let effective_messages = if self.native_tool_calling {
@@ -4617,6 +4655,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         } else {
             self.strip_native_tool_messages(&effective_messages)
         };
+        let prepared_contents = self
+            .prepare_message_contents(&effective_messages, model, !merge)
+            .await;
         let request = self.build_raw_native_tool_chat_request(
             &effective_messages,
             (!tools.is_empty()).then_some(tools),
@@ -4627,6 +4668,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             // Legacy entry point: carries no `ChatRequest`, so no runtime
             // thinking params are available to forward.
             None,
+            Some(prepared_contents),
         );
         let mut payload = serde_json::to_value(request)?;
         let tools_count = payload
@@ -4729,7 +4771,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let credential = self.resolve_credential().await?;
 
         let normalized = self
-            .normalize_messages_for_model(request.messages, model)
+            .normalize_messages_for_upstream(request.messages)
             .await?;
         let merge = self.effective_merge_system(model);
         let (effective_messages, system_merged) = Self::flatten_system_messages(&normalized, merge);
@@ -4740,6 +4782,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         };
 
         let tools = self.convert_tool_specs_for_model(request.tools, model);
+        let prepared_contents = self
+            .prepare_message_contents(&effective_messages, model, !merge)
+            .await;
         let native_request = self.build_native_tool_chat_request(
             &effective_messages,
             tools,
@@ -4748,6 +4793,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             !merge,
             system_merged,
             request.thinking,
+            Some(prepared_contents),
         );
         let mut payload = serde_json::to_value(native_request)?;
         let tools_count = payload
@@ -4923,8 +4969,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let video_policy = crate::qwen_video::current_read_policy();
         let handle = ::zeroclaw_spawn::spawn!(async move {
             let normalized = match crate::qwen_video::with_video_read_policy(
-                video_policy,
-                provider.normalize_messages_for_model(&messages_owned, &model),
+                video_policy.clone(),
+                provider.normalize_messages_for_upstream(&messages_owned),
             )
             .await
             {
@@ -4941,6 +4987,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let (effective_messages, system_merged) =
                 Self::flatten_system_messages(&normalized, merge);
             let effective_messages = provider.strip_native_tool_messages(&effective_messages);
+            let prepared_contents = crate::qwen_video::with_video_read_policy(
+                video_policy.clone(),
+                provider.prepare_message_contents(&effective_messages, &model, !merge),
+            )
+            .await;
             let tools = provider.convert_tool_specs_for_model(tools_owned.as_deref(), &model);
             let tools_count = tools.as_ref().map_or(0, Vec::len);
             let has_tools = tools_count > 0;
@@ -4960,22 +5011,15 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     merge,
                     system_merged,
                     thinking_owned,
+                    Some(prepared_contents),
                 ))
             } else {
                 let mut messages: Vec<Message> = effective_messages
                     .iter()
-                    .map(|message| Message {
+                    .zip(prepared_contents)
+                    .map(|(message, content)| Message {
                         role: message.role.clone(),
-                        content: provider.message_content_for_role(
-                            &message.role,
-                            &message.content,
-                            !merge,
-                            // Streamed requests are thinking-off under
-                            // passthrough (see streaming_thinking_params):
-                            // history replay blocks require the request
-                            // thinking object, so they never ride the
-                            // streamed wire.
-                        ),
+                        content,
                         thinking_blocks: None,
                     })
                     .collect();
@@ -5182,8 +5226,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 content: message_owned,
             };
             let normalized_user = match crate::qwen_video::with_video_read_policy(
-                video_policy,
-                provider.normalize_messages_for_model(std::slice::from_ref(&user_msg), &model),
+                video_policy.clone(),
+                provider.normalize_messages_for_upstream(std::slice::from_ref(&user_msg)),
             )
             .await
             {
@@ -5195,9 +5239,18 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     return;
                 }
             };
-            let normalized_message_content = normalized_user.content;
+            let normalized_message_content = normalized_user.content.clone();
 
             let merge = provider.effective_merge_system(&model);
+            let mut prepared_contents = crate::qwen_video::with_video_read_policy(
+                video_policy.clone(),
+                provider.prepare_message_contents(
+                    std::slice::from_ref(&normalized_user),
+                    &model,
+                    !merge,
+                ),
+            )
+            .await;
             let mut messages = Vec::new();
             if merge {
                 let content = match system_prompt_owned.as_deref() {
@@ -5219,11 +5272,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 }
                 messages.push(Message {
                     role: "user".to_string(),
-                    content: provider.message_content_for_role(
-                        "user",
-                        &normalized_message_content,
-                        !merge,
-                    ),
+                    content: prepared_contents.remove(0),
                     thinking_blocks: None,
                 });
             }
@@ -5358,8 +5407,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let video_policy = crate::qwen_video::current_read_policy();
         let handle = ::zeroclaw_spawn::spawn!(async move {
             let normalized = match crate::qwen_video::with_video_read_policy(
-                video_policy,
-                provider.normalize_messages_for_model(&messages_owned, &model),
+                video_policy.clone(),
+                provider.normalize_messages_for_upstream(&messages_owned),
             )
             .await
             {
@@ -5376,11 +5425,17 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             let (effective_messages, _system_merged) =
                 Self::flatten_system_messages(&normalized, merge);
             let effective_messages = provider.strip_native_tool_messages(&effective_messages);
+            let prepared_contents = crate::qwen_video::with_video_read_policy(
+                video_policy.clone(),
+                provider.prepare_message_contents(&effective_messages, &model, !merge),
+            )
+            .await;
             let api_messages: Vec<Message> = effective_messages
                 .iter()
-                .map(|m| Message {
+                .zip(prepared_contents)
+                .map(|(m, content)| Message {
                     role: m.role.clone(),
-                    content: provider.message_content_for_role(&m.role, &m.content, !merge),
+                    content,
                     thinking_blocks: None,
                 })
                 .collect();
@@ -6870,6 +6925,7 @@ mod tests {
             false,
             false,
             None,
+            None,
         ))
         .unwrap();
 
@@ -6902,6 +6958,7 @@ mod tests {
             true,
             false,
             false,
+            None,
             None,
         ))
         .unwrap();
@@ -6981,6 +7038,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         ))
         .unwrap();
         let without_params = serde_json::to_value(p.build_native_tool_chat_request(
@@ -6990,6 +7048,7 @@ mod tests {
             None,
             false,
             false,
+            None,
             None,
         ))
         .unwrap();
@@ -7040,6 +7099,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         );
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -7061,6 +7121,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         ))
         .unwrap();
         assert!(
@@ -7095,6 +7156,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         ))
         .unwrap();
         assert!(with_tools.get("thinking").is_none());
@@ -7109,6 +7171,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         ))
         .unwrap();
         assert!(
@@ -7275,6 +7338,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         );
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -7317,6 +7381,7 @@ mod tests {
                 false,
                 false,
                 Some(params),
+                None,
             );
             let value = serde_json::to_value(&req).unwrap();
             assert_eq!(
@@ -7340,6 +7405,7 @@ mod tests {
                 false,
                 false,
                 Some(params),
+                None,
             );
             let value = serde_json::to_value(&req).unwrap();
             assert_eq!(
@@ -7370,6 +7436,7 @@ mod tests {
             None,
             false,
             false,
+            None,
             None,
         );
         let value = serde_json::to_value(&req).unwrap();
@@ -7594,6 +7661,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -7640,6 +7708,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -7887,6 +7956,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         );
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -7909,6 +7979,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -7928,6 +7999,7 @@ mod tests {
             Some(0.75),
             false,
             false,
+            None,
             None,
         ))
         .unwrap();
@@ -7962,6 +8034,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         );
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -7980,6 +8053,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -7996,6 +8070,7 @@ mod tests {
             Some(0.75),
             false,
             false,
+            None,
             None,
         ))
         .unwrap();
@@ -8032,6 +8107,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         );
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -8077,6 +8153,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -8099,6 +8176,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -8227,6 +8305,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         );
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -8255,6 +8334,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -8274,6 +8354,7 @@ mod tests {
             Some(0.75),
             false,
             false,
+            None,
             None,
         ))
         .unwrap();
@@ -8309,6 +8390,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         );
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -8333,6 +8415,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -8349,6 +8432,7 @@ mod tests {
             Some(0.75),
             false,
             false,
+            None,
             None,
         ))
         .unwrap();
@@ -8386,6 +8470,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -8410,6 +8495,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -8446,6 +8532,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         );
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -8492,6 +8579,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -8520,6 +8608,7 @@ mod tests {
             false,
             false,
             Some(params),
+            None,
         ))
         .unwrap();
         assert_eq!(
@@ -8638,6 +8727,7 @@ mod tests {
             false,
             false,
             None,
+            None,
         );
         let value = serde_json::to_value(&req).unwrap();
         assert!(
@@ -8653,6 +8743,7 @@ mod tests {
             None,
             false,
             false,
+            None,
             None,
         );
         let value_empty = serde_json::to_value(&req_empty).unwrap();
@@ -8683,6 +8774,7 @@ mod tests {
             None,
             false,
             false,
+            None,
             None,
         );
         let value = serde_json::to_value(&req).unwrap();
@@ -8725,6 +8817,7 @@ mod tests {
             false,
             false,
             None,
+            None,
         );
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -8750,8 +8843,9 @@ mod tests {
             .build();
         let messages = vec![ChatMessage::user("hello")];
 
-        let req =
-            p.build_native_tool_chat_request(&messages, None, "gpt-5", None, false, false, None);
+        let req = p.build_native_tool_chat_request(
+            &messages, None, "gpt-5", None, false, false, None, None,
+        );
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
             value
@@ -8784,6 +8878,7 @@ mod tests {
             false,
             false,
             None,
+            None,
         );
         let value = serde_json::to_value(&req).unwrap();
         assert!(
@@ -8812,6 +8907,7 @@ mod tests {
             false,
             false,
             None,
+            None,
         );
         let value = serde_json::to_value(&req).unwrap();
         assert_eq!(
@@ -8831,6 +8927,7 @@ mod tests {
             None,
             false,
             false,
+            None,
             None,
         );
         let value = serde_json::to_value(&req).unwrap();
@@ -8861,6 +8958,7 @@ mod tests {
             None,
             false,
             false,
+            None,
             None,
         );
         let value = serde_json::to_value(&req).unwrap();
@@ -13971,6 +14069,7 @@ mod tests {
             true,
             false,
             None,
+            None,
         );
         let value = serde_json::to_value(&request).unwrap();
         let first_message = &value["messages"][0];
@@ -16155,6 +16254,7 @@ mod tests {
             true,
             false,
             None,
+            None,
         );
         let default_message = &default_request.messages[0];
         assert_eq!(default_message.role, "assistant");
@@ -16191,6 +16291,7 @@ mod tests {
             None,
             true,
             false,
+            None,
             None,
         );
         let groq_message = &groq_request.messages[0];

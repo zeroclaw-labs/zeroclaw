@@ -49,54 +49,56 @@ pub(crate) fn supports_model(model: &str) -> bool {
     })
 }
 
-pub(crate) fn parse_markers(content: &str) -> (String, Vec<String>) {
-    let mut text = String::new();
-    let mut videos = Vec::new();
-    let mut remaining = content;
-    while let Some(start) = remaining.find(PREFIX) {
-        let Some(end) = remaining[start + PREFIX.len()..].find(']') else {
-            break;
-        };
-        let end = start + PREFIX.len() + end;
-        text.push_str(&remaining[..start]);
-        videos.push(remaining[start + PREFIX.len()..end].trim().to_owned());
-        remaining = &remaining[end + 1..];
-    }
-    text.push_str(remaining);
-    (text, videos)
+/// A dispatch-local result. Only successfully loaded references become videos;
+/// retained text is never scanned again by the wire serializer.
+pub(crate) struct PreparedVideoMessage {
+    pub text: String,
+    pub videos: Vec<String>,
 }
 
-pub(crate) async fn normalize_messages(
+pub(crate) async fn prepare_messages(
     messages: &[ChatMessage],
     model: &str,
-) -> anyhow::Result<Vec<ChatMessage>> {
-    let mut normalized = messages.to_vec();
-    // A request-wide bound also limits repeated videos in retained history.
+) -> Vec<PreparedVideoMessage> {
     let mut remaining_bytes = MAX_VIDEO_BYTES;
-    for message in &mut normalized {
-        if message.role != "user" || is_tool_result_carrier(&message.role, &message.content) {
-            continue;
+    let mut prepared = Vec::with_capacity(messages.len());
+    for message in messages.iter().rev() {
+        let mut result = PreparedVideoMessage {
+            text: message.content.clone(),
+            videos: Vec::new(),
+        };
+        if message.role == "user"
+            && !is_tool_result_carrier(&message.role, &message.content)
+            && supports_model(model)
+        {
+            let mut remaining = message.content.as_str();
+            let mut text = String::new();
+            while let Some(start) = remaining.find(PREFIX) {
+                let Some(end) = remaining[start + PREFIX.len()..].find(']') else {
+                    break;
+                };
+                let end = start + PREFIX.len() + end + 1;
+                text.push_str(&remaining[..start]);
+                let marker = &remaining[start..end];
+                let source = marker[PREFIX.len()..marker.len() - 1].trim();
+                match load_video(source, remaining_bytes).await {
+                    Ok(bytes) => {
+                        remaining_bytes -= bytes.len();
+                        result
+                            .videos
+                            .push(format!("{DATA_PREFIX}{}", STANDARD.encode(bytes)));
+                    }
+                    Err(_) => text.push_str(marker),
+                }
+                remaining = &remaining[end..];
+            }
+            text.push_str(remaining);
+            result.text = text;
         }
-        let (text, videos) = parse_markers(&message.content);
-        if videos.is_empty() {
-            continue;
-        }
-        ensure!(
-            supports_model(model),
-            "Qwen model does not support video-file input"
-        );
-        let mut content = text;
-        for source in videos {
-            let bytes = load_video(&source, remaining_bytes).await?;
-            remaining_bytes -= bytes.len();
-            content.push_str("\n[VIDEO:");
-            content.push_str(DATA_PREFIX);
-            content.push_str(&STANDARD.encode(bytes));
-            content.push(']');
-        }
-        message.content = content;
+        prepared.push(result);
     }
-    Ok(normalized)
+    prepared.reverse();
+    prepared
 }
 
 async fn load_video(source: &str, limit: usize) -> anyhow::Result<Vec<u8>> {
@@ -247,16 +249,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn video_input_rejects_unsupported_models_and_aggregate_overflow() {
+    async fn video_input_preserves_unsupported_and_over_budget_markers() {
         let inline = format!("{DATA_PREFIX}{}", STANDARD.encode(MP4));
         let input = ChatMessage::user(format!("[VIDEO:{inline}]"));
-        assert!(normalize_messages(&[input], "qwen-turbo").await.is_err());
+        let expected = input.content.clone();
+        let prepared = prepare_messages(&[input], "qwen-turbo").await;
+        assert_eq!(prepared[0].text, expected);
+        assert!(prepared[0].videos.is_empty());
         assert!(supports_model("qwen3.8-flash-0902"));
         assert!(!supports_model("qwen3.8-flash-invented"));
         let bytes = [MP4, &vec![0; MAX_VIDEO_BYTES / 2]].concat();
         let inline = format!("{DATA_PREFIX}{}", STANDARD.encode(bytes));
         let input = ChatMessage::user(format!("[VIDEO:{inline}] [VIDEO:{inline}]"));
-        assert!(normalize_messages(&[input], "qwen3.8-flash").await.is_err());
+        let prepared = prepare_messages(&[input], "qwen3.8-flash").await;
+        assert_eq!(prepared[0].videos.len(), 1);
+        assert!(prepared[0].text.contains(&format!("[VIDEO:{inline}]")));
     }
     #[tokio::test]
     async fn video_paths_obey_current_agent_policy() {
@@ -317,10 +324,10 @@ mod tests {
         std::fs::create_dir(&visible).unwrap();
         std::fs::create_dir(&private).unwrap();
         std::fs::write(visible.join("clip.mp4"), MP4).unwrap();
-        std::fs::write(private.join("clip.mp4"), MP4).unwrap();
+        std::fs::write(private.join("clip.mp4"), b"private content").unwrap();
         let resolved = std::fs::canonicalize(visible.join("clip.mp4")).unwrap();
         std::fs::rename(&visible, directory.path().join("original")).unwrap();
-        std::os::unix::fs::symlink(private, visible).unwrap();
+        std::os::unix::fs::symlink("private", visible).unwrap();
         assert!(open_video_file_nofollow(&resolved).is_err());
     }
 }

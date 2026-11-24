@@ -597,8 +597,11 @@ default. Existing image inputs can accompany the video.
 The supported IDs and dated snapshots are defined by `qwen_video::supports_model`
 in `zeroclaw-providers`. The request-wide raw-video budget is strictly below
 7,000,000 bytes, including videos retained in history. Container checks validate
-the MP4 signature; the service validates codec decodability. Missing files,
-invalid Base64, unsupported models and exhausted budgets return input errors.
+the MP4 signature; the service validates codec decodability. References that
+cannot be loaded, unsupported models, invalid Base64 and
+exhausted budgets retain their literal video-marker text so the request can
+continue. Video history is processed newest-first, with successful loads alone
+spending the request budget. Older references that no longer load remain text.
 Files remain in their original location. Low-level provider callers must scope
 local reads with `with_video_read_policy`; an unscoped caller can supply inline
 video bytes. Video reference syntax in tool-result
