@@ -1055,6 +1055,7 @@ cli-desktop-download-at = {"  "}ダウンロード先: {$url}
 cli-config-legend = 凡例: 💉 env で上書き  🔒 シークレット
 cli-config-secret-set = {$path} は設定されています(暗号化されたシークレット — 値は表示されません)
 cli-config-secret-unset = {$path} は設定されていません(暗号化されたシークレット)
+cli-config-value-prompt = {$path} の値を入力してください
 cli-config-updated = {$path} を更新しました。
 cli-config-review-hint = `zeroclaw config list` を実行して確認し、必須フィールドを設定してください。
 cli-config-catalog-unavailable-manual = {"  "}⚠ {$provider} のカタログを利用できません（{$error}）。モデル ID を手動で入力してください。
