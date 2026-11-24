@@ -1193,13 +1193,13 @@ pub async fn list_plugin_tls_credentials(
 struct PluginTlsCredentialMutation {
     instance: String,
     property: String,
-    operation: PluginTlsCredentialOperation,
+    operation: CredentialOperation,
     value: Option<String>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum PluginTlsCredentialOperation {
+enum CredentialOperation {
     Create,
     Replace,
     Delete,
@@ -1273,17 +1273,15 @@ async fn mutate_plugin_tls_credential_inner(
         .get(&mutation.property)
         .is_some_and(|value| !value.is_empty());
     let (operation, value, configured, verb) = match (mutation.operation, mutation.value) {
-        (PluginTlsCredentialOperation::Create, Some(value)) if !present => {
+        (CredentialOperation::Create, Some(value)) if !present => {
             ("create", Some(value), true, Verb::Create)
         }
-        (PluginTlsCredentialOperation::Replace, Some(value)) if present => {
+        (CredentialOperation::Replace, Some(value)) if present => {
             ("replace", Some(value), true, Verb::Update)
         }
-        (PluginTlsCredentialOperation::Delete, None) if present => {
-            ("delete", None, false, Verb::Delete)
-        }
-        (PluginTlsCredentialOperation::Delete, Some(_))
-        | (PluginTlsCredentialOperation::Create | PluginTlsCredentialOperation::Replace, None) => {
+        (CredentialOperation::Delete, None) if present => ("delete", None, false, Verb::Delete),
+        (CredentialOperation::Delete, Some(_))
+        | (CredentialOperation::Create | CredentialOperation::Replace, None) => {
             return StatusCode::BAD_REQUEST.into_response();
         }
         _ => return StatusCode::CONFLICT.into_response(),
@@ -1363,7 +1361,7 @@ async fn mutate_plugin_tls_credential_inner(
 #[serde(deny_unknown_fields)]
 struct HttpCredentialMutation {
     name: String,
-    operation: PluginTlsCredentialOperation,
+    operation: CredentialOperation,
     credential: Option<zeroclaw_config::schema::ScopedHttpCredential>,
     permissions: Option<HttpCredentialGrant>,
 }
@@ -1492,7 +1490,7 @@ pub async fn mutate_http_credential(
                 return StatusCode::PRECONDITION_FAILED.into_response();
             }
             if !ScopedHttpCredential::valid_name(&mutation.name)
-                || (matches!(mutation.operation, PluginTlsCredentialOperation::Create)
+                || (matches!(mutation.operation, CredentialOperation::Create)
                     && config.http_request.secrets.contains_key(&mutation.name))
             {
                 return StatusCode::BAD_REQUEST.into_response();
@@ -1500,9 +1498,9 @@ pub async fn mutate_http_credential(
             let credentials = &mut config.http_request.scoped_credentials;
             let present = credentials.contains_key(&mutation.name);
             let edit = match (mutation.operation, present) {
-                (PluginTlsCredentialOperation::Create, false) => (Verb::Create, "create"),
-                (PluginTlsCredentialOperation::Replace, true) => (Verb::Update, "replace"),
-                (PluginTlsCredentialOperation::Delete, true) => (Verb::Delete, "delete"),
+                (CredentialOperation::Create, false) => (Verb::Create, "create"),
+                (CredentialOperation::Replace, true) => (Verb::Update, "replace"),
+                (CredentialOperation::Delete, true) => (Verb::Delete, "delete"),
                 _ => return StatusCode::CONFLICT.into_response(),
             };
             let store = SecretStore::new(dir, true);
