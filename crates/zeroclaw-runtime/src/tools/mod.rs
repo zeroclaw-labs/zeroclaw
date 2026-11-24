@@ -8459,6 +8459,13 @@ permissions = ["http_client"]
 
         let mut cfg = test_config(tmp);
         cfg.tools.optional = vec!["*".into()];
+        cfg.remote_files
+            .webdav
+            .push(zeroclaw_config::remote_files::WebDavResourceConfig {
+                alias: "inventory".into(),
+                root: "https://files.example.invalid/".into(),
+                credential_alias: "inventory-placeholder".into(),
+            });
         std::fs::create_dir_all(&cfg.data_dir).unwrap();
         // Plugin tools are outside the inventory, so plugins stay off, and the
         // plugin directory points under `tmp` as well.
