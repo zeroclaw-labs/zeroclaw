@@ -2027,7 +2027,11 @@ mod tests {
 
         assert_eq!(copied.skills.bundles, 1);
         assert_eq!(copied.skills.tally.files, 2);
-        assert!(copied.skills.without_content.is_empty());
+        assert!(
+            copied.skills.without_content.is_empty(),
+            "{:?}",
+            copied.skills.without_content
+        );
 
         let carried = out.join(SKILLS_DIR).join("research_tools");
         assert!(carried.join("web_search/SKILL.md").is_file());
@@ -3095,7 +3099,8 @@ mod tests {
 
         assert_eq!(copied.workspace.replaced_skipped, 1);
         assert_eq!(copied.workspace.files, 0);
-        assert!(all_files(&out.join(WORKSPACE_DIR)).is_empty());
+        let files = all_files(&out.join(WORKSPACE_DIR));
+        assert!(files.is_empty(), "{files:?}");
         assert_eq!(
             std::fs::read_to_string(source.join("notes/secret.md")).unwrap(),
             "host secret bytes"
@@ -3589,7 +3594,8 @@ mod tests {
 
         assert!(moved.join("bundle").join(MANIFEST_FILE).is_file());
         // The impostor that took the admitted parent's name is untouched.
-        assert!(entry_names(&parent).is_empty());
+        let entries = entry_names(&parent);
+        assert!(entries.is_empty(), "{entries:?}");
     }
 
     /// Root ignores mode bits, so probe rather than assume the permission-denied

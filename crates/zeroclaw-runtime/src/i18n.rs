@@ -1978,6 +1978,38 @@ mod tests {
     }
 
     #[test]
+    fn config_set_value_prompt_formats_in_every_builtin_locale() {
+        let key = "cli-config-value-prompt";
+        let path = "providers.models.openai.example.api_key";
+        let english = format!("Enter value for {path}");
+
+        for locale in available_locales() {
+            let source = if locale.code == "en" {
+                include_str!("../locales/en/cli.ftl")
+            } else {
+                builtin_cli_ftl_source(&locale.code)
+                    .unwrap_or_else(|| panic!("missing built-in CLI catalogue for {}", locale.code))
+            };
+            let prompt = format_ftl_message(source, &locale.code, key, &[("path", path)])
+                .unwrap_or_else(|| panic!("{key} should format in {}", locale.code));
+            assert!(
+                prompt.contains(path),
+                "{} should include the path",
+                locale.code
+            );
+            if locale.code == "en" {
+                assert_eq!(prompt, english);
+            } else {
+                assert_ne!(
+                    prompt, english,
+                    "{} should localize the prompt",
+                    locale.code
+                );
+            }
+        }
+    }
+
+    #[test]
     fn plugin_config_entry_key_formats_in_every_builtin_locale() {
         let args = [("capability", "Tool"), ("key", "zpi1_fixture")];
         for (source, locale) in [
