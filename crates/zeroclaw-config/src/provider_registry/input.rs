@@ -459,7 +459,7 @@ mod tests {
                 .provider_registry()
                 .unwrap()
                 .models
-                .contains_key(&"custom".into())
+                .contains_key("custom")
         );
     }
 
