@@ -18318,6 +18318,34 @@ pub async fn deliver_announcement(
         "qq" => {
             anyhow::bail!("QQ channel requires the `channel-qq` feature");
         }
+        #[cfg(feature = "channel-zulip")]
+        "zulip" => {
+            let zc = config
+                .channels
+                .zulip
+                .get(alias)
+                .ok_or_else(not_configured)?;
+            let peers = config.channel_external_peers("zulip", alias);
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || peers.clone());
+            let ch = ZulipChannel::new(
+                zc.site.clone(),
+                zc.email.clone(),
+                zc.api_key.clone(),
+                alias,
+                peer_resolver,
+                zc.mention_only.unwrap_or(false),
+            )
+            .with_stream_ids(&zc.stream_ids)?
+            .with_proxy_url(zc.proxy_url.clone())
+            .with_dm_enabled(zc.dm_enabled.unwrap_or(true))
+            .with_tls_ca_cert_path(zc.tls_ca_cert_path.as_deref())?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "channel-zulip"))]
+        "zulip" => {
+            anyhow::bail!("Zulip channel requires the `channel-zulip` feature");
+        }
         #[cfg(feature = "channel-lark")]
         "lark" | "feishu" => {
             // [channels.lark.<alias>] is the single source of truth for both
@@ -58322,6 +58350,85 @@ Done."#;
         assert!(
             !msg.contains("unsupported delivery channel"),
             "disabled alias must reach the QQ arm; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-zulip")]
+    async fn deliver_announcement_routes_zulip_to_zulip_arm() {
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = deliver_announcement(&config, "zulip.work", "stream:5:daily", None, "hi")
+            .await
+            .expect_err("expected zulip.work to bail because channel is not configured");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("unsupported delivery channel"),
+            "zulip.work must route to the Zulip arm, not fall through; got: {msg}"
+        );
+        assert!(
+            msg.contains("[channels.zulip.work] not configured"),
+            "zulip.work must report the real config table; got: {msg}"
+        );
+    }
+
+    #[cfg(feature = "channel-zulip")]
+    fn zulip_work_config(site: String, enabled: bool) -> zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.zulip.insert(
+            "work".to_string(),
+            zeroclaw_config::schema::ZulipConfig {
+                enabled,
+                site,
+                email: "bot@example.com".to_string(),
+                api_key: "test-api-key".to_string(),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-zulip")]
+    async fn deliver_announcement_sends_to_the_zulip_alias_site() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/messages"))
+            .and(body_string_contains("type=stream"))
+            .and(body_string_contains("to=5"))
+            .and(body_string_contains("topic=daily+report"))
+            .and(body_string_contains("content=hi"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"result": "success", "msg": "", "id": 42})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = zulip_work_config(server.uri(), true);
+        deliver_announcement(&config, "zulip.work", "stream:5:daily report", None, "hi")
+            .await
+            .expect("a configured zulip alias must deliver");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "channel-zulip")]
+    async fn deliver_announcement_rejects_disabled_zulip_alias() {
+        // A refused loopback port: if the guard regresses, the send fails
+        // there instead of reaching a real server.
+        let config = zulip_work_config("http://127.0.0.1:1".to_string(), false);
+
+        let err = deliver_announcement(&config, "zulip.work", "stream:5:daily", None, "hi")
+            .await
+            .expect_err("a disabled zulip alias must not be delivered to");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("[channels.zulip.work] is disabled"),
+            "disabled alias must report the off switch; got: {msg}"
         );
     }
 

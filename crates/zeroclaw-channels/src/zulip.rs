@@ -1232,8 +1232,13 @@ impl ZulipChannel {
         if let Target::Stream { .. } = &target {
             // DMs always bypass mention_only, as in Mattermost. A text answer to
             // a gate posted here passes too: whoever replies
-            // `approve <reference>` need not mention the bot.
-            if self.mention_only && !mentioned && !self.is_gate_text_reply(&msg.content) {
+            // `approve <reference>` need not mention the bot. So does a bare
+            // "yes" while an approval waits here, to get the reminder.
+            if self.mention_only
+                && !mentioned
+                && !self.is_gate_text_reply(&msg.content)
+                && !self.is_bare_reply_to_pending_approval(&msg.content, &target)
+            {
                 return None;
             }
         }
@@ -1259,6 +1264,11 @@ impl ZulipChannel {
             explicitly_addressed: is_direct || mentioned,
             ..Default::default()
         })
+    }
+
+    /// A tokenless "yes" or "no" where an approval prompt is pending.
+    fn is_bare_reply_to_pending_approval(&self, content: &str, target: &Target) -> bool {
+        is_bare_approval_word(content) && !self.pending_tokens_for(&target.encode()).is_empty()
     }
 
     /// `<choice> <reference>` for a gate this alias posted.
@@ -2149,6 +2159,35 @@ mod tests {
             .parse_message(&stream_msg(OPERATOR, "[]", "ciao"), &me())
             .unwrap();
         assert!(!msg.explicitly_addressed);
+    }
+
+    #[test]
+    fn bare_yes_bypasses_mention_only_only_while_an_approval_is_pending_there() {
+        let ch = channel(true);
+        assert!(
+            ch.parse_message(&stream_msg(OPERATOR, "[]", "yes"), &me())
+                .is_none()
+        );
+        let _other = register_pending(&ch, "def456", "stream:3:other", 701);
+        assert!(
+            ch.parse_message(&stream_msg(OPERATOR, "[]", "yes"), &me())
+                .is_none()
+        );
+        let _rx = register_pending(&ch, "abc123", "stream:3:ops: deploy", 700);
+        let msg = ch
+            .parse_message(&stream_msg(OPERATOR, "[]", "yes"), &me())
+            .unwrap();
+        assert!(is_bare_approval_word(&msg.content));
+        assert!(!msg.explicitly_addressed);
+        // Ordinary chatter and unauthorized senders are still dropped
+        assert!(
+            ch.parse_message(&stream_msg(OPERATOR, "[]", "ciao"), &me())
+                .is_none()
+        );
+        assert!(
+            ch.parse_message(&stream_msg(42, "[]", "yes"), &me())
+                .is_none()
+        );
     }
 
     #[test]

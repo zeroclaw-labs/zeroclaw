@@ -102,7 +102,8 @@ Only peer-group members can answer, and only in the conversation the prompt was
 posted to. Once decided, the prompt is edited to show the outcome (approved,
 denied, or expired). A bare `yes` or `no` without the token, sent while a prompt
 is pending in the same conversation, gets an immediate reminder with the token
-instead of waiting in the agent's queue.
+instead of waiting in the agent's queue. In a stream with `mention_only` it does
+not need to mention the bot; other unmentioned messages are still ignored.
 
 `approval_timeout_secs` bounds the wait. The default is 300 seconds; `0` denies
 immediately. A timeout is recorded as the runtime denying, not as a person.
@@ -198,6 +199,11 @@ dm_enabled = false
 6. `site` must be `https://`. Plain `http://` is accepted only for a loopback
    host (a local development server): for any other host the channel refuses to
    send the API key and does not start.
+7. Cron delivery and `zeroclaw channel send` address the instance as
+   `zulip.<alias>` and the destination as a `reply_target`
+   (`stream:<stream_id>:<topic>` or `dm:<user_id>,…`). When the alias is
+   running, its live client sends; otherwise a client is built from the config
+   for that one message. An alias with `enabled = false` is refused.
 
 ## See also
 
