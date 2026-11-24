@@ -14921,7 +14921,8 @@ target = "memory_recall"
                 base: ModelProviderConfig {
                     uri: Some(server.uri.clone()),
                     api_key: Some("fixture-key".into()),
-                    model: Some("gpt-5.4".into()),
+                    // An agentic worker can include tools while exposing its selected effort.
+                    model: Some("gpt-5.2".into()),
                     wire_api: Some(zeroclaw_config::schema::WireApi::ChatCompletions),
                     timeout_secs: Some(2),
                     ..Default::default()
@@ -14992,7 +14993,7 @@ target = "memory_recall"
                         parent.map(|_| "high")
                     };
                     assert_eq!(body["reasoning_effort"].as_str(), expected);
-                    assert_eq!(body["model"], "gpt-5.4");
+                    assert_eq!(body["model"], "gpt-5.2");
                     assert!(body.get("thinking").is_none());
                 }
             }
