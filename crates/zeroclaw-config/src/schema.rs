@@ -121,6 +121,7 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, RuntimeProxyC
 
 struct RuntimeProxyCachedClient {
     generation: u64,
+    runtime_id: tokio::runtime::Id,
     client: reqwest::Client,
 }
 
@@ -936,14 +937,16 @@ pub enum AuthMode {
 /// Prompt-cache entry lifetime to request for this provider's Anthropic
 /// cache markers. `"5m"` is the API default; `"1h"` extends the cache
 /// entry lifetime to one hour so a pause longer than five minutes does
-/// not force a full-price rewrite of the cached prefix. Meaningful only
-/// where Anthropic-shaped `cache_control` markers reach the API: the
-/// native Anthropic provider always places them, compatible providers
-/// only behind `cache_passthrough` (with passthrough off the setting is
-/// inert). One TTL applies to every marker this implementation places;
-/// operator-supplied `cache_control` (via `provider_extra` or raw tool
-/// JSON) sits outside that guarantee and must order 1h before 5m when
-/// mixing lifetimes in one request.
+/// not force a full-price rewrite of the cached prefix; `"off"` places no
+/// markers at all, for a workload that never reuses a prefix and would
+/// otherwise pay the write premium with no read to amortise it.
+/// Meaningful only where Anthropic-shaped `cache_control` markers reach
+/// the API: the native Anthropic provider always places them, compatible
+/// providers only behind `cache_passthrough` (with passthrough off the
+/// setting is inert). One TTL applies to every marker this implementation
+/// places; operator-supplied `cache_control` (via `provider_extra` or raw
+/// tool JSON) sits outside that guarantee and must order 1h before 5m
+/// when mixing lifetimes in one request.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
 )]
@@ -956,6 +959,9 @@ pub enum CacheTtl {
     /// 1-hour cache lifetime; cache writes bill at a premium write rate.
     #[serde(rename = "1h")]
     OneHour,
+    /// Place no prompt-cache breakpoints at all.
+    #[serde(rename = "off")]
+    Off,
 }
 
 /// Named model_provider profile definition.
@@ -2694,6 +2700,78 @@ pub struct AtlasCloudModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+// ── Cheaper Inference ──
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CheaperInferenceEndpoint {
+    #[default]
+    Default,
+}
+
+impl CheaperInferenceEndpoint {
+    /// Canonical Cheaper Inference endpoint. Single source of truth:
+    /// `CompatFamilySpec::DEFAULT_URL` for `CheaperInferenceModelProviderConfig`
+    /// references this const so the schema and factory surfaces never drift.
+    pub const DEFAULT_URI: &'static str = "https://api.cheaperinference.com/v1";
+}
+
+impl ModelEndpoint for CheaperInferenceEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => Self::DEFAULT_URI,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.cheaperinference"]
+pub struct CheaperInferenceModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+#[cfg(test)]
+mod cheaperinference_tests {
+    use super::*;
+
+    #[test]
+    fn cheaperinference_endpoint_uri() {
+        assert_eq!(
+            CheaperInferenceEndpoint::Default.uri(),
+            "https://api.cheaperinference.com/v1"
+        );
+    }
+
+    #[test]
+    fn cheaperinference_config_defaults_empty() {
+        let cfg = CheaperInferenceModelProviderConfig::default();
+        assert!(cfg.base.api_key.is_none());
+        assert!(cfg.base.model.is_none());
+    }
+
+    #[test]
+    fn cheaperinference_alias_round_trips_through_config() {
+        let toml = r#"
+[providers.models.cheaperinference.default]
+model = "gpt-5.4-mini"
+"#;
+        let config: Config = toml::from_str(toml).expect("cheaperinference alias deserializes");
+        let alias = config
+            .providers
+            .models
+            .cheaperinference
+            .get("default")
+            .expect("cheaperinference.default present");
+        assert_eq!(alias.base.model.as_deref(), Some("gpt-5.4-mini"));
+    }
+}
+
 // ── OVH ──
 
 #[derive(
@@ -3800,6 +3878,7 @@ impl_default_family_endpoint! {
     VercelModelProviderConfig,
     CloudflareModelProviderConfig,
     AtlasCloudModelProviderConfig,
+    CheaperInferenceModelProviderConfig,
     OvhModelProviderConfig,
     CopilotModelProviderConfig,
     DoubaoModelProviderConfig,
@@ -4924,6 +5003,13 @@ impl Config {
     }
 
     #[must_use]
+    pub fn effective_tool_elicitation(&self, agent_alias: &str) -> bool {
+        self.runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.tool_elicitation)
+            .unwrap_or(false)
+    }
+
+    #[must_use]
     pub fn effective_tool_dispatcher(&self, agent_alias: &str) -> String {
         self.runtime_profile_for_agent(agent_alias)
             .and_then(|p| p.tool_dispatcher.as_ref())
@@ -5165,6 +5251,66 @@ impl Config {
             0 => CronJobClaim::Unclaimed,
             1 => CronJobClaim::Sole(enabled[0]),
             _ => CronJobClaim::Contested(enabled),
+        }
+    }
+
+    /// One warning per agent whose explicit `delegates` roster can never fire:
+    /// the resolved risk profile forbids delegation, or its tool policy
+    /// blocks `delegate` (a closed `allowed_tools` list without it,
+    /// `deny_all_tools = true`, or `excluded_tools` naming it). The
+    /// configuration is coherent but inert, and operators otherwise only
+    /// discover that at the first delegation attempt.
+    fn collect_dead_delegate_grant_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for (alias, agent) in &self.agents {
+            if !agent.enabled || agent.delegates.is_empty() {
+                continue;
+            }
+            let Some(profile) = self.risk_profile_for_agent(alias) else {
+                continue;
+            };
+            let profile_alias = agent.risk_profile.trim();
+            let grant_count = agent.delegates.len();
+            let policy_blocks = !profile.delegation_policy.permits();
+            // `effective_allowed_tools()` folds in `deny_all_tools` and the
+            // legacy deny-all sentinel: `Some([])` denies every tool, `None`
+            // is unrestricted.
+            let allowlist_blocks = profile
+                .effective_allowed_tools()
+                .is_some_and(|allowed| !allowed.iter().any(|name| name == "delegate"));
+            let excluded = profile.excluded_tools.iter().any(|name| name == "delegate");
+            let tools_block = allowlist_blocks || excluded;
+            if !policy_blocks && !tools_block {
+                continue;
+            }
+            let tool_reason = if profile.deny_all_tools {
+                "sets deny_all_tools"
+            } else if excluded {
+                "lists `delegate` in excluded_tools"
+            } else {
+                "has an allowed_tools list that omits `delegate`"
+            };
+            let reason = match (policy_blocks, tools_block) {
+                (true, true) => format!(
+                    "risk profile `{profile_alias}` has a delegation_policy.mode that does not \
+                     permit delegation and {tool_reason}"
+                ),
+                (true, false) => format!(
+                    "risk profile `{profile_alias}` has a delegation_policy.mode that does not \
+                     permit delegation"
+                ),
+                (false, _) => format!("risk profile `{profile_alias}` {tool_reason}"),
+            };
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                crate::validation_warnings::DEAD_DELEGATE_GRANTS,
+                format!(
+                    "agents.{alias} has {grant_count} delegate grant(s) but {reason}, so the \
+                     grants are unreachable at runtime"
+                ),
+                format!("agents.{alias}.delegates"),
+            ));
         }
     }
 
@@ -7971,6 +8117,11 @@ pub struct GatewayConfig {
     #[serde(default = "default_gateway_websocket_ping_interval_secs")]
     pub websocket_ping_interval_secs: u64,
 
+    /// Global browser dictation silence timeout in seconds. 0 disables automatic sending.
+    /// Applies to every paired device; accepted range: 0..=300. Default: 15.
+    #[serde(default = "default_voice_silence_timeout_secs")]
+    pub voice_silence_timeout_secs: u64,
+
     /// Pairing-code generation policy (`[gateway.pairing_code]`). The one
     /// source of truth for the length and character family of every code
     /// the gateway issues.
@@ -8041,6 +8192,10 @@ fn default_gateway_long_running_request_timeout_secs() -> u64 {
     600
 }
 
+fn default_voice_silence_timeout_secs() -> u64 {
+    15
+}
+
 fn default_gateway_websocket_ping_interval_secs() -> u64 {
     30
 }
@@ -8105,6 +8260,7 @@ impl Default for GatewayConfig {
             session_persistence: true,
             session_ttl_hours: 0,
             websocket_ping_interval_secs: default_gateway_websocket_ping_interval_secs(),
+            voice_silence_timeout_secs: default_voice_silence_timeout_secs(),
             pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
             dashboard_sign_in: DashboardSignInConfig::default(),
@@ -8924,6 +9080,11 @@ pub struct BrowserConfig {
     /// Browser automation backend: "agent_browser" | "rust_native" | "computer_use" | "auto"
     #[serde(default = "default_browser_backend")]
     pub backend: String,
+    /// Timeout in seconds for agent-browser CLI commands (default: 60).
+    /// Bounds every `browser` tool action on the `agent_browser` backend so a
+    /// wedged CLI cannot hang an agent turn indefinitely.
+    #[serde(default = "default_browser_timeout_secs")]
+    pub timeout_secs: u64,
     /// Show browser window for agent_browser backend. When unset, inherits AGENT_BROWSER_HEADED.
     #[serde(default)]
     pub headed: Option<bool>,
@@ -8960,6 +9121,10 @@ fn default_browser_backend() -> String {
     "agent_browser".into()
 }
 
+fn default_browser_timeout_secs() -> u64 {
+    60
+}
+
 fn default_browser_webdriver_url() -> String {
     "http://127.0.0.1:9515".into()
 }
@@ -8986,6 +9151,7 @@ impl Default for BrowserConfig {
             allowed_domains: vec!["*".into()],
             session_name: None,
             backend: default_browser_backend(),
+            timeout_secs: default_browser_timeout_secs(),
             headed: None,
             native_headless: default_true(),
             native_webdriver_url: default_browser_webdriver_url(),
@@ -12027,21 +12193,28 @@ fn runtime_proxy_cache_key(
 }
 
 fn runtime_proxy_cached_client(cache_key: &str) -> Option<reqwest::Client> {
+    let runtime_id = tokio::runtime::Handle::try_current().ok()?.id();
     let generation = runtime_proxy_current_generation();
     match runtime_proxy_client_cache().read() {
         Ok(guard) => guard
             .get(cache_key)
-            .filter(|entry| entry.generation == generation)
+            .filter(|entry| entry.generation == generation && entry.runtime_id == runtime_id)
             .map(|entry| entry.client.clone()),
         Err(poisoned) => poisoned
             .into_inner()
             .get(cache_key)
-            .filter(|entry| entry.generation == generation)
+            .filter(|entry| entry.generation == generation && entry.runtime_id == runtime_id)
             .map(|entry| entry.client.clone()),
     }
 }
 
 fn set_runtime_proxy_cached_client(cache_key: String, generation: u64, client: reqwest::Client) {
+    // A pooled client's dispatcher belongs to the Tokio runtime that first
+    // uses it. Never hand that client to another runtime after its owner exits.
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let runtime_id = runtime.id();
     if generation != runtime_proxy_current_generation() {
         return;
     }
@@ -12049,13 +12222,27 @@ fn set_runtime_proxy_cached_client(cache_key: String, generation: u64, client: r
     match runtime_proxy_client_cache().write() {
         Ok(mut guard) => {
             if generation == runtime_proxy_config_generation() {
-                guard.insert(cache_key, RuntimeProxyCachedClient { generation, client });
+                guard.insert(
+                    cache_key,
+                    RuntimeProxyCachedClient {
+                        generation,
+                        runtime_id,
+                        client,
+                    },
+                );
             }
         }
         Err(poisoned) => {
             let mut guard = poisoned.into_inner();
             if generation == runtime_proxy_config_generation() {
-                guard.insert(cache_key, RuntimeProxyCachedClient { generation, client });
+                guard.insert(
+                    cache_key,
+                    RuntimeProxyCachedClient {
+                        generation,
+                        runtime_id,
+                        client,
+                    },
+                );
             }
         }
     }
@@ -14193,7 +14380,7 @@ impl RiskProfileConfig {
     }
 }
 
-fn parse_sandbox_backend(name: &str) -> SandboxBackend {
+pub(crate) fn parse_sandbox_backend(name: &str) -> SandboxBackend {
     match name.to_ascii_lowercase().as_str() {
         "auto" => SandboxBackend::Auto,
         "landlock" => SandboxBackend::Landlock,
@@ -14293,12 +14480,27 @@ pub struct OidcConfig {
     /// was issued TO. Empty = no restriction; non-empty = the token must carry
     /// an `azp` claim listed here or authentication fails closed.
     pub allowed_authorized_parties: Vec<String>,
+    /// OAuth scopes requested by the interactive flows ZeroClaw starts with
+    /// this issuer: the device grant (`zerocode login`, `zeroclaw oidc
+    /// login`) and browser Authorization Code with PKCE (including dashboard
+    /// sign-in). Sent space-separated in order. Empty = `["openid"]`. When
+    /// set, must include `openid`, because browser sign-in validates an ID
+    /// token. Some issuers derive the access token's audience from the
+    /// requested scope (Entra ID: `api://<app>/<scope>`); none of them are
+    /// added implicitly, including `offline_access`, whose meaning varies by
+    /// issuer.
+    pub scopes: Vec<String>,
+    /// OAuth scopes requested by `client_credentials` service enrollment.
+    /// Sent space-separated in order. Empty = `["openid"]`. Kept separate
+    /// from `scopes` because some issuers accept only a resource scope here
+    /// (Entra ID: `api://<app>/.default`, without `openid`).
+    pub service_scopes: Vec<String>,
     /// Client identities whose tokens are ALWAYS service principals
     /// (`client_credentials` callers), matched against the token's
-    /// verified `client_id` claim. Service tokens always need `client_id`:
-    /// in JWKS mode a token with no `client_id` whose signed `azp` names one
-    /// of these clients is refused, never treated as a service. Service
-    /// principals are keyed by issuer + client identity and never inherit
+    /// verified client claim. With default claim names an `azp` fallback
+    /// cannot establish a service. An untyped JWKS token or a custom client
+    /// claim also requires an explicit service value in `actor_claim_values`.
+    /// Service principals are keyed by issuer + client identity and never inherit
     /// human-user assumptions, whatever provider-specific shape their
     /// `sub` takes (`<client>@clients`, a service-account user id, or the
     /// client id itself).
@@ -14306,7 +14508,8 @@ pub struct OidcConfig {
     /// Actor classification is declarative, never inferred from the
     /// `sub`/`client_id` relationship: a token is a service because its
     /// client is listed here, a human because its client is listed in
-    /// `interactive_clients`, or classified by `actor_claim`. A token whose
+    /// `interactive_clients`, or classified by `actor_claim`. When evidence
+    /// is required it must agree with any client declaration. A token whose
     /// client is declared nowhere and carries no configured actor claim
     /// evidence is denied. A client may appear in only one of the two lists.
     pub service_clients: Vec<String>,
@@ -14317,20 +14520,55 @@ pub struct OidcConfig {
     /// and resolve through `profile_map`. A client may appear in only one of
     /// `service_clients` and `interactive_clients`.
     pub interactive_clients: Vec<String>,
-    /// Dotted path to a claim the issuer stamps on exactly ONE actor kind's
-    /// tokens (present, non-null), e.g. Auth0's `gty` on client-credentials
+    /// Dotted path to an issuer-controlled actor claim. With an empty
+    /// `actor_claim_values`, the issuer must stamp it on exactly ONE actor
+    /// kind's tokens (present, non-null), e.g. Auth0's `gty` on client-credentials
     /// tokens or Okta's `uid` on user tokens. `actor_claim_marks` names the
     /// kind its presence proves; absence proves the other kind. Required
     /// for a client that issues both human and machine tokens (declared in
     /// neither client list); also checked against declared clients, where
     /// contradicting evidence denies. Empty = no claim-based classification,
-    /// so every accepted client must be declared.
+    /// so every accepted client must be declared on the standard path.
+    /// In presence mode, untyped JWKS tokens and custom client claims
+    /// require a nonblank string issued only to people and
+    /// `actor_claim_marks = "human"` (Entra's delegated `scp` or Okta's `uid`).
     pub actor_claim: String,
-    /// Which actor kind the presence of `actor_claim` proves.
+    /// Which actor kind the presence of `actor_claim` proves in presence mode.
     pub actor_claim_marks: OidcActorKind,
+    /// Map exact, case-sensitive signed string values at `actor_claim` to
+    /// `human` or `service` (JWKS only). A nonempty map requires a match
+    /// on every token, including tokens from declared clients. Entra can
+    /// issue `idtyp` with values `app` and `user`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub actor_claim_values: HashMap<String, OidcActorKind>,
     /// Require the RFC 9068 typed JWT profile for JWKS validation. Opaque
     /// tokens remain valid only through configured introspection.
+    ///
+    /// Typing is how the verifier tells an access token from an ID token.
+    /// For issuers that don't type their access tokens (Okta: no `typ`;
+    /// Entra ID: `typ: JWT`), set `false` and prove the difference by
+    /// audience instead. An ID token's `aud` must contain the client it was
+    /// issued to and may list other audiences, so an untyped token must
+    /// carry exactly `audience` as its only `aud` value, and `audience`
+    /// must be an API identifier that is not `client_id` and not any client
+    /// declared here or by another entry for the same issuer. Untyped tokens
+    /// are then accepted with no header `typ` or `typ: JWT`; any other type
+    /// is still refused, as are `nonce` and non-access purpose markers. The
+    /// IdP must also never sign anyone in AS the API registration itself,
+    /// which ZeroClaw cannot check.
     pub require_at_jwt: bool,
+    /// Top-level claim naming the OAuth client in JWKS-validated access
+    /// tokens. Default `client_id` (RFC 9068), where a person's token may
+    /// name its client in `azp` instead. Set it where the issuer uses another
+    /// claim: `cid` for Okta, `azp` for Entra ID v2.0 tokens. A declared
+    /// client claim identifies the application. It has no fallback, and
+    /// a token whose `client_id` contradicts it is refused. JWKS only:
+    /// introspection answers always use `client_id`.
+    pub client_id_claim: String,
+    /// Top-level claim holding the access token's unique identifier in
+    /// JWKS-validated tokens. Default `jti` (RFC 9068). Entra ID uses `uti`.
+    /// JWKS only.
+    pub token_id_claim: String,
     /// Maximum authentication lifetime (seconds) for offline-validated
     /// (JWKS) tokens. Offline validation cannot see revocation, so the
     /// identity expires at the EARLIER of the token `exp` and `iat` + this
@@ -14363,16 +14601,26 @@ impl std::fmt::Debug for OidcConfig {
                 "allowed_authorized_parties",
                 &self.allowed_authorized_parties,
             )
+            .field("scopes", &self.scopes)
+            .field("service_scopes", &self.service_scopes)
             .field("service_clients", &self.service_clients)
             .field("interactive_clients", &self.interactive_clients)
             .field("actor_claim", &self.actor_claim)
             .field("actor_claim_marks", &self.actor_claim_marks)
+            .field("actor_claim_values", &self.actor_claim_values)
             .field("require_at_jwt", &self.require_at_jwt)
+            .field("client_id_claim", &self.client_id_claim)
+            .field("token_id_claim", &self.token_id_claim)
             .field("max_auth_lifetime_secs", &self.max_auth_lifetime_secs)
             .field("revalidation_secs", &self.revalidation_secs)
             .finish()
     }
 }
+
+/// RFC 9068 claim naming the OAuth client; the `client_id_claim` default.
+pub const DEFAULT_OIDC_CLIENT_ID_CLAIM: &str = "client_id";
+/// RFC 9068 claim holding the token identifier; the `token_id_claim` default.
+pub const DEFAULT_OIDC_TOKEN_ID_CLAIM: &str = "jti";
 
 fn default_oidc_max_auth_lifetime_secs() -> u64 {
     86_400
@@ -14396,11 +14644,16 @@ impl Default for OidcConfig {
             require_mfa: false,
             required_acr: Vec::new(),
             allowed_authorized_parties: Vec::new(),
+            scopes: Vec::new(),
+            service_scopes: Vec::new(),
             service_clients: Vec::new(),
             interactive_clients: Vec::new(),
             actor_claim: String::new(),
             actor_claim_marks: OidcActorKind::default(),
+            actor_claim_values: HashMap::new(),
             require_at_jwt: true,
+            client_id_claim: DEFAULT_OIDC_CLIENT_ID_CLAIM.to_string(),
+            token_id_claim: DEFAULT_OIDC_TOKEN_ID_CLAIM.to_string(),
             max_auth_lifetime_secs: default_oidc_max_auth_lifetime_secs(),
             revalidation_secs: default_oidc_revalidation_secs(),
         }
@@ -14438,19 +14691,17 @@ pub enum OidcValidation {
     Introspection,
 }
 
-/// The actor kind an OIDC `actor_claim`'s presence proves.
+/// The kind of identity established by the provider's actor claim.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
 )]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum OidcActorKind {
-    /// The claim is present only on `client_credentials` (machine) tokens;
-    /// a token without it is a human's.
+    /// A service acting on its own.
     #[default]
     Service,
-    /// The claim is present only on interactive (human) tokens; a token
-    /// without it is a machine's.
+    /// An application acting on behalf of a person.
     Human,
 }
 
@@ -14474,6 +14725,31 @@ impl Config {
         for alias in oidc_aliases {
             let oidc = &self.oidc[alias];
             oidc.validate(alias)?;
+            // An entry that accepts untyped access tokens relies on no client
+            // signing in with its audience. Clients of other entries for the
+            // same issuer are clients of that issuer too.
+            if oidc.validation == OidcValidation::Jwks && !oidc.require_at_jwt {
+                let mut siblings: Vec<&String> = self
+                    .oidc
+                    .iter()
+                    .filter(|(other, entry)| *other != alias && entry.issuer == oidc.issuer)
+                    .map(|(other, _)| other)
+                    .collect();
+                siblings.sort();
+                for sibling in siblings {
+                    if let Some(field) = self.oidc[sibling].field_naming_client(&oidc.audience) {
+                        validation_bail!(
+                            ValidationFailed,
+                            format!("oidc.{alias}.audience"),
+                            "oidc.{alias}.require_at_jwt = false needs an audience no client \
+                             signs in as, but oidc.{sibling}.{field} names {:?} as a client of \
+                             the same issuer: an ID token issued to it would pass as an access \
+                             token for oidc.{alias}",
+                            oidc.audience
+                        );
+                    }
+                }
+            }
             let mut claim_values: Vec<&String> = oidc.profile_map.keys().collect();
             claim_values.sort();
             for claim_value in claim_values {
@@ -14782,11 +15058,50 @@ impl OidcConfig {
                  tokens need a bounded authentication lifetime"
             );
         }
-        if self.validation == OidcValidation::Jwks && !self.require_at_jwt {
+        if self.validation == OidcValidation::Jwks
+            && !self.require_at_jwt
+            && let Some(field) = self.audience_shared_with_a_client()
+        {
             anyhow::bail!(
-                "oidc.{alias}.require_at_jwt must be true: bearer authentication accepts only \
-                 RFC 9068 typed access tokens"
+                "oidc.{alias}.require_at_jwt = false needs an audience no client signs in as, \
+                 but `audience` {:?} is also named by `{field}`: an ID token issued to that \
+                 client would carry the same audience and pass as an access token. Use a \
+                 separate API identifier for `audience`, or keep require_at_jwt = true",
+                self.audience
             );
+        }
+        for (field, name) in [
+            ("client_id_claim", &self.client_id_claim),
+            ("token_id_claim", &self.token_id_claim),
+        ] {
+            if name.is_empty() || name.contains('.') || !name.bytes().all(|b| b.is_ascii_graphic())
+            {
+                anyhow::bail!(
+                    "oidc.{alias}.{field} = {name:?} must be one top-level claim name: \
+                     nonblank, without spaces or dots"
+                );
+            }
+        }
+        if self.validation == OidcValidation::Introspection {
+            for (field, name, default) in [
+                (
+                    "client_id_claim",
+                    &self.client_id_claim,
+                    DEFAULT_OIDC_CLIENT_ID_CLAIM,
+                ),
+                (
+                    "token_id_claim",
+                    &self.token_id_claim,
+                    DEFAULT_OIDC_TOKEN_ID_CLAIM,
+                ),
+            ] {
+                if name != default {
+                    anyhow::bail!(
+                        "oidc.{alias}.{field} applies to validation = \"jwks\" only: \
+                         introspection answers follow RFC 7662, so leave it at {default:?}"
+                    );
+                }
+            }
         }
         for (field, clients) in [
             ("service_clients", &self.service_clients),
@@ -14795,6 +15110,30 @@ impl OidcConfig {
             if clients.iter().any(|client| client.trim().is_empty()) {
                 anyhow::bail!("oidc.{alias}.{field} must not contain a blank client id");
             }
+        }
+        for (field, scopes) in [
+            ("scopes", &self.scopes),
+            ("service_scopes", &self.service_scopes),
+        ] {
+            let mut seen = std::collections::HashSet::new();
+            for scope in scopes {
+                if !is_scope_token(scope) {
+                    anyhow::bail!(
+                        "oidc.{alias}.{field} contains {scope:?}, which is not an OAuth scope: \
+                         each entry is one nonblank scope of printable ASCII without spaces, \
+                         `\"`, or `\\` (RFC 6749 section 3.3)"
+                    );
+                }
+                if !seen.insert(scope.as_str()) {
+                    anyhow::bail!("oidc.{alias}.{field} lists {scope:?} more than once");
+                }
+            }
+        }
+        if !self.scopes.is_empty() && !self.scopes.iter().any(|scope| scope == "openid") {
+            anyhow::bail!(
+                "oidc.{alias}.scopes must include \"openid\": browser sign-in validates an \
+                 ID token, which the issuer returns only for that scope"
+            );
         }
         if let Some(shared) = self
             .service_clients
@@ -14807,8 +15146,47 @@ impl OidcConfig {
                  in neither and classified by actor_claim"
             );
         }
-        if self.actor_claim != self.actor_claim.trim() {
+        self.validate_actor_claim(alias)
+    }
+
+    /// Validate the actor evidence used by the verifier, including when a
+    /// provider is built directly without validating the whole configuration.
+    pub fn validate_actor_claim(&self, alias: &str) -> Result<()> {
+        let path = self.actor_claim.as_str();
+        if path != path.trim() {
             anyhow::bail!("oidc.{alias}.actor_claim must not have surrounding whitespace");
+        }
+        let exact = !self.actor_claim_values.is_empty();
+        let custom_jwks = self.validation == OidcValidation::Jwks
+            && (!self.require_at_jwt || self.client_id_claim != DEFAULT_OIDC_CLIENT_ID_CLAIM);
+        if (exact || custom_jwks)
+            && !path.is_empty()
+            && (matches!(path, "client_id" | "azp") || path == self.client_id_claim)
+        {
+            anyhow::bail!("oidc.{alias}.actor_claim must be independent of the client ID");
+        }
+        if !exact {
+            return Ok(());
+        }
+        if self.validation != OidcValidation::Jwks {
+            anyhow::bail!("oidc.{alias}.actor_claim_values requires signed JWKS tokens");
+        }
+        if path
+            .split('.')
+            .any(|part| part.is_empty() || part != part.trim())
+        {
+            anyhow::bail!(
+                "oidc.{alias}.actor_claim_values requires a nonblank actor_claim path with nonempty segments"
+            );
+        }
+        if self
+            .actor_claim_values
+            .keys()
+            .any(|value| value.is_empty() || value != value.trim())
+        {
+            anyhow::bail!(
+                "oidc.{alias}.actor_claim_values requires nonblank keys without surrounding whitespace"
+            );
         }
         Ok(())
     }
@@ -14823,6 +15201,75 @@ impl OidcConfig {
             &self.client_id
         }
     }
+
+    /// The `scope` parameter for the interactive flows (device grant and
+    /// browser Authorization Code): `scopes` space-joined, or `openid`.
+    #[must_use]
+    pub fn effective_scope(&self) -> String {
+        join_scopes(&self.scopes)
+    }
+
+    /// The `scope` parameter for `client_credentials`: `service_scopes`
+    /// space-joined, or `openid`.
+    #[must_use]
+    pub fn effective_service_scope(&self) -> String {
+        join_scopes(&self.service_scopes)
+    }
+
+    /// The field that names `audience` as one of this entry's own clients,
+    /// or `None` when the audience is separate from all of them.
+    ///
+    /// Every ID token's `aud` is the client it was issued to (OIDC Core), so
+    /// an audience no client signs in as is what lets the verifier tell an
+    /// untyped access token from an ID token. Shared by config validation
+    /// and the verifier so the rule has one definition; clients of OTHER
+    /// entries for the same issuer are checked by [`Config::validate_auth`].
+    #[must_use]
+    pub fn audience_shared_with_a_client(&self) -> Option<&'static str> {
+        self.field_naming_client(&self.audience)
+    }
+
+    /// The first field of this entry that names `client` as an OAuth client
+    /// it signs in as or accepts tokens from, if any.
+    #[must_use]
+    pub fn field_naming_client(&self, client: &str) -> Option<&'static str> {
+        if self.effective_client_id() == client {
+            return Some("client_id");
+        }
+        [
+            ("interactive_clients", &self.interactive_clients),
+            ("service_clients", &self.service_clients),
+            (
+                "allowed_authorized_parties",
+                &self.allowed_authorized_parties,
+            ),
+        ]
+        .into_iter()
+        .find(|(_, clients)| clients.iter().any(|named| named == client))
+        .map(|(field, _)| field)
+        .or_else(|| {
+            self.service_profile_map
+                .contains_key(client)
+                .then_some("service_profile_map")
+        })
+    }
+}
+
+fn join_scopes(scopes: &[String]) -> String {
+    if scopes.is_empty() {
+        "openid".to_string()
+    } else {
+        scopes.join(" ")
+    }
+}
+
+/// RFC 6749 §3.3: `scope-token = 1*( %x21 / %x23-5B / %x5D-7E )`, i.e.
+/// nonblank printable ASCII other than space, `"`, and `\`.
+fn is_scope_token(scope: &str) -> bool {
+    !scope.is_empty()
+        && scope
+            .bytes()
+            .all(|b| matches!(b, 0x21 | 0x23..=0x5B | 0x5D..=0x7E))
 }
 
 /// One local roster identity (`[users.<name>]`) for the local auth
@@ -15169,6 +15616,9 @@ pub struct RuntimeProfileConfig {
     pub parallel_tools: Option<bool>,
     /// Request one native tool call per provider response when supported. Default off.
     pub single_tool_rounds: Option<bool>,
+    /// Enable pre-turn tool-elicitation hints (prefilter + ephemeral hint).
+    /// `None` inherits (default off).
+    pub tool_elicitation: Option<bool>,
     /// Tool dispatch strategy (e.g. `"auto"`). `None` inherits.
     pub tool_dispatcher: Option<String>,
     /// Tools exempt from within-turn dedup check.
@@ -15237,6 +15687,7 @@ impl Default for RuntimeProfileConfig {
             compact_context: None,
             parallel_tools: None,
             single_tool_rounds: None,
+            tool_elicitation: None,
             tool_dispatcher: None,
             tool_call_dedup_exempt: Vec::new(),
             deferred_builtin_tools: false,
@@ -18114,6 +18565,9 @@ pub struct MatrixConfig {
     #[serde(default)]
     pub device_id: Option<String>,
     /// Allowed Matrix room IDs. Empty = allow all rooms the bot has joined.
+    /// Also gates room invites: an invite from an allowed peer is accepted
+    /// only for a listed room. When empty, an invite is accepted into any
+    /// room, but only from a peer named explicitly (not just via `*`).
     /// Entries are matched literally against the canonical room ID
     /// (`!abc:server`) of each incoming message; `#room:server` aliases are
     /// not resolved for this allowlist (they are resolved only for outbound
@@ -20167,7 +20621,8 @@ pub struct SecurityConfig {
     #[nested]
     pub otp: OtpConfig,
 
-    /// Emergency-stop state machine configuration.
+    /// Emergency-stop configuration. Not enforced: no runtime path reads the
+    /// estop state, so these settings do not stop anything.
     #[serde(default)]
     #[nested]
     pub estop: EstopConfig,
@@ -20383,15 +20838,17 @@ impl Default for OtpConfig {
 #[prefix = "security.estop"]
 #[serde(deny_unknown_fields)]
 pub struct EstopConfig {
-    /// Enable emergency stop controls.
+    /// Emergency stop switch. Not enforced: no runtime path reads the estop
+    /// state, so enabling it does not stop anything.
     #[serde(default)]
     pub enabled: bool,
 
-    /// File path used to persist estop state.
+    /// File path reserved for estop state. Not enforced: nothing reads its contents.
     #[serde(default = "default_estop_state_file")]
     pub state_file: String,
 
-    /// Require a valid OTP before resume operations.
+    /// Require a valid OTP before resume operations. Not enforced: the resume
+    /// command refuses to run.
     #[serde(default = "default_true")]
     pub require_otp_to_resume: bool,
 }
@@ -23946,6 +24403,7 @@ impl Config {
         self.collect_verifiable_intent_warnings(&mut warnings);
         self.collect_cron_claim_warnings(&mut warnings);
         self.collect_compiled_out_tool_warnings(&mut warnings);
+        self.collect_dead_delegate_grant_warnings(&mut warnings);
         warnings.extend(validate_memory_semantics(&self.memory));
         for (alias, wa) in &self.channels.whatsapp {
             warnings.extend(validate_whatsapp_semantics(alias, wa));
@@ -24096,6 +24554,24 @@ impl Config {
                      checked. Use a build that includes `{feature}`, or disable the section."
                 ),
                 format!("{section}.enabled"),
+            ));
+        }
+        // Web search defaults to enabled, so unlike the sections above its
+        // absence in a lean build is the norm, not a config written for a
+        // fuller build — report it the same way rather than dropping it
+        // silently. It stands outside `OptInTool::ALL` because the inventory
+        // files `web_search_tool` under `External`; see the variant's note.
+        let web_search = crate::opt_in_tools::OptInTool::WebSearch;
+        if !web_search.compiled() && web_search.enabled_in(self) {
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                crate::validation_warnings::TOOL_COMPILED_OUT,
+                format!(
+                    "[web_search] is enabled, but this build was compiled without the \
+                     `tools-external` feature, so the tool is unavailable and its settings \
+                     are not checked. Use a build that includes `tools-external` (the \
+                     `tools-compat` bundle), or disable the section."
+                ),
+                "web_search.enabled".to_string(),
             ));
         }
     }
@@ -24691,6 +25167,10 @@ impl Config {
             }
         }
 
+        if self.gateway.voice_silence_timeout_secs > 300 {
+            let path = "gateway.voice_silence_timeout_secs";
+            validation_bail!(InvalidNumericRange, path, "{path} must be 0..=300");
+        }
         let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
         if websocket_ping_interval_secs > GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS {
             let path = "gateway.websocket_ping_interval_secs";
@@ -29860,6 +30340,17 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
+    fn cache_ttl_off_is_a_known_lifetime_that_round_trips() {
+        let off: ModelProviderConfig = toml::from_str("cache_ttl = \"off\"").unwrap();
+        assert_eq!(off.cache_ttl, Some(CacheTtl::Off));
+        assert_eq!(
+            toml::to_string(&off).unwrap(),
+            "cache_ttl = \"off\"\n",
+            "off must round-trip its wire string"
+        );
+    }
+
+    #[::core::prelude::v1::test]
     fn cache_ttl_rejects_unknown_lifetime() {
         let parsed = toml::from_str::<ModelProviderConfig>("cache_ttl = \"2h\"");
         assert!(
@@ -31339,6 +31830,53 @@ zeroclaw-operators = "operator"
     }
 
     #[::core::prelude::v1::test]
+    fn oidc_actor_claim_values_require_an_independent_signed_claim() {
+        let mut oidc = auth_config().oidc.remove("corp").unwrap();
+        oidc.client_id_claim = "cid".into();
+        oidc.actor_claim = "idtyp".into();
+        oidc.actor_claim_values = HashMap::from([
+            ("app".into(), OidcActorKind::Service),
+            ("user".into(), OidcActorKind::Human),
+        ]);
+        let encoded = toml::to_string(&oidc).unwrap();
+        let decoded: OidcConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.actor_claim_values, oidc.actor_claim_values);
+        decoded.validate("corp").expect("valid exact actor values");
+        for (path, error) in [
+            ("", "nonblank actor_claim path"),
+            ("claims..kind", "nonblank actor_claim path"),
+            ("azp", "independent of the client ID"),
+            ("client_id", "independent of the client ID"),
+            ("cid", "independent of the client ID"),
+        ] {
+            let mut bad = oidc.clone();
+            bad.actor_claim = path.into();
+            let message = bad.validate("corp").unwrap_err().to_string();
+            assert!(message.contains(error), "{path:?}: {message}");
+        }
+        for value in ["", " app"] {
+            let mut bad = oidc.clone();
+            bad.actor_claim_values
+                .insert(value.into(), OidcActorKind::Service);
+            assert!(
+                bad.validate("corp")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("actor_claim_values")
+            );
+        }
+        oidc.validation = OidcValidation::Introspection;
+        oidc.client_id_claim = DEFAULT_OIDC_CLIENT_ID_CLAIM.into();
+        oidc.client_secret = Some("test-secret".into());
+        assert!(
+            oidc.validate("corp")
+                .unwrap_err()
+                .to_string()
+                .contains("actor_claim_values")
+        );
+    }
+
+    #[::core::prelude::v1::test]
     fn oidc_actor_claim_settings_roundtrip_from_toml() {
         let toml_src = r#"
 [permission_profiles.operator]
@@ -31369,6 +31907,268 @@ zeroclaw-operators = "operator"
         config.oidc.get_mut("corp").unwrap().require_at_jwt = false;
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("require_at_jwt"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_claim_name_defaults_are_the_rfc_9068_claims() {
+        let defaults = OidcConfig::default();
+        assert_eq!(defaults.client_id_claim, "client_id");
+        assert_eq!(defaults.token_id_claim, "jti");
+    }
+
+    /// An entry that may waive RFC 9068 typing: its daemon client differs from
+    /// its API audience, so no ID token it receives can carry that audience.
+    fn untyped_jwks_config() -> Config {
+        let mut config = auth_config();
+        {
+            let oidc = config.oidc.get_mut("corp").unwrap();
+            oidc.require_at_jwt = false;
+            oidc.client_id = "zeroclaw-daemon".to_string();
+            oidc.interactive_clients = vec!["zerocode-cli".to_string()];
+        }
+        config
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_untyped_tokens_are_allowed_when_audience_is_no_client() {
+        untyped_jwks_config()
+            .validate()
+            .expect("audience separated from every configured client");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_untyped_tokens_require_the_audience_to_differ_from_every_client() {
+        // Defaulted client_id (falls back to audience), an explicit equal
+        // client_id, and the audience declared as an interactive or service
+        // client: each would let an ID token issued to that client pass.
+        type Case = (&'static str, fn(&mut OidcConfig));
+        let cases: [Case; 5] = [
+            ("client_id", |oidc| oidc.client_id = String::new()),
+            ("client_id", |oidc| oidc.client_id = "zeroclaw".to_string()),
+            ("interactive_clients", |oidc| {
+                oidc.interactive_clients = vec!["zeroclaw".to_string()];
+            }),
+            ("service_clients", |oidc| {
+                oidc.service_clients = vec!["zeroclaw".to_string()];
+            }),
+            ("allowed_authorized_parties", |oidc| {
+                oidc.allowed_authorized_parties = vec!["zeroclaw".to_string()];
+            }),
+        ];
+        for (field, mutate) in cases {
+            let mut config = untyped_jwks_config();
+            mutate(config.oidc.get_mut("corp").unwrap());
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("require_at_jwt") && err.contains(field),
+                "{field}: got: {err}"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_untyped_tokens_refuse_an_audience_another_entry_signs_in_as() {
+        // A second entry for the SAME issuer whose client is this entry's
+        // audience would receive ID tokens carrying that audience.
+        let mut config = untyped_jwks_config();
+        let mut sibling = config.oidc["corp"].clone();
+        sibling.require_at_jwt = true;
+        sibling.audience = "dashboard".to_string();
+        sibling.client_id = "zeroclaw".to_string();
+        sibling.interactive_clients = Vec::new();
+        config
+            .oidc
+            .insert("corp-dashboard".to_string(), sibling.clone());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("oidc.corp") && err.contains("oidc.corp-dashboard"),
+            "got: {err}"
+        );
+
+        // The same client id at a DIFFERENT issuer names a different client.
+        sibling.issuer = "https://other.example.com".to_string();
+        config.oidc.insert("corp-dashboard".to_string(), sibling);
+        config
+            .validate()
+            .expect("client ids are scoped to their issuer");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_claim_names_roundtrip_from_toml() {
+        // Okta custom authorization server shape.
+        let toml_src = r#"
+[permission_profiles.operator]
+allowed_agents = ["*"]
+
+[oidc.okta]
+issuer = "https://example.okta.com/oauth2/default"
+audience = "api://zeroclaw"
+client_id = "0oaexampleclient"
+claim_path = "groups"
+require_at_jwt = false
+client_id_claim = "cid"
+interactive_clients = ["0oaexampleclient"]
+
+[oidc.okta.profile_map]
+zeroclaw-operators = "operator"
+"#;
+        let config: Config = toml::from_str(toml_src).expect("claim names parse");
+        config.validate().expect("okta shape validates");
+        assert_eq!(config.oidc["okta"].client_id_claim, "cid");
+        assert_eq!(config.oidc["okta"].token_id_claim, "jti");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_claim_names_must_be_single_nonblank_claims() {
+        // Top-level names only: these are read from the verified payload,
+        // never by dotted path.
+        for bad in ["", " ", "client id", "a.b", " cid"] {
+            for field in ["client_id_claim", "token_id_claim"] {
+                let mut config = auth_config();
+                {
+                    let oidc = config.oidc.get_mut("corp").unwrap();
+                    if field == "client_id_claim" {
+                        oidc.client_id_claim = bad.to_string();
+                    } else {
+                        oidc.token_id_claim = bad.to_string();
+                    }
+                }
+                let err = config.validate().unwrap_err().to_string();
+                assert!(
+                    err.contains(&format!("oidc.corp.{field}")),
+                    "{field} = {bad:?}: got: {err}"
+                );
+            }
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_claim_names_apply_to_jwks_only() {
+        // RFC 7662 answers name the client in `client_id`; a renamed claim
+        // there would silently do nothing, so it is refused instead.
+        for field in ["client_id_claim", "token_id_claim"] {
+            let mut config = auth_config();
+            {
+                let oidc = config.oidc.get_mut("corp").unwrap();
+                oidc.validation = OidcValidation::Introspection;
+                oidc.client_secret = Some("s3cret".to_string());
+                if field == "client_id_claim" {
+                    oidc.client_id_claim = "cid".to_string();
+                } else {
+                    oidc.token_id_claim = "uti".to_string();
+                }
+            }
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("oidc.corp.{field}")) && err.contains("jwks"),
+                "{field}: got: {err}"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_request_scopes_default_to_openid_for_every_flow() {
+        let defaults = OidcConfig::default();
+        assert!(defaults.scopes.is_empty());
+        assert!(defaults.service_scopes.is_empty());
+        assert_eq!(defaults.effective_scope(), "openid");
+        assert_eq!(defaults.effective_service_scope(), "openid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_request_scopes_roundtrip_from_toml_and_join_in_order() {
+        // Entra ID shape: the API scope sets the access token's audience, and
+        // client_credentials accepts only the `.default` scope (no `openid`).
+        let toml_src = r#"
+[permission_profiles.operator]
+allowed_agents = ["*"]
+
+[oidc.entra]
+issuer = "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0"
+audience = "11111111-1111-1111-1111-111111111111"
+claim_path = "roles"
+scopes = ["openid", "offline_access", "api://zeroclaw/zeroclaw.access"]
+service_scopes = ["api://zeroclaw/.default"]
+
+[oidc.entra.profile_map]
+"ZeroClaw.Operator" = "operator"
+"#;
+        let config: Config = toml::from_str(toml_src).expect("scopes parse");
+        config.validate().expect("scopes validate");
+        let oidc = &config.oidc["entra"];
+        assert_eq!(
+            oidc.effective_scope(),
+            "openid offline_access api://zeroclaw/zeroclaw.access"
+        );
+        assert_eq!(oidc.effective_service_scope(), "api://zeroclaw/.default");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_interactive_scopes_must_include_openid() {
+        // Browser sign-in validates an ID token, which only `openid` yields.
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().scopes = vec!["offline_access".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("oidc.corp.scopes") && err.contains("openid"),
+            "got: {err}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_service_scopes_do_not_require_openid() {
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().service_scopes =
+            vec!["api://zeroclaw/.default".to_string()];
+        config
+            .validate()
+            .expect("client_credentials scopes need not include openid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_request_scopes_must_be_rfc6749_scope_tokens() {
+        // RFC 6749 §3.3: scope-token = 1*( %x21 / %x23-5B / %x5D-7E ).
+        // Blank, whitespace (which would split one entry into two scopes),
+        // `"`, `\`, control, and non-ASCII characters are all refused.
+        for bad in [
+            "",
+            " ",
+            "openid profile",
+            "a\"b",
+            "a\\b",
+            "tab\there",
+            "naïve",
+        ] {
+            for field in ["scopes", "service_scopes"] {
+                let mut config = auth_config();
+                {
+                    let oidc = config.oidc.get_mut("corp").unwrap();
+                    let list = vec!["openid".to_string(), bad.to_string()];
+                    if field == "scopes" {
+                        oidc.scopes = list;
+                    } else {
+                        oidc.service_scopes = list;
+                    }
+                }
+                let err = config.validate().unwrap_err().to_string();
+                assert!(
+                    err.contains(&format!("oidc.corp.{field}")),
+                    "{field} = {bad:?} must be refused; got: {err}"
+                );
+            }
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_request_scopes_refuse_duplicates() {
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().scopes =
+            vec!["openid".to_string(), "openid".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("oidc.corp.scopes") && err.contains("openid"),
+            "got: {err}"
+        );
     }
 
     #[::core::prelude::v1::test]
@@ -32987,6 +33787,18 @@ enabled = true
             msg.contains("channels.telegram.default.reply_min_interval_secs"),
             "error must name the offending path; got: {msg}"
         );
+    }
+
+    #[test]
+    async fn validate_global_voice_silence_timeout_bounds() {
+        let mut config = Config::default();
+        assert_eq!(config.gateway.voice_silence_timeout_secs, 15);
+        for seconds in [0, 1, 15, 300] {
+            config.gateway.voice_silence_timeout_secs = seconds;
+            config.validate().expect("valid voice timeout");
+        }
+        config.gateway.voice_silence_timeout_secs = 301;
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -35809,6 +36621,30 @@ runtime_profile = "missing"
     }
 
     #[test]
+    async fn runtime_profile_tool_elicitation_is_honored() {
+        let raw = r#"
+[runtime_profiles.hinted]
+tool_elicitation = true
+
+[agents.default]
+runtime_profile = "hinted"
+"#;
+        let parsed = parse_test_config(raw);
+        assert!(parsed.effective_tool_elicitation("default"));
+    }
+
+    #[test]
+    async fn tool_elicitation_defaults_off() {
+        let parsed = parse_test_config(
+            r#"
+[agents.default]
+runtime_profile = "default"
+"#,
+        );
+        assert!(!parsed.effective_tool_elicitation("default"));
+    }
+
+    #[test]
     async fn runtime_profile_unset_max_tool_iterations_uses_default() {
         // A profile that does not set max_tool_iterations (sentinel 0) falls
         // back to the global default rather than 0.
@@ -38151,6 +38987,7 @@ allowed_numbers = ["+1", "+2"]
             session_persistence: true,
             session_ttl_hours: 0,
             websocket_ping_interval_secs: 30,
+            voice_silence_timeout_secs: 15,
             pairing_code: PairingCodePolicy::default(),
             pairing_dashboard: PairingDashboardConfig::default(),
             dashboard_sign_in: DashboardSignInConfig::default(),
@@ -38349,6 +39186,7 @@ default_temperature = 0.7
         );
         assert_eq!(b.allowed_domains, vec!["*".to_string()]);
         assert_eq!(b.backend, "agent_browser");
+        assert_eq!(b.timeout_secs, 60);
         assert_eq!(b.headed, None);
         assert!(b.native_headless);
         assert_eq!(b.native_webdriver_url, "http://127.0.0.1:9515");
@@ -38369,6 +39207,7 @@ default_temperature = 0.7
             allowed_domains: vec!["example.com".into(), "docs.example.com".into()],
             session_name: None,
             backend: "auto".into(),
+            timeout_secs: 45,
             headed: Some(true),
             native_headless: false,
             native_webdriver_url: "http://localhost:4444".into(),
@@ -38391,6 +39230,7 @@ default_temperature = 0.7
         assert_eq!(parsed.allowed_domains.len(), 2);
         assert_eq!(parsed.allowed_domains[0], "example.com");
         assert_eq!(parsed.backend, "auto");
+        assert_eq!(parsed.timeout_secs, 45);
         assert_eq!(parsed.headed, Some(true));
         assert!(!parsed.native_headless);
         assert_eq!(parsed.native_webdriver_url, "http://localhost:4444");
@@ -40470,8 +41310,13 @@ runtime_profile = "default"
     )))]
     #[test]
     async fn a_lean_build_validates_enabled_sections_for_tools_it_lacks() {
+        let mut quiet = Config::default();
+        // `[web_search]` defaults to enabled and reports compiled out in a
+        // build without `tools-external`; this assertion is about the
+        // sections enabled below, so keep the default noise out.
+        quiet.web_search.enabled = false;
         assert!(
-            !Config::default()
+            !quiet
                 .collect_warnings()
                 .iter()
                 .any(|warning| warning.code == crate::validation_warnings::TOOL_COMPILED_OUT),
@@ -40479,6 +41324,7 @@ runtime_profile = "default"
         );
 
         let mut config = Config::default();
+        config.web_search.enabled = false;
         config.microsoft365.enabled = true;
         config.project_intel.enabled = true;
         config.project_intel.templates_dir = Some("/nonexistent/zeroclaw-templates".into());
@@ -40515,6 +41361,10 @@ runtime_profile = "default"
     async fn google_workspace_allowlist_is_checked_only_where_the_tool_is_compiled() {
         use crate::opt_in_tools::OptInTool;
         let mut config = Config::default();
+        // `[web_search]` defaults to enabled and stands outside this test's
+        // focus; it reports compiled out in any build without
+        // `tools-external`, which the assertion below is not about.
+        config.web_search.enabled = false;
         config.google_workspace.enabled = true;
         config.google_workspace.allowed_services = vec!["drive".into()];
         config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
@@ -40546,6 +41396,28 @@ runtime_profile = "default"
         }
     }
 
+    /// `web_search` defaults to enabled, so a build without `tools-external`
+    /// must say the tool is compiled out instead of silently dropping it;
+    /// a build that carries the feature reports nothing.
+    #[test]
+    async fn web_search_section_reports_compiled_out_without_tools_external() {
+        use crate::opt_in_tools::OptInTool;
+        let mut config = Config::default();
+        config.web_search.enabled = true;
+
+        let compiled_out: Vec<String> = config
+            .collect_warnings()
+            .into_iter()
+            .filter(|warning| warning.code == crate::validation_warnings::TOOL_COMPILED_OUT)
+            .map(|warning| warning.path)
+            .collect();
+        if OptInTool::WebSearch.compiled() {
+            assert!(compiled_out.is_empty(), "{compiled_out:?}");
+        } else {
+            assert_eq!(compiled_out, ["web_search.enabled"]);
+        }
+    }
+
     /// The counterpart in a build that carries the tools: their settings are
     /// still checked, and nothing is reported as compiled out.
     #[cfg(all(
@@ -40568,6 +41440,10 @@ runtime_profile = "default"
         ];
         for (field, enable) in cases {
             let mut config = Config::default();
+            // `[web_search]` defaults to enabled and stands outside this
+            // test's focus; in a build without `tools-external` it would
+            // report compiled out and trip the assertion below.
+            config.web_search.enabled = false;
             enable(&mut config);
             let err = config
                 .validate()
@@ -40996,6 +41872,118 @@ api_token = "tok"
         assert!(err.contains("sub_resource contains invalid characters"));
     }
 
+    #[test]
+    async fn runtime_proxy_client_cache_survives_owner_runtime_shutdown() {
+        let _guard = env_override_lock().await;
+        struct RestoreProxyBypass(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreProxyBypass {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    // SAFETY: the environment test lock outlives this guard.
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(key, value),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let _bypass = RestoreProxyBypass(
+            ["NO_PROXY", "no_proxy"]
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect(),
+        );
+        for key in ["NO_PROXY", "no_proxy"] {
+            set_or_clear_env(key, Some("127.0.0.1"));
+        }
+        let previous = runtime_proxy_config();
+        set_runtime_proxy_config(ProxyConfig::default());
+        let result = tokio::task::spawn_blocking(|| {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            listener.set_nonblocking(true).unwrap();
+            let server = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+                let mut connections: Vec<(std::net::TcpStream, Vec<u8>)> = Vec::new();
+                let mut served_on = Vec::new();
+                while served_on.len() < 4 && std::time::Instant::now() < deadline {
+                    loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => {
+                                socket.set_nonblocking(true).unwrap();
+                                connections.push((socket, Vec::new()));
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(error) => panic!("fixture accept: {error}"),
+                        }
+                    }
+                    for (index, (socket, buffered)) in connections.iter_mut().enumerate() {
+                        let mut chunk = [0u8; 4096];
+                        match socket.read(&mut chunk) {
+                            Ok(count) => buffered.extend_from_slice(&chunk[..count]),
+                            Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ConnectionReset) => {},
+                            Err(error) => panic!("fixture read: {error}"),
+                        }
+                        while let Some(end) = buffered.windows(4).position(|part| part == b"\r\n\r\n") {
+                            buffered.drain(..end + 4);
+                            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok").unwrap();
+                            served_on.push(index);
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                served_on
+            });
+            let service = format!("runtime-owner-{}", uuid::Uuid::new_v4());
+            fn request_on(runtime: &tokio::runtime::Runtime, service: &str, endpoint: &str, count: usize) -> Vec<reqwest::Result<String>> {
+                runtime.block_on(async {
+                    let mut results = Vec::new();
+                    for _ in 0..count {
+                        let client = build_runtime_proxy_client_with_timeouts(service, 2, 2);
+                        results.push(async {client.get(endpoint).send().await?.text().await}.await);
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    results
+                })
+            }
+            let runtime = || tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let first_owner = runtime();
+            let mut results = request_on(&first_owner, &service, &endpoint, 2);
+            // Keep the first owner's live pool, but stop driving its reactor.
+            // A runtime-blind hit now dispatches into that paused owner and times out.
+            let second_owner = runtime();
+            results.extend(request_on(&second_owner, &service, &endpoint, 1));
+            drop(first_owner);
+            drop(second_owner);
+            // Also exercise cache lookup after its last owner has shut down.
+            let after_shutdown = runtime();
+            results.extend(request_on(&after_shutdown, &service, &endpoint, 1));
+            drop(after_shutdown);
+            (results, server.join().unwrap())
+        }).await;
+        set_runtime_proxy_config(previous);
+        let (results, served_on) = result.unwrap();
+        for result in results {
+            assert_eq!(result.unwrap(), "ok");
+        }
+        assert_eq!(served_on.len(), 4);
+        assert_eq!(
+            served_on[0], served_on[1],
+            "warm requests must reuse a live pooled connection"
+        );
+        assert_ne!(
+            served_on[1], served_on[2],
+            "a new runtime needs its own connection"
+        );
+        assert_ne!(
+            served_on[2], served_on[3],
+            "a shut-down owner cannot supply the next pool"
+        );
+    }
+
     fn runtime_proxy_cache_contains(cache_key: &str) -> bool {
         runtime_proxy_cached_client(cache_key).is_some()
     }
@@ -41105,6 +42093,7 @@ api_token = "tok"
                     cache_key.clone(),
                     RuntimeProxyCachedClient {
                         generation: stale_generation,
+                        runtime_id: tokio::runtime::Handle::current().id(),
                         client: reqwest::Client::new(),
                     },
                 );
@@ -41115,6 +42104,7 @@ api_token = "tok"
                     cache_key.clone(),
                     RuntimeProxyCachedClient {
                         generation: stale_generation,
+                        runtime_id: tokio::runtime::Handle::current().id(),
                         client: reqwest::Client::new(),
                     },
                 );
@@ -43407,6 +44397,163 @@ group_policy = "disabled"
 
         let config: Config = toml::from_str("").expect("empty TOML loads with defaults");
         assert!(config.security.audit.enabled);
+    }
+
+    #[test]
+    async fn collect_warnings_flags_dead_delegate_grants_under_forbidden_policy() {
+        let mut config: Config = toml::from_str(
+            r#"
+[risk_profiles.worker_project]
+[risk_profiles.worker_project.delegation_policy]
+mode = "forbidden"
+
+[agents.projects_assistant]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[[agents.projects_assistant.delegates]]
+agent = "demiurge"
+mode = "independent"
+
+[agents.demiurge]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[providers.models.openai.gpt]
+model = "gpt-4o-mini"
+"#,
+        )
+        .expect("dead-grant fixture loads");
+        suppress_semantic_memory_warning(&mut config);
+
+        let warnings =
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let w = &warnings[0];
+        assert_eq!(w.path, "agents.projects_assistant.delegates");
+        assert!(
+            w.message.contains("delegation_policy.mode")
+                && w.message.contains("projects_assistant")
+                && w.message.contains("unreachable"),
+            "unexpected message: {}",
+            w.message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_silent_when_delegate_grants_match_allow_policy() {
+        let mut config: Config = toml::from_str(
+            r#"
+[risk_profiles.worker_project]
+[risk_profiles.worker_project.delegation_policy]
+mode = "allow"
+
+[agents.projects_assistant]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[[agents.projects_assistant.delegates]]
+agent = "demiurge"
+mode = "independent"
+
+[agents.demiurge]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[providers.models.openai.gpt]
+model = "gpt-4o-mini"
+"#,
+        )
+        .expect("reachable-grant fixture loads");
+        suppress_semantic_memory_warning(&mut config);
+
+        assert!(
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS)
+                .is_empty()
+        );
+    }
+
+    fn dead_grant_fixture(profile_body: &str) -> Config {
+        let mut config: Config = toml::from_str(&format!(
+            r#"
+[risk_profiles.worker_project]
+{profile_body}
+[risk_profiles.worker_project.delegation_policy]
+mode = "allow"
+
+[agents.projects_assistant]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[[agents.projects_assistant.delegates]]
+agent = "demiurge"
+mode = "independent"
+
+[agents.demiurge]
+enabled = true
+risk_profile = "worker_project"
+model_provider = "openai.gpt"
+
+[providers.models.openai.gpt]
+model = "gpt-4o-mini"
+"#
+        ))
+        .expect("dead-grant fixture loads");
+        suppress_semantic_memory_warning(&mut config);
+        config
+    }
+
+    #[test]
+    async fn collect_warnings_flags_dead_delegate_grants_under_deny_all_tools() {
+        let config = dead_grant_fixture("deny_all_tools = true");
+        let warnings =
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.contains("deny_all_tools"),
+            "unexpected message: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_dead_delegate_grants_when_delegate_excluded() {
+        let config = dead_grant_fixture(r#"excluded_tools = ["delegate"]"#);
+        let warnings =
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.contains("excluded_tools"),
+            "unexpected message: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_flags_dead_delegate_grants_when_allowlist_omits_delegate() {
+        let config = dead_grant_fixture(r#"allowed_tools = ["shell"]"#);
+        let warnings =
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.contains("allowed_tools") && !warnings[0].message.contains("  "),
+            "unexpected message: {}",
+            warnings[0].message
+        );
+    }
+
+    #[test]
+    async fn collect_warnings_silent_when_allowlist_admits_delegate() {
+        let config = dead_grant_fixture(r#"allowed_tools = ["shell", "delegate"]"#);
+        assert!(
+            warnings_with_code(&config, crate::validation_warnings::DEAD_DELEGATE_GRANTS)
+                .is_empty()
+        );
     }
 
     // Disabling the section silently stops the certificate trail:
@@ -48420,6 +49567,80 @@ stream_tool_arguments = [
             mx.set_prop("channels.matrix.draft_update_interval_ms", "abc")
                 .is_err()
         );
+    }
+
+    /// `config set`, RPC `config/set`, the gateway PATCH and env overrides
+    /// all reach `set_prop`. Text that reads as infinity or NaN is refused
+    /// for a plain float field and for an optional one, and the value already
+    /// set is kept. Finite edge values still store exactly.
+    #[test]
+    async fn set_prop_float_refuses_non_finite_text_and_keeps_the_stored_value() {
+        let mut config = Config::default();
+        let vector_weight = config.memory.vector_weight;
+        config
+            .set_prop_persistent("runtime.docker.cpu_limit", "2.5")
+            .unwrap();
+        for text in [
+            "inf", "+inf", "-inf", "Infinity", "infinity", "NaN", "nan", "1e999", "-1e999",
+        ] {
+            for prop in ["memory.vector_weight", "runtime.docker.cpu_limit"] {
+                let err = config.set_prop_persistent(prop, text).expect_err(text);
+                assert!(
+                    format!("{err:#}").contains("Invalid float value"),
+                    "{prop} {text}: {err:#}"
+                );
+            }
+            assert_eq!(
+                config.memory.vector_weight.to_bits(),
+                vector_weight.to_bits(),
+                "{text}"
+            );
+            assert_eq!(config.runtime.docker.cpu_limit, Some(2.5), "{text}");
+        }
+        for (text, want) in [
+            ("-0.0", -0.0_f64),
+            ("5e-324", 5e-324),
+            ("1.7976931348623157e308", f64::MAX),
+            ("5", 5.0),
+        ] {
+            config
+                .set_prop_persistent("memory.vector_weight", text)
+                .unwrap();
+            assert_eq!(
+                config.memory.vector_weight.to_bits(),
+                want.to_bits(),
+                "{text}"
+            );
+            config
+                .set_prop_persistent("runtime.docker.cpu_limit", text)
+                .unwrap();
+            assert_eq!(
+                config.runtime.docker.cpu_limit.map(f64::to_bits),
+                Some(want.to_bits()),
+                "{text}"
+            );
+        }
+    }
+
+    /// `energy_threshold` is an `f32`: `1e39` is finite as an `f64` but
+    /// would be stored as infinity, so it is refused too.
+    #[test]
+    async fn set_prop_f32_refuses_a_value_too_large_for_the_field() {
+        let mut wake = VoiceWakeConfig::default();
+        let before = wake.energy_threshold;
+        for text in ["1e39", "-1e39", "inf", "NaN"] {
+            let err = wake
+                .set_prop("voice_wake.energy_threshold", text)
+                .expect_err(text);
+            assert!(
+                format!("{err:#}").contains("Invalid float value"),
+                "{text}: {err:#}"
+            );
+            assert_eq!(wake.energy_threshold.to_bits(), before.to_bits(), "{text}");
+        }
+        wake.set_prop("voice_wake.energy_threshold", "0.05")
+            .unwrap();
+        assert_eq!(wake.energy_threshold, 0.05_f32);
     }
 
     #[test]
@@ -54029,6 +55250,9 @@ group_policy = "all"
 
     fn suppress_semantic_memory_warning(config: &mut Config) {
         config.memory.search_mode = SearchMode::Bm25;
+        // Default-on `[web_search]` reports TOOL_COMPILED_OUT in builds
+        // without `tools-external`; these tests count unrelated warnings.
+        config.web_search.enabled = false;
     }
 
     #[test]
