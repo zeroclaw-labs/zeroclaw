@@ -489,9 +489,8 @@ impl OllamaModelProvider {
                     }
                 })
                 .collect();
-            // Textual reasoning/tool extraction belongs to the runtime model
-            // policy. Preserve the wire content here so a model can opt out
-            // of `<think>` extraction without the provider discarding it.
+            // Keep legacy reasoning removal and thinking-field fallback until
+            // the later registry layer activates model-owned extraction.
             let text = Self::raw_response_text(
                 &response.message.content,
                 response.message.thinking.as_deref(),
@@ -811,7 +810,7 @@ impl ModelProvider for OllamaModelProvider {
             return Ok(self.format_tool_calls_for_loop(&response.message.tool_calls));
         }
 
-        // Preserve wire text; model-owned extraction is applied by runtime.
+        // Keep legacy reasoning removal and thinking-field fallback.
         if let Some(content) = Self::raw_response_text(
             &response.message.content,
             response.message.thinking.as_deref(),
@@ -858,7 +857,7 @@ impl ModelProvider for OllamaModelProvider {
             return Ok(self.format_tool_calls_for_loop(&response.message.tool_calls));
         }
 
-        // Preserve wire text; model-owned extraction is applied by runtime.
+        // Keep legacy reasoning removal and thinking-field fallback.
         if let Some(content) = Self::raw_response_text(
             &response.message.content,
             response.message.thinking.as_deref(),

@@ -4235,7 +4235,7 @@ data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\"
     }
 
     #[tokio::test]
-    async fn streaming_total_deadline_is_independent_of_read_progress() {
+    async fn stream_outlives_legacy_timeout_secs() {
         use axum::{Router, response::IntoResponse, routing::post};
         use futures_util::StreamExt as _;
 

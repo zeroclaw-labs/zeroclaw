@@ -35,10 +35,15 @@ impl ChatHttpPolicy<'_> {
         self.read_timeout.hash(&mut fingerprint);
         self.redirect_endpoint.hash(&mut fingerprint);
         self.tls_ca_cert_pem.hash(&mut fingerprint);
-        for (name, value) in &self.headers {
-            name.as_str().hash(&mut fingerprint);
-            value.as_bytes().hash(&mut fingerprint);
-        }
+        // Header insertion order is not part of the HTTP policy. Canonicalize
+        // the pairs so reloading equivalent maps selects the existing pool.
+        let mut headers: Vec<_> = self
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes()))
+            .collect();
+        headers.sort_unstable();
+        headers.hash(&mut fingerprint);
         let profile = format!("chat-http:{:016x}", fingerprint.finish());
         zeroclaw_config::schema::try_build_runtime_proxy_client_with(
             service_key,
@@ -216,7 +221,7 @@ pub(crate) fn append_endpoint(base_url: &str, suffix: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::ChatHttpPolicy;
+    use super::{ChatHttpPolicy, HttpTransportConfig};
     use std::{net::SocketAddr, time::Duration};
 
     #[tokio::test]
@@ -265,12 +270,69 @@ mod tests {
             peer(&changed).await,
             "different timeouts select a different pool"
         );
+        let header_client = |reversed| {
+            let mut pairs = vec![("x-first", "one"), ("x-second", "two")];
+            if reversed {
+                pairs.reverse();
+            }
+            let mut headers = reqwest::header::HeaderMap::new();
+            for (name, value) in pairs {
+                headers.insert(name, value.parse().unwrap());
+            }
+            ChatHttpPolicy {
+                headers,
+                ..Default::default()
+            }
+            .client("model_provider.openai")
+            .unwrap()
+        };
+        assert_eq!(
+            peer(&header_client(false)).await,
+            peer(&header_client(true)).await,
+            "equivalent headers reuse the pool regardless of insertion order"
+        );
         zeroclaw_config::schema::set_runtime_proxy_config(Default::default());
         let after_proxy_publication = build(60);
         assert_ne!(
             first_peer,
             peer(&after_proxy_publication).await,
             "proxy publication invalidates the old pool"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_redirect_policy_preserves_legacy_and_native_boundaries() {
+        use axum::{Router, response::Redirect, routing::get};
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/redirect", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route(
+                "/redirect",
+                get(|| async { Redirect::temporary("/target") }),
+            )
+            .route("/target", get(|| async { "reached" }));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let _server_guard = scopeguard::guard(server, |server| server.abort());
+        let transport = HttpTransportConfig::with_base_url(&url, None);
+        let client = transport
+            .client(Duration::from_secs(10), "transcription")
+            .unwrap();
+        assert_eq!(
+            client.get(&url).send().await.unwrap().text().await.unwrap(),
+            "reached"
+        );
+        let restricted = transport
+            .without_redirects()
+            .client(Duration::from_secs(10), "transcription")
+            .unwrap();
+        assert_eq!(
+            restricted.get(&url).send().await.unwrap().status(),
+            reqwest::StatusCode::TEMPORARY_REDIRECT,
+            "redirect policy must also distinguish cached clients"
         );
     }
 }
