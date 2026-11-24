@@ -14480,6 +14480,21 @@ pub struct OidcConfig {
     /// was issued TO. Empty = no restriction; non-empty = the token must carry
     /// an `azp` claim listed here or authentication fails closed.
     pub allowed_authorized_parties: Vec<String>,
+    /// OAuth scopes requested by the interactive flows ZeroClaw starts with
+    /// this issuer: the device grant (`zerocode login`, `zeroclaw oidc
+    /// login`) and browser Authorization Code with PKCE (including dashboard
+    /// sign-in). Sent space-separated in order. Empty = `["openid"]`. When
+    /// set, must include `openid`, because browser sign-in validates an ID
+    /// token. Some issuers derive the access token's audience from the
+    /// requested scope (Entra ID: `api://<app>/<scope>`); none of them are
+    /// added implicitly, including `offline_access`, whose meaning varies by
+    /// issuer.
+    pub scopes: Vec<String>,
+    /// OAuth scopes requested by `client_credentials` service enrollment.
+    /// Sent space-separated in order. Empty = `["openid"]`. Kept separate
+    /// from `scopes` because some issuers accept only a resource scope here
+    /// (Entra ID: `api://<app>/.default`, without `openid`).
+    pub service_scopes: Vec<String>,
     /// Client identities whose tokens are ALWAYS service principals
     /// (`client_credentials` callers), matched against the token's
     /// verified `client_id` claim. Service tokens always need `client_id`:
@@ -14550,6 +14565,8 @@ impl std::fmt::Debug for OidcConfig {
                 "allowed_authorized_parties",
                 &self.allowed_authorized_parties,
             )
+            .field("scopes", &self.scopes)
+            .field("service_scopes", &self.service_scopes)
             .field("service_clients", &self.service_clients)
             .field("interactive_clients", &self.interactive_clients)
             .field("actor_claim", &self.actor_claim)
@@ -14583,6 +14600,8 @@ impl Default for OidcConfig {
             require_mfa: false,
             required_acr: Vec::new(),
             allowed_authorized_parties: Vec::new(),
+            scopes: Vec::new(),
+            service_scopes: Vec::new(),
             service_clients: Vec::new(),
             interactive_clients: Vec::new(),
             actor_claim: String::new(),
@@ -14983,6 +15002,30 @@ impl OidcConfig {
                 anyhow::bail!("oidc.{alias}.{field} must not contain a blank client id");
             }
         }
+        for (field, scopes) in [
+            ("scopes", &self.scopes),
+            ("service_scopes", &self.service_scopes),
+        ] {
+            let mut seen = std::collections::HashSet::new();
+            for scope in scopes {
+                if !is_scope_token(scope) {
+                    anyhow::bail!(
+                        "oidc.{alias}.{field} contains {scope:?}, which is not an OAuth scope: \
+                         each entry is one nonblank scope of printable ASCII without spaces, \
+                         `\"`, or `\\` (RFC 6749 section 3.3)"
+                    );
+                }
+                if !seen.insert(scope.as_str()) {
+                    anyhow::bail!("oidc.{alias}.{field} lists {scope:?} more than once");
+                }
+            }
+        }
+        if !self.scopes.is_empty() && !self.scopes.iter().any(|scope| scope == "openid") {
+            anyhow::bail!(
+                "oidc.{alias}.scopes must include \"openid\": browser sign-in validates an \
+                 ID token, which the issuer returns only for that scope"
+            );
+        }
         if let Some(shared) = self
             .service_clients
             .iter()
@@ -15010,6 +15053,37 @@ impl OidcConfig {
             &self.client_id
         }
     }
+
+    /// The `scope` parameter for the interactive flows (device grant and
+    /// browser Authorization Code): `scopes` space-joined, or `openid`.
+    #[must_use]
+    pub fn effective_scope(&self) -> String {
+        join_scopes(&self.scopes)
+    }
+
+    /// The `scope` parameter for `client_credentials`: `service_scopes`
+    /// space-joined, or `openid`.
+    #[must_use]
+    pub fn effective_service_scope(&self) -> String {
+        join_scopes(&self.service_scopes)
+    }
+}
+
+fn join_scopes(scopes: &[String]) -> String {
+    if scopes.is_empty() {
+        "openid".to_string()
+    } else {
+        scopes.join(" ")
+    }
+}
+
+/// RFC 6749 §3.3: `scope-token = 1*( %x21 / %x23-5B / %x5D-7E )`, i.e.
+/// nonblank printable ASCII other than space, `"`, and `\`.
+fn is_scope_token(scope: &str) -> bool {
+    !scope.is_empty()
+        && scope
+            .bytes()
+            .all(|b| matches!(b, 0x21 | 0x23..=0x5B | 0x5D..=0x7E))
 }
 
 /// One local roster identity (`[users.<name>]`) for the local auth
@@ -31600,6 +31674,111 @@ zeroclaw-operators = "operator"
         config.oidc.get_mut("corp").unwrap().require_at_jwt = false;
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("require_at_jwt"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_request_scopes_default_to_openid_for_every_flow() {
+        let defaults = OidcConfig::default();
+        assert!(defaults.scopes.is_empty());
+        assert!(defaults.service_scopes.is_empty());
+        assert_eq!(defaults.effective_scope(), "openid");
+        assert_eq!(defaults.effective_service_scope(), "openid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_request_scopes_roundtrip_from_toml_and_join_in_order() {
+        // Entra ID shape: the API scope sets the access token's audience, and
+        // client_credentials accepts only the `.default` scope (no `openid`).
+        let toml_src = r#"
+[permission_profiles.operator]
+allowed_agents = ["*"]
+
+[oidc.entra]
+issuer = "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0"
+audience = "11111111-1111-1111-1111-111111111111"
+claim_path = "roles"
+scopes = ["openid", "offline_access", "api://zeroclaw/zeroclaw.access"]
+service_scopes = ["api://zeroclaw/.default"]
+
+[oidc.entra.profile_map]
+"ZeroClaw.Operator" = "operator"
+"#;
+        let config: Config = toml::from_str(toml_src).expect("scopes parse");
+        config.validate().expect("scopes validate");
+        let oidc = &config.oidc["entra"];
+        assert_eq!(
+            oidc.effective_scope(),
+            "openid offline_access api://zeroclaw/zeroclaw.access"
+        );
+        assert_eq!(oidc.effective_service_scope(), "api://zeroclaw/.default");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_interactive_scopes_must_include_openid() {
+        // Browser sign-in validates an ID token, which only `openid` yields.
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().scopes = vec!["offline_access".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("oidc.corp.scopes") && err.contains("openid"),
+            "got: {err}"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_service_scopes_do_not_require_openid() {
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().service_scopes =
+            vec!["api://zeroclaw/.default".to_string()];
+        config
+            .validate()
+            .expect("client_credentials scopes need not include openid");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_request_scopes_must_be_rfc6749_scope_tokens() {
+        // RFC 6749 §3.3: scope-token = 1*( %x21 / %x23-5B / %x5D-7E ).
+        // Blank, whitespace (which would split one entry into two scopes),
+        // `"`, `\`, control, and non-ASCII characters are all refused.
+        for bad in [
+            "",
+            " ",
+            "openid profile",
+            "a\"b",
+            "a\\b",
+            "tab\there",
+            "naïve",
+        ] {
+            for field in ["scopes", "service_scopes"] {
+                let mut config = auth_config();
+                {
+                    let oidc = config.oidc.get_mut("corp").unwrap();
+                    let list = vec!["openid".to_string(), bad.to_string()];
+                    if field == "scopes" {
+                        oidc.scopes = list;
+                    } else {
+                        oidc.service_scopes = list;
+                    }
+                }
+                let err = config.validate().unwrap_err().to_string();
+                assert!(
+                    err.contains(&format!("oidc.corp.{field}")),
+                    "{field} = {bad:?} must be refused; got: {err}"
+                );
+            }
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_request_scopes_refuse_duplicates() {
+        let mut config = auth_config();
+        config.oidc.get_mut("corp").unwrap().scopes =
+            vec!["openid".to_string(), "openid".to_string()];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("oidc.corp.scopes") && err.contains("openid"),
+            "got: {err}"
+        );
     }
 
     #[::core::prelude::v1::test]
@@ -48998,6 +49177,80 @@ stream_tool_arguments = [
             mx.set_prop("channels.matrix.draft_update_interval_ms", "abc")
                 .is_err()
         );
+    }
+
+    /// `config set`, RPC `config/set`, the gateway PATCH and env overrides
+    /// all reach `set_prop`. Text that reads as infinity or NaN is refused
+    /// for a plain float field and for an optional one, and the value already
+    /// set is kept. Finite edge values still store exactly.
+    #[test]
+    async fn set_prop_float_refuses_non_finite_text_and_keeps_the_stored_value() {
+        let mut config = Config::default();
+        let vector_weight = config.memory.vector_weight;
+        config
+            .set_prop_persistent("runtime.docker.cpu_limit", "2.5")
+            .unwrap();
+        for text in [
+            "inf", "+inf", "-inf", "Infinity", "infinity", "NaN", "nan", "1e999", "-1e999",
+        ] {
+            for prop in ["memory.vector_weight", "runtime.docker.cpu_limit"] {
+                let err = config.set_prop_persistent(prop, text).expect_err(text);
+                assert!(
+                    format!("{err:#}").contains("Invalid float value"),
+                    "{prop} {text}: {err:#}"
+                );
+            }
+            assert_eq!(
+                config.memory.vector_weight.to_bits(),
+                vector_weight.to_bits(),
+                "{text}"
+            );
+            assert_eq!(config.runtime.docker.cpu_limit, Some(2.5), "{text}");
+        }
+        for (text, want) in [
+            ("-0.0", -0.0_f64),
+            ("5e-324", 5e-324),
+            ("1.7976931348623157e308", f64::MAX),
+            ("5", 5.0),
+        ] {
+            config
+                .set_prop_persistent("memory.vector_weight", text)
+                .unwrap();
+            assert_eq!(
+                config.memory.vector_weight.to_bits(),
+                want.to_bits(),
+                "{text}"
+            );
+            config
+                .set_prop_persistent("runtime.docker.cpu_limit", text)
+                .unwrap();
+            assert_eq!(
+                config.runtime.docker.cpu_limit.map(f64::to_bits),
+                Some(want.to_bits()),
+                "{text}"
+            );
+        }
+    }
+
+    /// `energy_threshold` is an `f32`: `1e39` is finite as an `f64` but
+    /// would be stored as infinity, so it is refused too.
+    #[test]
+    async fn set_prop_f32_refuses_a_value_too_large_for_the_field() {
+        let mut wake = VoiceWakeConfig::default();
+        let before = wake.energy_threshold;
+        for text in ["1e39", "-1e39", "inf", "NaN"] {
+            let err = wake
+                .set_prop("voice_wake.energy_threshold", text)
+                .expect_err(text);
+            assert!(
+                format!("{err:#}").contains("Invalid float value"),
+                "{text}: {err:#}"
+            );
+            assert_eq!(wake.energy_threshold.to_bits(), before.to_bits(), "{text}");
+        }
+        wake.set_prop("voice_wake.energy_threshold", "0.05")
+            .unwrap();
+        assert_eq!(wake.energy_threshold, 0.05_f32);
     }
 
     #[test]
