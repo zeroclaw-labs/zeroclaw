@@ -138,7 +138,7 @@ The following built-in capabilities are available when compiled and selected, wh
 | `file_read` | Read a file with line numbers; supports partial reads and base64 encoding for binary files (path must be inside the workspace unless autonomy permits otherwise) |
 | `file_write` | Write a file (same path constraint) |
 | `file_edit` | Replace an exact string match in a file with new content |
-| `glob_search` | List files matching a glob pattern within the workspace |
+| `glob_search` | List files matching a glob pattern within the workspace, or under an allowed root with an absolute pattern |
 | `content_search` | Search file contents by regex within the workspace (ripgrep with grep fallback) |
 | `http_request` | HTTP GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS to allowlisted domains |
 | `web_search_tool` | Web search. Provider is configurable: DuckDuckGo (default, no key), Brave, Tavily, SearXNG, Jina, Bocha, AnySearch, Serply, or Keenable (no key required; optional key lifts rate limits) |

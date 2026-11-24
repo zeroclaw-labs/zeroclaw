@@ -1435,6 +1435,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_search_preserves_unicode_paths_and_counts_matching_lines() {
+        let dir = TempDir::new().unwrap();
+        let relative = PathBuf::from("资料 space").join("🦀.rs");
+        std::fs::create_dir_all(dir.path().join("资料 space")).unwrap();
+        std::fs::write(
+            dir.path().join(&relative),
+            "first 中\r\nsecond 中文🦀\r\nthird 中文 中文 e\u{301}\r\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("excluded.txt"), "中文\n").unwrap();
+        std::fs::write(dir.path().join("unmatched.rs"), "no match\n").unwrap();
+        let tool = ContentSearchTool::new_with_backend(
+            test_security(dir.path().to_path_buf()),
+            SearchBackend::Internal,
+        );
+        let path = relative.display();
+        for (mode, expected) in [
+            (
+                "content",
+                format!(
+                    "{path}:2:second 中文🦀\n{path}:3:third 中文 中文 e\u{301}\n\nTotal: 2 matching lines in 1 files"
+                ),
+            ),
+            ("files_with_matches", format!("{path}\n\nTotal: 1 files")),
+            ("count", format!("{path}:2\n\nTotal: 2 matches in 1 files")),
+        ] {
+            let result = tool
+                .execute(json!({
+                    "pattern": "中文", "include": "*.rs", "output_mode": mode
+                }))
+                .await
+                .unwrap();
+            assert!(result.success, "{mode}: {:?}", result.error);
+            assert_eq!(result.output.as_str(), expected, "{mode}");
+        }
+    }
+
+    #[tokio::test]
     async fn content_search_internal_backend_finds_matches_without_external_tools() {
         let dir = TempDir::new().unwrap();
         create_test_files(&dir);

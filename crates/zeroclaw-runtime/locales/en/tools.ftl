@@ -144,7 +144,7 @@ tool-git-forge-error-raw-requires-path = 'raw' requires 'path'.
 tool-git-forge-error-requires-resource = a typed call requires 'resource' (or use action 'raw'/'describe').
 tool-git-forge-error-missing-repo = Missing 'repo' (expected 'owner/repo').
 
-tool-glob-search = Search for files matching a glob pattern within the workspace. Returns a sorted list of matching file paths relative to the workspace root. Examples: '**/*.rs' (all Rust files), 'src/**/mod.rs' (all mod.rs in src).
+tool-glob-search = Search for files matching a glob pattern within the workspace, or under an allowed root with an absolute pattern. Returns a sorted list of matching file paths: relative to the workspace root, absolute for files outside it. Examples: '**/*.rs' (all Rust files), 'src/**/mod.rs' (all mod.rs in src).
 
 tool-google-workspace = Interact with Google Workspace services (Drive, Gmail, Calendar, Sheets, Docs, etc.) via the gws CLI. Requires gws to be installed and authenticated.
 
@@ -288,3 +288,42 @@ tool-http-credential-alias = Credential alias must contain 1 to 64 ASCII letters
 tool-http-credential-not-granted = HTTP Request is not authorized to use this credential
 tool-http-request-authenticated-response-truncated = [Truncated authenticated response omitted]
 tool-http-credential-exclusive = Choose credential or auth_secret, not both
+
+tool-send-via-error-no-active-reply = No active channel reply to redirect. To start or resume a conversation, call send_via with both `target` and a non-empty `body`.
+
+tool-send-via-description-background =
+    Send a message immediately to a configured channel peer. Both `target` and a non-empty `body` are required: this task has no active channel reply to redirect. Sending starts or resumes the recipient's conversation; no inbound message is required. The target must be a channel alias or a peer group the active agent belongs to. `modality` defaults to the peer group's output modality.
+
+tool-send-via-description-routing =
+    Control where and how this turn's reply is delivered, or send an extra message to another channel.
+
+    WHEN TO USE: call this tool at the start of your response whenever the user requests a specific reply format or destination — e.g. "reply by text", "send as voice", "text only", "send to my email", "redirect to Discord". Do not wait for the user to name the tool; infer intent from natural language just as you would use a weather tool when asked for the weather.
+
+    Without `body` (routing instruction — affects this turn's main reply):
+    - `send_via(modality: "text")` — reply by text even on a voice-only peer
+    - `send_via(modality: "voice")` — reply by voice even on a text-only peer
+    - `send_via(target: "discord.main")` — redirect reply to another channel
+    - `send_via(target: "discord.main", modality: "voice")` — redirect + force modality
+    At least one of `target` or `modality` is required when `body` is absent.
+    Modality applies to this turn's final reply. Progress already streamed earlier in the turn (e.g. Telegram multi_message narration) keeps its streamed modality and is not retracted.
+
+    With `body` (immediate fanout — main reply still goes to originating channel):
+    - `send_via(target: "email.default", body: "...")` — send separate content elsewhere
+    `target` is required when `body` is present.
+
+    `target` must be a channel alias (e.g. `telegram.default`) or a peer group name the active agent belongs to. `modality` defaults to the peer group's output_modality.
+
+tool-send-via-param-target =
+    Channel alias (e.g. telegram.default) or peer group name. Required when body is present. Optional otherwise (omit = same channel).
+
+tool-send-via-param-modality =
+    Delivery modality. Omit to inherit from the peer group's output_modality.
+
+tool-send-via-param-body =
+    Message content for an immediate fanout send. Omit to set a routing instruction for the current reply instead.
+
+tool-send-via-param-background-target =
+    Required destination: a configured channel alias or authorized peer group.
+
+tool-send-via-param-background-body =
+    Required non-empty message content to send immediately.

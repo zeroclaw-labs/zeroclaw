@@ -27,6 +27,8 @@ mod dockerignore_test;
 mod estop_cli;
 #[cfg(feature = "gateway")]
 mod gateway;
+#[cfg(all(feature = "agent-runtime", feature = "gateway"))]
+mod gateway_get_paircode_cli;
 mod gemini_capabilities;
 mod hardware_probe_feature_graph;
 mod oidc_enrollment_cli;
