@@ -324,7 +324,6 @@ impl Drop for OutcomeUnknownGuard {
 impl McpServer {
     /// Connect to the server, perform the initialize handshake, and fetch the tool list.
     pub async fn connect(config: McpServerConfig) -> Result<Self> {
-        // Create transport based on config
         let transport: Arc<dyn SharedMcpTransportConn> =
             Arc::from(create_shared_transport(&config).with_context(|| {
                 format!(
@@ -332,6 +331,13 @@ impl McpServer {
                     config.name
                 )
             })?);
+        Self::connect_with_transport(config, transport).await
+    }
+
+    pub(crate) async fn connect_with_transport(
+        config: McpServerConfig,
+        transport: Arc<dyn SharedMcpTransportConn>,
+    ) -> Result<Self> {
         let epoch_gate = Arc::new(RwLock::new(0));
         let serial_gate =
             (config.transport != McpTransport::Stdio).then(|| Arc::new(Mutex::new(())));

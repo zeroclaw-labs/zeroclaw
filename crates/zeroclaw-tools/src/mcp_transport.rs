@@ -170,10 +170,9 @@ fn load_tls_ca_pem(config: &McpServerConfig, path: &str) -> Result<Vec<u8>> {
 /// enabled, and normal chain and hostname verification stay in force.
 fn build_remote_http_client(
     config: &McpServerConfig,
+    mut builder: reqwest::ClientBuilder,
     sse_origin: Option<reqwest::Url>,
 ) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder();
-
     // SSE endpoint discovery and redirects must not widen the destination to
     // which the operator entrusted this server's headers and request bodies.
     if sse_origin.is_some() || config.tls_ca_cert_path.is_some() {
@@ -235,6 +234,10 @@ fn build_remote_http_client(
 }
 
 // ── Transport Errors ───────────────────────────────────────────────────────
+
+#[derive(Debug, thiserror::Error)]
+#[error("MCP server returned HTTP {0}")]
+pub(crate) struct McpHttpStatus(pub(crate) reqwest::StatusCode);
 
 /// Transport-level failures that require reconnecting and re-running the MCP
 /// handshake. The client may retry only when the request is known not to have
@@ -1162,6 +1165,13 @@ pub struct HttpTransport {
 
 impl HttpTransport {
     pub fn new(config: &McpServerConfig) -> Result<Self> {
+        Self::with_builder(config, reqwest::Client::builder())
+    }
+
+    pub(crate) fn with_builder(
+        config: &McpServerConfig,
+        builder: reqwest::ClientBuilder,
+    ) -> Result<Self> {
         let url = config
             .url
             .as_ref()
@@ -1183,7 +1193,7 @@ impl HttpTransport {
         if config.tls_ca_cert_path.is_some() {
             require_https_url(&config.name, &url, "configured remote URL")?;
         }
-        let client = build_remote_http_client(config, None)?;
+        let client = build_remote_http_client(config, builder, None)?;
 
         Ok(Self {
             url,
@@ -1283,7 +1293,7 @@ impl SharedMcpTransportConn for HttpTransport {
                 .into());
             }
             lifecycle.mark_completed();
-            bail!("MCP server returned HTTP {}", status);
+            return Err(McpHttpStatus(status).into());
         }
 
         self.update_session_id_from_headers(resp.headers());
@@ -1403,7 +1413,7 @@ impl SseTransport {
         }
         let origin = reqwest::Url::parse(&sse_url).context("invalid configured MCP SSE URL")?;
         require_sse_origin(&origin, &origin)?;
-        let client = build_remote_http_client(config, Some(origin))?;
+        let client = build_remote_http_client(config, reqwest::Client::builder(), Some(origin))?;
 
         Ok(Self {
             sse_url,
