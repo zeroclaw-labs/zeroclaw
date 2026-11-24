@@ -28,8 +28,12 @@ jobs:
         with:
           toolchain: 1.98.0
 
+      # Same pinned builds as the Security job in ci.yml, so this scan and PR CI
+      # judge master with the same tools.
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        run: |
+          curl -LsSf https://github.com/EmbarkStudios/cargo-deny/releases/download/0.19.9/cargo-deny-0.19.9-x86_64-unknown-linux-musl.tar.gz \
+            | tar zxf - -C ~/.cargo/bin --strip-components=1
 
       - name: Install cargo-audit
         run: |
@@ -80,25 +84,44 @@ jobs:
             exit 0
           fi
 
-          # Avoid opening a duplicate while an advisory issue is still open.
-          open_count=$(gh issue list \
+          # One open issue per distinct set of failing advisories. Matching on
+          # the title alone let any open scan issue, such as a long-lived
+          # tracking issue for an accepted advisory, silence every new one.
+          # Only failing advisories count, not allowed warnings: cargo-audit
+          # marks a warning block with a `Warning:` line, and cargo-deny heads
+          # each finding with `error[...]` or `warning[...]`.
+          advisory_ids=$(awk '
+            /^Crate:/ { in_audit = 1; audit_warning = 0 }
+            /^Warning:/ { audit_warning = 1 }
+            /^(error|warning)\[/ { in_audit = 0; deny_error = ($0 ~ /^error\[/) }
+            /ID: *RUSTSEC-[0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]/ {
+              match($0, /RUSTSEC-[0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9]/)
+              if ((in_audit && !audit_warning) || (!in_audit && deny_error)) print substr($0, RSTART, RLENGTH)
+            }' /tmp/advisory-output.txt | sort -u | paste -sd ' ' - || true)
+          marker="<!-- advisory-scan-ids: ${advisory_ids:-none} -->"
+
+          existing_url=$(gh issue list \
             --repo "$GITHUB_REPOSITORY" \
             --label "security" \
             --state open \
             --search "Advisory scan failed in:title" \
-            --json number \
-            --jq 'length')
+            --limit 100 \
+            --json url,body \
+            | MARKER="$marker" jq -r '[.[] | select(.body | contains(env.MARKER))][0].url // ""')
 
-          if [[ "$open_count" -gt 0 ]]; then
-            echo "An open advisory issue already exists — skipping duplicate."
+          if [[ -n "$existing_url" ]]; then
+            echo "issue_url=$existing_url" >> "$GITHUB_OUTPUT"
+            echo "An open issue already reports this set of advisories: $existing_url"
             exit 0
           fi
 
           advisory_output=$(cat /tmp/advisory-output.txt)
 
           {
+            printf '%s\n' "${marker}"
             printf '## Advisory scan failed\n\n'
             printf 'Workflow run: %s\n\n' "${RUN_URL}"
+            printf 'Advisories: %s\n\n' "${advisory_ids:-none named in the output (a tool or network failure?)}"
             printf '```\n%s\n```\n\n' "${advisory_output}"
             printf 'Review `deny.toml` and `.cargo/audit.toml` for the current advisory policy.\n'
             printf 'Document any accepted risk with a rationale and tracking issue. If a\n'

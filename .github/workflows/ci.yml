@@ -121,7 +121,11 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          # The guard needs the commit graph for `git merge-base`, not every tree
+          # and blob in the repository's history. A treeless clone fetches the
+          # commits; the checkout then fetches only the files at HEAD.
           fetch-depth: 0
+          filter: tree:0
       - name: Test common ancestor guard
         run: bash scripts/ci/common_ancestor_guard.test.sh
       - name: Reject unrelated PR history
@@ -307,8 +311,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.98.0
@@ -825,7 +827,10 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          fetch-depth: 0
+          # Depth 2 keeps the parents of a pull request's test merge commit,
+          # which the admission proof records. The change detector below
+          # fetches the one base commit it compares against.
+          fetch-depth: 2
       - name: Verify plugin backend change filter
         run: bash scripts/ci/plugin_backend_change_filter.test.sh
       - name: Detect plugin backend changes
@@ -833,6 +838,8 @@ jobs:
         run: |
           base="${{ github.event.pull_request.base.sha }}"
           if [ -z "$base" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          # Fetch only the base commit. A two-dot diff needs no merge base.
+          git fetch --no-tags --depth=1 origin "$base"
           run="$(git diff --name-only "$base" HEAD | bash scripts/ci/plugin_backend_change_filter.sh)"
           echo "run=$run" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
@@ -1579,6 +1586,13 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # The root package enables runtime/test-util in its dev-dependencies.
+      # Select only the external consumer to exercise its public API contract.
+      - name: Test runtime composition as an external consumer
+        run: cargo test --locked -p runtime-composition-consumer
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
       # The crate's default feature set excludes the host-side hardware
       # modules. Compile-only `ci-all` coverage cannot exercise their process,
       # timeout, cleanup, and validation regressions.
@@ -2075,7 +2089,11 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          # The docs gates need `git merge-base` and a diff against it. A
+          # blobless clone has every commit and tree for that, and fetches
+          # file contents only for the paths the gates read.
           fetch-depth: 0
+          filter: blob:none
       - name: Resolve base SHA
         id: base
         run: echo "sha=$(git merge-base origin/master HEAD)" >> "$GITHUB_OUTPUT"
@@ -2099,23 +2117,9 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
-      - name: Detect zerocode changes
-        id: changed
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base="$(git merge-base origin/master HEAD)"
-            if git diff --name-only "$base" HEAD | grep -q '^apps/zerocode/'; then
-              echo "run=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "run=false" >> "$GITHUB_OUTPUT"
-            fi
-          else
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          fi
+      # The gate parses one manifest in well under a second, so it runs on
+      # every event instead of fetching history to decide whether to run.
       - name: Guard zerocode RPC-only boundary
-        if: steps.changed.outputs.run == 'true'
         run: bash scripts/ci/zerocode_no_zeroclaw_dep_gate.sh
 
   # Guards generated installation surfaces against canonical-spec drift from PR #7558; see the bespoke gate registry in README.md.
@@ -2197,6 +2201,9 @@ jobs:
       - name: Run SOP editor regressions
         working-directory: web
         run: npm run test:sop-editor
+      - name: Voice tests
+        working-directory: web
+        run: npm run test:voice
       - name: Run dashboard sign-in regressions
         working-directory: web
         run: npm run test:auth
@@ -2221,14 +2228,22 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          fetch-depth: 0
+          # Depth 2 keeps both parents of a pull request's test merge commit,
+          # which the trigger reads. The step below fetches the event's base.
+          fetch-depth: 2
       - name: Detect workspace version change
         id: bump
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
-        run: bash scripts/ci/crates_preflight_trigger.sh "$EVENT_NAME" "$BASE_SHA" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          # Pushes to master have no base and the trigger skips them.
+          if [[ -n "$BASE_SHA" ]]; then
+            git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          fi
+          bash scripts/ci/crates_preflight_trigger.sh "$EVENT_NAME" "$BASE_SHA" >> "$GITHUB_OUTPUT"
 
   # Blocking by design: retry an infrastructure failure and keep the bump
   # unmerged until required CI is green. The release run independently
