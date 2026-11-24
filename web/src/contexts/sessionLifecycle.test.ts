@@ -30,6 +30,8 @@ const storage = new MemoryStorage();
 const fakeWindow = {
   location: { protocol: 'http:', host: 'localhost' },
   dispatchEvent: () => true,
+  addEventListener: () => {},
+  removeEventListener: () => {},
 };
 // Document listeners are kept so a test can dispatch a key press to them, and the
 // focused element is tracked so the composer can be told it still holds focus.

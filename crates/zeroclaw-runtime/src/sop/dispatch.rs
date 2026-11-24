@@ -3795,31 +3795,45 @@ mod tests {
         }
 
         impl Scripted {
-            fn answering(gate: f64, mode: &str, confidence: f64) -> Arc<Self> {
+            /// The answers to the gate (when given) and mode questions.
+            fn script(gate: Option<f64>, mode: &str, confidence: f64) -> Answers {
                 let modes = ["auto", "supervised", "step_by_step"];
                 let probabilities = modes
                     .iter()
                     .map(|m| ((*m).to_string(), if *m == mode { 0.9 } else { 0.05 }))
                     .collect();
-                let answers = BTreeMap::from([
-                    ("start_sop".to_string(), Answer::Noul { noul: gate }),
-                    (
-                        "execution_mode".to_string(),
-                        Answer::Choice {
-                            choice: mode.into(),
-                            probabilities,
-                            confidence,
-                        },
-                    ),
-                ]);
+                let mut answers = BTreeMap::from([(
+                    "execution_mode".to_string(),
+                    Answer::Choice {
+                        choice: mode.into(),
+                        probabilities,
+                        confidence,
+                    },
+                )]);
+                if let Some(gate) = gate {
+                    answers.insert("start_sop".to_string(), Answer::Noul { noul: gate });
+                }
+                Answers {
+                    model: None,
+                    answers,
+                    usage: None,
+                }
+            }
+
+            fn with(answers: Answers) -> Arc<Self> {
                 Arc::new(Self {
-                    answers: Some(Answers {
-                        model: None,
-                        answers,
-                        usage: None,
-                    }),
+                    answers: Some(answers),
                     calls: AtomicUsize::new(0),
                 })
+            }
+
+            fn answering(gate: f64, mode: &str, confidence: f64) -> Arc<Self> {
+                Self::with(Self::script(Some(gate), mode, confidence))
+            }
+
+            /// A confident answer for `mode` with no `start_sop` answer at all.
+            fn answering_mode_without_gate(mode: &str, confidence: f64) -> Arc<Self> {
+                Self::with(Self::script(None, mode, confidence))
             }
 
             fn down() -> Arc<Self> {
@@ -4004,6 +4018,27 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn unusable_gate_answer_cannot_leave_a_run_less_supervised_than_fail_closed() {
+            let engine = engine_with(
+                vec![webhook_sop(
+                    "refunds",
+                    SopExecutionMode::Supervised,
+                    Some(spec()),
+                )],
+                Some(Scripted::answering_mode_without_gate("auto", 0.9)),
+            );
+            let results = dispatch_sop_event(&engine, &test_audit(), ticket("refund $12")).await;
+            assert_eq!(
+                started(&engine, &results),
+                vec![(
+                    "refunds".into(),
+                    "WaitApproval",
+                    Some(SopExecutionMode::StepByStep)
+                )]
+            );
+        }
+
+        #[tokio::test]
         async fn auto_decision_cannot_remove_a_step_confirmation() {
             let mut sop = webhook_sop("refunds", SopExecutionMode::Supervised, Some(spec()));
             sop.steps[0].requires_confirmation = true;
@@ -4129,7 +4164,127 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn model_outage_runs_every_step() {
+        async fn unusable_gate_answer_does_not_let_a_step_answer_skip_a_step() {
+            let mut sop = part_sop();
+            sop.decision = Some(spec());
+            let mut answers = Scripted::script(None, "auto", 0.9);
+            answers
+                .answers
+                .insert("part_1".to_string(), Answer::Noul { noul: 0.1 });
+            let engine = engine_with(vec![sop], Some(Scripted::with(answers)));
+            dispatch_sop_event(&engine, &test_audit(), ticket("typo fix")).await;
+            let run = active_run(&engine);
+            assert!(run.decisions.is_empty(), "{:?}", run.decisions);
+            assert_eq!(run.current_step, 1, "no usable answer: step 1 runs");
+            assert!(run.step_results.is_empty());
+            assert_eq!(run.decided_mode, Some(SopExecutionMode::StepByStep));
+        }
+
+        #[tokio::test]
+        async fn switch_with_only_decision_guards_completes_when_answers_are_ignored() {
+            use crate::sop::approval::{
+                ApprovalDecision, ApprovalPrincipal, BrokerOutcome, ResolveOutcome,
+            };
+            use crate::sop::step_contract::SwitchRule;
+
+            let mut sop = part_sop();
+            sop.decision = Some(spec());
+            sop.steps.push(SopStep {
+                number: 3,
+                ..sop.steps[1].clone()
+            });
+            sop.steps[0].routing.switch = vec![
+                SwitchRule {
+                    name: "yes".into(),
+                    when: Some("$.decisions.1 >= 0.5".into()),
+                    goto: Some(2),
+                },
+                SwitchRule {
+                    name: "no".into(),
+                    when: Some("$.decisions.1 < 0.5".into()),
+                    goto: Some(3),
+                },
+            ];
+            // This step answer would select the first port, but the gate answer is absent.
+            let mut answers = Scripted::script(None, "auto", 0.9);
+            answers
+                .answers
+                .insert("part_1".into(), Answer::Noul { noul: 0.9 });
+            let engine = engine_with(vec![sop], Some(Scripted::with(answers)));
+            dispatch_sop_event(&engine, &test_audit(), ticket("review")).await;
+            let run_id = active_run(&engine).run_id;
+            let mut engine = engine.lock().unwrap();
+            let approved = engine
+                .resolve_via_broker(
+                    &run_id,
+                    ApprovalDecision::Approve,
+                    ApprovalPrincipal::cli(None),
+                )
+                .unwrap();
+            assert!(matches!(
+                approved,
+                BrokerOutcome::Resolved(ResolveOutcome::Resumed(_))
+            ));
+            let action = engine
+                .advance_step(
+                    &run_id,
+                    SopStepResult {
+                        effective_agent: None,
+                        step_number: 1,
+                        status: SopStepStatus::Completed,
+                        output: "done".into(),
+                        started_at: now_iso8601(),
+                        completed_at: Some(now_iso8601()),
+                        tool_calls: Vec::new(),
+                    },
+                )
+                .unwrap();
+            assert!(
+                matches!(action, SopRunAction::Completed { .. }),
+                "{action:?}"
+            );
+            let run = engine.get_run(&run_id).unwrap();
+            assert_eq!(run.status, SopRunStatus::Completed);
+            assert!(run.decisions.is_empty());
+            assert_eq!(run.step_results.len(), 1);
+            assert_eq!(run.step_results[0].step_number, 1);
+        }
+
+        /// Dispatch a gated, moded SOP whose model says "no" to step 1 but whose
+        /// mode answer is unusable: step 1 must still run, under the strict mode.
+        async fn assert_unusable_mode_answer_does_not_skip_a_step(mut answers: Answers) {
+            let mut sop = part_sop();
+            sop.decision = Some(spec());
+            answers
+                .answers
+                .insert("start_sop".to_string(), Answer::Noul { noul: 0.95 });
+            answers
+                .answers
+                .insert("part_1".to_string(), Answer::Noul { noul: 0.1 });
+            let engine = engine_with(vec![sop], Some(Scripted::with(answers)));
+            dispatch_sop_event(&engine, &test_audit(), ticket("typo fix")).await;
+            let run = active_run(&engine);
+            assert!(run.decisions.is_empty(), "{:?}", run.decisions);
+            assert_eq!(run.current_step, 1, "no usable mode: step 1 runs");
+            assert!(run.step_results.is_empty());
+            assert_eq!(run.decided_mode, Some(SopExecutionMode::StepByStep));
+        }
+
+        #[tokio::test]
+        async fn low_confidence_mode_answer_does_not_let_a_step_answer_skip_a_step() {
+            assert_unusable_mode_answer_does_not_skip_a_step(Scripted::script(None, "auto", 0.5))
+                .await;
+        }
+
+        #[tokio::test]
+        async fn missing_mode_answer_does_not_let_a_step_answer_skip_a_step() {
+            let mut answers = Scripted::script(None, "auto", 0.9);
+            answers.answers.remove("execution_mode");
+            assert_unusable_mode_answer_does_not_skip_a_step(answers).await;
+        }
+
+        #[tokio::test]
+        async fn model_outage_leaves_the_conditional_step_eligible() {
             let engine = engine_with(vec![part_sop()], Some(Scripted::down()));
             dispatch_sop_event(&engine, &test_audit(), ticket("typo fix")).await;
             let run = active_run(&engine);
