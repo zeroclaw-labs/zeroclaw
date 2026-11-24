@@ -15,6 +15,9 @@ from typing import Callable, Optional, Pattern
 
 FINDINGS_EXIT = 1
 FATAL_EXIT = 2
+CHAR_LITERAL_RE = re.compile(
+    r"'(?:\\(?:[nrt0\\'\"]|x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f_]+\})|[^\\'\n])'"
+)
 
 
 @dataclass
@@ -104,18 +107,8 @@ def rust_comments(path: str, lines: list[str]) -> list[Comment]:
                 i += 1
                 continue
             if line[i] == "'":
-                end = i + 1
-                escaped = False
-                while end < len(line) and end - i <= 12:
-                    if line[end] == "'" and not escaped:
-                        i = end + 1
-                        break
-                    escaped = line[end] == "\\" and not escaped
-                    if line[end] != "\\":
-                        escaped = False
-                    end += 1
-                else:
-                    i += 1
+                char = CHAR_LITERAL_RE.match(line, i)
+                i = char.end() if char is not None else i + 1
                 continue
             if line.startswith("//", i):
                 add(out, path, lines, lineno, line[i:].rstrip("\n"), "rust_line")

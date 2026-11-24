@@ -13,7 +13,6 @@ use crate::security::ingress::{IngressPolicy, steering_policy};
 use crate::sop::{SopAuditLogger, SopEngine};
 use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
-use chrono::{Datelike, Timelike};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::Path;
@@ -48,6 +47,15 @@ type SessionModelProvider = (
 struct TurnModelSelection {
     selector: String,
     allowed_provider_refs: Option<Arc<HashSet<String>>>,
+}
+
+/// The physical target and handle for one turn. Adapter-built routers continue
+/// to decode the original selector; a supplied route provider receives its model.
+struct ResolvedTurnRoute {
+    dispatch_model: String,
+    selected_route: zeroclaw_providers::router::ResolvedModelRoute,
+    allowed_provider_refs: Option<Arc<HashSet<String>>>,
+    provider: Option<Box<dyn ModelProvider>>,
 }
 
 /// [`build_session_model_provider`] with the provider obtained from
@@ -1559,17 +1567,10 @@ impl Agent {
 
     /// Prefixes a user message with the current date/time in the labeled
     /// shape both embedded Agent turn paths store in history, including the
-    /// streamed path used by RPC and ACP. Other runtime owners format their
-    /// own user-message envelopes independently.
+    /// streamed path used by RPC and ACP. `prompt::timestamp_user_message`
+    /// owns that shape.
     fn enrich_user_message(&self, user_message: &str) -> String {
-        let now = self.current_turn_datetime();
-        let (year, month, day) = (now.year(), now.month(), now.day());
-        let (hour, minute, second) = (now.hour(), now.minute(), now.second());
-        let tz = now.format("%Z");
-        let date_str =
-            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
-
-        format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
+        crate::agent::prompt::timestamp_user_message(&self.current_turn_datetime(), user_message)
     }
 
     pub fn set_channel_name(&mut self, name: String) {
@@ -1913,10 +1914,15 @@ impl Agent {
         &self,
         messages: &[ChatMessage],
         effective_model: &str,
+        routed_provider: Option<(&str, &dyn ModelProvider)>,
     ) -> Option<String> {
         // Bypass the cache when a per-turn memory preamble the key cannot see
         // will be injected downstream (see `memory_injection_active`), or when
         // hooks/tools can change the final provider request after this point.
+        let (provider_name, provider) = routed_provider.unwrap_or((
+            self.model_provider_name.as_str(),
+            self.model_provider.as_ref(),
+        ));
         if self.temperature != Some(0.0)
             || self.response_cache.is_none()
             || self.memory_injection_active()
@@ -1929,9 +1935,7 @@ impl Agent {
                 .is_some_and(|runner| !runner.is_empty())
             || !self.tools.is_empty()
             || self.activated_tools.is_some()
-            || !self
-                .model_provider
-                .has_stable_request_identity(effective_model)
+            || !provider.has_stable_request_identity(effective_model)
         {
             return None;
         }
@@ -1947,10 +1951,10 @@ impl Agent {
         let transcript = Self::encode_response_cache_transcript(messages);
         let provider_model_identity = format!(
             "provider={}:{};alias={}:{};model={}:{}",
-            self.model_provider_name.len(),
-            self.model_provider_name,
-            self.model_provider.alias().len(),
-            self.model_provider.alias(),
+            provider_name.len(),
+            provider_name,
+            provider.alias().len(),
+            provider.alias(),
             effective_model.len(),
             effective_model,
         );
@@ -4036,12 +4040,16 @@ impl Agent {
     fn try_apply_model_switch(
         &mut self,
         current_effective_model: &str,
+        routed_provider_name: Option<&str>,
         new_model_provider: String,
         new_model: String,
     ) -> Option<String> {
-        // Same-provider, same-model: nothing to do. The request is owned by
-        // the completed tool-loop scope, so there is no persistent slot to clear.
-        if new_model_provider == self.model_provider_name && new_model == current_effective_model {
+        // A turn-local provider can serve the same model name as the session
+        // provider. An explicit switch must still install the requested handle.
+        if routed_provider_name.is_none()
+            && new_model_provider == self.model_provider_name
+            && new_model == current_effective_model
+        {
             return None;
         }
 
@@ -4050,7 +4058,10 @@ impl Agent {
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             &format!(
                 "Model switch detected in turn_streamed: {} {} -> {} {}",
-                self.model_provider_name, current_effective_model, new_model_provider, new_model
+                routed_provider_name.unwrap_or(&self.model_provider_name),
+                current_effective_model,
+                new_model_provider,
+                new_model
             )
         );
 
@@ -4203,6 +4214,40 @@ impl Agent {
         Ok(TurnModelSelection {
             selector: self.model_name.clone(),
             allowed_provider_refs: None,
+        })
+    }
+
+    fn resolve_turn_route(&self, user_message: &str) -> Result<ResolvedTurnRoute> {
+        let selection = self.classify_model(user_message)?;
+        let selected_route = self.model_route_resolver.resolve(&selection.selector);
+        let mut dispatch_model = selection.selector;
+        let mut provider = None;
+        if let Some(binding) = &self.supplied_capabilities
+            && selected_route.kind == zeroclaw_providers::router::RouteResolutionKind::MatchedHint
+        {
+            let config = self.full_config().ok_or_else(|| {
+                anyhow::Error::msg("a supplied model route requires the agent's config snapshot")
+            })?;
+            let scoped_config = selection
+                .allowed_provider_refs
+                .as_deref()
+                .map(|allowed| super::loop_::effort_scoped_provider_config(config, allowed));
+            provider = Some(binding.capabilities.model_provider(
+                &crate::composition::ProviderRequest {
+                    config: scoped_config.as_deref().unwrap_or(config),
+                    agent_alias: &self.agent_alias,
+                    provider_ref: Some(&selected_route.provider_name),
+                    model: Some(&selected_route.model),
+                    principal: binding.principal.as_ref(),
+                },
+            )?);
+            dispatch_model = selected_route.model.clone();
+        }
+        Ok(ResolvedTurnRoute {
+            dispatch_model,
+            selected_route,
+            allowed_provider_refs: selection.allowed_provider_refs,
+            provider,
         })
     }
 
@@ -4418,14 +4463,19 @@ impl Agent {
         let repetition_guard =
             std::sync::Mutex::new(super::turn::repetition::RepetitionGuard::default());
 
-        let model_selection = self.classify_model(user_message)?;
-        let effective_model = model_selection.selector;
-        let attempt_allowlist = model_selection.allowed_provider_refs;
-        let selected_route = self.model_route_resolver.resolve(&effective_model);
+        let ResolvedTurnRoute {
+            dispatch_model: effective_model,
+            selected_route,
+            allowed_provider_refs: attempt_allowlist,
+            provider: routed_provider,
+        } = self.resolve_turn_route(user_message)?;
         let context_limits =
             self.context_limits_for_route(&selected_route.provider_name, &selected_route.model);
 
         let turn_id = Self::new_turn_id();
+        // This frame owns the turn id and any model-switch rounds, so it
+        // backstops the turn's elicitation hint record on every exit.
+        let _hint_scope = crate::agent::loop_::TurnHintScope::new(&turn_id);
         let turn_observer = Arc::clone(&self.observer);
         let mut guard = crate::observability::AgentTurnGuard::start(
             turn_observer.as_ref(),
@@ -4473,7 +4523,7 @@ impl Agent {
                     let (vision_provider_box, _degrade_strip_images) =
                         crate::agent::turn::vision_route::resolve_vision_provider_with_allowed_refs(
                             self.full_config(),
-                            self.model_provider.as_ref(),
+                            routed_provider.as_deref().unwrap_or(self.model_provider.as_ref()),
                             &base_provider_messages,
                             &self.multimodal_config,
                             &selected_route.provider_name,
@@ -4486,7 +4536,12 @@ impl Agent {
                         .await?;
                     let (active_provider, active_model): (&dyn ModelProvider, &str) =
                         vision_provider_box.as_ref().map_or(
-                            (self.model_provider.as_ref(), effective_model.as_str()),
+                            (
+                                routed_provider
+                                    .as_deref()
+                                    .unwrap_or(self.model_provider.as_ref()),
+                                effective_model.as_str(),
+                            ),
                             |resolved| (resolved.provider.as_ref(), resolved.model.as_str()),
                         );
                     Ok::<_, anyhow::Error>(tool_dispatcher_for_provider(
@@ -4519,7 +4574,13 @@ impl Agent {
         };
 
         let provider_messages = active_dispatcher.to_provider_messages(&self.history);
-        let cache_key = self.response_cache_key_for_messages(&provider_messages, &effective_model);
+        let cache_key = self.response_cache_key_for_messages(
+            &provider_messages,
+            &effective_model,
+            routed_provider
+                .as_deref()
+                .map(|provider| (selected_route.provider_name.as_str(), provider)),
+        );
 
         if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
             if let Ok(Some(cached)) = cache.get(key) {
@@ -4582,7 +4643,9 @@ impl Agent {
                     crate::agent::loop_::ToolLoop {
                         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                             crate::agent::loop_::ResolvedModelAccess {
-                                model_provider: self.model_provider.as_ref(),
+                                model_provider: routed_provider
+                                    .as_deref()
+                                    .unwrap_or(self.model_provider.as_ref()),
                                 provider_name: &selected_route.provider_name,
                                 model: &selected_route.model,
                                 dispatch_model: &effective_model,
@@ -4970,17 +5033,23 @@ impl Agent {
         // `effective_model` is `mut` so a `model_switch` requested mid-turn
         // (handled in the round loop's `ModelSwitchRequested` arm via
         // `try_apply_model_switch`) can rebind it for later rounds
-        let model_selection =
-            self.classify_model(user_message)
-                .map_err(|error| StreamedTurnError {
-                    error,
-                    committed_response: String::new(),
-                    new_messages: Vec::new(),
-                })?;
-        let mut effective_model = model_selection.selector;
-        let attempt_allowlist = model_selection.allowed_provider_refs;
-        let mut selected_route = self.model_route_resolver.resolve(&effective_model);
+        let ResolvedTurnRoute {
+            dispatch_model: mut effective_model,
+            mut selected_route,
+            allowed_provider_refs: attempt_allowlist,
+            provider: mut routed_provider,
+        } = self
+            .resolve_turn_route(user_message)
+            .map_err(|error| StreamedTurnError {
+                error,
+                committed_response: String::new(),
+                new_messages: Vec::new(),
+            })?;
         let turn_id = Self::new_turn_id();
+        // This frame owns the turn id and the model-switch round loop, so it
+        // backstops the turn's elicitation hint record on every exit — a
+        // switch round that fails to rebuild its provider included.
+        let _hint_scope = crate::agent::loop_::TurnHintScope::new(&turn_id);
         let mut committed_response = String::new();
         // Requested-vs-served divergence for THIS turn. Source of truth is the
         // task-local record inside `zeroclaw_providers::reliable`, consumed
@@ -5009,7 +5078,7 @@ impl Agent {
                     let (vision_provider_box, _degrade_strip_images) =
                         crate::agent::turn::vision_route::resolve_vision_provider_with_allowed_refs(
                             self.full_config(),
-                            self.model_provider.as_ref(),
+                            routed_provider.as_deref().unwrap_or(self.model_provider.as_ref()),
                             &base_provider_messages,
                             &self.multimodal_config,
                             &selected_route.provider_name,
@@ -5022,7 +5091,12 @@ impl Agent {
                         .await?;
                     let (active_provider, active_model): (&dyn ModelProvider, &str) =
                         vision_provider_box.as_ref().map_or(
-                            (self.model_provider.as_ref(), effective_model.as_str()),
+                            (
+                                routed_provider
+                                    .as_deref()
+                                    .unwrap_or(self.model_provider.as_ref()),
+                                effective_model.as_str(),
+                            ),
                             |resolved| (resolved.provider.as_ref(), resolved.model.as_str()),
                         );
                     Ok::<_, anyhow::Error>(tool_dispatcher_for_provider(
@@ -5070,7 +5144,13 @@ impl Agent {
         };
 
         let provider_messages = active_dispatcher.to_provider_messages(&self.history);
-        let cache_key = self.response_cache_key_for_messages(&provider_messages, &effective_model);
+        let cache_key = self.response_cache_key_for_messages(
+            &provider_messages,
+            &effective_model,
+            routed_provider
+                .as_deref()
+                .map(|provider| (selected_route.provider_name.as_str(), provider)),
+        );
 
         if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
             if let Ok(Some(cached)) = cache.get(key) {
@@ -5227,7 +5307,9 @@ impl Agent {
                         crate::agent::loop_::ToolLoop {
                             exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                                 crate::agent::loop_::ResolvedModelAccess {
-                                    model_provider: self.model_provider.as_ref(),
+                                    model_provider: routed_provider
+                                        .as_deref()
+                                        .unwrap_or(self.model_provider.as_ref()),
                                     provider_name: &selected_route.provider_name,
                                     model: &selected_route.model,
                                     dispatch_model: &effective_model,
@@ -5614,6 +5696,9 @@ impl Agent {
                         crate::agent::loop_::is_model_switch_requested(&error)
                         && let Some(new_effective_model) = self.try_apply_model_switch(
                             &effective_model,
+                            routed_provider
+                                .as_ref()
+                                .map(|_| selected_route.provider_name.as_str()),
                             new_model_provider,
                             new_model,
                         )
@@ -5639,6 +5724,8 @@ impl Agent {
                         }
                         let notice = self.trim_history(Some(&turn_id));
                         forward_history_trim_notice(&event_tx, notice).await;
+                        // Later rounds use the newly installed session provider.
+                        routed_provider = None;
                         effective_model = new_effective_model;
                         selected_route = self.model_route_resolver.resolve(&effective_model);
                         continue;
@@ -13981,8 +14068,9 @@ mod tests {
 
     #[test]
     fn session_cwd_keeps_workspace_in_allowed_roots() {
-        let workspace = std::env::temp_dir().join("zeroclaw_test_session_cwd_workspace");
-        let session = std::env::temp_dir().join("zeroclaw_test_session_cwd_session");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let session = tmp.path().join("session");
         let _ = std::fs::create_dir_all(&workspace);
         let _ = std::fs::create_dir_all(&session);
 
@@ -16763,6 +16851,22 @@ mod tests {
 
         let mut agent_a = build("work", "answer-a", seen_a.clone(), cache.clone());
         let mut agent_b = build("personal", "answer-b", seen_b.clone(), cache);
+        let messages = [ChatMessage::user("same request")];
+        let supplied_target = Some((
+            agent_b.model_provider_name.as_str(),
+            agent_b.model_provider.as_ref(),
+        ));
+        let routed_key =
+            agent_a.response_cache_key_for_messages(&messages, "shared-model", supplied_target);
+        assert!(routed_key.is_some());
+        assert_eq!(
+            routed_key,
+            agent_b.response_cache_key_for_messages(&messages, "shared-model", None)
+        );
+        assert_ne!(
+            routed_key,
+            agent_a.response_cache_key_for_messages(&messages, "shared-model", None)
+        );
         assert_eq!(agent_a.turn("same request").await.unwrap(), "answer-a");
         assert_eq!(agent_b.turn("same request").await.unwrap(), "answer-b");
         assert_eq!(seen_a.lock().len(), 1);
@@ -17794,7 +17898,7 @@ mod tests {
             ChatMessage::system("system prompt"),
             ChatMessage::user("hello"),
         ];
-        let key = agent.response_cache_key_for_messages(&plain_messages, "test-model");
+        let key = agent.response_cache_key_for_messages(&plain_messages, "test-model", None);
         assert!(key.is_some(), "plain text prompt must produce a cache key");
 
         let structurally_distinct_a = vec![
@@ -17806,15 +17910,15 @@ mod tests {
             ChatMessage::user("b"),
         ];
         assert_ne!(
-            agent.response_cache_key_for_messages(&structurally_distinct_a, "test-model"),
-            agent.response_cache_key_for_messages(&structurally_distinct_b, "test-model"),
+            agent.response_cache_key_for_messages(&structurally_distinct_a, "test-model", None),
+            agent.response_cache_key_for_messages(&structurally_distinct_b, "test-model", None),
             "structurally distinct provider requests must not share a cache key"
         );
 
         let mut activated = crate::tools::ActivatedToolSet::new();
         activated.activate("echo".into(), Arc::new(MockTool));
         agent.activated_tools = Some(Arc::new(std::sync::Mutex::new(activated)));
-        let key = agent.response_cache_key_for_messages(&plain_messages, "test-model");
+        let key = agent.response_cache_key_for_messages(&plain_messages, "test-model", None);
         assert!(
             key.is_none(),
             "an activated deferred tool can advertise a schema and must bypass response caching"
@@ -17822,7 +17926,7 @@ mod tests {
         agent.activated_tools = None;
 
         agent.hook_runner = Some(Arc::new(crate::hooks::HookRunner::new()));
-        let key = agent.response_cache_key_for_messages(&plain_messages, "test-model");
+        let key = agent.response_cache_key_for_messages(&plain_messages, "test-model", None);
         assert!(
             key.is_some(),
             "an empty hook runner cannot change the request and must preserve cache eligibility"
@@ -17834,7 +17938,7 @@ mod tests {
             ChatMessage::system("system prompt"),
             ChatMessage::user("describe this image [IMAGE:/tmp/photo.png]"),
         ];
-        let key = agent.response_cache_key_for_messages(&multimodal_messages, "test-model");
+        let key = agent.response_cache_key_for_messages(&multimodal_messages, "test-model", None);
         assert!(
             key.is_none(),
             "multimodal prompt with [IMAGE:] marker must skip response cache"
@@ -21848,6 +21952,7 @@ model_provider = "custom.only"
 
         let switched = agent.try_apply_model_switch(
             "large-v1",
+            None,
             "custom.large".to_string(),
             "large-v2".to_string(),
         );
@@ -21984,6 +22089,7 @@ model_provider = "custom.only"
         let mut agent = build_test_agent("openai", "gpt-4o-mini", None);
         let result = agent.try_apply_model_switch(
             "gpt-4o-mini",
+            None,
             "openai".to_string(),
             "gpt-4o-mini".to_string(),
         );
@@ -21996,6 +22102,7 @@ model_provider = "custom.only"
         let mut agent = build_test_agent("openai", "gpt-4o-mini", None);
         let result = agent.try_apply_model_switch(
             "gpt-4o-mini",
+            None,
             "anthropic".to_string(),
             "claude-haiku".to_string(),
         );
@@ -22115,6 +22222,7 @@ model_provider = "custom.only"
 
         let switched = agent.try_apply_model_switch(
             "current-model",
+            None,
             "hailo_ollama.edge".to_string(),
             "edge-model".to_string(),
         );
@@ -22144,8 +22252,12 @@ model_provider = "custom.only"
         };
 
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
-        let result =
-            agent.try_apply_model_switch("gpt-4o-mini", "ollama".to_string(), "llama3".to_string());
+        let result = agent.try_apply_model_switch(
+            "gpt-4o-mini",
+            None,
+            "ollama".to_string(),
+            "llama3".to_string(),
+        );
 
         assert_eq!(
             result.as_deref(),
@@ -22206,6 +22318,7 @@ model_provider = "custom.only"
         // Apply in-turn switch
         let result = agent.try_apply_model_switch(
             "gpt-4o-mini",
+            None,
             "ollama.provider-b".to_string(),
             "llama3".to_string(),
         );
@@ -22237,6 +22350,7 @@ model_provider = "custom.only"
         let mut agent = build_test_agent("openai", "shared-name", Some(switch_cfg));
         let result = agent.try_apply_model_switch(
             "shared-name",
+            None,
             "ollama".to_string(),
             "shared-name".to_string(),
         );
@@ -22312,8 +22426,12 @@ model_provider = "custom.only"
         }));
 
         assert_eq!(agent.context_limits().context_token_budget, 180_000);
-        let switched =
-            agent.try_apply_model_switch("large", "ollama.small".to_string(), "small".to_string());
+        let switched = agent.try_apply_model_switch(
+            "large",
+            None,
+            "ollama.small".to_string(),
+            "small".to_string(),
+        );
 
         assert_eq!(switched.as_deref(), Some("small"));
         let selected = agent.model_route_resolver.resolve("small");
@@ -22353,6 +22471,7 @@ model_provider = "custom.only"
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
         let result = agent.try_apply_model_switch(
             "gpt-4o-mini",
+            None,
             "ollama".to_string(),
             "tinyllama".to_string(),
         );
@@ -24214,6 +24333,151 @@ mod capability_construction_tests {
     }
 
     #[tokio::test]
+    async fn supplied_effort_route_selects_the_provider_and_model_for_both_turn_paths() {
+        use crate::composition::{ProviderRequest, ProviderSource};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use zeroclaw_config::schema::{ModelRouteConfig, RuntimeProfileConfig};
+
+        struct EchoProvider(String);
+        impl Attributable for EchoProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                crate::composition::test_support::StubProvider.role()
+            }
+            fn alias(&self) -> &str {
+                &self.0
+            }
+        }
+        #[async_trait]
+        impl ModelProvider for EchoProvider {
+            async fn chat_with_system(
+                &self,
+                _system: Option<&str>,
+                _message: &str,
+                model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<String> {
+                Ok(format!("{} served {model}", self.0))
+            }
+        }
+        struct RouteSource {
+            principal: PrincipalId,
+            routed_requests: AtomicUsize,
+        }
+        impl ProviderSource for RouteSource {
+            fn model_provider(
+                &self,
+                request: &ProviderRequest<'_>,
+            ) -> Result<Arc<dyn ModelProvider>> {
+                let reference = request.provider_ref.unwrap_or("default");
+                if reference != "default" {
+                    self.routed_requests.fetch_add(1, Ordering::Relaxed);
+                    assert_eq!(reference, "openai.smart");
+                    assert_eq!(request.model, Some("local-model"));
+                    assert_eq!(request.agent_alias, "test-agent");
+                    assert_eq!(request.principal, Some(&self.principal));
+                    assert!(
+                        request
+                            .config
+                            .providers
+                            .models
+                            .find("openai", "fast")
+                            .is_none()
+                    );
+                    assert!(
+                        request
+                            .config
+                            .model_routes
+                            .iter()
+                            .all(|route| route.model_provider == "openai.smart")
+                    );
+                }
+                Ok(Arc::new(EchoProvider(reference.into())))
+            }
+
+            fn switched_model_provider(
+                &self,
+                request: &ProviderRequest<'_>,
+            ) -> Result<Arc<dyn ModelProvider>> {
+                assert_eq!(request.provider_ref, Some("openai.fast"));
+                assert_eq!(request.model, Some("local-model"));
+                assert_eq!(request.principal, Some(&self.principal));
+                Ok(Arc::new(EchoProvider("switched".into())))
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = two_provider_config(&tmp);
+        config.model_routes = vec![
+            ModelRouteConfig {
+                hint: "local".into(),
+                model_provider: "openai.smart".into(),
+                model: "local-model".into(),
+                api_key: None,
+            },
+            ModelRouteConfig {
+                hint: "cloud".into(),
+                model_provider: "openai.fast".into(),
+                model: "cloud-model".into(),
+                api_key: None,
+            },
+        ];
+        config.runtime_profiles.insert(
+            "effort".into(),
+            RuntimeProfileConfig {
+                effort_routing: Some(zeroclaw_config::scattered_types::EffortRoutingConfig {
+                    local_hint: "local".into(),
+                    cloud_hint: "cloud".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        config.agents.get_mut("test-agent").unwrap().runtime_profile = "effort".into();
+        let principal = PrincipalId::for_oidc("https://issuer.example", "subject-1");
+        let source = Arc::new(RouteSource {
+            principal: principal.clone(),
+            routed_requests: AtomicUsize::new(0),
+        });
+        let caps = RuntimeCapabilities {
+            providers: source.clone(),
+            ..capabilities(
+                Arc::new(RecordingProviders::default()),
+                Arc::new(RecordingMemory::default()),
+            )
+        };
+        let mut agent =
+            Agent::from_config_with_capabilities(&config, "test-agent", &caps, Some(&principal))
+                .await
+                .unwrap();
+        assert_eq!(
+            agent.turn("hello").await.unwrap(),
+            "openai.smart served local-model"
+        );
+        assert_eq!(source.routed_requests.load(Ordering::Relaxed), 1);
+        let (tx, _events) = tokio::sync::mpsc::channel(256);
+        let (reply, _) = agent.turn_streamed("hello", tx, None).await.unwrap();
+        assert_eq!(reply, "openai.smart served local-model");
+        assert_eq!(source.routed_requests.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            agent.model_provider.alias(),
+            "default",
+            "the session provider remains available for later default turns"
+        );
+        // The route and the requested switch may use the same model string on
+        // different provider profiles. This still rebuilds the session handle.
+        assert_eq!(
+            agent.try_apply_model_switch(
+                "local-model",
+                Some("openai.smart"),
+                "openai.fast".into(),
+                "local-model".into()
+            ),
+            Some("local-model".into())
+        );
+        assert_eq!(agent.model_provider.alias(), "switched");
+    }
+
+    #[tokio::test]
     async fn a_capability_built_agent_passes_its_principal_to_the_provider_source() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = two_provider_config(&tmp);
@@ -24252,8 +24516,12 @@ mod capability_construction_tests {
 
         // A model switch asks the same source through its switch entry, still
         // for the same principal.
-        let switched =
-            agent.try_apply_model_switch("gpt-4o-mini", "openai.smart".into(), "gpt-4o".into());
+        let switched = agent.try_apply_model_switch(
+            "gpt-4o-mini",
+            None,
+            "openai.smart".into(),
+            "gpt-4o".into(),
+        );
         assert_eq!(switched.as_deref(), Some("gpt-4o"));
         assert_eq!(
             *providers.switches.lock(),
@@ -24427,6 +24695,7 @@ mod capability_construction_tests {
         for agent in [&mut supplied, &mut adapter] {
             let switched = agent.try_apply_model_switch(
                 "gpt-4o-mini",
+                None,
                 "ollama".to_string(),
                 "tinyllama".to_string(),
             );
@@ -24601,8 +24870,12 @@ mod capability_construction_tests {
         );
         agent.sync_config_generation();
 
-        let switched =
-            agent.try_apply_model_switch("gpt-4o-mini", "openai.smart".into(), "gpt-4.1".into());
+        let switched = agent.try_apply_model_switch(
+            "gpt-4o-mini",
+            None,
+            "openai.smart".into(),
+            "gpt-4.1".into(),
+        );
         assert_eq!(switched.as_deref(), Some("gpt-4.1"));
         assert_eq!(
             *providers.switch_target_models.lock(),

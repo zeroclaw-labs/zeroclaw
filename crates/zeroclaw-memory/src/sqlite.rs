@@ -1095,11 +1095,28 @@ impl SqliteMemory {
                 .collect());
         }
 
-        // Compute query embedding only when needed (skip for BM25-only mode)
-        let query_embedding = if self.search_mode == SearchMode::Bm25 {
-            None
-        } else {
-            self.get_or_compute_embedding(query).await?
+        // Compute query embedding only when needed (skip for BM25-only mode).
+        // In hybrid mode a failing embedder costs the vector stage, not the
+        // keyword results: recall carries on as BM25-only, the same path a
+        // deployment without an embedder takes.
+        let query_embedding = match self.search_mode {
+            SearchMode::Bm25 => None,
+            SearchMode::Embedding => self.get_or_compute_embedding(query).await?,
+            SearchMode::Hybrid => match self.get_or_compute_embedding(query).await {
+                Ok(embedding) => embedding,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{e}"),
+                            })),
+                        "memory recall: query embedding failed; using keyword results only"
+                    );
+                    None
+                }
+            },
         };
 
         let conn = self.conn.clone();
@@ -1368,11 +1385,22 @@ impl SqliteMemory {
                         let _ = write!(agent_conditions, " AND m.agent_id IN ({agent_placeholders})");
                         param_idx += agent_filter.len();
                     }
+                    // Match the fallback's strict session semantics before LIMIT:
+                    // Some(session) excludes NULL/other sessions; None is unscoped.
+                    // Filtering after LIMIT lets newer foreign-session rows starve
+                    // eligible matches, even when prompt autosaves are excluded.
+                    let session_conditions = if session_ref.is_some() {
+                        let condition = format!(" AND m.session_id = ?{param_idx}");
+                        param_idx += 1;
+                        condition
+                    } else {
+                        String::new()
+                    };
                     let prompt_conditions = if prompt_only { Self::prompt_key_filter("m.") } else { String::new() };
                     let sql = format!(
                         "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id
                          FROM memories m LEFT JOIN agents a ON a.id = m.agent_id
-                         WHERE m.superseded_by IS NULL AND m.principal_id IS NULL AND ({where_clause}){time_conditions}{agent_conditions}{prompt_conditions}
+                         WHERE m.superseded_by IS NULL AND m.principal_id IS NULL AND ({where_clause}){time_conditions}{agent_conditions}{session_conditions}{prompt_conditions}
                          ORDER BY m.updated_at DESC
                          LIMIT ?{param_idx}"
                     );
@@ -1392,6 +1420,9 @@ impl SqliteMemory {
                         for agent_id in agent_filter {
                             param_values.push(Box::new(agent_id.clone()));
                         }
+                    }
+                    if let Some(sid) = session_ref {
+                        param_values.push(Box::new(sid.to_string()));
                     }
                     #[allow(clippy::cast_possible_wrap)]
                     param_values.push(Box::new(sql_limit as i64));
@@ -4174,6 +4205,57 @@ mod tests {
         assert_eq!(entry.content, "this content must be retained");
     }
 
+    #[tokio::test]
+    async fn hybrid_recall_keeps_keyword_results_when_embedding_fails() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(FailingEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::Hybrid,
+        )
+        .unwrap();
+        mem.store(
+            "budget",
+            "the quarterly budget review is on Friday",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let hits = mem
+            .recall("budget review", 5, None, None, None)
+            .await
+            .expect("recall must not fail when only the embedder does");
+        assert!(
+            hits.iter().any(|entry| entry.key == "budget"),
+            "keyword match must survive an embedder failure: {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn embedding_only_recall_still_reports_an_embedder_failure() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(FailingEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::Embedding,
+        )
+        .unwrap();
+
+        assert!(mem.recall("anything", 5, None, None, None).await.is_err());
+    }
+
     // ── Embedder hot-swap────────────────────────────────
 
     /// A working embedder double that returns a fixed-length vector (each
@@ -6627,5 +6709,127 @@ mod tests {
                 "list() must yield a deterministic order across reads"
             );
         }
+    }
+    #[tokio::test]
+    async fn like_fallback_filters_session_before_limit_preserving_unscoped_archive() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(FailingEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::Hybrid,
+        )
+        .unwrap();
+        let own = mem.ensure_agent_uuid("own").await.unwrap();
+        let other = mem.ensure_agent_uuid("other").await.unwrap();
+        let session = Some("wanted");
+        for (key, sid, agent) in [
+            ("fact", session, &own),
+            ("user_msg_raw", session, &own),
+            ("wrong_session", Some("foreign"), &own),
+            ("null_session", None, &own),
+            ("other_agent", session, &other),
+        ] {
+            mem.store_with_agent(
+                key,
+                "orchid prefers shade",
+                MemoryCategory::Core,
+                sid,
+                None,
+                None,
+                Some(agent),
+            )
+            .await
+            .unwrap();
+        }
+        mem.store_for_principal(
+            &PrincipalScope::new("user:alice"),
+            "private_fact",
+            "orchid private",
+            MemoryCategory::Core,
+            session,
+        )
+        .await
+        .unwrap();
+        // Deterministic ordering: both foreign/NULL session rows are newer.
+        {
+            let conn = mem.conn.lock();
+            for (key, timestamp) in [
+                ("fact", "2026-01-01T00:00:00+00:00"),
+                ("user_msg_raw", "2026-01-02T00:00:00+00:00"),
+                ("wrong_session", "2026-01-03T00:00:00+00:00"),
+                ("null_session", "2026-01-04T00:00:00+00:00"),
+                ("other_agent", "2026-01-05T00:00:00+00:00"),
+            ] {
+                conn.execute(
+                    "UPDATE memories SET created_at=?1, updated_at=?1 WHERE key=?2",
+                    params![timestamp, key],
+                )
+                .unwrap();
+            }
+        }
+        // Substring is not an FTS token: force LIKE after the embedding error.
+        let prompt = mem
+            .recall_for_prompt_for_agents(&[&own], "rch", 1, session)
+            .await
+            .unwrap();
+        assert_eq!(prompt.len(), 1);
+        assert_eq!(prompt[0].key, "fact");
+        assert_eq!(prompt[0].session_id.as_deref(), session);
+        assert_eq!(prompt[0].agent_id.as_deref(), Some(own.as_str()));
+        assert!(prompt[0].principal_id.is_none());
+        // Archival reads still include autosaves, but cannot lose the scoped row.
+        let archive = mem
+            .recall_for_agents(&[&own], "rch", 1, session, None, None)
+            .await
+            .unwrap();
+        assert_eq!(archive.len(), 1);
+        assert_eq!(archive[0].key, "user_msg_raw");
+        let all = mem
+            .recall_for_agents(&[&own], "rch", 10, session, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            all.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
+            vec!["user_msg_raw", "fact"]
+        );
+        // None remains unscoped, not IS NULL and not an implicit default session.
+        let unscoped = mem
+            .recall_for_prompt_for_agents(&[&own], "rch", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            unscoped.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
+            vec!["null_session", "wrong_session", "fact"]
+        );
+        let top = mem
+            .recall_for_prompt_for_agents(&[&own], "rch", 1, None)
+            .await
+            .unwrap();
+        assert_eq!(top[0].key, "null_session");
+        assert!(
+            mem.recall_for_prompt_for_agents(&[&own], "rch", 1, Some("missing"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Parameter ordering stays correct with time + agent + session filters.
+        let window = mem
+            .recall_for_agents(
+                &[&own],
+                "rch",
+                1,
+                session,
+                Some("2026-01-01T00:00:00+00:00"),
+                Some("2026-01-01T23:59:59+00:00"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(window.len(), 1);
+        assert_eq!(window[0].key, "fact");
     }
 }
