@@ -199,7 +199,7 @@ Parser behavior:
 - `- prompt:` sets the approval-gate notice template.
 - `- policy:` names an approval-broker policy in `[sop.approval].policies`; the policy gates approval through required-group membership and quorum. An absent policy fails closed rather than clearing on a single approval, while omission leaves the gate unpoliced.
 - `- edit:` opts a checkpoint into editing the named field before resume.
-- `- decide:` makes the step a conditional part: a yes/no question the SOP's `[decision]` model answers about the triggering event when the run starts. The step runs only on yes; on no it is recorded as skipped and the run continues. If the model cannot answer, the step runs.
+- `- decide:` makes the step a conditional part: a yes/no question the SOP's `[decision]` model answers about the triggering event when the run starts. The step runs only on yes; on no it is recorded as skipped and the run continues. If the model cannot answer, or its gate or mode answer is unusable, the step runs.
 - `- unless_decided: N` skips the step when step N's `decide` question was answered yes, so one decision can switch between alternative sets of steps.
 - Unrecognized sub-bullets and other non-empty continuation lines are appended to the step body.
 <!-- >>> end generated:sop-parser-behavior <<< -->
@@ -413,6 +413,11 @@ The `[sop]` config also controls whether run state survives a daemon restart:
 restart (`build_sop_engine` falls back to an in-memory store with a loud log if
 the durable backend cannot open, so this is default-safe); `persist_runs = false`
 is the documented opt-out for an ephemeral engine.
+
+**Mixed-version upgrades.** Opening an existing `runs.db` with the updated
+SQLite store installs a trigger and preserves the run history. From then on,
+an older daemon or CLI sharing the file receives a SQLite constraint error if
+it tries to mark a finished run active again. The run stays terminal.
 
 ## 4. Trigger Types
 
