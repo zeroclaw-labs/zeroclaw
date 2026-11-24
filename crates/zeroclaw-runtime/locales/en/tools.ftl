@@ -16,7 +16,7 @@ tool-browser-delegate = Delegate browser-based tasks to a browser-capable CLI fo
 tool-browser-open = Open an approved HTTPS URL in the system browser. Security constraints: allowlist-only domains, no local/private hosts, no scraping.
 
 tool-canvas-snapshot-empty = Canvas '{ $canvas_id }' has no content: it was never rendered or has been cleared, so nothing is displayed. Render it again to show something.
-tool-canvas-render-not-saved = Canvas '{ $canvas_id }' shows this content now, but it could not be saved, so it will not come back after a restart.
+tool-canvas-render-not-saved = Canvas '{ $canvas_id }' shows content that could not be saved, so after a restart it may be empty or show older content.
 tool-canvas-clear-not-saved = Canvas '{ $canvas_id }' is empty now, but its saved copy could not be removed, so the old content may come back after a restart.
 
 tool-channel-room = Create rooms and invite users through an active channel. Provide a channel key such as 'matrix.default', action 'create_room' or 'invite_user', and the action-specific room fields.

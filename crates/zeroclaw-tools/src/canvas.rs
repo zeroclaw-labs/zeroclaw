@@ -673,17 +673,29 @@ impl Tool for CanvasTool {
                 };
 
                 // Push a special eval frame so connected clients know to evaluate it.
+                // An eval saves nothing itself, but it reports whether the content the
+                // canvas shows was saved, so a failure is not forgotten after the turn
+                // that rendered it.
                 match self.store.render(canvas_id, "eval", expression) {
-                    Some(Rendered { frame, .. }) => Ok(ToolResult {
-                        success: true,
-                        output: format!(
+                    Some(Rendered { frame, save_failed }) => {
+                        let mut output = format!(
                             "Eval request sent to canvas '{}' (frame: {}). \
                              Result will be available to connected viewers.",
                             canvas_id, frame.frame_id
-                        )
-                        .into(),
-                        error: None,
-                    }),
+                        );
+                        if save_failed {
+                            output.push('\n');
+                            output.push_str(&crate::i18n::get_required_tool_string_with_args(
+                                "tool-canvas-render-not-saved",
+                                &[("canvas_id", canvas_id)],
+                            ));
+                        }
+                        Ok(ToolResult {
+                            success: true,
+                            output: output.into(),
+                            error: None,
+                        })
+                    }
                     None => Ok(ToolResult {
                         success: false,
                         output: ToolOutput::default(),
@@ -1309,7 +1321,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_tool_reports_a_render_and_clear_that_were_not_saved() {
+    async fn canvas_tool_reports_a_render_eval_and_clear_that_were_not_saved() {
         let dir = tempfile::tempdir().unwrap();
         let store = CanvasStore::persistent(dir.path());
         let tool = CanvasTool::new(store);
@@ -1321,6 +1333,22 @@ mod tests {
             .unwrap();
         assert!(rendered.success, "the canvas shows the content");
         assert!(rendered.output.contains("could not be saved"));
+        assert!(
+            rendered.output.contains("older content"),
+            "an old saved copy may survive a failed save"
+        );
+
+        let eval = tool
+            .execute(
+                json!({"action": "eval", "canvas_id": "report", "expression": "document.title"}),
+            )
+            .await
+            .unwrap();
+        assert!(eval.success);
+        assert!(
+            eval.output.contains("could not be saved"),
+            "a later eval still reports the unsaved content"
+        );
 
         let cleared = tool
             .execute(json!({"action": "clear", "canvas_id": "report"}))
@@ -1339,6 +1367,11 @@ mod tests {
             .await
             .unwrap();
         assert!(!rendered.output.contains("restart"));
+        let eval = tool
+            .execute(json!({"action": "eval", "canvas_id": "report", "expression": "1"}))
+            .await
+            .unwrap();
+        assert!(!eval.output.contains("restart"));
         let cleared = tool
             .execute(json!({"action": "clear", "canvas_id": "report"}))
             .await
