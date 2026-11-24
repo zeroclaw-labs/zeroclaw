@@ -22,7 +22,7 @@ function visibleText(
     case 'inlineCode':
       return node.value ?? '';
     case 'html':
-      return (node.value ?? '').replace(/<!--[\s\S]*?-->|<\/?[a-z][\w:-]*(?=[\s/>])(?:[^"'<>]|"[^"]*"|'[^']*')*>/gi, '');
+      return (node.value ?? '').replace(/<!--[\s\S]*?-->|<\/?[a-z][\w:-]*(?=[\s/>])(?:[^"'<>]|"[^"]*"|'[^']*')*>/gi, (tag) => /^<\/?(?:br|hr|p|div|li|tr|td|th|section|article|blockquote|h[1-6])(?=[\s/>])/i.test(tag) ? ' ' : '');
     case 'code':
       return '\n' + (node.value ?? '') + '\n';
     case 'image':
