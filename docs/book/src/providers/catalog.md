@@ -622,6 +622,18 @@ To bridge an existing `CHEAPER_INFERENCE_API_KEY` shell variable into
 ZeroClaw's schema-mirror env surface, set
 `ZEROCLAW_providers__models__cheaperinference__default__api_key="$CHEAPER_INFERENCE_API_KEY"`.
 
+**Obscurify.ai**: slot `obscurify`. OpenAI-compatible endpoint
+`https://obscurify.ai/v1` with bearer-token auth.
+`GET https://obscurify.ai/v1/models` lists model IDs with context lengths
+without a key. Key from the account page at
+[obscurify.ai](https://obscurify.ai).
+
+```toml
+[providers.models.obscurify.default]
+model = "z-ai/glm-5.3"
+api_key = "..."
+```
+
 > Credentials come only from config (`api_key`) or the `--credential` override at run
 > time, these slots do **not** read a per-provider `*_API_KEY` environment variable.
 

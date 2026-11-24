@@ -578,15 +578,16 @@ use zeroclaw_config::schema::{
     ManifestModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
     MoonshotEndpoint, MoonshotModelProviderConfig, MorphModelProviderConfig,
     NearaiModelProviderConfig, NebiusModelProviderConfig, NovitaModelProviderConfig,
-    NscaleModelProviderConfig, NvidiaModelProviderConfig, OllamaModelProviderConfig,
-    OpenAIModelProviderConfig, OpenRouterModelProviderConfig, OpencodeModelProviderConfig,
-    OsaurusModelProviderConfig, OvhModelProviderConfig, PerplexityModelProviderConfig,
-    QianfanModelProviderConfig, QwenModelProviderConfig, RekaModelProviderConfig,
-    SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
-    StepfunModelProviderConfig, SyntheticModelProviderConfig, TelnyxModelProviderConfig,
-    TogetherModelProviderConfig, UpstageModelProviderConfig, VeniceModelProviderConfig,
-    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
-    YiModelProviderConfig, ZaiModelProviderConfig, ZerorouterModelProviderConfig,
+    NscaleModelProviderConfig, NvidiaModelProviderConfig, ObscurifyModelProviderConfig,
+    OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
+    OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
+    PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
+    RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
+    SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
+    TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
+    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
+    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    ZerorouterModelProviderConfig,
 };
 
 #[must_use]
@@ -667,6 +668,13 @@ impl CompatFamilySpec for CheaperInferenceModelProviderConfig {
     const DEFAULT_URL: &'static str =
         zeroclaw_config::schema::CheaperInferenceEndpoint::DEFAULT_URI;
     const AUTH: AuthStyle = AuthStyle::Bearer;
+}
+impl CompatFamilySpec for ObscurifyModelProviderConfig {
+    const DISPLAY: &'static str = "Obscurify.ai";
+    const DEFAULT_URL: &'static str = zeroclaw_config::schema::ObscurifyEndpoint::DEFAULT_URI;
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+    // `GET /v1/models` is served without a key.
+    const PUBLIC_MODEL_LISTING: bool = true;
 }
 impl CompatFamilySpec for ZerorouterModelProviderConfig {
     const DISPLAY: &'static str = "ZeroRouter";
@@ -2643,6 +2651,21 @@ mod tests {
         assert_eq!(
             get_default_url("atlascloud"),
             Some("https://api.atlascloud.ai/v1")
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn obscurify_default_url_matches_schema_endpoint() {
+        use zeroclaw_config::schema::{ModelEndpoint, ObscurifyEndpoint};
+        assert_eq!(
+            <ObscurifyModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+            ObscurifyEndpoint::default().uri(),
+            "schema ObscurifyEndpoint and factory DEFAULT_URL disagree"
+        );
+        assert_eq!(
+            get_default_url("obscurify"),
+            Some("https://obscurify.ai/v1")
         );
     }
 
