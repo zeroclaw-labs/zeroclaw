@@ -58,6 +58,20 @@ expect_pass() {
 printf '// tracking #8519 for the upgrade\n' > a.rs
 expect_fail "rust issue ref" a.rs "issue/PR refs"
 
+cat > a.rs <<'RS'
+pub fn keep<'a>( // '#8519
+    _value: &'a str,
+) {}
+RS
+expect_fail "rust lifetime does not swallow a line comment" a.rs "issue/PR refs"
+
+cat > a.rs <<'RS'
+pub fn keep<'a>(
+    _value: &'a/*#8519'*/ str,
+) {}
+RS
+expect_fail "rust lifetime does not swallow a block comment" a.rs "issue/PR refs"
+
 printf '# See #1234 for details\n' > a.toml
 expect_fail "top-level toml hash comment issue ref" a.toml "issue/PR refs"
 
@@ -146,6 +160,15 @@ expect_fail "color-related prose does not hide an issue ref" a.rs "issue/PR refs
 
 printf 'assert!(ok, "regression #6156 must stay fixed");\n' > b.rs
 expect_pass "issue ref inside rust string literal" b.rs
+
+cat > b.rs <<'RS'
+pub fn characters() {
+    let _ = ['/', '\'', '\\', '\n', '\u{1_f600}'];
+    let _ = b'\x2f';
+    let _ = "#8519 stays inside a string";
+}
+RS
+expect_pass "rust character literals remain distinct from comments" b.rs
 
 printf '// boundary check\nlet m = format!("see #{n}");\n' > b.rs
 expect_pass "string literal beside an unrelated comment" b.rs
