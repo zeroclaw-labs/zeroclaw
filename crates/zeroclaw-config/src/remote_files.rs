@@ -536,6 +536,8 @@ pub struct WebDavResourceConfig {
     pub alias: String,
     pub root: String,
     pub credential_alias: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_endpoint_ip: Option<std::net::IpAddr>,
 }
 
 #[derive(Debug, Eq, PartialEq, thiserror::Error)]
@@ -561,9 +563,14 @@ pub struct WebDavCatalog {
 pub struct WebDavResource {
     root: url::Url,
     credential_alias: String,
+    private_endpoint_ip: Option<std::net::IpAddr>,
 }
 
 impl WebDavResource {
+    pub fn private_endpoint_ip(&self) -> Option<std::net::IpAddr> {
+        self.private_endpoint_ip
+    }
+
     pub fn root(&self) -> &url::Url {
         &self.root
     }
@@ -597,6 +604,7 @@ impl WebDavCatalog {
             let entry = WebDavResource {
                 root,
                 credential_alias: resource.credential_alias,
+                private_endpoint_ip: resource.private_endpoint_ip,
             };
             if catalog.resources.insert(key, entry).is_some() {
                 return Err(WebDavCatalogError::DuplicateAlias);
@@ -651,6 +659,7 @@ mod tests {
             alias: alias.into(),
             root: root.into(),
             credential_alias: "SHARED_LOGIN".into(),
+            private_endpoint_ip: None,
         };
         let catalog = WebDavCatalog::from_resources(vec![
             make("ORIGIN", "https://first.test/dav/"),

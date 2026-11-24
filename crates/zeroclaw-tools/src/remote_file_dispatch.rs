@@ -21,6 +21,7 @@ pub struct WebDavNetworkPolicy<'a> {
     pub proxy: &'a ProxyConfig,
     pub nat64_prefixes: &'a [Nat64Prefix],
     pub allow_private_endpoint: bool,
+    pub private_endpoint_ip: Option<std::net::IpAddr>,
 }
 
 impl WebDavNetworkPolicy<'_> {
@@ -59,6 +60,12 @@ impl WebDavNetworkPolicy<'_> {
         }
 
         let ips: Vec<_> = addresses.iter().map(SocketAddr::ip).collect();
+        if self
+            .private_endpoint_ip
+            .is_some_and(|expected| ips.iter().any(|ip| *ip != expected))
+        {
+            return Err(ReadDispatchError::NetworkDenied);
+        }
         let validate = if self.allow_private_endpoint {
             validate_resolved_ips_exclude_metadata
         } else {
@@ -468,10 +475,20 @@ impl zeroclaw_api::tool::Tool for RemoteFilesTool {
             "remote_files",
         )
         .map_err(|_| ReadDispatchError::NetworkDenied)?;
+        let alias = match &request {
+            RemoteFilesRequest::ListDirectory { resource, .. }
+            | RemoteFilesRequest::GetFileInfo { resource, .. } => resource,
+            _ => return Err(ReadDispatchError::UnsupportedOperation.into()),
+        };
+        let private_endpoint_ip = catalog
+            .resource(alias)
+            .ok_or(ReadDispatchError::Denied)?
+            .private_endpoint_ip();
         let network = WebDavNetworkPolicy {
             proxy: &config.proxy,
             nat64_prefixes: &nat64_prefixes,
-            allow_private_endpoint: false,
+            allow_private_endpoint: private_endpoint_ip.is_some(),
+            private_endpoint_ip,
         };
         let operations = [Right::ListDirectory, Right::GetFileInfo];
         let availability = BackendAvailability::Available(operations.into_iter().collect());
@@ -508,7 +525,10 @@ impl zeroclaw_api::tool::Tool for RemoteFilesTool {
                 else {
                     return None;
                 };
-                (entry.root() == root && actual == expected).then_some(&rights)
+                (entry.root() == root
+                    && actual == expected
+                    && entry.private_endpoint_ip() == private_endpoint_ip)
+                    .then_some(&rights)
             },
             &availability,
             &network,
@@ -681,6 +701,7 @@ mod tests {
             alias: "REPORTS".into(),
             root: root.to_string(),
             credential_alias: "REPORT_LOGIN".into(),
+            private_endpoint_ip: None,
         }])
         .unwrap();
         let request = RemoteFilesRequest::ListDirectory {
@@ -701,6 +722,7 @@ mod tests {
             proxy: &proxy,
             nat64_prefixes: &[],
             allow_private_endpoint: false,
+            private_endpoint_ip: None,
         };
         for approved in [false, true] {
             let context = ToolExecutionContext::default()
@@ -733,6 +755,7 @@ mod tests {
             proxy: &proxy,
             nat64_prefixes: &[],
             allow_private_endpoint: false,
+            private_endpoint_ip: None,
         };
 
         let addresses = || async {
@@ -765,6 +788,22 @@ mod tests {
             Err(ReadDispatchError::NetworkDenied)
         ));
 
+        let fixed = "10.1.2.3:443".parse::<SocketAddr>().unwrap();
+        policy.private_endpoint_ip = Some(fixed.ip());
+        assert_eq!(
+            policy
+                .resolve_with(&root, async |_, _| Ok(vec![fixed]))
+                .await
+                .unwrap(),
+            vec![fixed]
+        );
+        assert!(matches!(
+            policy
+                .resolve_with(&root, async |_, _| addresses().await)
+                .await,
+            Err(ReadDispatchError::NetworkDenied)
+        ));
+
         let proxy = ProxyConfig {
             enabled: true,
             scope: ProxyScope::Environment,
@@ -774,6 +813,7 @@ mod tests {
             proxy: &proxy,
             nat64_prefixes: &[],
             allow_private_endpoint: true,
+            private_endpoint_ip: None,
         };
         assert!(matches!(
             policy
@@ -793,6 +833,7 @@ mod tests {
             alias: "REPORTS".into(),
             root: "https://files.test/dav/".into(),
             credential_alias: "DEMO".into(),
+            private_endpoint_ip: None,
         }])
         .unwrap();
         let availability = BackendAvailability::Available(BTreeSet::from([Right::ListDirectory]));
@@ -805,6 +846,7 @@ mod tests {
             proxy: &proxy,
             nat64_prefixes: &[],
             allow_private_endpoint: false,
+            private_endpoint_ip: None,
         };
         let result = dispatch_catalog_webdav_read(
             &request,
