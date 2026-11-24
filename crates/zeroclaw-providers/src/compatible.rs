@@ -10373,7 +10373,14 @@ mod tests {
                 .body(reqwest::Body::from(body))
                 .expect("test response should build"),
         );
-        let events: Vec<_> = sse_bytes_to_events(response, false).collect().await;
+        let events: Vec<_> = sse_bytes_to_events(
+            response,
+            false,
+            crate::StreamTimeouts::from(crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT))
+                .start(),
+        )
+        .collect()
+        .await;
         assert!(
             !events
                 .iter()

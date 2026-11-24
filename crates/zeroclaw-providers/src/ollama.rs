@@ -489,13 +489,9 @@ impl OllamaModelProvider {
                     }
                 })
                 .collect();
-            // Textual reasoning/tool extraction belongs to the runtime model
-            // policy. Preserve the wire content here so a model can opt out
-            // of `<think>` extraction without the provider discarding it.
-            let text = Self::raw_response_text(
-                &response.message.content,
-                response.message.thinking.as_deref(),
-            );
+            // Structured calls already carry their action. Only content can
+            // narrate it; thinking must not become ordinary assistant text.
+            let text = Self::raw_response_text(&response.message.content, None);
             return ChatResponse {
                 text,
                 tool_calls,
@@ -811,7 +807,7 @@ impl ModelProvider for OllamaModelProvider {
             return Ok(self.format_tool_calls_for_loop(&response.message.tool_calls));
         }
 
-        // Preserve wire text; model-owned extraction is applied by runtime.
+        // Keep legacy reasoning removal and thinking-field fallback.
         if let Some(content) = Self::raw_response_text(
             &response.message.content,
             response.message.thinking.as_deref(),
@@ -858,7 +854,7 @@ impl ModelProvider for OllamaModelProvider {
             return Ok(self.format_tool_calls_for_loop(&response.message.tool_calls));
         }
 
-        // Preserve wire text; model-owned extraction is applied by runtime.
+        // Keep legacy reasoning removal and thinking-field fallback.
         if let Some(content) = Self::raw_response_text(
             &response.message.content,
             response.message.thinking.as_deref(),
@@ -1720,6 +1716,36 @@ mod tests {
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert!(resp.prompt_eval_count.is_none());
         assert!(resp.eval_count.is_none());
+    }
+
+    #[test]
+    fn structured_tool_calls_do_not_promote_thinking_to_reply_text() {
+        let provider = OllamaModelProvider::builder("test").build();
+        for (content, expected) in [
+            ("", None),
+            ("<think>private notes</think>", None),
+            ("Calling the tool", Some("Calling the tool")),
+        ] {
+            let response = serde_json::from_value(serde_json::json!({
+                "message": {
+                    "content": content,
+                    "thinking": "private working notes",
+                    "tool_calls": [{
+                        "id": "call_123",
+                        "function": {"name": "shell", "arguments": {"command": "date"}}
+                    }]
+                },
+                "prompt_eval_count": 50,
+                "eval_count": 25
+            }))
+            .unwrap();
+            let result = provider.response_to_chat_response(response, "test-model");
+            assert_eq!(result.text.as_deref(), expected);
+            assert_eq!(result.tool_calls.len(), 1);
+            assert_eq!(result.tool_calls[0].id, "call_123");
+            assert_eq!(result.tool_calls[0].name, "shell");
+            assert_eq!(result.usage.unwrap().output_tokens, Some(25));
+        }
     }
 
     #[test]
