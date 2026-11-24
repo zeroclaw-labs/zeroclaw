@@ -23,13 +23,14 @@ class MdBookLinkBoundaryTest(unittest.TestCase):
         return result.stdout.strip()
 
     def run_collector(
-        self, source_path: str, content: str
+        self, source_path: str, content: str, *, provide_docs_files: bool = True
     ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.run_git(root, "init", "--quiet")
             self.run_git(root, "config", "user.name", "Link Gate Test")
             self.run_git(root, "config", "user.email", "link-gate@example.invalid")
+            self.run_git(root, "config", "core.quotePath", "true")
 
             target = root / "docs/security/slsa-provenance.md"
             target.parent.mkdir(parents=True)
@@ -51,7 +52,7 @@ class MdBookLinkBoundaryTest(unittest.TestCase):
                     "--base",
                     base,
                     "--docs-files",
-                    source_path,
+                    source_path if provide_docs_files else "",
                     "--output",
                     str(root / "links.txt"),
                     "--check-local-targets",
@@ -112,6 +113,27 @@ class MdBookLinkBoundaryTest(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_cli_discovers_quoted_markdown_filename(self) -> None:
+        result = self.run_collector(
+            "docs/caf\u00e9.md",
+            "[Missing](missing.md)\n",
+            provide_docs_files=False,
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("Broken local docs link target(s):", result.stdout)
+        self.assertIn("docs/missing.md", result.stdout)
+
+    def test_cli_discovers_ascii_markdown_filename(self) -> None:
+        result = self.run_collector(
+            "docs/release.md",
+            "[SLSA](security/slsa-provenance.md)\n",
+            provide_docs_files=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Collected 1 added link(s)", result.stdout)
 
 
 if __name__ == "__main__":

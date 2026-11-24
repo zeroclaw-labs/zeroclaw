@@ -77,14 +77,11 @@ globalThis.fetch = async (input, init) => {
   const selected = perDevice.get(deviceId);
   if (!selected) return new Response('', { status: 404 });
   if (init?.method === 'PUT') {
-    const incoming = JSON.parse(String(init.body)) as typeof preferences;
-    selected.dictation = incoming.dictation;
-    selected.reading = incoming.reading;
-    selected.automatic = incoming.automatic;
-    selected.language = incoming.language;
-    selected.recognition = incoming.recognition;
-    selected.voice = incoming.voice;
-    selected.rate = incoming.rate;
+    // As the gateway does: fields left out of the body keep their saved value.
+    const incoming = JSON.parse(String(init.body)) as Partial<typeof preferences>;
+    for (const key of Object.keys(selected) as (keyof typeof preferences)[]) {
+      if (key in incoming) Object.assign(selected, { [key]: incoming[key] });
+    }
   }
   return new Response(JSON.stringify({ device_id: deviceId, preferences: selected }), { headers: { 'Content-Type': 'application/json' } });
 };
@@ -427,6 +424,31 @@ test('device list loads and edits the selected record without changing this brow
   } finally {
     if (renderer) await act(async () => { renderer.unmount(); });
     Object.assign(preferences, ownBefore); Object.assign(otherPreferences, otherBefore);
+  }
+});
+
+test('a settings screen that has not reloaded saves only the changed field', async () => {
+  const before = { ...preferences };
+  const { default: Settings } = await import('./BrowserVoiceSettings.tsx');
+  let renderer!: ReactTestRenderer;
+  try {
+    preferences.recognition = 'browser';
+    await act(async () => { renderer = create(createElement(Settings)); });
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 20)); });
+    // Another computer switches this device to on-device recognition. This screen
+    // gets no focus, visibility or same-browser notice, so it keeps its old copy.
+    preferences.recognition = 'local';
+    const rate = renderer.root.find(node => node.type === 'input' && node.props.type === 'range');
+    await act(async () => { rate.props.onPointerUp({ currentTarget: { valueAsNumber: 1.5 } }); });
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 20)); });
+    const write = requests.filter(request => request.method === 'PUT').slice(-1)[0]!;
+    assert.equal(write.path, '/api/devices/synthetic-device/voice');
+    assert.deepEqual(JSON.parse(write.body!), { rate: 1.5 });
+    assert.equal(preferences.rate, 1.5);
+    assert.equal(preferences.recognition, 'local', 'the rate change kept the recognition change made elsewhere');
+  } finally {
+    if (renderer) await act(async () => { renderer.unmount(); });
+    Object.assign(preferences, before);
   }
 });
 

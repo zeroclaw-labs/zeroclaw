@@ -1494,6 +1494,8 @@ mod tests {
             "http://example.com",
             "https://other.example.com",
             "https://example.com:8443",
+            "https://evil-example.com",
+            "https://example.com.evil.test",
         ] {
             let target = ValidatedHttpRequestTarget {
                 url: url.into(),
