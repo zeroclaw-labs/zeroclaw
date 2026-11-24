@@ -153,3 +153,9 @@ WebDAV resource, and grant **List directory** or **Get file info** in
 a relative path. This opt-in exposes only listing and metadata, using a local
 encrypted credential and a public HTTPS endpoint with direct, pinned egress.
 Other grant rights do not enable write or transfer operations in this slice.
+
+For a private HTTPS endpoint, set `private_endpoint_ip` on that resource to
+its exact address. All DNS answers must match that address. The configuration
+does not relax TLS hostname verification, redirect refusal, or the cloud
+metadata block. Changing the IP while an approval is pending invalidates the
+current operation.
