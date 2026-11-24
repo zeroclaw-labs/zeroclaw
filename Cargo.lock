@@ -14806,6 +14806,7 @@ dependencies = [
  "ring",
  "rustix 1.1.6",
  "rustls",
+ "rustls-native-certs 0.8.4",
  "rustls-pki-types",
  "scopeguard",
  "serde",

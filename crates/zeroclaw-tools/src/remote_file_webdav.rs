@@ -801,10 +801,17 @@ fn build_client(
     let (host, port) = validate_endpoint(root, addresses)?;
     let mut builder = Client::builder()
         .https_only(true)
+        .use_rustls_tls()
+        .tls_built_in_root_certs(false)
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(Duration::from_secs(30));
+    for certificate in rustls_native_certs::load_native_certs().certs {
+        let root = reqwest::Certificate::from_der(certificate.as_ref())
+            .map_err(|_| WebDavError::Transport)?;
+        builder = builder.add_root_certificate(root);
+    }
     if host.parse::<IpAddr>().is_err() {
         debug_assert!(addresses.iter().all(|address| address.port() == port));
         builder = builder.resolve_to_addrs(&host, addresses);
