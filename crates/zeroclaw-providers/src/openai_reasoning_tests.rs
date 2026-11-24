@@ -196,16 +196,51 @@ mod native_effort {
             .effort,
             NativeEffort::High
         );
-        assert_eq!(
-            resolve(
-                ReasoningSurface::PublicApi,
-                ReasoningApi::ChatCompletions,
-                "gpt-5.4-pro",
-                ThinkingLevel::High,
-                false
+    }
+
+    #[test]
+    fn responses_only_pro_models_use_verified_effort_bounds() {
+        for (model, minimum, maximum) in [
+            ("gpt-5.4-pro", NativeEffort::Medium, NativeEffort::XHigh),
+            ("gpt-5.2-pro", NativeEffort::Medium, NativeEffort::XHigh),
+            (
+                "gpt-5.2-pro-2025-12-11",
+                NativeEffort::Medium,
+                NativeEffort::XHigh,
             ),
-            Err(UnmappedReason::UnsupportedApi)
-        );
+            ("gpt-5-pro", NativeEffort::High, NativeEffort::High),
+            (
+                "gpt-5-pro-2025-10-06",
+                NativeEffort::High,
+                NativeEffort::High,
+            ),
+        ] {
+            for (level, expected) in [(ThinkingLevel::Off, minimum), (ThinkingLevel::Max, maximum)]
+            {
+                assert_eq!(
+                    resolve(
+                        ReasoningSurface::PublicApi,
+                        ReasoningApi::Responses,
+                        model,
+                        level,
+                        false
+                    )
+                    .unwrap()
+                    .effort,
+                    expected
+                );
+            }
+            assert_eq!(
+                resolve(
+                    ReasoningSurface::PublicApi,
+                    ReasoningApi::ChatCompletions,
+                    model,
+                    ThinkingLevel::High,
+                    false
+                ),
+                Err(UnmappedReason::UnsupportedApi)
+            );
+        }
     }
 
     #[test]

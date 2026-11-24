@@ -106,6 +106,17 @@ const PUBLIC_MODELS: &[ModelEfforts] = &[
         chat_supported: false,
         chat_tools: None,
     },
+    // https://developers.openai.com/api/docs/models/gpt-5.2-pro
+    ModelEfforts {
+        models: &["gpt-5.2-pro", "gpt-5.2-pro-2025-12-11"],
+        efforts: &[
+            NativeEffort::Medium,
+            NativeEffort::High,
+            NativeEffort::XHigh,
+        ],
+        chat_supported: false,
+        chat_tools: None,
+    },
     // https://developers.openai.com/api/docs/models/gpt-5.2
     ModelEfforts {
         models: &["gpt-5.2", "gpt-5.2-2025-12-11"],
@@ -297,6 +308,13 @@ const PUBLIC_MODELS: &[ModelEfforts] = &[
             NativeEffort::XHigh,
             NativeEffort::Max,
         ]),
+    },
+    // https://developers.openai.com/api/docs/models/gpt-5-pro
+    ModelEfforts {
+        models: &["gpt-5-pro", "gpt-5-pro-2025-10-06"],
+        efforts: &[NativeEffort::High],
+        chat_supported: false,
+        chat_tools: None,
     },
     // https://developers.openai.com/api/docs/models/gpt-5
     ModelEfforts {
