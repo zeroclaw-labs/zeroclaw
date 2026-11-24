@@ -506,9 +506,18 @@ impl Drop for ApprovalGuard {
 // the same alias. In memory only: after a restart a prompt is re-registered when
 // a reaction on it is matched through its signed marker.
 
+/// Who posted a prompt. Message IDs are only unique within one server, so an
+/// alias moved to another server or bot must not match its old records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GateOwner {
+    alias: String,
+    site: String,
+    email: String,
+}
+
 #[derive(Debug, Clone)]
 struct GatePromptRecord {
-    alias: String,
+    owner: GateOwner,
     message_id: u64,
     /// Canonical `reply_target` the prompt was posted to.
     target: String,
@@ -531,15 +540,15 @@ fn record_gate_prompt(reference: &str, record: GatePromptRecord) {
     map.entry(reference.to_string()).or_default().push(record);
 }
 
-/// Removes and returns this alias's prompts for `reference`.
-fn take_gate_prompts(reference: &str, alias: &str) -> Vec<GatePromptRecord> {
+/// Removes and returns this owner's prompts for `reference`.
+fn take_gate_prompts(reference: &str, owner: &GateOwner) -> Vec<GatePromptRecord> {
     let mut map = GATE_PROMPTS.lock();
     let Some(records) = map.get_mut(reference) else {
         return Vec::new();
     };
     let (mine, others): (Vec<_>, Vec<_>) = std::mem::take(records)
         .into_iter()
-        .partition(|r| r.alias == alias);
+        .partition(|r| r.owner == *owner);
     let now_empty = others.is_empty();
     *records = others;
     if now_empty {
@@ -548,21 +557,21 @@ fn take_gate_prompts(reference: &str, alias: &str) -> Vec<GatePromptRecord> {
     mine
 }
 
-/// (reference, target) of the prompt this alias posted as that message.
-fn gate_for_message(alias: &str, message_id: u64) -> Option<(String, String)> {
+/// (reference, target) of the prompt this owner posted as that message.
+fn gate_for_message(owner: &GateOwner, message_id: u64) -> Option<(String, String)> {
     GATE_PROMPTS.lock().iter().find_map(|(reference, records)| {
         records
             .iter()
-            .find(|r| r.alias == alias && r.message_id == message_id)
+            .find(|r| r.owner == *owner && r.message_id == message_id)
             .map(|r| (reference.clone(), r.target.clone()))
     })
 }
 
-fn has_gate_reference(alias: &str, reference: &str) -> bool {
+fn has_gate_reference(owner: &GateOwner, reference: &str) -> bool {
     GATE_PROMPTS
         .lock()
         .get(reference)
-        .is_some_and(|records| records.iter().any(|r| r.alias == alias))
+        .is_some_and(|records| records.iter().any(|r| r.owner == *owner))
 }
 
 fn gate_emoji_for(kind: GateChoiceKind) -> Option<&'static str> {
@@ -719,6 +728,26 @@ fn gate_title_from_content(content: &str) -> String {
         .and_then(|l| l.trim().strip_prefix("**")?.strip_suffix("**"))
         .unwrap_or("SOP approval")
         .to_string()
+}
+
+/// Context of an already posted gate prompt: what `render_gate_prompt` put
+/// between the title and the reaction hint or the Details spoiler.
+fn gate_body_from_content(content: &str) -> Option<String> {
+    let (_, rest) = content.split_once("\n\n")?;
+    let body = rest
+        .rsplit_once("\n\n```spoiler Details")
+        .map_or(rest, |(body, _)| body);
+    let is_hint = |line: &str| {
+        line.split(" · ")
+            .all(|l| l.starts_with(':') && (l.ends_with(" approve") || l.ends_with(" deny")))
+    };
+    let body = match body.rsplit_once("\n\n") {
+        Some((body, last)) if is_hint(last) => body,
+        _ if is_hint(body) => "",
+        _ => body,
+    };
+    let body = body.trim();
+    (!body.is_empty()).then(|| body.to_string())
 }
 
 /// Last marker in the message as `(reference, signature)`. Verify the signature
@@ -910,6 +939,14 @@ impl ZulipChannel {
 
     pub fn alias(&self) -> &str {
         &self.alias
+    }
+
+    fn gate_owner(&self) -> GateOwner {
+        GateOwner {
+            alias: self.alias.clone(),
+            site: self.site.clone(),
+            email: self.email.clone(),
+        }
     }
 
     fn http_client(&self) -> &reqwest::Client {
@@ -1278,7 +1315,7 @@ impl ZulipChannel {
         match (words.next(), words.next(), words.next()) {
             (Some(choice), Some(reference), None) => {
                 GateChoiceKind::from_id(choice).is_some_and(|k| !k.collects_text())
-                    && has_gate_reference(&self.alias, reference)
+                    && has_gate_reference(&self.gate_owner(), reference)
             }
             _ => false,
         }
@@ -1318,7 +1355,7 @@ impl ZulipChannel {
 
         // Process registry first, then the marker in the message, which
         // survives restarts. The marker counts only on the bot's own messages.
-        let (reference, target) = match gate_for_message(&self.alias, message_id) {
+        let (reference, target) = match gate_for_message(&self.gate_owner(), message_id) {
             Some(found) => found,
             None if self.not_gate.lock().contains(message_id) => return false,
             None => match self.fetch_message(message_id).await {
@@ -1349,11 +1386,11 @@ impl ZulipChannel {
                     record_gate_prompt(
                         &reference,
                         GatePromptRecord {
-                            alias: self.alias.clone(),
+                            owner: self.gate_owner(),
                             message_id,
                             target: target.clone(),
                             title: gate_title_from_content(&msg.content),
-                            resolved_description: None,
+                            resolved_description: gate_body_from_content(&msg.content),
                             emojis: vec![APPROVAL_EMOJI_APPROVE, APPROVAL_EMOJI_DENY],
                             created: Instant::now(),
                         },
@@ -1905,7 +1942,7 @@ impl Channel for ZulipChannel {
         record_gate_prompt(
             &prompt.reference,
             GatePromptRecord {
-                alias: self.alias.clone(),
+                owner: self.gate_owner(),
                 message_id,
                 target: target.encode(),
                 title: prompt.title.clone(),
@@ -1935,7 +1972,7 @@ impl Channel for ZulipChannel {
 
     /// Shows the outcome on the prompt: keeps the context, appends the outcome.
     async fn finalize_gate_prompt(&self, reference: &str, outcome: &str) -> Result<bool> {
-        let mut records = take_gate_prompts(reference, &self.alias);
+        let mut records = take_gate_prompts(reference, &self.gate_owner());
         if records.is_empty() {
             return Ok(false);
         }
@@ -2433,11 +2470,20 @@ mod tests {
         }
     }
 
+    /// Owner of `channel(..)` under another alias name.
+    fn owner(alias: &str) -> GateOwner {
+        GateOwner {
+            alias: alias.into(),
+            site: "https://zulip.example.com".into(),
+            email: "bot@example.com".into(),
+        }
+    }
+
     fn record(reference: &str, message_id: u64) {
         record_gate_prompt(
             reference,
             GatePromptRecord {
-                alias: "main".into(),
+                owner: owner("main"),
                 message_id,
                 target: "stream:5:approvals".into(),
                 title: "SOP approval needed: deploy".into(),
@@ -2700,7 +2746,7 @@ mod tests {
         record_gate_prompt(
             "run-d#1",
             GatePromptRecord {
-                alias: "other".into(),
+                owner: owner("other"),
                 message_id: 801,
                 target: "stream:5:approvals".into(),
                 title: "t".into(),
@@ -2709,11 +2755,53 @@ mod tests {
                 created: Instant::now(),
             },
         );
-        let mine = take_gate_prompts("run-d#1", "main");
+        let mine = take_gate_prompts("run-d#1", &owner("main"));
         assert_eq!(mine.len(), 1);
         assert_eq!(mine[0].message_id, 800);
-        assert!(has_gate_reference("other", "run-d#1"));
-        assert!(!has_gate_reference("main", "run-d#1"));
+        assert!(has_gate_reference(&owner("other"), "run-d#1"));
+        assert!(!has_gate_reference(&owner("main"), "run-d#1"));
+    }
+
+    #[test]
+    fn gate_records_do_not_cross_servers_or_bots() {
+        record("run-d#2", 810);
+        let moved = GateOwner {
+            site: "https://other.example.com".into(),
+            ..owner("main")
+        };
+        let rebotted = GateOwner {
+            email: "other-bot@example.com".into(),
+            ..owner("main")
+        };
+        for stranger in [&moved, &rebotted] {
+            assert_eq!(gate_for_message(stranger, 810), None);
+            assert!(!has_gate_reference(stranger, "run-d#2"));
+            assert!(take_gate_prompts("run-d#2", stranger).is_empty());
+        }
+        assert_eq!(channel(false).gate_owner(), owner("main"));
+        assert!(gate_for_message(&owner("main"), 810).is_some());
+    }
+
+    #[test]
+    fn posted_gate_body_is_recovered_without_hint_or_details() {
+        let prompt = gate_prompt("run-r#1", "Approve the deploy?");
+        let emojis = gate_emojis(&prompt);
+        let content = render_gate_prompt(&prompt, &emojis, "abc");
+        assert_eq!(
+            gate_body_from_content(&content).as_deref(),
+            Some("Deploy v1.2 to production")
+        );
+        // Without reactions the full description is the body
+        let content = render_gate_prompt(&prompt, &[], "abc");
+        assert_eq!(
+            gate_body_from_content(&content).as_deref(),
+            Some(prompt.description.as_str())
+        );
+        // A prompt with only a title has no body
+        assert_eq!(
+            gate_body_from_content("**T**\n\n:check: approve\n\n```spoiler Details\nx\n```"),
+            None
+        );
     }
 
     #[tokio::test]
@@ -3322,8 +3410,57 @@ mod wire_tests {
         assert_eq!(answer.reply_target, "stream:5:approvals");
         // Registered, so finalization can edit it
         assert_eq!(
-            gate_for_message("wire", 900),
+            gate_for_message(&ch.gate_owner(), 900),
             Some(("run-w3".into(), "stream:5:approvals".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_gate_keeps_its_context_when_finalized() {
+        let server = MockServer::start().await;
+        let key = derive_gate_key("secret");
+        let signed = sign_gate(&key, "wire", "run-w6", "stream:5:approvals");
+        let prompt = ChannelGatePrompt {
+            resolved_description: Some("Deploy v1.2 to production".into()),
+            ..gate("run-w6")
+        };
+        let posted = render_gate_prompt(&prompt, &gate_emojis(&prompt), &signed);
+        mount_posted_message(&server, 905, BOT, &posted).await;
+        mount_edit(&server, 905, "Approved").await;
+
+        // A fresh channel: the registry has no record of the prompt
+        let ch = channel_for(&server);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        assert!(
+            !ch.try_answer_gate_reaction(&reaction(905, OPERATOR, "check"), &me(), &tx)
+                .await
+        );
+        assert!(rx.try_recv().is_ok());
+        assert!(
+            ch.finalize_gate_prompt("run-w6", "Approved by 10")
+                .await
+                .unwrap()
+        );
+
+        let edit = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.method.as_str() == "PATCH")
+            .unwrap();
+        let content = reqwest::Url::parse(&format!(
+            "http://form/?{}",
+            String::from_utf8_lossy(&edit.body)
+        ))
+        .unwrap()
+        .query_pairs()
+        .find(|(k, _)| k == "content")
+        .map(|(_, v)| v.into_owned())
+        .unwrap();
+        assert_eq!(
+            content,
+            "**SOP approval needed: deploy**\n\nDeploy v1.2 to production\n\nApproved by 10"
         );
     }
 
@@ -3361,7 +3498,7 @@ mod wire_tests {
             rx.try_recv().is_err(),
             "another alias must not answer the prompt"
         );
-        assert_eq!(gate_for_message("other", 902), None);
+        assert_eq!(gate_for_message(&other.gate_owner(), 902), None);
 
         let posting = channel_for(&server);
         assert!(

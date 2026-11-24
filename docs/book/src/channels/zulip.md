@@ -134,7 +134,8 @@ are folded in a collapsed **Details** spoiler:
 The marker binds the message to the run without in-memory state, so reactions
 keep working after a daemon restart. The signature is an HMAC-SHA256 over the
 alias that posted the prompt, the reference and the place the prompt was posted
-to, keyed from the bot's API key.
+to, keyed from the bot's API key. A prompt recovered this way keeps its text:
+the outcome is added below what was approved.
 A marker the agent is talked into writing in an ordinary reply is not valid:
 outgoing text is sanitized so that only the gate prompt itself can carry one, and
 a marker moved to another place or forged without the key is rejected.
