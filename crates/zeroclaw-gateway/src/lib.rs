@@ -1037,6 +1037,21 @@ fn config_admin_router(route_auth: principal_gate::ConfigRouteAuth) -> Router<Ap
 /// the gateway, so what is left is cancelled before that grace runs out.
 const CONNECTION_DRAIN: Duration = Duration::from_millis(300);
 
+#[cfg(test)]
+tokio::task_local! {
+    static LISTENER_RELEASED: std::cell::RefCell<Option<tokio::sync::oneshot::Sender<()>>>;
+}
+
+fn release_listener(listener: tokio::net::TcpListener) {
+    drop(listener);
+    #[cfg(test)]
+    let _ = LISTENER_RELEASED.try_with(|released| {
+        if let Some(released) = released.borrow_mut().take() {
+            let _ = released.send(());
+        }
+    });
+}
+
 /// How long retirement waits for the tasks it cancelled to end. Cancelling
 /// only asks: a task ends, and drops what it owns, when it is next polled.
 const RETIRE_JOIN: Duration = Duration::from_millis(100);
@@ -3137,7 +3152,7 @@ pub async fn run_gateway_with_plugin_webhooks(
     }
     // Let go of the port at once, as `axum::serve` does: a connection made
     // from here on is refused, not accepted into a backlog nothing serves.
-    drop(listener);
+    release_listener(listener);
     // And stop taking relay-forwarded dashboard connections: the bridge
     // refuses them until the next generation attaches.
     drop(dashboard_feed);
@@ -7805,6 +7820,20 @@ path = "{trigger_path}"
         tls: Option<(&std::path::Path, &std::path::Path)>,
         event_bus: Option<zeroclaw_runtime::observability::EventBus>,
     ) -> (
+        std::net::SocketAddr,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        start_drain_test_gateway_with_release(data, port, tls, event_bus, None).await
+    }
+
+    async fn start_drain_test_gateway_with_release(
+        data: &std::path::Path,
+        port: u16,
+        tls: Option<(&std::path::Path, &std::path::Path)>,
+        event_bus: Option<zeroclaw_runtime::observability::EventBus>,
+        released: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> (
         SocketAddr,
         tokio::sync::watch::Sender<bool>,
         tokio::task::JoinHandle<Result<()>>,
@@ -7839,21 +7868,25 @@ path = "{trigger_path}"
             reload_tx,
         );
         let server = zeroclaw_spawn::spawn!(async move {
-            run_gateway(
-                "127.0.0.1",
-                port,
-                config,
-                event_bus,
-                Some(controls),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(readiness),
-            )
-            .await
+            LISTENER_RELEASED
+                .scope(std::cell::RefCell::new(released), async move {
+                    run_gateway(
+                        "127.0.0.1",
+                        port,
+                        config,
+                        event_bus,
+                        Some(controls),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(readiness),
+                    )
+                    .await
+                })
+                .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             ready_rx.wait_for(Option::is_some).await.unwrap();
@@ -9105,11 +9138,13 @@ path = "{trigger_path}"
             let certs = over_tls.then_some((cert_path.as_path(), key_path.as_path()));
             let tls = over_tls.then_some(&connector);
             let label = if over_tls { "tls" } else { "plain" };
-            let (addr, shutdown_tx, server) = start_drain_test_gateway_with(
+            let (released_tx, released_rx) = tokio::sync::oneshot::channel();
+            let (addr, shutdown_tx, server) = start_drain_test_gateway_with_release(
                 &tmp.path().join(format!("{label}-first")),
                 0,
                 certs,
                 None,
+                Some(released_tx),
             )
             .await;
             let mut streaming = drain_test_connect(addr, tls).await;
@@ -9117,19 +9152,12 @@ path = "{trigger_path}"
             assert!(head.starts_with("HTTP/1.1 200"), "{label}: {head}");
 
             shutdown_tx.send(true).unwrap();
-            let released = tokio::time::timeout(std::time::Duration::from_millis(150), async {
-                loop {
-                    match tokio::net::TcpStream::connect(addr).await {
-                        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break,
-                        _ => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
-                    }
-                }
-            })
-            .await;
-            assert!(
-                released.is_ok(),
-                "{label}: the stopped gateway still held its port while it drained"
-            );
+            // Windows may defer a refused TCP connect beyond the whole drain.
+            // Observe the owned listener's release, not the peer's retry timer.
+            tokio::time::timeout(std::time::Duration::from_secs(2), released_rx)
+                .await
+                .expect("the listener is released promptly")
+                .expect("the listener release is reported");
             assert!(
                 !server.is_finished(),
                 "{label}: the drain still holds the event stream"
