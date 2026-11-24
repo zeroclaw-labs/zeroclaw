@@ -1,6 +1,8 @@
 //! Scripted providers deliberately disregard correction to prove containment
 //! at the same Agent APIs consumed by embedded callers and ACP.
 
+#![cfg(test)]
+
 use super::*;
 use zeroclaw_api::model_provider::ConversationMessage;
 

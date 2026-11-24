@@ -414,6 +414,11 @@ restart (`build_sop_engine` falls back to an in-memory store with a loud log if
 the durable backend cannot open, so this is default-safe); `persist_runs = false`
 is the documented opt-out for an ephemeral engine.
 
+**Mixed-version upgrades.** Opening an existing `runs.db` with the updated
+SQLite store installs a trigger and preserves the run history. From then on,
+an older daemon or CLI sharing the file receives a SQLite constraint error if
+it tries to mark a finished run active again. The run stays terminal.
+
 ## 4. Trigger Types
 
 {{#sop-trigger-index}}
