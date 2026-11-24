@@ -514,7 +514,7 @@ mod native_effort {
         }
         let bodies = server.bodies();
         assert_eq!(bodies.len(), 4);
-        for pair in bodies.chunks_exact(2) {
+        for pair in bodies.as_chunks::<2>().0 {
             assert_eq!(pair[0]["reasoning"]["effort"], "high");
             assert_eq!(pair[0]["instructions"], "system prompt");
             assert_eq!(pair[1]["reasoning"]["effort"], "medium");
