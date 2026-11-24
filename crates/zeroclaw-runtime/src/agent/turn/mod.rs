@@ -4664,8 +4664,8 @@ async fn drive_live_sop_actions(
                     // depth — a depth >= 2 step naming the outer agent compares
                     // against the re-assembled child's alias and re-assembles
                     // instead of inheriting the child's scope.
-                    let needs_reassembly =
-                        step_needs_reassembly(agent_alias, step_alias) || foreign_owner;
+                    let changes_agent = step_needs_reassembly(agent_alias, step_alias);
+                    let needs_reassembly = changes_agent || foreign_owner;
                     let reassembly_alias = step_alias.or(agent_alias);
                     // A foreign owner's execution is memoized apart from this
                     // session's own, and keyed by the owner's whole scope: the
@@ -4798,6 +4798,17 @@ async fn drive_live_sop_actions(
                             .and_then(|owned| owned.execution_admission.as_ref())
                             .map(AgentExecutionAdmission::config)
                             .or(execution_config);
+                        // A different agent resolves its own level; owner-only
+                        // reassembly keeps the caller's selection. The legacy
+                        // budget remains unchanged on both paths.
+                        let step_native_level = if changes_agent {
+                            owned.and_then(|owned| {
+                                let thinking = &owned.agent.resolved.thinking;
+                                thinking.native_thinking.then_some(thinking.default_level)
+                            })
+                        } else {
+                            zeroclaw_api::current_native_thinking_level()
+                        };
                         let (
                             eff_model_provider,
                             eff_provider_name,
@@ -4976,7 +4987,9 @@ async fn drive_live_sop_actions(
                                 =>
                                 crate::sop::executor::scope_step_call_sink(
                                     step_call_sink.clone(),
-                                    Box::pin(run_tool_call_loop(ToolLoop {
+                                    Box::pin(zeroclaw_api::NATIVE_THINKING_LEVEL.scope(
+                                        step_native_level,
+                                        run_tool_call_loop(ToolLoop {
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: eff_model_provider,
@@ -5103,7 +5116,7 @@ async fn drive_live_sop_actions(
                                     // The step runs on the queuing loop's
                                     // binding, same-agent or cross-agent.
                                     capability_binding,
-                                    })),
+                                    }))),
                                 )
                             )
                             .await;
@@ -8250,9 +8263,14 @@ mod sop_step_reassembly_tests {
         }
     }
 
-    /// One captured child-provider request: transcript, offered tool-spec
-    /// names, and the temperature the loop passed.
-    type CapturedRequest = (Vec<ChatMessage>, Vec<String>, Option<f64>);
+    /// One captured child-provider request, including its native thinking context.
+    type CapturedRequest = (
+        Vec<ChatMessage>,
+        Vec<String>,
+        Option<f64>,
+        Option<zeroclaw_api::model_provider::ThinkingLevel>,
+        Option<zeroclaw_api::model_provider::NativeThinkingParams>,
+    );
 
     /// The CHILD side of the distinct-providers regression: records every
     /// request the nested loop sends so tests can prove what did (and did not)
@@ -8305,6 +8323,8 @@ mod sop_step_reassembly_tests {
                 request.messages.to_vec(),
                 tool_names,
                 temperature,
+                request.thinking_level,
+                request.thinking,
             ));
             Ok(ChatResponse {
                 text: Some("child-done".to_string()),
@@ -10459,7 +10479,7 @@ mod sop_step_reassembly_tests {
             !captured.is_empty(),
             "the seeded child provider must have run the step"
         );
-        for (messages, _tools, temperature) in captured.iter() {
+        for (messages, _tools, temperature, ..) in captured.iter() {
             assert!(
                 messages.iter().all(|m| !m.content.contains(PARENT_MARKER)
                     && !m.content.contains("parent system prompt")),
@@ -10499,6 +10519,238 @@ mod sop_step_reassembly_tests {
         assert_eq!(result.status, crate::sop::types::SopStepStatus::Completed);
         assert_eq!(result.output, "child-done");
         assert_eq!(result.effective_agent.as_deref(), Some("stepper"));
+    }
+
+    #[tokio::test]
+    async fn cross_agent_sop_step_uses_target_native_level_and_preserves_parent_budget() {
+        use zeroclaw_api::model_provider::{NativeThinkingParams, ThinkingLevel};
+
+        let budget = NativeThinkingParams {
+            budget_tokens: 4096,
+            display: None,
+        };
+        for (parent_level, parent_budget, child_native, child_level, expected) in [
+            (
+                Some(ThinkingLevel::High),
+                Some(budget),
+                false,
+                ThinkingLevel::Low,
+                None,
+            ),
+            (
+                None,
+                None,
+                true,
+                ThinkingLevel::Low,
+                Some(ThinkingLevel::Low),
+            ),
+            (
+                Some(ThinkingLevel::Low),
+                Some(budget),
+                true,
+                ThinkingLevel::Max,
+                Some(ThinkingLevel::Max),
+            ),
+        ] {
+            let (engine, run_id, action) = start_single_cross_agent_step("stepper");
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let config = zeroclaw_config::schema::Config {
+                data_dir: temp.path().join("data"),
+                config_path: temp.path().join("config.toml"),
+                ..Default::default()
+            };
+            let handle = SopStepReassembly {
+                config: &config,
+                live_config: None,
+                memory_owner: None,
+                capabilities: None,
+            };
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut child = seeded_owned(
+                Arc::clone(&requests),
+                Vec::new(),
+                std::collections::HashSet::new(),
+                Vec::new(),
+                None,
+            );
+            child.agent.resolved.thinking.native_thinking = child_native;
+            child.agent.resolved.thinking.default_level = child_level;
+            let mut exec_cache = std::collections::HashMap::from([("stepper".to_string(), child)]);
+            let parent_tools =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+            let mut history = vec![ChatMessage::system("parent")];
+            zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                .scope(parent_budget, async {
+                    zeroclaw_api::NATIVE_THINKING_LEVEL
+                        .scope(parent_level, async {
+                            drive_step(
+                                Arc::clone(&engine),
+                                action,
+                                &TextProvider,
+                                &parent_tools,
+                                &crate::observability::NoopObserver {},
+                                &mut history,
+                                None,
+                                None,
+                                None,
+                                Some("outer"),
+                                Some(handle),
+                                None,
+                                &mut exec_cache,
+                            )
+                            .await;
+                            assert_eq!(zeroclaw_api::current_native_thinking_level(), parent_level);
+                            assert_eq!(
+                                zeroclaw_api::NATIVE_THINKING_OVERRIDE.with(|value| *value),
+                                parent_budget
+                            );
+                        })
+                        .await;
+                })
+                .await;
+            let captured = requests.lock().expect("capture lock");
+            assert!(
+                !captured.is_empty(),
+                "the step agent must receive a request"
+            );
+            for request in captured.iter() {
+                assert_eq!(request.3, expected);
+                assert_eq!(request.4, parent_budget);
+            }
+            assert_eq!(
+                step1_result(&engine, &run_id).status,
+                crate::sop::types::SopStepStatus::Completed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn same_agent_sop_step_keeps_parent_level_when_owner_requires_reassembly() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        use zeroclaw_api::model_provider::ThinkingLevel;
+
+        let owner = PrincipalScope::new("fixture-owner").with_agent(Some("outer".to_string()));
+        let (engine, run_id, action) =
+            start_single_cross_agent_step_for("outer", Some(owner.clone()));
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let config = zeroclaw_config::schema::Config {
+            data_dir: temp.path().join("data"),
+            config_path: temp.path().join("config.toml"),
+            ..Default::default()
+        };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+            memory_owner: None,
+            capabilities: None,
+        };
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut child = seeded_owned(
+            Arc::clone(&requests),
+            Vec::new(),
+            std::collections::HashSet::new(),
+            Vec::new(),
+            None,
+        );
+        child.agent.resolved.thinking.native_thinking = true;
+        child.agent.resolved.thinking.default_level = ThinkingLevel::High;
+        let key = format!(
+            "outer\u{0}{}\u{0}{:?}\u{0}{:?}\u{0}{:?}",
+            owner.principal_id, owner.agent_alias, owner.namespace, owner.tenant_id
+        );
+        let mut exec_cache = std::collections::HashMap::from([(key, child)]);
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![ChatMessage::system("parent")];
+        zeroclaw_api::NATIVE_THINKING_LEVEL
+            .scope(Some(ThinkingLevel::Low), async {
+                drive_step(
+                    Arc::clone(&engine),
+                    action,
+                    &TextProvider,
+                    &parent_tools,
+                    &crate::observability::NoopObserver {},
+                    &mut history,
+                    None,
+                    None,
+                    None,
+                    Some("outer"),
+                    Some(handle),
+                    None,
+                    &mut exec_cache,
+                )
+                .await;
+                assert_eq!(
+                    zeroclaw_api::current_native_thinking_level(),
+                    Some(ThinkingLevel::Low)
+                );
+            })
+            .await;
+        let captured = requests.lock().expect("capture lock");
+        assert!(
+            !captured.is_empty(),
+            "the reassembled agent must receive a request"
+        );
+        assert!(
+            captured
+                .iter()
+                .all(|request| request.3 == Some(ThinkingLevel::Low))
+        );
+        assert_eq!(
+            step1_result(&engine, &run_id).status,
+            crate::sop::types::SopStepStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn same_agent_sop_step_keeps_parent_level_without_reassembly() {
+        use zeroclaw_api::model_provider::ThinkingLevel;
+
+        let (engine, run_id, action) = start_single_cross_agent_step("outer");
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let parent_provider = CaptureProvider {
+            requests: Arc::clone(&requests),
+        };
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![ChatMessage::system("parent")];
+        let mut exec_cache = std::collections::HashMap::new();
+        zeroclaw_api::NATIVE_THINKING_LEVEL
+            .scope(Some(ThinkingLevel::Minimal), async {
+                drive_step(
+                    Arc::clone(&engine),
+                    action,
+                    &parent_provider,
+                    &parent_tools,
+                    &crate::observability::NoopObserver {},
+                    &mut history,
+                    None,
+                    None,
+                    None,
+                    Some("outer"),
+                    None,
+                    None,
+                    &mut exec_cache,
+                )
+                .await;
+                assert_eq!(
+                    zeroclaw_api::current_native_thinking_level(),
+                    Some(ThinkingLevel::Minimal)
+                );
+            })
+            .await;
+        let captured = requests.lock().expect("capture lock");
+        assert!(
+            !captured.is_empty(),
+            "the parent provider must receive a request"
+        );
+        assert!(
+            captured
+                .iter()
+                .all(|request| request.3 == Some(ThinkingLevel::Minimal))
+        );
+        assert_eq!(
+            step1_result(&engine, &run_id).status,
+            crate::sop::types::SopStepStatus::Completed
+        );
     }
 
     /// The child registry and the child's own `tool_filter_groups` govern the
@@ -10572,7 +10824,7 @@ mod sop_step_reassembly_tests {
 
         let captured = requests.lock().expect("capture lock");
         assert!(!captured.is_empty(), "the child provider must have run");
-        let (_msgs, offered, _temp) = &captured[0];
+        let (_msgs, offered, _temp, ..) = &captured[0];
         assert!(
             offered.contains(&"plain_tool".to_string())
                 && offered.contains(&"srv__allowed".to_string()),
