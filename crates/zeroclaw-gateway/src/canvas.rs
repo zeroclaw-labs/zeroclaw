@@ -118,11 +118,12 @@ pub async fn handle_canvas_post(
     }
 
     match state.canvas_store.render(&id, content_type, &body.content) {
-        Some(frame) => (
+        Some(rendered) => (
             StatusCode::CREATED,
             Json(serde_json::json!({
                 "canvas_id": id,
-                "frame": frame,
+                "frame": rendered.frame,
+                "save_failed": rendered.save_failed,
             })),
         )
             .into_response(),
@@ -146,10 +147,11 @@ pub async fn handle_canvas_clear(
         return e.into_response();
     }
 
-    state.canvas_store.clear(&id);
+    let cleared = state.canvas_store.clear(&id);
     Json(serde_json::json!({
         "canvas_id": id,
         "status": "cleared",
+        "save_failed": cleared.save_failed,
     }))
     .into_response()
 }

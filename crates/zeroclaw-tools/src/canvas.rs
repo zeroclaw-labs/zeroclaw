@@ -78,13 +78,43 @@ struct PersistedCanvasRef<'a> {
 #[derive(Clone)]
 struct CanvasPersistence {
     dir: Arc<Dir>,
-    /// Per canvas, the frame id its file was last brought in line with:
-    /// saved, or removed because the save failed. A canvas with nothing
-    /// displayed has no entry. Holding this lock is also what makes disk
-    /// operations one at a time: each one settles whatever the canvas shows
-    /// when it runs, so the file converges on memory whichever render gets
-    /// here first, without holding the store lock across file I/O.
-    settled: Arc<parking_lot::Mutex<HashMap<String, String>>>,
+    /// Per canvas, the frame its file was last brought in line with, and
+    /// whether that frame failed to save. A canvas with nothing displayed has
+    /// no entry. Holding this lock is also what makes disk operations one at
+    /// a time: each one settles whatever the canvas shows when it runs, so
+    /// the file converges on memory whichever render gets here first, without
+    /// holding the store lock across file I/O.
+    settled: Arc<parking_lot::Mutex<HashMap<String, SettledFrame>>>,
+}
+
+/// The frame a canvas file was last brought in line with.
+#[derive(Clone)]
+struct SettledFrame {
+    frame_id: String,
+    /// The frame should have been saved but the write failed, so a restart
+    /// will not bring it back.
+    save_failed: bool,
+}
+
+/// What a successful [`CanvasStore::render`] did.
+#[derive(Debug, Clone)]
+pub struct Rendered {
+    /// The frame pushed to the canvas.
+    pub frame: CanvasFrame,
+    /// The canvas shows content that a persistent store could not save, so
+    /// it will not come back after a restart. Always `false` for an
+    /// in-memory store, which promises nothing across restarts.
+    pub save_failed: bool,
+}
+
+/// What [`CanvasStore::clear`] did.
+#[derive(Debug, Clone, Copy)]
+pub struct Cleared {
+    /// The canvas existed before the clear.
+    pub existed: bool,
+    /// A persistent store could not remove the saved copy, so a restart may
+    /// bring the cleared content back.
+    pub save_failed: bool,
 }
 
 impl CanvasPersistence {
@@ -228,7 +258,13 @@ impl CanvasStore {
             settled: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         };
         for canvas in persistence.load_all() {
-            settled.insert(canvas.canvas_id.clone(), canvas.frame.frame_id.clone());
+            settled.insert(
+                canvas.canvas_id.clone(),
+                SettledFrame {
+                    frame_id: canvas.frame.frame_id.clone(),
+                    save_failed: false,
+                },
+            );
             canvases.insert(
                 canvas.canvas_id,
                 CanvasEntry {
@@ -260,9 +296,13 @@ impl CanvasStore {
     /// `eval` requests never touch the disk. A canvas that shows nothing, and
     /// a frame that could not be saved, remove the file so a restart never
     /// brings back content that was replaced.
-    fn sync_to_disk(&self, canvas_id: &str) {
+    ///
+    /// Returns whether the saved copy failed to match what the canvas shows,
+    /// so the caller can tell whoever asked for the change. A frame settled
+    /// earlier reports the outcome recorded when it was settled.
+    fn sync_to_disk(&self, canvas_id: &str) -> bool {
         let Some(persistence) = &self.persistence else {
-            return;
+            return false;
         };
         let mut settled = persistence.settled.lock();
         let unsettled = {
@@ -271,46 +311,54 @@ impl CanvasStore {
                 .get(canvas_id)
                 .and_then(|entry| entry.displayed.as_ref())
             {
-                Some(frame) if settled.get(canvas_id) == Some(&frame.frame_id) => return,
-                Some(frame) => Some(frame.clone()),
+                Some(frame) => match settled.get(canvas_id) {
+                    Some(known) if known.frame_id == frame.frame_id => return known.save_failed,
+                    _ => Some(frame.clone()),
+                },
                 None => None,
             }
         };
         let outcome = match unsettled {
             Some(frame) => {
-                settled.insert(canvas_id.to_string(), frame.frame_id.clone());
-                if ALLOWED_CONTENT_TYPES.contains(&frame.content_type.as_str()) {
+                let outcome = if ALLOWED_CONTENT_TYPES.contains(&frame.content_type.as_str()) {
                     persistence.save(canvas_id, &frame).inspect_err(|_| {
                         let _ = persistence.remove(canvas_id);
                     })
                 } else {
                     persistence.remove(canvas_id)
-                }
+                };
+                settled.insert(
+                    canvas_id.to_string(),
+                    SettledFrame {
+                        frame_id: frame.frame_id.clone(),
+                        save_failed: outcome.is_err(),
+                    },
+                );
+                outcome
             }
             None => {
                 settled.remove(canvas_id);
                 persistence.remove(canvas_id)
             }
         };
-        if let Err(error) = outcome {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error": error})),
-                "canvas: could not update the saved frame; this canvas will not survive a restart"
-            );
+        match outcome {
+            Ok(()) => false,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": error})),
+                    "canvas: could not update the saved frame; this canvas will not survive a restart"
+                );
+                true
+            }
         }
     }
 
     /// Push a new frame to a canvas. Creates the canvas if it does not exist.
     /// Returns `None` if the maximum canvas count has been reached and this is a new canvas.
-    pub fn render(
-        &self,
-        canvas_id: &str,
-        content_type: &str,
-        content: &str,
-    ) -> Option<CanvasFrame> {
+    pub fn render(&self, canvas_id: &str, content_type: &str, content: &str) -> Option<Rendered> {
         let frame = CanvasFrame {
             frame_id: uuid::Uuid::new_v4().to_string(),
             content_type: content_type.to_string(),
@@ -348,9 +396,9 @@ impl CanvasStore {
         let _ = entry.tx.send(frame.clone());
 
         drop(store);
-        self.sync_to_disk(canvas_id);
+        let save_failed = self.sync_to_disk(canvas_id);
 
-        Some(frame)
+        Some(Rendered { frame, save_failed })
     }
 
     /// Get the current (most recent) frame for a canvas.
@@ -371,7 +419,7 @@ impl CanvasStore {
     /// Clear a canvas (removes current content and history). An entry nobody is
     /// subscribed to is dropped, so it stops counting against the canvas limit;
     /// a watched one keeps its channel for the next render.
-    pub fn clear(&self, canvas_id: &str) -> bool {
+    pub fn clear(&self, canvas_id: &str) -> Cleared {
         let existed = {
             let mut store = self.inner.write();
             let unwatched = match store.get_mut(canvas_id) {
@@ -396,10 +444,11 @@ impl CanvasStore {
             }
             unwatched.is_some()
         };
-        if existed {
-            self.sync_to_disk(canvas_id);
+        let save_failed = existed && self.sync_to_disk(canvas_id);
+        Cleared {
+            existed,
+            save_failed,
         }
-        existed
     }
 
     /// Subscribe to real-time updates for a canvas.
@@ -537,15 +586,24 @@ impl Tool for CanvasTool {
                 }
 
                 match self.store.render(canvas_id, content_type, content) {
-                    Some(frame) => Ok(ToolResult {
-                        success: true,
-                        output: format!(
+                    Some(Rendered { frame, save_failed }) => {
+                        let mut output = format!(
                             "Rendered {} content to canvas '{}' (frame: {})",
                             content_type, canvas_id, frame.frame_id
-                        )
-                        .into(),
-                        error: None,
-                    }),
+                        );
+                        if save_failed {
+                            output.push('\n');
+                            output.push_str(&crate::i18n::get_required_tool_string_with_args(
+                                "tool-canvas-render-not-saved",
+                                &[("canvas_id", canvas_id)],
+                            ));
+                        }
+                        Ok(ToolResult {
+                            success: true,
+                            output: output.into(),
+                            error: None,
+                        })
+                    }
                     None => Ok(ToolResult {
                         success: false,
                         output: ToolOutput::default(),
@@ -577,14 +635,22 @@ impl Tool for CanvasTool {
             },
 
             "clear" => {
-                let existed = self.store.clear(canvas_id);
+                let cleared = self.store.clear(canvas_id);
+                let mut output = if cleared.existed {
+                    format!("Canvas '{}' cleared", canvas_id)
+                } else {
+                    format!("Canvas '{}' was already empty", canvas_id)
+                };
+                if cleared.save_failed {
+                    output.push('\n');
+                    output.push_str(&crate::i18n::get_required_tool_string_with_args(
+                        "tool-canvas-clear-not-saved",
+                        &[("canvas_id", canvas_id)],
+                    ));
+                }
                 Ok(ToolResult {
                     success: true,
-                    output: if existed {
-                        format!("Canvas '{}' cleared", canvas_id).into()
-                    } else {
-                        format!("Canvas '{}' was already empty", canvas_id).into()
-                    },
+                    output: output.into(),
                     error: None,
                 })
             }
@@ -608,7 +674,7 @@ impl Tool for CanvasTool {
 
                 // Push a special eval frame so connected clients know to evaluate it.
                 match self.store.render(canvas_id, "eval", expression) {
-                    Some(frame) => Ok(ToolResult {
+                    Some(Rendered { frame, .. }) => Ok(ToolResult {
                         success: true,
                         output: format!(
                             "Eval request sent to canvas '{}' (frame: {}). \
@@ -648,7 +714,10 @@ mod tests {
     #[test]
     fn canvas_store_render_and_snapshot() {
         let store = CanvasStore::new();
-        let frame = store.render("test", "html", "<h1>Hello</h1>").unwrap();
+        let frame = store
+            .render("test", "html", "<h1>Hello</h1>")
+            .unwrap()
+            .frame;
         assert_eq!(frame.content_type, "html");
         assert_eq!(frame.content, "<h1>Hello</h1>");
 
@@ -691,7 +760,7 @@ mod tests {
         store.render("test", "html", "<p>content</p>");
         assert!(store.snapshot("test").is_some());
 
-        let cleared = store.clear("test");
+        let cleared = store.clear("test").existed;
         assert!(cleared);
         assert!(store.snapshot("test").is_none());
     }
@@ -699,7 +768,7 @@ mod tests {
     #[test]
     fn canvas_store_clear_nonexistent_returns_false() {
         let store = CanvasStore::new();
-        assert!(!store.clear("nonexistent"));
+        assert!(!store.clear("nonexistent").existed);
     }
 
     #[test]
@@ -926,7 +995,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let first = CanvasStore::persistent(dir.path());
         first.render("report", "html", "<p>v1</p>").unwrap();
-        let shown = first.render("report", "html", "<p>v2</p>").unwrap();
+        let shown = first.render("report", "html", "<p>v2</p>").unwrap().frame;
         drop(first);
 
         let second = CanvasStore::persistent(dir.path());
@@ -946,7 +1015,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let first = CanvasStore::persistent(dir.path());
         first.render("report", "html", "<p>v1</p>").unwrap();
-        assert!(first.clear("report"));
+        assert!(first.clear("report").existed);
         drop(first);
 
         let second = CanvasStore::persistent(dir.path());
@@ -1169,11 +1238,119 @@ mod tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
+    /// Put a directory where a canvas's file goes, so writing or removing
+    /// that file fails whatever the process's permissions are.
+    fn block_canvas_file(dir: &Path, canvas_id: &str) -> PathBuf {
+        let file = dir.join(CanvasPersistence::file_name(canvas_id));
+        let _ = std::fs::remove_file(&file);
+        std::fs::create_dir(&file).unwrap();
+        file
+    }
+
+    #[test]
+    fn a_render_that_cannot_be_saved_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CanvasStore::persistent(dir.path());
+        let blocked = block_canvas_file(dir.path(), "report");
+
+        let rendered = store.render("report", "html", "<p>v1</p>").unwrap();
+        assert!(rendered.save_failed);
+        assert_eq!(
+            store.snapshot("report").unwrap().content,
+            "<p>v1</p>",
+            "the canvas still shows what was rendered"
+        );
+        let eval = store.render("report", "eval", "document.title").unwrap();
+        assert!(
+            eval.save_failed,
+            "an eval reports that what the canvas shows is still unsaved"
+        );
+
+        std::fs::remove_dir(&blocked).unwrap();
+        let rendered = store.render("report", "html", "<p>v2</p>").unwrap();
+        assert!(!rendered.save_failed);
+        drop(store);
+        let restarted = CanvasStore::persistent(dir.path());
+        assert_eq!(restarted.snapshot("report").unwrap().content, "<p>v2</p>");
+    }
+
+    #[test]
+    fn a_clear_that_cannot_remove_the_saved_copy_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CanvasStore::persistent(dir.path());
+        assert!(
+            !store
+                .render("report", "html", "<p>v1</p>")
+                .unwrap()
+                .save_failed
+        );
+        block_canvas_file(dir.path(), "report");
+
+        let cleared = store.clear("report");
+        assert!(cleared.existed);
+        assert!(cleared.save_failed);
+        assert!(store.snapshot("report").is_none());
+    }
+
+    #[test]
+    fn saving_succeeds_quietly() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CanvasStore::persistent(dir.path());
+        assert!(
+            !store
+                .render("report", "html", "<p>v1</p>")
+                .unwrap()
+                .save_failed
+        );
+        assert!(!store.render("report", "eval", "1").unwrap().save_failed);
+        let cleared = store.clear("report");
+        assert!(cleared.existed && !cleared.save_failed);
+        assert!(!store.clear("never-rendered").save_failed);
+    }
+
+    #[tokio::test]
+    async fn canvas_tool_reports_a_render_and_clear_that_were_not_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CanvasStore::persistent(dir.path());
+        let tool = CanvasTool::new(store);
+        block_canvas_file(dir.path(), "report");
+
+        let rendered = tool
+            .execute(json!({"action": "render", "canvas_id": "report", "content": "<p>v1</p>"}))
+            .await
+            .unwrap();
+        assert!(rendered.success, "the canvas shows the content");
+        assert!(rendered.output.contains("could not be saved"));
+
+        let cleared = tool
+            .execute(json!({"action": "clear", "canvas_id": "report"}))
+            .await
+            .unwrap();
+        assert!(cleared.success);
+        assert!(cleared.output.contains("could not be removed"));
+    }
+
+    #[tokio::test]
+    async fn canvas_tool_says_nothing_about_saving_when_it_worked() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = CanvasTool::new(CanvasStore::persistent(dir.path()));
+        let rendered = tool
+            .execute(json!({"action": "render", "canvas_id": "report", "content": "<p>v1</p>"}))
+            .await
+            .unwrap();
+        assert!(!rendered.output.contains("restart"));
+        let cleared = tool
+            .execute(json!({"action": "clear", "canvas_id": "report"}))
+            .await
+            .unwrap();
+        assert!(!cleared.output.contains("restart"));
+    }
+
     #[test]
     fn clear_frees_the_canvas_slot_unless_someone_is_watching() {
         let store = CanvasStore::new();
         store.render("unwatched", "text", "a").unwrap();
-        assert!(store.clear("unwatched"));
+        assert!(store.clear("unwatched").existed);
         assert!(
             store.list().is_empty(),
             "a cleared canvas nobody watches is dropped"
@@ -1181,17 +1358,17 @@ mod tests {
 
         store.render("watched", "text", "b").unwrap();
         let mut viewer = store.subscribe("watched").unwrap();
-        assert!(store.clear("watched"));
+        assert!(store.clear("watched").existed);
         assert_eq!(store.list(), vec!["watched".to_string()]);
         assert_eq!(viewer.try_recv().unwrap().content_type, "clear");
         drop(viewer);
-        assert!(store.clear("watched"));
+        assert!(store.clear("watched").existed);
 
         for i in 0..MAX_CANVAS_COUNT {
             store.render(&format!("fill-{i}"), "text", "x").unwrap();
         }
         assert!(store.render("one-more", "text", "x").is_none());
-        assert!(store.clear("fill-0"));
+        assert!(store.clear("fill-0").existed);
         assert!(
             store.render("one-more", "text", "x").is_some(),
             "clearing an unwatched canvas makes room for a new one"
@@ -1225,7 +1402,12 @@ mod tests {
     #[test]
     fn in_memory_store_writes_nothing() {
         let store = CanvasStore::new();
-        store.render("report", "html", "<p>v1</p>").unwrap();
+        assert!(
+            !store
+                .render("report", "html", "<p>v1</p>")
+                .unwrap()
+                .save_failed
+        );
         assert!(store.persistence.is_none());
     }
 }
