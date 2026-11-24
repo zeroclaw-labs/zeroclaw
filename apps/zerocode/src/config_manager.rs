@@ -272,10 +272,10 @@ fn scalar_validation_status_key(kind: PropKind, value: &str) -> Option<&'static 
             .parse::<i64>()
             .err()
             .map(|_| "zc-config-status-invalid-integer"),
-        PropKind::Float => value
-            .parse::<f64>()
-            .err()
-            .map(|_| "zc-config-status-invalid-float"),
+        // The daemon refuses `inf`, `NaN` and out-of-range text such as
+        // `1e999`, which `str::parse` reads as non-finite floats.
+        PropKind::Float => (!value.parse::<f64>().is_ok_and(f64::is_finite))
+            .then_some("zc-config-status-invalid-float"),
         _ => None,
     }
 }
@@ -6636,6 +6636,29 @@ mod tests {
             Some("zc-config-status-invalid-float")
         );
         assert_eq!(scalar_validation_status_key(PropKind::Float, "0.7"), None);
+    }
+
+    /// The daemon refuses text that `str::parse` reads as infinity or NaN for
+    /// a float field, so the edit is refused here before it is sent. Finite
+    /// edge values still pass.
+    #[test]
+    fn config_scalar_validation_refuses_non_finite_float() {
+        for text in [
+            "inf", "+inf", "-inf", "Infinity", "infinity", "NaN", "nan", "1e999", "-1e999",
+        ] {
+            assert_eq!(
+                scalar_validation_status_key(PropKind::Float, text),
+                Some("zc-config-status-invalid-float"),
+                "{text}"
+            );
+        }
+        for text in ["-0.0", "5e-324", "1.7976931348623157e308", "5"] {
+            assert_eq!(
+                scalar_validation_status_key(PropKind::Float, text),
+                None,
+                "{text}"
+            );
+        }
     }
 
     #[tokio::test]
