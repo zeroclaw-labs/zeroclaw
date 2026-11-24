@@ -1626,6 +1626,9 @@ mod tests {
             sends: AtomicUsize::new(0),
             final_sends: AtomicUsize::new(0),
             finalize_drafts: AtomicUsize::new(0),
+            voice_finalizes: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
+            cleanup_fails: std::sync::atomic::AtomicBool::new(false),
         });
         let paced = PacedChannel::wrap(
             inner,
