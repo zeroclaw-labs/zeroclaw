@@ -6,6 +6,9 @@ on:
     paths:
       - ".github/workflows/platform-tests.yml"
       - "crates/zeroclaw-tools/src/coding_cli.rs"
+      - "crates/zeroclaw-tools/src/glob_search.rs"
+      - "crates/zeroclaw-gateway/src/lib.rs"
+      - "apps/zerocode/src/app.rs"
   workflow_dispatch:
   schedule:
     - cron: "17 3 * * *"
