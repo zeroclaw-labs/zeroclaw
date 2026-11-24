@@ -307,10 +307,13 @@ adapters retain their existing behavior and raw-body override precedence.
 Capabilities use exact verified model IDs and documented snapshots. Public API
 sets come from the [OpenAI model documentation](https://developers.openai.com/api/docs/models);
 subscription sets come separately from the
-[official Codex catalog](https://github.com/openai/codex/blob/126a0ee92ed2c5e73cd8a8f7e37563e8527552d7/codex-rs/models-manager/models.json).
+[official Codex catalog](https://github.com/openai/codex/blob/6aaf2a86b198bb0ee8f9d995e79155ad5c7f6357/codex-rs/models-manager/models.json).
 They can differ for the same model ID. The client mode `ultra` is never sent as
 native effort. Chat Completions with tools maps only verified combinations;
 models requiring Responses for tool reasoning should use `wire_api = "responses"`.
+On the public API, GPT-6.2 Astra and GPT-6.2 Sol map `off` to `low` and
+require Responses for tool calling. See the
+[OpenAI deployment checklist](https://developers.openai.com/api/docs/guides/deployment-checklist).
 Account access is still required independently of the capability mapping.
 
 Unknown/non-reasoning models, undocumented suffixes and unsupported API/tool

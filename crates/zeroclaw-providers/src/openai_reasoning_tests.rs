@@ -160,16 +160,30 @@ mod native_effort {
             .effort,
             NativeEffort::None
         );
-        assert_eq!(
-            resolve(
-                ReasoningSurface::PublicApi,
-                ReasoningApi::ChatCompletions,
-                "gpt-6.1-sol",
-                ThinkingLevel::High,
-                true
-            ),
-            Err(UnmappedReason::UnverifiedChatTools)
-        );
+        for model in ["gpt-6.1-sol", "gpt-6.2-sol", "gpt-6.2-astra"] {
+            assert_eq!(
+                resolve(
+                    ReasoningSurface::PublicApi,
+                    ReasoningApi::ChatCompletions,
+                    model,
+                    ThinkingLevel::Max,
+                    false
+                )
+                .unwrap()
+                .effort,
+                NativeEffort::Max
+            );
+            assert_eq!(
+                resolve(
+                    ReasoningSurface::PublicApi,
+                    ReasoningApi::ChatCompletions,
+                    model,
+                    ThinkingLevel::Max,
+                    true
+                ),
+                Err(UnmappedReason::UnverifiedChatTools)
+            );
+        }
         assert_eq!(
             resolve(
                 ReasoningSurface::PublicApi,
@@ -494,12 +508,16 @@ mod native_effort {
         ];
         let tools = tool_fixture();
         for stream in [false, true] {
-            for model in ["gpt-5.4", "gpt-6.2-sol"] {
+            for (model, level) in [
+                ("gpt-5.4", ThinkingLevel::High),
+                ("gpt-6.2-sol", ThinkingLevel::High),
+                ("gpt-6.2-astra", ThinkingLevel::Off),
+            ] {
                 let request = ChatRequest {
                     messages: &messages,
                     tools: Some(&tools),
                     thinking: None,
-                    thinking_level: Some(ThinkingLevel::High),
+                    thinking_level: Some(level),
                 };
                 if stream {
                     let mut events =
@@ -513,15 +531,17 @@ mod native_effort {
             }
         }
         let bodies = server.bodies();
-        assert_eq!(bodies.len(), 4);
-        for pair in bodies.as_chunks::<2>().0 {
-            assert_eq!(pair[0]["reasoning"]["effort"], "high");
-            assert_eq!(pair[0]["instructions"], "system prompt");
-            assert_eq!(pair[1]["reasoning"]["effort"], "medium");
-            assert!(pair[1].get("instructions").is_none());
-            assert_eq!(pair[1]["input"][0]["role"], "developer");
-            assert_eq!(pair[1]["input"][0]["content"][0]["text"], "system prompt");
-            assert_eq!(pair[1]["tools"][0]["name"], "inspect_value");
+        assert_eq!(bodies.len(), 6);
+        for [legacy, sol, astra] in bodies.as_chunks::<3>().0 {
+            assert_eq!(legacy["reasoning"]["effort"], "high");
+            assert_eq!(legacy["instructions"], "system prompt");
+            for (body, effort) in [(sol, "high"), (astra, "low")] {
+                assert_eq!(body["reasoning"]["effort"], effort);
+                assert!(body.get("instructions").is_none());
+                assert_eq!(body["input"][0]["role"], "developer");
+                assert_eq!(body["input"][0]["content"][0]["text"], "system prompt");
+                assert_eq!(body["tools"][0]["name"], "inspect_value");
+            }
         }
     }
 
@@ -742,6 +762,7 @@ mod native_effort {
             ("gpt-6.1-sol", None),
             ("unverified-model", Some(ThinkingLevel::Max)),
             ("gpt-5.5", Some(ThinkingLevel::Max)),
+            ("gpt-6.2-astra", Some(ThinkingLevel::Max)),
         ] {
             provider
                 .chat(
@@ -766,7 +787,7 @@ mod native_effort {
                         thinking: None,
                         thinking_level: zeroclaw_api::current_native_thinking_level(),
                     },
-                    "gpt-6.1-sol",
+                    "gpt-6.2-sol",
                     None,
                     StreamOptions::new(true),
                 )
@@ -797,15 +818,17 @@ mod native_effort {
             })
             .await;
         let bodies = server.bodies();
-        assert_eq!(bodies.len(), 13);
+        assert_eq!(bodies.len(), 14);
         for (body, expected) in bodies.iter().zip([
-            "low", "low", "low", "medium", "high", "max", "high", "high", "xhigh", "low", "high",
-            "low", "high",
+            "low", "low", "low", "medium", "high", "max", "high", "high", "xhigh", "max", "low",
+            "high", "low", "high",
         ]) {
             assert_eq!(body["reasoning"]["effort"], expected);
             assert_ne!(body["reasoning"]["effort"], "ultra");
         }
-        assert!(!bodies[9]["tools"].as_array().unwrap().is_empty());
+        assert_eq!(bodies[9]["model"], "gpt-6.2-astra");
+        assert_eq!(bodies[10]["model"], "gpt-6.2-sol");
+        assert!(!bodies[10]["tools"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

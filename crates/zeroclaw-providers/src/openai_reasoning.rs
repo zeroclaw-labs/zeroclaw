@@ -3,8 +3,8 @@
 //! Public API capabilities follow each model's official documentation:
 //! <https://developers.openai.com/api/docs/models>.
 //! Subscription capabilities follow the separate client catalog and wire normalization:
-//! <https://github.com/openai/codex/blob/126a0ee92ed2c5e73cd8a8f7e37563e8527552d7/codex-rs/models-manager/models.json>
-//! <https://github.com/openai/codex/blob/126a0ee92ed2c5e73cd8a8f7e37563e8527552d7/codex-rs/protocol/src/openai_models/reasoning_effort.rs>.
+//! <https://github.com/openai/codex/blob/6aaf2a86b198bb0ee8f9d995e79155ad5c7f6357/codex-rs/models-manager/models.json>
+//! <https://github.com/openai/codex/blob/6aaf2a86b198bb0ee8f9d995e79155ad5c7f6357/codex-rs/protocol/src/openai_models/reasoning_effort.rs>.
 
 use zeroclaw_api::model_provider::ThinkingLevel;
 
@@ -316,8 +316,9 @@ const PUBLIC_MODELS: &[ModelEfforts] = &[
         ]),
     },
     // https://developers.openai.com/api/docs/models/gpt-6-astra
+    // https://developers.openai.com/api/docs/guides/deployment-checklist
     ModelEfforts {
-        models: &["gpt-6-astra"],
+        models: &["gpt-6-astra", "gpt-6.2-astra", "gpt-6.2-sol"],
         efforts: &[
             NativeEffort::Low,
             NativeEffort::Medium,
@@ -387,7 +388,7 @@ const PUBLIC_MODELS: &[ModelEfforts] = &[
 
 const SUBSCRIPTION_MODELS: &[ModelEfforts] = &[
     ModelEfforts {
-        models: &["gpt-6-astra"],
+        models: &["gpt-6-astra", "gpt-6.2-astra", "gpt-6.2-sol"],
         efforts: &[
             NativeEffort::Low,
             NativeEffort::Medium,
