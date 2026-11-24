@@ -277,7 +277,7 @@ fn effort_turn_route(
     }))
 }
 
-fn effort_scoped_provider_config(
+pub(super) fn effort_scoped_provider_config(
     config: &Config,
     allowed_provider_refs: &HashSet<String>,
 ) -> anyhow::Result<Box<Config>> {
@@ -1346,29 +1346,30 @@ pub fn build_tool_instructions_for_names(
 }
 
 fn build_tool_instructions_for_tools<'a>(tools: impl IntoIterator<Item = &'a dyn Tool>) -> String {
-    let tools: Vec<&dyn Tool> = tools.into_iter().collect();
-    if tools.is_empty() {
+    build_tool_instructions_from_specs(tools.into_iter().map(|tool| tool.spec()))
+}
+
+/// Render already-admitted tool metadata, including owner-projected channel
+/// contracts. The projection changes prompt text only, never execution scope.
+pub fn build_tool_instructions_from_specs(
+    specs: impl IntoIterator<Item = zeroclaw_api::tool::ToolSpec>,
+) -> String {
+    let mut specs = specs.into_iter().peekable();
+    if specs.peek().is_none() {
         return String::new();
     }
-
-    // The tool-call formatting guidance has one home: `agent::tool_call_format`.
-    // Do not re-type it here; layer builder-specific material (the tool
-    // listing below) around it instead.
     let mut instructions = String::from("\n");
     instructions.push_str(crate::agent::tool_call_format::TOOL_CALL_PROTOCOL_INSTRUCTIONS);
     instructions.push_str("### Available Tools\n\n");
-
-    for tool in tools {
-        let desc = tool.description();
+    for spec in specs {
         let _ = writeln!(
             instructions,
             "**{}**: {}\nParameters: `{}`\n",
-            tool.name(),
-            desc,
-            tool.parameters_schema()
+            spec.name,
+            spec.description,
+            spec.parameters.as_ref()
         );
     }
-
     instructions
 }
 
@@ -19722,6 +19723,7 @@ Let me check the result."#;
         use super::{ToolLoop, run_tool_call_loop};
         use crate::observability::noop::NoopObserver;
         use ::zeroclaw_log::Instrument;
+        use zeroclaw_api::attribution::Attributable;
 
         let _writer_guard = zeroclaw_log::__private_test_writer_lock();
         let _hook_guard = zeroclaw_log::__private_test_hook_lock();
@@ -19739,6 +19741,7 @@ Let me check the result."#;
             capabilities: ProviderCapabilities::default(),
         };
         let observer = NoopObserver;
+        let attribution = crate::agent::AgentAttribution("trimtest");
 
         let big = "x".repeat(4000);
         let mut history = vec![
@@ -19808,9 +19811,7 @@ Let me check the result."#;
             agent_alias: None,
             turn_id: "test-turn-id",
         })
-        .instrument(zeroclaw_log::attribution_span!(
-            &crate::agent::AgentAttribution("trimtest")
-        ))
+        .instrument(zeroclaw_log::attribution_span!(&attribution))
         .await
         .expect("loop should succeed");
 
@@ -19823,6 +19824,8 @@ Let me check the result."#;
                         .get("message")
                         .and_then(|v| v.as_str())
                         .is_some_and(|m| m.starts_with("History trimmed:"))
+                        // The broadcast includes concurrent agents' records.
+                        && value["zeroclaw"]["agent_alias"].as_str() == Some(attribution.alias())
                     {
                         trim_event = Some(value);
                         break;

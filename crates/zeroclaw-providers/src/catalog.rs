@@ -84,9 +84,8 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         "sambanova" | "hyperbolic" | "anyscale" | "nscale" | "lepton" | "yi" | "baichuan"
         | "avian" | "deepmyst" | "astrai" | "sglang" | "vllm" | "osaurus" | "litellm"
         | "llamacpp" | "ollama" | "hailo_ollama" | "manifest" | "morph" | "github_models"
-        | "upstage" | "featherless" | "arcee" | "lambda_ai" | "inception" | "custom" => {
-            (None, None)
-        }
+        | "upstage" | "featherless" | "arcee" | "lambda_ai" | "inception" | "cheaperinference"
+        | "custom" => (None, None),
         _ => return None,
     };
     Some(pair)
