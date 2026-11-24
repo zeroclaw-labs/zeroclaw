@@ -151,14 +151,13 @@ impl ResolvedModelAccess<'_> {
                 );
                 // Only a semantically valid result controls accepted context
                 // usage and successful response telemetry.
-                let accepted_cost_usd = response.usage.as_ref().and_then(|usage| {
-                    crate::agent::cost::record_tool_loop_cost_usage(
-                        &served_provider,
-                        &served_model,
-                        usage,
-                    )
-                    .map(|(_, cost_usd)| cost_usd)
-                });
+                let accepted_cost_usd = crate::agent::cost::record_accepted_tool_loop_cost_usage(
+                    &served_provider,
+                    &served_model,
+                    response.usage.as_ref(),
+                    attempts.last().map(|attempt| attempt.outcome()),
+                )
+                .map(|(_, cost_usd)| cost_usd);
                 // The accepted leaf is always projected (even usage-less, so
                 // terminal identity stays coherent); the caller emits it with
                 // `accepted: true`.

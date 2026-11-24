@@ -32,6 +32,7 @@ pub enum Method {
     SessionList,
     SessionListAcp,
     SessionMessages,
+    SessionCost,
     SessionState,
     SessionDelete,
     SessionApprove,
@@ -171,6 +172,7 @@ impl Method {
         (Method::SessionList, "session/list"),
         (Method::SessionListAcp, "session/list-acp"),
         (Method::SessionMessages, "session/messages"),
+        (Method::SessionCost, "session/cost"),
         (Method::SessionState, "session/state"),
         (Method::SessionDelete, "session/delete"),
         (Method::SessionApprove, "session/approve"),
@@ -330,6 +332,7 @@ impl Method {
                 Typed("SessionMessagesParams"),
                 Typed("SessionMessagesResult"),
             ),
+            M::SessionCost => (Typed("SessionIdParams"), Typed("ConversationCostSummary")),
             M::SessionState => (Typed("SessionIdParams"), Typed("SessionStateResult")),
             M::SessionDelete => (Typed("SessionIdParams"), Typed("SessionDeleteResult")),
             M::SessionApprove => (Typed("SessionApproveParams"), Typed("SessionApproveResult")),
@@ -544,6 +547,7 @@ pub const EXTERNAL_TYPES: &[(&str, &str)] = &[
     ("SopDecideRequest", "zeroclaw-api"),
     // zeroclaw-config: no schema derive on the cost summary.
     ("CostSummary", "zeroclaw-config"),
+    ("ConversationCostSummary", "zeroclaw-api"),
 ];
 
 #[cfg(test)]

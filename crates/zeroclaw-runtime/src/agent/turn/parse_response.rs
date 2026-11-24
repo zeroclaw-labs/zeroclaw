@@ -9,7 +9,6 @@ use super::protocol_detect::{
 };
 use super::redact::scrub_credentials;
 use super::tool_specs::IterationToolSpecs;
-use crate::agent::cost::record_tool_loop_cost_usage;
 use crate::agent::loop_::capture_llm_messages;
 use crate::observability::ObserverEvent;
 use std::time::Instant;
@@ -350,6 +349,7 @@ pub(crate) async fn record_accepted_chat_response(
     llm_started_at: Instant,
     iteration: usize,
     accepted_route: Option<&AcceptedRoute>,
+    usage_outcome: Option<&zeroclaw_providers::dispatch::AttemptUsageOutcome>,
 ) {
     // The accepted_route tuple is the canonical identity when Reliable wrapping
     // produced an AcceptedRoute. When no AcceptedRoute exists (direct/vision
@@ -391,9 +391,13 @@ pub(crate) async fn record_accepted_chat_response(
         turn_id: Some(ctx.turn_id.to_string()),
         messages: capture_llm_messages(history, Some(response_text), native_tool_calls),
     });
-    let cost_usd = usage
-        .and_then(|usage| record_tool_loop_cost_usage(effective_provider, effective_model, usage))
-        .map(|(_total_tokens, cost_usd)| cost_usd);
+    let cost_usd = crate::agent::cost::record_accepted_tool_loop_cost_usage(
+        effective_provider,
+        effective_model,
+        usage,
+        usage_outcome,
+    )
+    .map(|(_, cost_usd)| cost_usd);
     // Exactly-one per accepted response, even when the provider returned no
     // usage data, so terminal identity and context-window accounting always
     // describe the accepted serving provider/model. The caller settles
@@ -1066,6 +1070,7 @@ mod cost_usd_regression_tests {
                     now,
                     0,
                     None,
+                    None,
                 )
                 .await;
             })
@@ -1268,6 +1273,7 @@ mod cost_usd_regression_tests {
             std::time::Instant::now(),
             0,
             None,
+            None,
         )
         .await;
 
@@ -1336,6 +1342,7 @@ mod cost_usd_regression_tests {
             std::time::Instant::now(),
             0,
             None,
+            None,
         )
         .await;
 
@@ -1394,6 +1401,7 @@ mod cost_usd_regression_tests {
             std::time::Instant::now(),
             0,
             None,
+            None,
         )
         .await;
 
@@ -1437,6 +1445,7 @@ mod cost_usd_regression_tests {
             &history,
             std::time::Instant::now(),
             0,
+            None,
             None,
         )
         .await;

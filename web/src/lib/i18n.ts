@@ -613,6 +613,18 @@ const translations: Record<Locale, Record<string, string>> = {
     "voice.pack_required": "Install this language pack in Settings → Other → Browser Voice and Audio, then click the microphone again.",
     "voice.no_transcript": "No speech was transcribed. Check the selected language and microphone, then try again.",
     "voice.capture_error": "Dictation failed. Check microphone permission and browser support.",
+    'agent.cost_estimate': 'Est.',
+    'agent.cost_incomplete': 'incomplete',
+    'agent.cost_unavailable': 'Cost unavailable',
+    'agent.cost_detail': 'Estimate of recorded conversation usage, including attributed delegates; not a provider invoice.',
+    'agent.cost_reason_missing_usage': 'Some provider usage was missing or incomplete.',
+    'agent.cost_reason_missing_prices': 'Prices were unavailable for some usage.',
+    'agent.cost_reason_unverified_history': 'Older records do not verify full usage coverage.',
+    'agent.cost_reason_tracking_disabled': 'Cost tracking is disabled.',
+    'agent.cost_reason_tracking_unavailable': 'Cost tracking is unavailable.',
+    'agent.cost_reason_no_recorded_usage': 'No usage has been recorded for this conversation.',
+    'agent.cost_reason_ledger_integrity': 'Some ledger records could not be read reliably.',
+    'agent.cost_reason_persistence_uncertain': 'A ledger write failed; saved spending is uncertain.',
 
     // Plugin package catalog
     'nav.plugins': "Plugins",

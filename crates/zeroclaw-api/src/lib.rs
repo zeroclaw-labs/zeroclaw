@@ -5,6 +5,7 @@ pub mod agent;
 pub mod attribution;
 pub mod channel;
 pub mod conversation_binding;
+pub mod cost;
 pub mod elicitation;
 pub mod grants;
 pub mod hook;

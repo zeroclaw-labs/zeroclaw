@@ -930,3 +930,16 @@ zc-config-save-lock-timeout = Another process is saving { $config } and still ho
 zc-config-invalid-saved-login = Saved login configuration is invalid. Zerocode will not use a different login's credentials.
 zc-config-migration-lock-skipped = Could not lock { $path } to update saved keybindings ({ $error }). The loaded configuration was kept and the file was not changed. Zerocode will try the update again the next time it can lock the file.
 zc-config-lock-not-regular = { $path } is not a regular file, so it cannot be used as the config lock.
+## Recorded conversation spending
+zc-cost-estimate = Est. { $amount }
+zc-cost-incomplete = { $estimate } · incomplete
+zc-cost-unavailable = Cost unavailable
+zc-cost-detail = Estimate of recorded conversation usage, including attributed delegates; not a provider invoice.
+zc-cost-missing-usage = Some provider usage was missing or incomplete.
+zc-cost-missing-prices = Prices were unavailable for some usage.
+zc-cost-unverified-history = Older records do not verify full usage coverage.
+zc-cost-tracking-disabled = Cost tracking is disabled.
+zc-cost-tracking-unavailable = Cost tracking is unavailable.
+zc-cost-no-recorded-usage = No usage has been recorded for this conversation.
+zc-cost-ledger-integrity = Some ledger records could not be read reliably.
+zc-cost-persistence-uncertain = A ledger write failed; saved spending is uncertain.
