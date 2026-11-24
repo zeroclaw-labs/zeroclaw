@@ -412,7 +412,8 @@ mod tests {
         set_runtime_proxy_config(ProxyConfig {
             enabled: true,
             http_proxy: Some(proxy.uri()),
-            scope: ProxyScope::Zeroclaw,
+            scope: ProxyScope::Services,
+            services: vec!["decision".to_owned()],
             ..Default::default()
         });
         client.ask(json!({}), questions()).await.unwrap();
@@ -425,6 +426,7 @@ mod tests {
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
         let server = MockServer::start().await;
         for kind in [
             "openai",
