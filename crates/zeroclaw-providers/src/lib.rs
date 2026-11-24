@@ -2268,7 +2268,12 @@ mod tests {
             .expect("Cheaper Inference provider should be listed");
         assert_eq!(cheaperinference.display_name, "Cheaper Inference");
         assert!(
-            create_model_provider("cheaperinference", Some("provider-test-credential")).is_ok(),
+            create_model_provider(
+                "cheaperinference",
+                Some("provider-test-credential"),
+                &Default::default()
+            )
+            .is_ok(),
             "Cheaper Inference should construct through the OpenAI-compatible family factory"
         );
     }

@@ -63,7 +63,10 @@ fn normalize_recovery(
     let policy = config
         .zip(route.as_ref())
         .map(|(config, route)| {
-            config.model_text_extraction(route.selection_ref().unwrap_or(route.provider_ref()))
+            config.model_input_text_extraction(
+                ctx.agent_alias,
+                route.selection_ref().unwrap_or(route.provider_ref()),
+            )
         })
         .unwrap_or(zeroclaw_api::TextExtraction {
             reasoning: Some(ctx.extract_text_reasoning),
@@ -355,7 +358,10 @@ pub(crate) async fn call_provider(
     let resolver = match config {
         Some(config) => {
             let config = std::sync::Arc::new(config.clone());
-            std::sync::Arc::new(move |model: &str| config.model_text_extraction(model))
+            let agent_alias = ctx.agent_alias.map(str::to_owned);
+            std::sync::Arc::new(move |model: &str| {
+                config.model_input_text_extraction(agent_alias.as_deref(), model)
+            })
                 as std::sync::Arc<dyn Fn(&str) -> zeroclaw_api::TextExtraction + Send + Sync>
         }
         None => {

@@ -4871,7 +4871,19 @@ impl Config {
         &self,
         model_ref: &str,
     ) -> crate::provider_registry::TextExtraction {
-        self.provider_registry()
+        self.model_input_text_extraction(None, model_ref)
+    }
+
+    /// Resolve the same ephemeral bare/URL selection used by provider
+    /// construction. The executing agent supplies inherited model options;
+    /// configured model keys always take precedence over CLI spellings.
+    #[must_use]
+    pub fn model_input_text_extraction(
+        &self,
+        agent: Option<&str>,
+        model_ref: &str,
+    ) -> crate::provider_registry::TextExtraction {
+        self.chat_registry_for_input(agent, model_ref)
             .ok()
             .and_then(|registry| {
                 registry

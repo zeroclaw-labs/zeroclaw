@@ -2040,7 +2040,7 @@ async fn run_tool_call_loop_impl<'a>(
         text_tool_calls_disabled,
         extract_text_reasoning: config.is_none_or(|config| {
             config
-                .model_text_extraction(provider_name)
+                .model_input_text_extraction(agent_alias, provider_name)
                 .reasoning
                 .unwrap_or(true)
         }),
@@ -2203,6 +2203,7 @@ async fn run_tool_call_loop_impl<'a>(
                         on_delta.as_ref(),
                         turn_state.canonical.as_deref_mut(),
                         config,
+                        agent_alias,
                         multimodal_config,
                         security,
                         hooks,
@@ -2449,7 +2450,8 @@ async fn run_tool_call_loop_impl<'a>(
             active_context_limits,
         );
         if let Some(config) = config {
-            let extraction = config.model_text_extraction(active_model_provider_name);
+            let extraction =
+                config.model_input_text_extraction(agent_alias, active_model_provider_name);
             ctx.extract_text_reasoning = extraction.reasoning.unwrap_or(true);
             ctx.text_tool_calls_disabled = !extraction.tool_calls;
         }
@@ -3049,8 +3051,10 @@ async fn run_tool_call_loop_impl<'a>(
         // consume the accepted selection's freshly resolved limits.
         let mut ctx = base_ctx.for_route(&served_provider, served_model_key, served_context_limits);
         if let Some(config) = config {
-            let extraction =
-                config.model_text_extraction(accepted_selection.unwrap_or(&served_provider));
+            let extraction = config.model_input_text_extraction(
+                agent_alias,
+                accepted_selection.unwrap_or(&served_provider),
+            );
             ctx.extract_text_reasoning = extraction.reasoning.unwrap_or(true);
             ctx.text_tool_calls_disabled = !extraction.tool_calls;
         }
@@ -4008,6 +4012,7 @@ async fn run_tool_call_loop_impl<'a>(
         on_delta.as_ref(),
         turn_state.canonical.as_deref_mut(),
         config,
+        agent_alias,
         multimodal_config,
         security,
         hooks,
@@ -4527,7 +4532,7 @@ fn build_owned_step_system_prompt(
         excluded_tools,
         owned.activated_tools.as_ref(),
         !config
-            .model_text_extraction(&owned.provider_name)
+            .model_input_text_extraction(Some(alias), &owned.provider_name)
             .tool_calls,
         owned.agent.resolved.prompt_injection_mode,
         owned.agent.resolved.compact_context,

@@ -86,6 +86,7 @@ pub(crate) async fn finish_after_max_iterations(
     on_delta: Option<&Sender<StreamDelta>>,
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
     config: Option<&Config>,
+    agent_alias: Option<&str>,
     multimodal_config: &MultimodalConfig,
     security: Option<&crate::security::SecurityPolicy>,
     hooks: Option<&crate::hooks::HookRunner>,
@@ -397,7 +398,10 @@ pub(crate) async fn finish_after_max_iterations(
             > = match config {
                 Some(config) => {
                     let config = std::sync::Arc::new(config.clone());
-                    std::sync::Arc::new(move |model: &str| config.model_text_extraction(model))
+                    let agent_alias = agent_alias.map(str::to_owned);
+                    std::sync::Arc::new(move |model: &str| {
+                        config.model_input_text_extraction(agent_alias.as_deref(), model)
+                    })
                 }
                 None => std::sync::Arc::new(|_: &str| zeroclaw_api::TextExtraction {
                     reasoning: Some(true),
@@ -523,7 +527,7 @@ pub(crate) async fn finish_after_max_iterations(
         .map_or(provider_name, |attempt| attempt.provider_ref.as_str());
     let extraction: zeroclaw_config::provider_registry::TextExtraction = config
         .map_or_else(Default::default, |config| {
-            config.model_text_extraction(served_ref)
+            config.model_input_text_extraction(agent_alias, served_ref)
         });
     let display_text = zeroclaw_providers::response::normalize_text(&raw_text, extraction);
     let protocol_suppressed = extraction.tool_calls
@@ -721,6 +725,7 @@ mod graceful_summary_metering_tests {
                 None,
                 None,
                 Some(&zeroclaw_config::migration::admit_test_input(&config)),
+                None,
                 &config.multimodal,
                 None,
                 None,
@@ -731,6 +736,7 @@ mod graceful_summary_metering_tests {
                 None,
                 &crate::observability::NoopObserver,
                 None,
+                crate::agent::turn::ToolContextRetention::keep_all(),
             )
             .await
             .unwrap();
@@ -785,6 +791,7 @@ mod graceful_summary_metering_tests {
             None,
             None,
             Some(&zeroclaw_config::migration::admit_test_input(&config)),
+            None,
             &config.multimodal,
             None,
             None,
@@ -795,6 +802,7 @@ mod graceful_summary_metering_tests {
             None,
             &crate::observability::NoopObserver,
             None,
+            crate::agent::turn::ToolContextRetention::keep_all(),
         )
         .await
         .unwrap();
@@ -887,6 +895,7 @@ options = { extract_text_reasoning = true, extract_text_tool_calls = true }
             on_delta,
             None,
             Some(&config),
+            None,
             &multimodal_config,
             None,
             None,
@@ -1250,6 +1259,7 @@ options = { extract_text_reasoning = true, extract_text_tool_calls = true }
                 None,
                 None,
                 None,
+                None,
                 &MultimodalConfig::default(),
                 None,
                 Some(&hooks),
@@ -1402,6 +1412,7 @@ options = { extract_text_reasoning = true, extract_text_tool_calls = true }
                 None,
                 None,
                 None,
+                None,
                 &multimodal_config,
                 None,
                 Some(&hooks),
@@ -1476,6 +1487,7 @@ options = { extract_text_reasoning = true, extract_text_tool_calls = true }
                 "summary-prompt-floor",
                 &LoopKnobs::default(),
                 Some(&tx),
+                None,
                 None,
                 None,
                 None,
@@ -1567,6 +1579,7 @@ options = { extract_text_reasoning = true, extract_text_tool_calls = true }
             "test-model",
             "test-model",
             None,
+            None,
             &pacing,
             None,
             CompletionLimit::LocalIterations(2),
@@ -1574,6 +1587,7 @@ options = { extract_text_reasoning = true, extract_text_tool_calls = true }
             "trace-collapsed-summary",
             &knobs,
             Some(&event_tx),
+            None,
             None,
             None,
             None,
@@ -1694,6 +1708,7 @@ options = { extract_text_reasoning = true, extract_text_tool_calls = true }
             None,
             None,
             None,
+            None,
             &multimodal_config,
             None,
             None,
@@ -1776,6 +1791,7 @@ options = { extract_text_reasoning = true, extract_text_tool_calls = true }
             String::new(),
             "trace-req-img-drop",
             &knobs,
+            None,
             None,
             None,
             None,
@@ -1881,6 +1897,7 @@ options = { extract_text_reasoning = true, extract_text_tool_calls = true }
             None,
             None,
             None,
+            None,
             &multimodal_config,
             None,
             None,
@@ -1961,6 +1978,7 @@ options = { extract_text_reasoning = true, extract_text_tool_calls = true }
             String::new(),
             "trace-req-img-legacy",
             &knobs,
+            None,
             None,
             None,
             None,
@@ -2059,6 +2077,7 @@ options = { extract_text_reasoning = true, extract_text_tool_calls = true }
             None,
             None,
             None,
+            None,
             &multimodal_config,
             None,
             None,
@@ -2112,6 +2131,7 @@ options = { extract_text_reasoning = true, extract_text_tool_calls = true }
             String::new(),
             "trace-req-img-quote-prompt",
             &knobs,
+            None,
             None,
             None,
             None,
@@ -2205,6 +2225,7 @@ options = { extract_text_reasoning = true, extract_text_tool_calls = true }
             None,
             None,
             None,
+            None,
             &multimodal_config,
             None,
             None,
@@ -2293,6 +2314,7 @@ options = { extract_text_reasoning = true, extract_text_tool_calls = true }
             String::new(),
             "trace-req-signed-thinking-degrade",
             &knobs,
+            None,
             None,
             None,
             None,
