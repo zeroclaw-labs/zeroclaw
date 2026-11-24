@@ -2078,6 +2078,7 @@ mod tool_round_policy_tests {
 
     #[tokio::test]
     async fn native_tool_round_flags_reach_stream_and_chat_wires_without_changing_defaults() {
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
         for wire in 0..3 {
             for streaming in [false, true] {
                 for tool_shape in 0..3 {
