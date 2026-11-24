@@ -105,6 +105,12 @@ pub struct Rendered {
     /// it will not come back after a restart. Always `false` for an
     /// in-memory store, which promises nothing across restarts.
     pub save_failed: bool,
+    /// The canvas shows nothing: it was cleared and this frame is an `eval`
+    /// request, which is not content. A `save_failed` then means the cleared
+    /// content's saved copy could not be removed, so it may come back after a
+    /// restart. Always `false` for an in-memory store, which does not track
+    /// what is shown.
+    pub shows_nothing: bool,
 }
 
 /// What [`CanvasStore::clear`] did.
@@ -386,6 +392,7 @@ impl CanvasStore {
         if self.persistence.is_some() && content_type != "eval" {
             entry.displayed = Some(frame.clone());
         }
+        let shows_nothing = self.persistence.is_some() && entry.displayed.is_none();
         entry.history.push(frame.clone());
         if entry.history.len() > MAX_HISTORY_FRAMES {
             let excess = entry.history.len() - MAX_HISTORY_FRAMES;
@@ -398,7 +405,11 @@ impl CanvasStore {
         drop(store);
         let save_failed = self.sync_to_disk(canvas_id);
 
-        Some(Rendered { frame, save_failed })
+        Some(Rendered {
+            frame,
+            save_failed,
+            shows_nothing,
+        })
     }
 
     /// Get the current (most recent) frame for a canvas.
@@ -586,7 +597,9 @@ impl Tool for CanvasTool {
                 }
 
                 match self.store.render(canvas_id, content_type, content) {
-                    Some(Rendered { frame, save_failed }) => {
+                    Some(Rendered {
+                        frame, save_failed, ..
+                    }) => {
                         let mut output = format!(
                             "Rendered {} content to canvas '{}' (frame: {})",
                             content_type, canvas_id, frame.frame_id
@@ -677,16 +690,25 @@ impl Tool for CanvasTool {
                 // canvas shows was saved, so a failure is not forgotten after the turn
                 // that rendered it.
                 match self.store.render(canvas_id, "eval", expression) {
-                    Some(Rendered { frame, save_failed }) => {
+                    Some(Rendered {
+                        frame,
+                        save_failed,
+                        shows_nothing,
+                    }) => {
                         let mut output = format!(
                             "Eval request sent to canvas '{}' (frame: {}). \
                              Result will be available to connected viewers.",
                             canvas_id, frame.frame_id
                         );
                         if save_failed {
+                            let key = if shows_nothing {
+                                "tool-canvas-clear-not-saved"
+                            } else {
+                                "tool-canvas-render-not-saved"
+                            };
                             output.push('\n');
                             output.push_str(&crate::i18n::get_required_tool_string_with_args(
-                                "tool-canvas-render-not-saved",
+                                key,
                                 &[("canvas_id", canvas_id)],
                             ));
                         }
@@ -1274,7 +1296,7 @@ mod tests {
         );
         let eval = store.render("report", "eval", "document.title").unwrap();
         assert!(
-            eval.save_failed,
+            eval.save_failed && !eval.shows_nothing,
             "an eval reports that what the canvas shows is still unsaved"
         );
 
@@ -1302,6 +1324,9 @@ mod tests {
         assert!(cleared.existed);
         assert!(cleared.save_failed);
         assert!(store.snapshot("report").is_none());
+
+        let eval = store.render("report", "eval", "document.title").unwrap();
+        assert!(eval.save_failed && eval.shows_nothing);
     }
 
     #[test]
@@ -1356,6 +1381,22 @@ mod tests {
             .unwrap();
         assert!(cleared.success);
         assert!(cleared.output.contains("could not be removed"));
+
+        let eval = tool
+            .execute(
+                json!({"action": "eval", "canvas_id": "report", "expression": "document.title"}),
+            )
+            .await
+            .unwrap();
+        assert!(eval.success);
+        assert!(
+            eval.output.contains("could not be removed"),
+            "an eval over a cleared canvas reports the copy that may come back"
+        );
+        assert!(
+            !eval.output.contains("could not be saved"),
+            "an empty canvas does not show unsaved content"
+        );
     }
 
     #[tokio::test]
