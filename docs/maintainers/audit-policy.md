@@ -76,6 +76,25 @@ Live, deny+audit (both files):
     `rusqlite` 0.41 bump, once `matrix-sdk-sqlite` accepts it. Tracking
     #12320.
 
+Live, audit-only (`.cargo/audit.toml` only):
+
+- **`cookie` 0.16.2 (`RUSTSEC-2026-0594`)**: private cookies can reuse
+  nonces in a process that forks. The fix is `cookie` 0.18.3.
+  - **Exposure:** none of our builds compiles the affected code. Private
+    and signed cookies live in `cookie`'s `secure` module, which compiles
+    only with its `private` or `signed` feature, and neither is enabled
+    anywhere in the workspace. The 0.18 copy that `fantoccini` and the
+    desktop app's `tauri` and `wry` use is on the fixed 0.18.3.
+  - **The fix is unreachable for this copy.** `cookie` 0.16.2 comes in only
+    through `webdriver`, which `fantoccini` pulls in behind the optional
+    `browser-native` feature. `webdriver` 0.54.0, the newest release, still
+    requires `cookie` `^0.16`, and no 0.16.x release has the fix.
+  - **Why only `audit.toml`:** `cargo deny`'s configured graph doesn't
+    include `browser-native`, so only `cargo audit` reports it.
+  - **When to remove it:** once a `webdriver` (or `fantoccini`) release
+    accepts `cookie` 0.18.3 or later, update it so `cookie` 0.16 leaves
+    `Cargo.lock`, and remove the entry in the same change. Tracking #12693.
+
 The previous entry in this category, `RUSTSEC-2026-0292`
 (`imbl-sized-chunks` double free), was waived in PR #11038 on 2026-09-21
 and cleared four days later by the `matrix-sdk` 0.19 bump, which resolves
@@ -209,7 +228,8 @@ unaffected by the advisory):
   not because the crate left `Cargo.lock`. Remaining deny+audit live
   ignores: `rustls-pemfile`, and the `libsqlite3-sys` waiver tracked in
   #12320. Remaining audit-only ignores:
-  `lru` (1, tracked in #9602) plus the 19 lockfile-stale entries above.
+  `lru` (1, tracked in #9602), the `cookie` 0.16.2 waiver (1, tracked in
+  #12693), plus the 19 lockfile-stale entries above.
 - **#9899**: *Remove the `matrix-sdk -> imbl` advisory waivers.* Closed by
   the `matrix-sdk` 0.19 bump. The resolved graph and `Cargo.lock` no longer
   contain `bitmaps` or an affected `imbl-sized-chunks`, so
@@ -224,6 +244,7 @@ unaffected by the advisory):
   which needs a `matrix-sdk-sqlite` release that accepts `rusqlite` 0.41.
   That change removes the waiver from both files.
 - **#12505**: *Track replacement of unmaintained chrono and chrono-tz dependencies.* Owns the `chrono` (RUSTSEC-2026-0543) and `chrono-tz` (RUSTSEC-2026-0555) exceptions, both present only in `deny.toml`. It stays open until the workspace and its dependencies no longer pull either crate into the resolved graph; that change removes both exceptions and updates this inventory.
+- **#12693**: *Security job fails on every build: RUSTSEC-2026-0594.* Owns the `cookie` 0.16.2 waiver, present only in `.cargo/audit.toml`. It stays open until a `webdriver` or `fantoccini` release lets `cookie` 0.16 leave `Cargo.lock`; that change removes the waiver and updates this inventory.
 - **#8059**: *Policy cleanup: deny.toml ignored-advisory tracking,
   multiple-versions, wildcards.* piiiico's RFC on adding per-entry
   rationale to `deny.toml` ignore blocks. This doc is the
@@ -258,6 +279,14 @@ two tools have drifted again. Open or update the tracking issue.
 
 ## Change log
 
+- 2026-11-23: Updated `cookie` 0.18.1 to 0.18.3 and added `RUSTSEC-2026-0594`
+  (`cookie` 0.16.2) to `.cargo/audit.toml` only, with its category 1 entry
+  above.
+  - **Why a waiver:** the advisory reached the database on 2026-11-23 and
+    failed `cargo audit` in the `Security` job on every build. The 0.18 copy
+    moves to the fix, but `webdriver` 0.54.0 still requires `cookie` `^0.16`.
+  - **Why only `audit.toml`:** `cargo deny check` passes, because its
+    configured graph doesn't include the optional `browser-native` feature.
 - 2026-11-17: Added `RUSTSEC-2026-0543` (`chrono`) and `RUSTSEC-2026-0555`
   (`chrono-tz`) to `deny.toml` only, with their deny-only entries above.
   - **Why a waiver:** both advisories were assigned their IDs in the
