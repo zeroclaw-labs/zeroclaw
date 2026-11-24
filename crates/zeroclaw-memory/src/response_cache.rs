@@ -296,6 +296,45 @@ mod tests {
         (tmp, cache)
     }
 
+    #[test]
+    fn response_cache_reopens_unicode_response_and_persists_hot_overwrite() {
+        let tmp = TempDir::new().unwrap();
+        let key = ResponseCache::cache_key("test-model", None, "中文 🦀 e\u{301}\n\"prompt\"");
+        let first = "  中文 🦀\r\ne\u{301}\t\"quoted\"\\tail  ";
+        let replacement = "更新 🦀\n  café\r\n";
+
+        let cache = ResponseCache::new(tmp.path(), 60, 1000).unwrap();
+        cache.put(&key, "test-model", first, 17).unwrap();
+        assert_eq!(cache.get(&key).unwrap().as_deref(), Some(first));
+        drop(cache);
+
+        let cache = ResponseCache::new(tmp.path(), 60, 1000).unwrap();
+        // The first read must come from disk; the next uses the promoted entry.
+        assert_eq!(cache.get(&key).unwrap().as_deref(), Some(first));
+        assert_eq!(cache.get(&key).unwrap().as_deref(), Some(first));
+        cache.put(&key, "test-model", replacement, 23).unwrap();
+        assert_eq!(cache.get(&key).unwrap().as_deref(), Some(replacement));
+        drop(cache);
+
+        let conn = Connection::open(tmp.path().join("memory/response_cache.db")).unwrap();
+        let stored: (String, String, u32) = conn
+            .query_row(
+                "SELECT model, response, token_count FROM response_cache WHERE prompt_hash = ?1",
+                [&key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, ("test-model".into(), replacement.into(), 23));
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM response_cache", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        drop(conn);
+
+        let cache = ResponseCache::new(tmp.path(), 60, 1000).unwrap();
+        assert_eq!(cache.get(&key).unwrap().as_deref(), Some(replacement));
+    }
+
     #[cfg(unix)]
     #[test]
     fn response_cache_hardens_fresh_storage_permissions() {

@@ -23,8 +23,12 @@ mod degraded_config_remediation;
 mod desktop_cli_linux;
 mod direct_cli_terminal_completion;
 mod dockerignore_test;
+#[cfg(feature = "agent-runtime")]
+mod estop_cli;
 #[cfg(feature = "gateway")]
 mod gateway;
+#[cfg(all(feature = "agent-runtime", feature = "gateway"))]
+mod gateway_get_paircode_cli;
 mod gemini_capabilities;
 mod hardware_probe_feature_graph;
 mod oidc_enrollment_cli;
@@ -38,6 +42,8 @@ mod reply_target_field_regression;
 mod schema_export_feature_graph;
 mod security;
 mod skills_bundle_cli;
+#[cfg(feature = "agent-runtime")]
+mod status_memory_cli;
 #[cfg(feature = "agent-runtime")]
 mod verifiable_intent_notice_visibility;
 #[cfg(feature = "gateway")]
