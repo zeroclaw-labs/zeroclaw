@@ -184,18 +184,40 @@ mod native_effort {
                 Err(UnmappedReason::UnverifiedChatTools)
             );
         }
-        assert_eq!(
-            resolve(
-                ReasoningSurface::PublicApi,
-                ReasoningApi::ChatCompletions,
-                "gpt-5.4",
-                ThinkingLevel::High,
-                true
-            )
-            .unwrap()
-            .effort,
-            NativeEffort::High
-        );
+        for model in [
+            "gpt-5.4",
+            "gpt-5.4-2026-03-05",
+            "gpt-5.4-mini",
+            "gpt-5.4-mini-2026-03-17",
+            "gpt-5.4-nano",
+            "gpt-5.4-nano-2026-03-17",
+            "gpt-5.5",
+            "gpt-5.5-2026-04-23",
+            "gpt-5.6",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ] {
+            for (api, has_tools, expected) in [
+                (ReasoningApi::Responses, true, NativeEffort::High),
+                (ReasoningApi::ChatCompletions, false, NativeEffort::High),
+                (ReasoningApi::ChatCompletions, true, NativeEffort::None),
+            ] {
+                assert_eq!(
+                    resolve(
+                        ReasoningSurface::PublicApi,
+                        api,
+                        model,
+                        ThinkingLevel::High,
+                        has_tools
+                    )
+                    .unwrap()
+                    .effort,
+                    expected,
+                    "{model} {api:?}, with tools: {has_tools}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -629,6 +651,8 @@ mod native_effort {
         ] {
             let server = CapturedOpenAi::start().await;
             let provider = server.provider(wire);
+            let request_tools =
+                (wire == zeroclaw_config::schema::WireApi::Responses).then_some(tools.as_slice());
             for level in [
                 ThinkingLevel::Off,
                 ThinkingLevel::Minimal,
@@ -641,7 +665,7 @@ mod native_effort {
                     .chat(
                         ChatRequest {
                             messages: &messages,
-                            tools: Some(&tools),
+                            tools: request_tools,
                             thinking: None,
                             thinking_level: Some(level),
                         },
@@ -656,7 +680,7 @@ mod native_effort {
                     .chat(
                         ChatRequest {
                             messages: &messages,
-                            tools: Some(&tools),
+                            tools: request_tools,
                             thinking: None,
                             thinking_level: None,
                         },
@@ -685,6 +709,36 @@ mod native_effort {
                 assert!(bodies[6].get("reasoning_effort").is_none());
             }
             assert_eq!(bodies[6]["temperature"], 0.7);
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_wire_keeps_tools_and_caps_reasoning_at_none_when_required() {
+        let messages = [ChatMessage::user("inspect")];
+        let tools = tool_fixture();
+        let server = CapturedOpenAi::start().await;
+        let provider = server.provider(zeroclaw_config::schema::WireApi::ChatCompletions);
+        for model in ["gpt-5.4", "gpt-5.6-terra"] {
+            provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: Some(&tools),
+                        thinking: None,
+                        thinking_level: Some(ThinkingLevel::High),
+                    },
+                    model,
+                    Some(0.7),
+                )
+                .await
+                .unwrap();
+        }
+        let bodies = server.bodies();
+        assert_eq!(bodies.len(), 2);
+        for body in bodies {
+            assert_eq!(body["reasoning_effort"], "none");
+            assert_eq!(body["tools"][0]["function"]["name"], "inspect_value");
+            assert_eq!(body["temperature"], 0.7);
         }
     }
 

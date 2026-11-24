@@ -309,8 +309,11 @@ sets come from the [OpenAI model documentation](https://developers.openai.com/ap
 subscription sets come separately from the
 [official Codex catalog](https://github.com/openai/codex/blob/6aaf2a86b198bb0ee8f9d995e79155ad5c7f6357/codex-rs/models-manager/models.json).
 They can differ for the same model ID. The client mode `ultra` is never sent as
-native effort. Chat Completions with tools maps only verified combinations;
-models requiring Responses for tool reasoning should use `wire_api = "responses"`.
+native effort. Chat Completions with tools maps only verified combinations.
+For models such as GPT-5.4, GPT-5.5, and GPT-5.6 that limit Chat Completions
+tools to `reasoning_effort = "none"`, this is the only mapped effort when
+tools are present. Use `wire_api = "responses"` to combine tools and reasoning.
+See the [OpenAI migration guide](https://developers.openai.com/api/docs/guides/migrate-to-responses#additional-differences).
 On the public API, GPT-6.2 Astra and GPT-6.2 Sol map `off` to `low` and
 require Responses for tool calling. See the
 [OpenAI deployment checklist](https://developers.openai.com/api/docs/guides/deployment-checklist).

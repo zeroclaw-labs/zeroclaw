@@ -76,6 +76,10 @@ struct ModelEfforts {
     chat_tools: Option<&'static [NativeEffort]>,
 }
 
+// Chat Completions tool calls for these models require disabled reasoning.
+// https://developers.openai.com/api/docs/guides/migrate-to-responses#additional-differences
+const CHAT_TOOLS_WITHOUT_REASONING: &[NativeEffort] = &[NativeEffort::None];
+
 const PUBLIC_MODELS: &[ModelEfforts] = &[
     // https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5.2
     // https://developers.openai.com/api/docs/models/o3
@@ -167,13 +171,7 @@ const PUBLIC_MODELS: &[ModelEfforts] = &[
             NativeEffort::XHigh,
         ],
         chat_supported: true,
-        chat_tools: Some(&[
-            NativeEffort::None,
-            NativeEffort::Low,
-            NativeEffort::Medium,
-            NativeEffort::High,
-            NativeEffort::XHigh,
-        ]),
+        chat_tools: Some(CHAT_TOOLS_WITHOUT_REASONING),
     },
     // https://developers.openai.com/api/docs/models/gpt-5.4-nano
     ModelEfforts {
@@ -186,13 +184,7 @@ const PUBLIC_MODELS: &[ModelEfforts] = &[
             NativeEffort::XHigh,
         ],
         chat_supported: true,
-        chat_tools: Some(&[
-            NativeEffort::None,
-            NativeEffort::Low,
-            NativeEffort::Medium,
-            NativeEffort::High,
-            NativeEffort::XHigh,
-        ]),
+        chat_tools: Some(CHAT_TOOLS_WITHOUT_REASONING),
     },
     // https://developers.openai.com/api/docs/models/gpt-5.4-pro
     ModelEfforts {
@@ -216,13 +208,7 @@ const PUBLIC_MODELS: &[ModelEfforts] = &[
             NativeEffort::XHigh,
         ],
         chat_supported: true,
-        chat_tools: Some(&[
-            NativeEffort::None,
-            NativeEffort::Low,
-            NativeEffort::Medium,
-            NativeEffort::High,
-            NativeEffort::XHigh,
-        ]),
+        chat_tools: Some(CHAT_TOOLS_WITHOUT_REASONING),
     },
     // https://developers.openai.com/api/docs/models/gpt-5.5-pro
     ModelEfforts {
@@ -246,13 +232,7 @@ const PUBLIC_MODELS: &[ModelEfforts] = &[
             NativeEffort::XHigh,
         ],
         chat_supported: true,
-        chat_tools: Some(&[
-            NativeEffort::None,
-            NativeEffort::Low,
-            NativeEffort::Medium,
-            NativeEffort::High,
-            NativeEffort::XHigh,
-        ]),
+        chat_tools: Some(CHAT_TOOLS_WITHOUT_REASONING),
     },
     // https://developers.openai.com/api/docs/models/gpt-5.6-luna
     ModelEfforts {
@@ -266,14 +246,7 @@ const PUBLIC_MODELS: &[ModelEfforts] = &[
             NativeEffort::Max,
         ],
         chat_supported: true,
-        chat_tools: Some(&[
-            NativeEffort::None,
-            NativeEffort::Low,
-            NativeEffort::Medium,
-            NativeEffort::High,
-            NativeEffort::XHigh,
-            NativeEffort::Max,
-        ]),
+        chat_tools: Some(CHAT_TOOLS_WITHOUT_REASONING),
     },
     // https://developers.openai.com/api/docs/models/gpt-5.6-sol
     ModelEfforts {
@@ -287,14 +260,7 @@ const PUBLIC_MODELS: &[ModelEfforts] = &[
             NativeEffort::Max,
         ],
         chat_supported: true,
-        chat_tools: Some(&[
-            NativeEffort::None,
-            NativeEffort::Low,
-            NativeEffort::Medium,
-            NativeEffort::High,
-            NativeEffort::XHigh,
-            NativeEffort::Max,
-        ]),
+        chat_tools: Some(CHAT_TOOLS_WITHOUT_REASONING),
     },
     // https://developers.openai.com/api/docs/models/gpt-5.6-terra
     ModelEfforts {
@@ -308,14 +274,7 @@ const PUBLIC_MODELS: &[ModelEfforts] = &[
             NativeEffort::Max,
         ],
         chat_supported: true,
-        chat_tools: Some(&[
-            NativeEffort::None,
-            NativeEffort::Low,
-            NativeEffort::Medium,
-            NativeEffort::High,
-            NativeEffort::XHigh,
-            NativeEffort::Max,
-        ]),
+        chat_tools: Some(CHAT_TOOLS_WITHOUT_REASONING),
     },
     // https://developers.openai.com/api/docs/models/gpt-5-pro
     ModelEfforts {
@@ -384,7 +343,7 @@ const PUBLIC_MODELS: &[ModelEfforts] = &[
             NativeEffort::Max,
         ],
         chat_supported: true,
-        chat_tools: Some(&[NativeEffort::None]),
+        chat_tools: Some(CHAT_TOOLS_WITHOUT_REASONING),
     },
     // https://developers.openai.com/api/docs/models/gpt-6-sol
     ModelEfforts {
@@ -398,7 +357,7 @@ const PUBLIC_MODELS: &[ModelEfforts] = &[
             NativeEffort::Max,
         ],
         chat_supported: true,
-        chat_tools: Some(&[NativeEffort::None]),
+        chat_tools: Some(CHAT_TOOLS_WITHOUT_REASONING),
     },
     // https://developers.openai.com/api/docs/models/gpt-6.1-sol
     ModelEfforts {
