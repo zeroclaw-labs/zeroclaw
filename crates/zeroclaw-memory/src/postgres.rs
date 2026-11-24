@@ -302,6 +302,145 @@ impl PostgresMemory {
             agent_id: row.try_get("agent_id").ok(),
         })
     }
+
+    async fn recall_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        prompt_only: bool,
+    ) -> Result<Vec<MemoryEntry>> {
+        let client = self.client.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let query = normalize_recent_recall_query(query).trim().to_string();
+        let sid = session_id.map(str::to_string);
+        let since_owned = since.map(str::to_string);
+        let until_owned = until.map(str::to_string);
+
+        run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
+            let mut client = client.lock();
+            let since_ref = since_owned.as_deref();
+            let until_ref = until_owned.as_deref();
+
+            let time_filter = recall_time_filter(since_ref.is_some(), until_ref.is_some(), 4);
+
+            let prompt_filter = if prompt_only { prompt_key_filter() } else { String::new() };
+            let stmt = format!(
+                "
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
+                       (
+                         CASE WHEN to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)
+                           THEN ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0
+                           ELSE 0.0 END +
+                         CASE WHEN to_tsvector('simple', m.content) @@ plainto_tsquery('simple', $1)
+                           THEN ts_rank_cd(to_tsvector('simple', m.content), plainto_tsquery('simple', $1))
+                           ELSE 0.0 END
+                       ) AS score
+                FROM {qualified_table} m
+                LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                WHERE ($2::TEXT IS NULL OR m.session_id = $2)
+                  AND ($1 = '' OR to_tsvector('simple', m.key || ' ' || m.content) @@ plainto_tsquery('simple', $1))
+                  {time_filter}{prompt_filter}
+                ORDER BY score DESC, m.updated_at DESC
+                LIMIT $3
+                ",
+            );
+
+            #[allow(clippy::cast_possible_wrap)]
+            let limit_i64 = limit as i64;
+
+            let rows = match (since_ref, until_ref) {
+                (Some(s), Some(u)) => client.query(&stmt, &[&query, &sid, &limit_i64, &s, &u])?,
+                (Some(s), None) => client.query(&stmt, &[&query, &sid, &limit_i64, &s])?,
+                (None, Some(u)) => client.query(&stmt, &[&query, &sid, &limit_i64, &u])?,
+                (None, None) => client.query(&stmt, &[&query, &sid, &limit_i64])?,
+            };
+            rows.iter()
+                .map(Self::row_to_entry)
+                .collect::<Result<Vec<MemoryEntry>>>()
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn recall_for_agents_filtered(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        prompt_only: bool,
+    ) -> Result<Vec<MemoryEntry>> {
+        // Empty allowlist means "no agent filter": fall back to plain
+        // recall. The wrapper always includes the bound agent's UUID,
+        // so a non-empty allowlist is the live-runtime case.
+        if allowed_agent_ids.is_empty() {
+            return self
+                .recall_filtered(query, limit, session_id, since, until, prompt_only)
+                .await;
+        }
+
+        let client = self.client.get().clone();
+        let qualified_table = self.qualified_table.clone();
+        let qualified_agents = self.qualified_agents.clone();
+        let q = normalize_recent_recall_query(query).trim().to_string();
+        let sid = session_id.map(str::to_string);
+        let since_owned = since.map(str::to_string);
+        let until_owned = until.map(str::to_string);
+        let allowed: Vec<String> = allowed_agent_ids.iter().map(|s| (*s).to_string()).collect();
+
+        run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
+            let mut client = client.lock();
+            let since_ref = since_owned.as_deref();
+            let until_ref = until_owned.as_deref();
+
+            let time_filter = recall_time_filter(since_ref.is_some(), until_ref.is_some(), 5);
+
+            let prompt_filter = if prompt_only { prompt_key_filter() } else { String::new() };
+            let stmt = format!(
+                "
+                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
+                       (
+                         CASE WHEN to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)
+                           THEN ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0
+                           ELSE 0.0 END +
+                         CASE WHEN to_tsvector('simple', m.content) @@ plainto_tsquery('simple', $1)
+                           THEN ts_rank_cd(to_tsvector('simple', m.content), plainto_tsquery('simple', $1))
+                           ELSE 0.0 END
+                       ) AS score
+                FROM {qualified_table} m
+                LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
+                WHERE ($2::TEXT IS NULL OR m.session_id = $2)
+                  AND ($1 = '' OR to_tsvector('simple', m.key || ' ' || m.content) @@ plainto_tsquery('simple', $1))
+                  AND m.agent_id = ANY($4)
+                  {time_filter}{prompt_filter}
+                ORDER BY score DESC, m.updated_at DESC
+                LIMIT $3
+                ",
+            );
+
+            #[allow(clippy::cast_possible_wrap)]
+            let limit_i64 = limit as i64;
+
+            let rows = match (since_ref, until_ref) {
+                (Some(s), Some(u)) => {
+                    client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &s, &u])?
+                }
+                (Some(s), None) => client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &s])?,
+                (None, Some(u)) => client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &u])?,
+                (None, None) => client.query(&stmt, &[&q, &sid, &limit_i64, &allowed])?,
+            };
+            rows.iter()
+                .map(Self::row_to_entry)
+                .collect::<Result<Vec<MemoryEntry>>>()
+        })
+        .await
+    }
 }
 
 async fn run_on_os_thread<F, T>(f: F) -> Result<T>
@@ -357,6 +496,23 @@ pub(super) fn quote_identifier(value: &str) -> String {
     format!("\"{value}\"")
 }
 
+/// Match the autosave predicate before SQL LIMIT without LIKE's wildcard underscores.
+fn prompt_key_filter() -> String {
+    // Rust trim uses Unicode White_Space; btrim defaults to ASCII space.
+    let whitespace: String = [
+        9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199,
+        8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288,
+    ]
+    .into_iter()
+    .filter_map(char::from_u32)
+    .collect();
+    // ASCII-only case folding matches is_user_autosave_key in every DB locale.
+    let key = format!(
+        "translate(btrim(m.key, '{whitespace}'), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"
+    );
+    format!(" AND {key} != 'user_msg' AND left({key}, 9) != 'user_msg_'")
+}
+
 fn recall_time_filter(since: bool, until: bool, first_placeholder: usize) -> String {
     match (since, until) {
         (true, true) => format!(
@@ -398,55 +554,36 @@ impl Memory for PostgresMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        let client = self.client.get().clone();
-        let qualified_table = self.qualified_table.clone();
-        let qualified_agents = self.qualified_agents.clone();
-        let query = normalize_recent_recall_query(query).trim().to_string();
-        let sid = session_id.map(str::to_string);
-        let since_owned = since.map(str::to_string);
-        let until_owned = until.map(str::to_string);
+        self.recall_filtered(query, limit, session_id, since, until, false)
+            .await
+    }
 
-        run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
-            let mut client = client.lock();
-            let since_ref = since_owned.as_deref();
-            let until_ref = until_owned.as_deref();
+    async fn recall_for_prompt(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        self.recall_filtered(query, limit, session_id, None, None, true)
+            .await
+    }
 
-            let time_filter = recall_time_filter(since_ref.is_some(), until_ref.is_some(), 4);
-
-            let stmt = format!(
-                "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
-                       (
-                         CASE WHEN to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)
-                           THEN ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0
-                           ELSE 0.0 END +
-                         CASE WHEN to_tsvector('simple', m.content) @@ plainto_tsquery('simple', $1)
-                           THEN ts_rank_cd(to_tsvector('simple', m.content), plainto_tsquery('simple', $1))
-                           ELSE 0.0 END
-                       ) AS score
-                FROM {qualified_table} m
-                LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
-                WHERE ($2::TEXT IS NULL OR m.session_id = $2)
-                  AND ($1 = '' OR to_tsvector('simple', m.key || ' ' || m.content) @@ plainto_tsquery('simple', $1))
-                  {time_filter}
-                ORDER BY score DESC, m.updated_at DESC
-                LIMIT $3
-                ",
-            );
-
-            #[allow(clippy::cast_possible_wrap)]
-            let limit_i64 = limit as i64;
-
-            let rows = match (since_ref, until_ref) {
-                (Some(s), Some(u)) => client.query(&stmt, &[&query, &sid, &limit_i64, &s, &u])?,
-                (Some(s), None) => client.query(&stmt, &[&query, &sid, &limit_i64, &s])?,
-                (None, Some(u)) => client.query(&stmt, &[&query, &sid, &limit_i64, &u])?,
-                (None, None) => client.query(&stmt, &[&query, &sid, &limit_i64])?,
-            };
-            rows.iter()
-                .map(Self::row_to_entry)
-                .collect::<Result<Vec<MemoryEntry>>>()
-        })
+    async fn recall_for_prompt_for_agents(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        self.recall_for_agents_filtered(
+            allowed_agent_ids,
+            query,
+            limit,
+            session_id,
+            None,
+            None,
+            true,
+        )
         .await
     }
 
@@ -753,66 +890,15 @@ impl Memory for PostgresMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        // Empty allowlist means "no agent filter": fall back to plain
-        // recall. The wrapper always includes the bound agent's UUID,
-        // so a non-empty allowlist is the live-runtime case.
-        if allowed_agent_ids.is_empty() {
-            return self.recall(query, limit, session_id, since, until).await;
-        }
-
-        let client = self.client.get().clone();
-        let qualified_table = self.qualified_table.clone();
-        let qualified_agents = self.qualified_agents.clone();
-        let q = normalize_recent_recall_query(query).trim().to_string();
-        let sid = session_id.map(str::to_string);
-        let since_owned = since.map(str::to_string);
-        let until_owned = until.map(str::to_string);
-        let allowed: Vec<String> = allowed_agent_ids.iter().map(|s| (*s).to_string()).collect();
-
-        run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
-            let mut client = client.lock();
-            let since_ref = since_owned.as_deref();
-            let until_ref = until_owned.as_deref();
-
-            let time_filter = recall_time_filter(since_ref.is_some(), until_ref.is_some(), 5);
-
-            let stmt = format!(
-                "
-                SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, a.alias AS agent_alias, m.agent_id,
-                       (
-                         CASE WHEN to_tsvector('simple', m.key) @@ plainto_tsquery('simple', $1)
-                           THEN ts_rank_cd(to_tsvector('simple', m.key), plainto_tsquery('simple', $1)) * 2.0
-                           ELSE 0.0 END +
-                         CASE WHEN to_tsvector('simple', m.content) @@ plainto_tsquery('simple', $1)
-                           THEN ts_rank_cd(to_tsvector('simple', m.content), plainto_tsquery('simple', $1))
-                           ELSE 0.0 END
-                       ) AS score
-                FROM {qualified_table} m
-                LEFT JOIN {qualified_agents} a ON a.id = m.agent_id
-                WHERE ($2::TEXT IS NULL OR m.session_id = $2)
-                  AND ($1 = '' OR to_tsvector('simple', m.key || ' ' || m.content) @@ plainto_tsquery('simple', $1))
-                  AND m.agent_id = ANY($4)
-                  {time_filter}
-                ORDER BY score DESC, m.updated_at DESC
-                LIMIT $3
-                ",
-            );
-
-            #[allow(clippy::cast_possible_wrap)]
-            let limit_i64 = limit as i64;
-
-            let rows = match (since_ref, until_ref) {
-                (Some(s), Some(u)) => {
-                    client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &s, &u])?
-                }
-                (Some(s), None) => client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &s])?,
-                (None, Some(u)) => client.query(&stmt, &[&q, &sid, &limit_i64, &allowed, &u])?,
-                (None, None) => client.query(&stmt, &[&q, &sid, &limit_i64, &allowed])?,
-            };
-            rows.iter()
-                .map(Self::row_to_entry)
-                .collect::<Result<Vec<MemoryEntry>>>()
-        })
+        self.recall_for_agents_filtered(
+            allowed_agent_ids,
+            query,
+            limit,
+            session_id,
+            since,
+            until,
+            false,
+        )
         .await
     }
 
@@ -1097,6 +1183,31 @@ mod tests {
             assert!(memory.forget("ci_key").await.unwrap());
             assert_eq!(memory.count().await.unwrap(), 0);
         });
+    }
+
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_prompt_key_filter_matches_rust_predicate() {
+        let mut client = Client::connect(&postgres_test_url(), NoTls).unwrap();
+        let sql = format!(
+            "SELECT EXISTS (SELECT 1 FROM (SELECT $1::TEXT AS key) m WHERE TRUE{})",
+            prompt_key_filter()
+        );
+        for key in [
+            "user_msg",
+            "user_msg_",
+            "USER_MSG_abc",
+            "\tuser_msg_abc\n",
+            "\u{2003}USER_MSG_abc\u{a0}",
+            "userXmsg_abc",
+            "user_message",
+            "fact",
+            "assistant_resp_abc",
+            "üser_msg_abc",
+        ] {
+            let included: bool = client.query_one(&sql, &[&key]).unwrap().get(0);
+            assert_eq!(included, !crate::is_user_autosave_key(key), "{key:?}");
+        }
     }
 
     #[test]

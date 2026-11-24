@@ -11,6 +11,11 @@ use tokio::sync::OnceCell;
 use uuid::Uuid;
 use zeroclaw_api::session_keys::sanitize_session_key;
 
+// Fixed prompt-only limits also bound scanner overfetch. No archive API change.
+const PROMPT_PAGE_POINTS: usize = 64;
+const PROMPT_MAX_PAGES: usize = 16;
+const PROMPT_PAGE_BYTES: usize = 1024 * 1024;
+
 /// Qdrant vector database memory backend.
 /// Uses Qdrant's REST API for vector storage and semantic search.
 /// Requires an embedding model_provider for converting text to vectors.
@@ -29,6 +34,185 @@ pub struct QdrantMemory {
 }
 
 impl QdrantMemory {
+    /// Prompt recall is intentionally incomplete past 1,024 raw points / 16
+    /// pages / 16 MiB / 5 seconds. Keep eligible partial results on a later
+    /// failure; never retry embedding or scan an entire archive to fill a quota.
+    /// Search uses ranked offsets; recent/empty-vector fallback uses scroll
+    /// continuations (point-id order, as in ordinary recall, not newest-first).
+    async fn recall_prompt_candidates(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        tokio::time::timeout_at(deadline, self.ensure_initialized()).await??;
+        let embedding = if is_recent_recall_query(query) {
+            Vec::new()
+        } else {
+            let embedder = self.embedder.read().clone();
+            tokio::time::timeout_at(deadline, embedder.embed_one(query)).await??
+        };
+        let search = !embedding.is_empty();
+        let endpoint = if search { "search" } else { "scroll" };
+        let mut must = Vec::new();
+        if let Some(sid) = session_id {
+            must.push(serde_json::json!({"key": "session_id", "match": {"value": sid}}));
+        }
+        // Empty allowlist retains the existing unscoped meaning.
+        if !allowed_agent_ids.is_empty() {
+            must.push(serde_json::json!({"key": "agent_id", "match": {"any": allowed_agent_ids}}));
+        }
+        let mut body = serde_json::json!({"limit": PROMPT_PAGE_POINTS, "with_payload": true});
+        if !must.is_empty() {
+            body["filter"] = serde_json::json!({"must": must});
+        }
+        if search {
+            body["vector"] = serde_json::json!(embedding);
+            body["offset"] = serde_json::json!(0);
+        }
+        let mut entries = Vec::new();
+        let mut ids = HashSet::new();
+        let mut cursors = HashSet::new();
+        let mut raw_seen = 0;
+        for _ in 0..PROMPT_MAX_PAGES {
+            let page =
+                match tokio::time::timeout_at(deadline, self.prompt_page(endpoint, &body)).await {
+                    Ok(Ok(page)) => page,
+                    result => {
+                        // A failed first page remains an error. A later failure
+                        // must not discard useful, already scope-filtered facts.
+                        if !entries.is_empty() {
+                            return Ok(entries);
+                        }
+                        return match result {
+                            Ok(Err(error)) => Err(error),
+                            Err(error) => Err(error.into()),
+                            Ok(Ok(_)) => unreachable!(),
+                        };
+                    }
+                };
+            let points = if search {
+                page.get("result")
+            } else {
+                page.pointer("/result/points")
+            }
+            .and_then(serde_json::Value::as_array);
+            let Some(points) = points else {
+                if !entries.is_empty() {
+                    return Ok(entries);
+                }
+                anyhow::bail!("invalid Qdrant prompt page");
+            };
+            // Count raw points BEFORE decoding/filtering. A malformed payload
+            // is not evidence of exhaustion and must still advance the offset.
+            if points.len() > PROMPT_PAGE_POINTS {
+                if !entries.is_empty() {
+                    return Ok(entries);
+                }
+                anyhow::bail!("Qdrant prompt page exceeds point budget");
+            }
+            raw_seen += points.len();
+            for point in points {
+                let Some(entry) = Self::prompt_entry(point, search) else {
+                    continue;
+                };
+                if !crate::is_user_autosave_key(&entry.key) && ids.insert(entry.id.clone()) {
+                    entries.push(entry);
+                    if entries.len() >= limit {
+                        return Ok(entries);
+                    }
+                }
+            }
+            if search {
+                if points.len() < PROMPT_PAGE_POINTS {
+                    break;
+                }
+                body["offset"] = serde_json::json!(raw_seen);
+            } else {
+                let Some(next) = page
+                    .pointer("/result/next_page_offset")
+                    .filter(|v| !v.is_null())
+                else {
+                    break;
+                };
+                if !(next.is_string() || next.is_u64()) || !cursors.insert(next.to_string()) {
+                    break;
+                }
+                body["offset"] = next.clone();
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Bound bytes before JSON decoding (without reading error response bodies); the caller
+    /// applies one shared deadline across initialization, embedding and pages.
+    async fn prompt_page(
+        &self,
+        endpoint: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let mut response = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/collections/{}/points/{endpoint}", self.collection),
+            )
+            .json(body)
+            .send()
+            .await?;
+        response.error_for_status_ref()?;
+        if response
+            .content_length()
+            .is_some_and(|n| n > PROMPT_PAGE_BYTES as u64)
+        {
+            anyhow::bail!("Qdrant prompt page exceeds byte budget");
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if chunk.len() > PROMPT_PAGE_BYTES - bytes.len() {
+                anyhow::bail!("Qdrant prompt page exceeds byte budget");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    fn prompt_entry(point: &serde_json::Value, search: bool) -> Option<MemoryEntry> {
+        let payload: MemoryPayload = serde_json::from_value(point.get("payload")?.clone()).ok()?;
+        let id = match point.get("id")? {
+            serde_json::Value::String(id) => id.clone(),
+            serde_json::Value::Number(id) => id.to_string(),
+            _ => return None,
+        };
+        let score = if search {
+            Some(point.get("score")?.as_f64()?)
+        } else {
+            None
+        };
+        Some(MemoryEntry {
+            id,
+            key: payload.key,
+            content: payload.content,
+            category: Self::parse_category(&payload.category),
+            timestamp: payload.timestamp,
+            session_id: payload.session_id,
+            score,
+            namespace: "default".into(),
+            importance: None,
+            superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
+            principal_id: None,
+            agent_alias: payload.agent_id.clone(),
+            agent_id: payload.agent_id,
+        })
+    }
+
     fn add_time_range_filter(
         must: &mut Vec<serde_json::Value>,
         since: Option<&str>,
@@ -838,6 +1022,27 @@ impl Memory for QdrantMemory {
         Ok(entries)
     }
 
+    async fn recall_for_prompt(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        self.recall_prompt_candidates(&[], query, limit, session_id)
+            .await
+    }
+
+    async fn recall_for_prompt_for_agents(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        self.recall_prompt_candidates(allowed_agent_ids, query, limit, session_id)
+            .await
+    }
+
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
         self.scroll_first_matching(&[("key", key)]).await
     }
@@ -1304,6 +1509,332 @@ mod tests {
                 "agent_id": "alpha"
             }
         })
+    }
+
+    struct CountingEmbedding {
+        calls: std::sync::atomic::AtomicUsize,
+        empty: bool,
+    }
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for CountingEmbedding {
+        fn name(&self) -> &str {
+            "fixture"
+        }
+        fn dimensions(&self) -> usize {
+            2
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![
+                if self.empty {
+                    Vec::new()
+                } else {
+                    vec![1.0, 0.0]
+                };
+                texts.len()
+            ])
+        }
+    }
+
+    // HTTP mock, not real Qdrant ranking evidence. Exact request scripts plus
+    // the call counter catch restarts, missing/extra pages and repeated embeds.
+    fn prompt_fixture(
+        responses: Vec<(usize, serde_json::Value, serde_json::Value, bool)>,
+        search: bool,
+        empty: bool,
+    ) -> (
+        QdrantMemory,
+        Arc<CountingEmbedding>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            for (limit, offset, response, fail) in responses {
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(std::time::Instant::now() < deadline, "missing request");
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let request = read_http_request(&mut stream);
+                let endpoint = if search { "search" } else { "scroll" };
+                assert!(request.starts_with(&format!("POST /collections/test/points/{endpoint} ")));
+                let body: serde_json::Value =
+                    serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                assert_eq!(body["limit"], limit);
+                assert_eq!(body["offset"], offset);
+                assert_eq!(
+                    body["filter"]["must"],
+                    serde_json::json!([
+                        {"key": "session_id", "match": {"value": "session"}},
+                        {"key": "agent_id", "match": {"any": ["alpha"]}}
+                    ])
+                );
+                let response = response.to_string();
+                let status = if fail {
+                    "500 Internal Server Error"
+                } else {
+                    "200 OK"
+                };
+                let written = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    response.len()
+                );
+                if response.len() <= PROMPT_PAGE_BYTES {
+                    written.unwrap();
+                }
+            }
+            // Keep accepting until the test has observed the return and joins.
+            // A forbidden extra request must fail this test, not be hidden by
+            // production partial-result-on-error behavior.
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(100);
+            while std::time::Instant::now() < until {
+                assert!(
+                    listener.accept().is_err(),
+                    "unexpected extra prompt request"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+        let embedder = Arc::new(CountingEmbedding {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            empty,
+        });
+        let mem = QdrantMemory::new_lazy("test", &url, "test", None, embedder.clone());
+        mem.initialized.set(()).unwrap();
+        (mem, embedder, server)
+    }
+
+    fn prompt_point(id: usize, key: &str) -> serde_json::Value {
+        let mut point = qdrant_fixture_point(id);
+        point["payload"]["key"] = serde_json::json!(key);
+        point["payload"]["session_id"] = serde_json::json!("session");
+        point["score"] = serde_json::json!(0.8);
+        point
+    }
+
+    #[tokio::test]
+    async fn prompt_pages_advance_over_malformed_points_embed_once_and_keep_archive() {
+        let mut first: Vec<_> = (0..PROMPT_PAGE_POINTS)
+            .map(|i| prompt_point(i, "user_msg_raw"))
+            .collect();
+        first[0] = serde_json::json!({"id": 0, "score": 1.0});
+        first[1] = serde_json::json!({"id": 1, "payload": {"key": 42}, "score": 1.0});
+        first[2]["id"] = serde_json::json!({"unsupported": true});
+        let (mem, embedder, server) = prompt_fixture(
+            vec![
+                (
+                    64,
+                    serde_json::json!(0),
+                    serde_json::json!({"result": first}),
+                    false,
+                ),
+                (
+                    64,
+                    serde_json::json!(64),
+                    serde_json::json!({"result": [prompt_point(99, "fact")]}),
+                    false,
+                ),
+                (
+                    1,
+                    serde_json::Value::Null,
+                    serde_json::json!({"result": [prompt_point(1, "user_msg_raw")]}),
+                    false,
+                ),
+            ],
+            true,
+            false,
+        );
+        assert!(
+            mem.recall_for_prompt_for_agents(&["alpha"], "query", 0, Some("session"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let entries = mem
+            .recall_for_prompt_for_agents(&["alpha"], "query", 5, Some("session"))
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "fact");
+        assert_eq!(embedder.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let archive = mem
+            .recall_for_agents(&["alpha"], "query", 1, Some("session"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(archive[0].key, "user_msg_raw");
+        assert_eq!(embedder.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn prompt_work_budget_returns_partial_without_extra_requests() {
+        let responses = (0..PROMPT_MAX_PAGES)
+            .map(|page| {
+                let mut points: Vec<_> = (0..PROMPT_PAGE_POINTS)
+                    .map(|i| prompt_point(page * 64 + i, "user_msg_raw"))
+                    .collect();
+                if page == 0 {
+                    points[0] = prompt_point(0, "fact");
+                }
+                (
+                    64,
+                    serde_json::json!(page * 64),
+                    serde_json::json!({"result": points}),
+                    false,
+                )
+            })
+            .collect();
+        let (mem, embedder, server) = prompt_fixture(responses, true, false);
+        let entries = mem
+            .recall_for_prompt_for_agents(&["alpha"], "query", 5, Some("session"))
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "fact");
+        assert_eq!(embedder.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn prompt_page_failure_keeps_previously_found_fact() {
+        let points: Vec<_> = (0..64)
+            .map(|i| prompt_point(i, if i == 0 { "fact" } else { "user_msg_raw" }))
+            .collect();
+        let (mem, embedder, server) = prompt_fixture(
+            vec![
+                (
+                    64,
+                    serde_json::json!(0),
+                    serde_json::json!({"result": points}),
+                    false,
+                ),
+                (
+                    64,
+                    serde_json::json!(64),
+                    serde_json::json!({"error": "fixture"}),
+                    true,
+                ),
+            ],
+            true,
+            false,
+        );
+        let entries = mem
+            .recall_for_prompt_for_agents(&["alpha"], "query", 5, Some("session"))
+            .await
+            .unwrap();
+        assert_eq!(entries[0].key, "fact");
+        assert_eq!(embedder.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server.join().unwrap();
+        let (mem, _, server) = prompt_fixture(
+            vec![(
+                64,
+                serde_json::json!(0),
+                serde_json::json!({"error": "fixture"}),
+                true,
+            )],
+            true,
+            false,
+        );
+        assert!(
+            mem.recall_for_prompt_for_agents(&["alpha"], "query", 5, Some("session"))
+                .await
+                .is_err()
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn prompt_scroll_and_fallback_follow_raw_cursor_and_stop_cycles() {
+        for (query, expected_embeds) in [("*", 0), ("fallback", 1)] {
+            let (mem, embedder, server) = prompt_fixture(
+                vec![
+                    (
+                        64,
+                        serde_json::Value::Null,
+                        serde_json::json!({"result": {
+                    "points": [{"id": 1}], "next_page_offset": "next"}}),
+                        false,
+                    ),
+                    (
+                        64,
+                        serde_json::json!("next"),
+                        serde_json::json!({"result": {
+                    "points": [prompt_point(2, "fact")], "next_page_offset": "next"}}),
+                        false,
+                    ),
+                ],
+                false,
+                true,
+            );
+            let entries = mem
+                .recall_for_prompt_for_agents(&["alpha"], query, 5, Some("session"))
+                .await
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].key, "fact");
+            assert_eq!(entries[0].score, None);
+            assert_eq!(
+                embedder.calls.load(std::sync::atomic::Ordering::SeqCst),
+                expected_embeds
+            );
+            server.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_response_byte_budget_rejects_oversized_page() {
+        let (mem, _, server) = prompt_fixture(
+            vec![(
+                64,
+                serde_json::json!(0),
+                serde_json::json!({"padding": "x".repeat(PROMPT_PAGE_BYTES)}),
+                false,
+            )],
+            true,
+            false,
+        );
+        assert!(
+            mem.recall_for_prompt_for_agents(&["alpha"], "query", 5, Some("session"))
+                .await
+                .is_err()
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn prompt_pages_stop_at_requested_count_and_empty_exhaustion() {
+        for (points, expected) in [(vec![prompt_point(1, "fact")], 1), (vec![], 0)] {
+            let (mem, embedder, server) = prompt_fixture(
+                vec![(
+                    64,
+                    serde_json::json!(0),
+                    serde_json::json!({"result": points}),
+                    false,
+                )],
+                true,
+                false,
+            );
+            let entries = mem
+                .recall_for_prompt_for_agents(&["alpha"], "query", 1, Some("session"))
+                .await
+                .unwrap();
+            assert_eq!(entries.len(), expected);
+            assert_eq!(embedder.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            server.join().unwrap();
+        }
     }
 
     #[tokio::test]
