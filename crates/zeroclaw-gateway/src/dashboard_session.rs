@@ -2916,6 +2916,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_page_sign_in_returns_the_notice_to_the_dashboard() {
+        let server = idp(&["admins"], "gw").await;
+        let fixture = fixture(sign_in_config(&server.uri()));
+        let notice = "4494e230-198b-4eb8-b8e3-b9037249ffc8";
+        let path = format!("/auth/sign-in/corp?return=%2Fchat%3Fthread%3D1%23turn&notice={notice}");
+        let started = start(&fixture, &path).await;
+        mount_token(&server, &started.nonce, true).await;
+        let response = send(&fixture.router, callback(&started, Some(&started.binding))).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers()[header::LOCATION].to_str().unwrap(),
+            format!("/chat?thread=1#turn#zeroclaw-signed-in={notice}")
+        );
+        assert!(cookie_from(&response, SESSION_COOKIE).is_some());
+    }
+
+    #[tokio::test]
     async fn an_off_site_return_path_lands_on_the_dashboard_root() {
         let server = idp(&["admins"], "gw").await;
         let fixture = fixture(sign_in_config(&server.uri()));

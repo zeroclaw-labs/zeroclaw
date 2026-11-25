@@ -1229,6 +1229,7 @@ cli-desktop-download-at = {"  "}Download it at: {$url}
 cli-config-legend = Legend: 💉 env-overridden  🔒 secret
 cli-config-secret-set = {$path} is set (encrypted secret — value not displayed)
 cli-config-secret-unset = {$path} is not set (encrypted secret)
+cli-config-value-prompt = Enter value for {$path}
 cli-config-updated = {$path} updated.
 cli-config-review-hint = Run `zeroclaw config list` to review, then set required fields.
 cli-config-catalog-unavailable-manual = {"  "}⚠ Catalog for {$provider} is unavailable ({$error}); enter the model ID manually.
@@ -1263,6 +1264,23 @@ cli-auth-refresh-ok = ✓ Token refresh OK (profile {$profile})
 cli-auth-removed = Removed auth profile {$provider}:{$profile}
 cli-auth-not-found = Auth profile not found: {$provider}:{$profile}
 cli-auth-xai-imported = Imported xAI auth profile from {$path}
+cli-auth-gemini-personal-account-warning =
+    ================================================================================
+    WARNING: PERSONAL GOOGLE ACCOUNTS DO NOT WORK WITH THIS LOGIN
+    ================================================================================
+    Google stopped serving Gemini Code Assist to Google AI free, Pro, and Ultra
+    accounts on June 18, 2026, and suspends accounts that use a consumer Google
+    login from third-party tools such as ZeroClaw. Do not sign in with a personal
+    Google account here.
+
+    Continue only with your own Google Cloud OAuth client and an account licensed
+    for Gemini Code Assist Standard or Enterprise.
+
+    For everything else, use one of:
+      - providers.models.gemini.<alias> with an API key
+      - providers.models.antigravity_cli.<alias> with a Gemini API key, Agent
+        Platform, or Gemini Enterprise
+    ================================================================================
 cli-auth-xai-device-code-started = xAI device-code login started.
 cli-auth-oauth-visit = Visit: {$uri}
 cli-auth-oauth-code = Code:  {$code}
