@@ -1580,7 +1580,10 @@ jobs:
       - name: Install test system dependencies
         run: bash scripts/ci/apt_install.sh mold expect python3
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: nextest
+          fallback: none
       - name: Run tests
         run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop
         env:
@@ -1675,7 +1678,10 @@ jobs:
       - name: Install test system dependencies
         run: bash scripts/ci/apt_install.sh mold expect python3
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: nextest
+          fallback: none
       - name: Run channel feature tests
         run: ${{ matrix.command }}
         env:
@@ -1711,7 +1717,10 @@ jobs:
       - name: Install test system dependencies
         run: bash scripts/ci/apt_install.sh mold expect python3
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: nextest
+          fallback: none
       - name: Run opt-in tool tests
         run: >-
           cargo nextest run --locked --no-fail-fast
@@ -1763,7 +1772,10 @@ jobs:
       - name: Install test system dependencies
         run: bash scripts/ci/apt_install.sh mold expect python3
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: nextest
+          fallback: none
       - name: Resolve the CLI-only feature set
         id: features
         run: |
@@ -1814,7 +1826,10 @@ jobs:
       - name: Install mold linker
         run: bash scripts/ci/apt_install.sh mold
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: nextest
+          fallback: none
       - name: Run memory-postgres feature tests
         run: cargo nextest run --locked -p zeroclaw-memory --features memory-postgres
         env:
@@ -1925,7 +1940,10 @@ jobs:
       - name: Install mold linker
         run: bash scripts/ci/apt_install.sh mold
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: nextest
+          fallback: none
       - name: Run Landlock tests
         run: cargo nextest run --locked -p zeroclaw-runtime --features sandbox-landlock -- landlock
         env:

@@ -52,11 +52,9 @@ jobs:
         include:
           - name: macOS
             os: macos-15
-            nextest-platform: mac
             timeout-minutes: 45
           - name: Windows
             os: windows-latest
-            nextest-platform: windows-tar
             timeout-minutes: 60
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ matrix.timeout-minutes }}
@@ -74,8 +72,10 @@ jobs:
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install cargo-nextest
-        shell: bash
-        run: curl -LsSf "https://get.nexte.st/latest/${{ matrix.nextest-platform }}" | tar zxf - -C "$HOME/.cargo/bin"
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: nextest
+          fallback: none
       - name: Run tests
         shell: bash
         run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast
