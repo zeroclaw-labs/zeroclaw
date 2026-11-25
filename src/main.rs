@@ -121,6 +121,67 @@ use std::sync::Arc;
 #[cfg(feature = "agent-runtime")]
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
+/// Localized, operator-facing text for one config migration notice about the
+/// config file at `path`. Printed on stderr: the matching WARN record is
+/// hidden without `-v`, and these report config the operator wrote being
+/// dropped, moved, or read under an assumed schema version.
+fn migration_notice_text(notice: &crate::config::migration::MigrationNotice, path: &str) -> String {
+    use crate::config::migration::MigrationNotice;
+    match notice {
+        MigrationNotice::AssumedV1 => ta(
+            "cli-config-migration-assumed-v1",
+            &[("path", path)],
+            format!(
+                "warning: {path} has no `schema_version`, so it was read as schema V1 and migrated from there. The V1 migration reshapes sections written for a newer version: provider entries can end up nested one level too deep, and channel sections are merged into a `default` alias. If this file was written for a newer ZeroClaw, add `schema_version` at the top with the version it was written for (restore the `.backup` copy first if `zeroclaw config migrate` already rewrote it)."
+            ),
+        ),
+        MigrationNotice::InferredV3 => ta(
+            "cli-config-migration-inferred-v3",
+            &[("path", path)],
+            format!(
+                "warning: {path} has no `schema_version`, but its sections are in the V3 format, so it was read as schema V3 and migrated from there. Run `zeroclaw config migrate` to write the current `schema_version` into the file."
+            ),
+        ),
+        MigrationNotice::Removed { path: key, reason } => {
+            let reason = retirement_reason_text(reason);
+            ta(
+                "cli-config-retired-key-removed",
+                &[("key", key), ("path", path), ("reason", &reason)],
+                format!("warning: dropped retired config key `{key}` from {path}: {reason}"),
+            )
+        }
+        MigrationNotice::IgnoredEnvOverride { variable, reason } => {
+            let reason = retirement_reason_text(reason);
+            ta(
+                "cli-config-env-override-retired",
+                &[("variable", variable), ("reason", &reason)],
+                format!("warning: ignored `{variable}`, which sets a retired config key: {reason}"),
+            )
+        }
+        MigrationNotice::Lowered { path: key, reason } => {
+            let reason = match crate::config::migration::capped_reason_id(reason) {
+                Some(id) => t(id, reason),
+                None => reason.to_string(),
+            };
+            ta(
+                "cli-config-capped-key-lowered",
+                &[("key", key), ("path", path), ("reason", &reason)],
+                format!("warning: lowered config key `{key}` in {path} to its maximum: {reason}"),
+            )
+        }
+    }
+}
+
+/// A retirement reason in the operator's locale. Notices carry the English
+/// reason, which logs keep; the CLI catalogue holds each one under the Fluent
+/// id its `RETIRED_KEYS` entry names.
+fn retirement_reason_text(reason: &str) -> String {
+    match crate::config::migration::retirement_reason_id(reason) {
+        Some(id) => t(id, reason),
+        None => reason.to_string(),
+    }
+}
+
 /// Resolve a `cli-*` Fluent key for CLI output. Routes through the runtime
 /// i18n catalogue under `agent-runtime` (default + CI/release); without that
 /// feature the runtime crate is absent, so the English `fallback` is used.
@@ -1327,19 +1388,20 @@ Examples:
         relay_command: RelayCommands,
     },
 
+    /// Emergency stop (not enforced: every form of this command refuses to run)
     Estop {
         #[command(subcommand)]
         estop_command: Option<EstopSubcommands>,
 
-        /// Level used when engaging estop from `zeroclaw estop`.
+        /// Level (not enforced: every form of this command refuses to run).
         #[arg(long, value_enum)]
         level: Option<EstopLevelArg>,
 
-        /// Domain pattern(s) for `domain-block` (repeatable).
+        /// Domain pattern(s). Accepted but ignored: the command is not enforced.
         #[arg(long = "domain")]
         domains: Vec<String>,
 
-        /// Tool name(s) for `tool-freeze` (repeatable).
+        /// Tool name(s). Accepted but ignored: the command is not enforced.
         #[arg(long = "tool")]
         tools: Vec<String>,
     },
@@ -2180,7 +2242,7 @@ async fn run_quickstart_cli(
                     "{}",
                     t(
                         "cli-quickstart-cancelled",
-                        "Quickstart cancelled. No config written."
+                        "Quickstart cancelled. Nothing was configured."
                     )
                 );
                 return Ok(());
@@ -7554,6 +7616,55 @@ fn ca_key_protection_from_env() -> zeroclaw_tls::CaKeyProtection {
     zeroclaw_tls::CaKeyProtection::from_env()
 }
 
+/// The relay bridge's half of `[relay.dashboard]`: the origin the relay
+/// serves this daemon's dashboard at, from the registration key's label, and
+/// the ingress its connections are handed to. `None` when it is off.
+///
+/// Logs the address and the redirect URI to register with the identity
+/// provider, and warns that this one relay route is not end-to-end.
+#[cfg(feature = "agent-runtime")]
+fn relay_dashboard_bridge(
+    dashboard: &zeroclaw_config::schema::RelayDashboardConfig,
+    signing_key_pkcs8: &[u8],
+    ingress: zeroclaw_runtime::relay_dashboard::DashboardIngress,
+) -> Result<Option<zeroclaw_runtime::relay::DashboardBridge>> {
+    if !dashboard.enabled {
+        return Ok(None);
+    }
+    if cfg!(not(feature = "gateway")) {
+        bail!(qta("cli-relay-dashboard-no-gateway", &[]));
+    }
+    let label = zeroclaw_runtime::relay::dashboard_label(signing_key_pkcs8)?;
+    let origin = zeroclaw_runtime::relay_dashboard::DashboardOrigin::new(
+        &format!("{label}.{}", dashboard.domain),
+        dashboard.port,
+    )
+    .with_context(|| qta("cli-relay-dashboard-bad-origin", &[]))?;
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "dashboard": format!("{}/", origin.origin()),
+                "redirect_uri": format!("{}/oidc/callback", origin.origin()),
+            })
+        ),
+        "relay dashboard: serving the dashboard through the relay. This route is NOT \
+         end-to-end: the relay ends the browser's TLS, so its operator can read and change \
+         this dashboard's traffic, including session cookies, and act as a signed-in user, \
+         with an administrator's session as an administrator. Administer this daemon over a \
+         direct connection or zerocode. Native clients through the relay stay end-to-end. \
+         Register redirect_uri exactly with the identity provider, and list this daemon in \
+         the relay's [dashboard] allow."
+    );
+    Ok(Some(zeroclaw_runtime::relay::DashboardBridge {
+        ingress,
+        origin,
+        // Inside the bridge's 256: enough for a few browsers (about six
+        // connections each), and never all of the native clients' slots.
+        max_conns: 64,
+    }))
+}
+
 /// Resolve the WSS mTLS policy without conflating the auto-CA and BYO-CA modes.
 ///
 /// The WSS plane is always mTLS. `enabled` controls only whether the configured
@@ -7731,7 +7842,8 @@ mod wss_client_auth_tests {
                 "relay.example.test".to_string(),
             ]
         );
-        assert!(wss_server_sans(&zeroclaw_config::schema::WssConfig::default(), &[]).is_empty());
+        let sans = wss_server_sans(&zeroclaw_config::schema::WssConfig::default(), &[]);
+        assert!(sans.is_empty(), "{sans:?}");
     }
 
     #[test]
@@ -8082,17 +8194,15 @@ mod wss_client_auth_tests {
         .unwrap();
         assert_eq!(sans, vec!["localhost", "127.0.0.1", "zero.tail1234.ts.net"]);
         // Default config, nothing known: empty keeps the default leaf path.
-        assert!(
-            effective_server_sans(
-                dir.path(),
-                &wss_with_sans(&[]),
-                TailnetSans::Unavailable {
-                    hostname_override: None
-                },
-            )
-            .unwrap()
-            .is_empty()
-        );
+        let sans = effective_server_sans(
+            dir.path(),
+            &wss_with_sans(&[]),
+            TailnetSans::Unavailable {
+                hostname_override: None,
+            },
+        )
+        .unwrap();
+        assert!(sans.is_empty(), "{sans:?}");
     }
 
     #[test]
@@ -8528,20 +8638,20 @@ fn list_wss_client_certs(config: &Config, json: bool) -> Result<()> {
 
 #[derive(Subcommand, Debug)]
 enum EstopSubcommands {
-    /// Print current estop status.
+    /// Not enforced: refuses to run.
     Status,
-    /// Resume from an engaged estop level.
+    /// Not enforced: refuses to run.
     Resume {
-        /// Resume only network kill.
+        /// Accepted but ignored: the command is not enforced.
         #[arg(long)]
         network: bool,
-        /// Resume one or more blocked domain patterns.
+        /// Accepted but ignored: the command is not enforced.
         #[arg(long = "domain")]
         domains: Vec<String>,
-        /// Resume one or more frozen tools.
+        /// Accepted but ignored: the command is not enforced.
         #[arg(long = "tool")]
         tools: Vec<String>,
-        /// OTP code. If omitted and OTP is required, a prompt is shown.
+        /// Accepted but ignored: the command is not enforced.
         #[arg(long)]
         otp: Option<String>,
     },
@@ -9862,27 +9972,36 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
         };
         eprintln!("{warning}");
     }
-    for section in &config.retired_wati_config_sections {
-        let fallback = format!(
-            "warning: retired WATI channel config section '{section}' is ignored because WATI support was removed. Migrate to '[channels.whatsapp.<alias>]' using the Cloud API or WhatsApp Web, then revoke the unused WATI API token."
-        );
-        eprintln!(
-            "{}",
-            ta(
-                "cli-config-section-retired-wati",
-                &[("section", section)],
-                &fallback,
-            )
-        );
-    }
-    if config.retired_node_transport_config {
-        eprintln!(
-            "{}",
-            t(
-                "cli-config-section-retired-node-transport",
-                "warning: retired `[node_transport]` config is ignored because the legacy HMAC node transport was removed. Delete the section from config.toml."
-            )
-        );
+    // `config migrate` reports the same notices itself, as changes it wrote.
+    let reports_own_migration = matches!(
+        &cli.command,
+        Commands::Config {
+            config_command: ConfigCommands::Migrate { .. }
+        }
+    );
+    if !reports_own_migration && !config.migration_notices.is_empty() {
+        let path = config.config_path.display().to_string();
+        for notice in &config.migration_notices {
+            eprintln!("{}", migration_notice_text(notice, &path));
+        }
+        // Only a change to the file can be written; an ignored environment
+        // variable or a kept reference is for the operator to fix.
+        if config
+            .migration_notices
+            .iter()
+            .any(crate::config::migration::MigrationNotice::changes_file)
+        {
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-config-migration-pending",
+                    &[("path", &path)],
+                    format!(
+                        "warning: these changes apply to this run only. Run `zeroclaw config migrate` to write them to {path}."
+                    ),
+                )
+            );
+        }
     }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
@@ -10442,6 +10561,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 )
                             );
                             println!("     zeroclaw gateway start"); // i18n-exempt: literal command/identifier example
+                            // Surface the fetch failure to the process exit status so
+                            // scripts/automation can tell that no code was obtained.
+                            // Exit here (instead of `return Err(e)`) so anyhow does not
+                            // reprint the same error after the human-readable guidance.
+                            std::process::exit(1);
                         }
                     }
                     Ok(())
@@ -10763,8 +10887,13 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     _ => None,
                 };
 
+                // Where the relay bridge hands a relay-served dashboard's browser
+                // connections to the gateway (`[relay.dashboard]`): in process,
+                // so they never arrive as loopback peers.
+                let dashboard_ingress = zeroclaw_runtime::relay_dashboard::DashboardIngress::new();
                 #[cfg(feature = "gateway")]
                 registry.register_gateway(Box::new({
+                    let dashboard_ingress = dashboard_ingress.clone();
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
                     let sop_dh = sop_driver_supervisor
@@ -10785,7 +10914,24 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         let sop_audit = sop_a.clone();
                         let sop_driver_handles = sop_dh.clone();
                         let plugin_webhooks = Arc::clone(&plugin_webhooks);
+                        // Only a generation whose config serves the dashboard
+                        // through the relay takes its connections.
+                        let dashboard_ingress = config
+                            .relay
+                            .dashboard
+                            .enabled
+                            .then(|| dashboard_ingress.clone());
                         Box::pin(async move {
+                            let supervision = zeroclaw_gateway::GatewaySupervision::new(
+                                ready_tx,
+                                plugin_webhooks,
+                                authority,
+                                sop_driver_handles,
+                            );
+                            let supervision = match dashboard_ingress {
+                                Some(ingress) => supervision.with_dashboard_ingress(ingress),
+                                None => supervision,
+                            };
                             Box::pin(zeroclaw_gateway::run_gateway_with_plugin_webhooks(
                                 &host,
                                 port,
@@ -10797,12 +10943,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                                 sop_engine,
                                 sop_audit,
                                 daemon_authority,
-                                zeroclaw_gateway::GatewaySupervision::new(
-                                    ready_tx,
-                                    plugin_webhooks,
-                                    authority,
-                                    sop_driver_handles,
-                                ),
+                                supervision,
                             ))
                             .await
                         })
@@ -11057,6 +11198,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                 // inner mTLS terminates; it never decrypts anything.
                 registry.register_relay(Box::new(move |ctx, cancel, _client_count| {
                     let enroll_bridge_ports_for_bridge = enroll_bridge_ports_for_bridge.clone();
+                    let dashboard_ingress = dashboard_ingress.clone();
                     Box::pin(async move {
                         let (relay_cfg, wss_cfg, enroll_cfg, data_dir) = {
                             let cfg = ctx.config.read();
@@ -11114,6 +11256,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                         } else {
                             relay_cfg.relay_host.clone()
                         };
+                        let dashboard = relay_dashboard_bridge(
+                            &relay_cfg.dashboard,
+                            &signing_key_pkcs8,
+                            dashboard_ingress,
+                        )?;
                         // Rotation is permitted only for an auto-minted id (a
                         // pinned [relay].node_id is fixed).
                         let rotation_allowed = relay_cfg.node_id.trim().is_empty();
@@ -11146,6 +11293,7 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                             data_dir: data_dir.clone(),
                             node_id_rotation_days,
                             rotation_allowed,
+                            dashboard,
                         };
                         zeroclaw_runtime::relay::run_relay_bridge(bridge_cfg, cancel).await
                     })
@@ -11683,7 +11831,6 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     "🌐 Web UI:        not included in this build (CLI-only)"
                 )
             );
-            let effective_memory_backend = config.resolve_active_storage().kind();
             let heartbeat_value = if config.heartbeat.enabled {
                 let interval_minutes = config.heartbeat.interval_minutes.to_string();
                 let heartbeat_every_fallback = format!("every {}min", interval_minutes);
@@ -11704,7 +11851,11 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
                     &heartbeat_fallback
                 )
             );
-            let memory_backend = effective_memory_backend.to_string();
+            let runtime_agent = config
+                .resolved_runtime_agent_alias()
+                .filter(|alias| config.agents.get(*alias).is_some_and(|agent| agent.enabled))
+                .or_else(|| agent_aliases.first().map(|alias| alias.as_str()));
+            let memory_backend = zeroclaw_memory::configured_memory_backend(&config, runtime_agent);
             let memory_auto_save = if config.memory.auto_save {
                 t("cli-status-word-on", "on")
             } else {
@@ -11942,7 +12093,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                 ta(
                     "cli-status-estop",
                     &[("v", &config.security.estop.enabled.to_string())],
-                    "E-stop enabled"
+                    "E-stop enabled: (not enforced)"
                 )
             );
             println!();
@@ -12094,12 +12245,7 @@ Add pricing to the active provider profile or supply a catalog entry."
             }
         },
 
-        Commands::Estop {
-            estop_command,
-            level,
-            domains,
-            tools,
-        } => handle_estop_command(&config, estop_command, level, domains, tools),
+        Commands::Estop { .. } => handle_estop_command(),
 
         Commands::Cron { cron_command } => cron::handle_command(cron_command, &config),
 
@@ -12808,6 +12954,12 @@ Add pricing to the active provider profile or supply a catalog entry."
                     !no_interactive && plugin_setting_is_plain(&config, &path);
                 #[cfg(not(feature = "plugins-wasm"))]
                 let plain_plugin_setting = false;
+                let value_prompt = || {
+                    i18n::get_required_cli_string_with_args(
+                        "cli-config-value-prompt",
+                        &[("path", &path)],
+                    )
+                };
                 let selected_value = if no_interactive {
                     value.ok_or_else(|| {
                         ::zeroclaw_log::record!(
@@ -12827,9 +12979,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                             "  \u{26a0} {path} is an encrypted secret \u{2014} using masked input."
                         );
                     }
-                    let secret_value = secret_prompt(&format!("Enter value for {path}"), false)?
-                        .trim()
-                        .to_string();
+                    let secret_value = secret_prompt(&value_prompt(), false)?.trim().to_string();
                     if !secret_value.is_empty() {
                         eprintln!("{}", ta("cli-secret-received", &[], "  ✓ Secret received"));
                     }
@@ -12841,7 +12991,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     val
                 } else if plain_plugin_setting {
                     dialoguer::Input::<String>::new()
-                        .with_prompt(format!("Enter value for {path}"))
+                        .with_prompt(value_prompt())
                         .interact_text()?
                 } else if let Some(provider_type) = model_path_provider_type(&path) {
                     use dialoguer::{FuzzySelect, Input};
@@ -13137,7 +13287,12 @@ Add pricing to the active provider profile or supply a catalog entry."
                             let envelope = serde_json::json!({
                                 "migrated": true,
                                 "backup_path": report.backup_path.display().to_string(),
+                                "version_backup_path": report
+                                    .version_backup_path
+                                    .as_ref()
+                                    .map(|path| path.display().to_string()),
                                 "schema_version": to,
+                                "notices": report.notices,
                             });
                             println!("{}", serde_json::to_string_pretty(&envelope)?);
                         } else {
@@ -13149,10 +13304,26 @@ Add pricing to the active provider profile or supply a catalog entry."
                                     "Backed up to"
                                 )
                             );
+                            if let Some(kept) = &report.version_backup_path {
+                                let kept = kept.display().to_string();
+                                let from = report.from_version.to_string();
+                                println!(
+                                    "{}",
+                                    ta(
+                                        "cli-config-kept-original",
+                                        &[("version", &from), ("path", &kept)],
+                                        "Kept the schema V{$version} original as {$path}, readable only by you. It is never replaced, and it still holds any secrets the migration removed; delete it once you no longer need to go back to an older ZeroClaw."
+                                    )
+                                );
+                            }
                             println!(
                                 "Migrated {} to schema version {to}.",
                                 config.config_path.display()
                             );
+                            let path = config.config_path.display().to_string();
+                            for notice in &report.notices {
+                                eprintln!("{}", migration_notice_text(notice, &path));
+                            }
                         }
                     }
                     None => {
@@ -14057,206 +14228,15 @@ Add pricing to the active provider profile or supply a catalog entry."
 }
 
 #[cfg(feature = "agent-runtime")]
-fn handle_estop_command(
-    config: &Config,
-    estop_command: Option<EstopSubcommands>,
-    level: Option<EstopLevelArg>,
-    domains: Vec<String>,
-    tools: Vec<String>,
-) -> Result<()> {
-    if !config.security.estop.enabled {
-        bail!("Emergency stop is disabled. Enable [security.estop].enabled = true in config.toml");
-    }
-
-    let config_dir = config
-        .config_path
-        .parent()
-        .context("Config path must have a parent directory")?;
-    let mut manager = security::EstopManager::load(&config.security.estop, config_dir)?;
-
-    match estop_command {
-        Some(EstopSubcommands::Status) => {
-            print_estop_status(&manager.status());
-            Ok(())
-        }
-        Some(EstopSubcommands::Resume {
-            network,
-            domains,
-            tools,
-            otp,
-        }) => {
-            let selector = build_resume_selector(network, domains, tools)?;
-            let mut otp_code = otp;
-            let otp_validator = if config.security.estop.require_otp_to_resume {
-                if !config.security.otp.enabled {
-                    bail!(
-                        "security.estop.require_otp_to_resume=true but security.otp.enabled=false"
-                    );
-                }
-                if otp_code.is_none() {
-                    let entered = secret_prompt("Enter OTP code", false)?;
-                    if !entered.is_empty() {
-                        eprintln!("{}", ta("cli-otp-received", &[], "  ✓ OTP received"));
-                    }
-                    otp_code = Some(entered);
-                }
-
-                let store = security::SecretStore::new(config_dir, config.secrets.encrypt);
-                let (validator, enrollment_uri) =
-                    security::OtpValidator::from_config(&config.security.otp, config_dir, &store)?;
-                if let Some(uri) = enrollment_uri {
-                    println!(
-                        "{}",
-                        t(
-                            "cli-otp-initialized",
-                            "Initialized OTP secret for ZeroClaw."
-                        )
-                    );
-                    println!(
-                        "{}",
-                        ta("cli-otp-enrollment-uri", &[("uri", &uri)], "Enrollment URI")
-                    );
-                }
-                Some(validator)
-            } else {
-                None
-            };
-
-            manager.resume(selector, otp_code.as_deref(), otp_validator.as_ref())?;
-            println!("{}", t("cli-estop-resume-done", "Estop resume completed."));
-            print_estop_status(&manager.status());
-            Ok(())
-        }
-        None => {
-            let engage_level = build_engage_level(level, domains, tools)?;
-            manager.engage(engage_level)?;
-            println!("{}", t("cli-estop-engaged", "Estop engaged."));
-            print_estop_status(&manager.status());
-            Ok(())
-        }
-    }
-}
-
-#[cfg(feature = "agent-runtime")]
-fn build_engage_level(
-    level: Option<EstopLevelArg>,
-    domains: Vec<String>,
-    tools: Vec<String>,
-) -> Result<security::EstopLevel> {
-    let requested = level.unwrap_or(EstopLevelArg::KillAll);
-    match requested {
-        EstopLevelArg::KillAll => {
-            if !domains.is_empty() || !tools.is_empty() {
-                bail!("--domain/--tool are only valid with --level domain-block/tool-freeze");
-            }
-            Ok(security::EstopLevel::KillAll)
-        }
-        EstopLevelArg::NetworkKill => {
-            if !domains.is_empty() || !tools.is_empty() {
-                bail!("--domain/--tool are not valid with --level network-kill");
-            }
-            Ok(security::EstopLevel::NetworkKill)
-        }
-        EstopLevelArg::DomainBlock => {
-            if domains.is_empty() {
-                bail!("--level domain-block requires at least one --domain");
-            }
-            if !tools.is_empty() {
-                bail!("--tool is not valid with --level domain-block");
-            }
-            Ok(security::EstopLevel::DomainBlock(domains))
-        }
-        EstopLevelArg::ToolFreeze => {
-            if tools.is_empty() {
-                bail!("--level tool-freeze requires at least one --tool");
-            }
-            if !domains.is_empty() {
-                bail!("--domain is not valid with --level tool-freeze");
-            }
-            Ok(security::EstopLevel::ToolFreeze(tools))
-        }
-    }
-}
-
-#[cfg(feature = "agent-runtime")]
-fn build_resume_selector(
-    network: bool,
-    domains: Vec<String>,
-    tools: Vec<String>,
-) -> Result<security::ResumeSelector> {
-    let selected =
-        usize::from(network) + usize::from(!domains.is_empty()) + usize::from(!tools.is_empty());
-    if selected > 1 {
-        bail!("Use only one of --network, --domain, or --tool for estop resume");
-    }
-    if network {
-        return Ok(security::ResumeSelector::Network);
-    }
-    if !domains.is_empty() {
-        return Ok(security::ResumeSelector::Domains(domains));
-    }
-    if !tools.is_empty() {
-        return Ok(security::ResumeSelector::Tools(tools));
-    }
-    Ok(security::ResumeSelector::KillAll)
-}
-
-#[cfg(feature = "agent-runtime")]
-fn print_estop_status(state: &security::EstopState) {
-    println!("{}", t("cli-estop-status", "Estop status:"));
-    println!(
-        "  engaged:        {}",
-        if state.is_engaged() { "yes" } else { "no" }
-    );
-    println!(
-        "  kill_all:       {}",
-        if state.kill_all { "active" } else { "inactive" }
-    );
-    println!(
-        "  network_kill:   {}",
-        if state.network_kill {
-            "active"
-        } else {
-            "inactive"
-        }
-    );
-    if state.blocked_domains.is_empty() {
-        println!(
-            "{}",
-            t("cli-estop-domains-none", "  domain_blocks:  (none)")
-        );
-    } else {
-        println!(
-            "{}",
-            ta(
-                "cli-estop-domains",
-                &[("v", &state.blocked_domains.join(", "))],
-                "domain_blocks"
-            )
-        );
-    }
-    if state.frozen_tools.is_empty() {
-        println!("{}", t("cli-estop-tools-none", "  tool_freeze:    (none)"));
-    } else {
-        println!(
-            "{}",
-            ta(
-                "cli-estop-tools",
-                &[("v", &state.frozen_tools.join(", "))],
-                "tool_freeze"
-            )
-        );
-    }
-    if let Some(updated_at) = &state.updated_at {
-        println!(
-            "{}",
-            ta(
-                "cli-estop-updated-at",
-                &[("v", &updated_at.to_string())],
-                "updated_at"
-            )
-        );
-    }
+fn handle_estop_command() -> Result<()> {
+    // No runtime path reads the estop state file, so engaging it would stop
+    // nothing. Refuse every form of the command before looking at its
+    // arguments, so the operator learns at once that nothing was stopped.
+    bail!(ta(
+        "cli-estop-not-enforced",
+        &[],
+        "`zeroclaw estop` is not enforced: no running agent, daemon, or tool reads the estop state file, so engaging it would not stop anything. The estop state was not changed. To halt the agent now, stop the ZeroClaw process itself."
+    ))
 }
 
 fn write_shell_completion<W: Write>(shell: CompletionShell, writer: &mut W) -> Result<()> {
@@ -17555,6 +17535,59 @@ mod tests {
         }
     }
 
+    /// Every retirement reason a migration notice can show has its text in
+    /// every locale the CLI ships.
+    #[test]
+    fn every_retirement_reason_is_in_every_cli_locale() {
+        let locales: [(&str, &str); 5] = [
+            (
+                "en",
+                include_str!("../crates/zeroclaw-runtime/locales/en/cli.ftl"),
+            ),
+            (
+                "es",
+                include_str!("../crates/zeroclaw-runtime/locales/es/cli.ftl"),
+            ),
+            (
+                "fr",
+                include_str!("../crates/zeroclaw-runtime/locales/fr/cli.ftl"),
+            ),
+            (
+                "ja",
+                include_str!("../crates/zeroclaw-runtime/locales/ja/cli.ftl"),
+            ),
+            (
+                "zh-CN",
+                include_str!("../crates/zeroclaw-runtime/locales/zh-CN/cli.ftl"),
+            ),
+        ];
+        for key in crate::config::migration::RETIRED_KEYS {
+            for (locale, cli_ftl) in locales {
+                let entry = format!("{} = ", key.reason_id);
+                assert!(
+                    cli_ftl.lines().any(|line| line.starts_with(&entry)),
+                    "{locale}: missing `{}` for {:?}",
+                    key.reason_id,
+                    key.path
+                );
+            }
+        }
+        // Lowered values: each reason, and the notice line that carries it.
+        let capped = crate::config::migration::CAPPED_KEYS
+            .iter()
+            .map(|key| key.reason_id)
+            .chain(["cli-config-capped-key-lowered"]);
+        for id in capped {
+            for (locale, cli_ftl) in locales {
+                let entry = format!("{id} = ");
+                assert!(
+                    cli_ftl.lines().any(|line| line.starts_with(&entry)),
+                    "{locale}: missing `{id}`"
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "agent-runtime")]
     #[test]
     fn quickstart_selector_rejects_widths_that_erase_action_labels() {
@@ -18572,6 +18605,39 @@ mod tests {
             }
             other => panic!("expected ACP command, got {other:?}"),
         }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn relay_dashboard_no_gateway_error_resolves_to_its_catalogue_text() {
+        assert_eq!(
+            qta("cli-relay-dashboard-no-gateway", &[]),
+            "[relay.dashboard] is enabled, but this build has no gateway to serve the dashboard. \
+             Use a build with the `gateway` feature, or disable [relay.dashboard]."
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "agent-runtime", feature = "gateway"))]
+    fn relay_dashboard_bad_origin_error_resolves_to_its_catalogue_text() {
+        let key = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+            .expect("generate an Ed25519 key");
+        let dashboard = zeroclaw_config::schema::RelayDashboardConfig {
+            enabled: true,
+            domain: "not a domain".into(),
+            port: 443,
+        };
+        let Err(error) = relay_dashboard_bridge(
+            &dashboard,
+            key.as_ref(),
+            zeroclaw_runtime::relay_dashboard::DashboardIngress::new(),
+        ) else {
+            panic!("a domain that is not a DNS name must not form a dashboard origin");
+        };
+        assert_eq!(
+            error.to_string(),
+            "[relay.dashboard] domain and port must form the dashboard's HTTPS origin"
+        );
     }
 
     #[test]
@@ -19707,7 +19773,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "agent-runtime")]
-    fn cli_parses_estop_default_engage() {
+    fn cli_parses_estop_without_subcommand() {
         let cli = Cli::try_parse_from(["zeroclaw", "estop"]).expect("estop command should parse");
 
         match cli.command {
@@ -19719,8 +19785,8 @@ mod tests {
             } => {
                 assert!(estop_command.is_none());
                 assert!(level.is_none());
-                assert!(domains.is_empty());
-                assert!(tools.is_empty());
+                assert!(domains.is_empty(), "{domains:?}");
+                assert!(tools.is_empty(), "{tools:?}");
             }
             other => panic!("expected estop command, got {other:?}"),
         }
@@ -19738,6 +19804,50 @@ mod tests {
                 ..
             } => assert_eq!(domains, vec!["*.chase.com".to_string()]),
             other => panic!("expected estop resume command, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    fn run_estop_from_argv(argv: &[&str]) -> Result<()> {
+        let mut full = vec!["zeroclaw", "estop"];
+        full.extend_from_slice(argv);
+        let cli = Cli::try_parse_from(full).expect("estop command should parse");
+        match cli.command {
+            Commands::Estop { .. } => handle_estop_command(),
+            other => panic!("expected estop command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn estop_refuses_every_form_instead_of_reporting_a_stop() {
+        let expected = ta("cli-estop-not-enforced", &[], "");
+        assert!(
+            expected.contains("zeroclaw estop"),
+            "the catalog must define cli-estop-not-enforced, got {expected:?}"
+        );
+
+        let invocations: &[&[&str]] = &[
+            &[],
+            &["--level", "kill-all"],
+            &["--level", "network-kill"],
+            &["--level", "domain-block", "--domain", "*.example.com"],
+            &["--level", "tool-freeze", "--tool", "shell"],
+            &["status"],
+            &["resume"],
+            &["resume", "--network"],
+            &["resume", "--domain", "*.example.com"],
+            &["resume", "--tool", "shell"],
+            &["resume", "--otp", "123456"],
+            &["resume", "--network", "--otp", "123456"],
+            &["--level", "domain-block"],
+            &["--level", "kill-all", "--domain", "*.example.com"],
+            &["resume", "--network", "--tool", "shell"],
+        ];
+        for argv in invocations {
+            let err = run_estop_from_argv(argv)
+                .expect_err("estop must not report success while nothing enforces it");
+            assert_eq!(err.to_string(), expected, "argv: {argv:?}");
         }
     }
 
@@ -20580,7 +20690,11 @@ mod tests {
             assert_eq!(supervisor.drivers.lock().unwrap().len(), 1);
             let teardown = supervisor.shutdown().await;
             assert!(teardown.still_running.is_empty());
-            assert!(teardown.unsettled_runs.is_empty());
+            assert!(
+                teardown.unsettled_runs.is_empty(),
+                "{:?}",
+                teardown.unsettled_runs
+            );
             assert_eq!(store.claim_counts(name).unwrap().0, 1);
 
             let reopened =
@@ -21927,7 +22041,11 @@ mod tests {
 
         // Clean posture: no gate, no nag.
         let clean = Config::default();
-        assert!(clean.degraded_security.is_empty());
+        assert!(
+            clean.degraded_security.is_empty(),
+            "{:?}",
+            clean.degraded_security
+        );
         let handle = gate_security_posture(&clean, false).expect("clean posture must pass");
         assert!(handle.is_none(), "clean posture must not spawn a nag");
 
@@ -23815,11 +23933,8 @@ type = "string"
             runtime_accepts_row(&config, &instance_key),
             "the repaired row must be one the runtime's own constructor accepts"
         );
-        assert!(
-            egress_grant_gap_lines(&config, &manifest)
-                .expect("gap lines must build")
-                .is_empty()
-        );
+        let gap_lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        assert!(gap_lines.is_empty(), "{gap_lines:?}");
     }
 
     /// REGRESSION (deployment-wide refusal blamed on a row): the row is valid
@@ -23883,10 +23998,11 @@ type = "string"
         // A row that grants nothing has nothing to inherit or keep.
         config.plugins.entries[0].egress_hosts.clear();
         config.plugins.entries[0].egress_allow_private.clear();
-        assert!(
-            existing_egress_grant_lines(&config, "weather-tool", &instance_key, &[]).is_empty()
-        );
-        assert!(removed_plugin_kept_grant_lines(&config, "weather-tool", &rows).is_empty());
+        let existing_lines =
+            existing_egress_grant_lines(&config, "weather-tool", &instance_key, &[]);
+        assert!(existing_lines.is_empty(), "{existing_lines:?}");
+        let kept_lines = removed_plugin_kept_grant_lines(&config, "weather-tool", &rows);
+        assert!(kept_lines.is_empty(), "{kept_lines:?}");
     }
 
     #[test]
@@ -24251,7 +24367,8 @@ type = "string"
         let mut config = crate::config::schema::Config::default();
         bind_channel_alias(&mut config, "elsewhere", "other-bridge", true);
 
-        assert!(bound_channel_aliases(&config, "chat-bridge").is_empty());
+        let bound_aliases = bound_channel_aliases(&config, "chat-bridge");
+        assert!(bound_aliases.is_empty(), "{bound_aliases:?}");
         let rows = instance_rows(&config, &manifest).expect("rows must derive");
         assert!(rows.is_empty(), "no binding, no instance, no row: {rows:?}");
     }
@@ -25373,7 +25490,8 @@ hosts = ["irc.example.net"]
             config.plugins.entry_egress(&key).0.is_empty(),
             "the existing grant stays empty"
         );
-        assert!(granted_on_disk(&config.config_path, &key).is_empty());
+        let granted = granted_on_disk(&config.config_path, &key);
+        assert!(granted.is_empty(), "{granted:?}");
         let name = "chat-bridge (plugin.operations)";
         for expected in [
             format!(
@@ -26491,7 +26609,7 @@ maxLength = 1
         )
         .expect("staging must succeed");
         assert_eq!(staged.granted, canonical);
-        assert!(staged.withheld.is_empty());
+        assert!(staged.withheld.is_empty(), "{:?}", staged.withheld);
         let ceremony = egress_grant_ceremony_lines(
             egress_command_config_dir(&config),
             "weather-tool",
@@ -27431,7 +27549,7 @@ hosts = ["api.example.com", "api2.example.com"]
         .await
         .expect("existing row needs no persistence")
         .expect("rows");
-        assert!(rows.created.is_empty());
+        assert!(rows.created.is_empty(), "{:?}", rows.created);
         assert_eq!(rows.existing.len(), first_entries.len());
         assert_eq!(config.dirty_paths, before.dirty_paths);
         assert_eq!(
@@ -28166,7 +28284,8 @@ type = "integer"
         config.plugins.entries[0]
             .config
             .insert("retries".to_string(), "3".to_string());
-        assert!(plugin_config_rejections(&config, &manifest).is_empty());
+        let rejections = plugin_config_rejections(&config, &manifest);
+        assert!(rejections.is_empty(), "{rejections:?}");
     }
 
     /// An update to a lower version says so instead of reading as a normal

@@ -40,14 +40,21 @@ mutated at all.
 #### Tools-only: enable it, don't bind it
 
 To use an IMAP mailbox as a pull-only tool, set `enabled = true` on the alias and
-leave it out of every agent's `channels` list. Enabling the alias registers the
-`email_search` and `email_read` tools, while binding it to an agent is what starts
-the IMAP listener. The distinction matters for aliases with no SMTP configured
-(no `smtp_host` or `from_address`), which are inbound-only: they can receive mail,
-but `send` refuses to reply. If you bind such an alias, every inbound message from
-a sender your peer group admits dispatches an agent turn. The agent tries to
-reply, `send` refuses, and the reply fails, so you pay for a model turn on every
-email and get nothing back.
+leave it out of every agent's `channels` list **and** out of every approval route
+that would name it. Enabling the alias registers the `email_search` and
+`email_read` tools. Binding it to an agent is one way to start the IMAP listener;
+an SOP approval `request_route` / `escalation_route`, or an enabled agent's risk-
+profile `approver_channel`, also starts it. A route may name the bare channel type
+`email`; when exactly one email alias is enabled, that resolves to the alias. An
+alias that only an approval route names stays live so approval replies can be
+delivered, but it is not assigned to an agent for ordinary traffic.
+
+The distinction matters for aliases with no SMTP configured (no `smtp_host` or
+`from_address`), which are inbound-only: they can receive mail, but `send` refuses
+to reply. If you bind such an alias, every inbound message from a sender your peer
+group admits dispatches an agent turn. The agent tries to reply, `send` refuses,
+and the reply fails, so you pay for a model turn on every email and get nothing
+back.
 
 ```toml
 [channels.email.myserver]
@@ -67,7 +74,10 @@ channel under the default agent (the agent named `default`, otherwise the first
 alphabetically). In an email-only config, that means the IMAP listener starts anyway
 and you pay the per-email turn cost described above. To keep the alias tools-only,
 make sure some agent binds at least one other channel, as in the example where
-`agents.example` binds `telegram.home`.
+`agents.example` binds `telegram.home`, and also leave the alias out of SOP
+approval `request_route` / `escalation_route` values and every enabled agent's
+risk-profile `approver_channel` (including a bare `email` route when only one
+email alias is enabled).
 
 ### Gmail gotchas
 

@@ -293,6 +293,9 @@ export interface WsMessage {
   // Emitted as JSON null when the accepted call reports no usage (stale
   // route protection); consumers must branch on null, not undefined.
   last_input_tokens?: number | null;
+  /** Display-only retained-context estimate after a real trim; never measured usage. */
+  context_input_tokens?: number;
+  context_input_tokens_source?: string;
 }
 
 export type ApprovalDecision = "approve" | "deny" | "always";
@@ -319,6 +322,16 @@ export interface SessionMessagesResponse {
   session_id: string;
   messages: SessionMessageRow[];
   session_persistence: boolean;
+}
+
+/** `GET /api/sessions/{id}/state`. The gateway records `running` when a turn
+ * starts and moves to `idle` (or `error`) only after it has stored that turn's
+ * transcript. Answers 404 when session persistence is disabled. */
+export interface SessionStateResponse {
+  session_id: string;
+  state: string;
+  turn_id?: string;
+  turn_started_at?: string;
 }
 
 export interface TuiEntry {

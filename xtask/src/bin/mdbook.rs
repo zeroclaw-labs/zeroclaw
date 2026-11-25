@@ -79,15 +79,23 @@ enum Cmd {
     /// Retain master and the newest DOCS_KEEP_VERSIONS final releases; drop
     /// every other version dir (run in the gh-pages clone root)
     PruneVersions,
-    /// Emit the gh-pages root index.html redirecting to the stable version
-    /// (from stable-version.txt), or master when none resolves
+    /// Emit the gh-pages root index.html redirecting to the stable alias
+    /// (stable/), or master when no stable-version.txt pointer resolves
     GenRootIndex,
+    /// Emit the gh-pages root 404.html, which sends links to pruned release
+    /// dirs to the same page under the stable alias
+    #[command(name = "gen-root-404")]
+    GenRoot404,
     /// Inject the version-selector script into deployed pages that lack it
     RetrofitSelector,
     /// Write canonical, hreflang, description and share tags into every
     /// deployed page, plus robots.txt and sitemap.xml at the root (run in the
     /// gh-pages clone root, after gen-root-index)
     GenSeo,
+    /// Rebuild stable/ as a copy of the stable-pointer target, the
+    /// version-less tree that canonical and sitemap URLs name (run in the
+    /// gh-pages clone root, after gen-seo)
+    GenStableAlias,
     /// Regenerate pc-themes.css + switcher list from the dashboard theme registry
     Themes,
     /// Regenerate hardware reference snippets from the board registry + catalog
@@ -159,8 +167,10 @@ fn main() -> anyhow::Result<()> {
         Cmd::PruneRoot => cmd::mdbook::versions::prune_root(),
         Cmd::PruneVersions => cmd::mdbook::versions::prune_versions(),
         Cmd::GenRootIndex => cmd::mdbook::versions::gen_root_index(),
+        Cmd::GenRoot404 => cmd::mdbook::versions::gen_root_404(),
         Cmd::RetrofitSelector => cmd::mdbook::versions::retrofit_selector(),
         Cmd::GenSeo => cmd::mdbook::seo::run(),
+        Cmd::GenStableAlias => cmd::mdbook::versions::gen_stable_alias(),
         Cmd::Themes => cmd::mdbook::themes::run(&xtask::util::repo_root()),
         Cmd::Hardware => cmd::mdbook::hardware::run(&xtask::util::repo_root()),
         Cmd::Linkcheck => cmd::mdbook::linkcheck::check_internal_links(
