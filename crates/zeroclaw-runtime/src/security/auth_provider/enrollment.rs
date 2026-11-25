@@ -139,6 +139,32 @@ struct OAuthError {
     error_description: Option<String>,
 }
 
+/// How a confidential client authenticates at the token and revocation
+/// endpoints (RFC 6749 §2.3.1). Serialized as the OAuth
+/// `token_endpoint_auth_method` registry names, because a refresh grant
+/// records the method its refresh token was issued with and reuses it: a
+/// provider may accept only the method registered for a client, so a
+/// refresh must authenticate the way the original grant did. A public client
+/// (no `client_secret`) sends only its `client_id` in the form under either
+/// method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAuthentication {
+    /// HTTP Basic with form-encoded credentials (`client_secret_basic`).
+    ClientSecretBasic,
+    /// `client_id` and `client_secret` in the form body (`client_secret_post`).
+    ClientSecretPost,
+}
+
+impl ClientAuthentication {
+    /// What the Device Authorization Grant sends, at both the device
+    /// authorization and token endpoints.
+    pub const DEVICE_GRANT: Self = Self::ClientSecretBasic;
+    /// What the Authorization Code exchange sends (browser sign-in, CLI
+    /// `--browser` and the gateway's browser enrollment).
+    pub const AUTHORIZATION_CODE: Self = Self::ClientSecretPost;
+}
+
 /// What the IdP answered a `grant_type=refresh_token` request with, when it
 /// answered in a way that settles the outcome (ADR-017 daemon-held refresh).
 #[derive(Debug)]
@@ -269,22 +295,29 @@ impl Enrollment {
         Ok(response)
     }
 
-    /// Confidential clients authenticate with HTTP Basic on every token- and
-    /// device-endpoint request (RFC 6749 §2.3.1); public clients send their
-    /// `client_id` in the form. One rule for device start, device poll and
-    /// client_credentials alike.
+    /// Authenticate the client on a token-, device- or revocation-endpoint
+    /// request (RFC 6749 §2.3.1). A confidential client uses `auth`: HTTP
+    /// Basic with form-encoded credentials, or both credentials in the form.
+    /// A public client sends its `client_id` in the form either way.
     fn with_client_auth(
         &self,
         request: reqwest::RequestBuilder,
         form: &mut Vec<(&'static str, String)>,
+        auth: ClientAuthentication,
     ) -> reqwest::RequestBuilder {
-        match self.config.client_secret.as_deref() {
-            Some(secret) => request.basic_auth(
-                form_urlencode_component(self.config.effective_client_id()),
+        let client_id = self.config.effective_client_id();
+        match (self.config.client_secret.as_deref(), auth) {
+            (Some(secret), ClientAuthentication::ClientSecretBasic) => request.basic_auth(
+                form_urlencode_component(client_id),
                 Some(form_urlencode_component(secret)),
             ),
-            None => {
-                form.push(("client_id", self.config.effective_client_id().to_string()));
+            (Some(secret), ClientAuthentication::ClientSecretPost) => {
+                form.push(("client_id", client_id.to_string()));
+                form.push(("client_secret", secret.to_string()));
+                request
+            }
+            (None, _) => {
+                form.push(("client_id", client_id.to_string()));
                 request
             }
         }
@@ -378,7 +411,11 @@ impl Enrollment {
             form.push(("code_challenge_method", "S256".into()));
             form.push(("code_challenge", challenge.to_string()));
         }
-        let request = self.with_client_auth(self.http.post(&endpoint), &mut form);
+        let request = self.with_client_auth(
+            self.http.post(&endpoint),
+            &mut form,
+            ClientAuthentication::DEVICE_GRANT,
+        );
         let response = request.form(&form).send().await?;
         let response =
             Self::refuse_redirect(response, "device authorization endpoint")?.error_for_status()?;
@@ -422,7 +459,11 @@ impl Enrollment {
         if let Some(verifier) = verifier {
             form.push(("code_verifier", verifier.to_string()));
         }
-        let request = self.with_client_auth(self.http.post(&discovery.token_endpoint), &mut form);
+        let request = self.with_client_auth(
+            self.http.post(&discovery.token_endpoint),
+            &mut form,
+            ClientAuthentication::DEVICE_GRANT,
+        );
         let response = request.form(&form).send().await?;
         let response = Self::refuse_redirect(response, "token endpoint")?;
         if response.status().is_success() {
@@ -457,7 +498,11 @@ impl Enrollment {
             ("grant_type", "client_credentials".to_string()),
             ("scope", self.config.effective_service_scope()),
         ];
-        let request = self.with_client_auth(self.http.post(&discovery.token_endpoint), &mut form);
+        let request = self.with_client_auth(
+            self.http.post(&discovery.token_endpoint),
+            &mut form,
+            ClientAuthentication::ClientSecretBasic,
+        );
         let response = request.form(&form).send().await?;
         let response = Self::refuse_redirect(response, "token endpoint")?;
         let status = response.status();
@@ -478,8 +523,10 @@ impl Enrollment {
         )
     }
 
-    /// Redeem a refresh token (RFC 6749 §6) with this entry's client
-    /// authentication.
+    /// Redeem a refresh token (RFC 6749 §6), authenticating the client with
+    /// `auth`: the method the refresh token was originally issued under, so a
+    /// provider that accepts only a client's registered method still accepts
+    /// the refresh.
     ///
     /// The request omits `scope`: a refresh cannot ask for more than the
     /// original grant, and omitting it keeps that grant even when the
@@ -489,7 +536,11 @@ impl Enrollment {
     ///
     /// Failures are classified by whether the refresh token can have reached
     /// the IdP; see [`RefreshFailure`].
-    pub async fn refresh(&self, refresh_token: &str) -> Result<RefreshOutcome, RefreshFailure> {
+    pub async fn refresh(
+        &self,
+        refresh_token: &str,
+        auth: ClientAuthentication,
+    ) -> Result<RefreshOutcome, RefreshFailure> {
         if refresh_token.trim().is_empty() {
             return Err(RefreshFailure::NotSent(anyhow::Error::msg(
                 "refresh token is empty",
@@ -500,7 +551,8 @@ impl Enrollment {
             ("grant_type", "refresh_token".to_string()),
             ("refresh_token", refresh_token.to_string()),
         ];
-        let request = self.with_client_auth(self.http.post(&discovery.token_endpoint), &mut form);
+        let request =
+            self.with_client_auth(self.http.post(&discovery.token_endpoint), &mut form, auth);
         let response = request
             .form(&form)
             .send()
@@ -541,8 +593,13 @@ impl Enrollment {
     }
 
     /// Revoke a refresh token (RFC 7009) when the issuer advertises a
-    /// `revocation_endpoint`, with this entry's client authentication.
-    pub async fn revoke_refresh_token(&self, refresh_token: &str) -> Result<RevocationOutcome> {
+    /// `revocation_endpoint`, authenticating the client with `auth` as for
+    /// [`Self::refresh`].
+    pub async fn revoke_refresh_token(
+        &self,
+        refresh_token: &str,
+        auth: ClientAuthentication,
+    ) -> Result<RevocationOutcome> {
         let discovery = self.discovery().await?;
         let Some(endpoint) = discovery.revocation_endpoint else {
             return Ok(RevocationOutcome::NotAdvertised);
@@ -552,7 +609,7 @@ impl Enrollment {
             ("token", refresh_token.to_string()),
             ("token_type_hint", "refresh_token".to_string()),
         ];
-        let request = self.with_client_auth(self.http.post(&endpoint), &mut form);
+        let request = self.with_client_auth(self.http.post(&endpoint), &mut form, auth);
         let response = request.form(&form).send().await?;
         let response = Self::refuse_redirect(response, "revocation endpoint")?;
         let status = response.status();
@@ -870,21 +927,17 @@ impl Enrollment {
             );
         }
         let mut form = vec![
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("redirect_uri", flow.redirect_uri.as_str()),
-            ("client_id", self.config.effective_client_id()),
-            ("code_verifier", flow.verifier.as_str()),
+            ("grant_type", "authorization_code".to_string()),
+            ("code", code.to_string()),
+            ("redirect_uri", flow.redirect_uri.clone()),
+            ("code_verifier", flow.verifier.clone()),
         ];
-        if let Some(secret) = self.config.client_secret.as_deref() {
-            form.push(("client_secret", secret));
-        }
-        let response = self
-            .http
-            .post(&flow.token_endpoint)
-            .form(&form)
-            .send()
-            .await?;
+        let request = self.with_client_auth(
+            self.http.post(&flow.token_endpoint),
+            &mut form,
+            ClientAuthentication::AUTHORIZATION_CODE,
+        );
+        let response = request.form(&form).send().await?;
         let status = response.status();
         let body = read_response_limited(response)
             .await
@@ -2773,7 +2826,13 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_sends_the_refresh_grant_without_scope() {
-        for secret in [Some("s3cret"), None] {
+        use ClientAuthentication::{ClientSecretBasic, ClientSecretPost};
+        for (secret, auth) in [
+            (Some("s3cret"), ClientSecretBasic),
+            (Some("s3cret"), ClientSecretPost),
+            (None, ClientSecretBasic),
+            (None, ClientSecretPost),
+        ] {
             let server = idp_with_refresh_endpoints(false).await;
             Mock::given(method("POST"))
                 .and(path("/token"))
@@ -2790,7 +2849,7 @@ mod tests {
             entry.scopes = vec!["openid".into(), "groups".into()];
             let enrollment = Enrollment::new("corp", entry).unwrap();
 
-            let outcome = enrollment.refresh("rt-1").await.unwrap();
+            let outcome = enrollment.refresh("rt-1", auth).await.unwrap();
             let RefreshOutcome::Granted(token) = outcome else {
                 panic!("expected a granted refresh, got {outcome:?}");
             };
@@ -2813,21 +2872,108 @@ mod tests {
                 !form.contains_key("scope"),
                 "a refresh must omit scope: {form:?}"
             );
-            match secret {
-                Some(_) => {
-                    assert!(basic_of(post).is_some_and(|v| v.starts_with("Basic ")));
-                    assert!(!form.contains_key("client_id"));
-                    assert!(!form.contains_key("client_secret"));
-                }
-                None => {
-                    assert!(basic_of(post).is_none());
-                    assert_eq!(
-                        form.get("client_id").map(String::as_str),
-                        Some("zerocode-cli")
-                    );
-                }
+            assert_client_authentication(post, secret, auth);
+        }
+    }
+
+    /// The request authenticated the client exactly as `auth` names: HTTP
+    /// Basic or form-body credentials for a confidential client, and only the
+    /// `client_id` in the form for a public one, whichever method is named.
+    fn assert_client_authentication(
+        request: &wiremock::Request,
+        secret: Option<&str>,
+        auth: ClientAuthentication,
+    ) {
+        let form = form_of(request);
+        match (secret, auth) {
+            (Some(_), ClientAuthentication::ClientSecretBasic) => {
+                assert!(basic_of(request).is_some_and(|v| v.starts_with("Basic ")));
+                assert!(!form.contains_key("client_id"), "{form:?}");
+                assert!(!form.contains_key("client_secret"), "{form:?}");
+            }
+            (Some(secret), ClientAuthentication::ClientSecretPost) => {
+                assert!(basic_of(request).is_none());
+                assert_eq!(
+                    form.get("client_id").map(String::as_str),
+                    Some("zerocode-cli")
+                );
+                assert_eq!(form.get("client_secret").map(String::as_str), Some(secret));
+            }
+            (None, _) => {
+                assert!(basic_of(request).is_none());
+                assert_eq!(
+                    form.get("client_id").map(String::as_str),
+                    Some("zerocode-cli")
+                );
+                assert!(!form.contains_key("client_secret"), "{form:?}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn each_token_flow_authenticates_as_its_recorded_method() {
+        // A grant records the method its token was issued with, read from
+        // these constants; they must name what each flow actually sends.
+        // Pinned to literal methods, not the constants, so changing a constant
+        // cannot also change the expectation. These are the documented methods
+        // (identity-providers.md, "Client authentication by request").
+        for secret in [Some("s3cret"), None] {
+            let server = idp_with_pkce_endpoints().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "at-1", "token_type": "Bearer",
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let enrollment = Enrollment::new("corp", config(&server.uri(), secret)).unwrap();
+            let flow = enrollment
+                .pkce_start("http://127.0.0.1:1/cb")
+                .await
+                .unwrap();
+            enrollment.pkce_exchange(&flow, "code").await.unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let post = requests.iter().find(|r| r.url.path() == "/token").unwrap();
+            assert_client_authentication(post, secret, ClientAuthentication::ClientSecretPost);
+        }
+        for secret in [Some("s3cret"), None] {
+            let server = idp_with_device_endpoint().await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "at-1", "token_type": "Bearer",
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let enrollment = Enrollment::new("corp", config(&server.uri(), secret)).unwrap();
+            enrollment.device_grant_poll("dev-1").await.unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let post = requests.iter().find(|r| r.url.path() == "/token").unwrap();
+            assert_client_authentication(post, secret, ClientAuthentication::ClientSecretBasic);
+        }
+    }
+
+    #[test]
+    fn client_authentication_serializes_as_the_registered_method_names() {
+        // Stored on a grant, so the names are a persistence format: the
+        // OAuth `token_endpoint_auth_method` registry values.
+        for (auth, name) in [
+            (
+                ClientAuthentication::ClientSecretBasic,
+                "client_secret_basic",
+            ),
+            (ClientAuthentication::ClientSecretPost, "client_secret_post"),
+        ] {
+            let json = serde_json::to_string(&auth).unwrap();
+            assert_eq!(json, format!("\"{name}\""));
+            assert_eq!(
+                serde_json::from_str::<ClientAuthentication>(&json).unwrap(),
+                auth
+            );
+        }
+        assert!(serde_json::from_str::<ClientAuthentication>("\"none\"").is_err());
     }
 
     #[tokio::test]
@@ -2843,7 +2989,11 @@ mod tests {
             .mount(&server)
             .await;
         let enrollment = Enrollment::new("corp", config(&server.uri(), Some("s"))).unwrap();
-        let RefreshOutcome::Granted(token) = enrollment.refresh("rt-1").await.unwrap() else {
+        let RefreshOutcome::Granted(token) = enrollment
+            .refresh("rt-1", ClientAuthentication::ClientSecretBasic)
+            .await
+            .unwrap()
+        else {
             panic!("expected a granted refresh");
         };
         assert!(token.refresh_token.is_none());
@@ -2863,7 +3013,10 @@ mod tests {
                 .mount(&server)
                 .await;
             let enrollment = Enrollment::new("corp", config(&server.uri(), Some("s"))).unwrap();
-            let outcome = enrollment.refresh("rt-1").await.unwrap();
+            let outcome = enrollment
+                .refresh("rt-1", ClientAuthentication::ClientSecretBasic)
+                .await
+                .unwrap();
             let RefreshOutcome::Refused(refusal) = &outcome else {
                 panic!("expected a refusal, got {outcome:?}");
             };
@@ -2877,7 +3030,10 @@ mod tests {
     async fn refresh_that_never_reached_the_token_endpoint_is_not_sent() {
         // Discovery failing means no refresh request was built at all.
         let enrollment = Enrollment::new("corp", config("http://127.0.0.1:9", Some("s"))).unwrap();
-        let err = enrollment.refresh("rt-1").await.unwrap_err();
+        let err = enrollment
+            .refresh("rt-1", ClientAuthentication::ClientSecretBasic)
+            .await
+            .unwrap_err();
         assert!(matches!(err, RefreshFailure::NotSent(_)), "{err:?}");
 
         // A token endpoint that refuses the connection was never sent the
@@ -2895,11 +3051,17 @@ mod tests {
             .mount(&server)
             .await;
         let enrollment = Enrollment::new("corp", config(&server.uri(), Some("s"))).unwrap();
-        let err = enrollment.refresh("rt-1").await.unwrap_err();
+        let err = enrollment
+            .refresh("rt-1", ClientAuthentication::ClientSecretBasic)
+            .await
+            .unwrap_err();
         assert!(matches!(err, RefreshFailure::NotSent(_)), "{err:?}");
 
         // A blank refresh token is refused before any request.
-        let err = enrollment.refresh("  ").await.unwrap_err();
+        let err = enrollment
+            .refresh("  ", ClientAuthentication::ClientSecretBasic)
+            .await
+            .unwrap_err();
         assert!(matches!(err, RefreshFailure::NotSent(_)), "{err:?}");
     }
 
@@ -2928,7 +3090,10 @@ mod tests {
                 .mount(&server)
                 .await;
             let enrollment = Enrollment::new("corp", config(&server.uri(), Some("s"))).unwrap();
-            let err = enrollment.refresh("rt-1").await.unwrap_err();
+            let err = enrollment
+                .refresh("rt-1", ClientAuthentication::ClientSecretBasic)
+                .await
+                .unwrap_err();
             assert!(matches!(err, RefreshFailure::Unknown(_)), "{err:?}");
         }
     }
@@ -2958,7 +3123,10 @@ mod tests {
             .await;
         let enrollment = Enrollment::new("corp", config(&server.uri(), None)).unwrap();
         // The socket drops when `hang_up` completes, before any answer.
-        let (delivered, result) = tokio::join!(hang_up, enrollment.refresh("rt-1"));
+        let (delivered, result) = tokio::join!(
+            hang_up,
+            enrollment.refresh("rt-1", ClientAuthentication::ClientSecretBasic)
+        );
         let err = result.unwrap_err();
         assert!(delivered, "the request reached the endpoint");
         assert!(matches!(err, RefreshFailure::Unknown(_)), "{err:?}");
@@ -2996,7 +3164,10 @@ mod tests {
                 .mount(&server)
                 .await;
             let enrollment = Enrollment::new("corp", config(&server.uri(), Some("s"))).unwrap();
-            let err = enrollment.refresh("rt-1").await.unwrap_err();
+            let err = enrollment
+                .refresh("rt-1", ClientAuthentication::ClientSecretBasic)
+                .await
+                .unwrap_err();
             assert!(matches!(err, RefreshFailure::Unknown(_)), "{err:?}");
             let printed = format!("{err:?} {err}");
             assert!(
@@ -3008,27 +3179,33 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_posts_the_refresh_token_to_the_advertised_endpoint() {
-        let server = idp_with_refresh_endpoints(true).await;
-        Mock::given(method("POST"))
-            .and(path("/revoke"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let enrollment = Enrollment::new("corp", config(&server.uri(), Some("s3cret"))).unwrap();
-        assert_eq!(
-            enrollment.revoke_refresh_token("rt-1").await.unwrap(),
-            RevocationOutcome::Revoked
-        );
-        let requests = server.received_requests().await.unwrap();
-        let post = requests.iter().find(|r| r.url.path() == "/revoke").unwrap();
-        let form = form_of(post);
-        assert_eq!(form.get("token").map(String::as_str), Some("rt-1"));
-        assert_eq!(
-            form.get("token_type_hint").map(String::as_str),
-            Some("refresh_token")
-        );
-        assert!(basic_of(post).is_some_and(|v| v.starts_with("Basic ")));
+        for auth in [
+            ClientAuthentication::ClientSecretBasic,
+            ClientAuthentication::ClientSecretPost,
+        ] {
+            let server = idp_with_refresh_endpoints(true).await;
+            Mock::given(method("POST"))
+                .and(path("/revoke"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let enrollment =
+                Enrollment::new("corp", config(&server.uri(), Some("s3cret"))).unwrap();
+            assert_eq!(
+                enrollment.revoke_refresh_token("rt-1", auth).await.unwrap(),
+                RevocationOutcome::Revoked
+            );
+            let requests = server.received_requests().await.unwrap();
+            let post = requests.iter().find(|r| r.url.path() == "/revoke").unwrap();
+            let form = form_of(post);
+            assert_eq!(form.get("token").map(String::as_str), Some("rt-1"));
+            assert_eq!(
+                form.get("token_type_hint").map(String::as_str),
+                Some("refresh_token")
+            );
+            assert_client_authentication(post, Some("s3cret"), auth);
+        }
     }
 
     #[tokio::test]
@@ -3041,7 +3218,10 @@ mod tests {
             .await;
         let enrollment = Enrollment::new("corp", config(&server.uri(), Some("s"))).unwrap();
         assert_eq!(
-            enrollment.revoke_refresh_token("rt-1").await.unwrap(),
+            enrollment
+                .revoke_refresh_token("rt-1", ClientAuthentication::ClientSecretBasic)
+                .await
+                .unwrap(),
             RevocationOutcome::NotAdvertised
         );
     }
@@ -3055,7 +3235,12 @@ mod tests {
             .mount(&server)
             .await;
         let enrollment = Enrollment::new("corp", config(&server.uri(), Some("s"))).unwrap();
-        assert!(enrollment.revoke_refresh_token("rt-1").await.is_err());
+        assert!(
+            enrollment
+                .revoke_refresh_token("rt-1", ClientAuthentication::ClientSecretBasic)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -3076,7 +3261,10 @@ mod tests {
             .mount(&server)
             .await;
         let enrollment = Enrollment::new("corp", config(&server.uri(), Some("s"))).unwrap();
-        let err = enrollment.revoke_refresh_token("rt-1").await.unwrap_err();
+        let err = enrollment
+            .revoke_refresh_token("rt-1", ClientAuthentication::ClientSecretBasic)
+            .await
+            .unwrap_err();
         assert!(
             format!("{err:#}").contains("revocation_endpoint"),
             "{err:#}"
