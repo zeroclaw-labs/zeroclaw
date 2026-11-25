@@ -437,6 +437,7 @@ WORKFLOW="$workflow" python3 - <<'PY'
 import itertools
 import json
 import os
+import re
 import subprocess
 import textwrap
 from pathlib import Path
@@ -465,8 +466,9 @@ scope_job = advisory.split("\n  windows-test-scope:\n", 1)[1].split(
 windows_job = advisory.split("\n  windows-test:\n", 1)[1].split(
     "\n  parallel-runtime-test-changes:\n", 1
 )[0]
-normalization = 'archive="$(cygpath -u "$archive")"'
-extraction = 'tar zxf "$archive" -C "$HOME/.cargo/bin"'
+nextest_install = windows_job.split("      - name: Install cargo-nextest\n", 1)[1].split(
+    "\n      - name:", 1
+)[0]
 skip_condition = "needs.windows-test-scope.outputs.mode != 'skip'"
 package_conversion = 'scripts/ci/windows_test_scope.py --package-args-json "$PACKAGES_JSON"'
 scoped_command = 'cargo nextest run --locked --no-fail-fast "${package_args[@]}"'
@@ -590,9 +592,10 @@ for case, command in ((scoped_case, scoped_command), (full_case, full_command)):
     assert case.index(command) < case.index("baseline_status=${PIPESTATUS[0]}")
     assert case.index("baseline_status=${PIPESTATUS[0]}") < case.index("set -e")
 assert '\n          exit "$overall_status"' in windows_job
-assert normalization in windows_job
-assert extraction in windows_job
-assert windows_job.index(normalization) < windows_job.index(extraction)
+assert re.search(r"^\s*uses: taiki-e/install-action@[0-9a-f]{40}(?:\s|$)", nextest_install, re.MULTILINE)
+assert "\n          tool: nextest\n" in nextest_install
+assert "\n          fallback: none" in nextest_install
+assert "checksum: false" not in nextest_install
 
 build = workflow.split("\n  build:\n", 1)[1].split("\n  windows-build:\n", 1)[0]
 required = workflow.split("\n  windows-required-changes:\n", 1)[1].split("\n  windows-service-smoke:\n", 1)[0]

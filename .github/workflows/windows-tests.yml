@@ -122,7 +122,7 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
-          tool: nextest@0.9.143
+          tool: nextest
           fallback: none
       - name: Run advisory Windows tests
         shell: bash
