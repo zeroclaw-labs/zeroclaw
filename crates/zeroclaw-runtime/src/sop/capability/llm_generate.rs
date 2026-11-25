@@ -244,6 +244,7 @@ impl ProviderLlmAdapter {
                 let (config, built) = zeroclaw_providers::model::build_nonblocking(resolve).await?;
                 let config = Arc::new(config);
                 let provider_ref = built.identity().provider_ref().to_owned();
+                let request_model = built.model_name().to_owned();
                 let sampling =
                     Temperature::default().for_call(Some(Arc::clone(&config)), &provider_ref);
                 let (provider, _, _) = built.into_parts();
@@ -258,7 +259,7 @@ impl ProviderLlmAdapter {
                         ProviderDispatch::new(Arc::from(provider)).chat_with_system_with_sampling(
                             system.as_deref(),
                             &prompt,
-                            &provider_ref,
+                            &request_model,
                             sampling,
                         ),
                     ))
@@ -759,6 +760,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response, "ok");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_adapter_model_less_fallback_uses_upstream_id() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let config = zeroclaw_config::migration::migrate_to_current(&format!(
+            r#"
+schema_version = 4
+[reliability]
+provider_retries = 0
+provider_backoff_ms = 0
+[providers.models.custom.main]
+uri = "{0}/primary/v1"
+api_key = "primary-key"
+model = "upstream-model"
+fallback = ["custom.backup"]
+[providers.models.custom.backup]
+uri = "{0}/backup/v1"
+api_key = "backup-key"
+"#,
+            server.uri()
+        ))
+        .unwrap();
+        for (endpoint, response) in [
+            ("primary", ResponseTemplate::new(500)),
+            ("backup", ResponseTemplate::new(200).set_body_json(json!({
+                "choices":[{"message":{"role":"assistant","content":"fallback response"},"finish_reason":"stop"}]
+            }))),
+        ] {
+            Mock::given(method("POST"))
+                .and(path(format!("/{endpoint}/v1/chat/completions")))
+                .and(body_partial_json(json!({"model":"upstream-model"})))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let text = tokio::task::spawn_blocking(move || {
+            ProviderLlmAdapter::generate_resolved(
+                move || {
+                    let built = zeroclaw_providers::model::build_model(
+                        &config,
+                        "default",
+                        "custom.main",
+                        None,
+                    )?;
+                    Ok((config, built))
+                },
+                None,
+                "hello",
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(text, "fallback response");
     }
 
     #[tokio::test(flavor = "current_thread")]
