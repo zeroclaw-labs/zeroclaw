@@ -1912,6 +1912,24 @@ mod tests {
         ));
     }
 
+    /// Prints the two profile roots the child actually received.
+    fn profile_root_echo_command() -> tokio::process::Command {
+        #[cfg(target_os = "windows")]
+        {
+            // `env_print_command()` is `set`, a cmd.exe built-in rather than an
+            // executable, so this fixture starts the interpreter itself.
+            let mut cmd = tokio::process::Command::new("cmd");
+            cmd.args(["/C", "echo %APPDATA%^|%LOCALAPPDATA%"]);
+            cmd
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut cmd = tokio::process::Command::new("/bin/sh");
+            cmd.args(["-c", r#"printf '%s|%s' "$APPDATA" "$LOCALAPPDATA""#]);
+            cmd
+        }
+    }
+
     #[test]
     fn shell_child_receives_windows_profile_roots_after_env_clear() {
         let names: Vec<String> = crate::tools::shell_env::WINDOWS_SAFE_SHELL_ENV_VARS
@@ -1920,7 +1938,7 @@ mod tests {
             .collect();
         let appdata = "/dummy/AppData/Roaming";
         let local_app_data = "/dummy/AppData/Local";
-        let mut cmd = tokio::process::Command::new(env_print_command());
+        let mut cmd = profile_root_echo_command();
         cmd.env_clear();
         super::apply_shell_env_vars(&mut cmd, &names, |key| match key {
             "APPDATA" => Some(appdata.to_string()),
@@ -1931,15 +1949,16 @@ mod tests {
         let output = cmd
             .as_std_mut()
             .output()
-            .expect("environment print child should run");
-        let stdout = String::from_utf8_lossy(&output.stdout);
+            .expect("profile root echo child should run");
         assert!(
-            env_output_contains_assignment(&stdout, "APPDATA", appdata),
-            "APPDATA must reach the child after env_clear; child output: {stdout}"
+            output.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
-        assert!(
-            env_output_contains_assignment(&stdout, "LOCALAPPDATA", local_app_data),
-            "LOCALAPPDATA must reach the child after env_clear; child output: {stdout}"
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            format!("{appdata}|{local_app_data}"),
+            "both profile roots must reach the child after env_clear"
         );
     }
 
