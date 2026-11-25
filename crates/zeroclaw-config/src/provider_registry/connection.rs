@@ -328,7 +328,14 @@ connection_struct!(PiperConnection {
 });
 connection_struct!(EdgeConnection { api: EdgeApi });
 connection_struct!(CliConnection { api: CliApi });
-connection_struct!(GrokConnection { api: GrokApi });
+connection_struct!(GrokConnection {
+    auth: Option<ApiKeyAuth>,
+    api: GrokApi,
+});
+connection_struct!(AntigravityConnection {
+    auth: Option<ApiKeyAuth>,
+    api: AntigravityApi,
+});
 connection_struct!(HailoConnection {
     uri: Option<String>,
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
@@ -672,6 +679,7 @@ provider_connections! {
     Gemini(GeminiConnection) = "gemini" [Chat],
     GeminiCli(CliConnection) = "gemini_cli" [Chat],
     GrokCli(GrokConnection) = "grok_cli" [Chat],
+    AntigravityCli(AntigravityConnection) = "antigravity_cli" [Chat],
     Bedrock(BedrockConnection) = "bedrock" [Chat],
     Telnyx(FixedChatConnection) = "telnyx" [Chat],
     Together(HttpChatConnection) = "together" [Chat],
@@ -1440,6 +1448,9 @@ impl ConnectionSettings for CliConnection {
     }
 }
 impl ConnectionSettings for GrokConnection {
+    fn api_key(&self) -> Option<&str> {
+        self.auth.as_ref().and_then(|auth| auth.api_key())
+    }
     fn chat_defaults(&self) -> Option<(Option<&PresetId>, &ChatOptionsPatch)> {
         self.api
             .chat
@@ -1452,6 +1463,20 @@ impl ConnectionSettings for GrokConnection {
             out.push(Capability::Chat);
         }
         out
+    }
+}
+impl ConnectionSettings for AntigravityConnection {
+    fn api_key(&self) -> Option<&str> {
+        self.auth.as_ref().and_then(|auth| auth.api_key())
+    }
+    fn chat_defaults(&self) -> Option<(Option<&PresetId>, &ChatOptionsPatch)> {
+        self.api
+            .chat
+            .as_ref()
+            .map(|api| (api.preset.as_ref(), &api.options))
+    }
+    fn configured_apis(&self) -> Vec<Capability> {
+        self.api.chat.iter().map(|_| Capability::Chat).collect()
     }
 }
 impl ConnectionSettings for HailoConnection {
@@ -1500,6 +1525,34 @@ impl ConnectionSettings for SystemOneConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subprocess_connections_keep_typed_keys_in_the_shared_secret_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(dir.path(), true);
+        for kind in ["grok_cli", "antigravity_cli"] {
+            let mut connection: ProviderConnection = toml::from_str(&format!(
+                "kind = '{kind}'\n[auth]\nmode = 'api_key'\napi_key = 'synthetic-cli-key'\n"
+            ))
+            .unwrap();
+            assert!(connection.supports(Capability::Chat));
+            assert!(!connection.supports(Capability::Embedding));
+            connection
+                .encrypt_secrets(&store, "providers.connections.cli")
+                .unwrap();
+            assert!(SecretStore::is_secure_encrypted(
+                connection.api_key().unwrap()
+            ));
+            let mut masked = connection.clone();
+            masked.mask_secrets().unwrap();
+            assert_eq!(masked.api_key(), Some(MASKED_SECRET));
+            masked.restore_secrets_from(&connection).unwrap();
+            masked
+                .decrypt_secrets(&store, "providers.connections.cli")
+                .unwrap();
+            assert_eq!(masked.api_key(), Some("synthetic-cli-key"));
+        }
+    }
 
     #[test]
     fn omitted_capabilities_use_kind_defaults_and_explicit_values_win() {
