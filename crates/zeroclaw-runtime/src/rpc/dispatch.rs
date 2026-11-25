@@ -44783,15 +44783,16 @@ model = "before"
         let started = std::time::Instant::now();
         let error = tokio::time::timeout(
             SESSION_PROVIDER_UPDATE_LOCK_TIMEOUT + std::time::Duration::from_secs(2),
-            dispatcher.handle_config_set(&json!({
-                "prop": "providers.models.openai.test-provider.model",
-                "value": "new-model"
-            })),
+            dispatcher.handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["models", "openai.test-provider", "model"],
+                json!("new-model"),
+            )),
         )
         .await
         .expect("config/set must not park behind a busy session's turn")
         .expect_err("config/set must refuse to rebuild a session that is mid-turn");
-        assert_eq!(error.code, SESSION_BUSY);
+        assert_eq!(error.code, SESSION_BUSY, "{}", error.message);
         assert!(
             error.message.contains(&busy_session),
             "the error must name the busy session: {}",
@@ -44816,25 +44817,23 @@ model = "before"
             model_name_for_session(&dispatcher, &busy_session).await,
             "old-model"
         );
-        assert_ne!(
-            dispatcher
-                .ctx
-                .config
-                .read()
-                .get_prop("providers.models.openai.test-provider.model")
-                .ok()
-                .as_deref(),
-            Some("new-model"),
+        let registry =
+            zeroclaw_config::provider_registry::editor::snapshot(&dispatcher.ctx.config.read())
+                .expect("canonical registry snapshot must remain valid");
+        assert_eq!(
+            registry["models"]["openai.test-provider"]["model"],
+            json!("old-model"),
             "a refused config/set must not publish the candidate config"
         );
 
         // Once the turn ends, the same edit goes through.
         drop(busy_guard);
         dispatcher
-            .handle_config_set(&json!({
-                "prop": "providers.models.openai.test-provider.model",
-                "value": "new-model"
-            }))
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["models", "openai.test-provider", "model"],
+                json!("new-model"),
+            ))
             .await
             .expect("config/set must succeed once the session is idle");
         assert_eq!(

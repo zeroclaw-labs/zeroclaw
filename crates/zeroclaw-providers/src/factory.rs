@@ -523,6 +523,18 @@ pub(crate) fn canonical_auth_ready(
 ) -> bool {
     use zeroclaw_config::provider_registry::{GeminiAuth, ProviderConnection, QwenAuth};
     let key = connection.api_key();
+    if let ProviderConnection::AntigravityCli(connection) = connection {
+        return AntigravityCliModelProviderConfig {
+            auth_method: connection
+                .api
+                .chat
+                .as_ref()
+                .map(|api| api.auth_method)
+                .unwrap_or_default(),
+            ..Default::default()
+        }
+        .fallback_auth_ready(key, &ModelProviderRuntimeOptions::default());
+    }
     if has_api_key(key)
         || connection
             .extra_headers()
@@ -2544,6 +2556,23 @@ mod tests {
             (json!({"kind": "llamacpp"}), true),
             (json!({"kind": "vllm"}), true),
             (json!({"kind": "gemini_cli"}), true),
+            (json!({"kind": "antigravity_cli"}), false),
+            (
+                json!({"kind": "antigravity_cli", "api": {"chat": {"auth_method": "agent_platform"}}}),
+                true,
+            ),
+            (
+                json!({"kind": "antigravity_cli", "api": {"chat": {"auth_method": "oauth_business"}}}),
+                true,
+            ),
+            (
+                json!({"kind": "antigravity_cli", "auth": {"mode": "api_key", "api_key": "test-key"}, "api": {"chat": {"auth_method": "oauth_personal"}}}),
+                false,
+            ),
+            (
+                json!({"kind": "antigravity_cli", "auth": {"mode": "api_key", "api_key": "test-key"}}),
+                true,
+            ),
             (json!({"kind": "bedrock"}), true),
             (json!({"kind": "gemini", "auth": {"mode": "oauth"}}), true),
             (json!({"kind": "qwen", "auth": {"mode": "oauth"}}), true),
