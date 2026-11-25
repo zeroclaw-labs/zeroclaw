@@ -102,6 +102,7 @@ mod tests {
     #[test]
     fn reexported_channel_configs_are_constructible() {
         let telegram = TelegramConfig {
+            edited_messages: false,
             enabled: true,
             bot_token: "token".into(),
             api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
