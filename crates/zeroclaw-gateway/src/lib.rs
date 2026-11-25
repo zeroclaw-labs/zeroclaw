@@ -9125,10 +9125,11 @@ path = "{trigger_path}"
     }
 
     /// A stopped gateway lets go of its port as soon as it stops accepting,
-    /// as `axum::serve` does, so a fresh connection is refused rather than
-    /// left in a backlog nothing serves, even while the drain still holds a
-    /// response in flight. The next gateway then takes the port. Over plain
-    /// HTTP and TLS.
+    /// as `axum::serve` does, even while the drain still holds a response in
+    /// flight: the listener is dropped within the drain, and the next
+    /// gateway then takes the port. Off Windows, a fresh connection made
+    /// during the drain is also seen to be refused rather than left in a
+    /// backlog nothing serves. Over plain HTTP and TLS.
     #[tokio::test]
     async fn a_stopped_gateway_releases_its_port_before_its_drain_ends() {
         let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
@@ -9152,12 +9153,31 @@ path = "{trigger_path}"
             assert!(head.starts_with("HTTP/1.1 200"), "{label}: {head}");
 
             shutdown_tx.send(true).unwrap();
-            // Windows may defer a refused TCP connect beyond the whole drain.
-            // Observe the owned listener's release, not the peer's retry timer.
-            tokio::time::timeout(std::time::Duration::from_secs(2), released_rx)
+            // Observe the owned listener's release, not the peer's retry
+            // timer: Windows may defer a refused TCP connect beyond the whole
+            // drain. The signal is in-process, so the drain bounds it.
+            tokio::time::timeout(CONNECTION_DRAIN, released_rx)
                 .await
-                .expect("the listener is released promptly")
+                .expect("the listener is released before the drain ends")
                 .expect("the listener release is reported");
+            // Where a refused connect is reported promptly, also see the
+            // release from the client side.
+            #[cfg(not(windows))]
+            {
+                let refused = tokio::time::timeout(std::time::Duration::from_millis(150), async {
+                    loop {
+                        match tokio::net::TcpStream::connect(addr).await {
+                            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break,
+                            _ => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                        }
+                    }
+                })
+                .await;
+                assert!(
+                    refused.is_ok(),
+                    "{label}: the stopped gateway still held its port while it drained"
+                );
+            }
             assert!(
                 !server.is_finished(),
                 "{label}: the drain still holds the event stream"
