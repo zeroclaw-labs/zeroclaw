@@ -9,7 +9,7 @@ use super::protocol_detect::{
 };
 use super::redact::scrub_credentials;
 use super::tool_specs::IterationToolSpecs;
-use crate::agent::cost::record_tool_loop_cost_usage;
+use crate::agent::cost::record_accepted_attempt_cost_usage;
 use crate::agent::loop_::capture_llm_messages;
 use crate::observability::ObserverEvent;
 use std::time::Instant;
@@ -332,7 +332,7 @@ pub(crate) async fn interpret_chat_response(
     }
 }
 
-use zeroclaw_providers::dispatch::AcceptedRoute;
+use zeroclaw_providers::dispatch::{AcceptedRoute, AccountedAttempt};
 
 /// Emit effects which are valid only after the turn loop accepts the parsed
 /// response. Keeping this separate from interpretation prevents a malformed
@@ -350,28 +350,32 @@ pub(crate) async fn record_accepted_chat_response(
     llm_started_at: Instant,
     iteration: usize,
     accepted_route: Option<&AcceptedRoute>,
+    accepted_attempt: Option<&AccountedAttempt>,
 ) {
-    // The accepted_route tuple is the canonical identity when Reliable wrapping
-    // produced an AcceptedRoute. When no AcceptedRoute exists (direct/vision
-    // routing without Reliable), fall back to ctx.serving_* overrides.
-    let (effective_provider, effective_model) = match accepted_route {
-        Some(route) => (route.provider_ref(), route.model()),
-        None => {
-            // Vision routing without Reliable: use ctx.serving_* overrides when
-            // they differ from the base provider.
-            let prov = if let Some(ref vision_provider) = ctx.serving_provider_name
-                && vision_provider != ctx.provider_name
-            {
-                vision_provider.as_str()
-            } else {
-                served_provider
-            };
-            let mdl = if ctx.serving_model.as_deref().is_some_and(|m| m != model) {
-                ctx.serving_model.as_deref().unwrap_or(model)
-            } else {
-                model
-            };
-            (prov, mdl)
+    // Prefer the reported attempt identity for accounting and observation.
+    // Without an attempt, retain the route and vision-override fallbacks.
+    let (effective_provider, effective_model) = if let Some(attempt) = accepted_attempt {
+        (attempt.provider_ref(), attempt.model())
+    } else {
+        match accepted_route {
+            Some(route) => (route.provider_ref(), route.model()),
+            None => {
+                // Vision routing without Reliable: use ctx.serving_* overrides when
+                // they differ from the base provider.
+                let prov = if let Some(ref vision_provider) = ctx.serving_provider_name
+                    && vision_provider != ctx.provider_name
+                {
+                    vision_provider.as_str()
+                } else {
+                    served_provider
+                };
+                let mdl = if ctx.serving_model.as_deref().is_some_and(|m| m != model) {
+                    ctx.serving_model.as_deref().unwrap_or(model)
+                } else {
+                    model
+                };
+                (prov, mdl)
+            }
         }
     };
 
@@ -392,7 +396,14 @@ pub(crate) async fn record_accepted_chat_response(
         messages: capture_llm_messages(history, Some(response_text), native_tool_calls),
     });
     let cost_usd = usage
-        .and_then(|usage| record_tool_loop_cost_usage(effective_provider, effective_model, usage))
+        .and_then(|usage| {
+            record_accepted_attempt_cost_usage(
+                effective_provider,
+                effective_model,
+                usage,
+                accepted_attempt,
+            )
+        })
         .map(|(_total_tokens, cost_usd)| cost_usd);
     // Exactly-one per accepted response, even when the provider returned no
     // usage data, so terminal identity and context-window accounting always
@@ -1066,6 +1077,7 @@ mod cost_usd_regression_tests {
                     now,
                     0,
                     None,
+                    None,
                 )
                 .await;
             })
@@ -1268,6 +1280,7 @@ mod cost_usd_regression_tests {
             std::time::Instant::now(),
             0,
             None,
+            None,
         )
         .await;
 
@@ -1336,6 +1349,7 @@ mod cost_usd_regression_tests {
             std::time::Instant::now(),
             0,
             None,
+            None,
         )
         .await;
 
@@ -1394,6 +1408,7 @@ mod cost_usd_regression_tests {
             std::time::Instant::now(),
             0,
             None,
+            None,
         )
         .await;
 
@@ -1437,6 +1452,7 @@ mod cost_usd_regression_tests {
             &history,
             std::time::Instant::now(),
             0,
+            None,
             None,
         )
         .await;
