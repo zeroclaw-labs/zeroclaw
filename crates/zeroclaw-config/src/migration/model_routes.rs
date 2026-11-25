@@ -199,6 +199,16 @@ pub(super) fn legacy_chat_api_fields(kind: &str) -> &'static [(&'static str, &'s
             ("extra_args", "extra_args"),
             ("max_acp_stdout_bytes", "max_acp_stdout_bytes"),
         ],
+        "antigravity_cli" => &[
+            ("timeout_secs", "request_timeout_secs"),
+            ("binary_path", "binary_path"),
+            ("working_directory", "working_directory"),
+            ("auth_method", "auth_method"),
+            ("state_directory", "state_directory"),
+            ("env_passthrough", "env_passthrough"),
+            ("extra_args", "extra_args"),
+            ("max_acp_stdout_bytes", "max_acp_stdout_bytes"),
+        ],
         "hailo_ollama" => &[
             ("timeout_secs", "request_timeout_secs"),
             ("queue_timeout_secs", "queue_timeout_secs"),

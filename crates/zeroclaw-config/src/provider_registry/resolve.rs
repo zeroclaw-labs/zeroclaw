@@ -199,7 +199,7 @@ impl ProviderRegistry {
         if effective.stream_request_timeout_secs.is_some()
             && matches!(
                 connection.kind(),
-                "gemini_cli" | "kilocli" | "grok_cli" | "hailo_ollama"
+                "gemini_cli" | "kilocli" | "grok_cli" | "antigravity_cli" | "hailo_ollama"
             )
         {
             return Err(RegistryError::model(
@@ -220,7 +220,7 @@ impl ProviderRegistry {
         if effective.read_timeout_secs.is_some()
             && matches!(
                 connection.kind(),
-                "hailo_ollama" | "gemini_cli" | "kilocli" | "grok_cli"
+                "hailo_ollama" | "gemini_cli" | "kilocli" | "grok_cli" | "antigravity_cli"
             )
         {
             return Err(RegistryError::model(
@@ -238,7 +238,7 @@ impl ProviderRegistry {
                 "request deadline cannot be disabled for this connection kind",
             ));
         }
-        if matches!(connection, ProviderConnection::GrokCli(_))
+        if matches!(connection, ProviderConnection::GrokCli(_) | ProviderConnection::AntigravityCli(_))
             && matches!(effective.request_timeout_secs, Some(Override::Clear))
         {
             return Err(RegistryError::model(
@@ -271,7 +271,7 @@ impl ProviderRegistry {
             api.wire_api.is_some()
                 && matches!(
                     connection.kind(),
-                    "hailo_ollama" | "gemini_cli" | "grok_cli" | "kilocli"
+                    "hailo_ollama" | "gemini_cli" | "grok_cli" | "kilocli" | "antigravity_cli"
                 )
         }) {
             return Err(RegistryError::model(
@@ -326,13 +326,21 @@ impl ProviderRegistry {
         let mut wire_api = None;
         let mut request_timeout_secs = None;
         let mut stream_request_timeout_secs = None;
-        if let ProviderConnection::GrokCli(connection) = selection.connection {
-            request_timeout_secs = connection
+        let subprocess_timeout = match selection.connection {
+            ProviderConnection::GrokCli(connection) => connection
                 .api
                 .chat
                 .as_ref()
-                .and_then(|api| api.request_timeout_secs)
-                .map(Override::Set);
+                .and_then(|api| api.request_timeout_secs),
+            ProviderConnection::AntigravityCli(connection) => connection
+                .api
+                .chat
+                .as_ref()
+                .and_then(|api| api.request_timeout_secs),
+            _ => None,
+        };
+        if let Some(timeout) = subprocess_timeout {
+            request_timeout_secs = Some(Override::Set(timeout));
         }
         let mut read_timeout_secs = None;
         let mut queue_timeout_secs = match selection.connection {

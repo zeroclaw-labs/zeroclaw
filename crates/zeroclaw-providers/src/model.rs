@@ -528,6 +528,25 @@ pub fn build_model(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn canonical_fallback_to_retired_gemini_cli_reports_retirement() {
+        let registry = serde_json::from_value(serde_json::json!({
+            "connections":{"local":{"kind":"ollama"},"retired":{"kind":"gemini_cli"}},
+            "models":{
+                "chat.primary":{"capability":"chat","provider":"local","model":"primary"},
+                "chat.retired":{"capability":"chat","provider":"retired","model":"old"}
+            },
+            "fallback":{"chat.primary":["chat.retired"]}
+        })).unwrap();
+        let error = super::build_provider_in_registry(
+            &Config::default(), &registry, &"chat.primary".into(), super::ProviderOverrides::default(),
+            &crate::ModelProviderRuntimeOptions::default(),
+        ).err().expect("a retired fallback must fail construction");
+        let message = error.to_string();
+        assert!(message.contains("retired"), "{message}");
+        assert!(message.contains("antigravity_cli"), "{message}");
+    }
+
     use super::*;
     use zeroclaw_config::schema::{ModelEntryConfig, ModelRouteConfig};
 

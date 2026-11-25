@@ -1,7 +1,9 @@
 #![allow(clippy::to_string_in_format_args)]
 //! ModelProvider subsystem for model inference backends.
 
+pub(crate) mod acp_cli;
 pub mod anthropic;
+pub mod antigravity_cli;
 pub mod auth;
 pub mod azure_openai;
 pub mod bedrock;
@@ -13,7 +15,6 @@ pub mod dispatch;
 pub mod embedding;
 pub mod factory;
 pub mod gemini;
-pub mod gemini_cli;
 pub mod grok_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod hailo_ollama;
@@ -1625,6 +1626,8 @@ pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
         "gemini-cli" => "gemini_cli",
         // Grok Build CLI is its own typed slot (subprocess runtime).
         "grok-cli" | "grokcli" => "grok_cli",
+        // Antigravity CLI is its own typed slot (ACP subprocess runtime).
+        "antigravity-cli" | "agy" => "antigravity_cli",
         // Stepfun-intl folds with a different uri at the schema layer.
         "stepfun-intl" | "step-intl" => "stepfun",
         // Anthropic special folds.
@@ -1932,8 +1935,9 @@ pub fn recommended_runtime_profile(name: &str) -> Option<&'static str> {
 /// `zeroclaw-config` are a dual-maintenance surface: the macro carries the
 /// canonical slot set, this list adds display-only fields (`display_name`,
 /// `local`). The `listed_model_providers_match_canonical_slots` test enforces
-/// that the two cover exactly the same slots, so a provider added to the macro
-/// without a display entry here (or vice versa) fails `cargo test`.
+/// that the two cover exactly the same slots, except
+/// [`RETIRED_MODEL_PROVIDER_SLOTS`], so a provider added to the macro without a
+/// display entry here (or vice versa) fails `cargo test`.
 pub fn list_model_providers() -> Vec<ModelProviderInfo> {
     let mut out: Vec<ModelProviderInfo> = Vec::new();
     push_family(
@@ -1981,8 +1985,8 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("perplexity", "Perplexity", false),
             ("cohere", "Cohere", false),
             ("copilot", "GitHub Copilot", false),
-            ("gemini_cli", "Gemini CLI", true),
             ("grok_cli", "Grok Build CLI", true),
+            ("antigravity_cli", "Antigravity CLI", true),
             ("kilocli", "KiloCLI", true),
             ("kilo", "Kilo", false),
             ("zerorouter", "ZeroRouter", false),
@@ -2058,12 +2062,18 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             .collect::<std::collections::BTreeSet<_>>(),
         canonical_model_provider_slots()
             .into_iter()
+            .filter(|slot| !RETIRED_MODEL_PROVIDER_SLOTS.contains(slot))
             .collect::<std::collections::BTreeSet<_>>(),
         "list_model_providers() drifted from for_each_model_provider_slot!: \
          every canonical slot needs exactly one display entry and vice versa"
     );
     out
 }
+
+/// Config slots kept only so existing configs parse and fail validation with
+/// a migration message. They are not offered in provider listings and their
+/// factories always refuse.
+pub const RETIRED_MODEL_PROVIDER_SLOTS: &[&str] = &["gemini_cli"];
 
 #[must_use]
 pub fn canonical_model_provider_slots() -> Vec<&'static str> {
@@ -3827,12 +3837,28 @@ mod tests {
     }
 
     #[test]
-    fn factory_gemini_cli() {}
+    fn factory_gemini_cli_is_retired_with_migration_guidance() {
+        let error = match create_model_provider("gemini_cli", None, &Default::default()) {
+            Ok(_) => panic!("retired gemini_cli provider must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("retired"), "{error}");
+        assert!(error.contains("antigravity_cli"), "{error}");
+    }
 
     #[test]
     fn factory_grok_cli() {
         let error = match create_model_provider("grok_cli", None, &Default::default()) {
             Ok(_) => panic!("unscoped grok_cli provider must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("working_directory"));
+    }
+
+    #[test]
+    fn factory_antigravity_cli() {
+        let error = match create_model_provider("antigravity_cli", Some("test-key"), &Default::default()) {
+            Ok(_) => panic!("unscoped antigravity_cli provider must fail"),
             Err(error) => error,
         };
         assert!(error.to_string().contains("working_directory"));
@@ -4511,9 +4537,9 @@ mod tests {
         // `normalize_model_provider_type` in `schema/v2.rs` and never reach
         // the runtime. `azure` is excluded (typed-config required, see
         // `listed_model_providers_are_constructible` skip list); `custom` is
-        // excluded (URI required); `grok_cli` is excluded because ACP requires
-        // an explicit absolute working_directory. Dedicated factory tests cover
-        // each required-config family.
+        // excluded (URI required); `grok_cli` and `antigravity_cli` are
+        // excluded because ACP requires an explicit absolute working_directory.
+        // Dedicated factory tests cover each required-config family.
         let canonical = [
             "openrouter",
             "anthropic",
@@ -4550,7 +4576,6 @@ mod tests {
             "perplexity",
             "cohere",
             "copilot",
-            "gemini_cli",
             "kilocli",
             "nvidia",
             "astrai",
@@ -4583,8 +4608,10 @@ mod tests {
     fn listed_model_providers_match_canonical_slots() {
         let listed: std::collections::BTreeSet<&str> =
             list_model_providers().iter().map(|p| p.name).collect();
-        let canonical: std::collections::BTreeSet<&str> =
-            canonical_model_provider_slots().into_iter().collect();
+        let canonical: std::collections::BTreeSet<&str> = canonical_model_provider_slots()
+            .into_iter()
+            .filter(|slot| !RETIRED_MODEL_PROVIDER_SLOTS.contains(slot))
+            .collect();
         let missing: Vec<&&str> = canonical.difference(&listed).collect();
         let phantom: Vec<&&str> = listed.difference(&canonical).collect();
         assert!(
@@ -4605,9 +4632,10 @@ mod tests {
             if model_provider.name == "custom" {
                 continue;
             }
-            // Grok ACP deliberately refuses the daemon cwd as an implicit
-            // trust boundary; a typed alias must provide working_directory.
-            if model_provider.name == "grok_cli" {
+            // ACP CLI providers deliberately refuse the daemon cwd as an
+            // implicit trust boundary; a typed alias must provide
+            // working_directory.
+            if matches!(model_provider.name, "grok_cli" | "antigravity_cli") {
                 continue;
             }
             let api_key = if model_provider.name == "hailo_ollama" {
