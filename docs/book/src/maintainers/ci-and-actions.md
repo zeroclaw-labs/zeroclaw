@@ -10,7 +10,9 @@ Fires on every PR targeting `master` and on trusted pushes to `master`.
 Composite job with multiple matrix legs:
 
 - **fmt**: `cargo fmt --all -- --check`
-- **history-guard**: fetches full history and checks the commit under test
+- **history-guard**: fetches the whole commit graph as a treeless clone
+  (`filter: tree:0`: every commit, without the trees and blobs behind them)
+  and checks the commit under test
   against `origin/master`; pull requests use the explicit
   `github.event.pull_request.head.sha`, while trusted pushes and merge-queue
   runs use `github.sha`. The guard and its fixture test reject an empty
@@ -97,7 +99,7 @@ Runs `cargo clippy -p zeroclaw-desktop --all-targets -- -D warnings` and then `c
 
 ### Daily Advisory Scan (`daily-audit.yml`)
 
-Runs `cargo deny check advisories` daily at 09:00 UTC against the dependency tree. Opens an issue on findings. No action unless a vulnerability is reported.
+Runs `cargo deny check advisories` and `cargo audit` daily at 09:00 UTC against `master`, with the same pinned cargo-deny and cargo-audit builds as the `Security` job in `ci.yml`. It only reports: on findings the run fails and opens one `security` issue for each distinct set of advisory IDs. A run that finds the same set as an open issue links that issue instead of opening another, and a new advisory gets its own issue even while an older one, such as a tracking issue for an accepted advisory, is still open.
 
 ### Daily npm Audit (`daily-npm-audit.yml`)
 

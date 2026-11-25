@@ -1060,6 +1060,7 @@ cli-desktop-download-at = {"  "}Téléchargez-la sur : {$url}
 cli-config-legend = Légende : 💉 remplacé par env  🔒 secret
 cli-config-secret-set = {$path} est défini (secret chiffré — valeur non affichée)
 cli-config-secret-unset = {$path} n'est pas défini (secret chiffré)
+cli-config-value-prompt = Saisissez une valeur pour {$path}
 cli-config-updated = {$path} mis à jour.
 cli-config-review-hint = Exécutez `zeroclaw config list` pour vérifier, puis définissez les champs requis.
 cli-config-catalog-unavailable-manual = {"  "}⚠ Le catalogue de {$provider} est indisponible ({$error}) ; saisissez manuellement l’identifiant du modèle.
@@ -1353,6 +1354,12 @@ sop-rpc-policy-unavailable = La politique du SOP en attente est indisponible : {
 tool-runtime-command-build-failed = Échec de la construction de la commande d’exécution : {$error}
 tool-runtime-command-docker-workspace-path = Échec de la construction de la commande d’exécution : échec de la canonicalisation du chemin de l’espace de travail Docker {$path} : {$cause}
 tool-runtime-command-docker-allowed-root = Échec de la création de la commande d’exécution : échec de la canonicalisation de la racine de l’espace de travail Docker {$path} : {$cause}
+
+# ── Shell tool failure labels (user-facing ToolComplete.error) ──
+tool-shell-exit-status = statut de sortie { $code }
+tool-shell-killed-by-signal = interrompu par le signal { $signal }
+tool-shell-exited-unsuccessfully = s'est terminé sans succès
+tool-shell-failure-with-detail = { $status }: { $detail }
 cli-approval-request = 🔧 L'agent veut exécuter : {$tool}
 cli-approval-prompt = { "   " }[Y] Oui / [N] Non / [A] Toujours pour {$tool} :{ " " }
 channel-approval-heading = Approbation de l'outil requise

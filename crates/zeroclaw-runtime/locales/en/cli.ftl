@@ -1229,6 +1229,7 @@ cli-desktop-download-at = {"  "}Download it at: {$url}
 cli-config-legend = Legend: 💉 env-overridden  🔒 secret
 cli-config-secret-set = {$path} is set (encrypted secret — value not displayed)
 cli-config-secret-unset = {$path} is not set (encrypted secret)
+cli-config-value-prompt = Enter value for {$path}
 cli-config-updated = {$path} updated.
 cli-config-review-hint = Run `zeroclaw config list` to review, then set required fields.
 cli-config-catalog-unavailable-manual = {"  "}⚠ Catalog for {$provider} is unavailable ({$error}); enter the model ID manually.
@@ -1263,6 +1264,23 @@ cli-auth-refresh-ok = ✓ Token refresh OK (profile {$profile})
 cli-auth-removed = Removed auth profile {$provider}:{$profile}
 cli-auth-not-found = Auth profile not found: {$provider}:{$profile}
 cli-auth-xai-imported = Imported xAI auth profile from {$path}
+cli-auth-gemini-personal-account-warning =
+    ================================================================================
+    WARNING: PERSONAL GOOGLE ACCOUNTS DO NOT WORK WITH THIS LOGIN
+    ================================================================================
+    Google stopped serving Gemini Code Assist to Google AI free, Pro, and Ultra
+    accounts on June 18, 2026, and suspends accounts that use a consumer Google
+    login from third-party tools such as ZeroClaw. Do not sign in with a personal
+    Google account here.
+
+    Continue only with your own Google Cloud OAuth client and an account licensed
+    for Gemini Code Assist Standard or Enterprise.
+
+    For everything else, use one of:
+      - providers.models.gemini.<alias> with an API key
+      - providers.models.antigravity_cli.<alias> with a Gemini API key, Agent
+        Platform, or Gemini Enterprise
+    ================================================================================
 cli-auth-xai-device-code-started = xAI device-code login started.
 cli-auth-oauth-visit = Visit: {$uri}
 cli-auth-oauth-code = Code:  {$code}
@@ -1318,6 +1336,9 @@ cli-channels-build-hint = {"  "}Build from source with `./install.sh --source --
 cli-channels-start-hint = To start channels: zeroclaw channel start
 cli-channels-doctor-hint = To check health:    zeroclaw channel doctor
 cli-channels-configure-hint = To configure:      zeroclaw config set channels.<name>.<field>=<value>
+# Refusal when a cron announcement or one-off send names a channel instance
+# whose `enabled` is false. `table` is the config table (`lark` for Feishu).
+cli-channels-delivery-disabled = [channels.{$table}.{$alias}] is disabled; set enabled = true to deliver
 
 cli-models-set-ok = Default model set to "{ $model }" on { $provider }.
 cli-models-status-current = Default model: { $model } (provider: { $provider })
@@ -1666,6 +1687,12 @@ sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
 tool-runtime-command-build-failed = Failed to build runtime command: {$error}
 tool-runtime-command-docker-workspace-path = Failed to build runtime command: Failed to canonicalize Docker workspace path {$path}: {$cause}
 tool-runtime-command-docker-allowed-root = Failed to build runtime command: Failed to canonicalize Docker workspace root {$path}: {$cause}
+
+# ── Shell tool failure labels (user-facing ToolComplete.error) ──
+tool-shell-exit-status = exit status { $code }
+tool-shell-killed-by-signal = killed by signal { $signal }
+tool-shell-exited-unsuccessfully = exited unsuccessfully
+tool-shell-failure-with-detail = { $status }: { $detail }
 
 # ── Terminal tool approval ──
 # The ASCII shortcut tokens stay aligned with the Rust-owned response parser.
