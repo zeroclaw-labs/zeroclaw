@@ -416,7 +416,7 @@ zc-quickstart-selector-peer-groups = Peer groups (optional)
 zc-quickstart-selector-agent = Agent
 zc-quickstart-selector-submit = Submit
 
-zc-quickstart-reuse-alias-help = Reuse this alias instead of creating a new one.
+zc-quickstart-reuse-alias-help = Reuse this configured model without creating another connection or model.
 zc-quickstart-existing-providers-heading = Configured models
 zc-quickstart-existing-providers-show-more = [+ Show { $count } more configured models]
 zc-quickstart-existing-providers-show-fewer = [- Show fewer configured models]
@@ -808,7 +808,7 @@ zc-config-group-other = Other
 zc-config-section-providers-models-label = Model providers
 zc-config-section-providers-registry-label = Provider registry
 zc-config-section-providers-registry-help = Configure reusable provider connections, capability models, presets and fallback references. Names are exact keys and may contain dots.
-zc-config-registry-help = Edit connections, models, model_presets and fallback together as JSON. Enter inserts a line; Ctrl+S saves. For inherited options, omit a field to inherit and use the string "null" to clear it. References are validated and unchanged masked credentials are preserved. The `revision` value is a concurrency token; reload after another editor changes the registry or after a daemon restart.
+zc-config-registry-help = `revision` prevents stale saves; reload after another edit or daemon restart. Edit registry JSON: Enter adds a line; Ctrl+S saves. Omit options to inherit; "null" clears them. References are checked; unchanged masked credentials are kept.
 zc-config-section-model-routes-label = Model routes
 zc-config-section-embedding-routes-label = Embedding routes
 zc-config-section-risk-profiles-label = Risk profiles

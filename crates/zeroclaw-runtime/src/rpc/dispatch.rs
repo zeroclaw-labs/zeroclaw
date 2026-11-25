@@ -10644,12 +10644,11 @@ impl RpcDispatcher {
                 continue;
             }
 
-            // ModelRefs can be narrowed before taking the per-session turn
-            // guard. This is the important fast path for a registry edit:
-            // an unrelated running chat must not hold up the config writer
-            // merely because another model changed. We still re-read the
-            // overrides below after acquiring the guard, so a concurrent
-            // session/configure cannot make this early decision stale.
+            // An idle agent's installed selection can exclude it before
+            // taking the per-session turn guard. Busy agents cannot expose
+            // a transient tool-selected model safely, so they use the bounded
+            // refusal below even when their saved selection looks unrelated.
+            // Re-read overrides under the guard before preparing an update.
             if let LiveSessionRefreshScope::ModelRefs(_) = scope {
                 let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
                     continue;
@@ -43914,6 +43913,181 @@ model = "before"
         assert_eq!(
             model_name_for_session(&dispatcher, &session_id).await,
             "after"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_connection_edit_refreshes_dependencies_and_refuses_busy_turns_atomically() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::provider_registry::editor;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let old_endpoint = MockServer::start().await;
+        let new_endpoint = MockServer::start().await;
+        for server in [&old_endpoint, &new_endpoint] {
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(server)
+                .await;
+        }
+        let mut config = make_model_refresh_test_config(&tmp);
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 0;
+        config.providers = serde_json::from_value(json!({
+            "connections": {
+                "gateway.prod": {"kind":"custom", "uri":old_endpoint.uri(), "auth":{"mode":"api_key","api_key":"old-key"}},
+                "other": {"kind":"custom", "uri":old_endpoint.uri(), "auth":{"mode":"api_key","api_key":"other-key"}}
+            },
+            "models": {
+                "chat.main": {"capability":"chat","provider":"gateway.prod","model":"main-model"},
+                "chat.other": {"capability":"chat","provider":"other","model":"other-model"}
+            }
+        }))
+        .unwrap();
+        config.agents.get_mut("test-agent").unwrap().model_provider = "chat.main".into();
+        let mut other_agent = config.agents["test-agent"].clone();
+        other_agent.model_provider = "chat.other".into();
+        config.agents.insert("other-agent".into(), other_agent);
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let other_session = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias":"other-agent", "cwd":tmp.path().join("workspace")
+            }))
+            .await
+            .unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let main = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .unwrap();
+        assert!(
+            main.lock()
+                .await
+                .turn("before connection edit")
+                .await
+                .is_err()
+        );
+        assert_eq!(old_endpoint.received_requests().await.unwrap().len(), 1);
+
+        // An unrelated idle agent can be excluded even with its update gate held.
+        let other_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&other_session)
+            .await
+            .unwrap();
+        let expected = editor::snapshot(&dispatcher.ctx.config.read()).unwrap();
+        let mut registry = expected.clone();
+        registry["connections"]["gateway.prod"]["uri"] = json!(new_endpoint.uri());
+        registry["connections"]["gateway.prod"]["auth"]["api_key"] = json!("rotated-key");
+        dispatcher
+            .handle_config_registry_set(&json!({"expected":expected,"registry":registry}))
+            .await
+            .expect("a connection-only edit must skip the unrelated session gate");
+        drop(other_guard);
+        assert!(
+            main.lock()
+                .await
+                .turn("after connection edit")
+                .await
+                .is_err()
+        );
+        let requests = new_endpoint.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the live provider must use the new endpoint"
+        );
+        assert_eq!(
+            requests[0].headers.get("authorization").unwrap(),
+            "Bearer rotated-key"
+        );
+        assert_eq!(old_endpoint.received_requests().await.unwrap().len(), 1);
+        let other = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&other_session)
+            .await
+            .unwrap();
+        assert!(
+            other
+                .lock()
+                .await
+                .turn("unchanged connection")
+                .await
+                .is_err()
+        );
+        let requests = old_endpoint.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].headers.get("authorization").unwrap(),
+            "Bearer other-key"
+        );
+
+        // Run a turn through the delayed endpoint with both session locks,
+        // matching prompt admission. Its transient model cannot be inspected.
+        new_endpoint.reset().await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let notify = Arc::clone(&entered);
+        Mock::given(method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                notify.notify_one();
+                ResponseTemplate::new(500).set_delay(std::time::Duration::from_secs(5))
+            })
+            .mount(&new_endpoint)
+            .await;
+        let sessions = Arc::clone(&dispatcher.ctx.sessions);
+        let running_session = session_id.clone();
+        let turn = zeroclaw_spawn::spawn!(async move {
+            let _turn_guard = sessions
+                .lock_model_provider_update(&running_session)
+                .await
+                .unwrap();
+            main.lock()
+                .await
+                .turn("hold an actual turn in flight")
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("the running turn must reach the delayed provider");
+        let edit = registry_edit_params(
+            &dispatcher,
+            &["models", "chat.other", "model"],
+            json!("other-v2"),
+        );
+        let before = editor::snapshot(&dispatcher.ctx.config.read()).unwrap();
+        let error = tokio::time::timeout(
+            SESSION_PROVIDER_UPDATE_LOCK_TIMEOUT + std::time::Duration::from_secs(2),
+            dispatcher.handle_config_registry_set(&edit),
+        )
+        .await
+        .expect("busy-turn admission must be bounded")
+        .expect_err("a busy agent must not be skipped from its saved model alone");
+        assert_eq!(error.code, SESSION_BUSY, "{}", error.message);
+        assert!(error.message.contains(&session_id));
+        assert_eq!(
+            editor::snapshot(&dispatcher.ctx.config.read()).unwrap(),
+            before
+        );
+        assert!(
+            dispatcher
+                .ctx
+                .config_authority
+                .try_lock_config_writer()
+                .is_some()
+        );
+        assert!(turn.await.unwrap().is_err());
+        dispatcher.handle_config_registry_set(&edit).await.unwrap();
+        assert_eq!(
+            model_name_for_session(&dispatcher, &other_session).await,
+            "other-v2"
         );
     }
 
