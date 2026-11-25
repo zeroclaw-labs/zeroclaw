@@ -4380,15 +4380,35 @@ mod tests {
     }
 
     #[test]
-    fn discord_declares_peer_routes() {
-        assert!(Channel::supports_peer_routes(&DiscordChannel::new(
+    fn discord_peer_routes_survive_reply_pacing() {
+        use zeroclaw_api::channel::{PeerAddressing, PeerRouteError};
+
+        let channel = Arc::new(DiscordChannel::new(
             "fake".into(),
             vec![],
             "discord_test_alias",
             Arc::new(Vec::new),
             false,
             false,
-        )));
+        ));
+        assert!(channel.supports_peer_routes());
+        let pacing = zeroclaw_config::schema::DiscordConfig {
+            reply_min_interval_secs: 1,
+            ..Default::default()
+        };
+        let paced = crate::paced_channel::PacedChannel::wrap(channel, &pacing);
+        let peer = RoutedPeer {
+            peer: "111111111111111111".into(),
+            mention: false,
+        };
+        assert_eq!(
+            PeerAddressing::Routed(peer.clone()).check(paced.supports_peer_routes()),
+            Ok(Some(peer))
+        );
+        assert_eq!(
+            PeerAddressing::Peer.check(paced.supports_peer_routes()),
+            Err(PeerRouteError::RouteRequired)
+        );
     }
 
     #[test]
