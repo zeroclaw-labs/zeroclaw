@@ -1409,6 +1409,7 @@ export function AgentProvider({
     // transcript over A's cache — the only copy when persistence is off.
     setHydratedSessionId(null);
     setSessionPersistence(null);
+    setConnected(false);
     // Async delete/model operations consult these refs before React commits
     // the state update. Move them with the transition so two completions in
     // the same task cannot both act on the conversation we just left.

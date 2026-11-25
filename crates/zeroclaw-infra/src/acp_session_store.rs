@@ -205,6 +205,7 @@ impl AcpSessionStore {
     /// one transaction. Existing ACP rows take precedence, including killed
     /// sessions. Deleting a destination row does not make the key eligible
     /// for import again.
+    /// Unreadable transcripts are logged and left eligible for a later retry.
     pub fn import_legacy_gateway_sessions(
         &self,
         legacy: &dyn crate::session_backend::SessionBackend,
@@ -247,20 +248,39 @@ impl AcpSessionStore {
                 continue;
             }
             let session_row = tx.last_insert_rowid();
-            let messages = legacy.try_load(&metadata.key)?;
-            let timestamped = legacy.load_with_timestamps(&metadata.key);
-            anyhow::ensure!(
-                messages.len() == timestamped.len()
-                    && messages.iter().zip(&timestamped).all(|(message, row)| {
-                        message.role == row.message.role && message.content == row.message.content
-                    }),
-                "Legacy transcript changed or could not be read for session {id}"
-            );
-            // Legacy WebChat restores an unrecorded flag as false. ACP reserves NULL
-            // for old ACP rows whose provenance must be inferred from message text.
-            let breadcrumb = legacy
-                .get_session_trim_breadcrumb(&metadata.key)?
-                .unwrap_or(false);
+            let transcript = (|| -> Result<_> {
+                let messages = legacy.try_load(&metadata.key)?;
+                let timestamped = legacy.load_with_timestamps(&metadata.key);
+                anyhow::ensure!(
+                    messages.len() == timestamped.len()
+                        && messages.iter().zip(&timestamped).all(|(message, row)| {
+                            message.role == row.message.role
+                                && message.content == row.message.content
+                        }),
+                    "Legacy transcript reads did not agree"
+                );
+                // ACP reserves NULL for old ACP rows with inferred provenance.
+                let breadcrumb = legacy
+                    .get_session_trim_breadcrumb(&metadata.key)?
+                    .unwrap_or(false);
+                Ok((timestamped, breadcrumb))
+            })();
+            let (timestamped, breadcrumb) = match transcript {
+                Ok(transcript) => transcript,
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(
+                                serde_json::json!({"session_id": id, "error": error.to_string()})
+                            ),
+                        "Legacy WebChat transcript could not be imported"
+                    );
+                    // Dropping the transaction leaves this key eligible for retry.
+                    continue;
+                }
+            };
             for row in timestamped {
                 let timestamp = row
                     .created_at
@@ -1541,7 +1561,14 @@ impl AcpSessionStore {
         id: &str,
     ) -> Result<Vec<crate::session_backend::TimestampedMessage>> {
         let conn = self.conn.lock();
-        let mut query = conn.prepare("SELECT m.role,m.content,m.created_at FROM acp_messages m JOIN acp_sessions s ON s.id=m.session_id WHERE s.session_uuid=?1 AND s.principal_id IS NULL AND s.killed_at IS NULL AND s.interaction_surface='webchat' AND m.role IN ('user','assistant') ORDER BY m.id")?;
+        let mut query = conn.prepare(
+            "SELECT m.role, m.content, m.created_at
+             FROM acp_messages m JOIN acp_sessions s ON s.id = m.session_id
+             WHERE s.session_uuid = ?1 AND s.principal_id IS NULL AND s.killed_at IS NULL
+               AND s.interaction_surface = 'webchat'
+               AND (m.role = 'user' OR (m.role = 'assistant' AND m.content <> ''))
+             ORDER BY m.id",
+        )?;
         let rows = query.query_map([id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -1568,14 +1595,24 @@ impl AcpSessionStore {
         Ok(self.conn.lock().execute("UPDATE acp_sessions SET name=?2 WHERE session_uuid=?1 AND principal_id IS NULL AND killed_at IS NULL AND interaction_surface='webchat'",params![id,name])? == 1)
     }
 
-    /// Erase the conversation while reserving its ID so a repeated legacy import cannot resurrect it.
-    pub fn delete_operator_webchat(&self, id: &str) -> Result<bool> {
+    /// Erase the transcript and its operator-owned legacy copy, if present.
+    /// A failed legacy delete leaves the ACP transcript available for retry.
+    /// Reserve the ACP ID against stale clients after a successful delete.
+    pub fn delete_operator_webchat(
+        &self,
+        id: &str,
+        legacy: Option<&dyn crate::session_backend::SessionBackend>,
+    ) -> Result<bool> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let deleted=tx.execute("DELETE FROM acp_sessions WHERE session_uuid=?1 AND principal_id IS NULL AND killed_at IS NULL AND interaction_surface='webchat'",[id])?;
         if deleted == 1 {
             let now = Utc::now().to_rfc3339();
             tx.execute("INSERT INTO acp_sessions(session_uuid,agent_alias,workspace_dir,killed_at,created_at,last_activity) VALUES(?1,'','',?2,?2,?2)", params![id,now])?;
+            if let Some(legacy) = legacy {
+                legacy
+                    .delete_session_authorized(&format!("gw_{id}"), None, &|_| Ok(Box::new(())))?;
+            }
         }
         tx.commit()?;
         Ok(deleted == 1)
@@ -4662,12 +4699,12 @@ mod tests {
         }
 
         let (dir, store) = open_store();
-        let err = store
+        let imported = store
             .import_legacy_gateway_sessions(&FailingLegacyBackend, |alias| {
                 (alias.unwrap_or("alpha").to_owned(), "/workspace".into())
             })
-            .expect_err("failed legacy read must fail the import");
-        assert!(err.to_string().contains("simulated legacy read failure"));
+            .unwrap();
+        assert_eq!(imported, 0, "an unreadable transcript must be skipped");
         assert!(
             store.load_session("broken").unwrap().is_none(),
             "transaction rollback must leave no partial acp_sessions row"
@@ -4684,6 +4721,60 @@ mod tests {
             1,
             "the failed transaction must not mark the legacy key processed"
         );
+    }
+
+    #[test]
+    fn operator_webchat_routes_ignore_other_sessions_and_empty_assistant_steps() {
+        let (_tmp, store) = open_store();
+        for (id, surface, owner) in [
+            ("operator", Some("webchat"), None),
+            ("scoped", Some("webchat"), Some("principal")),
+            ("ide", None, None),
+        ] {
+            store
+                .create_session_with_interaction_surface(
+                    id,
+                    "alpha",
+                    "/tmp/project",
+                    surface,
+                    owner,
+                )
+                .unwrap();
+        }
+        assert!(
+            store
+                .append_operator_webchat_message("operator", "")
+                .unwrap()
+        );
+        assert!(
+            store
+                .append_operator_webchat_message("operator", "reply")
+                .unwrap()
+        );
+        let rows = store.operator_webchat_history("operator").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message.content, "reply");
+        let sessions = store.operator_webchats().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].0.session_uuid, "operator");
+
+        for id in ["scoped", "ide"] {
+            store
+                .append_turn(
+                    id,
+                    &[ConversationMessage::Chat(ChatMessage::user("private"))],
+                )
+                .unwrap();
+            assert!(store.operator_webchat_id(id).unwrap().is_none());
+            assert!(store.operator_webchat_history(id).unwrap().is_empty());
+            assert!(
+                !store
+                    .append_operator_webchat_message(id, "forbidden")
+                    .unwrap()
+            );
+            assert!(!store.rename_operator_webchat(id, "forbidden").unwrap());
+            assert!(!store.delete_operator_webchat(id, None).unwrap());
+        }
     }
 
     #[test]

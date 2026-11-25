@@ -717,6 +717,7 @@ async fn handle_socket(
                 if let Ok(event) = event
                     && event["type"] == "message"
                     && event["source"] == "api"
+                    && event["chat_transport"] == "acp"
                     && let Some(sid) = event["session_id"].as_str()
                     && server.has_gateway_session(sid).await
                     && crate::dashboard_session::session_admits_now(&mut session_watch, &state).await.is_ok()
@@ -1098,6 +1099,12 @@ mod tests {
             legacy
                 .set_session_agent_alias("gw_team_alpha", "test-agent")
                 .unwrap();
+            legacy
+                .append("telegram_bot_42", &ChatMessage::user("channel question"))
+                .unwrap();
+            legacy
+                .set_session_agent_alias("telegram_bot_42", "test-agent")
+                .unwrap();
             Some(provider)
         } else {
             None
@@ -1235,6 +1242,8 @@ mod tests {
             let client = reqwest::Client::new();
             let sessions_url = format!("http://127.0.0.1:{port}/api/sessions");
             let session_url = format!("{sessions_url}/team_alpha");
+            let legacy_url = format!("{sessions_url}/gw_team_alpha");
+            let channel_history = format!("{sessions_url}/telegram_bot_42/messages");
             let history: serde_json::Value = client
                 .get(format!("{session_url}/messages"))
                 .send()
@@ -1246,8 +1255,12 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(history["messages"][1]["content"], "legacy answer");
+            assert_eq!(
+                get_json(&client, &format!("{legacy_url}/messages")).await["messages"],
+                history["messages"]
+            );
             client
-                .put(&session_url)
+                .put(&legacy_url)
                 .json(&serde_json::json!({"name":"Restored chat"}))
                 .send()
                 .await
@@ -1264,7 +1277,36 @@ mod tests {
                 .json()
                 .await
                 .unwrap();
-            assert_eq!(list["sessions"][0]["name"], "Restored chat");
+            let sessions = list["sessions"].as_array().unwrap();
+            assert_eq!(sessions.len(), 2);
+            let imported = sessions
+                .iter()
+                .find(|s| s["session_id"] == "team_alpha")
+                .unwrap();
+            assert_eq!(imported["session_key"], "gw_team_alpha");
+            assert_eq!(imported.get("channel_id"), Some(&serde_json::Value::Null));
+            assert_eq!(imported["name"], "Restored chat");
+            assert!(
+                sessions
+                    .iter()
+                    .any(|s| s["session_key"] == "telegram_bot_42")
+            );
+            assert_eq!(
+                get_json(&client, &channel_history).await["messages"][0]["content"],
+                "channel question"
+            );
+            client
+                .post(&channel_history)
+                .json(&serde_json::json!({"content":"channel notification"}))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            assert_eq!(
+                get_json(&client, &channel_history).await["messages"][1]["content"],
+                "channel notification"
+            );
 
             let appended = client
                 .post(format!("{sessions_url}/gw_team_alpha/messages"))
@@ -1374,7 +1416,12 @@ mod tests {
                 .json()
                 .await
                 .unwrap();
-            assert_eq!(list["sessions"], serde_json::json!([]));
+            let sessions = list["sessions"].as_array().unwrap();
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0]["session_key"], "telegram_bot_42");
+            let legacy =
+                zeroclaw_infra::make_session_backend(&install_root.join("data"), "sqlite").unwrap();
+            assert!(!legacy.session_exists("gw_team_alpha"));
         }
         shutdown_tx.send(true).ok();
         server.abort();

@@ -1707,6 +1707,15 @@ pub(crate) struct CutoverWebChat {
 
 pub(crate) type Cutover = Option<Extension<CutoverWebChat>>;
 
+fn is_legacy_session(state: &AppState, headers: &HeaderMap, id: &str) -> bool {
+    !id.starts_with(crate::GW_SESSION_PREFIX)
+        && crate::api::require_auth(state, headers).is_ok()
+        && state
+            .session_backend
+            .as_ref()
+            .is_some_and(|store| store.session_exists(id))
+}
+
 async fn operator_webchat_id(
     store: &Arc<AcpSessionStore>,
     id: String,
@@ -1758,14 +1767,16 @@ pub(crate) async fn sessions_list(
     ) {
         (Some(caller), _) => caller.sessions_list(),
         (None, Some(Extension(CutoverWebChat { store, .. }))) => {
+            let legacy_state = state.clone();
             webchat_store_result(&state, &headers, store, move |s| {
-                let sessions = s
+                let mut sessions = s
                     .operator_webchats()?
                     .into_iter()
                     .map(|(session, name)| {
                         json!({
                             "session_id": session.session_uuid,
-                            "session_key": session.session_uuid,
+                            "session_key": format!("{}{}", crate::GW_SESSION_PREFIX, session.session_uuid),
+                            "channel_id": null,
                             "agent_alias": session.agent_alias,
                             "created_at": session.created_at,
                             "last_activity": session.last_activity,
@@ -1774,6 +1785,8 @@ pub(crate) async fn sessions_list(
                         })
                     })
                     .collect::<Vec<_>>();
+                sessions.extend(crate::api::legacy_session_list(&legacy_state, false));
+                sessions.sort_by(|a, b| b["last_activity"].as_str().cmp(&a["last_activity"].as_str()));
                 Ok(Some(json!({"sessions":sessions})))
             })
             .await
@@ -1799,10 +1812,15 @@ pub(crate) async fn session_messages(
         cutover,
     ) {
         (Some(_), _) => CoreFailure::NotFound.into_response(),
-        (None, Some(Extension(CutoverWebChat { store, .. }))) => {
+        (None, Some(Extension(CutoverWebChat { store, .. })))
+            if !is_legacy_session(&state, &headers, &id) =>
+        {
             webchat_store_result(&state, &headers, store, move |s| {
-                let messages = s
-                    .operator_webchat_history(&id)?
+                let rows = match s.operator_webchat_id(&id)? {
+                    Some(session_id) => s.operator_webchat_history(&session_id)?,
+                    None => Vec::new(),
+                };
+                let messages = rows
                     .into_iter()
                     .map(|row| {
                         json!({
@@ -1818,7 +1836,7 @@ pub(crate) async fn session_messages(
             })
             .await
         }
-        (None, None) => crate::api::handle_api_session_messages(State(state), headers, Path(id))
+        (None, _) => crate::api::handle_api_session_messages(State(state), headers, Path(id))
             .await
             .into_response(),
     }
@@ -1839,7 +1857,9 @@ pub(crate) async fn session_rename(
         cutover,
     ) {
         (Some(_), _) => CoreFailure::NotFound.into_response(),
-        (None, Some(Extension(CutoverWebChat { store, .. }))) => {
+        (None, Some(Extension(CutoverWebChat { store, .. })))
+            if !is_legacy_session(&state, &headers, &id) =>
+        {
             let Some(name) = body["name"]
                 .as_str()
                 .map(str::trim)
@@ -1849,12 +1869,15 @@ pub(crate) async fn session_rename(
                 return StatusCode::BAD_REQUEST.into_response();
             };
             webchat_store_result(&state, &headers, store, move |s| {
-                Ok(s.rename_operator_webchat(&id, &name)?
+                let Some(session_id) = s.operator_webchat_id(&id)? else {
+                    return Ok(None);
+                };
+                Ok(s.rename_operator_webchat(&session_id, &name)?
                     .then(|| json!({"session_id":id,"name":name})))
             })
             .await
         }
-        (None, None) => {
+        (None, _) => {
             crate::api::handle_api_session_rename(State(state), headers, Path(id), Json(body))
                 .await
                 .into_response()
@@ -1877,7 +1900,9 @@ pub(crate) async fn session_delete(
         cutover,
     ) {
         (Some(_), _) => CoreFailure::NotFound.into_response(),
-        (None, Some(Extension(CutoverWebChat { store, turns }))) => {
+        (None, Some(Extension(CutoverWebChat { store, turns })))
+            if !is_legacy_session(&state, &headers, &id) =>
+        {
             if let Err(e) = crate::api::require_auth(&state, &headers) {
                 return e.into_response();
             }
@@ -1890,8 +1915,9 @@ pub(crate) async fn session_delete(
                 return StatusCode::CONFLICT.into_response();
             };
             let queue = Arc::clone(&state.session_queue);
+            let legacy = state.session_backend.clone();
             webchat_store_result(&state, &headers, store, move |s| {
-                Ok(s.delete_operator_webchat(&id)?.then(|| {
+                Ok(s.delete_operator_webchat(&id, legacy.as_deref())?.then(|| {
                     turns.forget_deleted_webchat(&permit);
                     queue.advance_generation(&id);
                     json!({"session_id":id,"deleted":true})
@@ -1899,7 +1925,7 @@ pub(crate) async fn session_delete(
             })
             .await
         }
-        (None, None) => crate::api::handle_api_session_delete(State(state), headers, Path(id))
+        (None, _) => crate::api::handle_api_session_delete(State(state), headers, Path(id))
             .await
             .into_response(),
     }
@@ -1913,7 +1939,9 @@ pub(crate) async fn session_message_post(
     Path(id): Path<String>,
     Json(body): Json<crate::api::SessionMessagePostBody>,
 ) -> Response {
-    let Some(Extension(CutoverWebChat { store, .. })) = cutover else {
+    let Some(Extension(CutoverWebChat { store, .. })) =
+        cutover.filter(|_| !is_legacy_session(&state, &headers, &id))
+    else {
         return crate::api::handle_api_session_message_post(
             State(state),
             headers,
@@ -1966,6 +1994,7 @@ pub(crate) async fn session_message_post(
             "role": "assistant",
             "content": body.content,
             "source": "api",
+            "chat_transport": "acp",
             "timestamp": chrono::Utc::now().to_rfc3339(),
         }));
         Ok(Some(json!({
@@ -2015,7 +2044,9 @@ pub(crate) async fn session_state(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    let Some(Extension(CutoverWebChat { store, turns })) = cutover else {
+    let Some(Extension(CutoverWebChat { store, turns })) =
+        cutover.filter(|_| !is_legacy_session(&state, &headers, &id))
+    else {
         return crate::api::handle_api_session_state(State(state), headers, Path(id))
             .await
             .into_response();
@@ -2044,7 +2075,9 @@ pub(crate) async fn session_abort(
     if let Some(caller) = core_caller(&state, &headers, core, dashboard, Reach::ScopedOnly) {
         return caller.session_abort(&id).await;
     }
-    let Some(Extension(CutoverWebChat { store, turns })) = cutover else {
+    let Some(Extension(CutoverWebChat { store, turns })) =
+        cutover.filter(|_| !is_legacy_session(&state, &headers, &id))
+    else {
         return crate::api::handle_api_session_abort(State(state), headers, Path(id))
             .await
             .into_response();

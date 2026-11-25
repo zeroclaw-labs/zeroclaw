@@ -25,6 +25,7 @@ import {
 const ACP_SESSION_NOT_FOUND = -32000;
 const ACP_PROTOCOL_VERSION = 1;
 const ACP_SESSION_LIMIT_REACHED = -32001;
+const ACP_FORBIDDEN = -32012;
 const DEFAULT_RECONNECT_DELAY = 1_000;
 const MAX_RECONNECT_DELAY = 30_000;
 
@@ -446,6 +447,9 @@ export class AcpChatSocket {
         code: stringValue(data?.code) ?? 'AGENT_INIT_FAILED',
         message: error instanceof Error ? error.message : String(error),
       });
+      if (error instanceof AcpError && error.code === ACP_FORBIDDEN) {
+        this.intentionallyClosed = true;
+      }
       this.client?.disconnect();
     }
   }

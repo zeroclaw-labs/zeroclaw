@@ -817,7 +817,7 @@ pub struct AppState {
     pub path_prefix: String,
     /// Filesystem path to `web/dist/` for serving the dashboard (None = API-only)
     pub web_dist_dir: Option<std::path::PathBuf>,
-    /// Session backend for persisting gateway WS chat sessions
+    /// Session backend for legacy WebChat and non-WebChat conversations.
     pub session_backend: Option<Arc<dyn SessionBackend>>,
     /// Per-session actor queue for serializing concurrent turns
     pub session_queue: Arc<session_queue::SessionActorQueue>,
@@ -2096,8 +2096,7 @@ pub async fn run_gateway_with_plugin_webhooks(
                         config.channels.session_backend
                     )
                 );
-                if !config.gateway.acp_webchat_cutover
-                    && config.gateway.session_ttl_hours > 0
+                if config.gateway.session_ttl_hours > 0
                     && let Ok(cleaned) = backend.cleanup_stale(config.gateway.session_ttl_hours)
                     && cleaned > 0
                 {
@@ -2147,8 +2146,6 @@ pub async fn run_gateway_with_plugin_webhooks(
     } else {
         None
     };
-    let session_backend = session_backend.filter(|_| cutover_store.is_none());
-
     // ── Pairing guard ──────────────────────────────────────
     // Supervised runs share the daemon's live authority so pairing and
     // revocation reach RPC authentication too; standalone constructs its

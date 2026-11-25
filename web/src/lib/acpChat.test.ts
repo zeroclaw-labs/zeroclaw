@@ -220,4 +220,27 @@ test('ACP reconnect requests the turn cursor and keeps a single tool card', asyn
     _meta: { zeroclawTurn: { sessionId: 'conversation', turnId: 'turn-two', seq: 1 } },
   });
   assert.equal(updates.filter((message) => message.type === 'tool_call').length, 2);
+
+  await t.test('a refused resume closes without scheduling another socket', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const staleChat = new AcpChatSocket({ agentAlias: 'test', sessionId: 'deleted', reconnectDelay: 1 });
+    t.after(() => staleChat.disconnect());
+    const errors: WsMessage[] = [];
+    staleChat.onMessage = (message) => errors.push(message);
+    staleChat.connect();
+    const socket = sockets[sockets.length - 1];
+    assert.ok(socket);
+    const count = sockets.length;
+    socket.open();
+    socket.reply('initialize', { protocolVersion: 1 });
+    await Promise.resolve();
+    const resume = socket.sent.find((frame) => frame.method === 'session/resume');
+    assert.ok(resume);
+    socket.receive({ id: resume.id, error: { code: -32012, message: 'Session unavailable' } });
+    await Promise.resolve();
+    t.mock.timers.tick(100);
+    assert.equal(sockets.length, count);
+    assert.equal(staleChat.connected, false);
+    assert.equal(errors.filter((message) => message.type === 'error').length, 1);
+  });
 });

@@ -680,7 +680,7 @@ mod tests {
 
         // Spawn the request; capture the outbound id, then dispatch a
         // matching "selected" response so the await resolves.
-        let earliest_expiry = permission_expires_at_ms(Duration::from_secs(5)).unwrap();
+        let started = SystemTime::now();
         let task = zeroclaw_spawn::spawn!(async move {
             ch.request_choice("Confirm?", &choices, Duration::from_secs(5))
                 .await
@@ -688,11 +688,12 @@ mod tests {
 
         let line = rx.recv().await.unwrap();
         let req: serde_json::Value = serde_json::from_str(&line).unwrap();
-        let latest_expiry = permission_expires_at_ms(Duration::from_secs(5)).unwrap();
         let expiry = req["params"]["_meta"]["zeroclaw"]["expiresAtUnixMs"]
             .as_u64()
             .unwrap();
-        assert!((earliest_expiry..=latest_expiry).contains(&expiry));
+        let expiry = UNIX_EPOCH + Duration::from_millis(expiry);
+        assert!(expiry + Duration::from_millis(1) >= started + Duration::from_secs(5));
+        assert!(expiry <= SystemTime::now() + Duration::from_secs(5));
         assert_eq!(req["method"], "session/request_permission");
         assert_eq!(req["params"]["options"].as_array().unwrap().len(), 3);
         assert_eq!(req["params"]["options"][0]["name"], "Option A");
@@ -1016,16 +1017,17 @@ mod tests {
             position: None,
         };
 
-        let earliest_expiry = permission_expires_at_ms(Duration::from_secs(30)).unwrap();
+        let started = SystemTime::now();
         let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
 
         let line = rx.recv().await.unwrap();
         let req: serde_json::Value = serde_json::from_str(&line).unwrap();
-        let latest_expiry = permission_expires_at_ms(Duration::from_secs(30)).unwrap();
         let expiry = req["params"]["_meta"]["zeroclaw"]["expiresAtUnixMs"]
             .as_u64()
             .unwrap();
-        assert!((earliest_expiry..=latest_expiry).contains(&expiry));
+        let expiry = UNIX_EPOCH + Duration::from_millis(expiry);
+        assert!(expiry + Duration::from_millis(1) >= started + Duration::from_secs(30));
+        assert!(expiry <= SystemTime::now() + Duration::from_secs(30));
         assert_eq!(req["method"], "session/request_permission");
         assert_eq!(req["params"]["sessionId"], "sess-1");
         assert_eq!(req["params"]["options"].as_array().unwrap().len(), 3);

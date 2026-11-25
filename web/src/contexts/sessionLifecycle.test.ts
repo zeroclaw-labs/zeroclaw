@@ -555,6 +555,7 @@ test('switch resets capability, hydrates the target, and ignores the old socket'
   assert.deepEqual(mounted.context().messages, []);
   assert.equal(mounted.context().hydrated, false);
   assert.equal(mounted.context().sessionPersistence, null);
+  assert.equal(mounted.context().connected, false);
   assert.equal(runtime.sockets[0]?.disconnectCalls, 1);
   assert.equal(runtime.sockets[1]?.sessionId, 'B');
 
@@ -569,6 +570,7 @@ test('switch resets capability, hydrates the target, and ignores the old socket'
   assert.equal(mounted.context().sessionId, 'B');
   assert.equal(mounted.context().sessionPersistence, true);
   assert.equal(mounted.context().hydrated, true);
+  assert.equal(mounted.context().connected, true);
   assert.deepEqual(mounted.context().messages.map((message) => message.content), ['from B']);
   await unmount(mounted.renderer);
 });
