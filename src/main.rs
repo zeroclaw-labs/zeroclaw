@@ -15851,7 +15851,20 @@ fn build_sop_adapters(
     // `llm.generate` runs against the DEFAULT agent's current model selection.
     // Resolve it at call time through the canonical builder so model-entry
     // options, credentials, endpoints and future fields stay in one place.
-    let resolver = move || Ok(live_config.snapshot());
+    let resolver = move || {
+        let config = live_config.snapshot();
+        let model_ref = config
+            .agent("default")
+            .map(|agent| agent.model_provider.as_str())
+            .ok_or_else(|| {
+                anyhow::Error::msg(zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "cli-skills-agent-not-configured",
+                    &[("alias", "default")],
+                ))
+            })?;
+        let built = zeroclaw_providers::model::build_model(&config, "default", model_ref, None)?;
+        Ok((config, built))
+    };
     let llm = Some(
         std::sync::Arc::new(zeroclaw_runtime::sop::capability::ProviderLlmAdapter::new(
             resolver,

@@ -313,25 +313,31 @@ fn build_provider_in_registry(
         let configured_model = registry
             .resolve_chat(&candidate_ref)?
             .upstream_model()
-            .unwrap_or(candidate_ref.as_str())
-            .to_owned();
+            .map(str::to_owned);
         let pinned_model = if candidate_ref == *model_ref {
             overrides
                 .model
                 .map(str::trim)
                 .filter(|model| !model.is_empty())
                 .map(str::to_owned)
-                .unwrap_or(configured_model)
+                .or(configured_model)
         } else {
             configured_model
         };
-        let candidate = crate::reliable::ReliableModelProviderEntry::new_pinned(
-            candidate_ref.as_str(),
-            candidate_ref.as_str(),
-            candidate_ref.as_str(),
-            &pinned_model,
-            provider,
-        );
+        let candidate = match pinned_model {
+            Some(model) => crate::reliable::ReliableModelProviderEntry::new_pinned(
+                candidate_ref.as_str(),
+                candidate_ref.as_str(),
+                candidate_ref.as_str(),
+                &model,
+                provider,
+            ),
+            None => crate::reliable::ReliableModelProviderEntry::new(
+                candidate_ref.as_str(),
+                candidate_ref.as_str(),
+                provider,
+            ),
+        };
         candidates.push(candidate.with_selection_ref(candidate_ref.as_str()));
     }
     let provider = crate::reliable::ReliableModelProvider::new_with_entries(
@@ -867,6 +873,98 @@ model = "backup"
             "custom.gateway.prod.fast",
             "custom.gateway.prod"
         ));
+    }
+
+    #[tokio::test]
+    async fn migrated_model_less_fallback_inherits_each_request_model() {
+        use serde_json::json;
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let config = zeroclaw_config::migration::migrate_to_current(&format!(
+            r#"
+schema_version = 4
+[reliability]
+provider_retries = 0
+provider_backoff_ms = 0
+[providers.models.custom.main]
+uri = "{0}/primary/v1"
+api_key = "primary-key"
+model = "primary-model"
+fallback = ["custom.backup", "custom.pinned"]
+[providers.models.custom.backup]
+uri = "{0}/backup/v1"
+api_key = "backup-key"
+[providers.models.custom.pinned]
+uri = "{0}/pinned/v1"
+api_key = "pinned-key"
+model = "pinned-model"
+"#,
+            server.uri()
+        ))
+        .unwrap();
+        assert!(config.providers.models.custom.is_empty());
+        let registry = config.provider_registry().unwrap();
+        assert_eq!(
+            registry
+                .fallback_chain(&"custom.main".into())
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            registry
+                .resolve_chat(&"custom.backup".into())
+                .unwrap()
+                .upstream_model()
+                .is_none()
+        );
+        let provider =
+            build_reliable_provider(&config, "custom.main", ProviderOverrides::default())
+                .unwrap()
+                .provider;
+        Mock::given(method("POST"))
+            .and(path("/primary/v1/chat/completions"))
+            .and(body_partial_json(json!({"model":"primary-model"})))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/backup/v1/chat/completions"))
+            .and(header("authorization", "Bearer backup-key"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/pinned/v1/chat/completions"))
+            .and(body_partial_json(json!({"model":"pinned-model"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        for requested_model in ["requested-a", "requested-b"] {
+            assert_eq!(
+                provider
+                    .chat_with_system(None, "hello", requested_model, None)
+                    .await
+                    .unwrap(),
+                "ok"
+            );
+        }
+        let requests = server.received_requests().await.unwrap();
+        let inherited = requests
+            .iter()
+            .filter(|request| request.url.path() == "/backup/v1/chat/completions")
+            .map(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"].clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(inherited, vec![json!("requested-a"), json!("requested-b")]);
     }
 
     #[tokio::test]
