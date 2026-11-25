@@ -212,21 +212,23 @@ impl SopCapability for LlmGenerateCapability {
     }
 }
 
-type ConfigResolver = dyn Fn() -> Result<Config> + Send + Sync;
+type ModelResolver = dyn Fn() -> Result<(Config, BuiltModel)> + Send + Sync;
 
 /// One bounded model call on the dedicated SOP bridge thread.
 ///
-/// The resolver reads canonical live config and uses the shared model builder
-/// on each call. The config and derived provider live only for that call,
-/// including its retries and fallbacks; the adapter caches no model policy.
+/// The composition root supplies one config generation and its built model
+/// per call. This consumer owns no live configuration source or selection
+/// policy, and retains the supplied model only for the bounded call.
 pub struct ProviderLlmAdapter {
-    resolver: Arc<ConfigResolver>,
+    resolver: Arc<ModelResolver>,
 }
 
 impl ProviderLlmAdapter {
-    /// Resolve one config generation and its model through the shared builder
-    /// at call time. Resolver errors propagate without dispatching an old model.
-    pub fn new(resolver: impl Fn() -> Result<Config> + Send + Sync + 'static) -> Self {
+    /// Inject call-scoped model construction from the composition root.
+    /// Resolver errors propagate without dispatching an old model.
+    pub fn new(
+        resolver: impl Fn() -> Result<(Config, BuiltModel)> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             resolver: Arc::new(resolver),
         }
@@ -294,25 +296,7 @@ impl LlmGenerateAdapter for ProviderLlmAdapter {
 
     fn generate_typed(&self, system: Option<&str>, prompt: &str) -> Result<String> {
         let resolver = Arc::clone(&self.resolver);
-        Self::generate_resolved(
-            move || {
-                let config = resolver()?;
-                let model_ref = config
-                    .agent("default")
-                    .map(|agent| agent.model_provider.as_str())
-                    .ok_or_else(|| {
-                        anyhow::Error::msg(crate::i18n::get_required_cli_string_with_args(
-                            "cli-skills-agent-not-configured",
-                            &[("alias", "default")],
-                        ))
-                    })?;
-                let built =
-                    zeroclaw_providers::model::build_model(&config, "default", model_ref, None)?;
-                Ok((config, built))
-            },
-            system,
-            prompt,
-        )
+        Self::generate_resolved(move || resolver(), system, prompt)
     }
 }
 
@@ -961,7 +945,11 @@ options = {{ temperature = 0.9, extract_text_reasoning = false }}
             // This public resolver runs outside the bridge's async worker,
             // just like synchronous OAuth client construction in the factory.
             drop(reqwest::blocking::Client::new());
-            Ok(source.snapshot())
+            let config = source.snapshot();
+            let model_ref = config.agent("default").unwrap().model_provider.as_str();
+            let built =
+                zeroclaw_providers::model::build_model(&config, "default", model_ref, None)?;
+            Ok((config, built))
         });
 
         // Keep the host's only runtime thread blocked during both sync calls.
