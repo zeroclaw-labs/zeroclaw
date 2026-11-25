@@ -120,24 +120,10 @@ jobs:
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
       - name: Install cargo-nextest
-        shell: bash
-        env:
-          NEXTEST_VERSION: 0.9.143
-          NEXTEST_SHA256: c42a1dbde532da06dc9b4a43d44fd0ce668b836c2ab7388410f10ff9834476a2
-        run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/cargo-nextest.tar.gz"
-          url="https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-x86_64-pc-windows-msvc.tar.gz"
-          curl -LsSf --retry 3 --retry-delay 2 -o "$archive" "$url"
-          actual_sha256="$(python3 -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "$archive")"
-          if [[ "$actual_sha256" != "$NEXTEST_SHA256" ]]; then
-            echo "::error::cargo-nextest checksum mismatch (expected $NEXTEST_SHA256, got $actual_sha256)"
-            exit 1
-          fi
-          if command -v cygpath >/dev/null 2>&1; then
-            archive="$(cygpath -u "$archive")"
-          fi
-          tar zxf "$archive" -C "$HOME/.cargo/bin"
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
+        with:
+          tool: nextest@0.9.143
+          fallback: none
       - name: Run advisory Windows tests
         shell: bash
         env:
