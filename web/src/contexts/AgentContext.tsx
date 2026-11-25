@@ -45,7 +45,7 @@ import {
   type TurnStreamState,
 } from '@/contexts/turnStream.logic';
 import { buildHistoryTrimmedNotice } from '@/contexts/historyTrimNotices.logic';
-import { uncommittedLocalTail } from '@/contexts/chatHydration.logic';
+import { normalizeServerUserContent, uncommittedLocalTail } from '@/contexts/chatHydration.logic';
 import {
   EMPTY_CONTEXT_LIMITS,
   EMPTY_CONTEXT_INPUT,
@@ -87,6 +87,65 @@ export interface ChatMessage {
   ephemeral?: boolean;
   /** User-visible lifecycle notice, rendered distinctly from agent output. */
   notice?: boolean;
+}
+
+type ReplayedCompletion = { sessionId: string; content: string; thinking?: string };
+
+function transcriptText(message: ChatMessage): string {
+  if (message.role === 'agent') return message.content.trim();
+  return message.local ? message.content : normalizeServerUserContent(message.content);
+}
+
+function preserveAcpChatDetails(
+  saved: ChatMessage[],
+  displayed: ChatMessage[],
+  replay?: ReplayedCompletion,
+): ChatMessage[] {
+  const messages: ChatMessage[] = [];
+  let nextSaved = 0;
+  let cards: ChatMessage[] = [];
+  for (const message of displayed) {
+    if (message.ephemeral) continue;
+    if (message.toolCall) {
+      cards.push(message);
+      continue;
+    }
+    const row = saved[nextSaved];
+    if (row?.role !== message.role || transcriptText(row) !== transcriptText(message)) break;
+    messages.push(...cards, message.thinking ? { ...row, thinking: message.thinking } : row);
+    cards = [];
+    nextSaved += 1;
+  }
+  messages.push(...saved.slice(nextSaved));
+  if (!replay) return messages;
+
+  // Frames from the attached turn append cards after the currently displayed
+  // text, even when the first HTTP snapshot already included the reply.
+  const replayCards: ChatMessage[] = [];
+  for (const message of displayed) {
+    if (message.ephemeral) continue;
+    if (message.toolCall) replayCards.push(message);
+    else replayCards.length = 0;
+  }
+  const reply = messages[messages.length - 1];
+  if (replay.content && reply?.role === 'agent' && reply.content.trim() === replay.content) {
+    messages.splice(messages.length - 1, 1, ...replayCards, {
+      ...reply,
+      thinking: replay.thinking ?? reply.thinking,
+    });
+  } else {
+    messages.push(...replayCards);
+    if (!replay.content && replay.thinking) {
+      messages.push({
+        id: generateUUID(),
+        role: 'agent',
+        content: '',
+        thinking: replay.thinking,
+        timestamp: new Date(),
+      });
+    }
+  }
+  return messages;
 }
 
 export interface AgentContextValue {
@@ -375,6 +434,7 @@ export function AgentProvider({
   // again: the turn may have finished on the server while no socket listened.
   const [transcriptVersion, setTranscriptVersion] = useState(0);
   const resyncOnOpenRef = useRef(false);
+  const replayedCompletionRef = useRef<ReplayedCompletion | null>(null);
   // Set while the page shows a turn that runs on the gateway but streams to
   // no socket of this page (its socket closed mid-turn, or the page loaded
   // while it ran). Aborting it ends the watch without a reload: the next
@@ -554,6 +614,9 @@ export function AgentProvider({
   // conversation the operator just selected.
   useEffect(() => {
     const sid = sessionId;
+    const replay = replayedCompletionRef.current?.sessionId === sid
+      ? replayedCompletionRef.current
+      : undefined;
     const hydrationStartedAtMutationVersion = localMessageMutationVersionRef.current;
     const sessionStartsAtRequest = sessionStartsRef.current;
     let cancelled = false;
@@ -663,7 +726,13 @@ export function AgentProvider({
             // reload or a round trip to another conversation mid-turn fetches a
             // snapshot that predates the prompt this browser already showed.
             // Keep that uncommitted tail instead of replacing it.
-            setMessages([...hydrated, ...uncommittedLocalTail(snapshotUsers, browserCopy)]);
+            const completedReplay = replayedCompletionRef.current === replay ? replay : undefined;
+            if (completedReplay) replayedCompletionRef.current = null;
+            const tail = uncommittedLocalTail(snapshotUsers, browserCopy);
+            setMessages((previous) => [
+              ...(getState ? hydrated : preserveAcpChatDetails(hydrated, previous, completedReplay)),
+              ...tail,
+            ]);
           }
           // A turn running on the gateway may not be in this snapshot, and its
           // answer will not reach this page's socket. Show it as running before
@@ -893,7 +962,13 @@ export function AgentProvider({
         });
         if (msg.replayed_completion && !perSocket) {
           // ACP persists the turn before publishing completion. The initial
-          // REST snapshot may already include it, so replace from the store.
+          // REST snapshot may already include it. Refresh text from the store
+          // and keep the details delivered by the socket.
+          replayedCompletionRef.current = {
+            sessionId: activeSessionIdRef.current,
+            content: outcome?.kind === 'commit' ? outcome.content : '',
+            thinking: outcome?.kind === 'commit' ? outcome.thinking : undefined,
+          };
           setHydratedSessionId(null);
           setTranscriptVersion((version) => version + 1);
         } else if (outcome?.kind === 'commit') {
@@ -1651,6 +1726,7 @@ export function AgentProvider({
    */
   const resetTranscriptState = useCallback(() => {
     localMessageMutationVersionRef.current += 1;
+    replayedCompletionRef.current = null;
     detachedTurnWatchRef.current?.abort();
     detachedTurnWatchRef.current = null;
     pendingTurnCheckRef.current?.abort();
