@@ -10,6 +10,11 @@
 //! - `client_credentials` for headless service principals (requires the
 //!   entry's `client_secret`).
 //!
+//! It also carries the two requests a daemon-held refresh grant needs
+//! (ADR-017): redeeming a refresh token (RFC 6749 §6) and revoking one
+//! (RFC 7009). They classify their outcome for the grant layer but hold no
+//! state themselves.
+//!
 //! Enrollment is CLIENT-side machinery: it talks to the IdP, never to the
 //! daemon, and nothing here stores the resulting token — the caller
 //! presents it in `initialize` (or exports it as `ZEROCLAW_AUTH_TOKEN`).
@@ -37,6 +42,11 @@ struct EnrollmentDiscovery {
     authorization_endpoint: Option<String>,
     #[serde(default)]
     code_challenge_methods_supported: Option<Vec<String>>,
+    /// RFC 7009 token revocation. Held to the URL policy only when a
+    /// revocation is about to be sent, so an IdP advertising one the policy
+    /// refuses changes nothing for the flows that never use it.
+    #[serde(default)]
+    revocation_endpoint: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -127,6 +137,80 @@ struct OAuthError {
     error: String,
     #[serde(default)]
     error_description: Option<String>,
+}
+
+/// What the IdP answered a `grant_type=refresh_token` request with, when it
+/// answered in a way that settles the outcome (ADR-017 daemon-held refresh).
+#[derive(Debug)]
+pub enum RefreshOutcome {
+    /// A new access token. `refresh_token` is the rotated refresh token, or
+    /// `None` when the IdP kept the current one (RFC 6749 §6).
+    Granted(Box<EnrolledToken>),
+    /// The IdP refused with an OAuth error, so no token was issued and the
+    /// refresh token was not rotated by this request. The grant layer fails
+    /// closed on a refusal.
+    Refused(RefreshRefusal),
+}
+
+/// An OAuth error answer to a refresh request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshRefusal {
+    pub error: String,
+    pub description: Option<String>,
+}
+
+impl RefreshRefusal {
+    /// `invalid_grant`: the refresh token is expired, revoked, reused or
+    /// otherwise no longer valid at the IdP.
+    pub fn is_invalid_grant(&self) -> bool {
+        self.error == "invalid_grant"
+    }
+}
+
+impl std::fmt::Display for RefreshRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.error)?;
+        if let Some(description) = &self.description {
+            write!(f, " ({description})")?;
+        }
+        Ok(())
+    }
+}
+
+/// A refresh that did not produce a [`RefreshOutcome`], classified by whether
+/// the refresh token can have reached the IdP. The distinction matters with
+/// rotating refresh tokens: an IdP that received the request may have
+/// rotated the token even though no usable answer came back, and presenting
+/// the old one again can trip reuse detection and revoke the whole family.
+///
+/// Neither variant's message carries token material or a response body.
+#[derive(Debug, thiserror::Error)]
+pub enum RefreshFailure {
+    /// The refresh token provably never left this process: the request was
+    /// refused before it was built, discovery failed, or the connection to
+    /// the token endpoint (resolution, TCP or TLS) was never established.
+    /// The stored grant is unaffected and may be retried.
+    #[error("refresh was not sent to the identity provider: {0:#}")]
+    NotSent(anyhow::Error),
+    /// The request may have reached the IdP but no usable answer came back:
+    /// the connection failed after it was established, the answer was a
+    /// redirect, a non-OAuth error, or a success the handshake cannot
+    /// present. Whether the IdP rotated the refresh token is unknown.
+    #[error("refresh outcome is unknown: {0:#}")]
+    Unknown(anyhow::Error),
+}
+
+/// What an RFC 7009 revocation request did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevocationOutcome {
+    /// The IdP accepted the revocation request. RFC 7009 answers 200 for a
+    /// token it no longer knows as well, so this does not say the token was
+    /// still live.
+    Revoked,
+    /// The issuer's discovery document advertises no `revocation_endpoint`,
+    /// so nothing was sent. Refresh tokens then end only by expiry or by
+    /// the IdP's own session policy.
+    NotAdvertised,
 }
 
 #[derive(Debug)]
@@ -392,6 +476,106 @@ impl Enrollment {
                 .map(|d| format!(" ({d})"))
                 .unwrap_or_default()
         )
+    }
+
+    /// Redeem a refresh token (RFC 6749 §6) with this entry's client
+    /// authentication.
+    ///
+    /// The request omits `scope`: a refresh cannot ask for more than the
+    /// original grant, and omitting it keeps that grant even when the
+    /// operator has since widened `scopes` (ADR-017). The new access token
+    /// is returned unverified; the caller verifies it through the
+    /// `oidc.<alias>` provider before releasing it.
+    ///
+    /// Failures are classified by whether the refresh token can have reached
+    /// the IdP; see [`RefreshFailure`].
+    pub async fn refresh(&self, refresh_token: &str) -> Result<RefreshOutcome, RefreshFailure> {
+        if refresh_token.trim().is_empty() {
+            return Err(RefreshFailure::NotSent(anyhow::Error::msg(
+                "refresh token is empty",
+            )));
+        }
+        let discovery = self.discovery().await.map_err(RefreshFailure::NotSent)?;
+        let mut form = vec![
+            ("grant_type", "refresh_token".to_string()),
+            ("refresh_token", refresh_token.to_string()),
+        ];
+        let request = self.with_client_auth(self.http.post(&discovery.token_endpoint), &mut form);
+        let response = request
+            .form(&form)
+            .send()
+            .await
+            .map_err(classify_send_error)?;
+        let status = response.status();
+        if status.is_redirection() {
+            return Err(RefreshFailure::Unknown(anyhow::Error::msg(format!(
+                "token endpoint answered with a redirect ({status}); enrollment never follows redirects"
+            ))));
+        }
+        let body = read_response_limited(response)
+            .await
+            .map_err(|e| RefreshFailure::Unknown(e.context("token response could not be read")))?;
+        if status.is_success() {
+            // The IdP issued tokens, and may have rotated the refresh token,
+            // so an answer that cannot be used leaves the outcome unknown.
+            // The error names only the shape problem, never the body.
+            let token: EnrolledToken = serde_json::from_slice(&body).map_err(|_| {
+                RefreshFailure::Unknown(anyhow::Error::msg(
+                    "token response is not a valid token response",
+                ))
+            })?;
+            return token
+                .validated()
+                .map(|token| RefreshOutcome::Granted(Box::new(token)))
+                .map_err(RefreshFailure::Unknown);
+        }
+        match serde_json::from_slice::<OAuthError>(&body) {
+            Ok(err) => Ok(RefreshOutcome::Refused(RefreshRefusal {
+                error: err.error,
+                description: err.error_description,
+            })),
+            Err(_) => Err(RefreshFailure::Unknown(anyhow::Error::msg(format!(
+                "token endpoint returned HTTP {status} without an OAuth error"
+            )))),
+        }
+    }
+
+    /// Revoke a refresh token (RFC 7009) when the issuer advertises a
+    /// `revocation_endpoint`, with this entry's client authentication.
+    pub async fn revoke_refresh_token(&self, refresh_token: &str) -> Result<RevocationOutcome> {
+        let discovery = self.discovery().await?;
+        let Some(endpoint) = discovery.revocation_endpoint else {
+            return Ok(RevocationOutcome::NotAdvertised);
+        };
+        validate_discovered_endpoint(&endpoint, "revocation_endpoint")?;
+        let mut form = vec![
+            ("token", refresh_token.to_string()),
+            ("token_type_hint", "refresh_token".to_string()),
+        ];
+        let request = self.with_client_auth(self.http.post(&endpoint), &mut form);
+        let response = request.form(&form).send().await?;
+        let response = Self::refuse_redirect(response, "revocation endpoint")?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!("revocation endpoint returned HTTP {status}");
+        }
+        Ok(RevocationOutcome::Revoked)
+    }
+}
+
+/// Classify a failed send of a refresh request. Only a failure to establish
+/// the connection (resolution, TCP connect or TLS handshake, including a
+/// connect timeout) or to build the request proves the refresh token was
+/// never sent; anything later, including a timeout waiting for the answer,
+/// may have delivered it.
+fn classify_send_error(error: reqwest::Error) -> RefreshFailure {
+    let not_sent = error.is_connect() || error.is_builder();
+    // reqwest's message can include the request URL but never the form body.
+    let error = anyhow::Error::new(error).context("refresh request to the token endpoint failed");
+    if not_sent {
+        RefreshFailure::NotSent(error)
+    } else {
+        RefreshFailure::Unknown(error)
     }
 }
 
@@ -2549,6 +2733,353 @@ mod tests {
                 .device_grant_poll_s256("dev", Some("invalid"))
                 .await
                 .is_err()
+        );
+    }
+
+    // ── Refresh and revocation (ADR-017 daemon-held refresh grants) ──
+
+    /// An IdP advertising a token endpoint and, when `revocation` is set, an
+    /// RFC 7009 revocation endpoint.
+    async fn idp_with_refresh_endpoints(revocation: bool) -> MockServer {
+        let server = MockServer::start().await;
+        let issuer = server.uri();
+        let mut document = serde_json::json!({
+            "issuer": issuer,
+            "token_endpoint": format!("{issuer}/token"),
+        });
+        if revocation {
+            document["revocation_endpoint"] = format!("{issuer}/revoke").into();
+        }
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(document))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn form_of(request: &wiremock::Request) -> HashMap<String, String> {
+        let mut url = reqwest::Url::parse("http://localhost/").unwrap();
+        url.set_query(Some(std::str::from_utf8(&request.body).unwrap()));
+        url.query_pairs().into_owned().collect()
+    }
+
+    fn basic_of(request: &wiremock::Request) -> Option<String> {
+        request
+            .headers
+            .get("authorization")
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    #[tokio::test]
+    async fn refresh_sends_the_refresh_grant_without_scope() {
+        for secret in [Some("s3cret"), None] {
+            let server = idp_with_refresh_endpoints(false).await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "access_token": "at-2", "token_type": "Bearer",
+                    "refresh_token": "rt-2", "expires_in": 300,
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            // Even with configured scopes, a refresh never names one: it
+            // cannot ask for more than the original grant (ADR-017).
+            let mut entry = config(&server.uri(), secret);
+            entry.scopes = vec!["openid".into(), "groups".into()];
+            let enrollment = Enrollment::new("corp", entry).unwrap();
+
+            let outcome = enrollment.refresh("rt-1").await.unwrap();
+            let RefreshOutcome::Granted(token) = outcome else {
+                panic!("expected a granted refresh, got {outcome:?}");
+            };
+            assert_eq!(token.access_token, "at-2");
+            assert_eq!(token.refresh_token.as_deref(), Some("rt-2"));
+            assert_eq!(token.expires_in, Some(300));
+
+            let requests = server.received_requests().await.unwrap();
+            let post = requests
+                .iter()
+                .find(|r| r.url.path() == "/token")
+                .expect("token endpoint reached");
+            let form = form_of(post);
+            assert_eq!(
+                form.get("grant_type").map(String::as_str),
+                Some("refresh_token")
+            );
+            assert_eq!(form.get("refresh_token").map(String::as_str), Some("rt-1"));
+            assert!(
+                !form.contains_key("scope"),
+                "a refresh must omit scope: {form:?}"
+            );
+            match secret {
+                Some(_) => {
+                    assert!(basic_of(post).is_some_and(|v| v.starts_with("Basic ")));
+                    assert!(!form.contains_key("client_id"));
+                    assert!(!form.contains_key("client_secret"));
+                }
+                None => {
+                    assert!(basic_of(post).is_none());
+                    assert_eq!(
+                        form.get("client_id").map(String::as_str),
+                        Some("zerocode-cli")
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_without_rotation_returns_no_new_refresh_token() {
+        // RFC 6749 §6 lets the IdP keep the current refresh token; the grant
+        // layer keeps its stored one when the response names none.
+        let server = idp_with_refresh_endpoints(false).await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-2", "token_type": "Bearer",
+            })))
+            .mount(&server)
+            .await;
+        let enrollment = Enrollment::new("corp", config(&server.uri(), Some("s"))).unwrap();
+        let RefreshOutcome::Granted(token) = enrollment.refresh("rt-1").await.unwrap() else {
+            panic!("expected a granted refresh");
+        };
+        assert!(token.refresh_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_reports_an_oauth_error_answer_as_refused() {
+        for (status, error) in [(400, "invalid_grant"), (401, "invalid_client")] {
+            let server = idp_with_refresh_endpoints(false).await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_json(serde_json::json!({
+                        "error": error, "error_description": "Token is not active",
+                    })),
+                )
+                .mount(&server)
+                .await;
+            let enrollment = Enrollment::new("corp", config(&server.uri(), Some("s"))).unwrap();
+            let outcome = enrollment.refresh("rt-1").await.unwrap();
+            let RefreshOutcome::Refused(refusal) = &outcome else {
+                panic!("expected a refusal, got {outcome:?}");
+            };
+            assert_eq!(refusal.error, error);
+            assert_eq!(refusal.description.as_deref(), Some("Token is not active"));
+            assert_eq!(refusal.is_invalid_grant(), error == "invalid_grant");
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_that_never_reached_the_token_endpoint_is_not_sent() {
+        // Discovery failing means no refresh request was built at all.
+        let enrollment = Enrollment::new("corp", config("http://127.0.0.1:9", Some("s"))).unwrap();
+        let err = enrollment.refresh("rt-1").await.unwrap_err();
+        assert!(matches!(err, RefreshFailure::NotSent(_)), "{err:?}");
+
+        // A token endpoint that refuses the connection was never sent the
+        // refresh token either.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead = format!("http://{}/token", closed.local_addr().unwrap());
+        drop(closed);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": server.uri(),
+                "token_endpoint": dead,
+            })))
+            .mount(&server)
+            .await;
+        let enrollment = Enrollment::new("corp", config(&server.uri(), Some("s"))).unwrap();
+        let err = enrollment.refresh("rt-1").await.unwrap_err();
+        assert!(matches!(err, RefreshFailure::NotSent(_)), "{err:?}");
+
+        // A blank refresh token is refused before any request.
+        let err = enrollment.refresh("  ").await.unwrap_err();
+        assert!(matches!(err, RefreshFailure::NotSent(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn refresh_answer_that_cannot_be_used_leaves_the_outcome_unknown() {
+        // Each of these reached the IdP, which may already have rotated the
+        // refresh token, so the caller must not assume the old one still
+        // works: the outcome is unknown, not "never sent" or "refused".
+        let cases = [
+            ResponseTemplate::new(502).set_body_string("bad gateway"),
+            ResponseTemplate::new(200).set_body_string("not json"),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "at-2", "token_type": "DPoP", "refresh_token": "rt-2",
+            })),
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": " ", "token_type": "Bearer",
+            })),
+            ResponseTemplate::new(302).insert_header("location", "https://elsewhere.example/"),
+        ];
+        for response in cases {
+            let server = idp_with_refresh_endpoints(false).await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let enrollment = Enrollment::new("corp", config(&server.uri(), Some("s"))).unwrap();
+            let err = enrollment.refresh("rt-1").await.unwrap_err();
+            assert!(matches!(err, RefreshFailure::Unknown(_)), "{err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_lost_after_the_connection_opened_is_unknown() {
+        // The token endpoint accepts the connection and reads the request,
+        // then hangs up without answering: the refresh token was delivered,
+        // so this must not be reported as "never sent".
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let hang_up = async move {
+            use tokio::io::AsyncReadExt as _;
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let read = socket.read(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf[..read]).contains("refresh_token=rt-1")
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": server.uri(),
+                "token_endpoint": token_endpoint,
+            })))
+            .mount(&server)
+            .await;
+        let enrollment = Enrollment::new("corp", config(&server.uri(), None)).unwrap();
+        // The socket drops when `hang_up` completes, before any answer.
+        let (delivered, result) = tokio::join!(hang_up, enrollment.refresh("rt-1"));
+        let err = result.unwrap_err();
+        assert!(delivered, "the request reached the endpoint");
+        assert!(matches!(err, RefreshFailure::Unknown(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn refresh_outcomes_never_print_token_material() {
+        let granted = RefreshOutcome::Granted(Box::new(EnrolledToken {
+            access_token: "raw-access".into(),
+            token_type: Some("Bearer".into()),
+            refresh_token: Some("raw-refresh".into()),
+            expires_in: Some(60),
+        }));
+        let printed = format!("{granted:?}");
+        assert!(!printed.contains("raw-access") && !printed.contains("raw-refresh"));
+
+        // An unknown outcome's error never echoes the response body, which
+        // may carry a rotated refresh token: neither for a body that parses
+        // but cannot be presented, nor for one that does not parse.
+        let bodies = [
+            serde_json::json!({
+                "access_token": "raw-access", "token_type": "DPoP",
+                "refresh_token": "raw-refresh",
+            }),
+            serde_json::json!({
+                "access_token": ["raw-access"], "token_type": "Bearer",
+                "refresh_token": "raw-refresh",
+            }),
+        ];
+        for body in bodies {
+            let server = idp_with_refresh_endpoints(false).await;
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+            let enrollment = Enrollment::new("corp", config(&server.uri(), Some("s"))).unwrap();
+            let err = enrollment.refresh("rt-1").await.unwrap_err();
+            assert!(matches!(err, RefreshFailure::Unknown(_)), "{err:?}");
+            let printed = format!("{err:?} {err}");
+            assert!(
+                !printed.contains("raw-access") && !printed.contains("raw-refresh"),
+                "{printed}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_posts_the_refresh_token_to_the_advertised_endpoint() {
+        let server = idp_with_refresh_endpoints(true).await;
+        Mock::given(method("POST"))
+            .and(path("/revoke"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let enrollment = Enrollment::new("corp", config(&server.uri(), Some("s3cret"))).unwrap();
+        assert_eq!(
+            enrollment.revoke_refresh_token("rt-1").await.unwrap(),
+            RevocationOutcome::Revoked
+        );
+        let requests = server.received_requests().await.unwrap();
+        let post = requests.iter().find(|r| r.url.path() == "/revoke").unwrap();
+        let form = form_of(post);
+        assert_eq!(form.get("token").map(String::as_str), Some("rt-1"));
+        assert_eq!(
+            form.get("token_type_hint").map(String::as_str),
+            Some("refresh_token")
+        );
+        assert!(basic_of(post).is_some_and(|v| v.starts_with("Basic ")));
+    }
+
+    #[tokio::test]
+    async fn revoke_without_an_advertised_endpoint_sends_nothing() {
+        let server = idp_with_refresh_endpoints(false).await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let enrollment = Enrollment::new("corp", config(&server.uri(), Some("s"))).unwrap();
+        assert_eq!(
+            enrollment.revoke_refresh_token("rt-1").await.unwrap(),
+            RevocationOutcome::NotAdvertised
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_reports_an_error_answer() {
+        let server = idp_with_refresh_endpoints(true).await;
+        Mock::given(method("POST"))
+            .and(path("/revoke"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let enrollment = Enrollment::new("corp", config(&server.uri(), Some("s"))).unwrap();
+        assert!(enrollment.revoke_refresh_token("rt-1").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn discovery_holds_the_revocation_endpoint_to_the_url_policy() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": server.uri(),
+                "token_endpoint": format!("{}/token", server.uri()),
+                "revocation_endpoint": "http://idp.example.com/revoke",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let enrollment = Enrollment::new("corp", config(&server.uri(), Some("s"))).unwrap();
+        let err = enrollment.revoke_refresh_token("rt-1").await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("revocation_endpoint"),
+            "{err:#}"
         );
     }
 }
