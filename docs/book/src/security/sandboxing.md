@@ -75,7 +75,18 @@ The sandbox passes through only the env vars listed in `[risk_profiles.<alias>].
 
 ### Process limits
 
-Per-tool wall-time timeouts live on the tool's own config block (`[shell_tool].timeout_secs`, etc.). Docker-specific limits (memory, CPU) live on `[runtime.docker]` when the agent's runtime kind is set to `docker`:
+The shell tool uses `[runtime_profiles.<alias>].shell_timeout_secs` when it is
+nonzero (the profile default is 60 seconds). Set it to `0` to inherit
+`[shell_tool].timeout_secs`, or set the profile value to the desired timeout.
+Other per-tool wall-time timeouts live on the tool's own config block.
+
+For the Docker runtime, shell timeout and cancellation remove that invocation's
+container before terminating its local Docker launcher. Cleanup can take up to
+10 additional seconds; a cleanup failure is reported rather than claiming the
+container stopped. Cancellation cleanup continues while the async runtime is
+running; abrupt ZeroClaw process termination cannot guarantee cleanup.
+Docker-specific limits (memory, CPU) live on `[runtime.docker]` when the agent's
+runtime kind is set to `docker`.
 
 ### Shell binary
 

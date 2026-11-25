@@ -1693,6 +1693,11 @@ tool-shell-exit-status = exit status { $code }
 tool-shell-killed-by-signal = killed by signal { $signal }
 tool-shell-exited-unsuccessfully = exited unsuccessfully
 tool-shell-failure-with-detail = { $status }: { $detail }
+tool-shell-cleanup-prepare-failed = Failed to prepare runtime cleanup: { $error }
+tool-shell-worker-failed = Shell execution task failed: { $error }
+tool-shell-cancelled = Command was cancelled
+tool-shell-cleanup-timed-out = Runtime cleanup did not finish within { $seconds } seconds
+tool-shell-cleanup-failed = Shell command ended without confirmed runtime cleanup; its resource may still be running: { $error }
 
 # ── Terminal tool approval ──
 # The ASCII shortcut tokens stay aligned with the Rust-owned response parser.
