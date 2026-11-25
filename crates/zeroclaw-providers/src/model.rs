@@ -882,7 +882,7 @@ model = "backup"
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
-        let config: Config = toml::from_str(&format!(
+        let config = zeroclaw_config::migration::migrate_to_current(&format!(
             r#"
 schema_version = 4
 [reliability]
@@ -906,6 +906,13 @@ model = "pinned-model"
         .unwrap();
         assert!(config.providers.models.custom.is_empty());
         let registry = config.provider_registry().unwrap();
+        assert_eq!(
+            registry
+                .fallback_chain(&"custom.main".into())
+                .unwrap()
+                .len(),
+            2
+        );
         assert!(
             registry
                 .resolve_chat(&"custom.backup".into())
