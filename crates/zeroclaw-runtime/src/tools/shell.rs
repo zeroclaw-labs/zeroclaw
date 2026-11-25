@@ -739,6 +739,9 @@ fn android_child_path(tui_path: Option<&str>, ambient_path: &str) -> String {
     }
 }
 
+#[cfg(test)]
+mod cleanup_tests;
+
 /// Doubles for the regressions that hold a command's grammar to the shell
 /// that runs it, shared by the shell tool, the shell-backed skill tool and
 /// the cron scheduler.

@@ -104,15 +104,17 @@ mod without_daemon {
         }
 
         fn tool(&self, timeout_secs: u64) -> ShellTool {
-            docker_tool(self.0.path(), timeout_secs).with_tui_env(Some(
-                std::collections::HashMap::from([
-                    ("PATH".into(), self.0.path().to_str().unwrap().into()),
-                    (
-                        "ZEROCLAW_DOCKER_TEST_STATE".into(),
-                        self.0.path().to_str().unwrap().into(),
-                    ),
-                ]),
-            ))
+            docker_tool(self.0.path(), timeout_secs).with_tui_env(Some(self.environment()))
+        }
+
+        fn environment(&self) -> std::collections::HashMap<String, String> {
+            std::collections::HashMap::from([
+                ("PATH".into(), self.0.path().to_str().unwrap().into()),
+                (
+                    "ZEROCLAW_DOCKER_TEST_STATE".into(),
+                    self.0.path().to_str().unwrap().into(),
+                ),
+            ])
         }
 
         fn touch(&self, name: &str) {
@@ -170,6 +172,22 @@ mod without_daemon {
         assert!(task.await.unwrap_err().is_cancelled());
         fixture.wait("cleanup-target").await;
         std::fs::remove_file(fixture.0.path().join("defer-create")).unwrap();
+        fixture.assert_removed().await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_timeout_cleanup_does_not_abort_removal() {
+        let fixture = DockerFixture::new();
+        fixture.touch("hang-cleanup");
+        let tool = fixture.tool(1);
+        let task =
+            zeroclaw_spawn::spawn!(
+                async move { tool.execute(json!({"command": "sleep 75"})).await }
+            );
+        fixture.wait("cleanup-target").await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        std::fs::remove_file(fixture.0.path().join("hang-cleanup")).unwrap();
         fixture.assert_removed().await;
     }
 
@@ -235,6 +253,81 @@ mod without_daemon {
         assert!(error.contains("may still be running"), "{error}");
         assert!(error.contains("10 seconds"), "{error}");
         assert!(!error.contains("was killed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn successful_auto_removal_preserves_output_without_an_extra_removal() {
+        let fixture = DockerFixture::new();
+        fixture.touch("succeed");
+        let result = fixture
+            .tool(5)
+            .execute(json!({"command": "echo completed"}))
+            .await
+            .unwrap();
+        assert!(result.success, "{result:?}");
+        assert_eq!(result.output.trim(), "completed");
+        assert_eq!(result.error.as_deref().unwrap_or_default().trim(), "notice");
+        assert!(!fixture.0.path().join("cleanup-target").exists());
+        let name = std::fs::read_to_string(fixture.0.path().join("created")).unwrap();
+        assert!(!fixture.0.path().join(name).exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_uses_forwarded_environment_without_inheriting_daemon_variables() {
+        // Seed only a subprocess's environment so parallel tests cannot observe
+        // synthetic daemon credentials or depend on a process-global env lock.
+        if std::env::var_os("ZEROCLAW_DOCKER_TEST_ENV_CHILD").is_none() {
+            let proof = tempfile::NamedTempFile::new().unwrap();
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "without_daemon::cleanup_uses_forwarded_environment_without_inheriting_daemon_variables",
+                    "--nocapture",
+                ])
+                .env("ZEROCLAW_DOCKER_TEST_ENV_CHILD", "1")
+                .env("ZEROCLAW_DOCKER_TEST_ENV_PROOF", proof.path())
+                .env("ZC_CLEANUP_DAEMON_ONLY", "synthetic-daemon-value")
+                .kill_on_drop(true);
+            let output = tokio::time::timeout(Duration::from_secs(30), child.output())
+                .await
+                .expect("isolated environment test must finish")
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(std::fs::read_to_string(proof.path()).unwrap(), "verified");
+            return;
+        }
+
+        let fixture = DockerFixture::new();
+        fixture.touch("record-env");
+        let mut env = fixture.environment();
+        env.insert("DOCKER_HOST".into(), "tcp://synthetic.invalid:2375".into());
+        env.insert("DOCKER_CONTEXT".into(), "synthetic-context".into());
+        let result = fixture
+            .tool(1)
+            .with_tui_env(Some(env))
+            .execute(json!({"command": "sleep 75"}))
+            .await
+            .unwrap();
+        assert!(result.error.unwrap().contains("timed out after 1s"));
+        for phase in ["run", "rm"] {
+            assert_eq!(
+                std::fs::read_to_string(fixture.0.path().join(format!("{phase}-env"))).unwrap(),
+                "tcp://synthetic.invalid:2375\nsynthetic-context\nunset\n",
+                "{phase} must use only the final forwarded environment"
+            );
+        }
+        fixture.assert_removed().await;
+        std::fs::write(
+            std::env::var_os("ZEROCLAW_DOCKER_TEST_ENV_PROOF").unwrap(),
+            "verified",
+        )
+        .unwrap();
     }
 }
 

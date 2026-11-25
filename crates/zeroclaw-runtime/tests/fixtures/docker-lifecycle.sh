@@ -4,6 +4,11 @@
 set -eu
 state=${ZEROCLAW_DOCKER_TEST_STATE:?}
 
+if [ -f "$state/record-env" ]; then
+    printf '%s\n%s\n%s\n' "${DOCKER_HOST-unset}" "${DOCKER_CONTEXT-unset}" \
+        "${ZC_CLEANUP_DAEMON_ONLY-unset}" > "$state/$1-env"
+fi
+
 case "$1" in
     run)
         [ "$2" = "--name" ]
@@ -17,6 +22,12 @@ case "$1" in
         while [ -f "$state/defer-create" ]; do /bin/sleep 0.02; done
         /bin/mkdir "$state/$name"
         printf '%s' "$name" > "$state/created"
+        if [ -f "$state/succeed" ]; then
+            /bin/rmdir "$state/$name"
+            echo completed
+            echo notice >&2
+            exit 0
+        fi
         while [ -d "$state/$name" ]; do /bin/sleep 0.02; done
         exit 137
         ;;

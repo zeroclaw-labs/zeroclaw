@@ -420,6 +420,50 @@ mod tests {
     }
 
     #[test]
+    fn docker_shell_invocations_have_distinct_runtime_owned_names() {
+        let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
+        let build = || {
+            runtime
+                .build_shell_command_with_launcher(
+                    "echo --name another-container",
+                    None,
+                    &[],
+                    Path::new("docker"),
+                )
+                .unwrap()
+        };
+        let first = build();
+        let second = build();
+        let name = |command: &tokio::process::Command| {
+            let args = command.as_std().get_args().collect::<Vec<_>>();
+            assert_eq!(args[0], "run");
+            assert_eq!(args[1], "--name");
+            assert_eq!(args[3], "--rm");
+            let name = args[2].to_str().unwrap();
+            assert!(name.starts_with("zeroclaw-shell-"));
+            assert_ne!(name, "another-container");
+            name.to_owned()
+        };
+        assert_ne!(name(&first), name(&second));
+    }
+
+    #[test]
+    fn docker_cleanup_refuses_commands_without_a_runtime_owned_name() {
+        let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
+        for args in [
+            vec![],
+            vec!["start", "--name", "other"],
+            vec!["run"],
+            vec!["run", "--name"],
+            vec!["run", "--rm", "alpine", "sh", "-c", "echo --name other"],
+        ] {
+            let mut command = tokio::process::Command::new("docker");
+            command.args(&args);
+            assert!(runtime.shell_command_cleanup(&command).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
     fn docker_build_shell_command_includes_runtime_flags() {
         let cfg = DockerRuntimeConfig {
             image: "alpine:3.20".into(),
