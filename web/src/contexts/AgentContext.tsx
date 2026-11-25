@@ -249,6 +249,7 @@ export interface SessionSocket {
   sendMessage(content: string): void;
   sendApprovalResponse(requestId: string, decision: ApprovalDecision): void;
   abortSession?(): Promise<void>;
+  closeSession?(): Promise<void>;
 }
 
 export interface AgentSessionRuntime {
@@ -357,6 +358,7 @@ export function AgentProvider({
   // The gateway's id for the open conversation (from `session_start`): what
   // the stop button aborts. The page's own `sessionId` names nothing there.
   const conversationIdRef = useRef<string | null>(null);
+  const closingScopedSocketRef = useRef<SessionSocket | null>(null);
   // A message that starts a conversation, shown at once and sent once the
   // conversation exists, so a refusal at the limit can't lose it.
   const pendingSendRef = useRef<string | null>(null);
@@ -889,7 +891,12 @@ export function AgentProvider({
           full_response: msg.full_response,
           content: msg.content,
         });
-        if (outcome?.kind === 'commit') {
+        if (msg.replayed_completion && !perSocket) {
+          // ACP persists the turn before publishing completion. The initial
+          // REST snapshot may already include it, so replace from the store.
+          setHydratedSessionId(null);
+          setTranscriptVersion((version) => version + 1);
+        } else if (outcome?.kind === 'commit') {
           // `commit` includes reasoning-only turns: empty content but present
           // thinking, so the turn renders instead of vanishing silently.
           localMessageMutationVersionRef.current += 1;
@@ -1449,7 +1456,7 @@ export function AgentProvider({
   }, [modelInfoVersion, agentAlias]);
 
   const sendMessage = useCallback((content: string) => {
-    if (perSocket && pendingSendRef.current !== null) return;
+    if (perSocket && (pendingSendRef.current !== null || closingScopedSocketRef.current !== null)) return;
     if (perSocket && !wsRef.current?.connected) {
       // No conversation is open: this message starts one on a new socket.
       pendingSendRef.current = content;
@@ -1727,26 +1734,40 @@ export function AgentProvider({
 
   const clearAllMessages = useCallback(() => {
     if (perSocket) {
-      resetTranscriptState();
-      // A new conversation: close this one (the gateway closes it with its
-      // socket) and wait for the message that starts the next. Nothing is
-      // deleted.
-      pendingSendRef.current = null;
-      conversationIdRef.current = null;
-      setConversationLimited(false);
-      setError(null);
       const oldWs = wsRef.current;
-      if (oldWs) {
-        oldWs.onOpen = null;
-        oldWs.onClose = null;
-        oldWs.onError = null;
-        oldWs.onMessage = null;
-        oldWs.disconnect();
+      const finishClear = () => {
+        if (wsRef.current !== oldWs) return;
+        resetTranscriptState();
+        pendingSendRef.current = null;
+        conversationIdRef.current = null;
+        setConversationLimited(false);
+        setError(null);
+        if (oldWs) {
+          oldWs.onOpen = null;
+          oldWs.onClose = null;
+          oldWs.onError = null;
+          oldWs.onMessage = null;
+          oldWs.disconnect();
+        }
+        wsRef.current = null;
+        setScopedSessionId(null);
+        setConnected(false);
+        setStartsConversationOnSend(true);
+      };
+      if (!oldWs?.closeSession || conversationIdRef.current === null) {
+        finishClear();
+        return;
       }
-      wsRef.current = null;
-      setScopedSessionId(null);
+      if (closingScopedSocketRef.current === oldWs) return;
+      closingScopedSocketRef.current = oldWs;
       setConnected(false);
-      setStartsConversationOnSend(true);
+      void oldWs.closeSession().then(finishClear, () => {
+        if (wsRef.current !== oldWs) return;
+        setConnected(oldWs.connected);
+        setError(t('agent.session_close_failed'));
+      }).finally(() => {
+        if (closingScopedSocketRef.current === oldWs) closingScopedSocketRef.current = null;
+      });
       return;
     }
 

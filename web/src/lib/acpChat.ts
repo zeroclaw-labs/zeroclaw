@@ -261,7 +261,11 @@ export class AcpChatSocket {
           } else if (params?.result) {
             const result = params.result as AcpSessionPromptResult;
             if (result.stopReason === 'cancelled') this.onMessage?.({ type: 'aborted' });
-            this.onMessage?.(acpPromptResultToWsMessage(result));
+            const meta = record(record(result._meta)?.zeroclaw);
+            this.onMessage?.({
+              ...acpPromptResultToWsMessage(result),
+              replayed_completion: meta?.transcriptPersisted === true,
+            });
           }
           return;
         }
@@ -371,6 +375,16 @@ export class AcpChatSocket {
     const client = this.client;
     if (!client?.connected) return;
     await client.request('session/cancel', { sessionId: this.sessionId });
+  }
+
+  async closeSession(): Promise<void> {
+    const client = this.client;
+    if (!client?.connected) throw new Error('ACP session is not connected');
+    try {
+      await client.request('session/close', { sessionId: this.sessionId });
+    } catch (error) {
+      if (!(error instanceof AcpError) || error.code !== ACP_SESSION_NOT_FOUND) throw error;
+    }
   }
 
   private async openSession(client: AcpWebSocketClient, generation: number): Promise<void> {

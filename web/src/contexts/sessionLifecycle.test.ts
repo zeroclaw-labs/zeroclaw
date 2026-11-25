@@ -182,6 +182,7 @@ class FakeSocket implements SessionSocket {
   onOpen: (() => void) | null = null;
   onClose: ((ev: CloseEvent) => void) | null = null;
   onError: ((ev: Event) => void) | null = null;
+  closeSession?: () => Promise<void>;
   connectCalls = 0;
   disconnectCalls = 0;
   sent: string[] = [];
@@ -1302,6 +1303,40 @@ const answered = (...contents: string[]): SessionMessagesResponse => ({
 
 const stateCallsFor = (runtime: FakeSessionRuntime, id: string) =>
   runtime.stateCalls.filter((call) => call.id === id).length;
+
+for (const historyIncludesReply of [false, true]) {
+  test(`an ACP replay uses saved history when the initial load ${historyIncludesReply ? 'already included' : 'missed'} its reply`, async () => {
+    const runtime = new FakeSessionRuntime();
+    Object.defineProperty(runtime, 'getState', { value: undefined });
+    const committed = answered('earlier', 'same answer', 'resumed prompt', 'same answer');
+    const initial = historyIncludesReply ? committed : answered('earlier', 'same answer');
+    runtime.queueMessages('A', () => Promise.resolve(initial));
+    const replayHistory = new Deferred<SessionMessagesResponse>();
+    runtime.queueMessages('A', () => replayHistory.promise);
+    const mounted = await mountChat(runtime, true);
+    try {
+      await openSocket(runtime, 0);
+      await settle();
+      const socket = runtime.sockets[0]!;
+      await act(async () => {
+        socket.emitMessage({ type: 'chunk', content: 'same answer' });
+        socket.emitMessage({ type: 'done', full_response: 'same answer', replayed_completion: true });
+      });
+      assert.deepEqual(mounted.context().messages.map((message) => message.content), initial.messages.map((row) => row.content));
+      assert.equal(mounted.context().hydrated, false);
+      await act(async () => { replayHistory.resolve(committed); });
+      await settle();
+      assert.deepEqual(mounted.context().messages.map((message) => message.content), [
+        'earlier', 'same answer', 'resumed prompt', 'same answer',
+      ]);
+      assert.equal(mounted.context().hydrated, true);
+      assert.equal(mounted.context().typing, false);
+      assert.deepEqual(runtime.messageCalls, ['A', 'A']);
+    } finally {
+      await unmount(mounted.renderer);
+    }
+  });
+}
 
 test('a socket that reopens while its turn still runs shows the turn and loads the answer once it ends', async () => {
   const runtime = new FakeSessionRuntime();
@@ -3017,6 +3052,42 @@ test('a new conversation closes this one, clears the page, and deletes nothing',
     assert.notEqual(socket.sessionId, mounted.context().sessionId);
     assert.equal(runtime.sockets.length, 2);
     await unmount(mounted.renderer);
+  });
+});
+
+test('scoped ACP Clear waits for the active conversation to close before discarding it', async () => {
+  await withSession(scopedSession, async () => {
+    const runtime = new FakeSessionRuntime();
+    const mounted = await mountChat(runtime);
+    const socket = await startConversation(mounted, runtime, 'running work', 'acp-1');
+    const close = new Deferred<void>();
+    let closeCalls = 0;
+    socket.closeSession = () => {
+      closeCalls += 1;
+      return close.promise;
+    };
+    try {
+      await act(async () => { mounted.context().clearAllMessages(); });
+      await act(async () => {
+        mounted.context().clearAllMessages();
+        mounted.context().sendMessage('too early');
+      });
+      assert.equal(closeCalls, 1);
+      assert.equal(socket.disconnectCalls, 0);
+      assert.deepEqual(socket.sent, ['running work']);
+      assert.equal(mounted.context().startsConversationOnSend, false);
+      assert.equal(mounted.context().messages[0]?.content, 'running work');
+
+      await act(async () => { close.resolve(); });
+      await settle();
+      assert.ok(socket.disconnectCalls > 0);
+      assert.deepEqual(mounted.context().messages, []);
+      assert.deepEqual(runtime.deleteCalls, []);
+      const next = await startConversation(mounted, runtime, 'fresh', 'acp-2');
+      assert.notEqual(next.sessionId, socket.sessionId);
+    } finally {
+      await unmount(mounted.renderer);
+    }
   });
 });
 

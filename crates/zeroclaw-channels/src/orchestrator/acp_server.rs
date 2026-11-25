@@ -75,6 +75,7 @@ type SeededMessage = (ConversationMessage, usize);
 enum TerminalOutcome {
     Success {
         response: String,
+        transcript_persisted: bool,
         provider_name: String,
         model: String,
         live_provider_ref: String,
@@ -2622,7 +2623,8 @@ impl AcpServer {
                     // any earlier content only durable storage still
                     // remembers (e.g. a degraded-away attachment marker) is
                     // preserved.
-                    let _ =
+                    let has_store = persist_store.is_some();
+                    let transcript_persisted =
                         if session.agent.history_trim_generation() != history_trim_generation_before_turn {
 
                         let full_history = session.agent.history().to_vec();
@@ -2633,11 +2635,12 @@ impl AcpServer {
                             full_history,
                             trim_breadcrumb,
                         )
-                        .await
+                        .await.is_ok()
                     } else {
+                        let has_messages = !success.new_messages.is_empty();
                         Self::append_transcript(persist_store, persist_session_id, success.new_messages)
-                            .await
-                    };
+                            .await.is_ok() && has_messages
+                    } && has_store;
                     let (_, live_provider_ref, live_model) = session.agent.attribution_fields();
                     let fallback_limits = success.final_context_limits.is_none().then(|| {
                         session
@@ -2649,6 +2652,7 @@ impl AcpServer {
                     });
                     TerminalOutcome::Success {
                         response: success.response,
+                        transcript_persisted,
                         provider_name: success.provider_name,
                         model: success.model,
                         live_provider_ref,
@@ -2865,6 +2869,7 @@ impl AcpServer {
         // notifications, and logs for each outcome.
         let (
             result_text,
+            transcript_persisted,
             active_provider,
             active_model,
             live_provider_ref,
@@ -2875,6 +2880,7 @@ impl AcpServer {
         ) = match outcome {
             TerminalOutcome::Success {
                 response,
+                transcript_persisted,
                 provider_name,
                 model,
                 live_provider_ref,
@@ -2884,6 +2890,7 @@ impl AcpServer {
                 consolidation_target,
             } => (
                 response,
+                transcript_persisted,
                 provider_name,
                 model,
                 live_provider_ref,
@@ -2917,7 +2924,9 @@ impl AcpServer {
                         data: None,
                     });
                 }
-                return Ok(Self::cancelled_prompt_result(session_id, &accumulated_text));
+                let mut result = Self::cancelled_prompt_result(session_id, &accumulated_text);
+                result["_meta"]["zeroclaw"]["transcriptPersisted"] = self.store.is_some().into();
+                return Ok(result);
             }
             TerminalOutcome::Failed {
                 error,
@@ -3041,6 +3050,7 @@ impl AcpServer {
             .unwrap_or(&active_provider);
 
         let mut zeroclaw_meta = serde_json::json!({
+            "transcriptPersisted": transcript_persisted,
             "inputTokens": usage_fold.total_input_tokens,
             "outputTokens": usage_fold.total_output_tokens,
             "tokensUsed": total_tokens,
@@ -8648,6 +8658,7 @@ mod tests {
             .await
             .expect("the next prompt must reach the provider");
         assert_eq!(result["stopReason"], "end_turn");
+        assert_eq!(result["_meta"]["zeroclaw"]["transcriptPersisted"], true);
 
         let requests = requests.lock();
         assert_eq!(requests.len(), 1, "expected exactly one provider request");
@@ -10825,14 +10836,15 @@ mod tests {
 
         // session/close cancels the in-flight turn and then waits on the session
         // lock. The turn task persists its terminal (cancelled) transcript while
-        // still holding that lock, so close can only acquire it — and return —
-        // after the transcript is committed. Release the barrier too so the turn
-        // also unwinds cleanly if cancellation did not abort the parked call.
-        release.notify_one();
-        server
-            .handle_session_close(&serde_json::json!({ "sessionId": session_id }))
-            .await
-            .expect("close resolves");
+        // still holding that lock. Keep the provider parked so the test
+        // requires close to cancel the turn and wait for it to settle.
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            server.handle_session_close(&serde_json::json!({ "sessionId": session_id })),
+        )
+        .await
+        .expect("close must cancel the parked provider")
+        .expect("close resolves");
 
         // Before this fix persistence ran after the lock was released, so close
         // could return first and expose the session for reload with stale rows.
@@ -10846,7 +10858,9 @@ mod tests {
                 > messages_before,
             "close returned before the terminal transcript was committed"
         );
-        prompt.await.unwrap().expect("prompt turn resolves");
+        let terminal = prompt.await.unwrap().expect("prompt turn resolves");
+        assert_eq!(terminal["stopReason"], "cancelled");
+        assert_eq!(terminal["_meta"]["zeroclaw"]["transcriptPersisted"], true);
     }
 
     #[tokio::test]

@@ -221,6 +221,34 @@ test('ACP reconnect requests the turn cursor and keeps a single tool card', asyn
   });
   assert.equal(updates.filter((message) => message.type === 'tool_call').length, 2);
 
+  for (const [seq, persisted] of [[2, true], [3, false]] as const) {
+    third.socket.receive({
+      method: '_zeroclaw/turn_complete',
+      params: {
+        sessionId: 'conversation',
+        result: {
+          content: 'answer',
+          stopReason: 'end_turn',
+          _meta: { zeroclaw: { transcriptPersisted: persisted } },
+        },
+      },
+      _meta: { zeroclawTurn: { sessionId: 'conversation', turnId: 'turn-two', seq } },
+    });
+    assert.equal(updates[updates.length - 1]?.replayed_completion, persisted);
+  }
+
+  let closed = false;
+  const close = chat.closeSession().then(() => { closed = true; });
+  assert.equal(closed, false);
+  assert.deepEqual(third.socket.reply('session/close', {}), { sessionId: 'conversation' });
+  await close;
+  assert.equal(closed, true);
+  const closeAgain = chat.closeSession();
+  const retry = third.socket.sent[third.socket.sent.length - 1];
+  assert.equal(retry?.method, 'session/close');
+  third.socket.receive({ id: retry.id, error: { code: -32000, message: 'Session not found' } });
+  await closeAgain;
+
   await t.test('a refused resume closes without scheduling another socket', async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
     const staleChat = new AcpChatSocket({ agentAlias: 'test', sessionId: 'deleted', reconnectDelay: 1 });

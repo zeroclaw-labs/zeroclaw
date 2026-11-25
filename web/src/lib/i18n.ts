@@ -1735,6 +1735,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.session_delete': 'Delete conversation',
     'agent.session_delete_confirm': 'Delete “{name}”?',
     'agent.session_delete_failed': "Couldn't delete this conversation.",
+    'agent.session_close_failed': "Couldn't close this conversation.",
     'agent.session_loading': 'Loading conversation…',
     'agent.session_open_elsewhere': 'Open in another tab',
     'agent.sessions_not_stored': 'This gateway does not store conversations.',

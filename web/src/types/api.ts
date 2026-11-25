@@ -243,6 +243,8 @@ export interface WsMessage {
     | "aborted";
   content?: string;
   full_response?: string;
+  /** ACP replay finished a turn whose transcript was already persisted. */
+  replayed_completion?: boolean;
   name?: string;
   args?: any;
   output?: string;
