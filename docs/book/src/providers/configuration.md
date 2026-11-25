@@ -223,7 +223,7 @@ The chat `options` object accepts two ordinary boolean extraction switches:
 | --- | --- | --- |
 | `minimax` | `true` | `false` |
 | `groq` | `true` | `true` |
-| `ollama`, `hailo_ollama`, `gemini`, `gemini_cli`, `grok_cli`, `kilocli`, `venice`, `atomic_chat` | unset | `true` |
+| `ollama`, `hailo_ollama`, `gemini`, `gemini_cli`, `grok_cli`, `antigravity_cli`, `kilocli`, `venice`, `atomic_chat` | unset | `true` |
 | All other kinds, including `openai`, `openai-compatible`, `vllm`, `deepseek`, and `qwen` | unset | `false` |
 
 Unset reasoning policy preserves historical normalization; it is distinct from

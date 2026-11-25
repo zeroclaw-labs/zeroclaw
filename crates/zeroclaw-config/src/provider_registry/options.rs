@@ -101,6 +101,7 @@ pub(crate) fn text_extraction_defaults(
                 | "gemini"
                 | "gemini_cli"
                 | "grok_cli"
+                | "antigravity_cli"
                 | "kilocli"
                 | "groq"
                 | "venice"
@@ -210,6 +211,7 @@ mod tests {
             ("gemini", None, true),
             ("gemini_cli", None, true),
             ("grok_cli", None, true),
+            ("antigravity_cli", None, true),
             ("kilocli", None, true),
             ("venice", None, true),
             ("atomic_chat", None, true),

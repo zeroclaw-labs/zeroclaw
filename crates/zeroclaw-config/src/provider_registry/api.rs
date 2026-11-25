@@ -189,30 +189,6 @@ pub struct AntigravityChatApiConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(default, deny_unknown_fields)]
-pub struct AntigravityChatApiConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub binary_path: Option<String>,
-    pub working_directory: String,
-    pub auth_method: crate::schema::AntigravityCliAuthMethod,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub state_directory: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub env_passthrough: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub extra_args: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_acp_stdout_bytes: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_timeout_secs: Option<NonZeroU64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub preset: Option<PresetId>,
-    #[serde(skip_serializing_if = "ChatOptionsPatch::is_empty")]
-    pub options: ChatOptionsPatch,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(default, deny_unknown_fields)]
 pub struct HailoChatApiConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue_timeout_secs: Option<NonZeroU64>,
