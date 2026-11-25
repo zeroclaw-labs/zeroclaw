@@ -20,9 +20,10 @@ pub(crate) static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 
 /// The password in a URL's userinfo, `scheme://user:password@host`. Its place
 /// alone marks it as a credential, so it is redacted whatever its length; the
-/// user and host stay.
+/// user and host stay. Userinfo ends before any `/`, `?` or `#`, so an `@`
+/// in a path, query or fragment is not taken for the end of a password.
 pub(crate) static URL_USERINFO_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:/@"'<>]*:)[^\s/@"'<>]+@"#)
+    Regex::new(r#"(?i)\b([a-z][a-z0-9+.\-]*://[^\s:/?#@"'<>]*:)[^\s/?#@"'<>]+@"#)
         .expect("static URL userinfo regex must compile")
 });
 
@@ -299,9 +300,17 @@ mod tests {
         );
         let dsn = "redis://:s3cret@h:6379";
         assert_eq!(scrub_credentials(dsn), dsn.replace("s3cret", "[REDACTED]"));
+        let full = "https://alice:hunter2@example.com/p?x=y#z";
+        assert_eq!(
+            scrub_credentials(full),
+            full.replace("hunter2", "[REDACTED]")
+        );
         for untouched in [
             "ssh://git@example.com:22/repo",
             "http://example.com:8080/a@b",
+            "http://example.com:8080?email=user@example.org",
+            "http://example.com:8080#user@example.org",
+            "http://user?x=1:2@example.org",
             "http://[::1]:8080/",
             "mail user@host or mailto:ops@example.com",
             r#"{"url":"http://api.example.com:8443","contact":"ops@example.com"}"#,
