@@ -211,7 +211,7 @@ impl ProviderRegistry {
             api.wire_api.is_some()
                 && matches!(
                     connection.kind(),
-                    "hailo_ollama" | "gemini_cli" | "grok_cli" | "kilocli"
+                    "hailo_ollama" | "gemini_cli" | "grok_cli" | "kilocli" | "antigravity_cli"
                 )
         }) {
             return Err(RegistryError::model(
@@ -219,6 +219,22 @@ impl ProviderRegistry {
                 "api.wire_api",
                 "connection kind does not support a model-level wire API override",
             ));
+        }
+        if connection.kind() == "antigravity_cli" {
+            if matches!(effective.request_timeout_secs, Some(Override::Clear)) {
+                return Err(RegistryError::model(
+                    name,
+                    "api.request_timeout_secs",
+                    "request deadline cannot be disabled for this connection kind",
+                ));
+            }
+            if effective.read_timeout_secs.is_some() {
+                return Err(RegistryError::model(
+                    name,
+                    "api.read_timeout_secs",
+                    "connection kind does not support an HTTP read timeout",
+                ));
+            }
         }
         if let Some(preset) = config.preset.as_ref() {
             ensure_preset(self, name, preset, Capability::Chat)?;
@@ -260,6 +276,14 @@ impl ProviderRegistry {
         let mut options = ChatOptionsPatch::default();
         let mut wire_api = None;
         let mut request_timeout_secs = None;
+        if let ProviderConnection::AntigravityCli(connection) = selection.connection {
+            request_timeout_secs = connection
+                .api
+                .chat
+                .as_ref()
+                .and_then(|api| api.request_timeout_secs)
+                .map(Override::Set);
+        }
         let mut read_timeout_secs = None;
         let mut live_pricing = None;
         if let Some(api) = selection.connection.chat_api() {
@@ -622,6 +646,80 @@ pub struct ResolvedDecision<'a> {
 mod tests {
     use super::{Override, ProviderRegistry};
     use std::num::NonZeroU64;
+
+    #[test]
+    fn antigravity_models_inherit_process_defaults_and_override_request_options() {
+        let registry: ProviderRegistry = toml::from_str(
+            r#"
+[connections."agy.business"]
+kind = "antigravity_cli"
+[connections."agy.business".api.chat]
+working_directory = "/workspace"
+auth_method = "agent_platform"
+state_directory = "/state/agy"
+request_timeout_secs = 30
+options = { temperature = 0.2 }
+
+[models."chat.inherited"]
+capability = "chat"
+provider = "agy.business"
+model = "gemini-model"
+
+[models."chat.overridden"]
+capability = "chat"
+provider = "agy.business"
+model = "gemini-model"
+api = { request_timeout_secs = 45 }
+options = { temperature = 0.6 }
+"#,
+        )
+        .unwrap();
+        for (name, timeout, temperature) in
+            [("chat.inherited", 30, 0.2), ("chat.overridden", 45, 0.6)]
+        {
+            let model = registry.resolve_chat(&name.into()).unwrap();
+            assert_eq!(
+                model.request_timeout_secs,
+                Some(Override::Set(NonZeroU64::new(timeout).unwrap()))
+            );
+            assert_eq!(model.options.temperature, Some(Override::Set(temperature)));
+            let super::super::ProviderConnection::AntigravityCli(connection) =
+                model.selection.connection
+            else {
+                panic!("expected an Antigravity connection")
+            };
+            let api = connection.api.chat.as_ref().unwrap();
+            assert_eq!(api.working_directory, "/workspace");
+            assert_eq!(api.state_directory.as_deref(), Some("/state/agy"));
+            assert_eq!(
+                api.auth_method,
+                crate::schema::AntigravityCliAuthMethod::AgentPlatform
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_models_reject_http_only_options_and_unbounded_process_requests() {
+        for (patch, field) in [
+            (r#"request_timeout_secs = "null""#, "request_timeout_secs"),
+            ("read_timeout_secs = 5", "read_timeout_secs"),
+            (r#"wire_api = "responses""#, "wire_api"),
+        ] {
+            let error = toml::from_str::<ProviderRegistry>(&format!(
+                r#"
+[connections.cli]
+kind = "antigravity_cli"
+[models.main]
+capability = "chat"
+provider = "cli"
+model = "gemini-model"
+api = {{ {patch} }}
+"#
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains(field), "{error}");
+        }
+    }
 
     #[test]
     fn asr_timeout_inherits_through_an_empty_model_api_and_can_be_cleared() {
