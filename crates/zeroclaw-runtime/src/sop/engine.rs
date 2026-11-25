@@ -233,7 +233,6 @@ impl OrphanedRunSettlementQueue {
 /// A transition was refused because this engine's copy of the run was out of
 /// date: another writer had advanced or finished the run. By the time this is
 /// returned the engine has already adopted the stored record.
-#[derive(Debug)]
 struct StaleRunCopy {
     run_id: String,
     local_step: Option<u32>,
@@ -241,6 +240,17 @@ struct StaleRunCopy {
     stored_revision: u64,
     stored_status: SopRunStatus,
     stored_step: u32,
+    /// First locally recorded result beyond the durable history when the
+    /// intervening write requested cancellation of this exact step attempt.
+    /// Only the driver or its maintenance retry may commit it.
+    finished_step: Option<SopStepResult>,
+}
+
+// Step output and its tool trace must stay out of error diagnostics.
+impl std::fmt::Debug for StaleRunCopy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
 }
 
 impl std::fmt::Display for StaleRunCopy {
@@ -1037,6 +1047,22 @@ impl SopEngine {
             ),
             "SOP engine: this engine's copy of the run is out of date; adopting the stored record"
         );
+        // Only the immediately following cancellation write can be tied to
+        // this attempt: after another revision the same step number may be a
+        // retry or a loop visit. Keep the stored history as the prefix, and
+        // carry only the result for the step it was executing.
+        let finished_step = if stored.run.status == SopRunStatus::CancelRequested
+            && seen.is_some_and(|revision| revision.checked_add(1) == Some(stored.revision))
+        {
+            self.active_runs.get_mut(run_id).and_then(|local| {
+                let index = stored.run.step_results.len();
+                let candidate = local.step_results.get(index)?;
+                (candidate.step_number == stored.run.current_step)
+                    .then(|| local.step_results.swap_remove(index))
+            })
+        } else {
+            None
+        };
         let err = anyhow::Error::new(StaleRunCopy {
             run_id: run_id.to_string(),
             local_step,
@@ -1044,6 +1070,7 @@ impl SopEngine {
             stored_revision: stored.revision,
             stored_status: stored.run.status,
             stored_step: stored.run.current_step,
+            finished_step,
         });
         if is_terminal_status(stored.run.status) {
             self.adopt_terminal_record(run_id, stored.run);
@@ -1127,7 +1154,7 @@ impl SopEngine {
         run_id: &str,
         advanced: Result<SopRunAction>,
     ) -> Result<SopRunAction> {
-        let (stale, recorded) = match advanced {
+        let (mut stale, recorded) = match advanced {
             Err(e) if err_is_stale_terminal_write(&e) => {
                 let stale = self.drop_stale_copy(run_id);
                 if !err_is_stale_run_copy(&stale) {
@@ -1139,10 +1166,22 @@ impl SopEngine {
             Err(e) if err_is_stale_run_copy(&e) => (e, true),
             advanced => return advanced,
         };
+        self.restore_finished_step_for_cancel(run_id, &mut stale);
         if let Some(cancelled) = self.finish_requested_cancellation(run_id)? {
             return Ok(cancelled);
         }
         Err(if recorded { stale } else { self.refused(stale) })
+    }
+
+    fn restore_finished_step_for_cancel(&mut self, run_id: &str, stale: &mut anyhow::Error) {
+        if let Some(copy) = stale.downcast_mut::<StaleRunCopy>()
+            && let Some(run) = self.active_runs.get_mut(run_id)
+            && run.status == SopRunStatus::CancelRequested
+            && run.current_step == copy.stored_step
+            && let Some(step) = copy.finished_step.take()
+        {
+            run.step_results.push(step);
+        }
     }
 
     /// Refuse a gate decision on a held run whose stored record is newer than
@@ -6212,7 +6251,8 @@ impl SopEngine {
     fn adopt_stale_copy_for_retry(&mut self, run_id: &str) -> bool {
         match self.adopt_if_stale(run_id) {
             Ok(None) => true,
-            Ok(Some(stale)) => {
+            Ok(Some(mut stale)) => {
+                self.restore_finished_step_for_cancel(run_id, &mut stale);
                 let _ = self.refused(stale);
                 let cancel_requested = self
                     .active_runs
@@ -9401,8 +9441,10 @@ mod tests {
             stored_revision: 5,
             stored_status: SopRunStatus::CancelRequested,
             stored_step: 2,
-        }
-        .to_string();
+            finished_step: Some(completed_step_result(2, "private step output")),
+        };
+        assert!(!format!("{refusal:?}").contains("private step output"));
+        let refusal = refusal.to_string();
         assert_eq!(
             refusal,
             crate::i18n::get_required_cli_string_with_args(
@@ -9991,6 +10033,15 @@ mod tests {
         );
         let stored = inner.load_run(&run_id).unwrap().unwrap();
         assert_eq!(stored.run.status, SopRunStatus::Cancelled);
+        assert_eq!(
+            stored
+                .run
+                .step_results
+                .iter()
+                .map(|result| (result.step_number, result.output.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "one"), (2, "two")],
+        );
         assert_eq!(inner.claim_counts("cancel-final").unwrap(), (0, 0));
         assert!(!owner.active_runs().contains_key(&run_id));
     }
@@ -10028,8 +10079,73 @@ mod tests {
         );
         let stored = inner.load_run(&run_id).unwrap().unwrap();
         assert_eq!(stored.run.status, SopRunStatus::Cancelled);
+        assert_eq!(
+            stored
+                .run
+                .step_results
+                .iter()
+                .map(|result| (result.step_number, result.output.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "one")],
+        );
         assert_eq!(inner.claim_counts("cancel-dispatch").unwrap(), (0, 0));
         assert!(!owner.active_runs().contains_key(&run_id));
+    }
+
+    #[test]
+    fn remote_cancel_after_another_visit_to_the_same_step_preserves_the_stored_result() {
+        for already_recorded in [false, true] {
+            let store: Arc<dyn SopRunStore> =
+                Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+            let lagging = Arc::new(LaggingLoadStore {
+                inner: store.clone(),
+                lagged: parking_lot::Mutex::new(None),
+            });
+            let sop = four_step_sop("cancel-later-visit");
+            let mut stale = engine_with_sops(vec![sop.clone()]).with_store(lagging.clone());
+            let action = stale
+                .start_run("cancel-later-visit", manual_event())
+                .unwrap();
+            let run_id = extract_run_id(&action).to_string();
+            let seen = store.load_run(&run_id).unwrap().unwrap();
+            let mut revisited = seen.clone();
+            // A later attempt is on the same step number after another writer changed the row.
+            revisited.revision += 1;
+            revisited.run.revision += 1;
+            if already_recorded {
+                revisited
+                    .run
+                    .step_results
+                    .push(completed_step_result(1, "stored result"));
+            }
+            store.save_run(&revisited).unwrap();
+            let mut owner = engine_with_sops(vec![sop]).with_store(store.clone());
+            owner.restore_runs();
+            owner
+                .cancel_run_idempotent(&run_id, None, Some("gateway:operator".into()))
+                .unwrap();
+            *lagging.lagged.lock() = Some(seen);
+
+            let action = stale
+                .advance_step(&run_id, completed_step_result(1, "late result"))
+                .unwrap();
+            assert!(matches!(action, SopRunAction::Cancelled { .. }));
+            let terminal = store.load_run(&run_id).unwrap().unwrap();
+            let expected = if already_recorded {
+                vec!["stored result"]
+            } else {
+                vec![]
+            };
+            assert_eq!(
+                terminal
+                    .run
+                    .step_results
+                    .iter()
+                    .map(|result| result.output.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
     }
 
     /// Another engine finished the run after the final step's check passed.
@@ -10426,6 +10542,154 @@ mod tests {
         );
     }
 
+    mod stale_park_tests {
+        use super::*;
+
+        fn cancel_from_another_engine(sop: Sop, store: Arc<dyn SopRunStore>, run_id: &str) {
+            let mut owner = engine_with_sops(vec![sop]).with_store(store);
+            owner.restore_runs();
+            owner.cancel_run(run_id).unwrap();
+        }
+
+        #[test]
+        fn deterministic_park_refuses_a_cancelled_run() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut sop = deterministic_sop("det-stale");
+            sop.location = Some(dir.path().into());
+            let store = Arc::new(InMemoryRunStore::new());
+            let mut engine = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+            let first = engine.start_run(&sop.name, manual_event()).unwrap();
+            let id = extract_run_id(&first);
+            cancel_from_another_engine(sop, store, id);
+
+            let error = engine
+                .advance_deterministic_step(id, serde_json::json!("done"), None)
+                .unwrap_err();
+            assert!(err_is_stale_run_copy(&error), "{error}");
+            assert_eq!(engine.get_run(id).unwrap().status, SopRunStatus::Cancelled);
+        }
+
+        #[test]
+        fn failed_park_retry_adopts_the_stored_cancellation() {
+            let mut sop = four_step_sop("retry-stale");
+            sop.steps[1].requires_confirmation = true;
+            let store = Arc::new(FailingSaveLeasedStore::healthy());
+            let mut engine = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+            let first = engine.start_run(&sop.name, manual_event()).unwrap();
+            let id = extract_run_id(&first);
+            store.fail_next_save();
+            engine
+                .advance_step(id, completed_step_result(1, "done"))
+                .unwrap();
+            assert!(engine.is_park_persist_pending(id));
+            cancel_from_another_engine(sop, store, id);
+
+            engine.run_maintenance_tick();
+            assert_eq!(engine.get_run(id).unwrap().status, SopRunStatus::Cancelled);
+            assert!(!engine.is_park_persist_pending(id));
+        }
+
+        #[test]
+        fn capacity_blocked_park_retry_adopts_the_stored_cancellation() {
+            let mut sop = four_step_sop("capacity-stale");
+            sop.steps[1].requires_confirmation = true;
+            sop.max_pending_approvals = 1;
+            sop.max_concurrent = 2;
+            let store = Arc::new(InMemoryRunStore::new());
+            let mut engine = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+            let first = engine.start_run(&sop.name, manual_event()).unwrap();
+            let second = engine.start_run(&sop.name, manual_event()).unwrap();
+            let first_id = extract_run_id(&first);
+            let id = extract_run_id(&second);
+            engine
+                .advance_step(first_id, completed_step_result(1, "one"))
+                .unwrap();
+            let blocked = engine
+                .advance_step(id, completed_step_result(1, "two"))
+                .unwrap();
+            assert!(
+                matches!(blocked, SopRunAction::Pending { .. }),
+                "{blocked:?}"
+            );
+            engine.cancel_run(first_id).unwrap();
+            cancel_from_another_engine(sop, store, id);
+
+            engine.run_maintenance_tick();
+            assert_eq!(engine.get_run(id).unwrap().status, SopRunStatus::Cancelled);
+        }
+
+        // Both engines saw the first checkpoint. The owner has already parked
+        // at the next checkpoint by the time the other engine tries its write.
+        fn assert_rollback_keeps_new_checkpoint(
+            decide: impl FnOnce(&mut SopEngine, DeterministicRunState) -> Result<SopRunAction>,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut sop = deterministic_sop("competing-checkpoints");
+            sop.location = Some(dir.path().into());
+            sop.steps[1].on_failure = StepFailure::Goto { step: 3 };
+            sop.steps[2].kind = SopStepKind::Checkpoint;
+            let store = Arc::new(InMemoryRunStore::new());
+            let lagging = Arc::new(LaggingLoadStore {
+                inner: store.clone(),
+                lagged: parking_lot::Mutex::new(None),
+            });
+            let mut owner = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+            let first = owner.start_run(&sop.name, manual_event()).unwrap();
+            let id = extract_run_id(&first);
+            let parked = owner
+                .advance_deterministic_step(id, serde_json::json!("done"), None)
+                .unwrap();
+            let SopRunAction::CheckpointWait { state_file, .. } = parked else {
+                panic!("expected the first checkpoint, got {parked:?}");
+            };
+            let state = SopEngine::load_deterministic_state(&state_file).unwrap();
+            // Keep the two waits distinguishable without sleeping for a clock tick.
+            owner.active_runs.get_mut(id).unwrap().waiting_since =
+                Some("2020-01-01T00:00:00Z".into());
+            assert!(owner.persist_active_checked(id));
+            let old = store.load_run(id).unwrap().unwrap();
+            let mut stale = engine_with_sops(vec![sop]).with_store(lagging.clone());
+            stale.restore_runs();
+            let advanced = owner.approve_step(id).unwrap();
+            assert!(
+                matches!(advanced, SopRunAction::CheckpointWait { .. }),
+                "{advanced:?}"
+            );
+            let new = store.load_run(id).unwrap().unwrap();
+            assert_eq!(new.run.current_step, 3);
+            assert_ne!(old.run.waiting_since, new.run.waiting_since);
+            // Model the owner advancing after the gate precheck: that read sees
+            // the earlier record, but the store evaluates the write against the new one.
+            *lagging.lagged.lock() = Some(old);
+
+            let error = decide(&mut stale, state).unwrap_err();
+            assert!(err_is_stale_run_copy(&error), "{error}");
+            let adopted = stale.get_run(id).unwrap();
+            assert_eq!(adopted.current_step, new.run.current_step);
+            assert_eq!(adopted.waiting_since, new.run.waiting_since);
+            assert_eq!(store.load_run(id).unwrap().unwrap().revision, new.revision);
+        }
+
+        #[test]
+        fn checkpoint_denial_keeps_the_adopted_record() {
+            assert_rollback_keeps_new_checkpoint(|engine, old| {
+                engine.decide_checkpoint(&old.run_id, ApprovalDecision::Deny { reason: None })
+            });
+        }
+
+        #[test]
+        fn checkpoint_approval_keeps_the_adopted_wait_time() {
+            assert_rollback_keeps_new_checkpoint(|engine, old| engine.approve_step(&old.run_id));
+        }
+
+        #[test]
+        fn deterministic_resume_keeps_the_adopted_checkpoint() {
+            assert_rollback_keeps_new_checkpoint(|engine, old| {
+                engine.resume_deterministic_run(old)
+            });
+        }
+    }
+
     /// The owner could not finish a cancellation (its terminal write failed),
     /// and another engine finished it instead. Maintenance adopts the stored
     /// terminal record instead of retrying the refused write every tick.
@@ -10484,19 +10748,29 @@ mod tests {
     /// `Failed` over it.
     #[test]
     fn maintenance_finishes_a_remote_cancel_instead_of_a_stale_budget_failure() {
-        let store: Arc<dyn SopRunStore> =
-            Arc::new(super::super::store::SqliteRunStore::open_in_memory().unwrap());
+        use super::super::store::{SqliteRunStore, testing::FailFirstTerminalWrite};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db");
+        let store: Arc<dyn SopRunStore> = Arc::new(SqliteRunStore::open(&path).unwrap());
+        let owner_store = Arc::new(FailFirstTerminalWrite::new(
+            SqliteRunStore::open(&path).unwrap(),
+        ));
         let sop = test_sop(
             "budget-then-cancel",
             SopExecutionMode::Auto,
             SopPriority::Normal,
         );
-        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+        let mut owner = engine_with_sops(vec![sop.clone()]).with_store(owner_store.clone());
         let action = owner
             .start_run("budget-then-cancel", manual_event())
             .unwrap();
         let run_id = extract_run_id(&action).to_string();
-        owner.step_budget_finalization_ready.insert(run_id.clone());
+        // The driver already ran this step; its terminal write has not landed.
+        owner
+            .record_step_result(&run_id, completed_step_result(1, "one"))
+            .unwrap();
+        assert!(owner.fail_headless_step_budget(&run_id).is_err());
+        assert!(owner_store.fired());
 
         let mut other = engine_with_sops(vec![sop]).with_store(store.clone());
         other.restore_runs();
@@ -10508,9 +10782,17 @@ mod tests {
         );
 
         owner.run_maintenance_tick();
+        owner.run_maintenance_tick();
+        let reopened = SqliteRunStore::open(&path).unwrap();
+        let terminal = reopened.load_run(&run_id).unwrap().unwrap();
+        assert_eq!(terminal.run.status, SopRunStatus::Cancelled);
+        assert_eq!(terminal.run.step_results.len(), 1);
+        assert_eq!(terminal.run.step_results[0].output, "one");
+        let detail = super::super::types::SopRunDetail::from_run(&terminal.run, false);
+        assert_eq!(detail.steps.len(), 1);
         assert_eq!(
-            store.load_run(&run_id).unwrap().unwrap().run.status,
-            SopRunStatus::Cancelled
+            (detail.steps[0].step_number, detail.steps[0].output.as_str()),
+            (1, "one")
         );
         assert_eq!(store.claim_counts("budget-then-cancel").unwrap(), (0, 0));
         assert!(!owner.active_runs().contains_key(&run_id));

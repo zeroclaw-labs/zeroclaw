@@ -549,13 +549,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Apple's notary and ticket services drop connections now and then, and
+          # this step runs after hours of build. Both calls are safe to repeat: a
+          # resubmitted .dmg is notarized again, and stapling fetches the same
+          # ticket. A rejected notarization still fails: it leaves no ticket, so
+          # stapling fails on every attempt.
+          retry() {
+            local label="$1" attempts="$2" attempt
+            shift 2
+            for ((attempt = 1; attempt <= attempts; attempt++)); do
+              if "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -lt "$attempts" ]; then
+                echo "::warning::${label} failed (attempt ${attempt}/${attempts}); retrying in $((attempt * 30))s."
+                sleep "$((attempt * 30))"
+              fi
+            done
+            echo "::error::${label} failed after ${attempts} attempts."
+            return 1
+          }
           echo "Notarizing .dmg for offline validation: $MACOS_DMG_PATH"
-          xcrun notarytool submit "$MACOS_DMG_PATH" \
+          retry "Notarization" 3 xcrun notarytool submit "$MACOS_DMG_PATH" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait
-          xcrun stapler staple "$MACOS_DMG_PATH"
+          retry "Stapling" 5 xcrun stapler staple "$MACOS_DMG_PATH"
           xcrun stapler validate "$MACOS_DMG_PATH"
           echo "Stapled — the .dmg now validates offline."
 
@@ -1191,7 +1211,7 @@ jobs:
         env:
           PAT: ${{ secrets.WEBSITE_REPO_PAT }}
         run: |
-          curl -fsSL -X POST \
+          curl -fsSL --retry 3 --retry-max-time 60 -X POST \
             -H "Authorization: token $PAT" \
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/zeroclaw-labs/zeroclaw-website/dispatches \
