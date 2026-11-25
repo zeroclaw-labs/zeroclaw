@@ -143,6 +143,17 @@ Ask our support team to release access for {identity}.
 
 The notice reads the daemon's published configuration when it is sent. Changes published through its shared config authority reach the next notice. Edits made only to disk, including `config.toml` edits and `zeroclaw config set`, need a daemon reload or process restart; see [Restart and persistence behavior](#restart-and-persistence-behavior).
 
+### Notifying the operator about turned-away senders
+
+The public stub reaches the sender, but in a group it is all bystanders see, and without a second copy the operator learns about unapproved callers only from the logs. Set `owner_chat_id`, typically the operator's own DM with the bot, to also receive a short heads-up naming the sender identity, the source chat, and a bounded preview of the turned-away message, plus the same authorization hint the sender received:
+
+```toml
+[channels.telegram.home]
+owner_chat_id = "123456789"
+```
+
+Unset (default) sends no operator notification. A value equal to the sender's own chat is ignored, since the public notice already reached it. The heads-up resolves `owner_chat_id` from the published configuration exactly like the stub text above.
+
 ## 4. Start the channel and inspect it
 
 Use the full daemon for normal operation, the channel-only process for a
