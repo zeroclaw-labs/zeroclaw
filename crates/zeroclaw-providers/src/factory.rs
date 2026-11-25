@@ -523,6 +523,18 @@ pub(crate) fn canonical_auth_ready(
 ) -> bool {
     use zeroclaw_config::provider_registry::{GeminiAuth, ProviderConnection, QwenAuth};
     let key = connection.api_key();
+    if let ProviderConnection::AntigravityCli(connection) = connection {
+        return AntigravityCliModelProviderConfig {
+            auth_method: connection
+                .api
+                .chat
+                .as_ref()
+                .map(|api| api.auth_method)
+                .unwrap_or_default(),
+            ..Default::default()
+        }
+        .fallback_auth_ready(key, &ModelProviderRuntimeOptions::default());
+    }
     if has_api_key(key)
         || connection
             .extra_headers()
@@ -559,9 +571,9 @@ pub(crate) fn canonical_auth_ready(
 
 use zeroclaw_config::schema::{
     Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicModelProviderConfig,
-    AnyscaleModelProviderConfig, ArceeModelProviderConfig, AstraiModelProviderConfig,
-    AtlasCloudModelProviderConfig, AtomicChatModelProviderConfig, AuthMode,
-    AvianModelProviderConfig, AzureModelProviderConfig, BaichuanModelProviderConfig,
+    AntigravityCliModelProviderConfig, AnyscaleModelProviderConfig, ArceeModelProviderConfig,
+    AstraiModelProviderConfig, AtlasCloudModelProviderConfig, AtomicChatModelProviderConfig,
+    AuthMode, AvianModelProviderConfig, AzureModelProviderConfig, BaichuanModelProviderConfig,
     BasetenModelProviderConfig, BedrockModelProviderConfig, CerebrasModelProviderConfig,
     CheaperInferenceModelProviderConfig, CloudflareModelProviderConfig, CohereModelProviderConfig,
     CopilotModelProviderConfig, CrusoeModelProviderConfig, CustomModelProviderConfig,
@@ -1801,6 +1813,8 @@ impl FamilyProviderFactory for CopilotModelProviderConfig {
 impl FamilyProviderFactory for GeminiCliModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::CliBacked;
 
+    /// Retired: always refuses with the shared migration message so an agent
+    /// still pointing at a `gemini_cli` alias fails at startup with the fix.
     fn create_provider(
         &self,
         alias: &str,
@@ -1808,13 +1822,25 @@ impl FamilyProviderFactory for GeminiCliModelProviderConfig {
         _api_url: Option<&str>,
         _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        Ok(Box::new(
-            crate::gemini_cli::GeminiCliModelProvider::builder(alias)
-                .binary_path(self.binary_path.as_deref())
-                .build(),
-        ))
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "model_provider": format!("gemini_cli.{alias}"),
+                    "error_key": "gemini_cli_retired",
+                })),
+            "gemini_cli: retired model provider refused"
+        );
+        anyhow::bail!(
+            "providers.models.gemini_cli.{alias}: {}",
+            zeroclaw_config::schema::GEMINI_CLI_PROVIDER_RETIRED
+        )
     }
 
+    /// Always ready, so a fallback naming a retired alias reaches
+    /// `create_provider` and reports the migration message rather than a
+    /// request for credentials the provider would never use.
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
         true
     }
@@ -1830,16 +1856,12 @@ impl FamilyProviderFactory for GrokCliModelProviderConfig {
         _api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        if has_api_key(key) {
-            anyhow::bail!(
-                "grok_cli does not accept api_key; use `grok login`, or export `XAI_API_KEY` and list it in the alias env_passthrough"
-            );
-        }
         Ok(Box::new(
             crate::grok_cli::GrokCliModelProvider::builder(alias)
                 .binary_path(self.binary_path.as_deref())
                 .working_directory(&self.working_directory)
                 .env_passthrough(self.env_passthrough.clone())
+                .api_key(key)
                 .extra_args(self.extra_args.clone())
                 .max_acp_stdout_bytes(self.max_acp_stdout_bytes)
                 .timeout_secs(opts.provider_timeout_secs.or(self.base.timeout_secs))
@@ -1854,6 +1876,51 @@ impl FamilyProviderFactory for GrokCliModelProviderConfig {
 
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
         true
+    }
+}
+
+impl FamilyProviderFactory for AntigravityCliModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::CliBacked;
+
+    fn create_provider(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        _api_url: Option<&str>,
+        opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
+        let state_root = opts.zeroclaw_dir.clone().unwrap_or_else(|| {
+            directories::UserDirs::new().map_or_else(
+                || std::path::PathBuf::from(".zeroclaw"),
+                |dirs| dirs.home_dir().join(".zeroclaw"),
+            )
+        });
+        Ok(Box::new(
+            crate::antigravity_cli::AntigravityCliModelProvider::builder(alias)
+                .binary_path(self.binary_path.as_deref())
+                .working_directory(&self.working_directory)
+                .state_directory(self.state_directory.as_deref())
+                .state_root(state_root)
+                .auth_method(self.auth_method)
+                .api_key(key)
+                .env_passthrough(self.env_passthrough.clone())
+                .extra_args(self.extra_args.clone())
+                .max_acp_stdout_bytes(self.max_acp_stdout_bytes)
+                .timeout_secs(opts.provider_timeout_secs.or(self.base.timeout_secs))
+                .vision_enabled(opts.vision == Some(true))
+                .build()?,
+        ))
+    }
+
+    fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        use zeroclaw_config::schema::AntigravityCliAuthMethod;
+        match self.auth_method {
+            AntigravityCliAuthMethod::GeminiApiKey => has_api_key(key),
+            AntigravityCliAuthMethod::AgentPlatform | AntigravityCliAuthMethod::OauthBusiness => {
+                true
+            }
+            AntigravityCliAuthMethod::OauthPersonal => false,
+        }
     }
 }
 
@@ -2423,6 +2490,19 @@ fn dispatch_resolved_chat(
             }
             return config.create_provider(alias, api_key, None, &runtime);
         }
+        ProviderConnection::AntigravityCli(connection) => {
+            let mut config = AntigravityCliModelProviderConfig::default();
+            if let Some(api) = &connection.api.chat {
+                config.binary_path = api.binary_path.clone();
+                config.working_directory = api.working_directory.clone();
+                config.auth_method = api.auth_method;
+                config.state_directory = api.state_directory.clone();
+                config.env_passthrough = api.env_passthrough.clone();
+                config.extra_args = api.extra_args.clone();
+                config.max_acp_stdout_bytes = api.max_acp_stdout_bytes;
+            }
+            return config.create_provider(alias, api_key, None, &runtime);
+        }
         ProviderConnection::HailoOllama(connection) => {
             return HailoOllamaModelProviderConfig {
                 queue_timeout_secs: resolved.queue_timeout_secs.map(std::num::NonZeroU64::get),
@@ -2476,6 +2556,23 @@ mod tests {
             (json!({"kind": "llamacpp"}), true),
             (json!({"kind": "vllm"}), true),
             (json!({"kind": "gemini_cli"}), true),
+            (json!({"kind": "antigravity_cli"}), false),
+            (
+                json!({"kind": "antigravity_cli", "api": {"chat": {"auth_method": "agent_platform"}}}),
+                true,
+            ),
+            (
+                json!({"kind": "antigravity_cli", "api": {"chat": {"auth_method": "oauth_business"}}}),
+                true,
+            ),
+            (
+                json!({"kind": "antigravity_cli", "auth": {"mode": "api_key", "api_key": "test-key"}, "api": {"chat": {"auth_method": "oauth_personal"}}}),
+                false,
+            ),
+            (
+                json!({"kind": "antigravity_cli", "auth": {"mode": "api_key", "api_key": "test-key"}}),
+                true,
+            ),
             (json!({"kind": "bedrock"}), true),
             (json!({"kind": "gemini", "auth": {"mode": "oauth"}}), true),
             (json!({"kind": "qwen", "auth": {"mode": "oauth"}}), true),
@@ -2507,6 +2604,44 @@ mod tests {
     }
 
     #[test]
+    fn canonical_cli_connections_forward_credentials_and_auth_policy() {
+        use serde_json::json;
+        use zeroclaw_config::provider_registry::ProviderRegistry;
+        let root = tempfile::tempdir().unwrap();
+        for (kind, auth, env, expected) in [
+            ("grok_cli", "gemini_api_key", vec!["XAI_API_KEY"], "either"),
+            (
+                "antigravity_cli",
+                "oauth_personal",
+                vec![],
+                "oauth_personal",
+            ),
+        ] {
+            let mut api = json!({"working_directory":root.path(),"binary_path":std::env::current_exe().unwrap(),"env_passthrough":env});
+            if kind == "antigravity_cli" {
+                api["auth_method"] = json!(auth);
+                api["state_directory"] = json!(root.path().join("isolated-state"));
+            }
+            let registry: ProviderRegistry = serde_json::from_value(json!({
+                "connections":{"cli":{"kind":kind,"auth":{"mode":"api_key","api_key":"synthetic-key"},"api":{"chat":api}}},
+                "models":{"chat.cli":{"capability":"chat","provider":"cli","model":"test-model"}}
+            })).unwrap();
+            let error = dispatch_model_ref_with_registry(
+                &registry,
+                &"chat.cli".into(),
+                &ModelProviderRuntimeOptions {
+                    zeroclaw_dir: Some(root.path().into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .err()
+            .expect("conflicting or refused auth must not construct a provider");
+            assert!(error.to_string().contains(expected), "{kind}: {error}");
+        }
+    }
+
+    #[test]
     fn every_advertised_chat_provider_constructs_from_a_canonical_connection() {
         use serde_json::json;
         use zeroclaw_config::provider_registry::{ModelRef, ProviderConnection, ProviderRegistry};
@@ -2525,7 +2660,7 @@ mod tests {
             if provider.name == "azure" {
                 connection["extra"] = json!({"resource": "test-resource"});
             }
-            if provider.name == "grok_cli" {
+            if matches!(provider.name, "grok_cli" | "antigravity_cli") {
                 connection["api"] = json!({"chat": {
                     "working_directory": root.path(),
                     "binary_path": std::env::current_exe().unwrap(),
@@ -2981,7 +3116,7 @@ mod tests {
                 "{family} requires operator endpoint input"
             );
         }
-        for family in ["gemini_cli", "grok_cli", "kilocli"] {
+        for family in ["gemini_cli", "grok_cli", "antigravity_cli", "kilocli"] {
             assert_eq!(
                 endpoint_for_family(family),
                 Some(ProviderEndpoint::CliBacked),
@@ -3005,22 +3140,41 @@ mod tests {
     }
 
     #[test]
-    fn grok_cli_factory_rejects_typed_api_key_instead_of_ignoring_it() {
+    fn grok_cli_factory_accepts_typed_api_key_but_not_with_env_passthrough_key() {
         let working_directory = tempfile::tempdir().expect("temporary working directory");
         let config = GrokCliModelProviderConfig {
+            binary_path: Some(
+                std::env::current_exe()
+                    .expect("current test executable")
+                    .display()
+                    .to_string(),
+            ),
             working_directory: working_directory.path().display().to_string(),
             ..Default::default()
         };
-        let error = match config.create_provider(
+        config
+            .create_provider(
+                "default",
+                Some("typed-test-key"),
+                None,
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .expect("typed api_key builds the Grok CLI provider");
+
+        let both = GrokCliModelProviderConfig {
+            env_passthrough: vec!["XAI_API_KEY".to_string()],
+            ..config
+        };
+        let error = match both.create_provider(
             "default",
             Some("typed-test-key"),
             None,
             &ModelProviderRuntimeOptions::default(),
         ) {
-            Ok(_) => panic!("grok_cli api_key must not be silently ignored"),
+            Ok(_) => panic!("two API-key sources must be rejected"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("does not accept api_key"));
+        assert!(error.to_string().contains("not both"));
     }
 
     #[test]
@@ -3069,6 +3223,80 @@ mod tests {
             .expect("vision opt-in must build the Grok CLI provider");
 
         assert!(provider.capabilities().vision);
+    }
+
+    fn antigravity_cli_config(
+        working_directory: &std::path::Path,
+        auth_method: zeroclaw_config::schema::AntigravityCliAuthMethod,
+    ) -> AntigravityCliModelProviderConfig {
+        AntigravityCliModelProviderConfig {
+            binary_path: Some(
+                std::env::current_exe()
+                    .expect("current test executable")
+                    .display()
+                    .to_string(),
+            ),
+            working_directory: working_directory.display().to_string(),
+            auth_method,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn antigravity_cli_factory_uses_typed_api_key_and_isolated_state() {
+        use zeroclaw_config::schema::AntigravityCliAuthMethod;
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let config = antigravity_cli_config(temp.path(), AntigravityCliAuthMethod::GeminiApiKey);
+        let opts = ModelProviderRuntimeOptions {
+            zeroclaw_dir: Some(temp.path().join("zeroclaw")),
+            vision: Some(true),
+            ..Default::default()
+        };
+
+        let missing = match config.create_provider("default", None, None, &opts) {
+            Ok(_) => panic!("gemini_api_key without api_key must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            missing
+                .to_string()
+                .contains("requires this alias's api_key")
+        );
+        assert!(!config.fallback_auth_ready(None, &opts));
+        assert!(config.fallback_auth_ready(Some("test-key"), &opts));
+
+        let provider = config
+            .create_provider("default", Some("test-key"), None, &opts)
+            .expect("typed api_key builds the Antigravity CLI provider");
+        assert!(provider.capabilities().vision);
+    }
+
+    #[test]
+    fn antigravity_cli_factory_refuses_personal_sign_in() {
+        use zeroclaw_config::schema::AntigravityCliAuthMethod;
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let config = antigravity_cli_config(temp.path(), AntigravityCliAuthMethod::OauthPersonal);
+        let opts = ModelProviderRuntimeOptions {
+            zeroclaw_dir: Some(temp.path().join("zeroclaw")),
+            ..Default::default()
+        };
+        assert!(!config.fallback_auth_ready(None, &opts));
+        let error = match config.create_provider("default", None, None, &opts) {
+            Ok(_) => panic!("oauth_personal must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("oauth_personal"));
+
+        for method in [
+            AntigravityCliAuthMethod::AgentPlatform,
+            AntigravityCliAuthMethod::OauthBusiness,
+        ] {
+            let config = antigravity_cli_config(temp.path(), method);
+            assert!(config.fallback_auth_ready(None, &opts));
+            config
+                .create_provider("default", None, None, &opts)
+                .expect("keyless Antigravity methods build");
+        }
     }
 
     #[test]

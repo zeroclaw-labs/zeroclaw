@@ -1477,6 +1477,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn v4_cli_connections_preserve_keys_process_policy_and_model_deadlines() {
+        let config: Config = toml::from_str(
+            r#"
+schema_version = 4
+[providers.models.antigravity_cli.business]
+api_key = "synthetic-gemini-key"
+model = "gemini-model"
+working_directory = "/workspace/agy"
+binary_path = "/bin/agy"
+auth_method = "gemini_api_key"
+state_directory = "/state/agy"
+env_passthrough = ["HTTPS_PROXY"]
+extra_args = ["--verbose"]
+max_acp_stdout_bytes = 8388608
+timeout_secs = 42
+
+[providers.models.grok_cli.build]
+api_key = "synthetic-xai-key"
+model = "grok-build"
+working_directory = "/workspace/grok"
+timeout_secs = 35
+"#,
+        )
+        .unwrap();
+        let registry = config.provider_registry().unwrap();
+        let connection = &registry.connections["legacy.antigravity_cli.business"];
+        assert_eq!(connection.api_key(), Some("synthetic-gemini-key"));
+        let registry::ProviderConnection::AntigravityCli(connection) = connection else {
+            panic!("migration must retain the Antigravity adapter")
+        };
+        let api = connection.api.chat.as_ref().unwrap();
+        assert_eq!(api.working_directory, "/workspace/agy");
+        assert_eq!(api.binary_path.as_deref(), Some("/bin/agy"));
+        assert_eq!(api.state_directory.as_deref(), Some("/state/agy"));
+        assert_eq!(api.env_passthrough, ["HTTPS_PROXY"]);
+        assert_eq!(api.extra_args, ["--verbose"]);
+        assert_eq!(api.max_acp_stdout_bytes, Some(8_388_608));
+        assert_eq!(
+            api.auth_method,
+            crate::schema::AntigravityCliAuthMethod::GeminiApiKey
+        );
+        assert_eq!(
+            registry.connections["legacy.grok_cli.build"].api_key(),
+            Some("synthetic-xai-key")
+        );
+        for (reference, seconds) in [("antigravity_cli.business", 42), ("grok_cli.build", 35)] {
+            assert_eq!(
+                registry
+                    .resolve_chat(&reference.into())
+                    .unwrap()
+                    .request_timeout_secs,
+                Some(registry::Override::Set(
+                    std::num::NonZeroU64::new(seconds).unwrap()
+                ))
+            );
+        }
+        let serialized = toml::to_string(&config).unwrap();
+        let reloaded: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            serde_json::to_value(registry).unwrap(),
+            serde_json::to_value(reloaded.provider_registry().unwrap()).unwrap()
+        );
+    }
+
+    #[test]
     fn tts_binary_path_is_projected_only_for_command_based_connections() {
         let config: Config = toml::from_str(
             r#"

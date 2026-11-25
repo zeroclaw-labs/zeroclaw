@@ -10,6 +10,20 @@ const RPC_RELOAD_REPLY_FLUSH_DELAY: std::time::Duration = std::time::Duration::f
 const RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY: std::time::Duration =
     std::time::Duration::from_millis(200);
 const PROBE_MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// How long a client-facing handler that already holds the config writer lock
+/// (a config write's live-session refresh, or `session/configure`) waits for a
+/// live session's `model_provider_update` guard before refusing with
+/// `SESSION_BUSY`.
+///
+/// A running turn holds that guard for its whole duration, and these handlers
+/// run inline on the issuing connection's sequential dispatcher while holding
+/// the daemon-wide config writer lock. An unbounded wait therefore stalls the
+/// issuing client (and every other config writer) until the turn ends — or
+/// forever, when the turn is itself waiting on a frame from that client, such
+/// as a tool approval. The bound absorbs brief holders while staying well
+/// inside zerocode's default 5s RPC timeout, so the client receives a real,
+/// retryable error instead of a transport timeout.
+const SESSION_PROVIDER_UPDATE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 use crate::agent::agent::TurnEvent;
 use crate::sop::SopGraphExt;
 use serde::Serialize;
@@ -7964,13 +7978,30 @@ impl RpcDispatcher {
             return Err(self.stale_session_incarnation_error());
         }
 
-        // Acquire the per-session ordering boundary.
-        let _model_provider_update = self
+        // Acquire the per-session ordering boundary. Bounded for the same
+        // reason as the config-write refresh: a mid-turn session holds this
+        // guard until its turn ends, and this handler runs inline on the
+        // connection's dispatcher while holding `config_write_lock`.
+        let _model_provider_update = match self
             .ctx
             .sessions
-            .lock_model_provider_update(&req.session_id)
+            .lock_model_provider_update_with_timeout(
+                &req.session_id,
+                SESSION_PROVIDER_UPDATE_LOCK_TIMEOUT,
+            )
             .await
-            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        {
+            Ok(guard) => guard,
+            Err(crate::rpc::session::WaitForProviderUpdateError::SessionNotFound) => {
+                return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+            }
+            Err(crate::rpc::session::WaitForProviderUpdateError::Timeout) => {
+                return Err(rpc_err(
+                    SESSION_BUSY,
+                    "Session is running a turn; retry configure after the turn finishes",
+                ));
+            }
+        };
 
         self.ensure_session_incarnation(&req.session_id, Some(session_generation))
             .await?;
@@ -10681,10 +10712,31 @@ impl RpcDispatcher {
             // The guard is BOUND (not dropped): it is moved into
             // `PreparedLiveSessionRefresh` and held through publication, so
             // preparation and apply are one ordered transition.
-            let Some(model_provider_update) =
-                ctx.sessions.lock_model_provider_update(&session_id).await
-            else {
-                continue;
+            //
+            // The wait is bounded: a session in scope that is mid-turn holds
+            // this guard until the turn ends, and parking here would stall
+            // the issuing connection's dispatcher and every config writer
+            // behind `config_write_lock`. Refusing drops the candidate
+            // config and every guard acquired so far, so nothing commits.
+            let model_provider_update = match ctx
+                .sessions
+                .lock_model_provider_update_with_timeout(
+                    &session_id,
+                    SESSION_PROVIDER_UPDATE_LOCK_TIMEOUT,
+                )
+                .await
+            {
+                Ok(guard) => guard,
+                Err(crate::rpc::session::WaitForProviderUpdateError::SessionNotFound) => continue,
+                Err(crate::rpc::session::WaitForProviderUpdateError::Timeout) => {
+                    return Err(rpc_err(
+                        SESSION_BUSY,
+                        format!(
+                            "Config update cannot refresh live session `{session_id}` while it \
+                             is running a turn; retry after the turn finishes"
+                        ),
+                    ));
+                }
             };
 
             // Re-verify the session has not been replaced while we waited
@@ -44450,6 +44502,82 @@ model = "before"
             .expect("session/configure must succeed after the update boundary is released");
     }
 
+    /// `session/configure` takes the daemon-wide config writer lock and then
+    /// the session's `model_provider_update` guard, which a running turn holds
+    /// until it ends. Configuring a mid-turn session must fail with a
+    /// retryable `SESSION_BUSY` inside the client's RPC budget rather than
+    /// park the issuing connection's sequential dispatcher — and, through the
+    /// writer lock, every config writer on the daemon — for the whole turn.
+    #[tokio::test]
+    async fn session_configure_on_busy_session_fails_busy_instead_of_hanging() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        // A running turn holds this guard for its whole duration.
+        let busy_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&session_id)
+            .await
+            .expect("session update lock exists");
+
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(
+            SESSION_PROVIDER_UPDATE_LOCK_TIMEOUT + std::time::Duration::from_secs(2),
+            dispatcher.handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": { "temperature": 0.6 }
+            })),
+        )
+        .await
+        .expect("session/configure must not park behind a busy session's turn")
+        .expect_err("session/configure must refuse while the session is mid-turn");
+        assert_eq!(error.code, SESSION_BUSY);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the refusal must arrive inside the client's 5s RPC timeout"
+        );
+
+        // The override was not applied, and the writer lock is free again.
+        assert!(
+            dispatcher
+                .ctx
+                .config_authority
+                .try_lock_config_writer()
+                .is_some(),
+            "a refused session/configure must release the config writer lock"
+        );
+        assert_eq!(
+            dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .and_then(|overrides| overrides.temperature),
+            None,
+            "a refused session/configure must not commit its override"
+        );
+
+        // Once the turn ends, the same configure goes through.
+        drop(busy_guard);
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": { "temperature": 0.6 }
+            }))
+            .await
+            .expect("session/configure must succeed once the session is idle");
+        assert_eq!(
+            dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .and_then(|overrides| overrides.temperature),
+            Some(0.6)
+        );
+    }
+
     /// Deterministic regression for the queued config-mutation → prompt race.
     ///
     /// This queues the real `config/set` transaction behind a held session
@@ -44853,6 +44981,89 @@ model = "before"
             "old-model"
         );
         drop(busy_guard);
+    }
+
+    /// Editing a setting that a mid-turn session is actively using must fail
+    /// with a retryable `SESSION_BUSY` error inside the client's RPC budget,
+    /// not park forever. `config/set` runs inline on the connection's
+    /// sequential dispatcher, so an unbounded wait here froze the issuing
+    /// TUI: every later frame from it — including the reply to a tool
+    /// approval the busy turn was itself waiting on — queued behind the
+    /// parked transaction, which held the global config writer lock too.
+    #[tokio::test]
+    async fn config_set_in_scope_of_busy_session_fails_busy_instead_of_hanging() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_model_refresh_test_config(&tmp);
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let busy_session = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        // A running turn holds this guard for its whole duration.
+        let busy_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&busy_session)
+            .await
+            .expect("session update lock exists");
+
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(
+            SESSION_PROVIDER_UPDATE_LOCK_TIMEOUT + std::time::Duration::from_secs(2),
+            dispatcher.handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["models", "openai.test-provider", "model"],
+                json!("new-model"),
+            )),
+        )
+        .await
+        .expect("config/set must not park behind a busy session's turn")
+        .expect_err("config/set must refuse to rebuild a session that is mid-turn");
+        assert_eq!(error.code, SESSION_BUSY, "{}", error.message);
+        assert!(
+            error.message.contains(&busy_session),
+            "the error must name the busy session: {}",
+            error.message
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the refusal must arrive inside the client's 5s RPC timeout"
+        );
+
+        // Nothing was committed, and the writer lock is free again so other
+        // config writers (and this client's next request) are not stalled.
+        assert!(
+            dispatcher
+                .ctx
+                .config_authority
+                .try_lock_config_writer()
+                .is_some(),
+            "a refused config/set must release the config writer lock"
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &busy_session).await,
+            "old-model"
+        );
+        let registry =
+            zeroclaw_config::provider_registry::editor::snapshot(&dispatcher.ctx.config.read())
+                .expect("canonical registry snapshot must remain valid");
+        assert_eq!(
+            registry["models"]["openai.test-provider"]["model"],
+            json!("old-model"),
+            "a refused config/set must not publish the candidate config"
+        );
+
+        // Once the turn ends, the same edit goes through.
+        drop(busy_guard);
+        dispatcher
+            .handle_config_registry_set(&registry_edit_params(
+                &dispatcher,
+                &["models", "openai.test-provider", "model"],
+                json!("new-model"),
+            ))
+            .await
+            .expect("config/set must succeed once the session is idle");
+        assert_eq!(
+            model_name_for_session(&dispatcher, &busy_session).await,
+            "new-model"
+        );
     }
 
     #[tokio::test]
