@@ -13,7 +13,7 @@ use zeroclaw_log::{Action, EventOutcome};
 
 const MAX_PERSISTED_TOOL_OUTPUT_BYTES: usize = 16 * 1024;
 
-/// A session already owns the requested ACP session ID.
+/// The requested ACP session ID is already in use or reserved for import.
 #[derive(Debug)]
 pub struct AcpSessionIdConflict;
 
@@ -205,7 +205,8 @@ impl AcpSessionStore {
     /// one transaction. Existing ACP rows take precedence, including killed
     /// sessions. Deleting a destination row does not make the key eligible
     /// for import again.
-    /// Unreadable transcripts are logged and left eligible for a later retry.
+    /// Unreadable transcripts are logged and leave their IDs reserved until a
+    /// later import succeeds.
     pub fn import_legacy_gateway_sessions(
         &self,
         legacy: &dyn crate::session_backend::SessionBackend,
@@ -219,35 +220,23 @@ impl AcpSessionStore {
             let mut conn = self.conn.lock();
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let marked = tx.execute(
-                "INSERT INTO acp_legacy_gateway_imports (legacy_key)
-                 VALUES (?1) ON CONFLICT(legacy_key) DO NOTHING",
+                "INSERT INTO acp_legacy_gateway_imports (legacy_key, pending)
+                 VALUES (?1, 0)
+                 ON CONFLICT(legacy_key) DO UPDATE SET pending = 0 WHERE pending = 1",
                 params![metadata.key],
             )?;
             if marked == 0 {
                 continue;
             }
-            let (alias, workspace) = resolve_agent(metadata.agent_alias.as_deref());
-            let changed = tx.execute(
-                "INSERT INTO acp_sessions
-                    (session_uuid, agent_alias, workspace_dir, name, interaction_surface,
-                     created_at, last_activity, principal_id)
-                 VALUES (?1, ?2, ?3, ?4, 'webchat', ?5, ?6, ?7)
-                 ON CONFLICT(session_uuid) DO NOTHING",
-                params![
-                    id,
-                    alias,
-                    workspace.to_string_lossy(),
-                    metadata.name,
-                    metadata.created_at.to_rfc3339(),
-                    metadata.last_activity.to_rfc3339(),
-                    metadata.principal_id,
-                ],
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM acp_sessions WHERE session_uuid = ?1)",
+                [id],
+                |row| row.get(0),
             )?;
-            if changed == 0 {
+            if exists {
                 tx.commit()?;
                 continue;
             }
-            let session_row = tx.last_insert_rowid();
             let transcript = (|| -> Result<_> {
                 let messages = legacy.try_load(&metadata.key)?;
                 let timestamped = legacy.load_with_timestamps(&metadata.key);
@@ -277,10 +266,32 @@ impl AcpSessionStore {
                             ),
                         "Legacy WebChat transcript could not be imported"
                     );
-                    // Dropping the transaction leaves this key eligible for retry.
+                    tx.execute(
+                        "UPDATE acp_legacy_gateway_imports SET pending = 1 WHERE legacy_key = ?1",
+                        [&metadata.key],
+                    )?;
+                    tx.commit()?;
                     continue;
                 }
             };
+            let (alias, workspace) = resolve_agent(metadata.agent_alias.as_deref());
+            tx.execute(
+                "INSERT INTO acp_sessions
+                    (session_uuid, agent_alias, workspace_dir, name, interaction_surface,
+                     created_at, last_activity, principal_id, trim_breadcrumb)
+                 VALUES (?1, ?2, ?3, ?4, 'webchat', ?5, ?6, ?7, ?8)",
+                params![
+                    id,
+                    alias,
+                    workspace.to_string_lossy(),
+                    metadata.name,
+                    metadata.created_at.to_rfc3339(),
+                    metadata.last_activity.to_rfc3339(),
+                    metadata.principal_id,
+                    breadcrumb,
+                ],
+            )?;
+            let session_row = tx.last_insert_rowid();
             for row in timestamped {
                 let timestamp = row
                     .created_at
@@ -297,10 +308,6 @@ impl AcpSessionStore {
                     ],
                 )?;
             }
-            tx.execute(
-                "UPDATE acp_sessions SET trim_breadcrumb = ?1 WHERE id = ?2",
-                params![breadcrumb, session_row],
-            )?;
             tx.commit()?;
             imported += 1;
         }
@@ -312,7 +319,7 @@ impl AcpSessionStore {
         std::fs::create_dir_all(&sessions_dir).context("Failed to create sessions directory")?;
         let db_path = sessions_dir.join("acp-sessions.db");
 
-        let conn = Connection::open(&db_path)
+        let mut conn = Connection::open(&db_path)
             .with_context(|| format!("Failed to open ACP session DB: {}", db_path.display()))?;
 
         conn.execute_batch(
@@ -345,7 +352,8 @@ impl AcpSessionStore {
              CREATE INDEX IF NOT EXISTS idx_acp_sessions_alias ON acp_sessions(agent_alias);
 
              CREATE TABLE IF NOT EXISTS acp_legacy_gateway_imports (
-                 legacy_key TEXT PRIMARY KEY NOT NULL
+                 legacy_key TEXT PRIMARY KEY NOT NULL,
+                 pending INTEGER NOT NULL DEFAULT 0
              );
 
              CREATE TABLE IF NOT EXISTS acp_messages (
@@ -415,10 +423,30 @@ impl AcpSessionStore {
 
         Self::ensure_retained_context_columns(&conn)
             .context("Failed to migrate ACP retained context columns")?;
+        Self::ensure_legacy_import_pending_column(&mut conn)
+            .context("Failed to migrate ACP legacy import ledger")?;
 
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    fn ensure_legacy_import_pending_column(conn: &mut Connection) -> Result<()> {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('acp_legacy_gateway_imports') WHERE name = 'pending'
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            tx.execute_batch(
+                "ALTER TABLE acp_legacy_gateway_imports ADD COLUMN pending INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Add the `principal_id` owner column on upgrade (RFC 7141 session
@@ -820,8 +848,8 @@ impl AcpSessionStore {
     }
 
     /// Record a session with an optional host-validated interaction surface,
-    /// stamped with its owning principal (RFC 7141). A duplicate ID returns
-    /// [`AcpSessionIdConflict`].
+    /// stamped with its owning principal (RFC 7141). An ID in use or reserved
+    /// for legacy import returns [`AcpSessionIdConflict`].
     pub fn create_session_with_interaction_surface(
         &self,
         session_uuid: &str,
@@ -835,7 +863,11 @@ impl AcpSessionStore {
         let inserted = conn.execute(
             "INSERT INTO acp_sessions
                (session_uuid, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, trim_breadcrumb, principal_id)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, 0, ?6)
+             SELECT ?1, ?2, ?3, ?4, 0, ?5, ?5, 0, ?6
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM acp_legacy_gateway_imports
+                 WHERE legacy_key = 'gw_' || ?1 AND pending = 1
+             )
              ON CONFLICT(session_uuid) DO NOTHING",
             params![
                 session_uuid,
@@ -1391,7 +1423,8 @@ impl AcpSessionStore {
         Self::load_restorable_session(&conn, session_uuid)
     }
 
-    /// `None` means the row belongs to another principal. A missing row is
+    /// `None` means restore is denied because the row belongs to another
+    /// principal or the ID is reserved for legacy import. A missing row is
     /// reported separately so callers can safely decide whether to create it.
     pub fn load_session_for_restore_owned(
         &self,
@@ -1408,7 +1441,17 @@ impl AcpSessionStore {
             )
             .optional()?;
         let result = match owner {
-            None => Some(AcpSessionRestore::Missing),
+            None => {
+                let reserved: bool = tx.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM acp_legacy_gateway_imports
+                        WHERE legacy_key = 'gw_' || ?1 AND pending = 1
+                    )",
+                    [session_uuid],
+                    |row| row.get(0),
+                )?;
+                (!reserved).then_some(AcpSessionRestore::Missing)
+            }
             Some(owner) if owner.as_deref() == expected_owner => {
                 Some(Self::load_restorable_session(&tx, session_uuid)?)
             }
@@ -4543,6 +4586,11 @@ mod tests {
         assert_eq!(store.delete_sessions_by_agent("alpha").unwrap(), 1);
         drop(store);
 
+        // Simulate upgrading a ledger written before it tracked pending imports.
+        Connection::open(dir.path().join("sessions/acp-sessions.db"))
+            .unwrap()
+            .execute_batch("ALTER TABLE acp_legacy_gateway_imports DROP COLUMN pending")
+            .unwrap();
         let reopened = AcpSessionStore::new(dir.path()).unwrap();
         assert_eq!(
             reopened
@@ -4653,73 +4701,78 @@ mod tests {
     }
 
     #[test]
-    fn legacy_gateway_import_rolls_back_session_row_when_transcript_load_fails() {
-        use crate::session_backend::{SessionBackend, SessionMetadata, TimestampedMessage};
-        struct FailingLegacyBackend;
-        impl SessionBackend for FailingLegacyBackend {
-            fn load(&self, _session_id: &str) -> Vec<ChatMessage> {
-                Vec::new()
-            }
-            fn try_load(&self, _session_id: &str) -> std::io::Result<Vec<ChatMessage>> {
-                Err(std::io::Error::other("simulated legacy read failure"))
-            }
-            fn load_with_timestamps(&self, _session_id: &str) -> Vec<TimestampedMessage> {
-                Vec::new()
-            }
-            fn append(&self, _session_id: &str, _message: &ChatMessage) -> std::io::Result<()> {
-                Ok(())
-            }
-            fn remove_last(&self, _session_id: &str) -> std::io::Result<bool> {
-                Ok(false)
-            }
-            fn delete_session(&self, _session_id: &str) -> std::io::Result<bool> {
-                Ok(false)
-            }
-            fn list_sessions(&self) -> Vec<String> {
-                vec!["gw_broken".into()]
-            }
-            fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
-                let now = chrono::Utc::now();
-                vec![SessionMetadata {
-                    key: "gw_broken".into(),
-                    created_at: now,
-                    last_activity: now,
-                    message_count: 1,
-                    name: Some("Broken".into()),
-                    agent_alias: Some("alpha".into()),
-                    channel_id: None,
-                    room_id: None,
-                    sender_id: None,
-                    principal_id: None,
-                }]
-            }
-            fn cleanup_stale(&self, _max_age_hours: u32) -> std::io::Result<usize> {
-                Ok(0)
-            }
-        }
-
+    fn legacy_gateway_import_reserves_an_unreadable_session_until_repaired() {
         let (dir, store) = open_store();
-        let imported = store
-            .import_legacy_gateway_sessions(&FailingLegacyBackend, |alias| {
-                (alias.unwrap_or("alpha").to_owned(), "/workspace".into())
-            })
-            .unwrap();
-        assert_eq!(imported, 0, "an unreadable transcript must be skipped");
-        assert!(
-            store.load_session("broken").unwrap().is_none(),
-            "transaction rollback must leave no partial acp_sessions row"
-        );
-
-        let legacy = crate::session_sqlite::SqliteSessionBackend::new(dir.path()).unwrap();
+        let legacy = crate::session_store::SessionStore::new(dir.path()).unwrap();
+        let id = "a11b1111-1111-4111-8111-111111111111";
+        let transcript = dir.path().join("sessions").join(format!("gw_{id}.jsonl"));
+        std::fs::write(&transcript, "{broken\n").unwrap();
         legacy
-            .append("gw_broken", &ChatMessage::user("readable on retry"))
+            .append("gw_readable", &ChatMessage::user("readable"))
             .unwrap();
+        let resolve = |_: Option<&str>| ("alpha".into(), dir.path().into());
+
         assert_eq!(
             store
-                .import_legacy_gateway_sessions(&legacy, |_| ("alpha".into(), dir.path().into()))
+                .import_legacy_gateway_sessions(&legacy, resolve)
                 .unwrap(),
-            1,
-            "the failed transaction must not mark the legacy key processed"
+            1
+        );
+        assert!(store.load_session("readable").unwrap().is_some());
+        assert!(store.load_session(id).unwrap().is_none());
+        drop(store);
+
+        let reopened = AcpSessionStore::new(dir.path()).unwrap();
+        assert!(
+            reopened
+                .load_session_for_restore_owned(id, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            reopened
+                .load_session_for_restore_owned("genuinely-missing", None)
+                .unwrap(),
+            Some(AcpSessionRestore::Missing)
+        ));
+        assert!(
+            reopened
+                .create_session_with_interaction_surface(
+                    id,
+                    "alpha",
+                    "/workspace",
+                    Some("webchat"),
+                    None
+                )
+                .expect_err("the browser must not be able to claim the pending ID")
+                .is::<AcpSessionIdConflict>()
+        );
+
+        std::fs::write(
+            &transcript,
+            serde_json::to_vec(&ChatMessage::user("recovered legacy history")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .import_legacy_gateway_sessions(&legacy, resolve)
+                .unwrap(),
+            1
+        );
+        let Some(AcpSessionRestore::Restorable(session)) =
+            reopened.load_session_for_restore_owned(id, None).unwrap()
+        else {
+            panic!("the repaired transcript should restore through the original ID");
+        };
+        assert!(matches!(
+            session.messages.as_slice(),
+            [ConversationMessage::Chat(message)] if message.content == "recovered legacy history"
+        ));
+        assert_eq!(
+            reopened
+                .import_legacy_gateway_sessions(&legacy, resolve)
+                .unwrap(),
+            0
         );
     }
 
