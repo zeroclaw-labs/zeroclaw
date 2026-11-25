@@ -4436,13 +4436,18 @@ mod budget_override_tests {
         }
     }
 
-    /// A tracker with $3.00 spent today against a $1.00 daily limit.
+    /// A tracker with $3.00 spent today against a $1.00 daily limit, in
+    /// block mode, where an exceeded call is refused.
     fn over_limit_tracker(tmp: &tempfile::TempDir, allow_override: bool) -> Arc<CostTracker> {
         let tracker = CostTracker::new(
             CostConfig {
                 enabled: true,
                 daily_limit_usd: 1.0,
                 allow_override,
+                enforcement: zeroclaw_config::schema::CostEnforcementConfig {
+                    mode: "block".into(),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             tmp.path(),

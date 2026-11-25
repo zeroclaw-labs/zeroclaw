@@ -340,13 +340,19 @@ impl CostTracker {
     /// per-hop ceiling tightens the shared daily limit reports
     /// `agent_alias: None`, so this re-checks with the period granted and
     /// offers only when that check no longer fails on the same period.
+    /// Under `[cost.enforcement] mode = "warn"` the exceeded call goes
+    /// ahead anyway, so there is no refusal to override and nothing is
+    /// offered; an operator's deny could not stop the call.
     pub fn override_offer(&self) -> Option<OverrideOffer> {
         self.override_offer_at_period(ReportingPeriod::current())
     }
 
     fn override_offer_at_period(&self, at: ReportingPeriod) -> Option<OverrideOffer> {
-        if !self.config.read().allow_override {
-            return None;
+        {
+            let config = self.config.read();
+            if !config.allow_override || config.enforcement.mode == "warn" {
+                return None;
+            }
         }
         let BudgetCheck::Exceeded {
             current_usd,
@@ -1810,6 +1816,7 @@ impl CostStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::CostEnforcementConfig;
     use chrono::{Duration, TimeZone, Utc};
     use tempfile::TempDir;
 
@@ -4048,6 +4055,7 @@ mod tests {
         ));
     }
 
+    /// Over a $1 daily limit in block mode, where an exceeded call is refused.
     fn over_daily_limit(dir: &Path, allow_override: bool) -> CostTracker {
         let tracker = CostTracker::new(
             CostConfig {
@@ -4055,6 +4063,10 @@ mod tests {
                 daily_limit_usd: 1.0,
                 monthly_limit_usd: 500.0,
                 allow_override,
+                enforcement: CostEnforcementConfig {
+                    mode: "block".into(),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             dir,
@@ -4072,6 +4084,33 @@ mod tests {
             ))
             .unwrap();
         tracker
+    }
+
+    /// Warn mode lets an exceeded call proceed, so no override is offered;
+    /// block mode still offers it for the same exceeded daily limit.
+    #[test]
+    fn override_is_not_offered_in_warn_mode() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = over_daily_limit(tmp.path(), true);
+        let set_mode = |mode: &str| {
+            let mut config = tracker.config();
+            config.enforcement.mode = mode.to_string();
+            tracker.update_config(config);
+        };
+
+        set_mode("warn");
+        assert!(tracker.override_offer().is_none());
+
+        set_mode("block");
+        let offer = tracker
+            .override_offer()
+            .expect("block mode offers the override");
+        assert_eq!(offer.period, UsagePeriod::Day);
+        assert_eq!(tracker.grant_offer(&offer), OverrideGrant::Granted);
+        assert!(matches!(
+            tracker.check_budget(0.0).unwrap(),
+            BudgetCheck::Allowed
+        ));
     }
 
     /// A restart must restore enforcement; no grant is written to the workspace.

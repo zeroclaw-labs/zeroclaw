@@ -31884,6 +31884,10 @@ mod tests {
                     enabled: true,
                     daily_limit_usd: 1.0,
                     allow_override: true,
+                    enforcement: zeroclaw_config::schema::CostEnforcementConfig {
+                        mode: "block".into(),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
                 &tmp.path().join("cost"),
