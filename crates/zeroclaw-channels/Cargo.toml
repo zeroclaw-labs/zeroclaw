@@ -105,6 +105,7 @@ rustls-pki-types = { version = "1.14.0", optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 sha2 = "0.10"
+tempfile = "3.26"
 tokio = { version = "1.50", default-features = false, features = [
   "fs",
   "io-util",
@@ -206,6 +207,7 @@ channels-full = [
   "channel-qq",
   "channel-reddit",
   "channel-signal",
+  "channel-simplex",
   "channel-slack",
   "channel-twitch",
   "channel-twitter",
@@ -253,6 +255,7 @@ whatsapp-web = [
 # Channels with no optional deps (cfg gate only)
 channel-discord = ["ws-transport"]
 channel-slack = ["ws-transport"]
+channel-simplex = ["ws-transport"]
 channel-signal = ["dep:mime_guess"]
 channel-mattermost = ["ws-transport"]
 channel-irc = ["tls-client"]
@@ -317,7 +320,6 @@ matrix-sdk-base = { version = "0.19", default-features = false, features = ["e2e
 matrix-sdk-test = "0.19"
 rcgen = "0.13"
 rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
-tempfile = "3.26"
 toml = "1.0"
 wiremock = "0.6"
 # `test-util` is what `#[tokio::test(start_paused = true)]` needs, so a

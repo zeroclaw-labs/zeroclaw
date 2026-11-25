@@ -2026,6 +2026,7 @@ impl WhatsAppWebChannel {
                 conversation_scope,
                 references: Vec::new(),
                 voice_origin: false,
+                control: None,
             })
             .await
         {
@@ -5109,6 +5110,7 @@ fn vote_message(
         references: Vec::new(),
         // A vote is not spoken input.
         voice_origin: false,
+        control: None,
     }
 }
 

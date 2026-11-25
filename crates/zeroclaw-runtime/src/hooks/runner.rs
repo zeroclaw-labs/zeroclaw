@@ -45,7 +45,9 @@ impl HookRunner {
         ToolCallHookContext::uncorrelated(format!("legacy:{sequence}"))
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    /// Whether any handlers are installed. An empty runner cannot rewrite or
+    /// cancel outbound content and need not defer speculative delivery.
+    pub fn is_empty(&self) -> bool {
         self.handlers.is_empty()
     }
 

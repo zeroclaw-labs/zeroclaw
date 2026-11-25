@@ -427,6 +427,13 @@ channel-telegram-cmd-stop-desc = 実行中のタスクをキャンセル
 channel-telegram-cmd-model-desc = 現在のモデルを表示または切り替え
 channel-telegram-cmd-models-desc = 利用可能なモデルプロバイダーを一覧表示、またはプロバイダーを切り替え
 channel-telegram-cmd-config-desc = 現在の設定を表示
+channel-simplex-cmd-new-label = 新しいセッション
+channel-simplex-cmd-clear-label = セッションを消去
+channel-simplex-cmd-stop-label = タスクを停止
+channel-simplex-cmd-thinking-label = 思考
+channel-simplex-cmd-model-label = モデル
+channel-simplex-cmd-models-label = プロバイダー
+channel-simplex-cmd-config-label = 設定
 onboard-openai-auth-note =
     OpenAI認証:
     • APIキー — platform.openai.com 経由の標準APIアクセス (sk-...)

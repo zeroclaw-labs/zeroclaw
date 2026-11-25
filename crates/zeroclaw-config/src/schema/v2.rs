@@ -75,6 +75,7 @@ pub const V3_CHANNEL_TYPES: &[&str] = &[
     "imessage",
     "matrix",
     "signal",
+    "simplex",
     "whatsapp",
     "linq",
     "nextcloud_talk",
