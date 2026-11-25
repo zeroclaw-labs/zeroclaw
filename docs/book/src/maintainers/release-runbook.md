@@ -599,8 +599,8 @@ recreate `gh-pages` or change the supported-version window.
 ### What happens automatically
 
 - The `deploy-docs` job dispatches a build that lands in `/vX.Y.Z/`.
-- "Stable" is a pointer to the release's existing docs directory. `bump-version.sh` writes `docs/book/stable-version.txt`; only a master run publishes that pointer to `gh-pages` and refreshes the root redirect and version selector. A normal master deploy builds development docs and shared assets as well. There is no duplicate `/stable/` tree.
-- **Ordering matters:** the version-bump master deploy usually precedes the release tag deploy. It retains the previous live pointer until `/vX.Y.Z/` exists. The release's `deploy-docs` job only dispatches the tag build: a green dispatch job does not prove the docs build finished. Once that run succeeds, use the promotion mode below to publish the stable pointer without another full master build.
+- "Stable" is a pointer to the release's existing docs directory. `bump-version.sh` writes `docs/book/stable-version.txt`; only a master run publishes that pointer to `gh-pages` and refreshes the root redirect and version selector. A normal master deploy builds development docs and shared assets as well. Every build deploy also writes `/stable/`, a copy of the pointer's release directory: canonical, language-alternate and sitemap URLs name `/stable/`, so they stay the same when a new release becomes Stable.
+- **Ordering matters:** the version-bump master deploy usually precedes the release tag deploy. It retains the previous live pointer until `/vX.Y.Z/` exists. The release's `deploy-docs` job only dispatches the tag build: a green dispatch job does not prove the docs build finished. Once that run succeeds, use the promotion mode below to publish the stable pointer, then run the master build that promotion requires.
 - `gh-pages` is ephemeral: publication replaces it with a single orphan commit. Normal builds enforce retention via `DOCS_KEEP_VERSIONS` (master, the stable pointer target, and the newest N final releases). Promotion preserves all existing version directories.
 - The `_shared/` directory (containing UI CSS, JS, and favicons) is updated from the build so the theme cascades to all deployed versions.
 - Translated locales (`es`, `fr`, `ja`, `zh-CN`) render from the `docs/book/po` submodule, which the deploy resolves via `submodules: recursive` at whatever commit the deployed ref pins. That pin is set during the version bump; see [Step 2](#step-2-bump-and-merge-the-version-pr) for the refresh, tag, and pin procedure. English needs no submodule.
@@ -611,10 +611,15 @@ Dispatch **Deploy mdBook docs to Pages** from branch **master**, set **mode** to
 `promote-stable`, and set **tag** to the exact final tag, for example `v0.8.5`.
 The default `build` mode retains the normal build behavior.
 
-Promotion updates `stable-version.txt`, `index.html`, `versions.json`, and the
-root `llms.txt` / `llms-full.txt` pair at the site root. That pair mirrors the
-promoted release's English copy, and is withdrawn when the release doesn't carry
-both files, so the fixed LLM URLs always describe the release `/` redirects to.
+Promotion updates `stable-version.txt`, `index.html`, `versions.json`,
+`sitemap.xml`, and the root `llms.txt` / `llms-full.txt` pair at the site
+root, and replaces `stable/` with a copy of the promoted release's
+directory. The llms pair mirrors the promoted release's English copy, and is
+withdrawn when the release doesn't carry both files, so the fixed LLM URLs
+always describe the release `/` redirects to.
+In the root `404.html`, promotion rewrites the two lines that set the
+redirect's `target` and `locales`, so links to pruned releases reach the
+promoted release's languages.
 It installs no Rust or mdBook tools and preserves every locale, the API
 reference, shared chrome, and retention state. The workflow's existing
 `gh-pages` concurrency group serializes both modes; promotion also uses an exact
@@ -632,10 +637,19 @@ fresh run. Repeating a successful promotion is safe.
 
 Deployments made before source receipts were introduced need one normal `build`
 dispatch for that release tag before promotion can verify their source. Do not
-create a receipt by hand. Promotion does not rewrite page-level canonical or
-language-alternate tags, or `sitemap.xml`; those SEO fields refresh on the next
-normal docs deploy. If an immediate SEO refresh is required, use a normal master
-build. A downgrade requires a separately reviewed manual rollback; this mode has
+create a receipt by hand.
+
+**After a promotion, run a normal master build:** dispatch **Deploy mdBook docs
+to Pages** from branch **master** with **mode** `build` and **tag** `master`.
+This is a required step. Promotion copies the release's pages to `stable/` with
+the SEO tags they were deployed with, while the release was not yet Stable, and
+it does not rerun `gen-seo`. Until the master build runs, pages new in the
+promoted release, and every page of a locale it adds, are served under
+`/stable/` with `noindex` and a canonical to `/vX.Y.Z/`, and no stable page
+carries language-alternate (`hreflang`) links. Promotion does rewrite
+`sitemap.xml` for the promoted release.
+
+A downgrade requires a separately reviewed manual rollback; this mode has
 no rollback override. Reverting the workflow change removes the manual mode but
 does not change the already published pointer.
 

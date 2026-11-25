@@ -272,10 +272,10 @@ fn scalar_validation_status_key(kind: PropKind, value: &str) -> Option<&'static 
             .parse::<i64>()
             .err()
             .map(|_| "zc-config-status-invalid-integer"),
-        PropKind::Float => value
-            .parse::<f64>()
-            .err()
-            .map(|_| "zc-config-status-invalid-float"),
+        // The daemon refuses `inf`, `NaN` and out-of-range text such as
+        // `1e999`, which `str::parse` reads as non-finite floats.
+        PropKind::Float => (!value.parse::<f64>().is_ok_and(f64::is_finite))
+            .then_some("zc-config-status-invalid-float"),
         _ => None,
     }
 }
@@ -502,6 +502,9 @@ pub(crate) struct App {
     select_cursor: usize,
     select_items: Vec<String>,
     status_msg: Option<String>,
+    /// The daemon's reason for refusing this principal its config sections
+    /// (it lacks `config:read`), shown in place of the section list.
+    refused: Option<String>,
     application_feedback: crate::config_application::ApplicationFeedback,
     // Filter state: None = inactive, Some(buf) = active filter
     filter: Option<String>,
@@ -582,6 +585,7 @@ impl App {
             select_cursor: 0,
             select_items: Vec::new(),
             status_msg: None,
+            refused: None,
             application_feedback: crate::config_application::ApplicationFeedback::new(),
             filter: None,
             filter_cursor: 0,
@@ -626,7 +630,20 @@ impl App {
 
     /// Load initial data from the daemon. Call once before draw/handle_key.
     pub(crate) async fn init(&mut self) -> Result<()> {
-        self.sections = self.rpc.config_sections().await?;
+        self.sections = match self.rpc.config_sections().await {
+            Ok(sections) => sections,
+            Err(error) => {
+                // A principal without `config:read` still gets the rest of
+                // the TUI; this pane says why it is empty.
+                return match crate::client::forbidden_reason(&error).map(str::to_string) {
+                    Some(reason) => {
+                        self.refused = Some(reason);
+                        Ok(())
+                    }
+                    None => Err(error),
+                };
+            }
+        };
         for section in &mut self.sections {
             localize_section_metadata(section);
         }
@@ -4836,6 +4853,16 @@ impl App {
         }
         let list_area = rows[1];
 
+        if let Some(reason) = &self.refused {
+            let notice = crate::i18n::t_args("zc-config-refused", &[("reason", reason)]);
+            frame.render_widget(
+                Paragraph::new(Span::styled(notice, theme::warn_style()))
+                    .wrap(ratatui::widgets::Wrap { trim: true }),
+                list_area,
+            );
+            return;
+        }
+
         let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
         let visible = self.filtered_section_indices(&labels);
 
@@ -6611,6 +6638,29 @@ mod tests {
         assert_eq!(scalar_validation_status_key(PropKind::Float, "0.7"), None);
     }
 
+    /// The daemon refuses text that `str::parse` reads as infinity or NaN for
+    /// a float field, so the edit is refused here before it is sent. Finite
+    /// edge values still pass.
+    #[test]
+    fn config_scalar_validation_refuses_non_finite_float() {
+        for text in [
+            "inf", "+inf", "-inf", "Infinity", "infinity", "NaN", "nan", "1e999", "-1e999",
+        ] {
+            assert_eq!(
+                scalar_validation_status_key(PropKind::Float, text),
+                Some("zc-config-status-invalid-float"),
+                "{text}"
+            );
+        }
+        for text in ["-0.0", "5e-324", "1.7976931348623157e308", "5"] {
+            assert_eq!(
+                scalar_validation_status_key(PropKind::Float, text),
+                None,
+                "{text}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn scalar_field_edit_supports_cursor_insertion_and_word_navigation() {
         let mut manager = test_manager();
@@ -6791,6 +6841,67 @@ mod tests {
             entry_with_cost("gamma", ""),
         ];
         (mgr, mode, seen)
+    }
+
+    /// A config manager, as built at startup, on a fake daemon that answers
+    /// every request with `answer` and records the method of each.
+    fn manager_answered_with(
+        answer: crate::jsonrpc::JsonRpcError,
+    ) -> (App, Arc<std::sync::Mutex<Vec<String>>>) {
+        use crate::jsonrpc::RpcOutbound;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (daemon, daemon_seen) = (outbound.clone(), seen.clone());
+        tokio::spawn(async move {
+            while let Some(frame) = rx.recv().await {
+                let request: serde_json::Value = serde_json::from_str(&frame).expect("a request");
+                daemon_seen
+                    .lock()
+                    .unwrap()
+                    .push(request["method"].as_str().unwrap_or_default().to_string());
+                let id = request["id"].as_str().unwrap_or_default().to_string();
+                daemon.dispatch_response(&id, None, Some(answer.clone()));
+            }
+        });
+        let mgr = App::new(
+            Arc::new(RpcClient::with_rpc(outbound)),
+            std::path::Path::new("/tmp"),
+        );
+        (mgr, seen)
+    }
+
+    /// An account without `config:read` still opens the TUI: the pane keeps
+    /// the daemon's reason, and nothing more is asked of the daemon.
+    #[tokio::test]
+    async fn refused_config_sections_leave_the_pane_open_with_the_reason() {
+        let reason = "Principal is not granted config:read (required by config/sections)";
+        let (mut mgr, seen) = manager_answered_with(crate::jsonrpc::JsonRpcError {
+            code: crate::jsonrpc::error_codes::FORBIDDEN,
+            message: reason.to_string(),
+            data: None,
+        });
+
+        mgr.init()
+            .await
+            .expect("refused config sections are not a startup failure");
+
+        assert_eq!(mgr.refused.as_deref(), Some(reason));
+        assert!(mgr.sections.is_empty());
+        assert_eq!(*seen.lock().unwrap(), ["config/sections"]);
+    }
+
+    /// Any other failure still fails startup, as before.
+    #[tokio::test]
+    async fn failed_config_sections_still_fail_startup() {
+        let (mut mgr, _) = manager_answered_with(crate::jsonrpc::JsonRpcError {
+            code: crate::jsonrpc::error_codes::INTERNAL_ERROR,
+            message: "boom".to_string(),
+            data: None,
+        });
+
+        assert!(mgr.init().await.is_err());
+        assert!(mgr.refused.is_none());
     }
 
     /// The real handlers take the app's `Term`. A fixed viewport never

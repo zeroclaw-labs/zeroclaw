@@ -1241,7 +1241,10 @@ mod tests {
     }
 
     fn assert_common_dev_template_contract(cfg: &zeroclaw_config::schema::Config) {
-        assert_eq!(cfg.schema_version, 3);
+        assert_eq!(
+            cfg.schema_version,
+            zeroclaw_config::migration::CURRENT_SCHEMA_VERSION
+        );
 
         let provider = cfg
             .providers
@@ -1372,7 +1375,7 @@ mod tests {
         let mut cfg = zeroclaw_config::schema::Config::default();
         let cases = [
             ("providers.models", "atomic_chat"),
-            ("providers.models", "gemini_cli"),
+            ("providers.models", "grok_cli"),
             ("providers.transcription", "local_whisper"),
         ];
 
@@ -1387,8 +1390,8 @@ mod tests {
             "created Atomic Chat alias should land in the atomic_chat provider map",
         );
         assert!(
-            cfg.providers.models.gemini_cli.contains_key("default"),
-            "created Gemini CLI alias should land in the gemini_cli provider map",
+            cfg.providers.models.grok_cli.contains_key("default"),
+            "created Grok CLI alias should land in the grok_cli provider map",
         );
         assert!(
             cfg.providers
@@ -1620,7 +1623,6 @@ mod tests {
                 8, 30, 600,
             )),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,

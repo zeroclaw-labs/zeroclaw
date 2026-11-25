@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::sync::{
     Arc,
@@ -485,6 +485,19 @@ enum SessionError {
     ResyncFailed,
 }
 
+/// The fallback outcome line, naming the question it settles. A blank
+/// question leaves the outcome alone.
+fn elicitation_outcome_note(question: &str, outcome: &str) -> String {
+    let question = question.trim();
+    if question.is_empty() {
+        return outcome.to_string();
+    }
+    crate::i18n::t_args(
+        "zc-chat-elicitation-outcome-note",
+        &[("outcome", outcome), ("question", question)],
+    )
+}
+
 /// Classify a failed turn's daemon error text for `SessionError`. Single
 /// source of the daemon's session-loss sentinel string (`session_not_found`,
 /// see `handle_session_prompt`): the session must be re-attached before the
@@ -528,6 +541,10 @@ pub(crate) struct Chat {
     session_resync_tx: mpsc::Sender<SessionResyncResult>,
     session_resync_rx: mpsc::Receiver<SessionResyncResult>,
     session_resync_in_flight: HashMap<String, ResyncInFlight>,
+    /// One explicit read, independent of recovery and its dispatch gate.
+    session_refresh_tx: mpsc::Sender<Result<SessionResyncSnapshot, SessionRefreshError>>,
+    session_refresh_rx: mpsc::Receiver<Result<SessionResyncSnapshot, SessionRefreshError>>,
+    session_refresh: Option<SessionRefreshAttempt>,
     /// Request-form `session/prompt` completions. Terminal notifications remain
     /// transcript authority; this channel only prevents a lost terminal frame
     /// from leaving the matching local turn stuck in flight.
@@ -628,6 +645,17 @@ struct SessionReattachResult {
 struct SessionResyncResult {
     session_id: String,
     result: Result<SessionResyncSnapshot, String>,
+}
+
+struct SessionRefreshAttempt {
+    session_id: String,
+    turn_generation: u64,
+    invalidated: bool,
+}
+
+enum SessionRefreshError {
+    Busy,
+    Failed(String),
 }
 
 /// How a resync reconciles with the daemon before reloading the transcript.
@@ -887,6 +915,7 @@ impl Chat {
         let (session_reattach_tx, session_reattach_rx) =
             mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
         let (session_resync_tx, session_resync_rx) = mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
+        let (session_refresh_tx, session_refresh_rx) = mpsc::channel(1);
         let (prompt_completion_tx, prompt_completion_rx) =
             mpsc::channel(MAX_TRACKED_SESSIONS_PER_PANE);
         Self {
@@ -904,6 +933,9 @@ impl Chat {
             session_resync_tx,
             session_resync_rx,
             session_resync_in_flight: HashMap::new(),
+            session_refresh_tx,
+            session_refresh_rx,
+            session_refresh: None,
             prompt_completion_tx,
             prompt_completion_rx,
             phase: ChatPhase::PickAgent {
@@ -1254,6 +1286,9 @@ impl Chat {
             return false;
         };
         let incoming = self.background.remove(idx);
+        if let Some(attempt) = self.session_refresh.as_mut() {
+            attempt.invalidated = true;
+        }
         // Swap with the focused session; a non-Active phase (picker, error)
         // is simply replaced — clicking a session row leaves those flows.
         match std::mem::replace(&mut self.phase, ChatPhase::Active(Box::new(incoming))) {
@@ -2747,6 +2782,11 @@ impl Chat {
                         // their stream too, so transcripts and status dots
                         // stay current while unfocused.
                         let sid = update.session_id().to_string();
+                        if let Some(attempt) = self.session_refresh.as_mut()
+                            && attempt.session_id == sid
+                        {
+                            attempt.invalidated = true;
+                        }
                         let mut terminal_reconcile = false;
                         if !self.session_resync_in_flight.contains_key(&sid)
                             && let Some(state) = self.state_for_session_mut(&sid)
@@ -2944,6 +2984,11 @@ impl Chat {
     }
 
     fn begin_session_resync(&mut self, session_id: String, mode: SessionResyncMode) {
+        if let Some(attempt) = self.session_refresh.as_mut()
+            && attempt.session_id == session_id
+        {
+            attempt.invalidated = true;
+        }
         // Ownership evidence exists only for `Reattach`, and only while the
         // pane's own prompt is still outstanding: read it before the prepare
         // below mutates the state.
@@ -2971,7 +3016,6 @@ impl Chat {
         let tx = self.session_resync_tx.clone();
         if let Some(state) = self.state_for_session_mut(&session_id) {
             let approval = state.pending_approval.take();
-            let elicitation = state.pending_elicitation.take();
             match mode {
                 // Cancel is on its way to the daemon: the visible turn is
                 // abandoned now, before the terminal confirmation.
@@ -2989,10 +3033,8 @@ impl Chat {
             if let Some(approval) = approval {
                 Self::reject_stale_approval(&rpc, session_id.clone(), approval.request_id);
             }
-            if let Some(elicitation) = elicitation {
-                Self::answer_cancel(&rpc, elicitation.request_id);
-            }
         }
+        self.answer_withdrawn_elicitations();
 
         tokio::spawn(async move {
             let result = Self::confirm_and_reload_with_retry(&rpc, &session_id, mode).await;
@@ -3277,6 +3319,128 @@ impl Chat {
         }
     }
 
+    fn begin_session_refresh(&mut self) {
+        if self.session_refresh.is_some() {
+            return;
+        }
+        let ChatPhase::Active(state) = &mut self.phase else {
+            return;
+        };
+        if state.last_error == Some(SessionError::ResyncFailed) {
+            state.set_info_notice(crate::i18n::t("zc-chat-refresh-recovery-required"));
+            return;
+        }
+        if state.refresh_is_busy()
+            || self
+                .session_resync_in_flight
+                .contains_key(&state.session_id)
+            || self.session_reattach_in_flight.contains(&state.session_id)
+        {
+            state.set_info_notice(crate::i18n::t("zc-chat-refresh-busy"));
+            return;
+        }
+        let session_id = state.session_id.clone();
+        self.session_refresh = Some(SessionRefreshAttempt {
+            session_id: session_id.clone(),
+            turn_generation: state.turn_generation,
+            invalidated: false,
+        });
+        state.set_info_notice(crate::i18n::t("zc-chat-refresh-started"));
+        let rpc = self.rpc.clone();
+        let tx = self.session_refresh_tx.clone();
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(Duration::from_secs(20), async {
+                let before = rpc
+                    .session_state(&session_id)
+                    .await
+                    .map_err(|e| SessionRefreshError::Failed(e.to_string()))?;
+                if before.state != "idle" {
+                    return Err(SessionRefreshError::Busy);
+                }
+                let messages = rpc
+                    .session_messages(&session_id)
+                    .await
+                    .map_err(|e| SessionRefreshError::Failed(e.to_string()))?;
+                if messages.start != 0 || messages.total != messages.messages.len() {
+                    return Err(SessionRefreshError::Failed(crate::i18n::t(
+                        "zc-chat-refresh-incomplete",
+                    )));
+                }
+                let after = rpc
+                    .session_state(&session_id)
+                    .await
+                    .map_err(|e| SessionRefreshError::Failed(e.to_string()))?;
+                if after.state != "idle" {
+                    return Err(SessionRefreshError::Busy);
+                }
+                Ok(SessionResyncSnapshot {
+                    messages: messages.messages,
+                    message_count: messages.total,
+                    plan: after.plan,
+                    turn_running: false,
+                })
+            })
+            .await
+            .unwrap_or_else(|_| {
+                Err(SessionRefreshError::Failed(crate::i18n::t(
+                    "zc-chat-refresh-timeout",
+                )))
+            });
+            let _ = tx.send(result).await;
+        });
+    }
+
+    fn drain_session_refresh_results(&mut self) {
+        while let Ok(result) = self.session_refresh_rx.try_recv() {
+            let Some(attempt) = self.session_refresh.take() else {
+                continue;
+            };
+            let ChatPhase::Active(state) = &mut self.phase else {
+                continue;
+            };
+            if state.session_id != attempt.session_id {
+                continue;
+            }
+            if attempt.invalidated
+                || state.turn_generation != attempt.turn_generation
+                || state.refresh_is_busy()
+            {
+                state.set_info_notice(crate::i18n::t("zc-chat-refresh-stale"));
+                continue;
+            }
+            let notice = match result {
+                Ok(snapshot) => match state
+                    .refresh_history(snapshot.messages, self.pane_kind == PaneKind::Acp)
+                {
+                    Ok(()) => {
+                        state.message_count = snapshot.message_count;
+                        if let Some(plan) = snapshot.plan {
+                            let visible = state.todo_tracker.is_visible();
+                            state.todo_tracker.set_plan(plan);
+                            // Refresh updates the plan without changing the reading layout.
+                            // Installing it consumes the one-time auto-pop as usual.
+                            if state.todo_tracker.is_visible() != visible {
+                                state.todo_tracker.toggle();
+                            }
+                        }
+                        crate::widgets::InfoMessage::note(crate::i18n::t("zc-chat-refreshed"))
+                    }
+                    Err(error) => crate::widgets::InfoMessage::error(crate::i18n::t_args(
+                        "zc-chat-refresh-failed",
+                        &[("error", &error)],
+                    )),
+                },
+                Err(SessionRefreshError::Busy) => {
+                    crate::widgets::InfoMessage::note(crate::i18n::t("zc-chat-refresh-busy"))
+                }
+                Err(SessionRefreshError::Failed(error)) => crate::widgets::InfoMessage::error(
+                    crate::i18n::t_args("zc-chat-refresh-failed", &[("error", &error)]),
+                ),
+            };
+            state.info_message = Some(notice);
+        }
+    }
+
     /// Answer an inbound request with `{"action":"cancel"}`, which the daemon's
     /// `RpcApprovalChannel::request_choice` collapses to `Ok(None)` so the
     /// calling tool takes its non-channel fallback path.
@@ -3455,15 +3619,15 @@ impl Chat {
                 let ChatPhase::Active(ref mut state) = self.phase else {
                     return;
                 };
-                if !state.copy_text_and_clear_selection(&target.text) {
+                let Some(outcome) = state.copy_text_and_clear_selection(&target.text) else {
                     return;
-                }
+                };
                 match target.kind {
                     CopyHitKind::Code => {
-                        state.set_copy_feedback(CopyFeedbackTarget::Code(target.group));
+                        state.set_copy_feedback(CopyFeedbackTarget::Code(target.group), outcome);
                     }
                     CopyHitKind::Message | CopyHitKind::Transcript => {
-                        state.set_overlay_copy_feedback(target.rect);
+                        state.set_overlay_copy_feedback(target.rect, outcome);
                     }
                 }
             }
@@ -3479,9 +3643,8 @@ impl Chat {
                 }
             }
             ChatContextMenuRequest::CopyUrl(url) => {
-                crate::mouse::copy_osc52(&url);
                 if let ChatPhase::Active(ref mut state) = self.phase {
-                    state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
+                    let _ = state.copy_text(&url);
                 }
             }
             ChatContextMenuRequest::Queue { id, action } => match action {
@@ -3503,8 +3666,7 @@ impl Chat {
                     let Some(text) = state.queued_text(id).filter(|text| !text.is_empty()) else {
                         return;
                     };
-                    crate::mouse::copy_osc52(&text);
-                    state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
+                    let _ = state.copy_text(&text);
                 }
                 ChatContextMenuAction::AddToChat => {}
                 ChatContextMenuAction::Edit => {
@@ -3840,11 +4002,47 @@ impl Chat {
         self.drain_notifications();
         self.drain_session_resync_results();
         self.drain_prompt_completions();
+        self.drain_session_refresh_results();
         self.settle_stuck_cancel();
         self.drain_git_branch_results();
         self.drain_model_fetch_results();
         self.drain_session_reattach_results();
+        self.answer_withdrawn_elicitations();
         self.maybe_refresh_git_branch();
+    }
+
+    /// Send the `cancel` every withdrawn elicitation still owes the daemon,
+    /// and note each one in its transcript. Runs after the resync drain, so
+    /// a note for a prompt dropped by a reload lands after the reloaded
+    /// history rather than being wiped by it.
+    fn answer_withdrawn_elicitations(&mut self) {
+        let rpc = self.rpc.clone();
+        let resyncs = &self.session_resync_in_flight;
+        let answer = |state: &mut ChatState| {
+            for mut withdrawn in state.take_withdrawn_elicitations() {
+                if let Some(request_id) = withdrawn.request_id.take() {
+                    Self::answer_cancel(&rpc, request_id);
+                }
+                if withdrawn.note {
+                    if resyncs.contains_key(&state.session_id) {
+                        // Reply immediately, but retain the note until the reload
+                        // can no longer replace the transcript containing it.
+                        state.withdrawn_elicitations.push(withdrawn);
+                        continue;
+                    }
+                    state.record_elicitation_outcome(
+                        &withdrawn.question,
+                        crate::i18n::t("zc-chat-elicitation-withdrawn"),
+                    );
+                }
+            }
+        };
+        if let ChatPhase::Active(state) = &mut self.phase {
+            answer(state);
+        }
+        for state in self.background.iter_mut() {
+            answer(state);
+        }
     }
 
     /// Whether live transport state is waiting for `tick_transport_events`.
@@ -3858,6 +4056,7 @@ impl Chat {
             || !self.prompt_completion_rx.is_empty()
             || !self.session_resync_rx.is_empty()
             || !self.session_reattach_rx.is_empty()
+            || !self.session_refresh_rx.is_empty()
     }
 
     #[cfg(test)]
@@ -4247,12 +4446,20 @@ impl Chat {
                     // Build the response without holding the modal borrow,
                     // then answer the daemon. For an invalid multi-select
                     // (bounds unmet) keep the modal open.
-                    let payload = state
-                        .pending_elicitation
-                        .as_ref()
-                        .and_then(|e| e.accept_content().map(|c| (e.request_id.clone(), c)));
-                    if let Some((id, content)) = payload {
-                        state.pending_elicitation = None;
+                    let payload = state.pending_elicitation.as_ref().and_then(|e| {
+                        e.accept_content()
+                            .map(|c| (e.request_id.clone(), c, e.answer_summary()))
+                    });
+                    if let Some((id, content, answer)) = payload
+                        && let Some(e) = state.pending_elicitation.take()
+                    {
+                        state.record_elicitation_outcome(
+                            &e.message,
+                            crate::i18n::t_args(
+                                "zc-chat-elicitation-answered",
+                                &[("answer", &answer)],
+                            ),
+                        );
                         state.mark_dirty_full();
                         self.rpc.respond_to_inbound_request(
                             id,
@@ -4267,6 +4474,10 @@ impl Chat {
                 }
                 Some(ModalAction::Cancel) => {
                     if let Some(e) = state.pending_elicitation.take() {
+                        state.record_elicitation_outcome(
+                            &e.message,
+                            crate::i18n::t("zc-chat-elicitation-cancelled"),
+                        );
                         state.mark_dirty_full();
                         let id = e.request_id;
                         self.rpc.respond_to_inbound_request(
@@ -4341,10 +4552,29 @@ impl Chat {
             return false;
         }
 
+        // Refresh preserves transcript selection, but yields to modal overlays,
+        // ordinary typing, and the focused composer's live input bindings.
+        let refresh_yields_to_composer = state.composer_owns_text_input()
+            && (crate::keymap::InputBarAction::from_chord(&key).is_some()
+                || !crate::keymap::action_bypasses_text_input(
+                    crate::keymap::ChatTabAction::RefreshSession,
+                    &key,
+                ));
+        if crate::keymap::ChatTabAction::from_chord(&key)
+            == Some(crate::keymap::ChatTabAction::RefreshSession)
+            && !refresh_yields_to_composer
+        {
+            self.begin_session_refresh();
+            return false;
+        }
+
         // The focused composer owns its editing chords before queue shortcuts
         // or transcript copy. Modals and browse mode retain first refusal.
         if state.composer_owns_text_input() && state.input_bar.claims_edit_key(&key) {
-            state.input_bar.handle_key(key);
+            if let InputBarAction::StatusMessage(message) = state.input_bar.handle_key(key) {
+                let cleanup_notice = state.input_bar.take_cleanup_report().notice();
+                state.set_info_notice(append_cleanup_notice(message, cleanup_notice));
+            }
             return false;
         }
 
@@ -4452,6 +4682,7 @@ impl Chat {
         let chat_action = ChatTabAction::from_chord(&key);
         let chat_action_bypasses_text_input = chat_action.is_some_and(|action| {
             !matches!(action, ChatTabAction::ApprovalApprove)
+                && !(action == ChatTabAction::RefreshSession && refresh_yields_to_composer)
                 && crate::keymap::action_bypasses_text_input(action, &key)
         });
 
@@ -5649,12 +5880,16 @@ impl Chat {
                                     ChatContextMenuRequest::AddToChat(region),
                                 )
                                 .await;
-                            } else if state.copy_text_and_clear_selection(&region.text) {
+                            } else if let Some(outcome) =
+                                state.copy_text_and_clear_selection(&region.text)
+                            {
                                 match region.kind {
-                                    CopyHitKind::Code => state
-                                        .set_copy_feedback(CopyFeedbackTarget::Code(region.group)),
+                                    CopyHitKind::Code => state.set_copy_feedback(
+                                        CopyFeedbackTarget::Code(region.group),
+                                        outcome,
+                                    ),
                                     CopyHitKind::Transcript => {
-                                        state.set_overlay_copy_feedback(region.rect);
+                                        state.set_overlay_copy_feedback(region.rect, outcome);
                                     }
                                     CopyHitKind::Message => {}
                                 }
@@ -5722,16 +5957,19 @@ impl Chat {
                         .find(|r| mouse::in_rect(col, row, r.rect))
                         .cloned()
                     {
-                        if state.copy_text_and_clear_selection(&region.text) {
+                        if let Some(outcome) = state.copy_text_and_clear_selection(&region.text) {
                             match region.kind {
                                 CopyHitKind::Code => {
-                                    state.set_copy_feedback(CopyFeedbackTarget::Code(region.group));
+                                    state.set_copy_feedback(
+                                        CopyFeedbackTarget::Code(region.group),
+                                        outcome,
+                                    );
                                 }
                                 CopyHitKind::Message => {
-                                    state.set_overlay_copy_feedback(region.rect);
+                                    state.set_overlay_copy_feedback(region.rect, outcome);
                                 }
                                 CopyHitKind::Transcript => {
-                                    state.set_overlay_copy_feedback(region.rect);
+                                    state.set_overlay_copy_feedback(region.rect, outcome);
                                 }
                             }
                         }
@@ -5934,13 +6172,24 @@ impl Chat {
 
     /// Copy is local even when normal pane dispatch is disabled after a
     /// disconnect. Do not call the general handler: other keys can send RPCs.
-    pub(crate) fn copy_composer_selection(&self, key: &KeyEvent) -> bool {
-        matches!(&self.phase, ChatPhase::Active(state)
-            if state.composer_owns_text_input()
-                && state.input_bar.has_selection()
-                && crate::keymap::InputBarAction::from_chord(key)
-                    == Some(crate::keymap::InputBarAction::CopySelection)
-                && state.input_bar.copy_selection())
+    pub(crate) fn copy_composer_selection(&mut self, key: &KeyEvent) -> bool {
+        let ChatPhase::Active(state) = &mut self.phase else {
+            return false;
+        };
+        if !state.composer_owns_text_input()
+            || crate::keymap::InputBarAction::from_chord(key)
+                != Some(crate::keymap::InputBarAction::CopySelection)
+        {
+            return false;
+        }
+        let Some(result) = state.input_bar.copy_selection() else {
+            return false;
+        };
+        state.set_info_notice(match result {
+            Ok(outcome) => outcome.notice(),
+            Err(error) => crate::clipboard::copy_failure_notice(&error),
+        });
+        true
     }
 
     pub(crate) fn wants_quit_chord(&self, key: &KeyEvent) -> bool {
@@ -6249,6 +6498,10 @@ impl crate::widgets::HelpContext for Chat {
                     E::key(
                         chord_label(ChatTabAction::SwitchSession),
                         crate::i18n::t("zc-chat-help-switch-session"),
+                    ),
+                    E::key(
+                        chord_label(ChatTabAction::RefreshSession),
+                        crate::i18n::t("zc-chat-help-refresh-session"),
                     ),
                     E::spacer(),
                     E::key(
@@ -7318,6 +7571,105 @@ fn render_tool_entry(
                 }
             }
         }
+        "ask_user" | "poll" => {
+            // The card is the durable record of a question (the daemon
+            // persists the tool call), so it leads with the question and
+            // lists the choices, in every disclosure. The generic preview
+            // showed the first bytes of key-sorted JSON, which put `channel`
+            // and `choices` ahead of the question and cut it off.
+            let parsed = serde_json::from_str::<serde_json::Value>(input_json).ok();
+            let question = parsed
+                .as_ref()
+                .and_then(|input| input.get("question"))
+                .and_then(serde_json::Value::as_str);
+            if let (Some(input), Some(question)) = (parsed.as_ref(), question) {
+                let (question, limited) = terminal_safe_tool_text_limited(
+                    question,
+                    TOOL_EXPANDED_MAX_BYTES,
+                    TOOL_EXPANDED_MAX_LINES,
+                );
+                display_limited |= limited;
+                push_text(lines, &crate::i18n::t("zc-chat-tool-question"), &question);
+                let choices = input
+                    .get(if name == "poll" { "options" } else { "choices" })
+                    .and_then(serde_json::Value::as_array);
+                let choices = choices.map(Vec::as_slice).unwrap_or_default();
+                let count = choices.len();
+                let full = matches!(disclosure, ToolDisclosure::Full);
+                let limit = if full {
+                    TOOL_EXPANDED_MAX_LINES
+                } else {
+                    FILE_TOOL_PREVIEW_LINES
+                };
+                let mut remaining_bytes = TOOL_EXPANDED_MAX_BYTES;
+                let mut remaining_lines = limit;
+                let mut shown = 0;
+                for (i, choice) in choices.iter().enumerate() {
+                    if remaining_lines == 0 {
+                        break;
+                    }
+                    let Some(choice) = choice.as_str() else {
+                        continue;
+                    };
+                    let prefix = format!("    {}. ", i + 1);
+                    if !full {
+                        let row = format!("{prefix}{}", preview(choice, 200));
+                        if row.len() > remaining_bytes {
+                            break;
+                        }
+                        remaining_bytes -= row.len();
+                        remaining_lines -= 1;
+                        lines.push(Line::from(Span::styled(
+                            row,
+                            theme::dim_style().add_modifier(sel_mod),
+                        )));
+                        shown += 1;
+                        continue;
+                    }
+                    // Expanded cards are the only place a closed question's
+                    // choices can be read in full, so each choice gets the
+                    // shared expanded byte and line limits rather than the
+                    // one-line preview, with continuation lines indented
+                    // under the choice's first line.
+                    let (text, cut) = terminal_safe_tool_text_limited(
+                        choice,
+                        remaining_bytes.saturating_sub(prefix.len()),
+                        remaining_lines,
+                    );
+                    if cut && text.is_empty() {
+                        break;
+                    }
+                    let indent = " ".repeat(prefix.len());
+                    for (row_index, row) in text.split('\n').enumerate() {
+                        let lead = if row_index == 0 { &prefix } else { &indent };
+                        lines.push(Line::from(Span::styled(
+                            format!("{lead}{row}"),
+                            theme::dim_style().add_modifier(sel_mod),
+                        )));
+                        remaining_lines = remaining_lines.saturating_sub(1);
+                    }
+                    remaining_bytes = remaining_bytes.saturating_sub(prefix.len() + text.len());
+                    shown += 1;
+                    if cut {
+                        display_limited = true;
+                        break;
+                    }
+                }
+                if shown < count {
+                    footer = Some(count - shown);
+                    display_limited |= full;
+                }
+                if full {
+                    let metadata =
+                        semantic_tool_metadata(input, &["question", "choices", "options"]);
+                    if metadata != "{}" {
+                        display_limited |= render_field(lines, "input", &metadata, 120);
+                    }
+                }
+            } else {
+                display_limited |= render_generic_input(lines);
+            }
+        }
         _ => display_limited |= render_generic_input(lines),
     }
 
@@ -7370,6 +7722,31 @@ fn render_tool_entry(
         {
             display_limited |=
                 render_field(lines, &crate::i18n::t("zc-chat-tool-details"), details, 120);
+        }
+    } else if let Some(res) = result
+        && matches!(name, "ask_user" | "poll")
+        && !res.starts_with("Error")
+    {
+        // The outcome of a question stands out like the answer line it
+        // replaced: the pick in yellow, or only the DISMISSED marker.
+        let (res, limited) = if matches!(disclosure, ToolDisclosure::Full) {
+            terminal_safe_tool_text_limited(res, TOOL_EXPANDED_MAX_BYTES, TOOL_EXPANDED_MAX_LINES)
+        } else {
+            (preview(res, 200), false)
+        };
+        display_limited |= limited;
+        let answer = theme::warn_style().add_modifier(Modifier::ITALIC | sel_mod);
+        let dim = theme::dim_style().add_modifier(sel_mod);
+        for (i, line) in res.split('\n').enumerate() {
+            let (marked, rest) = match line.strip_prefix("DISMISSED").filter(|_| i == 0) {
+                Some(rest) => ("DISMISSED", rest),
+                None => (line, ""),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(if i == 0 { "  result: " } else { "    " }, dim),
+                Span::styled(marked.to_string(), answer),
+                Span::styled(rest.to_string(), dim),
+            ]));
         }
     } else if let Some(res) = result {
         display_limited |= render_field(lines, "result", res, 200);
@@ -7536,10 +7913,6 @@ fn label_cells(line: &Line<'static>, copy_lbl: &str) -> Option<(u16, u16)> {
 
 fn message_copy_label() -> String {
     crate::i18n::t("zc-chat-copy-message")
-}
-
-fn message_copied_label() -> String {
-    crate::i18n::t("zc-chat-copy-message-copied")
 }
 
 #[cfg(test)]
@@ -8384,7 +8757,7 @@ fn render_copy_feedback(f: &mut Frame, state: &ChatState) {
 
     match feedback.target {
         CopyFeedbackTarget::Code(group) => {
-            let label = message_copied_label();
+            let label = feedback.outcome.label();
             for region in state
                 .copy_hit_regions
                 .iter()
@@ -8396,7 +8769,7 @@ fn render_copy_feedback(f: &mut Frame, state: &ChatState) {
             }
         }
         CopyFeedbackTarget::Overlay(rect) => {
-            render_copied_label(f, &message_copied_label(), rect);
+            render_copied_label(f, &feedback.outcome.label(), rect);
         }
     }
 }
@@ -9628,7 +10001,34 @@ pub struct PendingElicitation {
     pub selected: Vec<bool>,
 }
 
+/// A pending elicitation cleared without an answer, awaiting its `cancel`.
+#[derive(Debug, Clone)]
+struct WithdrawnElicitation {
+    /// Taken once the cancel is sent; a deferred transcript note may remain.
+    request_id: Option<serde_json::Value>,
+    /// Whether to note the withdrawal in this state's transcript. False when
+    /// the state has already moved to a different session.
+    note: bool,
+    /// The question, to place the note after its tool card.
+    question: String,
+}
+
 impl PendingElicitation {
+    /// The chosen choice titles, comma-joined, for the transcript record.
+    fn answer_summary(&self) -> String {
+        if self.multi {
+            self.choices
+                .iter()
+                .zip(&self.selected)
+                .filter(|(_, on)| **on)
+                .map(|(title, _)| title.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            self.choices.get(self.cursor).cloned().unwrap_or_default()
+        }
+    }
+
     /// Number of currently-checked rows (multi-select only).
     pub fn selected_count(&self) -> usize {
         self.selected.iter().filter(|&&b| b).count()
@@ -9666,7 +10066,7 @@ impl PendingElicitation {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ChatEntry {
     AgentMessage(Arc<str>),
     /// A response committed after the prompt RPC returned but before its
@@ -9692,6 +10092,98 @@ pub enum ChatEntry {
         /// `Some(Arc<str>)` once the result arrives.
         result: Option<Arc<str>>,
     },
+}
+
+impl ChatEntry {
+    fn refresh_matches(&self, canonical: &Self, strip_runtime_enrichment: bool) -> bool {
+        if let (
+            Self::UserMessage { text, attachments },
+            Self::UserMessage {
+                text: Some(stored), ..
+            },
+        ) = (self, canonical)
+            && !attachments.is_empty()
+        {
+            let stored = if strip_runtime_enrichment {
+                strip_refresh_enrichment_prefix(stored)
+            } else {
+                stored.as_ref()
+            };
+            let original = text.as_deref().unwrap_or("");
+            // Only remove the daemon suffix when this local row owns attachments.
+            // Never normalize marker-like text in an ordinary user message.
+            let suffix = if original.is_empty() {
+                Some(stored)
+            } else {
+                stored
+                    .strip_prefix(original)
+                    .and_then(|rest| rest.strip_prefix('\n'))
+            };
+            if let Some(suffix) = suffix {
+                let mut markers = suffix.lines();
+                let matched = attachments.iter().all(|_| {
+                    let Some(marker) = markers.next() else {
+                        return false;
+                    };
+                    if let Some(path) = marker
+                        .strip_prefix("[IMAGE:")
+                        .and_then(|m| m.strip_suffix(']'))
+                    {
+                        !path.is_empty()
+                    } else {
+                        // Content-addressed reuse may retain an earlier filename.
+                        marker
+                            .strip_prefix("[Document: ")
+                            .and_then(|rest| rest.split_once("] "))
+                            .is_some_and(|(name, path)| !name.is_empty() && !path.is_empty())
+                    }
+                });
+                if matched && markers.next().is_none() {
+                    return true;
+                }
+            }
+        }
+        match (self, canonical) {
+            (Self::SystemMessage(old), Self::SystemMessage(new)) if strip_runtime_enrichment => {
+                old == new
+            }
+            (Self::SystemMessage(_) | Self::AgentThought(_), _) => false,
+            (Self::UserMessage { text: old, .. }, Self::UserMessage { text: new, .. }) => {
+                if strip_runtime_enrichment {
+                    old.as_deref().map(strip_refresh_enrichment_prefix)
+                        == new.as_deref().map(strip_refresh_enrichment_prefix)
+                } else {
+                    old == new
+                }
+            }
+            (Self::AgentMessageContinuation(old), Self::AgentMessage(new)) => {
+                old.as_str() == new.as_ref()
+            }
+            _ => self == canonical,
+        }
+    }
+
+    fn refresh_identity(&self, strip_runtime_enrichment: bool) -> Option<Self> {
+        match self {
+            // Only ACP history can supply durable system notices to match.
+            Self::SystemMessage(_) if strip_runtime_enrichment => Some(self.clone()),
+            Self::SystemMessage(_) | Self::AgentThought(_) => None,
+            Self::UserMessage { text, .. } => Some(Self::UserMessage {
+                text: text.as_deref().map(|text| {
+                    Arc::from(if strip_runtime_enrichment {
+                        strip_refresh_enrichment_prefix(text)
+                    } else {
+                        text
+                    })
+                }),
+                attachments: Vec::new(),
+            }),
+            Self::AgentMessageContinuation(text) => {
+                Some(Self::AgentMessage(Arc::from(text.as_str())))
+            }
+            _ => Some(self.clone()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -9839,6 +10331,7 @@ enum CopyFeedbackTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CopyFeedback {
     target: CopyFeedbackTarget,
+    outcome: crate::clipboard::CopyOutcome,
     shown_at: Instant,
 }
 
@@ -9877,6 +10370,12 @@ pub struct ChatState {
     streaming_thought: String,
     pending_approval: Option<PendingApproval>,
     pending_elicitation: Option<PendingElicitation>,
+    /// Elicitations this state cleared without the user's answer (a reload,
+    /// a session reset, a newer prompt). The daemon is still waiting on each
+    /// one, so `Chat::answer_withdrawn_elicitations` sends it a `cancel` and
+    /// notes it in the transcript. Without this the tool call blocks until
+    /// its own timeout (600 s for `ask_user`) with nothing on screen.
+    withdrawn_elicitations: Vec<WithdrawnElicitation>,
     /// Why the sidebar shows this session red. Set when a turn ends
     /// `Failed`; cleared by the next prompt, a completed turn, a session
     /// reset, or a successful re-attach.
@@ -9960,7 +10459,7 @@ pub struct ChatState {
     context_copy_regions: Vec<CopyHitRegion>,
     /// Active transcript or queue context menu.
     context_menu: Option<ChatContextMenu>,
-    /// Temporary `[Copied]` overlay for copy labels.
+    /// Temporary overlay for the actual clipboard delivery outcome.
     copy_feedback: Option<CopyFeedback>,
     /// Clickable provider/model title spans from the last draw.
     title_hit_rects: Vec<TitleHitRect>,
@@ -9979,9 +10478,9 @@ pub struct ChatState {
     /// provider (input + cached + output) is added on arrival. Cleared on
     /// session reset only.
     pub context_input_tokens: Option<u64>,
-    /// Provenance of `context_input_tokens` ("provider" or "estimate"). An
-    /// estimated count must be rendered as approximate, never as measured
-    /// usage. Always set and cleared together with the count it describes.
+    /// Provenance of `context_input_tokens`, using the wire values of
+    /// `zeroclaw_api::agent::TokenCountSource`. Derived counts are rendered as
+    /// approximate. Always set and cleared together with the count it describes.
     pub context_input_tokens_source: Option<String>,
     /// Preemptive-trim budget for this session (the bar fills toward this).
     pub context_max_tokens: Option<u64>,
@@ -10050,6 +10549,7 @@ impl ChatState {
             streaming_thought: String::new(),
             pending_approval: None,
             pending_elicitation: None,
+            withdrawn_elicitations: Vec::new(),
             last_error: None,
             turn_in_flight: false,
             turn_generation: 0,
@@ -10190,8 +10690,15 @@ impl ChatState {
             .context_menu
             .take()
             .filter(|menu| matches!(menu.target, ChatContextMenuTarget::Queue(_)));
+        // Copy has already cleared its selection. A redraw may only be moving
+        // the viewport for the new info notice; validate feedback against the
+        // next snapshot rather than discarding it before that comparison.
+        let feedback = self
+            .copy_feedback
+            .filter(|_| self.transcript_selection.is_none());
         self.clear_transcript_selection();
         self.context_menu = queue_menu;
+        self.copy_feedback = feedback;
     }
 
     fn begin_transcript_drag(&mut self, column: u16, row: u16) -> bool {
@@ -10375,7 +10882,40 @@ impl ChatState {
             .as_ref()
             .is_some_and(|current| current != &snapshot)
         {
+            let feedback = self.copy_feedback.and_then(|mut feedback| {
+                let current = self.transcript_snapshot.as_ref()?;
+                // Compare transcript-global rows, not their screen positions.
+                // Width or content changes invalidate the original copy target.
+                if current.area.width != snapshot.area.width
+                    || current.total_rows != snapshot.total_rows
+                    || !current
+                        .cells
+                        .keys()
+                        .any(|row| snapshot.cells.contains_key(row))
+                    || current.cells.iter().any(|(row, cells)| {
+                        snapshot.cells.get(row).is_some_and(|next| next != cells)
+                    })
+                {
+                    return None;
+                }
+                if let CopyFeedbackTarget::Overlay(mut rect) = feedback.target {
+                    let x =
+                        i32::from(rect.x) + i32::from(snapshot.area.x) - i32::from(current.area.x);
+                    let y = i32::from(rect.y) + i32::from(snapshot.area.y)
+                        - i32::from(current.area.y)
+                        + i32::from(current.scroll)
+                        - i32::from(snapshot.scroll);
+                    rect.x = u16::try_from(x).ok()?;
+                    rect.y = u16::try_from(y).ok()?;
+                    if rect.intersection(snapshot.area) != rect {
+                        return None;
+                    }
+                    feedback.target = CopyFeedbackTarget::Overlay(rect);
+                }
+                Some(feedback)
+            });
             self.clear_transcript_selection_for_render_change();
+            self.copy_feedback = feedback;
         }
         self.transcript_snapshot = Some(snapshot);
     }
@@ -10507,24 +11047,43 @@ impl ChatState {
                     .as_ref()?
                     .selection_anchor_rect(self.transcript_selection?)
             });
-        if !self.copy_text_and_clear_selection(&text) {
-            return false;
-        }
-        if let Some(anchor) = feedback_anchor {
-            self.set_overlay_copy_feedback(anchor);
-        }
-        true
-    }
-
-    fn copy_text_and_clear_selection(&mut self, text: &str) -> bool {
         if text.is_empty() {
             return false;
         }
-        crate::mouse::copy_osc52(text);
+        if let Some(outcome) = self.copy_text_and_clear_selection(&text)
+            && let Some(anchor) = feedback_anchor
+        {
+            self.set_overlay_copy_feedback(anchor, outcome);
+        }
+        // A failed copy still owns the key and leaves the selection available.
+        true
+    }
+
+    fn copy_text(&mut self, text: &str) -> Option<crate::clipboard::CopyOutcome> {
+        if text.is_empty() {
+            return None;
+        }
+        self.copy_feedback = None;
+        match crate::clipboard::copy_text(text) {
+            Ok(outcome) => {
+                self.set_info_notice(outcome.notice());
+                Some(outcome)
+            }
+            Err(error) => {
+                self.set_info_notice(crate::clipboard::copy_failure_notice(&error));
+                None
+            }
+        }
+    }
+
+    fn copy_text_and_clear_selection(
+        &mut self,
+        text: &str,
+    ) -> Option<crate::clipboard::CopyOutcome> {
+        let outcome = self.copy_text(text)?;
         self.clear_mouse_highlight();
         self.clear_browse_selection();
-        self.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
-        true
+        Some(outcome)
     }
 
     fn current_selection_text(&self) -> String {
@@ -11477,8 +12036,82 @@ impl ChatState {
     /// before the first is answered is a protocol anomaly we resolve by
     /// keeping the newest).
     pub fn set_pending_elicitation(&mut self, e: PendingElicitation) {
+        self.withdraw_pending_elicitation(true);
         self.pending_elicitation = Some(e);
         self.mark_dirty_full();
+    }
+
+    /// Clear the pending elicitation without an answer, queueing the
+    /// `cancel` the daemon is waiting for. Every path that drops the modal
+    /// for a reason other than the user's answer goes through here.
+    fn withdraw_pending_elicitation(&mut self, note: bool) {
+        if let Some(e) = self.pending_elicitation.take() {
+            self.withdrawn_elicitations.push(WithdrawnElicitation {
+                request_id: Some(e.request_id),
+                note,
+                question: e.message,
+            });
+            self.mark_dirty_full();
+        }
+    }
+
+    fn take_withdrawn_elicitations(&mut self) -> Vec<WithdrawnElicitation> {
+        std::mem::take(&mut self.withdrawn_elicitations)
+    }
+
+    /// Note how a question ended (answered, dismissed, withdrawn, expired),
+    /// but only when no unanswered `ask_user` / `poll` card in the latest
+    /// user turn asked it. The
+    /// card is the record: it shows the question and choices in the agent's
+    /// turn, and its `result:` line shows the outcome once the tool returns,
+    /// so a line here would repeat both. The `elicitation/create` request
+    /// can reach the pane before the `ToolCall` update that draws the card
+    /// (the router drains inbound requests before notifications), which is
+    /// why nothing is written on arrival. With no matching card (an older
+    /// history, a card that never arrived) the line is appended so the
+    /// outcome is still on record, and it names the question because no
+    /// card shows it.
+    fn record_elicitation_outcome(&mut self, question: &str, text: String) {
+        if self.elicitation_card_index(question).is_some() {
+            return;
+        }
+        self.entries.push(ChatEntry::SystemMessage(Arc::<str>::from(
+            elicitation_outcome_note(question, &text),
+        )));
+        self.mark_dirty_append();
+    }
+
+    /// Match an unanswered card in the latest user turn. Completed cards
+    /// from earlier questions cannot stand in for a new request after a reload.
+    fn elicitation_card_index(&self, question: &str) -> Option<usize> {
+        let question = question.trim();
+        let turn_start = self
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry, ChatEntry::UserMessage { .. }))
+            .unwrap_or(0);
+        self.entries[turn_start..]
+            .iter()
+            .rposition(|entry| {
+                let ChatEntry::Tool {
+                    name,
+                    input_json,
+                    result,
+                    ..
+                } = entry
+                else {
+                    return false;
+                };
+                result.is_none()
+                    && matches!(name.as_ref(), "ask_user" | "poll")
+                    && serde_json::from_str::<serde_json::Value>(input_json)
+                        .ok()
+                        .as_ref()
+                        .and_then(|input| input.get("question"))
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|q| q.trim() == question)
+            })
+            .map(|index| turn_start + index)
     }
 
     /// Commit any accumulated streaming thought as an entry. Called at the two
@@ -11781,6 +12414,17 @@ impl ChatState {
                 self.entries
                     .push(ChatEntry::SystemMessage(Arc::<str>::from(notice)));
                 self.mark_dirty_append();
+                // A real trim supplies a new retained-context estimate. Its
+                // token_budget can be an emergency dispatch threshold, so the
+                // canonical budget/capacity still come only from ContextUsage.
+                // A zero-drop floor notice and a message-only trim do not
+                // replace the last count or its provenance.
+                if dropped_messages > 0
+                    && let Some(after) = tokens_after
+                {
+                    self.context_input_tokens = Some(after);
+                    self.context_input_tokens_source = tokens_after_source;
+                }
             }
             SessionUpdate::BudgetWarning {
                 current_usd,
@@ -11833,6 +12477,16 @@ impl ChatState {
                 }
                 if let Some(message_count) = message_count {
                     self.message_count = message_count;
+                }
+                // Close the stale modal and still reply: an uncorrelated
+                // completion may race with a newer inbound elicitation.
+                if let Some(e) = self.pending_elicitation.take() {
+                    self.record_elicitation_outcome(
+                        &e.message,
+                        crate::i18n::t("zc-chat-elicitation-expired"),
+                    );
+                    self.pending_elicitation = Some(e);
+                    self.withdraw_pending_elicitation(false);
                 }
                 match outcome {
                     TurnEndOutcome::Completed => {
@@ -12197,15 +12851,20 @@ impl ChatState {
         }
     }
 
-    fn set_overlay_copy_feedback(&mut self, anchor: Rect) {
-        if let Some(rect) = centered_copy_feedback_rect(&message_copied_label(), anchor) {
-            self.set_copy_feedback(CopyFeedbackTarget::Overlay(rect));
+    fn set_overlay_copy_feedback(&mut self, anchor: Rect, outcome: crate::clipboard::CopyOutcome) {
+        if let Some(rect) = centered_copy_feedback_rect(&outcome.label(), anchor) {
+            self.set_copy_feedback(CopyFeedbackTarget::Overlay(rect), outcome);
         }
     }
 
-    fn set_copy_feedback(&mut self, target: CopyFeedbackTarget) {
+    fn set_copy_feedback(
+        &mut self,
+        target: CopyFeedbackTarget,
+        outcome: crate::clipboard::CopyOutcome,
+    ) {
         self.copy_feedback = Some(CopyFeedback {
             target,
+            outcome,
             shown_at: Instant::now(),
         });
     }
@@ -12404,7 +13063,7 @@ impl ChatState {
     fn prepare_for_reattach_resync(&mut self, mode: SessionResyncMode) {
         self.freeze_prompt_settled_stream();
         self.pending_approval = None;
-        self.pending_elicitation = None;
+        self.withdraw_pending_elicitation(true);
         if mode == SessionResyncMode::Reattach {
             self.lag_reattach = None;
         }
@@ -12418,7 +13077,10 @@ impl ChatState {
     fn reset_turn_for_resync_reload(&mut self) {
         self.freeze_prompt_settled_stream();
         self.pending_approval = None;
-        self.pending_elicitation = None;
+        // A prompt that arrived while the reload ran is still awaited by the
+        // daemon; dropping it silently left the tool call hanging until its
+        // timeout. Withdraw it so it is answered.
+        self.withdraw_pending_elicitation(true);
         self.streaming_text.clear();
         self.streaming_thought.clear();
         self.turn_in_flight = false;
@@ -12558,7 +13220,288 @@ impl ChatState {
         self.mark_dirty_full();
     }
 
-    fn load_history(&mut self, messages: Vec<crate::client::MessageEntry>, acp_history: bool) {
+    fn load_history(
+        &mut self,
+        messages: Vec<crate::client::MessageEntry>,
+        strip_runtime_enrichment: bool,
+    ) {
+        let mut entries = std::mem::take(&mut self.entries);
+        Self::append_history(&mut entries, messages, strip_runtime_enrichment);
+        self.seed_first_message(&entries, strip_runtime_enrichment);
+        self.entries = entries;
+        self.mark_dirty_full();
+    }
+
+    fn refresh_is_busy(&self) -> bool {
+        self.turn_in_flight
+            || self.pending_approval.is_some()
+            || self.pending_elicitation.is_some()
+            || !self.streaming_text.is_empty()
+            || !self.streaming_thought.is_empty()
+            || self.last_error == Some(SessionError::ResyncFailed)
+    }
+
+    /// Replace only transcript-derived state. Entry identities are ordered,
+    /// because identical messages in different turns are legitimate.
+    fn refresh_history(
+        &mut self,
+        messages: Vec<crate::client::MessageEntry>,
+        strip_runtime_enrichment: bool,
+    ) -> Result<(), String> {
+        let anchor_error = || crate::i18n::t("zc-chat-refresh-anchor");
+        let mut entries = Self::history_entries(messages, strip_runtime_enrichment);
+        let append_only = entries.len() >= self.entries.len()
+            && self
+                .entries
+                .iter()
+                .zip(&entries)
+                .all(|(old, new)| old.refresh_matches(new, strip_runtime_enrichment));
+        let mut mapped = vec![None; self.entries.len()];
+        if append_only {
+            for (index, old) in self.entries.iter().enumerate() {
+                mapped[index] = Some(index);
+                if matches!(old, ChatEntry::UserMessage { .. }) {
+                    entries[index] = old.clone();
+                }
+            }
+        } else {
+            let mut by_identity: HashMap<ChatEntry, VecDeque<usize>> = HashMap::new();
+            for (index, entry) in entries.iter().enumerate() {
+                if let Some(identity) = entry.refresh_identity(strip_runtime_enrichment) {
+                    by_identity.entry(identity).or_default().push_back(index);
+                }
+            }
+            let mut next = 0;
+            for (old_index, old) in self.entries.iter().enumerate() {
+                let Some(identity) = old.refresh_identity(strip_runtime_enrichment) else {
+                    continue;
+                };
+                let exact = by_identity.get_mut(&identity).and_then(|indices| {
+                    while indices.front().is_some_and(|index| *index < next) {
+                        indices.pop_front();
+                    }
+                    indices.front().copied()
+                });
+                let attachment_match = if matches!(old, ChatEntry::UserMessage { attachments, .. } if !attachments.is_empty())
+                {
+                    entries[next..]
+                        .iter()
+                        .position(|entry| old.refresh_matches(entry, strip_runtime_enrichment))
+                        .map(|index| next + index)
+                } else {
+                    None
+                };
+                if let Some(index) = exact.into_iter().chain(attachment_match).min() {
+                    mapped[old_index] = Some(index);
+                    next = index + 1;
+                    // Keep the already-rendered form of this unchanged user row.
+                    if matches!(old, ChatEntry::UserMessage { .. }) {
+                        entries[index] = old.clone();
+                    }
+                }
+            }
+        }
+        let map_index = |index: usize| {
+            mapped
+                .get(index)
+                .copied()
+                .flatten()
+                .ok_or_else(anchor_error)
+        };
+        let cursor = self.browse_cursor.map(map_index).transpose()?;
+        let browse_anchor = self.browse_anchor.map(map_index).transpose()?;
+        let validate_range = |a: usize, h: usize| -> Result<(), String> {
+            let lo = a.min(h);
+            let first = map_index(lo)?;
+            for index in lo..=a.max(h) {
+                if map_index(index)? != first + index - lo {
+                    return Err(anchor_error());
+                }
+            }
+            Ok(())
+        };
+        if let Some((lo, hi)) = self.browse_range() {
+            validate_range(lo, hi)?;
+        }
+        let browse_multi = self
+            .browse_multi
+            .iter()
+            .copied()
+            .map(map_index)
+            .collect::<Result<_, _>>()?;
+        let mouse_down_entry = self.mouse_down_entry.map(map_index).transpose()?;
+        let row_anchor = |row: u16| {
+            self.transcript_layout
+                .view()
+                .cached_screen_ranges
+                .iter()
+                .find(|(_, lo, hi, _)| *lo <= row && row < *hi)
+                .map(|(index, lo, _, _)| (*index, row.saturating_sub(*lo)))
+        };
+        let scroll_anchor = if self.pinned_to_bottom {
+            None
+        } else {
+            row_anchor(self.scroll_offset)
+                .map(|(index, row)| map_index(index).map(|i| (i, row)))
+                .transpose()?
+        };
+        let selection_anchors = self
+            .transcript_selection
+            .map(|selection| -> Result<_, String> {
+                let (a, a_row) = row_anchor(selection.anchor.row).ok_or_else(anchor_error)?;
+                let (h, h_row) = row_anchor(selection.head.row).ok_or_else(anchor_error)?;
+                // Do not silently select different text when a middle row changed.
+                validate_range(a, h)?;
+                Ok((map_index(a)?, a_row, map_index(h)?, h_row))
+            })
+            .transpose()?;
+        let natural_start = entries.len().saturating_sub(MAX_RENDERED_ENTRIES);
+        let mut start =
+            if self.pinned_to_bottom || self.transcript_layout.view().cached_render_width == 0 {
+                natural_start
+            } else {
+                mapped
+                    .get(self.transcript_layout.view().cached_render_start)
+                    .copied()
+                    .flatten()
+                    .or(scroll_anchor.map(|(index, _)| index))
+                    .unwrap_or(0)
+                    .min(natural_start)
+            };
+        if let Some(cursor) = cursor {
+            if cursor < start {
+                start = cursor;
+            } else if cursor >= start.saturating_add(MAX_RENDERED_ENTRIES) {
+                start = cursor
+                    .saturating_add(1)
+                    .saturating_sub(MAX_RENDERED_ENTRIES);
+            }
+        }
+        start = start.min(natural_start);
+        let end = start
+            .saturating_add(MAX_RENDERED_ENTRIES)
+            .min(entries.len());
+        if selection_anchors
+            .is_some_and(|(a, _, h, _)| a < start || h < start || a >= end || h >= end)
+            || scroll_anchor.is_some_and(|(index, _)| index < start || index >= end)
+        {
+            return Err(anchor_error());
+        }
+
+        // All fallible anchor checks precede the replacement.
+        let old_ranges = self.transcript_layout.view().cached_screen_ranges.clone();
+        let retain_prefix_cache =
+            append_only && start == self.transcript_layout.view().cached_render_start;
+        self.entries = entries;
+        self.first_message = None;
+        let entries = std::mem::take(&mut self.entries);
+        self.seed_first_message(&entries, strip_runtime_enrichment);
+        self.entries = entries;
+        self.browse_cursor = cursor;
+        self.browse_anchor = browse_anchor;
+        self.browse_multi = browse_multi;
+        self.mouse_down_entry = mouse_down_entry;
+        if start != self.transcript_layout.view().cached_render_start {
+            self.transcript_layout.set_render_start(start);
+        }
+        self.prompt_settled_stream_entry = None;
+        self.context_menu = self
+            .context_menu
+            .take()
+            .filter(|menu| matches!(menu.target, ChatContextMenuTarget::Queue(_)));
+        self.copy_feedback = None;
+        self.entry_rects.clear();
+        self.tool_header_rects.clear();
+        self.tool_footer_rects.clear();
+        self.copy_hit_regions.clear();
+        self.context_copy_regions.clear();
+        if retain_prefix_cache {
+            self.mark_dirty_append();
+        } else {
+            self.mark_dirty_full();
+        }
+        if self.transcript_layout.view().cached_render_width != 0 {
+            self.rebuild_lines(self.transcript_layout.view().cached_render_width);
+            self.last_total_rows = self.transcript_layout.view().cached_total_rows;
+            let ranges = &self.transcript_layout.view().cached_screen_ranges;
+            let new_row = |index: usize, intra: u16| {
+                ranges
+                    .binary_search_by_key(&index, |(i, _, _, _)| *i)
+                    .ok()
+                    .map(|position| &ranges[position])
+                    .map(|(_, lo, _, _)| lo.saturating_add(intra))
+            };
+            if let Some((index, intra)) = scroll_anchor {
+                self.scroll_offset = new_row(index, intra).unwrap_or(self.scroll_offset);
+            }
+            if let (Some(selection), Some((a, a_row, h, h_row))) =
+                (&mut self.transcript_selection, selection_anchors)
+                && let (Some(anchor), Some(head)) = (new_row(a, a_row), new_row(h, h_row))
+            {
+                selection.anchor.row = anchor;
+                selection.head.row = head;
+            }
+            if let Some(snapshot) = self.transcript_snapshot.as_mut() {
+                let remap_row = |row: u16| {
+                    let position = old_ranges.partition_point(|(_, _, hi, _)| *hi <= row);
+                    let (index, lo, hi, _) = old_ranges.get(position)?;
+                    if row < *lo || row >= *hi {
+                        return None;
+                    }
+                    new_row(
+                        mapped.get(*index).copied().flatten()?,
+                        row.saturating_sub(*lo),
+                    )
+                };
+                snapshot.cells = std::mem::take(&mut snapshot.cells)
+                    .into_iter()
+                    .filter_map(|(row, cells)| Some((remap_row(row)?, cells)))
+                    .collect();
+                snapshot.row_breaks = std::mem::take(&mut snapshot.row_breaks)
+                    .into_iter()
+                    .filter_map(|(row, kind)| Some((remap_row(row)?, kind)))
+                    .collect();
+                snapshot.total_rows = self.transcript_layout.view().cached_total_rows;
+                snapshot.scroll = self.scroll_offset;
+            }
+        }
+        Ok(())
+    }
+
+    fn seed_first_message(&mut self, entries: &[ChatEntry], strip_runtime_enrichment: bool) {
+        if self.first_message.is_some() {
+            return;
+        }
+        self.first_message = entries.iter().find_map(|entry| {
+            let ChatEntry::UserMessage {
+                text: Some(text), ..
+            } = entry
+            else {
+                return None;
+            };
+            let display = if strip_runtime_enrichment {
+                strip_enrichment_prefix(text)
+            } else {
+                text.as_ref()
+            };
+            (!display.trim().is_empty()).then(|| display.to_string())
+        });
+    }
+
+    fn history_entries(
+        messages: Vec<crate::client::MessageEntry>,
+        acp_history: bool,
+    ) -> Vec<ChatEntry> {
+        let mut entries = Vec::new();
+        Self::append_history(&mut entries, messages, acp_history);
+        entries
+    }
+
+    fn append_history(
+        entries: &mut Vec<ChatEntry>,
+        messages: Vec<crate::client::MessageEntry>,
+        acp_history: bool,
+    ) {
         for m in messages {
             match m.kind {
                 crate::client::MessageEntryKind::ToolCall => {
@@ -12567,7 +13510,7 @@ impl ChatState {
                         .as_ref()
                         .and_then(|value| serde_json::to_string(value).ok())
                         .unwrap_or_else(|| "null".to_string());
-                    self.entries.push(ChatEntry::Tool {
+                    entries.push(ChatEntry::Tool {
                         tool_call_id: Arc::<str>::from(m.tool_call_id.unwrap_or_default()),
                         name: Arc::<str>::from(
                             m.tool_name.unwrap_or_else(|| "unknown".to_string()),
@@ -12581,7 +13524,7 @@ impl ChatState {
                     let tool_call_id = m.tool_call_id.unwrap_or_default();
                     let output = bounded_tool_output(m.tool_output.unwrap_or(m.content));
                     if let Some(ChatEntry::Tool { result, .. }) =
-                        self.entries.iter_mut().rev().find(|entry| {
+                        entries.iter_mut().rev().find(|entry| {
                             matches!(
                                 entry,
                                 ChatEntry::Tool {
@@ -12594,7 +13537,7 @@ impl ChatState {
                     {
                         *result = Some(Arc::<str>::from(output));
                     } else {
-                        self.entries.push(ChatEntry::Tool {
+                        entries.push(ChatEntry::Tool {
                             tool_call_id: Arc::<str>::from(tool_call_id),
                             name: Arc::<str>::from(
                                 m.tool_name.unwrap_or_else(|| "unknown".to_string()),
@@ -12610,34 +13553,23 @@ impl ChatState {
             }
             match m.role() {
                 crate::client::MessageRole::User => {
-                    let display = if acp_history {
-                        strip_enrichment_prefix(&m.content)
-                    } else {
-                        &m.content
-                    };
-                    if self.first_message.is_none() && !display.trim().is_empty() {
-                        self.first_message = Some(display.to_string());
-                    }
-                    self.entries.push(ChatEntry::UserMessage {
+                    entries.push(ChatEntry::UserMessage {
                         text: Some(Arc::<str>::from(m.content)),
                         attachments: vec![],
                     });
                 }
                 crate::client::MessageRole::Assistant => {
-                    self.entries
-                        .push(ChatEntry::AgentMessage(Arc::<str>::from(m.content)));
+                    entries.push(ChatEntry::AgentMessage(Arc::<str>::from(m.content)));
                 }
                 crate::client::MessageRole::System if acp_history => {
                     // ACP history excludes real system prompts in the store.
                     // Its system rows are persisted recovery notices, not
                     // provider instructions. Ordinary Chat has no such contract.
-                    self.entries
-                        .push(ChatEntry::SystemMessage(Arc::<str>::from(m.content)));
+                    entries.push(ChatEntry::SystemMessage(Arc::<str>::from(m.content)));
                 }
                 crate::client::MessageRole::System | crate::client::MessageRole::Other => {}
             }
         }
-        self.mark_dirty_full();
     }
     /// Reset conversational state for a new or switched session.
     /// Re-materialize this pane's state for a newly-entered session.
@@ -12672,7 +13604,10 @@ impl ChatState {
         self.context_menu = None;
         self.copy_feedback = None;
         self.pending_approval = None;
-        self.pending_elicitation = None;
+        self.withdraw_pending_elicitation(false);
+        for withdrawn in &mut self.withdrawn_elicitations {
+            withdrawn.note = false;
+        }
         self.last_error = None;
         self.turn_in_flight = false;
         self.message_count = 0;
@@ -12728,6 +13663,20 @@ fn strip_enrichment_prefix(content: &str) -> &str {
         return content;
     };
     rest[bracket_end + 1..].trim_start()
+}
+
+/// Strip the runtime envelope without discarding authored whitespace.
+fn strip_refresh_enrichment_prefix(content: &str) -> &str {
+    let Some(rest) = content.strip_prefix("[CURRENT DATE & TIME:") else {
+        return content;
+    };
+    let Some(bracket_end) = rest.find(']') else {
+        return content;
+    };
+    // The runtime inserts exactly two newlines. Authored whitespace is identity.
+    rest[bracket_end + 1..]
+        .strip_prefix("\n\n")
+        .unwrap_or(content)
 }
 
 /// Body-only clipboard text.
@@ -14600,6 +15549,188 @@ mod tests {
     }
 
     #[test]
+    fn terminal_requested_copy_renders_outcome_label_with_matching_width() {
+        use ratatui::{Terminal, backend::TestBackend};
+        use unicode_width::UnicodeWidthStr;
+
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("whole message")));
+        state.browse_cursor = Some(0);
+        state.copy_hit_regions.push(CopyHitRegion {
+            rect: Rect::new(10, 1, 20, 1),
+            text: Arc::<str>::from("whole message"),
+            kind: CopyHitKind::Message,
+            group: 0,
+            action: CopyHitAction::Copy,
+        });
+        let outcome = crate::clipboard::CopyOutcome::TerminalRequested;
+        crate::clipboard::with_copy_result(Ok(outcome), || {
+            assert!(state.copy_current_selection());
+        });
+        let feedback = state.copy_feedback.expect("requested feedback");
+        assert_eq!(feedback.outcome, outcome);
+        let CopyFeedbackTarget::Overlay(rect) = feedback.target else {
+            panic!("expected overlay");
+        };
+        assert_eq!(
+            usize::from(rect.width),
+            UnicodeWidthStr::width(outcome.label().as_str())
+        );
+        assert_eq!(state.info_message.as_ref().unwrap().text, outcome.notice());
+
+        // Clearing a selection invalidates hit regions; the next draw rebuilds them.
+        state.copy_hit_regions.push(CopyHitRegion {
+            rect: Rect::new(10, 1, 20, 1),
+            text: Arc::<str>::from("whole message"),
+            kind: CopyHitKind::Code,
+            group: 0,
+            action: CopyHitAction::Copy,
+        });
+        for target in [
+            CopyFeedbackTarget::Overlay(rect),
+            CopyFeedbackTarget::Code(0),
+        ] {
+            state.set_copy_feedback(target, outcome);
+            let mut terminal = Terminal::new(TestBackend::new(60, 3)).expect("test terminal");
+            terminal
+                .draw(|frame| render_copy_feedback(frame, &state))
+                .expect("draw feedback");
+            let rendered: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                rendered.contains(&outcome.label()),
+                "rendered: {rendered:?}"
+            );
+            assert!(!rendered.contains(&crate::clipboard::CopyOutcome::Copied.label()));
+        }
+    }
+
+    #[tokio::test]
+    async fn first_copy_badge_survives_app_notice_resize() {
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            for outcome in [
+                crate::clipboard::CopyOutcome::Copied,
+                crate::clipboard::CopyOutcome::TerminalRequested,
+            ] {
+                for code_block in [false, true] {
+                    let (mut chat, _rx) = test_chat();
+                    chat.pane_kind = kind;
+                    let mut code = crate::acp::Acp::new(chat.rpc.clone());
+                    let mut active = state();
+                    for _ in 0..60 {
+                        active.entries.push(ChatEntry::AgentMessage(Arc::from(
+                            "message text\n\n```rust\nlet value = 1;\n```",
+                        )));
+                    }
+                    active.mark_dirty_full();
+                    chat.phase = ChatPhase::Active(Box::new(active));
+                    let (_, before) =
+                        draw_app_notice_frame(crate::app::Mode::Chat, &mut chat, &mut code);
+                    let active = active_state(&mut chat);
+                    let target = if code_block {
+                        let region = active
+                            .copy_hit_regions
+                            .iter()
+                            .rev()
+                            .find(|region| region.kind == CopyHitKind::Code)
+                            .expect("visible code copy target");
+                        CopyFeedbackTarget::Code(region.group)
+                    } else {
+                        let (_, rect) = active.entry_rects.last().expect("visible message");
+                        CopyFeedbackTarget::Overlay(
+                            centered_copy_feedback_rect(&outcome.label(), *rect)
+                                .expect("message feedback rect"),
+                        )
+                    };
+                    crate::clipboard::with_copy_result(Ok(outcome), || {
+                        assert_eq!(
+                            active.copy_text_and_clear_selection("copy payload"),
+                            Some(outcome)
+                        );
+                    });
+                    active.set_copy_feedback(target, outcome);
+                    let (rows, after) =
+                        draw_app_notice_frame(crate::app::Mode::Chat, &mut chat, &mut code);
+                    assert!(
+                        after.height < before.height,
+                        "notice must resize the transcript"
+                    );
+                    assert!(
+                        rows.iter().any(|row| row.contains(&outcome.label())),
+                        "first copy badge missing: {rows:?}"
+                    );
+                    assert!(active_state(&mut chat).copy_feedback.is_some());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failed_keyboard_copy_keeps_transcript_and_browse_selection() {
+        let mut state = state();
+        state
+            .entries
+            .push(ChatEntry::AgentMessage(Arc::<str>::from("whole message")));
+        state.browse_cursor = Some(0);
+        state.browse_multi.insert(0);
+        state.transcript_snapshot = Some(transcript_snapshot(
+            Rect::new(0, 0, 12, 1),
+            &["visible text"],
+        ));
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 6, row: 0 },
+            dragged: true,
+        });
+        let selection = state.transcript_selection;
+        state.set_copy_feedback(
+            CopyFeedbackTarget::Overlay(Rect::new(0, 0, 8, 1)),
+            crate::clipboard::CopyOutcome::Copied,
+        );
+        let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer rejected copy");
+        let expected = crate::clipboard::copy_failure_notice(&error);
+        crate::clipboard::with_copy_result(Err(error), || {
+            assert!(
+                state.copy_current_selection(),
+                "an attempted copy owns its key"
+            );
+        });
+        assert_eq!(state.transcript_selection, selection);
+        assert_eq!(state.browse_cursor, Some(0));
+        assert!(state.browse_multi.contains(&0));
+        assert!(
+            state.copy_feedback.is_none(),
+            "failed copy must remove stale success feedback"
+        );
+        assert_eq!(state.info_message.as_ref().unwrap().text, expected);
+    }
+
+    #[test]
+    fn unrelated_copy_keeps_transcript_selection() {
+        let mut state = state();
+        state.transcript_snapshot = Some(transcript_snapshot(Rect::new(0, 0, 5, 1), &["hello"]));
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: 0, row: 0 },
+            head: CellPoint { column: 1, row: 0 },
+            dragged: true,
+        });
+        let selection = state.transcript_selection;
+        let outcome = crate::clipboard::CopyOutcome::TerminalRequested;
+        crate::clipboard::with_copy_result(Ok(outcome), || {
+            assert_eq!(state.copy_text("https://example.com"), Some(outcome));
+        });
+        assert_eq!(state.transcript_selection, selection);
+        assert_eq!(state.info_message.as_ref().unwrap().text, outcome.notice());
+    }
+
+    #[test]
     fn copy_shortcuts_do_not_swallow_normal_y_input() {
         use crate::keymap::ChatTabAction;
         use crossterm::event::{KeyCode, KeyModifiers};
@@ -14926,7 +16057,10 @@ mod tests {
         assert!(state.update_transcript_drag(2, 1));
         state.finish_transcript_drag();
         let selection = state.transcript_selection;
-        state.set_overlay_copy_feedback(Rect::new(0, 0, 5, 2));
+        state.set_overlay_copy_feedback(
+            Rect::new(0, 0, 5, 2),
+            crate::clipboard::CopyOutcome::Copied,
+        );
 
         state.scroll_down(1);
         assert_eq!(state.transcript_selection, selection);
@@ -15169,6 +16303,7 @@ mod tests {
             });
             state.copy_feedback = Some(CopyFeedback {
                 target: CopyFeedbackTarget::Overlay(Rect::new(0, 0, 2, 1)),
+                outcome: crate::clipboard::CopyOutcome::Copied,
                 shown_at: Instant::now(),
             });
 
@@ -16069,6 +17204,569 @@ mod tests {
                 data: None,
             }),
         );
+    }
+
+    fn refresh_messages(rows: &[(&str, &str)]) -> Vec<crate::client::MessageEntry> {
+        rows.iter()
+            .map(|(role, content)| crate::client::MessageEntry {
+                role: (*role).into(),
+                content: (*content).into(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    async fn finish_refresh(chat: &mut Chat) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while chat.session_refresh_rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refresh result");
+        assert!(chat.has_pending_transport_events());
+        chat.tick_transport_events();
+        assert!(chat.session_refresh.is_none());
+    }
+
+    async fn answer_refresh(
+        rx: &mut mpsc::Receiver<String>,
+        rpc: &RpcOutbound,
+        messages: serde_json::Value,
+        after: &str,
+    ) {
+        let before = next_rpc_request(rx, "read initial lifecycle").await;
+        assert_eq!(before["method"], method::SESSION_STATE);
+        respond_ok(rpc, &before, serde_json::json!({"state": "idle"}));
+        let history = next_rpc_request(rx, "read durable history").await;
+        assert_eq!(history["method"], method::SESSION_MESSAGES);
+        let total = messages.as_array().expect("history array").len();
+        respond_ok(
+            rpc,
+            &history,
+            serde_json::json!({"messages": messages, "total": total, "start": 0}),
+        );
+        let final_state = next_rpc_request(rx, "recheck lifecycle").await;
+        assert_eq!(final_state["method"], method::SESSION_STATE);
+        respond_ok(rpc, &final_state, serde_json::json!({"state": after}));
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn session_refresh_yields_to_typing_composer_bindings_and_modals() {
+        use crate::keymap::{ChatTabAction, Chord, InputBarAction, overrides};
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let _guard = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        let mut term = key_term();
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            let (tx, mut rx) = mpsc::channel(16);
+            let rpc = Arc::new(RpcOutbound::new(tx));
+            let mut chat = Chat::new(Arc::new(RpcClient::with_rpc(rpc)), kind);
+            let mut prior = state();
+            prior.input_bar.insert_text("draft");
+            chat.phase = ChatPhase::Active(Box::new(prior));
+
+            overrides::set_row(
+                ChatTabAction::TAG,
+                "refresh_session",
+                vec![Chord::char('r')],
+            );
+            chat.handle_key(
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+                &mut term,
+            )
+            .await;
+            assert_eq!(active_state(&mut chat).input_bar.input(), "draftr");
+            assert!(chat.session_refresh.is_none());
+            assert!(rx.try_recv().is_err());
+
+            overrides::reset();
+            overrides::set_row(
+                InputBarAction::TAG,
+                "cursor_left",
+                vec![Chord::key(KeyCode::F(5))],
+            );
+            chat.handle_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE), &mut term)
+                .await;
+            assert_eq!(active_state(&mut chat).input_bar.cursor(), "draft".len());
+            assert!(chat.session_refresh.is_none());
+            assert!(rx.try_recv().is_err());
+
+            overrides::reset();
+            active_state(&mut chat).model_picker = ModelPickerOverlay::Loading;
+            chat.handle_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE), &mut term)
+                .await;
+            assert!(matches!(
+                active_state(&mut chat).model_picker,
+                ModelPickerOverlay::Loading
+            ));
+            assert_eq!(active_state(&mut chat).input_bar.input(), "draftr");
+            assert!(chat.session_refresh.is_none());
+            assert!(rx.try_recv().is_err());
+        }
+        overrides::reset();
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn session_refresh_action_imports_external_turn_without_touching_local_owners() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            let (tx, mut rx) = mpsc::channel(16);
+            let rpc = Arc::new(RpcOutbound::new(tx));
+            let mut chat = Chat::new(Arc::new(RpcClient::with_rpc(rpc.clone())), kind);
+            let mut prior = state();
+            prior.load_history(
+                refresh_messages(&[("user", "local ask"), ("assistant", "local answer")]),
+                false,
+            );
+            let dir = tempfile::tempdir().expect("attachment fixture");
+            let path = dir.path().join("draft.png");
+            std::fs::write(&path, b"fixture").expect("attachment file");
+            prior
+                .input_bar
+                .load_for_edit("keep draft".into(), vec![clipboard_att(&path, "draft.png")]);
+            prior
+                .enqueue_message("keep queue".into(), Vec::new())
+                .unwrap();
+            prior.toggle_queue_pause();
+            assert!(prior.queue_paused());
+            prior.message_queue.ensure_selection();
+            let selected_queue = prior.message_queue.selected();
+            assert!(selected_queue.is_some());
+            prior.git_branch_last_fetch = Some(Instant::now());
+            chat.phase = ChatPhase::Active(Box::new(prior));
+            let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+                crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+                },
+            )
+            .unwrap();
+            chat.handle_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE), &mut term)
+                .await;
+            // This is the history now returned after a different client completed a turn.
+            answer_refresh(
+                &mut rx,
+                &rpc,
+                serde_json::json!([
+                    {"role": "user", "content": "local ask"},
+                    {"role": "assistant", "content": "local answer"},
+                    {"role": "system", "content": "durable recovery notice"},
+                    {"role": "user", "content": "external ask"},
+                    {"role": "assistant", "content": "external answer"}
+                ]),
+                "idle",
+            )
+            .await;
+            finish_refresh(&mut chat).await;
+            let state = active_state(&mut chat);
+            assert_eq!(state.input_bar.input(), "keep draft");
+            assert_eq!(state.input_bar.pending_attachments().len(), 1);
+            assert!(path.exists());
+            assert_eq!(
+                state.message_queue.items().front().unwrap().text,
+                "keep queue"
+            );
+            assert!(state.queue_paused());
+            assert_eq!(state.message_queue.selected(), selected_queue);
+            assert_eq!(state.message_count, 5);
+            let mut output =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            output.draw(|frame| chat.draw(frame, frame.area())).unwrap();
+            let visible = overlay_text(&output, Rect::new(0, 0, 100, 30));
+            assert!(visible.contains("external answer"));
+            assert_eq!(
+                visible.contains("durable recovery notice"),
+                kind == PaneKind::Acp
+            );
+            assert!(
+                rx.try_recv().is_err(),
+                "refresh never dispatches, cancels, or answers an interaction"
+            );
+        }
+    }
+
+    #[test]
+    fn session_refresh_preserves_selection_and_scroll_through_final_render() {
+        let mut state = state();
+        let mut rows = vec![("user", "same ask"), ("assistant", "same reply")];
+        rows.extend([("user", "same ask"), ("assistant", "same reply")]);
+        state.load_history(refresh_messages(&rows), false);
+        state.pinned_to_bottom = false;
+        let mut output =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 14)).unwrap();
+        output
+            .draw(|f| {
+                render_conversation(f, &mut state, f.area());
+            })
+            .unwrap();
+        let row = state
+            .transcript_layout
+            .view()
+            .cached_screen_ranges
+            .iter()
+            .find(|(index, _, _, _)| *index == 1)
+            .unwrap()
+            .1;
+        let (first, last) = state
+            .transcript_snapshot
+            .as_ref()
+            .unwrap()
+            .row_text_bounds(row)
+            .unwrap();
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: first, row },
+            head: CellPoint { column: last, row },
+            dragged: true,
+        });
+        let selected = state.transcript_selected_text().unwrap();
+        let scroll = state.scroll_offset;
+        rows.extend([("user", "external ask"), ("assistant", "external answer")]);
+        state
+            .refresh_history(refresh_messages(&rows), false)
+            .unwrap();
+        output
+            .draw(|f| {
+                render_conversation(f, &mut state, f.area());
+            })
+            .unwrap();
+        assert_eq!(
+            state.transcript_selected_text().as_deref(),
+            Some(selected.as_str())
+        );
+        assert_eq!(state.scroll_offset, scroll);
+        assert!(!state.pinned_to_bottom);
+        assert!(overlay_text(&output, Rect::new(0, 0, 80, 14)).contains("external answer"));
+        // Browse ranges also retain the second occurrence, not the first duplicate.
+        state.transcript_selection = None;
+        state.browse_cursor = Some(3);
+        state.browse_anchor = Some(2);
+        state.browse_multi.insert(3);
+        state
+            .refresh_history(refresh_messages(&rows), false)
+            .unwrap();
+        assert_eq!(state.browse_cursor, Some(3));
+        assert_eq!(state.browse_anchor, Some(2));
+        assert_eq!(
+            state.browse_multi.iter().copied().collect::<Vec<_>>(),
+            vec![3]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_refresh_busy_error_and_stale_reads_keep_the_last_valid_view() {
+        for scenario in [
+            "busy_before",
+            "busy_after",
+            "failed",
+            "local_turn",
+            "notification",
+            "focus",
+        ] {
+            let (tx, mut rx) = mpsc::channel(16);
+            let rpc = Arc::new(RpcOutbound::new(tx));
+            let mut chat = Chat::new(Arc::new(RpcClient::with_rpc(rpc.clone())), PaneKind::Acp);
+            let mut prior = state();
+            prior.load_history(
+                refresh_messages(&[("user", "keep ask"), ("assistant", "keep answer")]),
+                false,
+            );
+            prior.git_branch_last_fetch = Some(Instant::now());
+            let expected = prior.entries.clone();
+            chat.phase = ChatPhase::Active(Box::new(prior));
+            chat.begin_session_refresh();
+            match scenario {
+                "busy_before" | "failed" => {
+                    let request = next_rpc_request(&mut rx, "initial read").await;
+                    assert_eq!(request["method"], method::SESSION_STATE);
+                    if scenario == "failed" {
+                        respond_err(&rpc, &request, -32000, "read unavailable");
+                    } else {
+                        respond_ok(&rpc, &request, serde_json::json!({"state": "running"}));
+                    }
+                }
+                _ => {
+                    answer_refresh(&mut rx, &rpc, serde_json::json!([
+                        {"role": "user", "content": "new ask"}, {"role": "assistant", "content": "new answer"}
+                    ]), if scenario == "busy_after" { "running" } else { "idle" }).await;
+                    match scenario {
+                        "local_turn" => {
+                            active_state(&mut chat).turn_generation += 1;
+                        }
+                        "notification" => {
+                            chat.rpc.push_notification_for_test(
+                                "session/update",
+                                serde_json::json!({
+                                    "type": "plan", "session_id": "sess-1", "entries": []
+                                }),
+                            );
+                        }
+                        "focus" => {
+                            let mut other = state_for("other-session", "other-agent");
+                            other.git_branch_last_fetch = Some(Instant::now());
+                            chat.background.push(other);
+                            chat.focus_session("other-session").await;
+                            // The old read must not become valid again after refocusing.
+                            chat.focus_session("sess-1").await;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            finish_refresh(&mut chat).await;
+            assert_eq!(active_state(&mut chat).entries, expected, "{scenario}");
+            if scenario == "failed" {
+                assert!(matches!(
+                    active_state(&mut chat).info_message.as_ref().unwrap().kind,
+                    crate::widgets::InfoKind::Error
+                ));
+            }
+            assert!(
+                rx.try_recv().is_err(),
+                "{scenario}: no cancel, retry, or prompt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_refresh_never_answers_pending_interactions() {
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut chat = Chat::new(
+            Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx)))),
+            PaneKind::Acp,
+        );
+        let mut prior = state();
+        prior.pending_approval = Some(PendingApproval {
+            request_id: "keep-approval".into(),
+            tool_name: "shell".into(),
+            arguments_summary: "pwd".into(),
+            timeout_secs: 30,
+        });
+        prior.pending_elicitation = Some(single_elicitation());
+        chat.phase = ChatPhase::Active(Box::new(prior));
+        chat.begin_session_refresh();
+        assert!(active_state(&mut chat).pending_approval.is_some());
+        assert!(active_state(&mut chat).pending_elicitation.is_some());
+        assert!(chat.session_refresh.is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn session_refresh_missing_anchor_is_a_non_destructive_failure() {
+        let mut state = state();
+        state.load_history(
+            refresh_messages(&[("user", "keep ask"), ("assistant", "selected reply")]),
+            false,
+        );
+        state.browse_cursor = Some(1);
+        let expected = state.entries.clone();
+        assert!(
+            state
+                .refresh_history(refresh_messages(&[("user", "replacement")]), false)
+                .is_err()
+        );
+        assert_eq!(state.entries, expected);
+        assert_eq!(state.browse_cursor, Some(1));
+    }
+
+    #[test]
+    fn session_refresh_browse_range_rejects_changed_interior() {
+        for inserted in [false, true] {
+            let mut state = state();
+            state.load_history(
+                refresh_messages(&[("user", "ask"), ("assistant", "answer")]),
+                false,
+            );
+            if !inserted {
+                state
+                    .entries
+                    .insert(1, ChatEntry::AgentThought("local thought".into()));
+            }
+            state.browse_anchor = Some(0);
+            state.browse_cursor = Some(state.entries.len() - 1);
+            let expected = state.entries.clone();
+            let selected = state.current_selection_text();
+            let rows = if inserted {
+                vec![
+                    ("user", "ask"),
+                    ("assistant", "inserted"),
+                    ("assistant", "answer"),
+                ]
+            } else {
+                vec![("user", "ask"), ("assistant", "answer")]
+            };
+            assert!(
+                state
+                    .refresh_history(refresh_messages(&rows), false)
+                    .is_err()
+            );
+            assert_eq!(state.entries, expected);
+            assert_eq!(state.current_selection_text(), selected);
+        }
+    }
+
+    #[test]
+    fn session_refresh_sent_attachment_rows_keep_display_and_anchors() {
+        for (prompt, enriched) in [
+            (Some("look here"), false),
+            (None, false),
+            (Some("  look here"), true),
+            (None, true),
+        ] {
+            let mut state = state();
+            state.entries.push(ChatEntry::UserMessage {
+                text: prompt.map(Arc::from),
+                attachments: vec!["photo.png".into(), "notes.txt".into()],
+            });
+            state.entries.push(ChatEntry::AgentMessage("done".into()));
+            state.browse_cursor = Some(0);
+            state.browse_anchor = Some(1);
+            state.pinned_to_bottom = false;
+            let original = state.entries[0].clone();
+            let stored = format!(
+                "{}{}[IMAGE:/fixture/uploads/hash.png]\n[Document: earlier-name.txt] /fixture/uploads/hash.txt",
+                if enriched {
+                    "[CURRENT DATE & TIME: fixture]\n\n"
+                } else {
+                    ""
+                },
+                prompt.map(|text| format!("{text}\n")).unwrap_or_default()
+            );
+            state
+                .refresh_history(
+                    refresh_messages(&[
+                        ("user", &stored),
+                        ("assistant", "done"),
+                        ("assistant", "external answer"),
+                    ]),
+                    enriched,
+                )
+                .unwrap();
+            assert_eq!(state.entries[0], original);
+            assert_eq!(state.browse_cursor, Some(0));
+            assert_eq!(state.browse_anchor, Some(1));
+            let mut output =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+            output
+                .draw(|f| {
+                    render_conversation(f, &mut state, f.area());
+                })
+                .unwrap();
+            let visible = overlay_text(&output, Rect::new(0, 0, 80, 20));
+            assert!(visible.contains("photo.png") && visible.contains("notes.txt"));
+            assert!(!visible.contains("/fixture/uploads"));
+        }
+        let ordinary = ChatEntry::UserMessage {
+            text: Some("look here".into()),
+            attachments: Vec::new(),
+        };
+        let marked = ChatEntry::UserMessage {
+            text: Some("look here\n[IMAGE:/fixture/file.png]".into()),
+            attachments: Vec::new(),
+        };
+        assert!(!ordinary.refresh_matches(&marked, false));
+    }
+
+    #[tokio::test]
+    async fn session_refresh_first_plan_keeps_visibility_and_selection() {
+        let mut chat = active_chat();
+        let state = active_state(&mut chat);
+        state.todo_tracker =
+            crate::todo_tracker::TodoTracker::new(crate::config::TodoLocation::Right, true, false);
+        state.load_history(
+            refresh_messages(&[("user", "ask"), ("assistant", "selected answer")]),
+            false,
+        );
+        state.pinned_to_bottom = false;
+        let mut output =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        output.draw(|f| chat.draw(f, f.area())).unwrap();
+        let state = active_state(&mut chat);
+        let row = state
+            .transcript_layout
+            .view()
+            .cached_screen_ranges
+            .iter()
+            .find(|(i, _, _, _)| *i == 1)
+            .unwrap()
+            .1;
+        let (first, last) = state
+            .transcript_snapshot
+            .as_ref()
+            .unwrap()
+            .row_text_bounds(row)
+            .unwrap();
+        state.transcript_selection = Some(TranscriptSelection {
+            anchor: CellPoint { column: first, row },
+            head: CellPoint { column: last, row },
+            dragged: true,
+        });
+        let selected = state.transcript_selected_text().unwrap();
+        chat.session_refresh = Some(SessionRefreshAttempt {
+            session_id: state.session_id.clone(),
+            turn_generation: state.turn_generation,
+            invalidated: false,
+        });
+        chat.session_refresh_tx
+            .try_send(Ok(SessionResyncSnapshot {
+                messages: refresh_messages(&[
+                    ("user", "ask"),
+                    ("assistant", "selected answer"),
+                    ("assistant", "external answer"),
+                ]),
+                message_count: 3,
+                plan: Some(vec![crate::wire::PlanEntry {
+                    content: "new plan".into(),
+                    status: crate::wire::PlanStatus::Pending,
+                    priority: crate::wire::PlanPriority::Medium,
+                    active_form: None,
+                }]),
+                turn_running: false,
+            }))
+            .unwrap();
+        chat.drain_session_refresh_results();
+        assert!(!chat.plan_visible());
+        assert_eq!(
+            active_state(&mut chat).todo_tracker.entries()[0].content,
+            "new plan"
+        );
+        output.draw(|f| chat.draw(f, f.area())).unwrap();
+        assert_eq!(
+            chat.transcript_selected_text_for_test().as_deref(),
+            Some(selected.as_str())
+        );
+    }
+
+    #[test]
+    fn session_refresh_append_keeps_existing_rendered_prefix() {
+        let mut state = state();
+        let contents = (0..900).map(|i| format!("message {i}")).collect::<Vec<_>>();
+        let mut rows = contents
+            .iter()
+            .map(|text| ("assistant", text.as_str()))
+            .collect::<Vec<_>>();
+        state.load_history(refresh_messages(&rows), false);
+        state.rebuild_lines(80);
+        let prefix = state.transcript_layout.view().cached_lines.clone();
+        rows.push(("assistant", "external answer"));
+        state
+            .refresh_history(refresh_messages(&rows), false)
+            .unwrap();
+        assert_eq!(
+            &state.transcript_layout.view().cached_lines[..prefix.len()],
+            prefix.as_slice()
+        );
+        assert_eq!(state.transcript_layout.view().dirty, LinesDirty::Clean);
+        assert_eq!(state.transcript_layout.view().cached_entry_count, 901);
     }
 
     #[test]
@@ -26771,6 +28469,169 @@ mod tests {
     }
 
     #[test]
+    fn history_trimmed_refreshes_the_displayed_context_budget() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: Some(180_000),
+            input_tokens_source: Some("provider".to_string()),
+            max_context_tokens: Some(160_000),
+            model_context_window: Some(200_000),
+        });
+
+        // The terminal trim is emitted after the last accepted usage event, so
+        // the bar must adopt the trim's post-trim count while keeping the
+        // canonical budget. The event's threshold may be an emergency cap.
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 4,
+            dropped_turns: Some(1),
+            kept_turns: 1,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(128_000),
+            tokens_before: Some(180_000),
+            tokens_after: Some(90_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
+        });
+
+        assert_eq!(s.context_input_tokens, Some(90_000));
+        assert_eq!(
+            s.context_input_tokens_source.as_deref(),
+            Some("calibrated"),
+            "the bar must describe the post-trim count, not the pre-trim provider sample"
+        );
+        assert_eq!(
+            s.context_max_tokens,
+            Some(160_000),
+            "the event threshold must not replace the canonical trim budget"
+        );
+        assert_eq!(
+            s.context_model_window,
+            Some(200_000),
+            "a trim does not re-resolve model capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_trimmed_rpc_updates_the_real_status_bar_without_changing_limits() {
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        let apply = |chat: &mut Chat, update: serde_json::Value| {
+            chat.rpc
+                .push_notification_for_test("session/update", update);
+            chat.tick_transport_events();
+            let (input, source, budget, window) = chat.ctx_tokens();
+            crate::app::tests::render_status_bar_cells(
+                crate::widgets::CtxBar::new(input, source, budget, window),
+                120,
+            )
+        };
+        let usage = |input: Option<u64>, budget: u64, window: Option<u64>| {
+            serde_json::json!({
+                "type": "context_usage", "session_id": "sess-1", "input_tokens": input,
+                "input_tokens_source": "provider", "max_context_tokens": budget,
+                "model_context_window": window,
+            })
+        };
+        let trim = |session: &str, dropped: usize, after: Option<u64>| {
+            serde_json::json!({
+                "type": "history_trimmed", "session_id": session,
+                "dropped_messages": dropped, "dropped_turns": usize::from(dropped > 0),
+                "kept_turns": 1, "reason": "context token budget exceeded",
+                "token_budget": 200_000, "tokens_before": 180_000,
+                "tokens_after": after, "tokens_before_source": "provider",
+                "tokens_after_source": "calibrated", "unsatisfiable_floor": true,
+            })
+        };
+        let before = apply(&mut chat, usage(Some(180_000), 160_000, Some(200_000)));
+        assert!(before.contains("180,000 / 200,000"), "{before}");
+        let unchanged = apply(&mut chat, trim("sess-1", 0, Some(90_000)));
+        assert_eq!(
+            unchanged, before,
+            "a floor notice without drops is not a new count"
+        );
+        assert_eq!(
+            apply(&mut chat, trim("other-session", 4, Some(90_000))),
+            before
+        );
+        assert_eq!(apply(&mut chat, trim("sess-1", 4, None)), before);
+
+        let after = apply(&mut chat, trim("sess-1", 4, Some(90_000)));
+        assert!(
+            after.contains("~ 90,000 / 200,000"),
+            "real terminal status cells: {after}"
+        );
+        assert!(
+            after.contains("~45%"),
+            "real terminal status percentage: {after}"
+        );
+        assert_eq!(
+            chat.ctx_tokens().2,
+            Some(160_000),
+            "emergency threshold cannot move the canonical marker"
+        );
+        assert!(
+            after.contains('│'),
+            "canonical trim marker remains visible: {after}"
+        );
+
+        let measured = apply(&mut chat, usage(Some(70_000), 160_000, Some(200_000)));
+        assert!(measured.contains("70,000 / 200,000"), "{measured}");
+        assert!(
+            !measured.contains('~'),
+            "later measured usage clears estimate provenance"
+        );
+        apply(&mut chat, usage(None, 160_000, Some(200_000)));
+        assert_eq!(chat.ctx_tokens().0, None);
+        assert_eq!(chat.ctx_tokens().1, None);
+
+        let disabled = apply(&mut chat, usage(Some(12_000), 0, None));
+        assert!(
+            !disabled.contains(" / "),
+            "no configured denominator: {disabled}"
+        );
+        let still_disabled = apply(&mut chat, trim("sess-1", 2, Some(6_000)));
+        assert!(
+            !still_disabled.contains(" / "),
+            "trim must not invent a denominator: {still_disabled}"
+        );
+        assert_eq!(chat.ctx_tokens().2, Some(0));
+    }
+
+    #[test]
+    fn history_trimmed_without_token_accounting_leaves_the_displayed_budget_alone() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: Some(12_000),
+            input_tokens_source: Some("provider".to_string()),
+            max_context_tokens: Some(32_000),
+            model_context_window: Some(200_000),
+        });
+
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 2,
+            dropped_turns: Some(1),
+            kept_turns: 1,
+            reason: "history message limit exceeded".to_string(),
+            token_budget: None,
+            tokens_before: None,
+            tokens_after: None,
+            tokens_before_source: None,
+            tokens_after_source: None,
+            unsatisfiable_floor: None,
+        });
+
+        assert_eq!(s.context_input_tokens, Some(12_000));
+        assert_eq!(s.context_input_tokens_source.as_deref(), Some("provider"));
+        assert_eq!(s.context_max_tokens, Some(32_000));
+        assert_eq!(s.context_model_window, Some(200_000));
+    }
+
+    #[test]
     fn history_trimmed_estimated_sources_render_estimate_label() {
         let mut s = state();
         s.apply_update(SessionUpdate::HistoryTrimmed {
@@ -31201,6 +33062,7 @@ mod tests {
         });
         s.copy_feedback = Some(CopyFeedback {
             target: CopyFeedbackTarget::Overlay(Rect::new(1, 1, 8, 1)),
+            outcome: crate::clipboard::CopyOutcome::Copied,
             shown_at: Instant::now(),
         });
         s.reset_for_session(
@@ -31494,31 +33356,29 @@ mod tests {
         use crate::client::MessageEntry;
         use ratatui::{Terminal, backend::TestBackend};
         let mut s = state();
-        s.load_history(
-            vec![
-                MessageEntry {
-                    role: "user".to_string(),
-                    content: "question".to_string(),
-                    ..Default::default()
-                },
-                MessageEntry {
-                    role: "assistant".to_string(),
-                    content: "partial answer".to_string(),
-                    ..Default::default()
-                },
-                MessageEntry {
-                    role: "system".to_string(),
-                    content: "localized recovery notice".to_string(),
-                    ..Default::default()
-                },
-                MessageEntry {
-                    role: "user".to_string(),
-                    content: "continue".to_string(),
-                    ..Default::default()
-                },
-            ],
-            true,
-        );
+        let mut messages = vec![
+            MessageEntry {
+                role: "user".to_string(),
+                content: "question".to_string(),
+                ..Default::default()
+            },
+            MessageEntry {
+                role: "assistant".to_string(),
+                content: "partial answer".to_string(),
+                ..Default::default()
+            },
+            MessageEntry {
+                role: "system".to_string(),
+                content: "localized recovery notice".to_string(),
+                ..Default::default()
+            },
+            MessageEntry {
+                role: "user".to_string(),
+                content: "continue".to_string(),
+                ..Default::default()
+            },
+        ];
+        s.load_history(messages.clone(), true);
         assert!(matches!(
             s.entries.as_slice(),
             [ChatEntry::UserMessage { .. }, ChatEntry::AgentMessage(partial),
@@ -31544,6 +33404,45 @@ mod tests {
             .expect("recovery notice is visible in the final terminal cells");
         let next = text.find("continue").expect("next prompt is visible");
         assert!(partial < notice && notice < next, "{text}");
+
+        let s = active_state(&mut chat);
+        s.browse_cursor = Some(3);
+        s.browse_anchor = Some(1);
+        s.browse_multi.insert(2);
+        let prefix = s.transcript_layout.view().cached_lines.clone();
+        messages.push(MessageEntry {
+            role: "assistant".to_string(),
+            content: "external answer".to_string(),
+            ..Default::default()
+        });
+        s.refresh_history(messages.clone(), true).unwrap();
+        assert_eq!(s.browse_cursor, Some(3));
+        assert_eq!(s.browse_anchor, Some(1));
+        assert!(s.browse_multi.contains(&2));
+        assert_eq!(
+            &s.transcript_layout.view().cached_lines[..prefix.len()],
+            prefix.as_slice()
+        );
+
+        // A changed prefix also maps the unchanged notice's identity.
+        messages.insert(
+            0,
+            MessageEntry {
+                role: "user".to_string(),
+                content: "earlier prompt".to_string(),
+                ..Default::default()
+            },
+        );
+        s.refresh_history(messages, true).unwrap();
+        assert_eq!(s.browse_cursor, Some(4));
+        assert_eq!(s.browse_anchor, Some(2));
+        assert!(s.browse_multi.contains(&3));
+        terminal
+            .draw(|frame| chat.draw_with_dock(frame, area, None, None))
+            .unwrap();
+        let text = overlay_text(&terminal, area);
+        assert!(text.contains("localized recovery notice"));
+        assert!(text.contains("external answer"));
     }
 
     #[test]
@@ -31784,6 +33683,505 @@ mod tests {
         assert!(
             s.pending_elicitation().is_none(),
             "a session switch must drop any stale elicitation modal"
+        );
+    }
+
+    #[test]
+    fn replacing_an_elicitation_queues_only_the_older_request() {
+        let mut s = state();
+        s.set_pending_elicitation(single_elicitation());
+        let mut newer = single_elicitation();
+        newer.request_id = serde_json::json!("newer");
+        s.set_pending_elicitation(newer);
+        let withdrawn = s.take_withdrawn_elicitations();
+        assert_eq!(withdrawn.len(), 1);
+        assert_eq!(withdrawn[0].request_id, Some(serde_json::json!("elicit-1")));
+        assert_eq!(
+            s.pending_elicitation().unwrap().request_id,
+            serde_json::json!("newer")
+        );
+    }
+
+    #[test]
+    fn older_elicitation_cards_do_not_hide_new_outcomes() {
+        let mut s = state();
+        stream_ask_user_turn(&mut s);
+        s.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-ask".to_string(),
+            raw_output: "Yes".to_string(),
+        });
+        s.record_elicitation_outcome("Pick one", "new withdrawal".to_string());
+        assert!(system_texts(&s).contains(&elicitation_outcome_note("Pick one", "new withdrawal")));
+
+        // An unanswered card from a prior user turn cannot match either.
+        let mut s = state();
+        stream_ask_user_turn(&mut s);
+        s.push_user_message(Some("Next turn".to_string()), Vec::new());
+        s.record_elicitation_outcome("Pick one", "new expiry".to_string());
+        assert!(system_texts(&s).contains(&elicitation_outcome_note("Pick one", "new expiry")));
+    }
+
+    #[tokio::test]
+    async fn withdrawn_elicitation_note_waits_for_resync_without_resending_cancel() {
+        let (mut chat, mut writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        chat.session_order = vec!["sess-1".to_string()];
+        chat.session_resync_in_flight.insert(
+            "sess-1".to_string(),
+            ResyncInFlight {
+                mode: SessionResyncMode::Reattach,
+                owned_turn: None,
+            },
+        );
+        let s = active_state(&mut chat);
+        s.set_pending_elicitation(single_elicitation());
+        s.withdraw_pending_elicitation(true);
+        chat.answer_withdrawn_elicitations();
+        let frame = next_rpc_request(&mut writer_rx, "cancel must not wait for reload").await;
+        assert_eq!(frame["result"]["action"], "cancel");
+        assert!(system_texts(active_state(&mut chat)).is_empty());
+        chat.answer_withdrawn_elicitations();
+        assert!(writer_rx.try_recv().is_err(), "cancel is sent only once");
+        chat.apply_session_resync_result(SessionResyncResult {
+            session_id: "sess-1".to_string(),
+            result: Ok(SessionResyncSnapshot {
+                messages: Vec::new(),
+                message_count: 0,
+                plan: None,
+                turn_running: false,
+            }),
+        });
+        chat.answer_withdrawn_elicitations();
+        assert!(
+            system_texts(active_state(&mut chat)).contains(&elicitation_outcome_note(
+                "Pick a fruit",
+                &crate::i18n::t("zc-chat-elicitation-withdrawn")
+            ))
+        );
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "recording the note sends no second cancel"
+        );
+    }
+
+    #[test]
+    fn elicitation_cards_bound_choices_and_preserve_expanded_results() {
+        for name in ["ask_user", "poll"] {
+            let choices: Vec<_> = (0..150).map(|i| format!("option-{i}")).collect();
+            let input = if name == "poll" {
+                serde_json::json!({"question": "Pick", "options": choices})
+            } else {
+                serde_json::json!({"question": "Pick", "choices": choices})
+            }
+            .to_string();
+            let result = format!("{}\nlast answer", "a".repeat(250));
+            let mut lines = Vec::new();
+            assert!(
+                render_tool_entry(
+                    &mut lines,
+                    name,
+                    &input,
+                    Some(&result),
+                    false,
+                    ToolDisclosure::Collapsed
+                )
+                .is_some()
+            );
+            let text = rendered_text(&lines);
+            assert!(text.contains("option-5"));
+            assert!(!text.contains("option-6"));
+            assert!(text.contains("144 more lines"));
+            assert!(!text.contains("last answer"));
+            lines.clear();
+            render_tool_entry(
+                &mut lines,
+                name,
+                &input,
+                Some(&result),
+                false,
+                ToolDisclosure::Full,
+            );
+            let text = rendered_text(&lines);
+            assert!(text.contains(&"a".repeat(250)));
+            assert!(text.contains("last answer"));
+            assert_eq!(text.matches("question:").count(), 1);
+            assert!(!text.contains("option-100"));
+            assert!(text.contains(&crate::i18n::t("zc-chat-tool-display-limited")));
+            assert!(lines.len() < 2 * TOOL_EXPANDED_MAX_LINES + 10);
+        }
+    }
+
+    #[test]
+    fn reset_for_session_queues_a_cancel_for_the_dropped_elicitation() {
+        let mut s = state();
+        s.set_pending_elicitation(single_elicitation());
+        s.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        let withdrawn = s.take_withdrawn_elicitations();
+        assert_eq!(withdrawn.len(), 1, "the daemon is still waiting on it");
+        assert_eq!(withdrawn[0].request_id, Some(serde_json::json!("elicit-1")));
+        assert!(
+            !withdrawn[0].note,
+            "the old session's note does not belong in the new one"
+        );
+    }
+
+    fn system_texts(state: &ChatState) -> Vec<String> {
+        state
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                ChatEntry::SystemMessage(text) => Some(text.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Regression (2026-10-09): a prompt that arrives while a reattach reload
+    /// is in flight was installed, then wiped by the reload's turn reset with
+    /// no reply. The daemon's `ask_user` waited out its 600 s timeout and the
+    /// user never saw the question. It must be answered `cancel` and noted.
+    #[tokio::test]
+    async fn elicitation_installed_during_reload_is_answered_not_dropped() {
+        let (mut chat, mut writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        chat.session_order = vec!["sess-1".to_string()];
+        chat.session_resync_in_flight.insert(
+            "sess-1".to_string(),
+            ResyncInFlight {
+                mode: SessionResyncMode::Reattach,
+                owned_turn: None,
+            },
+        );
+        assert!(matches!(
+            chat.try_install_elicitation(inbound_single_elicitation("e-mid", "sess-1")),
+            ElicitationRouting::Installed
+        ));
+
+        chat.apply_session_resync_result(SessionResyncResult {
+            session_id: "sess-1".to_string(),
+            result: Ok(SessionResyncSnapshot {
+                messages: Vec::new(),
+                message_count: 0,
+                plan: None,
+                turn_running: false,
+            }),
+        });
+        chat.answer_withdrawn_elicitations();
+
+        let frame = next_rpc_request(&mut writer_rx, "the dropped prompt must be answered").await;
+        assert_eq!(frame["id"], "e-mid");
+        assert_eq!(frame["result"]["action"], "cancel");
+        let state = active_state(&mut chat);
+        assert!(state.pending_elicitation.is_none());
+        let withdrawn =
+            elicitation_outcome_note("Pick one", &crate::i18n::t("zc-chat-elicitation-withdrawn"));
+        assert!(
+            withdrawn.contains("Pick one"),
+            "the note names the dropped question"
+        );
+        assert_eq!(
+            system_texts(state).last(),
+            Some(&withdrawn),
+            "the note lands after the reloaded history"
+        );
+    }
+
+    /// The agent's turn as the daemon streams it before an `ask_user`: some
+    /// text, then the tool call whose card carries the question.
+    fn stream_ask_user_turn(state: &mut ChatState) {
+        state.apply_update(SessionUpdate::AgentMessageChunk {
+            session_id: "sess-1".to_string(),
+            text: "Answer this one:".to_string(),
+        });
+        state.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-ask".to_string(),
+            name: "ask_user".to_string(),
+            raw_input: serde_json::json!({
+                "channel": "rpc",
+                "choices": ["Yes", "No"],
+                "question": "Pick one"
+            }),
+        });
+    }
+
+    fn rendered_transcript(state: &mut ChatState) -> String {
+        state.rebuild_lines(200);
+        rendered_text(&state.transcript_layout.view().cached_lines)
+    }
+
+    fn test_term() -> crate::config_manager::Term {
+        ratatui::Terminal::with_options(
+            crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .unwrap()
+    }
+
+    // Keymap overrides are process-global; hold the test lock across the
+    // key dispatch so another test cannot remap Enter mid-test.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn elicitation_question_choices_and_answer_are_recorded() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        use crossterm::event::{KeyCode, KeyModifiers};
+        crate::keymap::overrides::reset();
+        let (mut chat, mut writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        chat.session_order = vec!["sess-1".to_string()];
+        stream_ask_user_turn(active_state(&mut chat));
+        assert!(matches!(
+            chat.try_install_elicitation(inbound_single_elicitation("e-rec", "sess-1")),
+            ElicitationRouting::Installed
+        ));
+        assert!(
+            system_texts(active_state(&mut chat)).is_empty(),
+            "the tool card is the record of the question; arrival adds no line"
+        );
+
+        let mut term = test_term();
+        chat.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut term)
+            .await;
+        chat.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut term)
+            .await;
+
+        let frame = next_rpc_request(&mut writer_rx, "the answer must be sent").await;
+        assert_eq!(frame["id"], "e-rec");
+        assert_eq!(frame["result"]["content"]["choice"], "choice-1");
+        let state = active_state(&mut chat);
+        state.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-ask".to_string(),
+            raw_output: "No".to_string(),
+        });
+        assert!(
+            system_texts(state).is_empty(),
+            "the card's result is the record of the answer; no extra line"
+        );
+        let text = rendered_transcript(state);
+        assert_eq!(
+            text.matches("Pick one").count(),
+            1,
+            "the question is shown once, on the card: {text}"
+        );
+        assert!(text.contains("  question: Pick one"), "{text}");
+        assert!(
+            text.contains("    2. No"),
+            "the choices stay on record: {text}"
+        );
+    }
+
+    /// Regression (dogfood, 2026-10-13 and 2026-10-17): the "asked" line was
+    /// written when `elicitation/create` arrived, which can be before the
+    /// agent's text and the `ask_user` `ToolCall` are drained, so it sat
+    /// above the agent label and repeated the card. The outcome line then
+    /// repeated the card's `result:`. Here the request lands first, the turn
+    /// streams in after it, a parallel tool call finishes, and the user
+    /// presses Esc. The question appears once, inside the agent's turn, and
+    /// no outcome line is added next to the card.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn elicitation_with_a_card_adds_no_outcome_line() {
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        use crossterm::event::{KeyCode, KeyModifiers};
+        crate::keymap::overrides::reset();
+        let (mut chat, mut writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        chat.session_order = vec!["sess-1".to_string()];
+        assert!(matches!(
+            chat.try_install_elicitation(inbound_single_elicitation("e-ord", "sess-1")),
+            ElicitationRouting::Installed
+        ));
+        let state = active_state(&mut chat);
+        stream_ask_user_turn(state);
+        state.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-shell".to_string(),
+            name: "shell".to_string(),
+            raw_input: serde_json::json!({"command": "ls"}),
+        });
+        state.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-shell".to_string(),
+            raw_output: "file.txt".to_string(),
+        });
+        state.browse_cursor = Some(2);
+
+        let mut term = test_term();
+        chat.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut term)
+            .await;
+        let frame = next_rpc_request(&mut writer_rx, "the dismissal must be sent").await;
+        assert_eq!(frame["id"], "e-ord");
+        assert_eq!(frame["result"]["action"], "cancel");
+
+        let state = active_state(&mut chat);
+        let kinds: Vec<String> = state
+            .entries()
+            .iter()
+            .map(|entry| match entry {
+                ChatEntry::AgentMessage(_) => "agent".to_string(),
+                ChatEntry::Tool { name, .. } => format!("tool:{name}"),
+                ChatEntry::SystemMessage(text) => format!("system:{text}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "agent".to_string(),
+                "tool:ask_user".to_string(),
+                "tool:shell".to_string(),
+            ]
+        );
+        assert_eq!(
+            state.browse_cursor,
+            Some(2),
+            "the browse cursor is untouched"
+        );
+        let text = rendered_transcript(state);
+        assert_eq!(text.matches("Pick one").count(), 1, "{text}");
+        let label = text
+            .find(&crate::i18n::t("zc-chat-label-agent"))
+            .expect("agent label");
+        let question = text.find("question: Pick one").expect("card question");
+        assert!(
+            label < question,
+            "the card sits inside the agent turn: {text}"
+        );
+    }
+
+    #[test]
+    fn turn_complete_closes_a_stale_elicitation_and_records_it() {
+        let mut s = state();
+        s.set_pending_elicitation(single_elicitation());
+        s.apply_update(turn_complete("sess-1", TurnEndOutcome::Completed, "done"));
+        assert!(
+            s.pending_elicitation().is_none(),
+            "nobody is waiting on a prompt once its turn ends"
+        );
+        assert!(
+            system_texts(&s).contains(&elicitation_outcome_note(
+                "Pick a fruit",
+                &crate::i18n::t("zc-chat-elicitation-expired")
+            )),
+            "the unanswered outcome is recorded"
+        );
+        let withdrawn = s.take_withdrawn_elicitations();
+        assert_eq!(withdrawn.len(), 1);
+        assert_eq!(withdrawn[0].request_id, Some(serde_json::json!("elicit-1")));
+        assert!(!withdrawn[0].note, "the expiry was already recorded");
+    }
+
+    #[test]
+    fn ask_user_card_leads_with_the_question_and_lists_choices() {
+        // Key-sorted, as the daemon serializes tool input.
+        let input = serde_json::json!({
+            "channel": "rpc",
+            "choices": [
+                "A+B+C as proposed, filing all three upstream tonight",
+                "Only A and C now, B waits for the dogfood rebase",
+                "Something else (I'll type)"
+            ],
+            "question": "Which plan should I follow for the three bugs?",
+            "timeout_secs": 600
+        })
+        .to_string();
+        let mut lines = Vec::new();
+        render_tool_entry(
+            &mut lines,
+            "ask_user",
+            &input,
+            Some("Only A and C now, B waits for the dogfood rebase"),
+            false,
+            ToolDisclosure::Collapsed,
+        );
+        let text = rendered_text(&lines);
+        assert!(
+            text.contains("  question: Which plan should I follow for the three bugs?"),
+            "{text}"
+        );
+        assert!(text.contains("    1. A+B+C as proposed"), "{text}");
+        assert!(text.contains("    3. Something else (I'll type)"), "{text}");
+        assert!(
+            text.find("question:") < text.find("result:"),
+            "question before the outcome: {text}"
+        );
+    }
+
+    #[test]
+    fn expanded_ask_user_card_shows_whole_choices_within_shared_limits() {
+        let long = format!("{} end-of-long-choice", "word ".repeat(60));
+        let input = serde_json::json!({
+            "choices": [long, "first line\nsecond line of the choice", "short"],
+            "question": "Which one?"
+        })
+        .to_string();
+        let mut lines = Vec::new();
+        render_tool_entry(
+            &mut lines,
+            "ask_user",
+            &input,
+            None,
+            false,
+            ToolDisclosure::Full,
+        );
+        let text = rendered_text(&lines);
+        assert!(text.contains("end-of-long-choice"), "{text}");
+        assert!(text.contains("    2. first line"), "{text}");
+        assert!(text.contains("       second line of the choice"), "{text}");
+        assert!(text.contains("    3. short"), "{text}");
+
+        let mut collapsed = Vec::new();
+        render_tool_entry(
+            &mut collapsed,
+            "ask_user",
+            &input,
+            None,
+            false,
+            ToolDisclosure::Collapsed,
+        );
+        let collapsed = rendered_text(&collapsed);
+        assert!(!collapsed.contains("end-of-long-choice"), "{collapsed}");
+        assert!(
+            !collapsed.contains("second line of the choice"),
+            "{collapsed}"
+        );
+    }
+
+    #[test]
+    fn expanded_ask_user_choices_stop_at_the_shared_line_limit() {
+        let choices: Vec<String> = (0..TOOL_EXPANDED_MAX_LINES)
+            .map(|i| format!("choice {i}\nmore {i}"))
+            .collect();
+        let mut lines = Vec::new();
+        render_tool_entry(
+            &mut lines,
+            "poll",
+            &serde_json::json!({ "options": choices, "question": "Pick" }).to_string(),
+            None,
+            false,
+            ToolDisclosure::Full,
+        );
+        let choice_rows = rendered_text(&lines)
+            .lines()
+            .filter(|line| line.starts_with("    ") && !line.trim_start().is_empty())
+            .filter(|line| line.contains("choice ") || line.contains("more "))
+            .count();
+        assert_eq!(choice_rows, TOOL_EXPANDED_MAX_LINES);
+        assert!(
+            rendered_text(&lines).contains(&crate::i18n::t("zc-chat-tool-show-less")),
+            "the cut-off list keeps its footer"
         );
     }
 
@@ -32868,6 +35266,77 @@ mod tests {
                 "{kind:?}: Esc must close the popup"
             );
             assert!(!state.in_browse_mode());
+        }
+    }
+
+    #[test]
+    fn connected_composer_copy_feedback_reaches_chat_and_code_info_bar() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let _guard = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = runtime.enter();
+        for kind in [PaneKind::Chat, PaneKind::Acp] {
+            let (tx, mut rx) = mpsc::channel::<String>(16);
+            let rpc = Arc::new(RpcOutbound::new(tx));
+            let client = Arc::new(RpcClient::with_rpc(rpc));
+            let mut chat = Chat::new(client, kind);
+            let mut active = state();
+            active
+                .input_bar
+                .load_for_edit("selected draft".into(), Vec::new());
+            chat.phase = ChatPhase::Active(Box::new(active));
+            let mut term: crate::config_manager::Term = ratatui::Terminal::with_options(
+                crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+                },
+            )
+            .expect("test terminal");
+            runtime.block_on(chat.handle_key(
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+                &mut term,
+            ));
+            let copy = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+            let outcome = crate::clipboard::CopyOutcome::TerminalRequested;
+            crate::clipboard::with_copy_result(Ok(outcome), || {
+                assert!(!runtime.block_on(chat.handle_key(copy, &mut term)));
+            });
+            assert_eq!(
+                active_state(&mut chat).info_message.as_ref().unwrap().text,
+                outcome.notice()
+            );
+            assert_eq!(active_state(&mut chat).input_bar.input(), "selected draft");
+            assert!(active_state(&mut chat).input_bar.has_selection());
+
+            for key in ['c', 'x'] {
+                let error =
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer rejected copy");
+                let expected = crate::clipboard::copy_failure_notice(&error);
+                crate::clipboard::with_copy_result(Err(error), || {
+                    assert!(!runtime.block_on(chat.handle_key(
+                        KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL),
+                        &mut term,
+                    )));
+                });
+                assert_eq!(
+                    active_state(&mut chat).info_message.as_ref().unwrap().text,
+                    expected
+                );
+                assert_eq!(active_state(&mut chat).input_bar.input(), "selected draft");
+                assert!(active_state(&mut chat).input_bar.has_selection());
+                assert!(
+                    chat.wants_quit_chord(&copy),
+                    "failed copy keeps composer ownership"
+                );
+            }
+            assert!(rx.try_recv().is_err(), "composer copy must not issue RPCs");
         }
     }
 

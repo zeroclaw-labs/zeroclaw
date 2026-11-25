@@ -27,7 +27,7 @@ fn throwaway_config_dir() -> tempfile::TempDir {
     let config_dir = tempfile::tempdir().expect("temp config dir");
     std::fs::write(
         config_dir.path().join("config.toml"),
-        "schema_version = 3\n",
+        "schema_version = 4\n",
     )
     .expect("write config");
     config_dir
@@ -123,7 +123,7 @@ x-secret = true
     std::fs::write(
         config_dir.path().join("config.toml"),
         format!(
-            "schema_version = 3\n\n[plugins]\nplugins_dir = '{plugins_dir}'\n\n\
+            "schema_version = 4\n\n[plugins]\nplugins_dir = '{plugins_dir}'\n\n\
              [[plugins.entries]]\nname = \"{installed}\"\n\n\
              [[plugins.entries]]\nname = \"{not_installed}\"\n"
         ),
@@ -231,7 +231,7 @@ permissions = []
     );
     std::fs::write(
         config_dir.path().join("config.toml"),
-        format!("schema_version = 3\n\n[plugins]\nplugins_dir = '{plugins_dir}'\n"),
+        format!("schema_version = 4\n\n[plugins]\nplugins_dir = '{plugins_dir}'\n"),
     )
     .expect("write config");
     config_dir
@@ -375,7 +375,7 @@ mod refused_configuration {
         std::fs::write(
             config_dir.join("config.toml"),
             format!(
-                "schema_version = 3\n\n[plugins]\nplugins_dir = '{plugins_dir}'\n\n\
+                "schema_version = 4\n\n[plugins]\nplugins_dir = '{plugins_dir}'\n\n\
                  [[plugins.entries]]\nname = \"{}\"\n\n[plugins.entries.config]\n{values}",
                 tool_row_key()
             ),

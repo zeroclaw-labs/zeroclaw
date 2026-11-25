@@ -75,14 +75,17 @@ pub(crate) fn build_iteration_tool_specs(
     activated_tools: Option<&Arc<Mutex<ActivatedToolSet>>>,
 ) -> Result<IterationToolSpecs> {
     // Rebuild tool_specs each iteration so newly activated deferred tools appear.
+    // Advertisement uses the SAME exclusion predicate as execution and
+    // elicitation (trimmed, case-insensitive): a name the executor would
+    // refuse must never be advertised to the provider either.
     let mut tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
         .iter()
-        .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
+        .filter(|tool| !crate::agent::tool_execution::is_excluded_tool(tool.name(), excluded_tools))
         .map(|tool| tool.spec())
         .collect();
     let mut hidden_builtin_names = HashSet::new();
     if let Some(at) = activated_tools {
-        let activated_tools = match at.lock() {
+        let mut activated_tools = match at.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
                 ::zeroclaw_log::record!(
@@ -95,12 +98,15 @@ pub(crate) fn build_iteration_tool_specs(
                 poisoned.into_inner()
             }
         };
+        // A spec can follow live config, so the deferred copies that
+        // tool_search serves are refreshed from the live tools each iteration.
+        activated_tools.sync_deferred_builtin_specs(&tool_specs);
         // Turn exclusions can remove search without mutating the scoped registry.
         if tool_specs.iter().any(|spec| spec.name == "tool_search") {
             hidden_builtin_names = activated_tools.hidden_builtin_names();
         }
         for spec in activated_tools.tool_specs() {
-            if !excluded_tools.iter().any(|ex| ex == &spec.name) {
+            if !crate::agent::tool_execution::is_excluded_tool(&spec.name, excluded_tools) {
                 tool_specs.push(spec);
             }
         }
@@ -337,6 +343,98 @@ mod tests {
         );
     }
 
+    struct LiveSchemaTool {
+        limit: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for LiveSchemaTool {
+        fn name(&self) -> &str {
+            "live_schema"
+        }
+
+        fn description(&self) -> &str {
+            "Advertises a limit read from live state"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "maxItems": self.limit.load(Ordering::SeqCst)
+                    }
+                }
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            unreachable!("schema test should not execute the tool")
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for LiveSchemaTool {
+        fn role(&self) -> Role {
+            Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+
+        fn alias(&self) -> &str {
+            self.name()
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_builtin_schema_served_by_tool_search_follows_the_live_tool() {
+        let limit = Arc::new(AtomicUsize::new(3));
+        let live = Box::new(LiveSchemaTool {
+            limit: Arc::clone(&limit),
+        });
+        let search = Box::new(CountingTool::new(
+            "tool_search",
+            Arc::new(AtomicUsize::new(0)),
+        ));
+        let mut activated = ActivatedToolSet::new();
+        activated.set_deferred_builtin_specs(vec![live.spec()]);
+        let activated = Arc::new(Mutex::new(activated));
+        let registry: Vec<Box<dyn Tool>> = vec![live, search];
+
+        limit.store(7, Ordering::SeqCst);
+        build_iteration_tool_specs(
+            &NativeToolsProvider,
+            "test-model",
+            &registry,
+            &[],
+            Some(&activated),
+        )
+        .unwrap();
+
+        let result = crate::tools::ToolSearchTool::for_builtin_schemas(Arc::clone(&activated))
+            .execute(serde_json::json!({"query": "select:live_schema"}))
+            .await
+            .unwrap();
+        let schema: serde_json::Value = result
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("<function>")?.strip_suffix("</function>"))
+            .map(|schema| serde_json::from_str(schema).unwrap())
+            .expect("tool_search should return the selected schema");
+        assert_eq!(
+            schema["parameters"]["properties"]["items"]["maxItems"],
+            serde_json::json!(7),
+            "tool_search must serve the live schema, not the one captured at assembly"
+        );
+        assert!(
+            activated
+                .lock()
+                .unwrap()
+                .is_builtin_schema_exposed("live_schema")
+        );
+    }
+
     #[test]
     fn build_iteration_tool_specs_recovers_poisoned_activated_tool_lock() {
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
@@ -370,6 +468,49 @@ mod tests {
                 .iter()
                 .any(|spec| spec.name == "docker-mcp__extract_text"),
             "recovered poisoned lock should still expose activated tool specs"
+        );
+    }
+
+    #[test]
+    fn advertisement_uses_execution_exclusion_normalization() {
+        // Advertisement, execution, and elicitation share one exclusion
+        // predicate: a case- or whitespace-variant exclusion must suppress
+        // the provider-facing spec for static and activated tools alike.
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let static_tool = Box::new(CountingTool::new("send_via", Arc::clone(&invocations)));
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let activated_tool: Arc<dyn Tool> = Arc::new(CountingTool::new(
+            "docker-mcp__extract_text",
+            Arc::clone(&invocations),
+        ));
+        activated
+            .lock()
+            .unwrap()
+            .activate("docker-mcp__extract_text".into(), activated_tool);
+
+        let excluded = vec![
+            " SEND_VIA ".to_string(),
+            "DOCKER-MCP__EXTRACT_TEXT".to_string(),
+        ];
+        let specs = build_iteration_tool_specs(
+            &NativeToolsProvider,
+            "test-model",
+            &[static_tool],
+            &excluded,
+            Some(&activated),
+        )
+        .expect("specs should build");
+        assert!(
+            !specs
+                .tool_specs
+                .iter()
+                .any(|spec| spec.name == "send_via" || spec.name == "docker-mcp__extract_text"),
+            "normalized exclusions must suppress advertisement: {:?}",
+            specs
+                .tool_specs
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>()
         );
     }
 

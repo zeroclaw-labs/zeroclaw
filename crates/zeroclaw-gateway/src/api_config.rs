@@ -2974,6 +2974,12 @@ pub struct MigrateResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backup_path: Option<String>,
     pub schema_version: u32,
+    /// What the migration changed or assumed, one line each, as
+    /// `zeroclaw config migrate` reports them: a retired key removed, or a
+    /// missing `schema_version` read as V1 or V3. Key paths and reasons only,
+    /// never values.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<String>,
 }
 
 pub async fn handle_migrate(
@@ -3003,7 +3009,7 @@ pub async fn handle_migrate(
         }
     };
 
-    let migrated = match zeroclaw_config::migration::migrate_file(&raw) {
+    let migrated = match zeroclaw_config::migration::migrate_file_with_notices(&raw) {
         Ok(out) => out,
         Err(e) => {
             return error_response(ConfigApiError::new(
@@ -3014,7 +3020,14 @@ pub async fn handle_migrate(
     };
 
     match migrated {
-        Some(new_content) => {
+        Some((new_content, notices)) => {
+            // The `.bak` written below is replaced by the next save. Keep the
+            // pre-upgrade original as well, once per version, as
+            // `config migrate` and the save paths do.
+            let from_version = toml::from_str::<toml::Value>(&raw)
+                .ok()
+                .and_then(|value| zeroclaw_config::migration::detect_version(&value).ok())
+                .filter(|version| *version < zeroclaw_config::migration::CURRENT_SCHEMA_VERSION);
             let backup_path = config_path.with_extension("toml.bak");
             let parent = match config_path.parent() {
                 Some(p) => p.to_path_buf(),
@@ -3121,6 +3134,19 @@ pub async fn handle_migrate(
                     }
 
                     // 2. Backup BEFORE replacing the original.
+                    if let Some(version) = from_version
+                        && let Err(e) = zeroclaw_config::schema::keep_pre_upgrade_backup(
+                            &replace_config_path,
+                            version,
+                        )
+                        .await
+                    {
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                        return Err(ConfigApiError::new(
+                            ConfigApiCode::InternalError,
+                            format!("{e:#}"),
+                        ));
+                    }
                     if let Err(e) = tokio::fs::copy(&replace_config_path, &backup_path).await {
                         let _ = tokio::fs::remove_file(&temp_path).await;
                         return Err(ConfigApiError::new(
@@ -3178,6 +3204,10 @@ pub async fn handle_migrate(
                 migrated: true,
                 backup_path: Some(response_backup_path),
                 schema_version: zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,
+                notices: notices
+                    .iter()
+                    .map(zeroclaw_config::migration::MigrationNotice::message)
+                    .collect(),
             })
             .into_response()
         }
@@ -3185,6 +3215,7 @@ pub async fn handle_migrate(
             migrated: false,
             backup_path: None,
             schema_version: zeroclaw_config::migration::CURRENT_SCHEMA_VERSION,
+            notices: Vec::new(),
         })
         .into_response(),
     }
@@ -3463,7 +3494,6 @@ mod tests {
             session_backend: None,
             session_queue: Arc::new(crate::session_queue::SessionActorQueue::new(8, 30, 600)),
             device_registry: None,
-            pending_pairings: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -3662,7 +3692,11 @@ mod tests {
             )
             .unwrap(),
         );
-        let router = crate::config_admin_router(&auth).with_state(state.clone());
+        let router = crate::config_admin_router(crate::principal_gate::ConfigRouteAuth::new(
+            &auth,
+            &state.config,
+        ))
+        .with_state(state.clone());
         let read = || {
             axum::http::Request::builder()
                 .uri("/api/config/reload-status")
@@ -4041,6 +4075,36 @@ mod tests {
         }
     }
 
+    /// The dashboard's migrate reports what it changed, as `config migrate`
+    /// does, so an operator learns that a retired table was removed.
+    #[tokio::test]
+    async fn migration_reports_its_notices() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        tokio::fs::write(
+            &config_path,
+            "schema_version = 3\n\n[security.nevis]\nenabled = true\n",
+        )
+        .await
+        .unwrap();
+        let state = test_state(zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        });
+
+        let (status, json) = response_json(handle_migrate(State(state), None).await).await;
+
+        assert_eq!(status, StatusCode::OK);
+        let notices = json["notices"].as_array().expect("notices are returned");
+        assert!(
+            notices.iter().any(|notice| notice
+                .as_str()
+                .is_some_and(|n| n.contains("security.nevis"))),
+            "{json}"
+        );
+    }
+
     #[tokio::test]
     async fn migration_preserves_runtime_paths_and_publishes_schema_version() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4058,10 +4122,18 @@ mod tests {
             ..Default::default()
         });
 
+        let original = tokio::fs::read_to_string(&config_path).await.unwrap();
         let (status, json) = response_json(handle_migrate(State(state.clone()), None).await).await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["migrated"], true);
+        assert_eq!(
+            tokio::fs::read_to_string(tmp.path().join("selected-config.toml.v2.backup"))
+                .await
+                .unwrap(),
+            original,
+            "the pre-upgrade original is kept where the next save cannot replace it"
+        );
         assert_eq!(
             state.config.read().config_path,
             config_path,
@@ -4543,6 +4615,10 @@ mod tests {
             !config_path.with_extension("toml.bak").exists(),
             "no backup may be written before the candidate is accepted"
         );
+        assert!(
+            !install.path().join("config.toml.v1.backup").exists(),
+            "nor the lasting pre-upgrade copy"
+        );
         let residue: Vec<std::ffi::OsString> = std::fs::read_dir(install.path())
             .unwrap()
             .filter_map(|entry| entry.ok())
@@ -4692,7 +4768,11 @@ mod tests {
     async fn patch_enabling_an_opt_in_tool_follows_whether_the_build_carries_it() {
         use zeroclaw_config::opt_in_tools::OptInTool;
         let tmp = tempfile::tempdir().unwrap();
-        let config = temp_config(&tmp);
+        let mut config = temp_config(&tmp);
+        // `[web_search]` defaults to enabled and reports its own
+        // tool_compiled_out line in lean builds; this test counts the
+        // microsoft365 warning only.
+        config.web_search.enabled = false;
         config.save().await.unwrap();
         let state = test_state(config);
         let (status, json) = response_json(
@@ -4729,6 +4809,133 @@ mod tests {
                 .collect();
             assert_eq!(compiled_out.len(), 1, "{json}");
             assert_eq!(compiled_out[0]["path"], "microsoft365.enabled");
+        }
+    }
+
+    /// A string that `str::parse` reads as infinity or NaN is refused for a
+    /// float field with the field named, the whole patch is refused (an
+    /// earlier op in it is not applied), and the stored values are unchanged
+    /// in memory and on disk. A finite string still stores. Covers a plain
+    /// float (`memory.vector_weight`) and an optional one
+    /// (`runtime.docker.cpu_limit`).
+    #[tokio::test]
+    async fn patch_refuses_non_finite_float_text_and_keeps_the_stored_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = temp_config(&tmp);
+        config.save().await.unwrap();
+        let config_path = config.config_path.clone();
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        let (vector_weight, keyword_weight, cpu_limit) = (
+            config.memory.vector_weight,
+            config.memory.keyword_weight,
+            config.runtime.docker.cpu_limit,
+        );
+        let state = test_state(config);
+        let patch = |ops: serde_json::Value| {
+            let state = state.clone();
+            async move {
+                response_json(
+                    handle_patch(State(state), None, HeaderMap::new(), axum::Json(ops)).await,
+                )
+                .await
+            }
+        };
+
+        for text in [
+            "inf", "+inf", "-inf", "Infinity", "infinity", "NaN", "nan", "1e999", "-1e999",
+        ] {
+            for (pointer, prop) in [
+                ("/memory/vector_weight", "memory.vector_weight"),
+                ("/runtime/docker/cpu_limit", "runtime.docker.cpu_limit"),
+            ] {
+                let (status, json) = patch(serde_json::json!([
+                    {"op": "replace", "path": "/memory/keyword_weight", "value": 0.5},
+                    {"op": "replace", "path": pointer, "value": text}
+                ]))
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{text} {prop}: {json}");
+                assert_eq!(json["code"], "value_type_mismatch", "{text} {prop}: {json}");
+                assert_eq!(json["path"], prop, "{text}: {json}");
+                assert_eq!(json["op_index"], 1, "{text} {prop}: {json}");
+                {
+                    let live = state.config.read();
+                    assert_eq!(
+                        live.memory.vector_weight.to_bits(),
+                        vector_weight.to_bits(),
+                        "{text} {prop}"
+                    );
+                    assert_eq!(
+                        live.memory.keyword_weight.to_bits(),
+                        keyword_weight.to_bits(),
+                        "{text} {prop}"
+                    );
+                    assert_eq!(live.runtime.docker.cpu_limit, cpu_limit, "{text} {prop}");
+                }
+                assert_eq!(
+                    std::fs::read_to_string(&config_path).unwrap(),
+                    saved,
+                    "{text} {prop}"
+                );
+            }
+        }
+
+        let (status, json) = patch(serde_json::json!([
+            {"op": "replace", "path": "/memory/vector_weight", "value": "0.6"},
+            {"op": "replace", "path": "/runtime/docker/cpu_limit", "value": "2.5"}
+        ]))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(state.config.read().memory.vector_weight, 0.6);
+        assert_eq!(state.config.read().runtime.docker.cpu_limit, Some(2.5));
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(written.contains("vector_weight = 0.6"), "{written}");
+        assert!(written.contains("cpu_limit = 2.5"), "{written}");
+    }
+
+    /// `energy_threshold` is an `f32`. `1e39` is finite as an `f64`, so it
+    /// passes coercion, but the field would store infinity. As a JSON string
+    /// or a JSON number it is refused with the same code as other text that
+    /// is not a usable number, and the stored value is kept.
+    #[tokio::test]
+    async fn patch_refuses_a_value_too_large_for_an_f32_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.channels.voice_wake.insert(
+            "test".to_string(),
+            zeroclaw_config::schema::VoiceWakeConfig::default(),
+        );
+        config.save().await.unwrap();
+        let before = config.channels.voice_wake["test"].energy_threshold;
+        let state = test_state(config);
+
+        for value in [serde_json::json!("1e39"), serde_json::json!(1e39)] {
+            let (status, json) = response_json(
+                handle_patch(
+                    State(state.clone()),
+                    None,
+                    HeaderMap::new(),
+                    axum::Json(serde_json::json!([{
+                        "op": "replace",
+                        "path": "/channels/voice_wake/test/energy_threshold",
+                        "value": value
+                    }])),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{value}: {json}");
+            assert_eq!(json["code"], "value_type_mismatch", "{value}: {json}");
+            assert_eq!(
+                json["path"], "channels.voice_wake.test.energy_threshold",
+                "{value}: {json}"
+            );
+            assert_eq!(
+                state.config.read().channels.voice_wake["test"]
+                    .energy_threshold
+                    .to_bits(),
+                before.to_bits(),
+                "{value}"
+            );
         }
     }
 
@@ -6262,7 +6469,11 @@ mod tests {
             )
             .unwrap(),
         );
-        let router = crate::config_admin_router(&auth).with_state(state.clone());
+        let router = crate::config_admin_router(crate::principal_gate::ConfigRouteAuth::new(
+            &auth,
+            &state.config,
+        ))
+        .with_state(state.clone());
         let response = router
             .oneshot(
                 axum::http::Request::builder()
