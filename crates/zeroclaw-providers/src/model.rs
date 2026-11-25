@@ -537,11 +537,17 @@ mod tests {
                 "chat.retired":{"capability":"chat","provider":"retired","model":"old"}
             },
             "fallback":{"chat.primary":["chat.retired"]}
-        })).unwrap();
+        }))
+        .unwrap();
         let error = super::build_provider_in_registry(
-            &Config::default(), &registry, &"chat.primary".into(), super::ProviderOverrides::default(),
+            &Config::default(),
+            &registry,
+            &"chat.primary".into(),
+            super::ProviderOverrides::default(),
             &crate::ModelProviderRuntimeOptions::default(),
-        ).err().expect("a retired fallback must fail construction");
+        )
+        .err()
+        .expect("a retired fallback must fail construction");
         let message = error.to_string();
         assert!(message.contains("retired"), "{message}");
         assert!(message.contains("antigravity_cli"), "{message}");

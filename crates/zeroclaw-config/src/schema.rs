@@ -25602,7 +25602,12 @@ impl Config {
 
     /// Refuse the retired `gemini_cli` model provider with its migration path.
     fn validate_retired_gemini_cli(&self) -> Result<()> {
-        if let Some((name, _)) = self.providers.connections.iter().find(|(_, connection)| connection.kind() == "gemini_cli") {
+        if let Some((name, _)) = self
+            .providers
+            .connections
+            .iter()
+            .find(|(_, connection)| connection.kind() == "gemini_cli")
+        {
             validation_bail!(
                 ValidationFailed,
                 format!("providers.connections.{name}"),
@@ -36128,7 +36133,10 @@ auto_save = true
             serde_json::from_value(serde_json::json!({"kind":"gemini_cli"})).unwrap(),
         );
         let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("providers.connections.retired.home"), "{error}");
+        assert!(
+            error.contains("providers.connections.retired.home"),
+            "{error}"
+        );
         assert!(error.contains("retired"), "{error}");
         assert!(error.contains("antigravity_cli"), "{error}");
         config.providers.connections.clear();

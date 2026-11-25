@@ -1527,6 +1527,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn subprocess_connections_keep_typed_keys_in_the_shared_secret_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(dir.path(), true);
+        for kind in ["grok_cli", "antigravity_cli"] {
+            let mut connection: ProviderConnection = toml::from_str(&format!(
+                "kind = '{kind}'\n[auth]\nmode = 'api_key'\napi_key = 'synthetic-cli-key'\n"
+            ))
+            .unwrap();
+            assert!(connection.supports(Capability::Chat));
+            assert!(!connection.supports(Capability::Embedding));
+            connection
+                .encrypt_secrets(&store, "providers.connections.cli")
+                .unwrap();
+            assert!(SecretStore::is_secure_encrypted(
+                connection.api_key().unwrap()
+            ));
+            let mut masked = connection.clone();
+            masked.mask_secrets().unwrap();
+            assert_eq!(masked.api_key(), Some(MASKED_SECRET));
+            masked.restore_secrets_from(&connection).unwrap();
+            masked
+                .decrypt_secrets(&store, "providers.connections.cli")
+                .unwrap();
+            assert_eq!(masked.api_key(), Some("synthetic-cli-key"));
+        }
+    }
+
+    #[test]
     fn omitted_capabilities_use_kind_defaults_and_explicit_values_win() {
         let custom: ProviderConnection = toml::from_str(
             r#"

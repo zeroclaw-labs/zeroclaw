@@ -3857,10 +3857,11 @@ mod tests {
 
     #[test]
     fn factory_antigravity_cli() {
-        let error = match create_model_provider("antigravity_cli", Some("test-key"), &Default::default()) {
-            Ok(_) => panic!("unscoped antigravity_cli provider must fail"),
-            Err(error) => error,
-        };
+        let error =
+            match create_model_provider("antigravity_cli", Some("test-key"), &Default::default()) {
+                Ok(_) => panic!("unscoped antigravity_cli provider must fail"),
+                Err(error) => error,
+            };
         assert!(error.to_string().contains("working_directory"));
     }
 

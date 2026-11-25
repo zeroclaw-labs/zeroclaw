@@ -2581,7 +2581,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         for (kind, auth, env, expected) in [
             ("grok_cli", "gemini_api_key", vec!["XAI_API_KEY"], "either"),
-            ("antigravity_cli", "oauth_personal", vec![], "oauth_personal"),
+            (
+                "antigravity_cli",
+                "oauth_personal",
+                vec![],
+                "oauth_personal",
+            ),
         ] {
             let mut api = json!({"working_directory":root.path(),"binary_path":std::env::current_exe().unwrap(),"env_passthrough":env});
             if kind == "antigravity_cli" {
@@ -2595,9 +2600,14 @@ mod tests {
             let error = dispatch_model_ref_with_registry(
                 &registry,
                 &"chat.cli".into(),
-                &ModelProviderRuntimeOptions { zeroclaw_dir:Some(root.path().into()), ..Default::default() },
+                &ModelProviderRuntimeOptions {
+                    zeroclaw_dir: Some(root.path().into()),
+                    ..Default::default()
+                },
                 None,
-            ).err().expect("conflicting or refused auth must not construct a provider");
+            )
+            .err()
+            .expect("conflicting or refused auth must not construct a provider");
             assert!(error.to_string().contains(expected), "{kind}: {error}");
         }
     }

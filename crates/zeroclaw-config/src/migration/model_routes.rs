@@ -362,11 +362,13 @@ pub(super) fn legacy_model(
             api.insert(new.into(), value.clone());
         }
     }
-    if kind == "grok_cli" && api.get("request_timeout_secs").and_then(Value::as_u64) == Some(0) {
+    if matches!(kind, "grok_cli" | "antigravity_cli")
+        && api.get("request_timeout_secs").and_then(Value::as_u64) == Some(0)
+    {
         // The historical process builder treated zero as the bounded default.
         api.remove("request_timeout_secs");
     }
-    if kind != "grok_cli"
+    if !matches!(kind, "grok_cli" | "antigravity_cli")
         && let Some(timeout) = api.get("request_timeout_secs").and_then(Value::as_u64)
     {
         if timeout == 0 {
@@ -383,7 +385,10 @@ pub(super) fn legacy_model(
         }
     }
     // V3 omitted wire_api means chat completions, including old OpenAI rows.
-    if !matches!(kind, "gemini_cli" | "kilocli" | "grok_cli" | "hailo_ollama") {
+    if !matches!(
+        kind,
+        "gemini_cli" | "kilocli" | "grok_cli" | "antigravity_cli" | "hailo_ollama"
+    ) {
         api.entry("wire_api").or_insert(json!("chat_completions"));
     }
     // Hailo's queue deadline is connection policy; the inference request
@@ -499,7 +504,13 @@ mod tests {
 
     #[test]
     fn cli_routes_preserve_driver_settings_without_http_fields() {
-        for kind in ["gemini_cli", "kilocli", "grok_cli", "hailo_ollama"] {
+        for kind in [
+            "gemini_cli",
+            "kilocli",
+            "grok_cli",
+            "antigravity_cli",
+            "hailo_ollama",
+        ] {
             let raw = json!({
                 "model":"selected", "timeout_secs":30, "binary_path":"/usr/bin/driver",
                 "working_directory":"/workspace", "env_passthrough":["XAI_API_KEY"],
@@ -509,7 +520,7 @@ mod tests {
             let (connection, model) = legacy_model(&raw, kind, None, None).unwrap();
             let decoded: ProviderConnection = serde_json::from_value(connection.clone()).unwrap();
             assert_eq!(decoded.kind(), kind);
-            if kind == "grok_cli" {
+            if matches!(kind, "grok_cli" | "antigravity_cli") {
                 assert_eq!(connection["api"]["chat"]["request_timeout_secs"], 30);
                 assert!(
                     connection["api"]["chat"]
