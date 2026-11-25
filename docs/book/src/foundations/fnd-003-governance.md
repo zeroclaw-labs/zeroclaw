@@ -1,8 +1,8 @@
 # FND-003: Team Organization, Project Governance, and Contribution Pipeline
 
-> Starting v0.7.0 · Type: Governance · Rev. 19
+> Starting v0.7.0 · Type: Governance · Rev. 20
 >
-> **Canonical reference** · Ratified by the team · Rev. 19
+> **Canonical reference** · Ratified by the team · Rev. 20
 > Original governance discussion: [#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577)
 > Follow-up work-lane and label-governance policy: [#6808](https://github.com/zeroclaw-labs/zeroclaw/issues/6808)
 
@@ -37,6 +37,7 @@
 | 17 | 2026-08-23 | Defined deferred RFC vote handling for unchanged snapshots: no-quorum and missing-threshold or explicit-unanimity cases enter another recorded 72-hour cycle on the same vote, existing explicit ballots count toward quorum and outcome until replaced, and material revisions return the proposal to discussion rather than renewing the unchanged snapshot ([#10288](https://github.com/zeroclaw-labs/zeroclaw/pull/10288)) |
 | 18 | 2026-09-08 | Implemented the accepted second-review exception with one non-author Core approval, clean exact-head advisory evidence, green required CI, and no unresolved holds or findings; added a five-business-date waiting condition ([RFC #10366](https://github.com/zeroclaw-labs/zeroclaw/issues/10366), [#10677](https://github.com/zeroclaw-labs/zeroclaw/pull/10677)) |
 | 19 | 2026-09-13 | Removed mandatory pre-vote RFC discussion timers, made stable snapshot readiness the vote-opening gate, made valid `REVISE` ballots stop the current snapshot, and required deferred unchanged snapshots to continue only through a recorded deadline and carried-ballot record ([#10549](https://github.com/zeroclaw-labs/zeroclaw/issues/10549)) |
+| 20 | 2026-11-25 | Moved the public roadmap from a Project view to the pinned roadmap tracker, [#12712](https://github.com/zeroclaw-labs/zeroclaw/issues/12712), and made it the first pinned item |
 
 ---
 
@@ -198,6 +199,7 @@ Create four named views in the Project:
 - Grouped by: Milestone
 - Visible fields: Title, Type, Size, Component, Assignee
 - Purpose: Public-facing. "Here is what is coming and when." Share this link in the README and with the community. Keep it updated.
+- Current practice: the public roadmap is the pinned roadmap tracker, [#12712](https://github.com/zeroclaw-labs/zeroclaw/issues/12712), not a Project view. It lists the release order, the target dates and the v1.0.0 checklist, and the README links to it.
 
 #### View 2: Board
 
@@ -225,10 +227,11 @@ Create four named views in the Project:
 
 GitHub allows up to six pinned issues per repository. Use them for high-signal, always-visible communication:
 
-1. The current active RFC under discussion
-2. The most wanted community feature (highest-voted Discussion)
-3. The next release milestone tracking issue
-4. The good first issue index (an issue that links to all current `good first issue` items)
+1. The roadmap tracker, [#12712](https://github.com/zeroclaw-labs/zeroclaw/issues/12712): release order, target dates and the v1.0.0 checklist
+2. The current active RFC under discussion
+3. The most wanted community feature (highest-voted Discussion)
+4. The next release milestone tracking issue
+5. The good first issue index (an issue that links to all current `good first issue` items)
 
 Pinned issues are a promise to the community: these are the things that matter most right now. Update them when priorities shift.
 
@@ -902,7 +905,7 @@ As the plugin system becomes usable, external contributors will start arriving. 
 By v1.0.0, the governance model should be self-sustaining: the team should not need to think about it, it should just work.
 
 - [ ] Review and update the governance document based on what has worked and what has not
-- [ ] Establish the release cadence (how often are releases cut, who cuts them)
+- [ ] Establish the release cadence (how often are releases cut, who cuts them). Until v1.0.0, the release order and target dates are kept in the roadmap tracker, [#12712](https://github.com/zeroclaw-labs/zeroclaw/issues/12712).
 - [ ] Publish the plugin registry governance document (per the architecture RFC)
 - [ ] Consider introducing time-boxed cycles (two or four weeks) if milestone-only planning feels too loose
 - [ ] Document the process for a Core Team member to step down or become inactive
