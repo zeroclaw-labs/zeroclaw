@@ -221,9 +221,6 @@ fn typed_env_value(
     parsed: &Value,
     literal: &Value,
 ) -> Result<Option<Value>> {
-    if parsed == literal {
-        return Ok(Some(parsed.clone()));
-    }
     // The schema is the source for the leaf's type, including credentials
     // that happen to look like JSON numbers. Probe independently so a valid
     // numeric option cannot turn into a string while repairing another leaf.
@@ -231,6 +228,9 @@ fn typed_env_value(
     set_document(&mut probe, path, parsed.clone(), None)?;
     if serde_json::from_value::<crate::providers::Providers>(probe).is_ok() {
         return Ok(Some(parsed.clone()));
+    }
+    if parsed == literal {
+        return Ok(None);
     }
     let mut probe = template.clone();
     set_document(&mut probe, path, literal.clone(), None)?;
@@ -245,21 +245,39 @@ fn typed_env_value(
 /// Compound auth overrides must not admit an incomplete intermediate variant.
 pub(crate) fn set_many(config: &mut Config, edits: &[(String, String)]) -> Result<()> {
     let mut document = serde_json::to_value(&config.providers)?;
-    let mut type_template = document.clone();
-    let mut parsed_edits = Vec::with_capacity(edits.len());
-    for (path, value) in edits {
-        let (parsed, literal) = env_value(value);
-        // Enum tags, removals and whole-object replacements must all be in
-        // the completed type probe. A legacy OAuth edit replaces the entire
-        // auth object and removes fields from its former API-key variant.
-        if parsed == literal || parsed.is_object() || parsed.is_array() {
-            set_document(&mut type_template, path, parsed.clone(), None)?;
+    let mut probe = document.clone();
+    let parsed_edits: Vec<_> = edits
+        .iter()
+        .map(|(path, value)| (path, env_value(value)))
+        .collect();
+    let mut selected = vec![None; edits.len()];
+    // Keep the probe schema-valid. Defer edits that require another edit
+    // first (for example an OAuth leaf before its mode, or a mode change
+    // before a whole-auth replacement removes the old API key). Each round
+    // selects at least one additional edit or terminates; unrelated malformed
+    // intermediate values never determine a different leaf's representation.
+    loop {
+        let mut progressed = false;
+        for (index, (path, (parsed, literal))) in parsed_edits.iter().enumerate() {
+            if selected[index].is_some() {
+                continue;
+            }
+            if let Some(value) = typed_env_value(&probe, path, parsed, literal)? {
+                set_document(&mut probe, path, value.clone(), None)?;
+                selected[index] = Some(value);
+                progressed = true;
+            }
         }
-        parsed_edits.push((path, parsed, literal));
+        if !progressed {
+            break;
+        }
     }
-
-    for (path, parsed, literal) in parsed_edits {
-        let value = typed_env_value(&type_template, path, &parsed, &literal)?.unwrap_or(parsed);
+    // Probe order only selects representations. Replaying the original order
+    // preserves last-write semantics for overlapping leaf/whole-object edits.
+    // An unresolved edit may be superseded by a later replacement; otherwise
+    // final typed admission below reports the invalid completed configuration.
+    for ((path, (parsed, _)), value) in parsed_edits.into_iter().zip(selected) {
+        let value = value.unwrap_or(parsed);
         set_document(&mut document, path, value, None)?;
     }
     for (path, _) in edits {
@@ -572,6 +590,65 @@ mod tests {
             "123"
         );
         assert_eq!(document["models"]["chat.Fast.v2"]["model"], "456");
+    }
+
+    #[test]
+    fn batch_preserves_structured_looking_and_numeric_header_strings() {
+        let mut config = fixture();
+        set_many(
+            &mut config,
+            &[
+                (
+                    "/providers/connections/gateway.Prod/extra_headers/X-Meta".into(),
+                    r#"{"tenant":"work"}"#.into(),
+                ),
+                (
+                    "/providers/connections/gateway.Prod/extra_headers/X-Project-Id".into(),
+                    "123".into(),
+                ),
+            ],
+        )
+        .unwrap();
+        let document = serde_json::to_value(&config.providers).unwrap();
+        assert_eq!(
+            document["connections"]["gateway.Prod"]["extra_headers"]["X-Meta"],
+            r#"{"tenant":"work"}"#
+        );
+        assert_eq!(
+            document["connections"]["gateway.Prod"]["extra_headers"]["X-Project-Id"],
+            "123"
+        );
+    }
+
+    #[test]
+    fn deferred_leaf_cannot_override_a_later_whole_auth_edit() {
+        let mut config = Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {"gemini": {"kind": "gemini"}},
+                "models": {}
+            }))
+            .unwrap(),
+            ..Config::default()
+        };
+        set_many(
+            &mut config,
+            &[
+                (
+                    "/providers/connections/gemini/auth/client_secret".into(),
+                    "early-secret".into(),
+                ),
+                (
+                    "/providers/connections/gemini/auth".into(),
+                    r#"{"mode":"oauth","client_secret":"final-secret"}"#.into(),
+                ),
+            ],
+        )
+        .unwrap();
+        let document = serde_json::to_value(&config.providers).unwrap();
+        assert_eq!(
+            document["connections"]["gemini"]["auth"]["client_secret"],
+            "final-secret"
+        );
     }
 
     #[test]
