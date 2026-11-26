@@ -199,6 +199,9 @@ they will be, so to rename an entry without orphaning its data later, set
 
 ### OIDC
 
+[Identity providers](./identity-providers.md) lists the providers tested
+with ZeroClaw, what each one needs, and the current limitations.
+
 Each `[oidc.<alias>]` entry is one trust relationship with one issuer;
 token verification (offline JWKS or RFC 7662 introspection), claim
 mapping, and the lifetime bounds are documented on the section reference:
@@ -239,8 +242,10 @@ the same URL policy as the issuer (`https`, or `http` only for an exact
 loopback host), redirects are never followed, response bodies are
 size-capped, and a token response is accepted only when it carries a
 non-empty `Bearer` access token. A confidential client (an entry with a
-`client_secret`) authenticates with HTTP Basic on every request; a public
-client sends its `client_id` in the form.
+`client_secret`) authenticates with HTTP Basic on device-grant and
+`client_credentials` requests, and sends the secret in the form body for the
+authorization-code exchange (`--browser`, the gateway's browser flow and
+dashboard sign-in); a public client sends its `client_id` in the form.
 
 `--browser` opens the system browser for you on macOS and Linux, and on
 every platform it also prints the sign-in URL so you can open it by
@@ -376,7 +381,10 @@ above five minutes rather than sleeping on a hostile answer. An
 advertised interval of `0` or `1` is floored at RFC 8628's five-second
 default, so a gateway answer cannot put zerocode on a once-a-second
 poll the per-client budget would only refuse. The legacy automatic enrollment
-path holds the token in memory for that session only. For URL-scoped persistent login, use
+path holds the token in memory for that session only. That path uses the
+same device-grant helper as `zerocode login`, so it also sends an S256
+PKCE challenge; a provider that rejects `code_challenge` on its device
+authorization endpoint will fail here as well. For URL-scoped persistent login, use
 `zerocode login <alias> <wss-url> --gateway-url <https-origin>`; see
 [Remote setup](../zerocode/remote.md#sign-in-with-oidc-recommended-for-oidc-deployments).
 That command starts from an empty client directory: OIDC sign-in authorizes
@@ -727,7 +735,8 @@ Turning it on needs:
   address, which the daemon logs at startup.
   Its client must be listed in `interactive_clients` (or classified by
   `actor_claim`), and its access tokens must carry the configured
-  `audience`.
+  `audience`. [Identity providers](./identity-providers.md) lists the
+  providers tested for this and the settings each one needs.
 - An access-token lifetime that suits a working session, such as one to
   eight hours. The dashboard does not use refresh tokens: when the token
   expires the user signs in again.
@@ -809,6 +818,10 @@ What a signed-in account can do follows its permission profile:
     open it. Use zerocode when an account needs history that outlasts its
     chat.
 
+Completing sign-in in one dashboard tab tells the other open dashboard
+tabs to check their session. A tab showing the sign-in screen then opens
+the dashboard. Ordinary reloads keep other tabs quiet.
+
 Sign-out ends the session in this ZeroClaw and drops its cookie, also
 when the session had already ended; it does not sign the user out of the
 identity provider. When a session ends (sign-out, expiry, or a
@@ -866,9 +879,13 @@ Things to know before turning it on:
 - `session_lifetime_secs` caps sessions that start after it is set;
   sessions already signed in keep the cap they started with. To end them
   sooner, take the provider off `gateway.dashboard_sign_in.oidc`.
-- With introspection, an identity provider that cannot be reached when a
-  session is due for revalidation ends that session (it fails closed);
-  users sign in again once the provider is back.
+- An identity provider that cannot be reached, or answers with an error,
+  when a session's token is verified again ends that session (it fails
+  closed). That happens at each introspection revalidation deadline, and
+  in either validation mode after a configuration reload or a change to
+  the OIDC, user or permission-profile configuration. The dashboard
+  reports the session as expired; users sign in again once the provider is
+  back (#12096).
 
 ## Credential lifecycle
 
@@ -1074,9 +1091,10 @@ opens inside an allowed root instead.
 
 ### Keycloak access-token client attribution
 
-JWKS verification accepts a signed `azp` as the OAuth client identifier when a
-typed access token has no `client_id` and the configured client declaration or
-`actor_claim` establishes a human actor. The issuer, signature, token purpose,
+With the default claim names, JWKS verification accepts a signed `azp` as the
+OAuth client identifier when a typed access token has no `client_id` and the
+configured client declaration or `actor_claim` establishes a human actor.
+The issuer, signature, token purpose,
 audience, lifetime and actor-classification checks still apply. An `azp`-only
 token cannot authenticate a service, including one classified by `actor_claim`;
 service actors still require `client_id`. A blank `client_id`, contradictory
