@@ -1636,6 +1636,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_search_disables_batch_preview_until_live_dispatch() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(32);
+        let mut ctx = test_ctx(&observer, &pacing, &tx);
+        let exempt = vec!["shell".to_string()];
+        ctx.dedup_exempt_tools = &exempt;
+        let args = serde_json::json!({"command":"same"});
+        let calls = vec![
+            parsed_call(
+                "tool_search",
+                serde_json::json!({"query":"deferred"}),
+                "search",
+            ),
+            parsed_call("shell", args.clone(), "a1"),
+            parsed_call("shell", args.clone(), "a2"),
+            parsed_call("shell", args.clone(), "a3"),
+            parsed_call("unresolved", serde_json::json!({}), "b"),
+            parsed_call("shell", args, "a4"),
+        ];
+        let detector = crate::agent::loop_detector::LoopDetector::new(Default::default());
+        let prepared = prepare_tool_calls(
+            &ctx,
+            &stub_tools(&["tool_search", "shell"]),
+            None,
+            &[],
+            &calls,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            0,
+            false,
+            Some(&detector),
+        )
+        .await
+        .unwrap();
+        assert!(!prepared.preflight_loop_stopped);
+        assert_eq!(
+            prepared
+                .executable_calls
+                .iter()
+                .filter(|call| call.name == "shell")
+                .count(),
+            4
+        );
+        assert!(
+            prepared
+                .executable_calls
+                .iter()
+                .any(|call| call.name == "tool_search")
+        );
+    }
+
+    #[tokio::test]
     async fn loop_preflight_unavailable_calls_do_not_reset_executable_repeats() {
         for dedup_enabled in [false, true] {
             let observer = NoopObserver;
