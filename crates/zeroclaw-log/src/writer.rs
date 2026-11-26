@@ -507,7 +507,7 @@ fn has_unterminated_tail(path: &Path) -> Result<bool> {
     let mut last_byte = [0];
     file.read_exact(&mut last_byte)
         .context("reading the last byte of the active log")?;
-    Ok(last_byte != [b'\n'])
+    Ok(last_byte != *b"\n")
 }
 
 /// Public accessor for the canonical log file path. Used by the gateway's
