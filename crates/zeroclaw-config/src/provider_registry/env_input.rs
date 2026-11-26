@@ -30,7 +30,7 @@ pub(crate) fn path_with_staged(
         "models"
             if staged
                 .and_then(|document| document["models"].get(*key))
-                .is_some_and(|value| !value.is_null())
+                .is_some_and(|value| value.get("capability").is_some())
                 || config
                     .providers
                     .models
