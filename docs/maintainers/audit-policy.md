@@ -62,8 +62,8 @@ These ignores mark advisories with an exploitable bug. They are
 
 There is no active exploitable-advisory waiver in this branch. The
 `rusqlite` 0.41.1 / `libsqlite3-sys` 0.39.1 upgrade supplies patched SQLite
-3.54.1 and removes `RUSTSEC-2026-0459` from both tool files. The registry
-publication hold for the Matrix dependency remains tracked in #12322.
+3.54.1 and removes `RUSTSEC-2026-0459` from both tool files. The published
+Matrix SDK 0.20.0 dependency resolves the publication hold tracked in #12322.
 
 Live, audit-only (`.cargo/audit.toml` only):
 
