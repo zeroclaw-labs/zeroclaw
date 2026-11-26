@@ -24544,6 +24544,7 @@ impl Config {
         self.collect_verifiable_intent_warnings(&mut warnings);
         self.collect_cron_claim_warnings(&mut warnings);
         self.collect_compiled_out_tool_warnings(&mut warnings);
+        self.collect_removed_tool_warnings(&mut warnings);
         self.collect_dead_delegate_grant_warnings(&mut warnings);
         warnings.extend(validate_memory_semantics(&self.memory));
         for (alias, wa) in &self.channels.whatsapp {
@@ -25249,6 +25250,25 @@ impl Config {
         }
     }
 
+    /// Report an enabled section for a tool ZeroClaw no longer ships.
+    ///
+    /// `validate_retired_gemini_cli` refuses the same condition, but
+    /// `zeroclaw doctor` and the dashboard read only this list. Without this
+    /// entry they would say nothing, and the tool would vanish from an agent
+    /// without explanation.
+    fn collect_removed_tool_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        if self.gemini_cli.enabled {
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                crate::validation_warnings::TOOL_REMOVED,
+                GEMINI_CLI_TOOL_RETIRED.to_string(),
+                "gemini_cli.enabled".to_string(),
+            ));
+        }
+    }
+
     /// Refuse the retired `gemini_cli` model provider and tool with their
     /// migration paths.
     fn validate_retired_gemini_cli(&self) -> Result<()> {
@@ -25276,7 +25296,6 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
         self.cost.rates.validate()?;
-        self.validate_retired_gemini_cli()?;
 
         for (profile_alias, profile) in &self.runtime_profiles {
             if profile.max_execution_tree_iterations == Some(0) {
@@ -26173,9 +26192,16 @@ impl Config {
         // on stderr) and via Config::collect_warnings (gateway HTTP returns
         // structured to dashboard callers). Single source of truth lives in
         // collect_warnings; emit them to tracing here so the existing log
-        // behavior is preserved, with the single documented exception below.
+        // behavior is preserved, with the documented exceptions below.
         for w in self.collect_warnings() {
-            // One code is held back from this loop on purpose. The runtime
+            // A removed tool's warning mirrors the error
+            // `validate_retired_gemini_cli` returns at the end of this
+            // function, with the same text. Tracing it here as well would put
+            // two copies of the notice next to each other.
+            if w.code == crate::validation_warnings::TOOL_REMOVED {
+                continue;
+            }
+            // The withheld-capability code is held back on purpose too. The runtime
             // already records the withheld-capability notice itself, with an
             // explicit `System` category and the same code and path, once at
             // every config application. Records emitted here carry no category
@@ -27261,6 +27287,11 @@ impl Config {
                 }
             }
         }
+
+        // Retired sections are checked last. Validation stops at the first
+        // error, so checking them earlier would hide every problem in the
+        // checks above, which guard live behavior, behind a removal notice.
+        self.validate_retired_gemini_cli()?;
 
         Ok(())
     }
@@ -35771,6 +35802,66 @@ auto_save = true
             .to_string();
         assert!(error.contains("gemini_cli.enabled"), "{error}");
         assert!(error.contains("removed"), "{error}");
+    }
+
+    #[test]
+    async fn enabled_gemini_cli_section_is_reported_by_collect_warnings() {
+        let removed = |config: &Config| -> Vec<crate::validation_warnings::ValidationWarning> {
+            config
+                .collect_warnings()
+                .into_iter()
+                .filter(|w| w.code == crate::validation_warnings::TOOL_REMOVED)
+                .collect()
+        };
+
+        let mut config = Config::default();
+        assert!(
+            removed(&config).is_empty(),
+            "a disabled [gemini_cli] section is not reported"
+        );
+
+        config.gemini_cli.enabled = true;
+        let warnings = removed(&config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].path, "gemini_cli.enabled");
+        assert_eq!(warnings[0].message, GEMINI_CLI_TOOL_RETIRED);
+    }
+
+    #[test]
+    async fn retired_gemini_cli_sections_do_not_hide_other_validation_errors() {
+        let with_other_error = || {
+            let mut config = Config::default();
+            config.runtime_profiles.insert(
+                "default".to_string(),
+                RuntimeProfileConfig {
+                    max_execution_tree_iterations: Some(0),
+                    ..RuntimeProfileConfig::default()
+                },
+            );
+            config
+        };
+
+        // Each retired trigger on its own still refuses the config, and an
+        // unrelated error elsewhere is the one reported first.
+        let mut tool = with_other_error();
+        tool.gemini_cli.enabled = true;
+        let mut provider = with_other_error();
+        provider
+            .providers
+            .models
+            .gemini_cli
+            .insert("home".to_string(), GeminiCliModelProviderConfig::default());
+
+        for (label, config) in [("tool", tool), ("provider", provider)] {
+            let error = config
+                .validate()
+                .expect_err("the config has an unrelated error")
+                .to_string();
+            assert!(
+                error.contains("max_execution_tree_iterations"),
+                "{label}: the unrelated error must not be hidden by the retired section: {error}"
+            );
+        }
     }
 
     #[test]
