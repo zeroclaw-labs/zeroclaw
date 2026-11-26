@@ -933,7 +933,12 @@ pub(crate) fn prepare_memory_env_input(
 
 /// Authentication-mode input replaces one auth object atomically. The
 /// pre-override snapshot therefore restores the original mode and credential.
-pub(crate) fn legacy_env_value(config: &Config, tail: &str, value: &str) -> Result<String> {
+pub(crate) fn legacy_env_value(
+    config: &Config,
+    staged: &serde_json::Value,
+    tail: &str,
+    value: &str,
+) -> Result<String> {
     let parts: Vec<_> = tail.split("__").collect();
     let ["providers", "models", family, alias, field] = parts.as_slice() else {
         return Ok(value.into());
@@ -942,10 +947,8 @@ pub(crate) fn legacy_env_value(config: &Config, tail: &str, value: &str) -> Resu
     let Some(model) = config.providers.models.canonical_model(&reference) else {
         return Ok(value.into());
     };
-    let connection = config
-        .providers
-        .connections
-        .get(model.provider())
+    let raw = staged["connections"]
+        .get(model.provider().as_str())
         .context("historical env target has no connection")?;
     let oauth_field = super::model_routes::LEGACY_OAUTH_FIELDS
         .iter()
@@ -970,11 +973,10 @@ pub(crate) fn legacy_env_value(config: &Config, tail: &str, value: &str) -> Resu
         _ if oauth_field.is_some() => "oauth",
         _ => return Ok(value.into()),
     };
-    let raw = serde_json::to_value(connection)?;
     let mut auth = json!({"mode":mode});
     if mode == "api_key" {
-        if let Some(key) = connection.api_key() {
-            auth["api_key"] = key.into();
+        if let Some(key) = raw.get("auth").and_then(|auth| auth.get("api_key")) {
+            auth["api_key"] = key.clone();
         }
     } else if mode == "oauth" {
         for &(_, key) in super::model_routes::LEGACY_OAUTH_FIELDS {

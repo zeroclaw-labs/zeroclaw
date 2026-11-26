@@ -70,8 +70,10 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
     // One admission-time source for snapshots, including several env names
     // that address the same field or create the same optional auth table.
     let registry_before = serde_json::to_value(&config.providers)?;
+    let mut registry_staged = registry_before.clone();
     let mut paths: HashSet<String> = HashSet::with_capacity(entries.len());
     let mut snapshots: HashMap<String, String> = HashMap::with_capacity(entries.len());
+    let mut registry_edits = Vec::new();
     for (env_name, value, tail) in entries {
         // Recognized legacy `[todotracker]` vars are accepted and ignored so an
         // upgrade cannot turn a previously working deployment into a daemon
@@ -118,8 +120,13 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
         }
         let path = resolve_path(&tail, config)
             .with_context(|| format!("{env_name} did not resolve to a schema path"))?;
-        let value = crate::migration::provider_inputs::legacy_env_value(config, &tail, &value)
-            .with_context(|| format!("{env_name} did not resolve to a canonical override value"))?;
+        let value = crate::migration::provider_inputs::legacy_env_value(
+            config,
+            &registry_staged,
+            &tail,
+            &value,
+        )
+        .with_context(|| format!("{env_name} did not resolve to a canonical override value"))?;
         if NON_OVERRIDABLE_PATHS.contains(path.as_str()) {
             ::zeroclaw_log::record!(
                 WARN,
@@ -142,7 +149,9 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
         snapshots.entry(path.clone()).or_insert(snapshot);
 
         if path.starts_with("/providers/") {
-            crate::provider_registry::env_input::set(config, &path, &value, false)
+            crate::provider_registry::env_input::stage(&mut registry_staged, &path, &value)?;
+            registry_edits.push((path.clone(), value.clone(), env_name.clone()));
+            Ok(())
         } else {
             config.set_prop(&path, &value)
         }
@@ -164,6 +173,20 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
             );
         }
         paths.insert(path);
+    }
+    if !registry_edits.is_empty() {
+        let edits: Vec<_> = registry_edits
+            .iter()
+            .map(|(path, value, _)| (path.clone(), value.clone()))
+            .collect();
+        crate::provider_registry::env_input::set_many(config, &edits).with_context(|| {
+            let names = registry_edits
+                .iter()
+                .map(|(_, _, name)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("registry environment overrides ({names})")
+        })?;
     }
     if !paths.is_empty() {
         ::zeroclaw_log::record!(
@@ -569,6 +592,152 @@ oauth_client_secret = "original-secret"
     }
 
     #[tokio::test]
+    async fn historical_oauth_pair_composes_before_registry_admission() {
+        let _guard = super::env_test_lock().await;
+        let _client = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__gemini__work__oauth_client_id",
+            "env-client",
+        );
+        let _secret = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__gemini__work__oauth_client_secret",
+            "env-client-secret",
+        );
+        let mut config: Config = toml::from_str(
+            r#"
+[providers.models.gemini.work]
+model = "gemini-test"
+oauth_client_id = "original-client"
+oauth_client_secret = "original-secret"
+"#,
+        )
+        .unwrap();
+        let before = serde_json::to_value(&config.providers).unwrap();
+        let applied = apply_env_overrides(&mut config).unwrap();
+        assert_eq!(
+            config
+                .gemini_oauth_client_credentials("gemini.work")
+                .unwrap(),
+            Some(("env-client".into(), "env-client-secret".into()))
+        );
+        mask_env_overrides_for_save(&mut config, &applied.snapshots).unwrap();
+        assert_eq!(serde_json::to_value(&config.providers).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn mixed_auth_env_names_preserve_json_looking_keys() {
+        let _guard = super::env_test_lock().await;
+        let _key = EnvVarGuard::set(
+            "ZEROCLAW_providers__connections__gemini__auth__api_key",
+            "123",
+        );
+        let _mode = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__gemini__work__auth_mode",
+            "api_key",
+        );
+        let mut config: Config = toml::from_str(
+            r#"
+[providers.connections.gemini]
+kind = "gemini"
+[providers.models."gemini.work"]
+capability = "chat"
+provider = "gemini"
+model = "gemini-test"
+"#,
+        )
+        .unwrap();
+        let before = serde_json::to_value(&config.providers).unwrap();
+        let applied = apply_env_overrides(&mut config).unwrap();
+        assert_eq!(
+            config.providers.connections["gemini"].api_key(),
+            Some("123")
+        );
+        mask_env_overrides_for_save(&mut config, &applied.snapshots).unwrap();
+        assert_eq!(serde_json::to_value(&config.providers).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn mixed_oauth_env_names_preserve_a_numeric_client_secret() {
+        let _guard = super::env_test_lock().await;
+        let _secret = EnvVarGuard::set(
+            "ZEROCLAW_providers__connections__gemini__auth__client_secret",
+            "123",
+        );
+        let _mode = EnvVarGuard::set(
+            "ZEROCLAW_providers__connections__gemini__auth__mode",
+            "oauth",
+        );
+        let _client = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__gemini__work__oauth_client_id",
+            "env-client",
+        );
+        let mut config: Config = toml::from_str(
+            r#"
+[providers.connections.gemini]
+kind = "gemini"
+[providers.models."gemini.work"]
+capability = "chat"
+provider = "gemini"
+model = "gemini-test"
+"#,
+        )
+        .unwrap();
+        let before = serde_json::to_value(&config.providers).unwrap();
+        let applied = apply_env_overrides(&mut config).unwrap();
+        assert_eq!(
+            config
+                .gemini_oauth_client_credentials("gemini.work")
+                .unwrap(),
+            Some(("env-client".into(), "123".into()))
+        );
+        mask_env_overrides_for_save(&mut config, &applied.snapshots).unwrap();
+        assert_eq!(serde_json::to_value(&config.providers).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn mixed_oauth_replacement_keeps_numeric_model_options() {
+        let _guard = super::env_test_lock().await;
+        let _mode = EnvVarGuard::set(
+            "ZEROCLAW_providers__connections__gemini__auth__mode",
+            "oauth",
+        );
+        let _client = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__gemini__work__oauth_client_id",
+            "env-client",
+        );
+        let _temperature = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__gemini.work__options__temperature",
+            "0.25",
+        );
+        let mut config: Config = toml::from_str(
+            r#"
+[providers.connections.gemini]
+kind = "gemini"
+auth = {mode = "api_key", api_key = "original-key"}
+[providers.models."gemini.work"]
+capability = "chat"
+provider = "gemini"
+model = "gemini-test"
+"#,
+        )
+        .unwrap();
+        let before = serde_json::to_value(&config.providers).unwrap();
+        let applied = apply_env_overrides(&mut config).unwrap();
+        let document = serde_json::to_value(&config.providers).unwrap();
+        assert_eq!(document["connections"]["gemini"]["auth"]["mode"], "oauth");
+        assert!(
+            document["connections"]["gemini"]["auth"]
+                .get("api_key")
+                .is_none()
+        );
+        assert_eq!(
+            document["models"]["gemini.work"]["options"]["temperature"],
+            serde_json::json!(0.25)
+        );
+        mask_env_overrides_for_save(&mut config, &applied.snapshots).unwrap();
+        assert_eq!(serde_json::to_value(&config.providers).unwrap(), before);
+    }
+
+    #[tokio::test]
     async fn historical_memory_env_overrides_rematerialize_a_loaded_model_without_persisting_it() {
         let _guard = super::env_test_lock().await;
         let _model = EnvVarGuard::set("ZEROCLAW_memory__embedding_model", "env-embedding");
@@ -700,6 +869,32 @@ embedding_model_ref="embedding.main"
 
         assert!(applied.paths.contains("gateway.request_timeout_secs"));
         assert_eq!(config.gateway.request_timeout_secs, 120);
+    }
+
+    #[tokio::test]
+    async fn registry_auth_overrides_are_decoded_after_the_whole_batch() {
+        let _guard = super::env_test_lock().await;
+        let _mode = EnvVarGuard::set(
+            "ZEROCLAW_providers__connections__gemini__auth__mode",
+            "oauth",
+        );
+        let _secret = EnvVarGuard::set(
+            "ZEROCLAW_providers__connections__gemini__auth__client_secret",
+            "client-secret",
+        );
+        let mut config = Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {"gemini": {"kind": "gemini"}},
+                "models": {}
+            }))
+            .unwrap(),
+            ..Config::default()
+        };
+
+        apply_env_overrides(&mut config).expect("compound OAuth overrides must be atomic");
+        let connection = serde_json::to_value(&config.providers.connections["gemini"]).unwrap();
+        assert_eq!(connection["auth"]["mode"], "oauth");
+        assert_eq!(connection["auth"]["client_secret"], "client-secret");
     }
 
     #[tokio::test]

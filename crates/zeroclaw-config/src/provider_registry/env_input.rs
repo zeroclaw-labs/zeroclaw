@@ -176,32 +176,118 @@ pub(crate) fn remap_after_promotion(source: &Config, candidate: &mut Config) -> 
 }
 
 pub(crate) fn set(config: &mut Config, path: &str, value: &str, restore: bool) -> Result<()> {
-    let mut document = serde_json::to_value(&config.providers)?;
     if restore {
+        let mut document = serde_json::to_value(&config.providers)?;
         restore_document(&mut document, path, value)?;
         config.providers = serde_json::from_value(document)?;
         return Ok(());
     }
-    // Let the real schema select the type. String fields must preserve values
-    // such as numeric model IDs and JSON-looking credentials verbatim.
+    set_many(config, &[(path.to_owned(), value.to_owned())])
+}
+
+fn env_value(value: &str) -> (Value, Value) {
     let literal = if value.is_empty() {
         Value::Null
     } else {
         Value::String(value.to_owned())
     };
-    // JSON-valued options need their structured representation. A typed string
-    // field rejects numbers/objects here, then accepts the unchanged literal
-    // below. Keep strings (including quoted credentials) and the clear
-    // sentinel verbatim instead of treating them as JSON string syntax.
     let parsed = serde_json::from_str::<Value>(value)
         .ok()
         .filter(|value| !value.is_null() && !value.is_string())
         .unwrap_or_else(|| literal.clone());
-    set_document(&mut document, path, parsed.clone(), None)?;
-    // Option patches tolerate unknown keys when loading files (the startup
-    // scanner reports them). Env edits instead fail atomically. Validate
-    // these permissive leaves from the same field declarations; every other
-    // canonical container is checked by its strict typed deserializer.
+    (parsed, literal)
+}
+
+/// An untyped transaction view lets historical whole-auth edits compose with
+/// earlier edits before the final registry is admitted.
+pub(crate) fn stage(document: &mut Value, path: &str, value: &str) -> Result<()> {
+    let (parsed, literal) = env_value(value);
+    let value = typed_env_value(document, path, &parsed, &literal)?.unwrap_or({
+        // An incomplete auth variant cannot reveal a leaf's type yet. Keep
+        // scalar input literal so later whole-auth expansion cannot copy a
+        // numeric credential. Final batch admission resolves the actual type.
+        if parsed.is_number() || parsed.is_boolean() {
+            literal
+        } else {
+            parsed
+        }
+    });
+    set_document(document, path, value, None)
+}
+
+fn typed_env_value(
+    template: &Value,
+    path: &str,
+    parsed: &Value,
+    literal: &Value,
+) -> Result<Option<Value>> {
+    // The schema is the source for the leaf's type, including credentials
+    // that happen to look like JSON numbers. Probe independently so a valid
+    // numeric option cannot turn into a string while repairing another leaf.
+    let mut probe = template.clone();
+    set_document(&mut probe, path, parsed.clone(), None)?;
+    if serde_json::from_value::<crate::providers::Providers>(probe).is_ok() {
+        return Ok(Some(parsed.clone()));
+    }
+    if parsed == literal {
+        return Ok(None);
+    }
+    let mut probe = template.clone();
+    set_document(&mut probe, path, literal.clone(), None)?;
+    if serde_json::from_value::<crate::providers::Providers>(probe).is_ok() {
+        Ok(Some(literal.clone()))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Stage all registry environment edits before decoding the final registry.
+/// Compound auth overrides must not admit an incomplete intermediate variant.
+pub(crate) fn set_many(config: &mut Config, edits: &[(String, String)]) -> Result<()> {
+    let mut document = serde_json::to_value(&config.providers)?;
+    let mut probe = document.clone();
+    let parsed_edits: Vec<_> = edits
+        .iter()
+        .map(|(path, value)| (path, env_value(value)))
+        .collect();
+    let mut selected = vec![None; edits.len()];
+    // Keep the probe schema-valid. Defer edits that require another edit
+    // first (for example an OAuth leaf before its mode, or a mode change
+    // before a whole-auth replacement removes the old API key). Each round
+    // selects at least one additional edit or terminates; unrelated malformed
+    // intermediate values never determine a different leaf's representation.
+    loop {
+        let mut progressed = false;
+        for (index, (path, (parsed, literal))) in parsed_edits.iter().enumerate() {
+            if selected[index].is_some() {
+                continue;
+            }
+            if let Some(value) = typed_env_value(&probe, path, parsed, literal)? {
+                set_document(&mut probe, path, value.clone(), None)?;
+                selected[index] = Some(value);
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+    // Probe order only selects representations. Replaying the original order
+    // preserves last-write semantics for overlapping leaf/whole-object edits.
+    // An unresolved edit may be superseded by a later replacement; otherwise
+    // final typed admission below reports the invalid completed configuration.
+    for ((path, (parsed, _)), value) in parsed_edits.into_iter().zip(selected) {
+        let value = value.unwrap_or(parsed);
+        set_document(&mut document, path, value, None)?;
+    }
+    for (path, _) in edits {
+        validate_option_override(&document, path)?;
+    }
+    config.providers = serde_json::from_value(document)?;
+    Ok(())
+}
+
+fn validate_option_override(document: &Value, path: &str) -> Result<()> {
     let parts: Vec<_> = path
         .trim_start_matches('/')
         .split('/')
@@ -244,16 +330,6 @@ pub(crate) fn set(config: &mut Config, path: &str, value: &str, restore: bool) -
             );
         }
     }
-    let candidate = serde_json::from_value(document.clone());
-    let candidate: crate::providers::Providers = match candidate {
-        Ok(candidate) => candidate,
-        Err(error) => {
-            ensure!(parsed != literal, "{error}");
-            set_document(&mut document, path, literal, None)?;
-            serde_json::from_value(document)?
-        }
-    };
-    config.providers = candidate;
     Ok(())
 }
 
@@ -484,6 +560,95 @@ mod tests {
             );
             set(&mut config, &path, &saved, true).unwrap();
         }
+    }
+
+    #[test]
+    fn batch_keeps_numeric_options_and_json_looking_strings() {
+        let mut config = fixture();
+        set_many(
+            &mut config,
+            &[
+                (
+                    "/providers/models/chat.Fast.v2/options/temperature".into(),
+                    "0.25".into(),
+                ),
+                (
+                    "/providers/connections/gateway.Prod/auth/api_key".into(),
+                    "123".into(),
+                ),
+                ("/providers/models/chat.Fast.v2/model".into(), "456".into()),
+            ],
+        )
+        .unwrap();
+        let document = serde_json::to_value(&config.providers).unwrap();
+        assert_eq!(
+            document["models"]["chat.Fast.v2"]["options"]["temperature"],
+            serde_json::json!(0.25)
+        );
+        assert_eq!(
+            document["connections"]["gateway.Prod"]["auth"]["api_key"],
+            "123"
+        );
+        assert_eq!(document["models"]["chat.Fast.v2"]["model"], "456");
+    }
+
+    #[test]
+    fn batch_preserves_structured_looking_and_numeric_header_strings() {
+        let mut config = fixture();
+        set_many(
+            &mut config,
+            &[
+                (
+                    "/providers/connections/gateway.Prod/extra_headers/X-Meta".into(),
+                    r#"{"tenant":"work"}"#.into(),
+                ),
+                (
+                    "/providers/connections/gateway.Prod/extra_headers/X-Project-Id".into(),
+                    "123".into(),
+                ),
+            ],
+        )
+        .unwrap();
+        let document = serde_json::to_value(&config.providers).unwrap();
+        assert_eq!(
+            document["connections"]["gateway.Prod"]["extra_headers"]["X-Meta"],
+            r#"{"tenant":"work"}"#
+        );
+        assert_eq!(
+            document["connections"]["gateway.Prod"]["extra_headers"]["X-Project-Id"],
+            "123"
+        );
+    }
+
+    #[test]
+    fn deferred_leaf_cannot_override_a_later_whole_auth_edit() {
+        let mut config = Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {"gemini": {"kind": "gemini"}},
+                "models": {}
+            }))
+            .unwrap(),
+            ..Config::default()
+        };
+        set_many(
+            &mut config,
+            &[
+                (
+                    "/providers/connections/gemini/auth/client_secret".into(),
+                    "early-secret".into(),
+                ),
+                (
+                    "/providers/connections/gemini/auth".into(),
+                    r#"{"mode":"oauth","client_secret":"final-secret"}"#.into(),
+                ),
+            ],
+        )
+        .unwrap();
+        let document = serde_json::to_value(&config.providers).unwrap();
+        assert_eq!(
+            document["connections"]["gemini"]["auth"]["client_secret"],
+            "final-secret"
+        );
     }
 
     #[test]
