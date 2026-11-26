@@ -227,9 +227,9 @@ unaffected by the advisory):
 - **#11429**: *Remove the `anymap2` maintenance exception after Matrix migrates.* The RUSTSEC-2026-0319 exception is present only in `deny.toml`. Keep this issue open until the Matrix dependency update removes the affected crate from the resolved graph, then remove the exception and update this inventory.
 - **#12252**: *Accept the `pin-utils` maintenance advisory (RUSTSEC-2026-0441) until `async-imap` moves off it.* The RUSTSEC-2026-0441 exception is present only in `deny.toml`. Keep this issue open until the email dependency update removes `pin-utils` from the resolved graph, then remove the exception and update this inventory.
 - **#12320**: *Security job fails on every build: RUSTSEC-2026-0459.* Owns
-  the bundled SQLite advisory. This branch upgrades to `rusqlite` 0.41.1
-  and `libsqlite3-sys` 0.39.1 and removes the waiver from both files.
-  Publishing still needs a compatible Matrix storage release (#12322).
+  the bundled SQLite advisory. The patched graph uses `rusqlite` 0.41.1
+  and `libsqlite3-sys` 0.39.1; #12322 removes the waiver from both files
+  and uses the published Matrix SDK 0.20.0 storage package without a path patch.
 - **#12505**: *Track replacement of unmaintained chrono and chrono-tz dependencies.* Owns the `chrono` (RUSTSEC-2026-0543) and `chrono-tz` (RUSTSEC-2026-0555) exceptions, both present only in `deny.toml`. It stays open until the workspace and its dependencies no longer pull either crate into the resolved graph; that change removes both exceptions and updates this inventory.
 - **#12693**: *Security job fails on every build: RUSTSEC-2026-0594.* Owns the `cookie` 0.16.2 waiver, present only in `.cargo/audit.toml`. It stays open until a `webdriver` or `fantoccini` release lets `cookie` 0.16 leave `Cargo.lock`; that change removes the waiver and updates this inventory.
 - **#8059**: *Policy cleanup: deny.toml ignored-advisory tracking,
@@ -266,9 +266,10 @@ two tools have drifted again. Open or update the tracking issue.
 
 ## Change log
 
-- 2026-11-09: Removed `RUSTSEC-2026-0459` from both tool files with the
-  patched SQLite upgrade in #12322. The checkout build uses SQLite 3.54.1;
-  the separate Matrix registry-publication requirement remains unresolved.
+- Pending merge (#12322): remove `RUSTSEC-2026-0459` from both tool files
+  with the patched SQLite 3.54.1 upgrade and published Matrix SDK 0.20.0.
+  The temporary Matrix vendor directory and path patch are removed. Record
+  the merge date here when this change lands.
 - 2026-11-23: Updated `cookie` 0.18.1 to 0.18.3 and added `RUSTSEC-2026-0594`
   (`cookie` 0.16.2) to `.cargo/audit.toml` only, with its category 1 entry
   above.
