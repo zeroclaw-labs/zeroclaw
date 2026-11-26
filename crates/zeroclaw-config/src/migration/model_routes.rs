@@ -39,7 +39,7 @@ pub(super) fn migrate(mut document: toml::Value) -> Result<toml::Value> {
             .cloned()
             .map(toml::Value::try_into)
             .transpose()
-            .context("read V3 route provider definitions")?
+            .context("read V4 route provider definitions")?
             .unwrap_or_default(),
         ..Config::default()
     };
@@ -86,19 +86,24 @@ pub(super) fn migrate(mut document: toml::Value) -> Result<toml::Value> {
             .providers
             .models
             .canonical_model(&ModelRef::from(reference));
+        let mut source_provider = canonical.map(|model| model.provider().to_string());
         let mut model_ref = reference.to_owned();
         if canonical.is_none() || explicit_model.is_some() || key.is_some() {
             let (mut connection, mut model) = if let Some(model) = canonical {
-                let connection = config
-                    .providers
-                    .connections
-                    .get(model.provider())
-                    .context("V3 route references a model with no connection")?;
+                // Preserve the raw TOML input: serializing a typed connection
+                // to JSON includes absent optional fields as null, which TOML
+                // cannot encode when a route needs its own credential copy.
+                let connection = connections
+                    .get(model.provider().as_str())
+                    .context("V4 route references a model with no connection")?;
                 (
                     serde_json::to_value(connection)?,
                     serde_json::to_value(model)?,
                 )
             } else if let Some(selection) = config.resolve_model_selection(reference) {
+                // Admission materializes this same profile connection. Keep
+                // its identity for inherited credentials and later env edits.
+                source_provider = Some(format!("legacy.{}.{}", selection.family, selection.alias));
                 let profiles = serde_json::to_value(&config.providers.models)?;
                 let raw = profiles[selection.family][selection.alias].clone();
                 let mut definition = legacy_model(
@@ -153,12 +158,24 @@ pub(super) fn migrate(mut document: toml::Value) -> Result<toml::Value> {
                 name = format!("{base}.{suffix}");
                 suffix += 1;
             }
-            model["provider"] = name.clone().into();
+            // A route without its own credential override must keep the
+            // source connection identity. Environment overrides are applied
+            // to that canonical connection after migration; copying it under
+            // `route.*` would leave the migrated route with stale credentials.
+            let inherited_provider = key
+                .is_none()
+                .then_some(source_provider.as_deref())
+                .flatten();
+            let reuse_provider = inherited_provider.is_some();
+            let provider_name = inherited_provider.unwrap_or(&name);
+            model["provider"] = provider_name.to_owned().into();
             // Decode the connection here to avoid producing a document which
             // only fails much later at first use. Values never enter errors.
             serde_json::from_value::<ProviderConnection>(connection.clone())
                 .with_context(|| format!("cannot migrate model_routes[{index}] connection"))?;
-            connections.insert(name.clone(), toml::Value::try_from(connection)?);
+            if !reuse_provider {
+                connections.insert(name.clone(), toml::Value::try_from(connection)?);
+            }
             models.insert(name.clone(), toml::Value::try_from(model)?);
             if let Some(targets) = fallbacks.get(reference) {
                 route_fallbacks.push((name.clone(), targets.clone()));
@@ -707,5 +724,103 @@ model_provider = "ollama.main.fast"
         let migrated = migrate(document).unwrap();
         let named = &migrated["providers"]["models"]["route.fast"]["options"];
         assert!(named.get("extract_text_tool_calls").is_none());
+    }
+
+    #[test]
+    fn route_without_credential_override_reuses_canonical_connection() {
+        let document: toml::Value = toml::from_str(
+            r#"
+schema_version = 4
+
+[providers.connections."gateway.prod"]
+kind = "custom"
+uri = "https://example.test/v1"
+auth = { mode = "api_key", api_key = "from-env" }
+
+[providers.models."chat.main"]
+capability = "chat"
+provider = "gateway.prod"
+model = "primary"
+
+[[model_routes]]
+hint = "fast"
+model_provider = "chat.main"
+model = "route-model"
+"#,
+        )
+        .unwrap();
+        let migrated = migrate(document).unwrap();
+        assert_eq!(
+            migrated["providers"]["models"]["route.fast"]["provider"].as_str(),
+            Some("gateway.prod")
+        );
+        assert!(
+            migrated["providers"]["connections"]
+                .get("route.fast")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn legacy_route_reuses_profile_connection_after_admission() {
+        let config = crate::migration::migrate_to_current(
+            r#"
+schema_version = 4
+[providers.models.openai.main]
+model = "primary"
+[[model_routes]]
+hint = "fast"
+model_provider = "openai.main"
+model = "route-model"
+"#,
+        )
+        .unwrap();
+        let primary = config
+            .providers
+            .models
+            .canonical_model(&"openai.main".into())
+            .unwrap();
+        let route = config
+            .providers
+            .models
+            .canonical_model(&config.model_routes[0].model_ref.as_str().into())
+            .unwrap();
+        assert_eq!(primary.provider(), route.provider());
+        assert_eq!(route.upstream_model(), Some("route-model"));
+    }
+
+    #[test]
+    fn route_credential_override_uses_its_own_connection() {
+        let config = crate::migration::migrate_to_current(
+            r#"
+schema_version = 4
+[providers.connections.shared]
+kind = "openai"
+auth = { mode = "api_key", api_key = "primary-key" }
+[providers.models."chat.main"]
+capability = "chat"
+provider = "shared"
+model = "primary"
+[[model_routes]]
+hint = "fast"
+model_provider = "chat.main"
+model = "route-model"
+api_key = "route-key"
+"#,
+        )
+        .unwrap();
+        let primary = config
+            .providers
+            .models
+            .canonical_model(&"chat.main".into())
+            .unwrap();
+        let route = config
+            .providers
+            .models
+            .canonical_model(&config.model_routes[0].model_ref.as_str().into())
+            .unwrap();
+        assert_ne!(primary.provider(), route.provider());
+        let route_connection = &config.providers.connections[route.provider()];
+        assert_eq!(route_connection.api_key(), Some("route-key"));
     }
 }
