@@ -4,14 +4,16 @@
 //! transport. The assembled prompt is sent as JSON-RPC on child stdin; it is
 //! never placed in argv or a temporary file.
 //! Authentication uses the Grok CLI login cache by default. API-key auth is an
-//! explicit per-alias opt-in: export `XAI_API_KEY` into the ZeroClaw process and
-//! list that name in `env_passthrough`. Typed alias `api_key` is rejected; this
-//! provider does not store the key in config. At each spawn the child allowlist
-//! resolves process env by name (including `XAI_API_KEY` when opted in) so the
-//! CLI login cache remains the default owner and the key is never snapshotted
-//! into the long-lived provider handle. A future typed Config bridge may map
-//! the same name at load time; until then the documented process-env +
-//! `env_passthrough` surface is the single operator credential path.
+//! explicit per-alias opt-in through either of two mutually exclusive paths:
+//!
+//! - the alias's typed `api_key` secret (stored encrypted in config like every
+//!   other provider key), which ZeroClaw places in the child's `XAI_API_KEY`
+//!   at spawn time; or
+//! - exporting `XAI_API_KEY` into the ZeroClaw process and listing that name
+//!   in `env_passthrough`, resolved from process env at each spawn.
+//!
+//! The Grok CLI reads API keys only from `XAI_API_KEY`, so the key reaches the
+//! child through its (otherwise cleared) environment; it never appears in argv.
 //!
 //! # Usage
 //!
@@ -20,6 +22,7 @@
 //! model = "grok-4.5"
 //! working_directory = "/path/to/agents/default/workspace"
 //! # binary_path = "/home/you/.grok/bin/grok"
+//! # api_key = "..."   # optional; set with `zeroclaw config set`
 //!
 //! [agents.default]
 //! model_provider = "grok_cli.default"
@@ -64,22 +67,30 @@
 //!   corresponding sampling flag.
 //! - `timeout_secs` is clamped to one hour maximum.
 
-mod acp;
-
+use crate::acp_cli;
+use crate::acp_cli::env::{
+    base_env_allowed, env_name_starts_with, env_names_equal, is_valid_env_var_name,
+};
+use crate::acp_cli::process::{AcpSubprocessError, log_acp_failure, run_oneshot_subprocess};
+use crate::acp_cli::protocol::{self as acp, AcpCliFlavor, LabeledAcpError};
 use crate::traits::{ChatRequest, ChatResponse, ModelProvider, ProviderCapabilities};
 use async_trait::async_trait;
+use serde_json::{Value, json};
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
-use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::process::Command;
 
-#[cfg(windows)]
-use process_wrap::tokio::{ChildWrapper, CommandWrap, JobObject, KillOnDrop};
-#[cfg(not(windows))]
-use tokio::process::Child;
+/// Public error label and stable log-key prefix for this provider.
+const FLAVOR: AcpCliFlavor = AcpCliFlavor {
+    label: "Grok",
+    key_prefix: "grok_cli",
+};
+
+/// Provider family name used in configuration errors.
+const FAMILY: &str = "grok_cli";
 
 /// Default `grok` binary name (resolved via `PATH`).
 const DEFAULT_GROK_CLI_BINARY: &str = "grok";
@@ -97,95 +108,8 @@ const DEFAULT_GROK_CLI_TIMEOUT: Duration = Duration::from_secs(600);
 /// provider slot indefinitely. Values above this are clamped.
 const MAX_GROK_CLI_TIMEOUT_SECS: u64 = 3_600;
 
-/// Additional bounded time allowed for reaping a terminated child.
-const PROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Bounded grace period for a cooperative ACP stdin shutdown.
-const STDIN_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
-
-/// Additional bounded time allowed for the stderr drain to observe EOF.
-const STDERR_DRAIN_FINISH_TIMEOUT: Duration = Duration::from_millis(250);
-
-/// Stderr is drained continuously, but only bounded metadata is retained.
-const MAX_GROK_CLI_STDERR_BYTES: usize = 65_536;
-
 const GROK_CLI_SUPPORTED_TEMPERATURES: [f64; 2] = [0.7, 1.0];
 const TEMP_EPSILON: f64 = 1e-9;
-
-#[cfg(not(windows))]
-fn executable_candidates(path: &Path, _path_ext_env: Option<&OsStr>) -> Vec<PathBuf> {
-    vec![path.to_path_buf()]
-}
-
-#[cfg(windows)]
-fn executable_candidates(path: &Path, path_ext_env: Option<&OsStr>) -> Vec<PathBuf> {
-    let mut candidates = vec![path.to_path_buf()];
-    if path.extension().is_some() {
-        return candidates;
-    }
-    let Some(path_extensions) = path_ext_env.and_then(OsStr::to_str) else {
-        return candidates;
-    };
-    for extension in path_extensions.split(';').filter(|extension| {
-        extension.starts_with('.')
-            && extension.len() > 1
-            && extension[1..]
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric())
-    }) {
-        let mut candidate = path.as_os_str().to_os_string();
-        candidate.push(extension);
-        candidates.push(PathBuf::from(candidate));
-    }
-    candidates
-}
-
-#[cfg(unix)]
-fn is_executable_file(path: &Path) -> bool {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    if !path.metadata().is_ok_and(|metadata| metadata.is_file()) {
-        return false;
-    }
-    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
-        return false;
-    };
-    // SAFETY: `path` is a live NUL-terminated CString and `access` does not retain it.
-    unsafe { libc::access(path.as_ptr(), libc::X_OK) == 0 }
-}
-
-#[cfg(windows)]
-fn is_executable_file(path: &Path) -> bool {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::GetBinaryTypeW;
-
-    if !path.metadata().is_ok_and(|metadata| metadata.is_file()) {
-        return false;
-    }
-    if path
-        .extension()
-        .and_then(OsStr::to_str)
-        .is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("bat") || extension.eq_ignore_ascii_case("cmd")
-        })
-    {
-        return true;
-    }
-    let wide_path: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let mut binary_type = 0_u32;
-    // SAFETY: `wide_path` is NUL-terminated and `binary_type` is valid for this call.
-    unsafe { GetBinaryTypeW(wide_path.as_ptr(), &mut binary_type) != 0 }
-}
-
-#[cfg(all(not(unix), not(windows)))]
-fn is_executable_file(path: &Path) -> bool {
-    path.is_file()
-}
 
 /// Default OS sandbox profile when the operator does not provide one.
 const DEFAULT_SANDBOX_PROFILE: &str = "strict";
@@ -262,50 +186,6 @@ const VALUE_TAKING_EXTRA_ARG_FLAGS: &[&str] = &[
     "--tools",
 ];
 
-/// Environment variable names required for process startup, locale, and
-/// explicitly configured network proxies.
-const ENV_ALLOWLIST_EXACT: &[&str] = &[
-    "PATH",
-    "PATHEXT",
-    "HOME",
-    "USER",
-    "USERNAME",
-    "USERPROFILE",
-    "HOMEDRIVE",
-    "HOMEPATH",
-    "LOGNAME",
-    "SHELL",
-    "SYSTEMROOT",
-    "SYSTEMDRIVE",
-    "WINDIR",
-    "COMSPEC",
-    "TMPDIR",
-    "TMP",
-    "TEMP",
-    "LANG",
-    "LANGUAGE",
-    "TERM",
-    "COLORTERM",
-    "NO_COLOR",
-    "XDG_RUNTIME_DIR",
-    "XDG_CONFIG_HOME",
-    "XDG_CACHE_HOME",
-    "XDG_DATA_HOME",
-    "XDG_STATE_HOME",
-    "SSL_CERT_FILE",
-    "SSL_CERT_DIR",
-    "REQUESTS_CA_BUNDLE",
-    "CURL_CA_BUNDLE",
-    "HTTP_PROXY",
-    "HTTPS_PROXY",
-    "NO_PROXY",
-    "http_proxy",
-    "https_proxy",
-    "no_proxy",
-    "ALL_PROXY",
-    "all_proxy",
-];
-
 /// Model provider that invokes Grok Build through ACP.
 pub struct GrokCliModelProvider {
     /// `[providers.models.<family>.<alias>]` config-key alias.
@@ -316,6 +196,8 @@ pub struct GrokCliModelProvider {
     working_directory: PathBuf,
     /// Operator-selected environment variable names inherited at spawn time.
     env_passthrough: Vec<String>,
+    /// Alias `api_key` secret, placed in the child's `XAI_API_KEY` at spawn.
+    api_key: Option<String>,
     /// Operator-supplied argv tokens, after provider-owned flag validation.
     extra_args: Vec<String>,
     /// Aggregate stdout budget for one ACP request.
@@ -340,6 +222,7 @@ pub struct GrokCliBuilder {
     binary_path: Option<String>,
     working_directory: Option<String>,
     env_passthrough: Vec<String>,
+    api_key: Option<String>,
     extra_args: Vec<String>,
     max_acp_stdout_bytes: Option<usize>,
     timeout_secs: Option<u64>,
@@ -365,6 +248,15 @@ impl GrokCliBuilder {
     /// Add operator-selected environment variables to the child allowlist.
     pub fn env_passthrough(mut self, names: Vec<String>) -> Self {
         self.env_passthrough = names;
+        self
+    }
+
+    /// Alias `api_key` secret. Whitespace-only inputs count as unset.
+    pub fn api_key(mut self, key: Option<&str>) -> Self {
+        self.api_key = key
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_string);
         self
     }
 
@@ -395,14 +287,25 @@ impl GrokCliBuilder {
     }
 
     pub fn build(self) -> anyhow::Result<GrokCliModelProvider> {
-        let working_directory = GrokCliModelProvider::validate_working_directory(
+        let working_directory = acp_cli::validate_working_directory(
+            FAMILY,
             self.working_directory.as_deref().unwrap_or_default(),
         )?;
         let env_passthrough =
             GrokCliModelProvider::normalize_and_validate_env_passthrough(self.env_passthrough)?;
+        if self.api_key.is_some()
+            && env_passthrough
+                .iter()
+                .any(|name| env_names_equal(name, XAI_API_KEY_ENV))
+        {
+            anyhow::bail!(
+                "grok_cli takes an API key from either the alias api_key or env_passthrough \
+                 `XAI_API_KEY`, not both; remove one"
+            );
+        }
         let extra_args = GrokCliModelProvider::normalize_and_validate_extra_args(self.extra_args)?;
         let max_acp_stdout_bytes =
-            GrokCliModelProvider::validate_acp_stdout_limit(self.max_acp_stdout_bytes)?;
+            acp_cli::validate_acp_stdout_limit(FAMILY, self.max_acp_stdout_bytes)?;
         let timeout = self
             .timeout_secs
             .filter(|seconds| *seconds > 0)
@@ -420,129 +323,13 @@ impl GrokCliBuilder {
             binary_path,
             working_directory,
             env_passthrough,
+            api_key: self.api_key,
             extra_args,
             max_acp_stdout_bytes,
             timeout,
             vision_enabled: self.vision_enabled,
         })
     }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct StderrSummary {
-    bytes_seen: usize,
-    truncated: bool,
-    read_failed: bool,
-}
-
-struct StderrDrain {
-    task: Option<JoinHandle<StderrSummary>>,
-}
-
-impl StderrDrain {
-    fn start(mut stderr: ChildStderr) -> Self {
-        let task = ::zeroclaw_spawn::spawn!(async move {
-            let mut summary = StderrSummary::default();
-            let mut chunk = [0_u8; 8192];
-            loop {
-                match stderr.read(&mut chunk).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let remaining =
-                            MAX_GROK_CLI_STDERR_BYTES.saturating_sub(summary.bytes_seen);
-                        let retained = remaining.min(n);
-                        summary.bytes_seen = summary.bytes_seen.saturating_add(retained);
-                        summary.truncated |= retained < n;
-                    }
-                    Err(_) => {
-                        summary.read_failed = true;
-                        break;
-                    }
-                }
-            }
-            summary
-        });
-        Self { task: Some(task) }
-    }
-
-    async fn finish(mut self) -> StderrSummary {
-        let Some(mut task) = self.task.take() else {
-            return StderrSummary::default();
-        };
-        match timeout(STDERR_DRAIN_FINISH_TIMEOUT, &mut task).await {
-            Ok(Ok(summary)) => summary,
-            Ok(Err(_)) => StderrSummary {
-                read_failed: true,
-                ..StderrSummary::default()
-            },
-            Err(_) => {
-                task.abort();
-                StderrSummary {
-                    truncated: true,
-                    ..StderrSummary::default()
-                }
-            }
-        }
-    }
-}
-
-impl Drop for StderrDrain {
-    fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
-    }
-}
-
-/// Kill the process group on every exit path. The child is made its own group
-/// before spawn, so this does not signal ZeroClaw itself.
-#[cfg(unix)]
-struct ProcessTreeGuard {
-    pgid: Option<nix::unistd::Pid>,
-}
-
-#[cfg(unix)]
-impl ProcessTreeGuard {
-    fn new(child_pid: Option<u32>) -> Self {
-        Self {
-            pgid: child_pid
-                .and_then(|pid| i32::try_from(pid).ok())
-                .map(nix::unistd::Pid::from_raw),
-        }
-    }
-
-    fn kill_now(&self) {
-        if let Some(pgid) = self.pgid {
-            let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL);
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.pgid = None;
-    }
-}
-
-#[cfg(unix)]
-impl Drop for ProcessTreeGuard {
-    fn drop(&mut self) {
-        self.kill_now();
-    }
-}
-
-/// On Windows, the child is assigned to a kill-on-close Job Object. Other
-/// non-Unix targets fall back to Tokio's kill-on-drop child handling.
-#[cfg(not(unix))]
-struct ProcessTreeGuard;
-
-#[cfg(not(unix))]
-impl ProcessTreeGuard {
-    fn new(_child_pid: Option<u32>) -> Self {
-        Self
-    }
-
-    fn kill_now(&self) {}
-
-    fn disarm(&mut self) {}
 }
 
 impl GrokCliModelProvider {
@@ -553,6 +340,7 @@ impl GrokCliModelProvider {
             binary_path: None,
             working_directory: None,
             env_passthrough: Vec::new(),
+            api_key: None,
             extra_args: Vec::new(),
             max_acp_stdout_bytes: None,
             timeout_secs: None,
@@ -565,74 +353,18 @@ impl GrokCliModelProvider {
         path_env: Option<&OsStr>,
         path_ext_env: Option<&OsStr>,
     ) -> anyhow::Result<PathBuf> {
-        let binary = configured.unwrap_or(DEFAULT_GROK_CLI_BINARY);
-        let path = Path::new(binary);
-        if path.is_absolute() {
-            Self::first_executable_candidate(path, path_ext_env)
-        } else {
-            let mut components = path.components();
-            if !matches!(components.next(), Some(std::path::Component::Normal(_)))
-                || components.next().is_some()
-            {
-                anyhow::bail!(
-                    "grok_cli binary_path must be an absolute path or a bare executable name"
-                );
-            }
-
-            let safe_directories: Vec<PathBuf> = path_env
-                .into_iter()
-                .flat_map(std::env::split_paths)
-                .filter(|directory| directory.is_absolute())
-                .collect();
-            if safe_directories.is_empty() {
-                anyhow::bail!("grok_cli PATH contains no absolute executable directories");
-            }
-            safe_directories.into_iter().find_map(|directory| {
-                Self::first_executable_candidate(&directory.join(path), path_ext_env)
-            })
-        }
-        .ok_or_else(|| anyhow::Error::msg("grok_cli binary was not found or is not executable"))
+        acp_cli::resolve_binary_path(
+            FAMILY,
+            DEFAULT_GROK_CLI_BINARY,
+            configured,
+            path_env,
+            path_ext_env,
+        )
     }
 
+    #[cfg(test)]
     fn first_executable_candidate(path: &Path, path_ext_env: Option<&OsStr>) -> Option<PathBuf> {
-        executable_candidates(path, path_ext_env)
-            .into_iter()
-            .find_map(|candidate| {
-                let canonical = std::fs::canonicalize(candidate).ok()?;
-                is_executable_file(&canonical).then_some(canonical)
-            })
-    }
-
-    fn validate_working_directory(value: &str) -> anyhow::Result<PathBuf> {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            anyhow::bail!(
-                "grok_cli requires an explicit working_directory for the ACP session boundary"
-            );
-        }
-        let path = Path::new(trimmed);
-        if !path.is_absolute() {
-            anyhow::bail!("grok_cli working_directory must be an absolute path");
-        }
-        let canonical = std::fs::canonicalize(path).map_err(|_| {
-            anyhow::Error::msg("grok_cli working_directory does not exist or is inaccessible")
-        })?;
-        if !canonical.is_dir() {
-            anyhow::bail!("grok_cli working_directory must identify a directory");
-        }
-        Ok(canonical)
-    }
-
-    fn validate_acp_stdout_limit(value: Option<usize>) -> anyhow::Result<usize> {
-        let limit = value.unwrap_or(acp::DEFAULT_ACP_STDOUT_LIMIT_BYTES);
-        if !(acp::MIN_ACP_STDOUT_LIMIT_BYTES..=acp::MAX_ACP_STDOUT_LIMIT_BYTES).contains(&limit) {
-            anyhow::bail!(
-                "grok_cli max_acp_stdout_bytes must be between {} and {} bytes",
-                acp::MIN_ACP_STDOUT_LIMIT_BYTES,
-                acp::MAX_ACP_STDOUT_LIMIT_BYTES
-            );
-        }
-        Ok(limit)
+        acp_cli::first_executable_candidate(path, path_ext_env)
     }
 
     fn normalize_and_validate_env_passthrough(names: Vec<String>) -> anyhow::Result<Vec<String>> {
@@ -822,13 +554,7 @@ impl GrokCliModelProvider {
     }
 
     fn apply_env_allowlist(cmd: &mut Command, env_passthrough: &[String]) -> bool {
-        // Skip non-Unicode names/values rather than panicking on `vars()`.
-        let variables = std::env::vars_os().filter_map(|(key, value)| {
-            let key = key.into_string().ok()?;
-            let value = value.into_string().ok()?;
-            Some((key, value))
-        });
-        Self::apply_env_allowlist_from(cmd, env_passthrough, variables)
+        Self::apply_env_allowlist_from(cmd, env_passthrough, acp_cli::env::unicode_process_env())
     }
 
     fn apply_env_allowlist_from(
@@ -861,27 +587,34 @@ impl GrokCliModelProvider {
         let mut cmd = Command::new(&self.binary_path);
         cmd.args(&args);
         cmd.current_dir(&self.working_directory);
-        let xai_api_key_available = Self::apply_env_allowlist(&mut cmd, &self.env_passthrough);
-        #[cfg(not(windows))]
-        cmd.kill_on_drop(true);
-        cmd.stdin(std::process::Stdio::piped());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        #[cfg(unix)]
-        cmd.process_group(0);
+        let mut xai_api_key_available = Self::apply_env_allowlist(&mut cmd, &self.env_passthrough);
+        if let Some(api_key) = self.api_key.as_deref() {
+            cmd.env(XAI_API_KEY_ENV, api_key);
+            xai_api_key_available = true;
+        }
 
-        #[cfg(windows)]
-        let spawn_result = {
-            let mut command = CommandWrap::from(cmd);
-            command.wrap(KillOnDrop).wrap(JobObject);
-            command.spawn()
+        let request = acp::OneshotPrompt {
+            prompt: &prompt,
+            cwd: &self.working_directory,
+            permission_policy,
+            max_stdout_bytes: self.max_acp_stdout_bytes,
+            session_meta: None,
+            model: None,
+            session_check: None,
+            failure_marker: None,
         };
-        #[cfg(not(windows))]
-        let spawn_result = cmd.spawn();
+        let outcome = run_oneshot_subprocess(cmd, self.timeout, &request, |initialize| {
+            let method_id = select_auth_method_id(initialize, xai_api_key_available)?;
+            Ok(Some(json!({
+                "methodId": method_id,
+                "_meta": { "headless": true }
+            })))
+        })
+        .await;
 
-        let mut child = match spawn_result {
-            Ok(child) => child,
-            Err(err) => {
+        match outcome.result {
+            Ok(text) => Ok(text),
+            Err(AcpSubprocessError::Spawn(err)) => {
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -895,62 +628,31 @@ impl GrokCliModelProvider {
                         })),
                     "grok_cli: failed to spawn ACP binary"
                 );
-                return Err(anyhow::Error::msg(format!(
+                Err(anyhow::Error::msg(format!(
                     "Failed to spawn Grok Build CLI ACP binary at {}: {err}. \
                      Ensure `grok` is installed and on PATH, or set binary_path.",
                     self.binary_path.display()
-                )));
+                )))
             }
-        };
-
-        let mut process_tree = ProcessTreeGuard::new(child.id());
-        let Some(mut stdin) = take_child_stdin(&mut child) else {
-            return Err(anyhow::Error::msg("Failed to open Grok ACP stdin"));
-        };
-        let Some(stdout) = take_child_stdout(&mut child) else {
-            return Err(anyhow::Error::msg("Failed to open Grok ACP stdout"));
-        };
-        let Some(stderr) = take_child_stderr(&mut child) else {
-            return Err(anyhow::Error::msg("Failed to open Grok ACP stderr"));
-        };
-        let stderr_drain = StderrDrain::start(stderr);
-
-        let request_result = timeout(
-            self.timeout,
-            acp::run_oneshot_prompt(
-                &mut stdin,
-                stdout,
-                &prompt,
-                &self.working_directory,
-                xai_api_key_available,
-                permission_policy,
-                self.max_acp_stdout_bytes,
-            ),
-        )
-        .await;
-
-        // Closing stdin tells a cooperative ACP server it can stop. We still
-        // terminate the complete tree because a completed turn may have left
-        // tool descendants running.
-        let _ = timeout(STDIN_SHUTDOWN_TIMEOUT, stdin.shutdown()).await;
-        drop(stdin);
-        let reaped = terminate_child_tree(&mut child, &mut process_tree).await;
-        let stderr_summary = stderr_drain.finish().await;
-
-        match request_result {
-            Ok(Ok(text)) if reaped => Ok(text),
-            Ok(Ok(_)) => {
-                log_acp_failure("reap", "grok_cli_reap_failed", stderr_summary);
+            Err(AcpSubprocessError::Pipe(stream)) => Err(anyhow::Error::msg(format!(
+                "Failed to open Grok ACP {stream}"
+            ))),
+            Err(AcpSubprocessError::Reap) => {
+                log_acp_failure(FLAVOR, "reap", "grok_cli_reap_failed", outcome.stderr);
                 Err(anyhow::Error::msg(
                     "Grok Build CLI ACP process could not be reaped after completion",
                 ))
             }
-            Ok(Err(error)) => {
-                log_acp_failure("protocol", error.error_key(), stderr_summary);
+            Err(AcpSubprocessError::Protocol(error)) => {
+                let error = LabeledAcpError {
+                    flavor: FLAVOR,
+                    error,
+                };
+                log_acp_failure(FLAVOR, "protocol", &error.error_key(), outcome.stderr);
                 Err(anyhow::Error::new(error))
             }
-            Err(_) => {
-                log_acp_failure("timeout", "grok_cli_timeout", stderr_summary);
+            Err(AcpSubprocessError::Timeout) => {
+                log_acp_failure(FLAVOR, "timeout", "grok_cli_timeout", outcome.stderr);
                 Err(anyhow::Error::msg(format!(
                     "Grok Build CLI ACP request timed out after {}s",
                     self.timeout.as_secs()
@@ -1037,94 +739,40 @@ fn joined_prompt_text(system: Option<&str>, message: &str) -> String {
     }
 }
 
-#[cfg(windows)]
-type ManagedChild = Box<dyn ChildWrapper>;
+/// Grok Build ACP authentication method: an explicitly passed `XAI_API_KEY`
+/// first, then the CLI login cache.
+///
+/// Grok Build 0.2.x advertises `xai.api_key`, `cached_token`, and `xai.oauth`.
+/// Grok Build 1.0 advertises only `grok.com` (its login cache / sign-in flow)
+/// while still accepting the unadvertised `xai.api_key` method, which reads
+/// `XAI_API_KEY` from the child environment.
+fn select_auth_method_id(
+    initialize: &Value,
+    xai_api_key_available: bool,
+) -> Result<String, acp::AcpError> {
+    let ids: Vec<&str> = initialize
+        .get("authMethods")
+        .or_else(|| initialize.get("auth_methods"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|method| {
+            method
+                .get("id")
+                .or_else(|| method.get("methodId"))
+                .and_then(Value::as_str)
+        })
+        .collect();
 
-#[cfg(not(windows))]
-type ManagedChild = Child;
-
-#[cfg(windows)]
-fn take_child_stdin(child: &mut ManagedChild) -> Option<ChildStdin> {
-    child.stdin().take()
-}
-
-#[cfg(not(windows))]
-fn take_child_stdin(child: &mut ManagedChild) -> Option<ChildStdin> {
-    child.stdin.take()
-}
-
-#[cfg(windows)]
-fn take_child_stdout(child: &mut ManagedChild) -> Option<ChildStdout> {
-    child.stdout().take()
-}
-
-#[cfg(not(windows))]
-fn take_child_stdout(child: &mut ManagedChild) -> Option<ChildStdout> {
-    child.stdout.take()
-}
-
-#[cfg(windows)]
-fn take_child_stderr(child: &mut ManagedChild) -> Option<ChildStderr> {
-    child.stderr().take()
-}
-
-#[cfg(not(windows))]
-fn take_child_stderr(child: &mut ManagedChild) -> Option<ChildStderr> {
-    child.stderr.take()
-}
-
-async fn terminate_child_tree(child: &mut ManagedChild, guard: &mut ProcessTreeGuard) -> bool {
-    guard.kill_now();
-    let _ = child.start_kill();
-    match timeout(PROCESS_REAP_TIMEOUT, child.wait()).await {
-        Ok(Ok(_)) => {
-            guard.disarm();
-            true
+    if xai_api_key_available && (ids.contains(&"xai.api_key") || ids.contains(&"grok.com")) {
+        return Ok("xai.api_key".to_string());
+    }
+    for preferred in ["cached_token", "xai.oauth", "grok.com"] {
+        if ids.contains(&preferred) {
+            return Ok(preferred.to_string());
         }
-        Ok(Err(_)) | Err(_) => false,
     }
-}
-
-fn log_acp_failure(phase: &'static str, error_key: &'static str, stderr: StderrSummary) {
-    ::zeroclaw_log::record!(
-        ERROR,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-            .with_attrs(::serde_json::json!({
-                "phase": phase,
-                "error_key": error_key,
-                "stderr_bytes_seen": stderr.bytes_seen,
-                "stderr_truncated": stderr.truncated,
-                "stderr_read_failed": stderr.read_failed,
-            })),
-        "grok_cli: ACP subprocess failed"
-    );
-}
-
-fn is_valid_env_var_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    matches!(chars.next(), Some(first) if first == '_' || first.is_ascii_alphabetic())
-        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
-}
-
-/// Environment name equality for allow/deny/dedup. Windows process env is
-/// case-insensitive, so mixed-case spellings of the same variable must not
-/// bypass denylists or miss allowlists there.
-fn env_names_equal(left: &str, right: &str) -> bool {
-    if cfg!(windows) {
-        left.eq_ignore_ascii_case(right)
-    } else {
-        left == right
-    }
-}
-
-fn env_name_starts_with(name: &str, prefix: &str) -> bool {
-    if cfg!(windows) {
-        name.len() >= prefix.len()
-            && name.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
-    } else {
-        name.starts_with(prefix)
-    }
+    Err(acp::AcpError::NoAuthenticationMethod)
 }
 
 fn is_disallowed_provider_env_var(name: &str) -> bool {
@@ -1133,10 +781,7 @@ fn is_disallowed_provider_env_var(name: &str) -> bool {
 }
 
 fn env_var_allowed(key: &str, env_passthrough: &[String]) -> bool {
-    ENV_ALLOWLIST_EXACT
-        .iter()
-        .any(|allowed| env_names_equal(key, allowed))
-        || env_name_starts_with(key, "LC_")
+    base_env_allowed(key)
         || env_passthrough
             .iter()
             .any(|name| env_names_equal(name, key))
@@ -1482,6 +1127,83 @@ mod tests {
             resolved,
             std::fs::canonicalize(trusted_binary).expect("canonical trusted executable")
         );
+    }
+
+    #[test]
+    fn auth_selection_uses_explicit_api_key_then_cli_login() {
+        let initialize = json!({
+            "authMethods": [
+                { "id": "xai.api_key" },
+                { "id": "cached_token" }
+            ]
+        });
+        assert_eq!(
+            select_auth_method_id(&initialize, true).expect("API-key auth"),
+            "xai.api_key"
+        );
+        assert_eq!(
+            select_auth_method_id(&initialize, false).expect("cached auth"),
+            "cached_token"
+        );
+
+        let api_key_only = json!({
+            "authMethods": [{ "id": "xai.api_key" }]
+        });
+        assert_eq!(
+            select_auth_method_id(&api_key_only, true).expect("API-key auth"),
+            "xai.api_key"
+        );
+        assert!(matches!(
+            select_auth_method_id(&api_key_only, false),
+            Err(acp::AcpError::NoAuthenticationMethod)
+        ));
+    }
+
+    #[test]
+    fn auth_selection_supports_grok_build_1_0_methods() {
+        let initialize = json!({ "authMethods": [{ "id": "grok.com" }] });
+        assert_eq!(
+            select_auth_method_id(&initialize, true).expect("API-key auth"),
+            "xai.api_key",
+            "Grok Build 1.0 accepts the unadvertised xai.api_key method"
+        );
+        assert_eq!(
+            select_auth_method_id(&initialize, false).expect("login cache"),
+            "grok.com"
+        );
+        assert!(matches!(
+            select_auth_method_id(&json!({ "authMethods": [{ "id": "other" }] }), true),
+            Err(acp::AcpError::NoAuthenticationMethod)
+        ));
+    }
+
+    #[test]
+    fn typed_api_key_is_exclusive_with_env_passthrough_key() {
+        let temp = TempDir::new().expect("tempdir");
+        let provider = provider_builder(temp.path())
+            .api_key(Some(" typed-key "))
+            .build()
+            .expect("typed api_key");
+        assert_eq!(provider.api_key.as_deref(), Some("typed-key"));
+        assert!(
+            provider_builder(temp.path())
+                .api_key(Some("   "))
+                .build()
+                .expect("blank key")
+                .api_key
+                .is_none()
+        );
+
+        let error = match provider_builder(temp.path())
+            .api_key(Some("typed-key"))
+            .env_passthrough(vec![XAI_API_KEY_ENV.to_string()])
+            .build()
+        {
+            Ok(_) => panic!("both key sources must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("not both"), "{error}");
+        assert!(!error.contains("typed-key"));
     }
 
     #[test]
@@ -2276,6 +1998,56 @@ if [ "${1-}" = --warm-up ]; then exit 0; fi
                 sleep(Duration::from_millis(20)).await;
             }
             assert!(!process_exists(pid), "process {pid} survived cleanup");
+        }
+
+        /// Grok Build 1.0 shape: only `grok.com` is advertised.
+        const GROK_1_0_API_KEY_BODY: &str = r#"
+printf '%s\n' "$@" > args.txt
+printf '%s' "${XAI_API_KEY-}" > xai-key.txt
+IFS= read -r line
+printf '%s\n' "$line" >> requests.ndjson
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"grok.com"}]}}'
+IFS= read -r line
+printf '%s\n' "$line" >> requests.ndjson
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+IFS= read -r line
+printf '%s\n' "$line" >> requests.ndjson
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"fake-session"}}'
+IFS= read -r line
+printf '%s\n' "$line" >> requests.ndjson
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"FAKE_ACP_OK"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
+while IFS= read -r line; do :; done
+"#;
+
+        #[tokio::test]
+        async fn fake_child_receives_typed_api_key_only_in_xai_api_key_env() {
+            let temp = TempDir::new().expect("tempdir");
+            let binary = fake_grok(&temp, GROK_1_0_API_KEY_BODY);
+            let model_provider = GrokCliModelProvider::builder("test")
+                .binary_path(Some(binary.to_str().expect("UTF-8 fake path")))
+                .working_directory(temp.path().to_str().expect("UTF-8 test path"))
+                .api_key(Some("TYPED_XAI_KEY_SECRET"))
+                .timeout_secs(Some(5))
+                .build()
+                .expect("provider");
+            let reply = model_provider
+                .invoke_acp(None, "hello", "default")
+                .await
+                .expect("fake ACP reply");
+            assert_eq!(reply, "FAKE_ACP_OK");
+
+            let key = std::fs::read_to_string(temp.path().join("xai-key.txt")).expect("env key");
+            assert_eq!(key, "TYPED_XAI_KEY_SECRET");
+            let args = std::fs::read_to_string(temp.path().join("args.txt")).expect("argv");
+            assert!(!args.contains("TYPED_XAI_KEY_SECRET"));
+            let requests = std::fs::read_to_string(temp.path().join("requests.ndjson"))
+                .expect("captured requests");
+            assert!(!requests.contains("TYPED_XAI_KEY_SECRET"));
+            let authenticate: serde_json::Value =
+                serde_json::from_str(requests.lines().nth(1).expect("authenticate request"))
+                    .expect("authenticate JSON");
+            assert_eq!(authenticate["params"]["methodId"], "xai.api_key");
         }
 
         #[tokio::test]

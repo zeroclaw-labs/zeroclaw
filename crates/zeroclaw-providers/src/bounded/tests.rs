@@ -659,9 +659,14 @@ async fn cli_and_direct_native_ollama_decline_without_spending() {
     let executable = std::env::current_exe().unwrap();
     let providers: Vec<Box<dyn ModelProvider>> = vec![
         Box::new(
-            crate::gemini_cli::GeminiCliModelProvider::builder("fixture")
-                .binary_path(Some("must-not-be-launched"))
-                .build(),
+            crate::antigravity_cli::AntigravityCliModelProvider::builder("fixture")
+                .binary_path(Some(executable.to_str().unwrap()))
+                .working_directory(cwd.path().to_str().unwrap())
+                .state_root(cwd.path().join("state"))
+                .auth_method(zeroclaw_config::schema::AntigravityCliAuthMethod::GeminiApiKey)
+                .api_key(Some("fixture-key"))
+                .build()
+                .unwrap(),
         ),
         Box::new(
             crate::kilocli::KiloCliModelProvider::builder("fixture")
