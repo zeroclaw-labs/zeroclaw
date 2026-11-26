@@ -2549,10 +2549,11 @@ fn all_tools_with_runtime_on_thread(
         Arc::new(tool)
     });
     register_tool!("send_message_to_peer", {
-        let tool = SendMessageToPeerTool::new_with_live_config_and_capability(
+        let tool = SendMessageToPeerTool::new_with_live_config_security_and_capability(
             Arc::clone(&root_config_shared),
             agent_alias,
             live_config.clone(),
+            security.clone(),
             execution_capability.clone(),
         );
         capability_slots.push(tool.capabilities_slot());
@@ -2991,6 +2992,9 @@ fn all_tools_with_runtime_on_thread(
             // `config.toml` and miss an env-only key, or send a stored key
             // that a blank override was meant to suppress.
             .with_keenable_api_key_override(WebSearchTool::keenable_api_key_override(
+                root_config,
+            ))
+            .with_firecrawl_api_key_override(WebSearchTool::firecrawl_api_key_override(
                 root_config,
             )),
                 security.clone(),

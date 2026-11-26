@@ -253,7 +253,7 @@ to one provider.
 | `provider:claude-code` | `claude_code.rs` |
 | `provider:compatible` | `compatible.rs` |
 | `provider:copilot` | `copilot.rs` |
-| `provider:gemini` | `gemini.rs`, `gemini_cli.rs` |
+| `provider:gemini` | `gemini.rs` |
 | `provider:glm` | `glm.rs` |
 | `provider:kilocli` | `kilocli.rs` |
 | `provider:ollama` | `ollama.rs` |

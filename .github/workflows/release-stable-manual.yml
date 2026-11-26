@@ -1211,7 +1211,7 @@ jobs:
         env:
           PAT: ${{ secrets.WEBSITE_REPO_PAT }}
         run: |
-          curl -fsSL -X POST \
+          curl -fsSL --retry 3 --retry-max-time 60 -X POST \
             -H "Authorization: token $PAT" \
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/zeroclaw-labs/zeroclaw-website/dispatches \
