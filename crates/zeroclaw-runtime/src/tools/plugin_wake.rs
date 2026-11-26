@@ -3358,7 +3358,8 @@ mod tests {
         fn revoke_grant(config: &mut Config) {
             config.plugins.entries = vec![entry(&instance_key(), &[], None)];
         }
-        let cases: [(&str, fn(&mut Config), AgentWakeError); 2] = [
+        type Case = (&'static str, fn(&mut Config), AgentWakeError);
+        let cases: [Case; 2] = [
             ("disabled", disable_target, AgentWakeError::UnknownAgent),
             ("revoked", revoke_grant, AgentWakeError::AccessDenied),
         ];
