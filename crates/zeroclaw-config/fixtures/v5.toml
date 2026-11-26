@@ -756,42 +756,6 @@ mode = "api_key"
 HTTP-Referer = "https://zeroclaw.test"
 X-Title = "zeroclaw-v1-fixture"
 
-[providers.connections."route.deep"]
-capabilities = ["chat"]
-kind = "anthropic"
-uri = "https://api.anthropic.com"
-
-[providers.connections."route.deep".api.chat]
-wire_api = "chat_completions"
-
-[providers.connections."route.deep".auth]
-mode = "api_key"
-
-[providers.connections."route.fast"]
-capabilities = [
-    "chat",
-    "embedding",
-    "tts",
-    "asr",
-    "decision",
-]
-kind = "openai"
-uri = "https://api.openai.com/v1/chat/completions"
-
-[providers.connections."route.fast".api.chat]
-read_timeout_secs = 300
-request_timeout_secs = 90
-stream_request_timeout_secs = "null"
-wire_api = "chat_completions"
-
-[providers.connections."route.fast".auth]
-api_key = "sk-v1-test-global"
-mode = "api_key"
-
-[providers.connections."route.fast".extra_headers]
-HTTP-Referer = "https://zeroclaw.test"
-X-Title = "zeroclaw-v1-fixture"
-
 [providers.models."anthropic.agent_complex_agent"]
 capability = "chat"
 model = "claude-sonnet-4-5"
@@ -868,14 +832,14 @@ temperature = 0.5
 [providers.models."route.deep"]
 capability = "chat"
 model = "claude-sonnet-4-6"
-provider = "route.deep"
+provider = "legacy.anthropic.default"
 
 [providers.models."route.deep".metadata]
 
 [providers.models."route.fast"]
 capability = "chat"
 model = "gpt-4o-mini"
-provider = "route.fast"
+provider = "legacy.openai.default"
 
 [providers.models."route.fast".metadata]
 

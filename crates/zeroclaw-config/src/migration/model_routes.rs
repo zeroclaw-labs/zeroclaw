@@ -39,7 +39,7 @@ pub(super) fn migrate(mut document: toml::Value) -> Result<toml::Value> {
             .cloned()
             .map(toml::Value::try_into)
             .transpose()
-            .context("read V3 route provider definitions")?
+            .context("read V4 route provider definitions")?
             .unwrap_or_default(),
         ..Config::default()
     };
@@ -90,11 +90,12 @@ pub(super) fn migrate(mut document: toml::Value) -> Result<toml::Value> {
         let mut model_ref = reference.to_owned();
         if canonical.is_none() || explicit_model.is_some() || key.is_some() {
             let (mut connection, mut model) = if let Some(model) = canonical {
-                let connection = config
-                    .providers
-                    .connections
-                    .get(model.provider())
-                    .context("V3 route references a model with no connection")?;
+                // Preserve the raw TOML input: serializing a typed connection
+                // to JSON includes absent optional fields as null, which TOML
+                // cannot encode when a route needs its own credential copy.
+                let connection = connections
+                    .get(model.provider().as_str())
+                    .context("V4 route references a model with no connection")?;
                 (
                     serde_json::to_value(connection)?,
                     serde_json::to_value(model)?,

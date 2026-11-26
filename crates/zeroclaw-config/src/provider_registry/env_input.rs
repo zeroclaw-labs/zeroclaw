@@ -201,7 +201,32 @@ fn env_value(value: &str) -> (Value, Value) {
 /// An untyped transaction view lets historical whole-auth edits compose with
 /// earlier edits before the final registry is admitted.
 pub(crate) fn stage(document: &mut Value, path: &str, value: &str) -> Result<()> {
-    set_document(document, path, env_value(value).0, None)
+    let (parsed, literal) = env_value(value);
+    let value = typed_env_value(document, path, parsed, literal)?;
+    set_document(document, path, value, None)
+}
+
+fn typed_env_value(template: &Value, path: &str, parsed: Value, literal: Value) -> Result<Value> {
+    if parsed == literal {
+        return Ok(parsed);
+    }
+    // The schema is the source for the leaf's type, including credentials
+    // that happen to look like JSON numbers. Probe independently so a valid
+    // numeric option cannot turn into a string while repairing another leaf.
+    let mut probe = template.clone();
+    set_document(&mut probe, path, parsed.clone(), None)?;
+    if serde_json::from_value::<crate::providers::Providers>(probe).is_ok() {
+        return Ok(parsed);
+    }
+    let mut probe = template.clone();
+    set_document(&mut probe, path, literal.clone(), None)?;
+    if serde_json::from_value::<crate::providers::Providers>(probe).is_ok() {
+        Ok(literal)
+    } else {
+        // Another staged edit can complete an intermediate auth variant.
+        // The final decode below still rejects genuinely invalid batches.
+        Ok(parsed)
+    }
 }
 
 /// Stage all registry environment edits before decoding the final registry.
@@ -221,27 +246,7 @@ pub(crate) fn set_many(config: &mut Config, edits: &[(String, String)]) -> Resul
     }
 
     for (path, parsed, literal) in parsed_edits {
-        let value = if parsed == literal {
-            parsed
-        } else {
-            // Ask the real schema to distinguish JSON-valued options from
-            // string fields such as numeric model IDs and credentials. Probe
-            // each ambiguous leaf independently: changing an unrelated numeric
-            // option to a string must not hide a later string-field override.
-            let mut probe = type_template.clone();
-            set_document(&mut probe, path, parsed.clone(), None)?;
-            if serde_json::from_value::<crate::providers::Providers>(probe).is_ok() {
-                parsed
-            } else {
-                let mut probe = type_template.clone();
-                set_document(&mut probe, path, literal.clone(), None)?;
-                if serde_json::from_value::<crate::providers::Providers>(probe).is_ok() {
-                    literal
-                } else {
-                    parsed
-                }
-            }
-        };
+        let value = typed_env_value(&type_template, path, parsed, literal)?;
         set_document(&mut document, path, value, None)?;
     }
     for (path, _) in edits {

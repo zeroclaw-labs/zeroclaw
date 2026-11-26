@@ -624,6 +624,38 @@ oauth_client_secret = "original-secret"
     }
 
     #[tokio::test]
+    async fn mixed_auth_env_names_preserve_json_looking_keys() {
+        let _guard = super::env_test_lock().await;
+        let _key = EnvVarGuard::set(
+            "ZEROCLAW_providers__connections__gemini__auth__api_key",
+            "123",
+        );
+        let _mode = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__gemini__work__auth_mode",
+            "api_key",
+        );
+        let mut config: Config = toml::from_str(
+            r#"
+[providers.connections.gemini]
+kind = "gemini"
+[providers.models."gemini.work"]
+capability = "chat"
+provider = "gemini"
+model = "gemini-test"
+"#,
+        )
+        .unwrap();
+        let before = serde_json::to_value(&config.providers).unwrap();
+        let applied = apply_env_overrides(&mut config).unwrap();
+        assert_eq!(
+            config.providers.connections["gemini"].api_key(),
+            Some("123")
+        );
+        mask_env_overrides_for_save(&mut config, &applied.snapshots).unwrap();
+        assert_eq!(serde_json::to_value(&config.providers).unwrap(), before);
+    }
+
+    #[tokio::test]
     async fn historical_memory_env_overrides_rematerialize_a_loaded_model_without_persisting_it() {
         let _guard = super::env_test_lock().await;
         let _model = EnvVarGuard::set("ZEROCLAW_memory__embedding_model", "env-embedding");
@@ -768,12 +800,14 @@ embedding_model_ref="embedding.main"
             "ZEROCLAW_providers__connections__gemini__auth__client_secret",
             "client-secret",
         );
-        let mut config = Config::default();
-        config.providers = serde_json::from_value(serde_json::json!({
-            "connections": {"gemini": {"kind": "gemini"}},
-            "models": {}
-        }))
-        .unwrap();
+        let mut config = Config {
+            providers: serde_json::from_value(serde_json::json!({
+                "connections": {"gemini": {"kind": "gemini"}},
+                "models": {}
+            }))
+            .unwrap(),
+            ..Config::default()
+        };
 
         apply_env_overrides(&mut config).expect("compound OAuth overrides must be atomic");
         let connection = serde_json::to_value(&config.providers.connections["gemini"]).unwrap();
