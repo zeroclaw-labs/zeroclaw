@@ -4,14 +4,16 @@
 //! transport. The assembled prompt is sent as JSON-RPC on child stdin; it is
 //! never placed in argv or a temporary file.
 //! Authentication uses the Grok CLI login cache by default. API-key auth is an
-//! explicit per-alias opt-in: export `XAI_API_KEY` into the ZeroClaw process and
-//! list that name in `env_passthrough`. Typed alias `api_key` is rejected; this
-//! provider does not store the key in config. At each spawn the child allowlist
-//! resolves process env by name (including `XAI_API_KEY` when opted in) so the
-//! CLI login cache remains the default owner and the key is never snapshotted
-//! into the long-lived provider handle. A future typed Config bridge may map
-//! the same name at load time; until then the documented process-env +
-//! `env_passthrough` surface is the single operator credential path.
+//! explicit per-alias opt-in through either of two mutually exclusive paths:
+//!
+//! - the alias's typed `api_key` secret (stored encrypted in config like every
+//!   other provider key), which ZeroClaw places in the child's `XAI_API_KEY`
+//!   at spawn time; or
+//! - exporting `XAI_API_KEY` into the ZeroClaw process and listing that name
+//!   in `env_passthrough`, resolved from process env at each spawn.
+//!
+//! The Grok CLI reads API keys only from `XAI_API_KEY`, so the key reaches the
+//! child through its (otherwise cleared) environment; it never appears in argv.
 //!
 //! # Usage
 //!
@@ -20,6 +22,7 @@
 //! model = "grok-4.5"
 //! working_directory = "/path/to/agents/default/workspace"
 //! # binary_path = "/home/you/.grok/bin/grok"
+//! # api_key = "..."   # optional; set with `zeroclaw config set`
 //!
 //! [agents.default]
 //! model_provider = "grok_cli.default"
@@ -193,6 +196,8 @@ pub struct GrokCliModelProvider {
     working_directory: PathBuf,
     /// Operator-selected environment variable names inherited at spawn time.
     env_passthrough: Vec<String>,
+    /// Alias `api_key` secret, placed in the child's `XAI_API_KEY` at spawn.
+    api_key: Option<String>,
     /// Operator-supplied argv tokens, after provider-owned flag validation.
     extra_args: Vec<String>,
     /// Aggregate stdout budget for one ACP request.
@@ -217,6 +222,7 @@ pub struct GrokCliBuilder {
     binary_path: Option<String>,
     working_directory: Option<String>,
     env_passthrough: Vec<String>,
+    api_key: Option<String>,
     extra_args: Vec<String>,
     max_acp_stdout_bytes: Option<usize>,
     timeout_secs: Option<u64>,
@@ -242,6 +248,15 @@ impl GrokCliBuilder {
     /// Add operator-selected environment variables to the child allowlist.
     pub fn env_passthrough(mut self, names: Vec<String>) -> Self {
         self.env_passthrough = names;
+        self
+    }
+
+    /// Alias `api_key` secret. Whitespace-only inputs count as unset.
+    pub fn api_key(mut self, key: Option<&str>) -> Self {
+        self.api_key = key
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_string);
         self
     }
 
@@ -278,6 +293,16 @@ impl GrokCliBuilder {
         )?;
         let env_passthrough =
             GrokCliModelProvider::normalize_and_validate_env_passthrough(self.env_passthrough)?;
+        if self.api_key.is_some()
+            && env_passthrough
+                .iter()
+                .any(|name| env_names_equal(name, XAI_API_KEY_ENV))
+        {
+            anyhow::bail!(
+                "grok_cli takes an API key from either the alias api_key or env_passthrough \
+                 `XAI_API_KEY`, not both; remove one"
+            );
+        }
         let extra_args = GrokCliModelProvider::normalize_and_validate_extra_args(self.extra_args)?;
         let max_acp_stdout_bytes =
             acp_cli::validate_acp_stdout_limit(FAMILY, self.max_acp_stdout_bytes)?;
@@ -298,6 +323,7 @@ impl GrokCliBuilder {
             binary_path,
             working_directory,
             env_passthrough,
+            api_key: self.api_key,
             extra_args,
             max_acp_stdout_bytes,
             timeout,
@@ -314,6 +340,7 @@ impl GrokCliModelProvider {
             binary_path: None,
             working_directory: None,
             env_passthrough: Vec::new(),
+            api_key: None,
             extra_args: Vec::new(),
             max_acp_stdout_bytes: None,
             timeout_secs: None,
@@ -560,20 +587,28 @@ impl GrokCliModelProvider {
         let mut cmd = Command::new(&self.binary_path);
         cmd.args(&args);
         cmd.current_dir(&self.working_directory);
-        let xai_api_key_available = Self::apply_env_allowlist(&mut cmd, &self.env_passthrough);
+        let mut xai_api_key_available = Self::apply_env_allowlist(&mut cmd, &self.env_passthrough);
+        if let Some(api_key) = self.api_key.as_deref() {
+            cmd.env(XAI_API_KEY_ENV, api_key);
+            xai_api_key_available = true;
+        }
 
         let request = acp::OneshotPrompt {
             prompt: &prompt,
             cwd: &self.working_directory,
             permission_policy,
             max_stdout_bytes: self.max_acp_stdout_bytes,
+            session_meta: None,
+            model: None,
+            session_check: None,
+            failure_marker: None,
         };
         let outcome = run_oneshot_subprocess(cmd, self.timeout, &request, |initialize| {
             let method_id = select_auth_method_id(initialize, xai_api_key_available)?;
-            Ok(json!({
+            Ok(Some(json!({
                 "methodId": method_id,
                 "_meta": { "headless": true }
-            }))
+            })))
         })
         .await;
 
@@ -706,6 +741,11 @@ fn joined_prompt_text(system: Option<&str>, message: &str) -> String {
 
 /// Grok Build ACP authentication method: an explicitly passed `XAI_API_KEY`
 /// first, then the CLI login cache.
+///
+/// Grok Build 0.2.x advertises `xai.api_key`, `cached_token`, and `xai.oauth`.
+/// Grok Build 1.0 advertises only `grok.com` (its login cache / sign-in flow)
+/// while still accepting the unadvertised `xai.api_key` method, which reads
+/// `XAI_API_KEY` from the child environment.
 fn select_auth_method_id(
     initialize: &Value,
     xai_api_key_available: bool,
@@ -724,10 +764,10 @@ fn select_auth_method_id(
         })
         .collect();
 
-    if xai_api_key_available && ids.contains(&"xai.api_key") {
+    if xai_api_key_available && (ids.contains(&"xai.api_key") || ids.contains(&"grok.com")) {
         return Ok("xai.api_key".to_string());
     }
-    for preferred in ["cached_token", "xai.oauth"] {
+    for preferred in ["cached_token", "xai.oauth", "grok.com"] {
         if ids.contains(&preferred) {
             return Ok(preferred.to_string());
         }
@@ -1117,6 +1157,53 @@ mod tests {
             select_auth_method_id(&api_key_only, false),
             Err(acp::AcpError::NoAuthenticationMethod)
         ));
+    }
+
+    #[test]
+    fn auth_selection_supports_grok_build_1_0_methods() {
+        let initialize = json!({ "authMethods": [{ "id": "grok.com" }] });
+        assert_eq!(
+            select_auth_method_id(&initialize, true).expect("API-key auth"),
+            "xai.api_key",
+            "Grok Build 1.0 accepts the unadvertised xai.api_key method"
+        );
+        assert_eq!(
+            select_auth_method_id(&initialize, false).expect("login cache"),
+            "grok.com"
+        );
+        assert!(matches!(
+            select_auth_method_id(&json!({ "authMethods": [{ "id": "other" }] }), true),
+            Err(acp::AcpError::NoAuthenticationMethod)
+        ));
+    }
+
+    #[test]
+    fn typed_api_key_is_exclusive_with_env_passthrough_key() {
+        let temp = TempDir::new().expect("tempdir");
+        let provider = provider_builder(temp.path())
+            .api_key(Some(" typed-key "))
+            .build()
+            .expect("typed api_key");
+        assert_eq!(provider.api_key.as_deref(), Some("typed-key"));
+        assert!(
+            provider_builder(temp.path())
+                .api_key(Some("   "))
+                .build()
+                .expect("blank key")
+                .api_key
+                .is_none()
+        );
+
+        let error = match provider_builder(temp.path())
+            .api_key(Some("typed-key"))
+            .env_passthrough(vec![XAI_API_KEY_ENV.to_string()])
+            .build()
+        {
+            Ok(_) => panic!("both key sources must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("not both"), "{error}");
+        assert!(!error.contains("typed-key"));
     }
 
     #[test]
@@ -1911,6 +1998,56 @@ if [ "${1-}" = --warm-up ]; then exit 0; fi
                 sleep(Duration::from_millis(20)).await;
             }
             assert!(!process_exists(pid), "process {pid} survived cleanup");
+        }
+
+        /// Grok Build 1.0 shape: only `grok.com` is advertised.
+        const GROK_1_0_API_KEY_BODY: &str = r#"
+printf '%s\n' "$@" > args.txt
+printf '%s' "${XAI_API_KEY-}" > xai-key.txt
+IFS= read -r line
+printf '%s\n' "$line" >> requests.ndjson
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"authMethods":[{"id":"grok.com"}]}}'
+IFS= read -r line
+printf '%s\n' "$line" >> requests.ndjson
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
+IFS= read -r line
+printf '%s\n' "$line" >> requests.ndjson
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"sessionId":"fake-session"}}'
+IFS= read -r line
+printf '%s\n' "$line" >> requests.ndjson
+printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"FAKE_ACP_OK"}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}'
+while IFS= read -r line; do :; done
+"#;
+
+        #[tokio::test]
+        async fn fake_child_receives_typed_api_key_only_in_xai_api_key_env() {
+            let temp = TempDir::new().expect("tempdir");
+            let binary = fake_grok(&temp, GROK_1_0_API_KEY_BODY);
+            let model_provider = GrokCliModelProvider::builder("test")
+                .binary_path(Some(binary.to_str().expect("UTF-8 fake path")))
+                .working_directory(temp.path().to_str().expect("UTF-8 test path"))
+                .api_key(Some("TYPED_XAI_KEY_SECRET"))
+                .timeout_secs(Some(5))
+                .build()
+                .expect("provider");
+            let reply = model_provider
+                .invoke_acp(None, "hello", "default")
+                .await
+                .expect("fake ACP reply");
+            assert_eq!(reply, "FAKE_ACP_OK");
+
+            let key = std::fs::read_to_string(temp.path().join("xai-key.txt")).expect("env key");
+            assert_eq!(key, "TYPED_XAI_KEY_SECRET");
+            let args = std::fs::read_to_string(temp.path().join("args.txt")).expect("argv");
+            assert!(!args.contains("TYPED_XAI_KEY_SECRET"));
+            let requests = std::fs::read_to_string(temp.path().join("requests.ndjson"))
+                .expect("captured requests");
+            assert!(!requests.contains("TYPED_XAI_KEY_SECRET"));
+            let authenticate: serde_json::Value =
+                serde_json::from_str(requests.lines().nth(1).expect("authenticate request"))
+                    .expect("authenticate JSON");
+            assert_eq!(authenticate["params"]["methodId"], "xai.api_key");
         }
 
         #[tokio::test]

@@ -2383,6 +2383,7 @@ mod tests {
         config.providers.transcription.local_whisper.insert(
             "default".to_string(),
             zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig {
+                model: None,
                 uri: "http://localhost:8001/inference".to_string(),
                 bearer_token: None,
                 language: None,
@@ -3762,6 +3763,31 @@ mod tests {
         assert!(
             expected.contains("Command execution is not audited"),
             "the operator line must scope the gap to command execution: {expected}"
+        );
+    }
+
+    #[test]
+    fn diagnose_reports_an_enabled_removed_gemini_cli_section() {
+        let mut config = Config::default();
+        config.gemini_cli.enabled = true;
+
+        let results = diagnose(&config);
+        let hit = results.iter().find(|item| {
+            item.category == "config"
+                && item.message.contains("(at gemini_cli.enabled)")
+                && item.message.contains("the `gemini_cli` tool is removed")
+        });
+        assert!(
+            hit.is_some(),
+            "doctor must explain why an enabled [gemini_cli] tool is gone; got: {results:?}"
+        );
+
+        config.gemini_cli.enabled = false;
+        assert!(
+            !diagnose(&config)
+                .iter()
+                .any(|item| item.message.contains("gemini_cli.enabled")),
+            "a disabled [gemini_cli] section is not reported"
         );
     }
 
