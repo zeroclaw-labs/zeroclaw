@@ -13304,6 +13304,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streamed_hint_keeps_resolved_route_identity_without_usage_chain() {
+        struct HintedStreamingProvider;
+
+        impl zeroclaw_api::attribution::Attributable for HintedStreamingProvider {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "anthropic.fast"
+            }
+        }
+
+        #[async_trait]
+        impl ModelProvider for HintedStreamingProvider {
+            async fn chat_with_system(
+                &self,
+                _system: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> Result<String> {
+                anyhow::bail!("this fixture must use streaming")
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat(
+                &self,
+                _request: ChatRequest<'_>,
+                model: &str,
+                _temperature: Option<f64>,
+                _options: zeroclaw_providers::traits::StreamOptions,
+            ) -> futures_util::stream::BoxStream<
+                'static,
+                zeroclaw_providers::traits::StreamResult<zeroclaw_providers::traits::StreamEvent>,
+            > {
+                use zeroclaw_providers::traits::{StreamChunk, StreamEvent};
+                assert_eq!(model, "hint:fast");
+                Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta("classified"))),
+                    Ok(StreamEvent::Final),
+                ]))
+            }
+        }
+
+        let provider = Box::new(HintedStreamingProvider);
+        let mut agent = blank_input_agent(provider);
+        agent.classification_config = zeroclaw_config::schema::QueryClassificationConfig {
+            enabled: true,
+            rules: vec![zeroclaw_config::schema::ClassificationRule {
+                hint: "fast".to_string(),
+                keywords: vec!["quick".to_string()],
+                patterns: vec![],
+                min_length: None,
+                max_length: None,
+                priority: 10,
+            }],
+        };
+        agent.model_route_resolver = Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
+            vec![(
+                "fast".to_string(),
+                zeroclaw_providers::router::Route {
+                    provider_name: "anthropic.fast".to_string(),
+                    model: "anthropic/claude-haiku-4-5".to_string(),
+                },
+            )],
+            "custom.default".to_string(),
+            "default-model".to_string(),
+        ));
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(32);
+        let outcome = agent
+            .turn_streamed_with_steering_state("quick summary please", event_tx, None, None)
+            .await
+            .expect("hinted streamed turn completes");
+
+        assert_eq!(outcome.response, "classified");
+        assert_eq!(outcome.provider_name, "anthropic.fast");
+        assert_eq!(outcome.model, "anthropic/claude-haiku-4-5");
+    }
+
+    #[tokio::test]
     async fn agent_turn_entry_points_apply_effort_route_and_attempt_boundary() {
         use zeroclaw_config::scattered_types::CloudEscalationPolicy;
 
