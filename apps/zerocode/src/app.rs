@@ -6077,7 +6077,10 @@ pub(crate) mod tests {
         assert!(!woke);
         assert!(started.elapsed() >= Duration::from_millis(40));
         let polls = polls.borrow();
-        assert!(polls.len() >= 4);
+        // The time left is read before each poll, so the first poll's exit
+        // check still sees 40 ms against a 10 ms slice and a second poll
+        // always follows, however long the first one's sleep overruns.
+        assert!(polls.len() >= 2, "{polls:?}");
         assert!(
             polls
                 .iter()

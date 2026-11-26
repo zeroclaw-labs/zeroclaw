@@ -6661,6 +6661,7 @@ mod tests {
 
         fn local_whisper_config(url: &str) -> LocalWhisperConfig {
             LocalWhisperConfig {
+                model: None,
                 url: url.to_string(),
                 bearer_token: Some("test-token".to_string()),
                 max_audio_bytes: 10 * 1024 * 1024,
@@ -6823,6 +6824,7 @@ mod tests {
 
         fn local_whisper_config(url: &str) -> zeroclaw_config::schema::LocalWhisperConfig {
             zeroclaw_config::schema::LocalWhisperConfig {
+                model: None,
                 url: url.to_string(),
                 bearer_token: Some("test-token".to_string()),
                 max_audio_bytes: 10 * 1024 * 1024,
@@ -7178,6 +7180,7 @@ mod tests {
                     TranscriptionConfig {
                         enabled: true,
                         local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                            model: None,
                             url: stt_url.to_string(),
                             bearer_token: Some("test-token".to_string()),
                             max_audio_bytes: 10 * 1024 * 1024,
@@ -12204,6 +12207,7 @@ mod tests {
         fn resolver_yields_a_manager_when_enabled() {
             let resolver = legacy_transcription_resolver(TranscriptionConfig {
                 local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                    model: None,
                     url: "http://127.0.0.1:9999/v1/transcribe".to_string(),
                     bearer_token: None,
                     max_audio_bytes: 10 * 1024 * 1024,
