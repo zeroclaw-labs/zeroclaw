@@ -450,6 +450,8 @@ function OverviewTab({
   const costBars = costOverviewBars(cost, budget);
   // The tracker's day and month, and so the limits, are UTC: say when each
   // resets in the viewer's local time, since the Cost tab's "Today" is local.
+  // With cost tracking off nothing is recorded and no limit is checked, so
+  // when the totals reset doesn't matter.
   const now = new Date();
   const resetsAt = (when: Date, withDate: boolean) =>
     t("dashboard.cost.resets").replace(
@@ -603,12 +605,14 @@ function OverviewTab({
                     />
                   </div>
                 )}
-                <div
-                  className="mt-1 text-[11px]"
-                  style={{ color: "var(--pc-text-faint)" }}
-                >
-                  {resets}
-                </div>
+                {budget?.tracking && (
+                  <div
+                    className="mt-1 text-[11px]"
+                    style={{ color: "var(--pc-text-faint)" }}
+                  >
+                    {resets}
+                  </div>
+                )}
               </div>
             ))}
           </div>
