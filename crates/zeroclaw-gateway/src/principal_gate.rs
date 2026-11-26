@@ -451,6 +451,15 @@ pub struct RequestAuth {
 /// or published then.
 pub type RequestPrincipal = Option<axum::Extension<RequestAuth>>;
 
+pub(crate) fn request_principal_id(request: &RequestPrincipal) -> Option<&str> {
+    request
+        .as_ref()?
+        .0
+        .principal
+        .as_ref()
+        .map(|auth| auth.principal.id.as_str())
+}
+
 /// One config mutation's complete write set: every dotted path the
 /// mutation persists, each with the verb its effect requires.
 #[derive(Clone, Debug, Default)]
@@ -1332,6 +1341,17 @@ type = "string"
         });
         let router = router_for(config);
         let url = "/api/config/plugin-tls-credentials";
+        let (first, second) = tokio::join!(
+            send(&router, "GET", url, OPERATOR.0, OPERATOR.1, None),
+            send(&router, "GET", url, OPERATOR.0, OPERATOR.1, None),
+        );
+        assert_eq!(first.0, StatusCode::OK, "first operator catalog load");
+        assert_eq!(
+            second.0,
+            StatusCode::OK,
+            "concurrent catalog load waits for discovery"
+        );
+
         let create = serde_json::json!({
             "instance": instance, "property": property,
             "operation": "create", "value": "synthetic-credential"

@@ -1026,7 +1026,10 @@ async fn admitted_plugin_tls_slots(
         use zeroclaw_plugins::{host::PluginHost, instance::PluginInstanceId};
 
         static DISCOVERY: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
-        let permit = DISCOVERY.try_acquire().ok()?;
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(2), DISCOVERY.acquire())
+            .await
+            .ok()?
+            .ok()?;
         let directory = config.plugins.resolved_plugins_dir();
         let mode = PluginHost::resolve_signature_mode(&config.plugins.security.signature_mode);
         let keys = config.plugins.security.trusted_publisher_keys.clone();
@@ -1325,7 +1328,7 @@ async fn mutate_plugin_tls_credential_inner(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
             serde_json::json!({
-                "actor": "operator",
+                "actor": crate::principal_gate::request_principal_id(principal),
                 "consumer": mutation.instance,
                 "credential": mutation.property,
                 "operation": operation,
