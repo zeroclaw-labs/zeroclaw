@@ -1606,18 +1606,8 @@ pub async fn mutate_http_credential(
                 }) else {
                     return StatusCode::SERVICE_UNAVAILABLE.into_response();
                 };
-                let replaces_list = permissions.remote_files_grants.is_some()
-                    || permissions.http_origins.is_some()
-                    || permissions.destinations.is_some()
-                    || permissions
-                        .browser
-                        .as_ref()
-                        .is_some_and(|browser| browser.origins.is_some());
                 let current_revision = permission_revision(&record);
-                if match permissions.expected_revision.as_deref() {
-                    Some(revision) => revision != current_revision,
-                    None => replaces_list,
-                } {
+                if permissions.expected_revision.as_deref() != Some(current_revision.as_str()) {
                     return StatusCode::CONFLICT.into_response();
                 }
                 let grant = serde_json::json!({
@@ -1704,6 +1694,11 @@ pub async fn mutate_http_credential(
                     _ => return StatusCode::BAD_REQUEST.into_response(),
                 }
                 }
+                if !record.http_grants().is_empty()
+                    && matches!(&record.auth, ScopedHttpAuth::UserPassword { username, .. } if username.contains(':'))
+                {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
                 let Ok(ciphertext) = serde_json::to_string(&record)
                     .map_err(anyhow::Error::from)
                     .and_then(|value| store.encrypt(&value))
@@ -1782,11 +1777,13 @@ pub async fn mutate_http_credential(
                     {
                         return StatusCode::BAD_REQUEST.into_response();
                     }
-                    if previous.http_allowed || previous.http_origins.is_some() {
-                        credential.http_origins = Some(previous.http_grants().to_vec());
+                    if previous.origin == credential.origin {
+                        if previous.http_allowed || previous.http_origins.is_some() {
+                            credential.http_origins = Some(previous.http_grants().to_vec());
+                        }
+                        credential.browser_origin = previous.browser_origin;
+                        credential.browser_origins = previous.browser_origins;
                     }
-                    credential.browser_origin = previous.browser_origin;
-                    credential.browser_origins = previous.browser_origins;
                     if credential.supports_local_webdav() {
                         credential.remote_files_grants = previous.remote_files_grants;
                     }

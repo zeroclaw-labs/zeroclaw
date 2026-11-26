@@ -545,15 +545,35 @@ impl BrowserTool {
     }
 
     async fn submit_catalog_credential(&self, args: &Value) -> anyhow::Result<()> {
-        use crate::scoped_credentials::{load_scoped_credential, resolve_scoped_value};
+        self.submit_catalog_credential_with_resolver(
+            args,
+            crate::scoped_credentials::resolve_scoped_value,
+        )
+        .await
+    }
+
+    async fn submit_catalog_credential_with_resolver<F, Fut>(
+        &self,
+        args: &Value,
+        resolve: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnOnce(zeroclaw_config::schema::ScopedCredentialSource, String) -> Fut + Send,
+        Fut: std::future::Future<Output = anyhow::Result<String>> + Send,
+    {
+        use crate::scoped_credentials::load_scoped_credential_snapshot;
         use tokio::io::AsyncWriteExt as _;
         use zeroclaw_config::schema::ScopedHttpAuth;
 
+        let mut audited_origin = None;
+        let mut audit_phase = "catalog";
+        let result: anyhow::Result<()> = async {
         let alias = args
             .get("credential")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::Error::msg("Credential alias required"))?;
-        let record = load_scoped_credential(self.credential_config_path.as_deref(), alias)?;
+        let (record, reviewed) = load_scoped_credential_snapshot(self.credential_config_path.as_deref(), alias)?;
+        audit_phase = "origin";
         let active = self
             .run_command(&["get", "url"])
             .await?
@@ -562,6 +582,7 @@ impl BrowserTool {
             .ok_or_else(|| anyhow::Error::msg("Active browser URL unavailable"))?;
         let active = reqwest::Url::parse(&active)?;
         let origin = active.origin().ascii_serialization();
+        audited_origin = Some(origin.clone());
         self.validate_url(&origin)?;
         anyhow::ensure!(
             record.permits_browser_submission(&active, &active, &active),
@@ -581,6 +602,7 @@ impl BrowserTool {
                 .all(|selector| !selector.is_empty() && selector.len() <= 256),
             "Invalid credential selector"
         );
+        audit_phase = "lookup";
         let values = match record.auth {
             ScopedHttpAuth::UserPassword { username, .. } if stage == "username" => {
                 json!({ "username": username })
@@ -588,7 +610,7 @@ impl BrowserTool {
             ScopedHttpAuth::UserPassword { username, password }
                 if matches!(stage, "auto" | "password" | "login") =>
             {
-                let password = resolve_scoped_value(record.source, password).await?;
+                let password = resolve(record.source, password).await?;
                 if stage == "password" {
                     json!({ "password": password })
                 } else {
@@ -596,7 +618,7 @@ impl BrowserTool {
                 }
             }
             ScopedHttpAuth::Totp { seed } if matches!(stage, "auto" | "otp") => {
-                let seed = resolve_scoped_value(record.source, seed).await?;
+                let seed = resolve(record.source, seed).await?;
                 let timestamp = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)?
                     .as_secs();
@@ -604,11 +626,14 @@ impl BrowserTool {
             }
             _ => anyhow::bail!("Credential kind is unsupported by the browser"),
         };
-        let current = load_scoped_credential(self.credential_config_path.as_deref(), alias)?;
+        audit_phase = "revision";
+        let (current, revision) = load_scoped_credential_snapshot(self.credential_config_path.as_deref(), alias)?;
+        anyhow::ensure!(revision == reviewed, "Browser credential changed during lookup");
         anyhow::ensure!(
             current.permits_browser_submission(&active, &active, &active),
             "Browser credential permission was revoked"
         );
+        audit_phase = "form";
         let payload = json!({ "origin": origin, "values": values, "stage": stage, "field": field, "frame": frame });
         let script = format!(
             "({})({payload})",
@@ -643,6 +668,23 @@ impl BrowserTool {
             "Browser refused the credential form"
         );
         Ok(())
+        }.await;
+        let alias = args
+            .get("credential")
+            .and_then(Value::as_str)
+            .filter(|name| zeroclaw_config::schema::ScopedHttpCredential::valid_name(name));
+        let stage = args
+            .get("credential_stage")
+            .and_then(Value::as_str)
+            .filter(|stage| matches!(*stage, "auto" | "username" | "password" | "login" | "otp"));
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(if result.is_ok() { ::zeroclaw_log::EventOutcome::Success } else { ::zeroclaw_log::EventOutcome::Failure })
+                .with_attrs(serde_json::json!({ "alias": alias, "origin": audited_origin, "stage": stage.unwrap_or("auto"), "phase": audit_phase, "status": if result.is_ok() { "submitted" } else { "refused_or_unconfirmed" } })),
+            "browser_credential_use"
+        );
+        result
     }
 
     /// Execute an agent-browser command
@@ -1579,6 +1621,7 @@ impl Tool for BrowserTool {
             "key_type, key_press, screen_capture) through a computer-use sidecar. Use 'snapshot' to map ",
             "interactive elements to refs (@e1, @e2). Enforces browser.allowed_domains for open actions. ",
             "For a saved login use submit_credential with the username/password alias on the sign-in form. ",
+            "A refused or unconfirmed submission may already have been handled by the page; inspect page state before retrying. ",
             "If a separate one-time-code form appears, call submit_credential again with the TOTP alias. ",
             "After each submission inspect the new page. Submission alone does not prove authentication. ",
             "If an access verification or human challenge prevents the form from appearing, report the blocker."
@@ -3961,6 +4004,95 @@ esac
                 .await
                 .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browser_catalog_changes_during_lookup_never_reach_the_form() {
+        use std::os::unix::fs::PermissionsExt;
+        use zeroclaw_config::{
+            schema::{Config, ScopedHttpCredential},
+            secrets::SecretStore,
+        };
+        for change in ["replace", "revoke", "delete", "denied"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("config.toml");
+            let marker = tmp.path().join("submitted");
+            let bin = tmp.path().join("fixture-browser");
+            std::fs::write(&bin, format!("#!/bin/sh\ncase \"$1\" in\n get) printf '%s\\n' '{{\"success\":true,\"data\":{{\"url\":\"https://login.example.test/login\"}}}}' ;;\n eval) touch '{}' ; exit 1 ;;\n esac\n", marker.display())).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut record: ScopedHttpCredential = serde_json::from_value(json!({
+                "origin": "https://login.example.test", "source": "open_bao",
+                "browser_origin": "https://login.example.test",
+                "auth": {"kind":"user_password","username":"fixture","password":"kv/fixture/password"}
+            })).unwrap();
+            if change == "denied" {
+                record.browser_origin = None;
+            }
+            let mut config = Config::default();
+            config.secrets.encrypt = true;
+            let store = SecretStore::new(tmp.path(), true);
+            config.http_request.scoped_credentials.insert(
+                "LOGIN".into(),
+                store
+                    .encrypt(&serde_json::to_string(&record).unwrap())
+                    .unwrap(),
+            );
+            std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+            let mut tool =
+                screenshot_tool_with_workspace(tmp.path()).with_credential_config(path.clone());
+            tool.set_agent_browser_bin_for_tests(bin);
+            let (started, lookup_started) = tokio::sync::oneshot::channel();
+            let (resume, resumed) = tokio::sync::oneshot::channel();
+            let args = json!({"credential":"LOGIN"});
+            let apply = tool.submit_catalog_credential_with_resolver(&args, |_, _| async move {
+                assert_ne!(
+                    change, "denied",
+                    "an ungranted alias must not reach the resolver"
+                );
+                started.send(()).unwrap();
+                resumed.await.unwrap();
+                Ok("old-synthetic-password".into())
+            });
+            if change == "denied" {
+                assert!(apply.await.is_err());
+                continue;
+            }
+            let mutate = async {
+                lookup_started.await.unwrap();
+                if change == "delete" {
+                    config.http_request.scoped_credentials.remove("LOGIN");
+                } else {
+                    if change == "revoke" {
+                        record.browser_origin = None;
+                    } else if let zeroclaw_config::schema::ScopedHttpAuth::UserPassword {
+                        password,
+                        ..
+                    } = &mut record.auth
+                    {
+                        *password = "kv/fixture/replaced".into();
+                    }
+                    config.http_request.scoped_credentials.insert(
+                        "LOGIN".into(),
+                        store
+                            .encrypt(&serde_json::to_string(&record).unwrap())
+                            .unwrap(),
+                    );
+                }
+                std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+                resume.send(()).unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(apply, mutate)
+            })
+            .await
+            .unwrap();
+            assert!(result.is_err(), "{change} must fail closed");
+            assert!(
+                !marker.exists(),
+                "no evaluation may receive the stale value"
+            );
+        }
     }
 
     #[tokio::test]

@@ -229,6 +229,8 @@ jobs:
 
       - name: Test docs version selector and root 404 redirect
         run: node --test scripts/docs/version_selector_test.mjs scripts/docs/root_404_test.mjs
+      - name: Test browser credential submission boundaries
+        run: node --test crates/zeroclaw-tools/src/browser_credential_form.test.mjs
 
   relay-container-smoke-changes:
     name: Detect Relay Container Smoke changes
