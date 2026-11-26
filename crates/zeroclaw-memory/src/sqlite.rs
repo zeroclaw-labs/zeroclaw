@@ -4170,7 +4170,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl super::super::embeddings::EmbeddingProvider for RecordingEmbedding {
+    impl zeroclaw_api::embedding::EmbeddingProvider for RecordingEmbedding {
         fn name(&self) -> &str {
             "recording"
         }
