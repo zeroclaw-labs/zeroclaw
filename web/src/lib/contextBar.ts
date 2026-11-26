@@ -1,8 +1,11 @@
+export const CONTEXT_BAR_WIDTH = 16;
+
 export interface ContextBarState {
   used: number;
   denominator: number;
   percent: number;
-  cells: string;
+  /** Number of filled cells in a {@link CONTEXT_BAR_WIDTH}-cell bar. */
+  filled: number;
   trimMarkerIndex: number | null;
 }
 
@@ -11,7 +14,7 @@ export function resolveContextBarState(
   contextMaxTokens: number | null,
   contextModelWindow: number | null,
   contextInputTokens: number | null,
-  barWidth = 16,
+  barWidth = CONTEXT_BAR_WIDTH,
 ): ContextBarState | null {
   const denominator = contextModelWindow ?? contextMaxTokens;
   if (!denominator || denominator <= 0 || barWidth <= 0) return null;
@@ -19,7 +22,6 @@ export function resolveContextBarState(
   const used = contextInputTokens ?? 0;
   const percent = Math.min((used / denominator) * 100, 100);
   const filled = Math.round((percent / 100) * barWidth);
-  const cells = ('█'.repeat(filled) + '░'.repeat(Math.max(0, barWidth - filled))).split('');
   let trimMarkerIndex: number | null = null;
   if (
     contextModelWindow &&
@@ -31,8 +33,7 @@ export function resolveContextBarState(
       Math.round((contextMaxTokens / contextModelWindow) * barWidth),
       barWidth - 1,
     );
-    cells[trimMarkerIndex] = '│';
   }
 
-  return { used, denominator, percent, cells: cells.join(''), trimMarkerIndex };
+  return { used, denominator, percent, filled, trimMarkerIndex };
 }
