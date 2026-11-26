@@ -648,6 +648,41 @@ mod tests {
     use std::num::NonZeroU64;
 
     #[test]
+    fn fixed_chat_connections_reject_unsupported_speech_apis() {
+        for kind in ["openrouter", "telnyx", "ovh", "copilot"] {
+            for capability in ["tts", "asr"] {
+                for (capabilities, expected) in [
+                    (
+                        String::new(),
+                        "configured API must be explicitly enabled in capabilities",
+                    ),
+                    (
+                        format!(r#"capabilities = ["chat", "{capability}"]"#),
+                        "capability is not implemented by this connection kind",
+                    ),
+                ] {
+                    for settings in ["", r#"preset = "missing""#] {
+                        let error = toml::from_str::<ProviderRegistry>(&format!(
+                            r#"
+[connections.gateway]
+kind = "{kind}"
+{capabilities}
+[connections.gateway.api.{capability}]
+{settings}
+"#
+                        ))
+                        .unwrap_err();
+                        assert!(
+                            error.to_string().contains(expected),
+                            "{kind}/{capability}: {error}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn antigravity_models_inherit_process_defaults_and_override_request_options() {
         let registry: ProviderRegistry = toml::from_str(
             r#"
