@@ -14,6 +14,7 @@ ignore = [
     # crates that cargo-deny (graph-aware) does not pull into the resolved
     # dependency graph. These entries are needed only in audit.toml. ──
     "RUSTSEC-2026-0253",  # lru 0.16; residual Nostr cache path is absent from cargo-deny's resolved graph; migration tracked in #9602
+    "RUSTSEC-2026-0594",  # cookie 0.16.2 private-cookie nonce reuse; only via webdriver behind the optional browser-native feature, and webdriver 0.54.0 (newest) still requires cookie ^0.16 while the fix is 0.18.3; the private and signed features that compile the affected code are off; #12693
 
     # ── Still present in Cargo.lock though no longer in cargo-deny's resolved
     # graph (removed from deny.toml in this same PR); audit-only, tracked in
