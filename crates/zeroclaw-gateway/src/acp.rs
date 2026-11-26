@@ -3,7 +3,7 @@
 use super::AppState;
 use crate::chat_core::WS_CLOSE_CONVERSATION_LIMIT;
 use crate::core_rpc::CoreRpc;
-use crate::dashboard_core::{CoreFailure, Place, take_conversation_place};
+use crate::dashboard_core::{CoreBinding, CoreFailure, Place, take_conversation_place};
 use crate::dashboard_session::{
     DashboardAuth, DashboardCaller, SessionWatch, WS_CLOSE_SESSION_ENDED, session_lost,
 };
@@ -19,6 +19,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -54,6 +55,7 @@ struct ActiveAcpTurn {
     tx: broadcast::Sender<AcpTurnEventFrame>,
     cancel: CancellationToken,
     guard: Option<SessionGuard>,
+    scoped_place: Option<Weak<ScopedChatPlace>>,
 }
 
 /// Snapshot + live receiver returned when a reconnected socket reattaches to
@@ -166,12 +168,13 @@ impl AcpTurnHub {
 
     /// Try to acquire the per-session [`SessionActorQueue`] permit and register
     /// an active turn for `session_id`.
-    pub(crate) async fn start_turn(
+    async fn start_turn(
         &self,
         session_id: &str,
         principal_id: Option<String>,
         cancel: CancellationToken,
         server: Weak<AcpServer>,
+        scoped_place: Option<Weak<ScopedChatPlace>>,
     ) -> Result<(), SessionQueueError> {
         let permit = self.queue.try_acquire(session_id).await?;
         let (tx, _) = broadcast::channel(256);
@@ -189,6 +192,7 @@ impl AcpTurnHub {
                 tx,
                 cancel,
                 guard: Some(permit),
+                scoped_place,
             },
         );
         Ok(())
@@ -268,6 +272,24 @@ impl AcpTurnHub {
                 }
             }
         });
+    }
+
+    fn recover_scoped_place(
+        &self,
+        session_id: &str,
+        principal: &str,
+        sign_in: &Arc<CoreBinding>,
+    ) -> Option<ScopedChatSocket> {
+        let turns = self.turns.lock().unwrap_or_else(|e| e.into_inner());
+        let turn = turns.get(session_id)?;
+        if turn.completed || turn.principal_id.as_deref() != Some(principal) {
+            return None;
+        }
+        let place = turn.scoped_place.as_ref()?.upgrade()?;
+        if !place.budget.belongs_to_sign_in(sign_in) {
+            return None;
+        }
+        place.attach()
     }
 
     fn answer(
@@ -401,12 +423,39 @@ pub struct AcpQuery {
     /// address each configured agent via its own URL. Validated exactly like
     /// an explicit `agentAlias` at `session/new`; ignored by session restore.
     agent: Option<String>,
+    /// The existing conversation to restore when reconnecting.
+    #[serde(rename = "resumeSession")]
+    resume_session: Option<String>,
+}
+
+struct ScopedChatPlace {
+    budget: Place,
+    attached: AtomicBool,
+}
+
+impl ScopedChatPlace {
+    fn attach(self: &Arc<Self>) -> Option<ScopedChatSocket> {
+        self.attached
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(ScopedChatSocket(Arc::clone(self)))
+    }
+}
+
+/// The single interactive socket using a conversation's budget slot.
+struct ScopedChatSocket(Arc<ScopedChatPlace>);
+
+impl Drop for ScopedChatSocket {
+    fn drop(&mut self) {
+        self.0.attached.store(false, Ordering::Release);
+    }
 }
 
 struct ScopedAcpChat {
     principal_id: String,
     grants: Arc<dyn Fn() -> Option<ResolvedGrants> + Send + Sync>,
-    place: Place,
+    socket: ScopedChatSocket,
+    recovery_session: Option<String>,
 }
 
 pub(crate) async fn handle_ws_acp(
@@ -467,17 +516,35 @@ pub(crate) async fn handle_ws_acp(
                             return CoreFailure::SessionEnded.into_response();
                         };
                         let principal_id = session.principal().id.as_str().to_string();
-                        let place = match take_conversation_place(&core, &binding, &principal_id) {
-                            Ok(place) => place,
-                            Err(CoreFailure::ConversationLimit) => {
-                                return ws.on_upgrade(|mut socket| async move {
-                                    let _ = socket.send(Message::Close(Some(CloseFrame {
-                                        code: WS_CLOSE_CONVERSATION_LIMIT,
-                                        reason: crate::dashboard_core::conversation_limit_message().into(),
-                                    }))).await;
-                                }).into_response();
-                            }
-                            Err(error) => return error.into_response(),
+                        let recovered = params.resume_session.as_ref().and_then(|sid| {
+                            turn_hub.recover_scoped_place(sid, &principal_id, &binding)
+                        });
+                        let (socket, recovery_session) = if let Some(socket) = recovered {
+                            (socket, params.resume_session.clone())
+                        } else {
+                            let budget = match take_conversation_place(
+                                &core,
+                                &binding,
+                                &principal_id,
+                            ) {
+                                Ok(place) => place,
+                                Err(CoreFailure::ConversationLimit) => {
+                                    return ws.on_upgrade(|mut socket| async move {
+                                        let _ = socket.send(Message::Close(Some(CloseFrame {
+                                            code: WS_CLOSE_CONVERSATION_LIMIT,
+                                            reason: crate::dashboard_core::conversation_limit_message().into(),
+                                        }))).await;
+                                    }).into_response();
+                                }
+                                Err(error) => return error.into_response(),
+                            };
+                            (
+                                ScopedChatSocket(Arc::new(ScopedChatPlace {
+                                    budget,
+                                    attached: AtomicBool::new(true),
+                                })),
+                                None,
+                            )
                         };
                         let auth_for_grants = Arc::clone(&auth);
                         let session_for_grants = Arc::clone(&session);
@@ -486,7 +553,8 @@ pub(crate) async fn handle_ws_acp(
                             grants: Arc::new(move || {
                                 auth_for_grants.chat_grants(&session_for_grants)
                             }),
-                            place,
+                            socket,
+                            recovery_session,
                         });
                         session_watch =
                             Some(SessionWatch::for_acp_chat(auth, session, agent, &state));
@@ -537,14 +605,8 @@ async fn handle_socket(
     scoped: Option<ScopedAcpChat>,
     turn_hub: Arc<AcpTurnHub>,
 ) {
-    let (principal_id, scoped_grants, place) = match scoped {
-        Some(scope) => (
-            Some(scope.principal_id),
-            Some(scope.grants),
-            Some(scope.place),
-        ),
-        None => (None, None, None),
-    };
+    let principal_id = scoped.as_ref().map(|scope| scope.principal_id.clone());
+    let scoped_grants = scoped.as_ref().map(|scope| Arc::clone(&scope.grants));
     let (mut sender, mut receiver) = socket.split();
     let (input_tx, input_rx) = mpsc::channel::<String>(256);
     let (output_tx, mut output_rx) = mpsc::channel::<String>(256);
@@ -554,7 +616,7 @@ async fn handle_socket(
 
     let config = state.config.read().clone();
     let acp_config = AcpServerConfig {
-        max_sessions: if place.is_some() {
+        max_sessions: if scoped.is_some() {
             config.acp.max_sessions.min(1)
         } else {
             config.acp.max_sessions
@@ -791,6 +853,20 @@ async fn handle_socket(
                 if let Ok(parsed) = parsed
                     && let Some(method) = parsed.get("method").and_then(serde_json::Value::as_str)
                 {
+                    if let Some(recovery_session) = scoped.as_ref().and_then(|scope| scope.recovery_session.as_deref())
+                        && (method == "session/new"
+                            || (matches!(method, "session/load" | "session/resume")
+                                && parsed["params"].get("sessionId").or_else(|| parsed["params"].get("session_id"))
+                                    .and_then(serde_json::Value::as_str) != Some(recovery_session)))
+                    {
+                        if let Some(id) = parsed.get("id") {
+                            let _ = wire_tx.send(serde_json::json!({
+                                "jsonrpc":"2.0","id":id,
+                                "error":{"code":FORBIDDEN,"message":"This connection reserved the conversation it is restoring"}
+                            }).to_string()).await;
+                        }
+                        continue;
+                    }
                     if method == "_zeroclaw/session/reattach" {
                         let req_id = parsed.get("id").cloned().unwrap_or(serde_json::Value::Null);
                         let sid = parsed
@@ -833,7 +909,7 @@ async fn handle_socket(
                         }
                         continue;
                     }
-                    if method == "_zeroclaw/session/steer" && place.is_some() {
+                    if method == "_zeroclaw/session/steer" && scoped.is_some() {
                         if let Some(id) = parsed.get("id") {
                             let _ = wire_tx.send(serde_json::json!({
                                 "jsonrpc":"2.0","id":id,
@@ -891,6 +967,7 @@ async fn handle_socket(
                         let turn_cancel = revoked_token.child_token();
                         if turn_hub.start_turn(
                             sid, principal_id.clone(), turn_cancel.clone(), Arc::downgrade(&server),
+                            scoped.as_ref().map(|scope| Arc::downgrade(&scope.socket.0)),
                         ).await.is_err() {
                             let _ = wire_tx.send(serde_json::json!({
                                 "jsonrpc":"2.0","id":req_id,
@@ -928,9 +1005,11 @@ async fn handle_socket(
     drop(input_tx);
     drop(server);
     drop(wire_tx);
+    let detached_place = scoped.as_ref().map(|scope| Arc::clone(&scope.socket.0));
+    drop(scoped);
     zeroclaw_spawn::spawn!(async move {
         // A detached turn still holds its sign-in and account budget.
-        let _place = place;
+        let _place = detached_place;
         let _ = server_task.await;
         let mut bridge = output_bridge;
         if revoked {
@@ -1187,6 +1266,7 @@ mod tests {
             Some("alice".into()),
             cancel,
             std::sync::Weak::new(),
+            None,
         )
         .await
         .expect("first turn must acquire permit");
@@ -1319,7 +1399,7 @@ mod tests {
             Default::default(),
         ));
         let sid = "reattach-retry";
-        hub.start_turn(sid, None, Default::default(), Arc::downgrade(&origin))
+        hub.start_turn(sid, None, Default::default(), Arc::downgrade(&origin), None)
             .await
             .unwrap();
         hub.record_frame(sid, serde_json::json!({"data": "first"}).to_string(), false)
@@ -1394,7 +1474,7 @@ mod tests {
             Default::default(),
         ));
         let sid = "next-turn";
-        hub.start_turn(sid, None, Default::default(), std::sync::Weak::new())
+        hub.start_turn(sid, None, Default::default(), std::sync::Weak::new(), None)
             .await
             .unwrap();
         let previous_id = hub
@@ -1403,7 +1483,7 @@ mod tests {
             .unwrap()
             .turn_id;
         hub.finish_turn(sid);
-        hub.start_turn(sid, None, Default::default(), std::sync::Weak::new())
+        hub.start_turn(sid, None, Default::default(), std::sync::Weak::new(), None)
             .await
             .unwrap();
         hub.record_frame(
@@ -1460,6 +1540,7 @@ mod tests {
             Some("alice".into()),
             cancel.clone(),
             std::sync::Weak::new(),
+            None,
         )
         .await
         .unwrap();
@@ -1496,6 +1577,7 @@ mod tests {
             None,
             tokio_util::sync::CancellationToken::new(),
             std::sync::Weak::new(),
+            None,
         )
         .await
         .unwrap();
@@ -1506,6 +1588,7 @@ mod tests {
                 None,
                 tokio_util::sync::CancellationToken::new(),
                 std::sync::Weak::new(),
+                None,
             )
             .await
             .expect_err("second concurrent turn on same session must be rejected without waiting");
@@ -1521,6 +1604,7 @@ mod tests {
             None,
             tokio_util::sync::CancellationToken::new(),
             std::sync::Weak::new(),
+            None,
         )
         .await
         .expect("after finish_turn releases permit, next turn must succeed");
