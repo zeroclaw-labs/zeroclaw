@@ -28,6 +28,7 @@ pub(crate) async fn record_executed_outcomes(
         .zip(executed_outcomes)
     {
         let was_executed = outcome.executed_tool_name.is_some();
+        let loop_refused = outcome.loop_refused;
         let outcome = outcome.outcome;
         // The pending ToolCall and terminal ToolResult are emitted by the
         // executor (execute_one_tool) at dispatch and completion time so serial
@@ -65,7 +66,7 @@ pub(crate) async fn record_executed_outcomes(
         // ── Hook: after_tool_call (void) ─────────────────
         if let Some(hooks) = ctx.hooks {
             let hook_context = crate::hooks::tool_call_hook_context(ctx.turn_id, iteration, *idx);
-            if !was_executed {
+            if loop_refused {
                 hooks
                     .fire_tool_call_abandoned(&hook_context, &call.name)
                     .await;
@@ -115,7 +116,7 @@ pub(crate) async fn record_executed_outcomes(
 
         // The SOP ledger retains attempted calls too, including denied or
         // unknown calls with their failed outcomes. This is separate from
-        // completion hooks, which require actual dispatch provenance.
+        // repetition tracking, which requires actual dispatch provenance.
         if crate::sop::executor::step_capture_active() {
             crate::sop::executor::record_step_tool_call(
                 &call.name,

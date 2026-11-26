@@ -335,6 +335,8 @@ pub(crate) struct CompletedToolExecution {
     /// Created by the executor only after `Tool::execute` completes. An
     /// unavailable name returns an outcome without dispatch evidence.
     pub(crate) executed_tool_name: Option<String>,
+    /// Only the repetition guard refuses dispatch with abandonment semantics.
+    pub(crate) loop_refused: bool,
 }
 
 #[cfg(test)]
@@ -391,6 +393,7 @@ async fn execute_one_tool_with_provenance(
         DispatchResolution::Unavailable => {
             return Ok(CompletedToolExecution {
                 executed_tool_name: None,
+                loop_refused: false,
                 outcome: unavailable_tool_outcome(
                     call_name,
                     tool_call_id_owned,
@@ -404,6 +407,7 @@ async fn execute_one_tool_with_provenance(
         DispatchResolution::Unknown => {
             return Ok(CompletedToolExecution {
                 executed_tool_name: None,
+                loop_refused: false,
                 outcome: unknown_tool_outcome(
                     call_name,
                     tool_call_id_owned,
@@ -675,6 +679,7 @@ async fn execute_one_tool_with_provenance(
     outcome.map(|outcome| CompletedToolExecution {
         outcome,
         executed_tool_name: Some(tool.name().to_owned()),
+        loop_refused: false,
     })
 }
 
@@ -831,6 +836,7 @@ pub(crate) async fn execute_tools_sequential(
             slots.push(Some(CompletedToolExecution {
                 outcome,
                 executed_tool_name: None,
+                loop_refused: true,
             }));
             continue;
         }
@@ -1120,6 +1126,11 @@ mod tests {
             outcomes.iter().all(Option::is_some),
             "policy refusals are not cancellation"
         );
+        assert!(outcomes[4].as_ref().unwrap().loop_refused);
+        assert!(
+            !outcomes[5].as_ref().unwrap().loop_refused,
+            "unknown tools preserve failed-attempt audit semantics"
+        );
         assert!(outcomes[4].as_ref().unwrap().executed_tool_name.is_none());
         assert!(!outcomes[4].as_ref().unwrap().outcome.success);
     }
@@ -1184,6 +1195,10 @@ mod tests {
             0,
             "a tool the step denies must not execute, even when a call earlier in \
              the same response activated it"
+        );
+        assert!(
+            !outcomes[1].as_ref().unwrap().loop_refused,
+            "step exclusions preserve failed-attempt audit semantics"
         );
         let second = outcomes[1]
             .as_ref()

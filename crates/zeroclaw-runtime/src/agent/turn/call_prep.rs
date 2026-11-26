@@ -731,6 +731,7 @@ mod tests {
             &prepared.stream_calls,
             vec![crate::agent::tool_execution::CompletedToolExecution {
                 executed_tool_name: Some("test_tool".into()),
+                loop_refused: false,
                 outcome: ToolExecutionOutcome {
                     output: "ok".to_string(),
                     attachments: Vec::new(),
@@ -858,6 +859,29 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("after:{}:{}", tool, context.invocation_id()));
+        }
+
+        async fn on_after_tool_call_with_context_and_args(
+            &self,
+            context: &zeroclaw_api::hook::ToolCallHookContext,
+            tool: &str,
+            args: &serde_json::Value,
+            result: &zeroclaw_api::tool::ToolResult,
+            duration: Duration,
+        ) {
+            if tool == "unknown" || tool == "unavailable" {
+                assert!(!result.success);
+                assert_eq!(
+                    args["attempt"],
+                    if tool == "unknown" {
+                        "unknown"
+                    } else {
+                        "excluded"
+                    }
+                );
+            }
+            self.on_after_tool_call_with_context(context, tool, result, duration)
+                .await;
         }
 
         async fn on_tool_call_abandoned(
@@ -993,6 +1017,7 @@ mod tests {
             &prepared.stream_calls,
             vec![crate::agent::tool_execution::CompletedToolExecution {
                 executed_tool_name: Some("test_tool".into()),
+                loop_refused: false,
                 outcome: ToolExecutionOutcome {
                     output: "ok".to_string(),
                     attachments: Vec::new(),
@@ -1021,7 +1046,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_refusal_abandons_context_but_retains_result() {
+    async fn only_loop_refusal_abandons_context_other_failures_keep_audit_hooks() {
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
         let (tx, _rx) = mpsc::channel(16);
@@ -1035,6 +1060,12 @@ mod tests {
         let calls = [
             parsed_call("attempted", serde_json::json!({}), "a"),
             parsed_call("refused", serde_json::json!({}), "b"),
+            parsed_call("unknown", serde_json::json!({"attempt":"unknown"}), "c"),
+            parsed_call(
+                "unavailable",
+                serde_json::json!({"attempt":"excluded"}),
+                "d",
+            ),
         ];
         let mut seen = HashSet::new();
         let mut prompt_seen = HashSet::new();
@@ -1052,11 +1083,13 @@ mod tests {
         )
         .await
         .unwrap();
-        let outcomes = [Some("attempted"), None]
+        let outcomes = [Some("attempted"), None, None, None]
             .into_iter()
+            .enumerate()
             .map(
-                |name| crate::agent::tool_execution::CompletedToolExecution {
+                |(index, name)| crate::agent::tool_execution::CompletedToolExecution {
                     executed_tool_name: name.map(str::to_owned),
+                    loop_refused: index == 1,
                     outcome: ToolExecutionOutcome {
                         output: "failed or refused".into(),
                         attachments: Vec::new(),
@@ -1084,8 +1117,12 @@ mod tests {
             vec![
                 "before:attempted:test-turn:0:0",
                 "before:refused:test-turn:0:1",
+                "before:unknown:test-turn:0:2",
+                "before:unavailable:test-turn:0:3",
                 "after:attempted:test-turn:0:0",
                 "abandoned:refused:test-turn:0:1",
+                "after:unknown:test-turn:0:2",
+                "after:unavailable:test-turn:0:3",
             ]
         );
         assert!(prepared.ordered_results.iter().all(Option::is_some));
