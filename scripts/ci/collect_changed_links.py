@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import unquote
 
 
 DOC_PATH_RE = re.compile(r"\.mdx?$")
@@ -92,8 +93,8 @@ def normalize_link_target(raw_target: str, source_path: str) -> str | None:
     if target.startswith(("http://", "https://")):
         return target.rstrip(TRAILING_PUNCTUATION)
 
-    path_without_fragment = target.split("#", 1)[0].split("?", 1)[0]
-    if not path_without_fragment:
+    path = unquote(target.split("#", 1)[0].split("?", 1)[0])
+    if not path:
         return None
 
     # Keep this changed-line gate aligned with the built-book link checker:
@@ -106,16 +107,10 @@ def normalize_link_target(raw_target: str, source_path: str) -> str | None:
         "docs/book/src/reference/config.md",
         "docs/book/src/reference/cli.md",
     }
-    if (
-        path_without_fragment.startswith("/")
-        or path_without_fragment.startswith("api/")
-        or "/api/" in path_without_fragment
-    ):
+    if Path(path).anchor or path.startswith("api/") or "/api/" in path:
         return None
 
-    resolved = os.path.normpath(
-        os.path.join(os.path.dirname(source_path) or ".", path_without_fragment)
-    )
+    resolved = os.path.normpath(os.path.join(os.path.dirname(source_path) or ".", path))
 
     if not resolved or resolved == ".":
         return None

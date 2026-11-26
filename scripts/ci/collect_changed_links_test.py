@@ -23,7 +23,12 @@ class MdBookLinkBoundaryTest(unittest.TestCase):
         return result.stdout.strip()
 
     def run_collector(
-        self, source_path: str, content: str, *, provide_docs_files: bool = True
+        self,
+        source_path: str,
+        content: str,
+        *,
+        provide_docs_files: bool = True,
+        target_path: str = "docs/security/slsa-provenance.md",
     ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -32,7 +37,7 @@ class MdBookLinkBoundaryTest(unittest.TestCase):
             self.run_git(root, "config", "user.email", "link-gate@example.invalid")
             self.run_git(root, "config", "core.quotePath", "true")
 
-            target = root / "docs/security/slsa-provenance.md"
+            target = root / target_path
             target.parent.mkdir(parents=True)
             target.write_text("# SLSA provenance\n", encoding="utf-8")
             self.run_git(root, "add", target.relative_to(root).as_posix())
@@ -134,6 +139,35 @@ class MdBookLinkBoundaryTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Collected 1 added link(s)", result.stdout)
+
+    def test_cli_ignores_percent_encoded_site_absolute_target(self) -> None:
+        result = self.run_collector(
+            "docs/maintainers/release-attestation-runbook.md",
+            "[Guide](%2Fsite-guide.md)\n",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Collected 0 added link(s)", result.stdout)
+
+    def test_cli_accepts_percent_encoded_local_target(self) -> None:
+        result = self.run_collector(
+            "docs/book/src/maintainers/release-verification.md",
+            "[Guide](../reference/caf%C3%A9%20%231.md?mode=local#overview)\n",
+            target_path="docs/book/src/reference/caf\u00e9 #1.md",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Checked 1 local docs link target(s).", result.stdout)
+
+    def test_cli_reports_missing_percent_encoded_local_target(self) -> None:
+        result = self.run_collector(
+            "docs/book/src/maintainers/release-verification.md",
+            "[Missing](../reference/missing%20guide.md)\n",
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("Broken local docs link target(s):", result.stdout)
+        self.assertIn("docs/book/src/reference/missing guide.md", result.stdout)
 
 
 if __name__ == "__main__":
