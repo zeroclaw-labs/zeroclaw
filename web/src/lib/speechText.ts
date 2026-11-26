@@ -56,7 +56,7 @@ export function speechText(markdown: string): string {
   }
   collect(root);
   const references = new Set<string>();
-  const main = visibleText(root, definitions, references);
+  const main = visibleText(root, definitions, references).trim().replace(/(?:\s*🦀\uFE0F?)+\s*$/u, '').trim();
   const notes: string[] = [];
   for (const id of references) {
     const note = definitions.get(id)!;

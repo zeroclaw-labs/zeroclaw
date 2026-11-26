@@ -974,3 +974,11 @@ test('narration separates HTML lines and table cells without splitting inline wo
   assert.equal(speechText('<table><tr><td>Alpha</td><td>Beta</td></tr></table>'), 'Alpha Beta');
   assert.equal(speechText('inter<em>operable</em>'), 'interoperable');
 });
+
+
+test('narration removes the answer signature before appending referenced footnotes', async () => {
+  const { speechText } = await import('../lib/speechText.ts');
+  assert.equal(speechText('Answer[^a]. 🦀\n\n[^a]: Details.'), 'Answer.\n\nDetails.');
+  assert.equal(speechText('Answer[^a]. 🦀️ 🦀\n\n[^a]: Details.'), 'Answer.\n\nDetails.');
+  assert.match(speechText('The 🦀 is content[^a].\n\n[^a]: Details.'), /The 🦀 is content/);
+});
