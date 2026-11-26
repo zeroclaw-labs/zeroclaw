@@ -5,6 +5,14 @@ use anyhow::{Result, ensure};
 use serde_json::Value;
 
 pub(crate) fn path(config: &Config, tail: &str) -> Option<String> {
+    path_with_staged(config, tail, None)
+}
+
+pub(crate) fn path_with_staged(
+    config: &Config,
+    tail: &str,
+    staged: Option<&Value>,
+) -> Option<String> {
     let parts: Vec<_> = tail.split("__").collect();
     let ["providers", section, key, rest @ ..] = parts.as_slice() else {
         return None;
@@ -19,16 +27,21 @@ pub(crate) fn path(config: &Config, tail: &str) -> Option<String> {
             segments.extend(rest.iter().map(|part| (*part).to_owned()))
         }
         "models"
-            if config
-                .providers
-                .models
-                .canonical_model(&(*key).into())
-                .is_some() =>
+            if staged
+                .and_then(|document| document["models"].get(*key))
+                .is_some_and(|value| !value.is_null())
+                || config
+                    .providers
+                    .models
+                    .canonical_model(&(*key).into())
+                    .is_some() =>
         {
             segments.extend(rest.iter().map(|part| (*part).to_owned()));
         }
         "models" => {
-            segments = crate::migration::provider_inputs::legacy_env_segments(config, &parts)?;
+            segments = crate::migration::provider_inputs::legacy_env_segments_with_staged(
+                config, &parts, staged,
+            )?;
         }
         _ => return None,
     }

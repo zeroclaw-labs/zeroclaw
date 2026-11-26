@@ -118,7 +118,7 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
             snapshots.entry(path.clone()).or_insert(snapshot);
             paths.insert(path);
         }
-        let path = resolve_path(&tail, config)
+        let path = resolve_path(&tail, config, &registry_staged)
             .with_context(|| format!("{env_name} did not resolve to a schema path"))?;
         let value = crate::migration::provider_inputs::legacy_env_value(
             config,
@@ -213,8 +213,10 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
 /// Walk an env-var tail against the schema. Map-keyed positions consume one
 /// `__`-delimited alias token (which may contain single `_` per the alias
 /// validator); everything else resolves via `prop_fields()` lookup.
-fn resolve_path(tail: &str, config: &mut Config) -> Result<String> {
-    if let Some(path) = crate::provider_registry::env_input::path(config, tail) {
+fn resolve_path(tail: &str, config: &mut Config, staged: &serde_json::Value) -> Result<String> {
+    if let Some(path) =
+        crate::provider_registry::env_input::path_with_staged(config, tail, Some(staged))
+    {
         return Ok(path);
     }
     if let ["providers", "models", family, alias, ..] =
@@ -735,6 +737,38 @@ model = "gemini-test"
         );
         mask_env_overrides_for_save(&mut config, &applied.snapshots).unwrap();
         assert_eq!(serde_json::to_value(&config.providers).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn legacy_model_credentials_follow_a_staged_provider_switch() {
+        let _guard = super::env_test_lock().await;
+        let _provider = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__openai.main__provider",
+            "new",
+        );
+        let _key = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__openai__main__api_key",
+            "new-key",
+        );
+        let mut config: Config = toml::from_str(
+            r#"
+[providers.connections.old]
+kind = "custom"
+auth = {mode = "api_key", api_key = "old-key"}
+[providers.connections.new]
+kind = "custom"
+[providers.models."openai.main"]
+capability = "chat"
+provider = "old"
+model = "primary"
+"#,
+        )
+        .unwrap();
+        apply_env_overrides(&mut config).unwrap();
+        let document = serde_json::to_value(&config.providers).unwrap();
+        assert_eq!(document["models"]["openai.main"]["provider"], "new");
+        assert_eq!(document["connections"]["new"]["auth"]["api_key"], "new-key");
+        assert_eq!(document["connections"]["old"]["auth"]["api_key"], "old-key");
     }
 
     #[tokio::test]

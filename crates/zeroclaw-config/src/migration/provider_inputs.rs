@@ -795,6 +795,14 @@ fn speech_reference(
 /// Redirect historical env names after file input has already been admitted.
 /// Protocol/extra field maps are shared with the file migration decoder.
 pub(crate) fn legacy_env_segments(config: &Config, parts: &[&str]) -> Option<Vec<String>> {
+    legacy_env_segments_with_staged(config, parts, None)
+}
+
+pub(crate) fn legacy_env_segments_with_staged(
+    config: &Config,
+    parts: &[&str],
+    staged: Option<&serde_json::Value>,
+) -> Option<Vec<String>> {
     let ["providers", "models", family, alias, field, rest @ ..] = parts else {
         return None;
     };
@@ -811,8 +819,19 @@ pub(crate) fn legacy_env_segments(config: &Config, parts: &[&str]) -> Option<Vec
         (ModelRef::from(format!("{family}.{alias}")), *field, rest)
     };
     let model = config.providers.models.canonical_model(&reference)?;
-    let connection = config.providers.connections.get(model.provider())?;
-    let kind = connection.kind();
+    let provider = staged
+        .and_then(|document| document["models"][reference.as_str()]["provider"].as_str())
+        .map(ProviderId::from)
+        .unwrap_or_else(|| model.provider().clone());
+    let kind = staged
+        .and_then(|document| document["connections"][provider.as_str()]["kind"].as_str())
+        .or_else(|| {
+            config
+                .providers
+                .connections
+                .get(&provider)
+                .map(|c| c.kind())
+        })?;
     let mut target = vec!["providers".into()];
     let model_field = if matches!(field, "model" | "id") {
         Some(vec!["model"])
@@ -831,7 +850,7 @@ pub(crate) fn legacy_env_segments(config: &Config, parts: &[&str]) -> Option<Vec
         target.extend(["models".into(), reference.to_string()]);
         target.extend(path.into_iter().map(str::to_owned));
     } else {
-        target.extend(["connections".into(), model.provider().to_string()]);
+        target.extend(["connections".into(), provider.to_string()]);
         match field {
             "api_key" => target.extend(["auth".into(), "api_key".into()]),
             "requires_openai_auth"
@@ -947,8 +966,13 @@ pub(crate) fn legacy_env_value(
     let Some(model) = config.providers.models.canonical_model(&reference) else {
         return Ok(value.into());
     };
+    let provider = staged["models"][reference.as_str()]
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .map(ProviderId::from)
+        .unwrap_or_else(|| model.provider().clone());
     let raw = staged["connections"]
-        .get(model.provider().as_str())
+        .get(provider.as_str())
         .context("historical env target has no connection")?;
     let oauth_field = super::model_routes::LEGACY_OAUTH_FIELDS
         .iter()
