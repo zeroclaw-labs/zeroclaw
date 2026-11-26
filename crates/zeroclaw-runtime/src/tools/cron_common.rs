@@ -2,6 +2,8 @@ use crate::cron::{CronJob, CronJobPatch, Schedule, deserialize_maybe_stringified
 use chrono::DateTime;
 use serde_json::{Value, json};
 use std::str::FromStr;
+use zeroclaw_api::conversation_binding::ConversationBinding;
+use zeroclaw_config::schema::Config;
 
 pub(crate) const CRON_TZ_DESCRIPTION: &str = "Optional explicit IANA timezone name, e.g. 'America/New_York'. If omitted, the schedule uses the runtime local timezone. For user-facing schedules, pass an explicit IANA timezone.";
 
@@ -23,6 +25,33 @@ pub(crate) fn deserialize_patch_arg(value: &Value) -> Result<CronJobPatch, Strin
 
     deserialize_maybe_stringified::<CronJobPatch>(value)
         .map_err(|err| format!("Invalid patch payload: {err}"))
+}
+
+/// Who may read the output of a job's runs that were tied to a conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundOutput {
+    /// The job has no conversation binding.
+    Unbound,
+    /// The job is bound to the conversation this tool call is running in.
+    Readable,
+    /// The job is bound to another conversation, or its binding cannot be
+    /// read. Output tied to a conversation stays with that conversation.
+    Withheld,
+}
+
+/// Decide [`BoundOutput`] for `job_id` from the job's stored binding and the
+/// conversation the current turn is serving. Neither can be set by a tool
+/// argument. An unreadable binding withholds.
+pub(crate) fn bound_output(config: &Config, job_id: &str, agent_alias: &str) -> BoundOutput {
+    match crate::cron::job_conversation_binding(config, job_id) {
+        Ok(None) => BoundOutput::Unbound,
+        Ok(Some(binding))
+            if ConversationBinding::of_current_turn(agent_alias).as_ref() == Some(&binding) =>
+        {
+            BoundOutput::Readable
+        }
+        Ok(Some(_)) | Err(_) => BoundOutput::Withheld,
+    }
 }
 
 pub(crate) fn cron_add_output(job: &CronJob) -> Value {

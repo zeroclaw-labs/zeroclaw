@@ -1,3 +1,4 @@
+use super::cron_common::{BoundOutput, bound_output};
 use crate::cron;
 use async_trait::async_trait;
 use serde::Serialize;
@@ -42,6 +43,10 @@ struct RunView {
     principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     executing_agent: Option<String>,
+    /// Set when `output` is left out because the run was tied to a
+    /// conversation other than the one this call is running in.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    output_withheld: bool,
 }
 
 #[async_trait]
@@ -124,21 +129,35 @@ impl Tool for CronRunsTool {
             });
         }
 
+        // A run tied to a conversation may repeat what was said there, so its
+        // output is shown only in that conversation while the job is still
+        // bound to it. Once the binding is gone, no conversation is known to
+        // be the right reader and the output is withheld from every one.
+        let readable_here =
+            bound_output(&self.config, job_id, &self.agent_alias) == BoundOutput::Readable;
         let runs: Vec<RunView> = runs
             .into_iter()
-            .map(|run| RunView {
-                id: run.id,
-                job_id: run.job_id,
-                started_at: run.started_at,
-                finished_at: run.finished_at,
-                status: run.status,
-                output: run.output.map(|out| truncate(&out, MAX_RUN_OUTPUT_CHARS)),
-                duration_ms: run.duration_ms,
-                execution: run.execution,
-                delivery: run.delivery,
-                persistence: run.persistence,
-                principal: run.principal,
-                executing_agent: run.executing_agent,
+            .map(|run| {
+                let output_withheld =
+                    run.ties_output_to_a_conversation() && !readable_here && run.output.is_some();
+                RunView {
+                    id: run.id,
+                    job_id: run.job_id,
+                    started_at: run.started_at,
+                    finished_at: run.finished_at,
+                    status: run.status,
+                    output: run
+                        .output
+                        .filter(|_| !output_withheld)
+                        .map(|out| truncate(&out, MAX_RUN_OUTPUT_CHARS)),
+                    duration_ms: run.duration_ms,
+                    execution: run.execution,
+                    delivery: run.delivery,
+                    persistence: run.persistence,
+                    principal: run.principal,
+                    executing_agent: run.executing_agent,
+                    output_withheld,
+                }
             })
             .collect();
 
@@ -433,5 +452,130 @@ mod tests {
             !format!("{:?}", result.output).contains("private-output"),
             "another agent's job output must not leak"
         );
+    }
+
+    fn telegram_binding(key: &str) -> zeroclaw_api::conversation_binding::ConversationBinding {
+        zeroclaw_api::conversation_binding::ConversationBinding {
+            surface: zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+            route: "telegram".to_string(),
+            key: key.to_string(),
+        }
+    }
+
+    fn serving(
+        key: Option<&str>,
+    ) -> Option<zeroclaw_api::conversation_binding::ActiveConversation> {
+        key.map(
+            |key| zeroclaw_api::conversation_binding::ActiveConversation {
+                surface: zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+                route: "telegram".to_string(),
+                key: key.to_string(),
+                agent_alias: TEST_AGENT.to_string(),
+            },
+        )
+    }
+
+    fn bound_job(cfg: &Config) -> cron::CronJob {
+        cron::add_agent_job_bound(
+            cfg,
+            TEST_AGENT,
+            Some("reminder".into()),
+            cron::Schedule::Every { every_ms: 60_000 },
+            "Remind me to call Sam",
+            cron::SessionTarget::Main,
+            None,
+            None,
+            false,
+            None,
+            true,
+            Some(&telegram_binding("telegram_42_42")),
+        )
+        .unwrap()
+    }
+
+    fn record(cfg: &Config, job_id: &str, persistence: &str, output: &str) {
+        let now = Utc::now();
+        cron::record_run(
+            cfg,
+            job_id,
+            now,
+            now + ChronoDuration::milliseconds(1),
+            "ok",
+            cron::RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence,
+            },
+            cron::RunProvenance {
+                principal: None,
+                executing_agent: Some(TEST_AGENT),
+                job_source: Some("imperative"),
+            },
+            Some(output),
+            1,
+        )
+        .unwrap();
+    }
+
+    async fn runs_seen_from(cfg: &Arc<Config>, job_id: &str, key: Option<&str>) -> String {
+        let tool = CronRunsTool::new(cfg.clone(), TEST_AGENT);
+        let result = zeroclaw_api::TOOL_LOOP_ACTIVE_CONVERSATION
+            .scope(serving(key), tool.execute(json!({ "job_id": job_id })))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        result.output.to_string()
+    }
+
+    #[tokio::test]
+    async fn bound_run_output_is_shown_only_in_its_conversation() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = bound_job(&cfg);
+        record(&cfg, &job.id, "persisted", "Sam said six");
+        record(&cfg, &job.id, "failed", "ran without the chat");
+        record(&cfg, &job.id, "not_bound", "manual run elsewhere");
+
+        let inside = runs_seen_from(&cfg, &job.id, Some("telegram_42_42")).await;
+        assert!(inside.contains("Sam said six"), "{inside}");
+        assert!(inside.contains("ran without the chat"), "{inside}");
+        assert!(!inside.contains("output_withheld"), "{inside}");
+
+        for outside in [Some("telegram_99_99"), None] {
+            let seen = runs_seen_from(&cfg, &job.id, outside).await;
+            assert!(!seen.contains("Sam said six"), "{seen}");
+            assert!(!seen.contains("ran without the chat"), "{seen}");
+            assert!(seen.contains("manual run elsewhere"), "{seen}");
+            let runs: Vec<serde_json::Value> = serde_json::from_str(&seen).unwrap();
+            let withheld = runs
+                .iter()
+                .filter(|run| run["output_withheld"] == json!(true))
+                .count();
+            assert_eq!(withheld, 2, "{seen}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bound_run_output_stays_withheld_after_the_job_is_unbound() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = bound_job(&cfg);
+        record(&cfg, &job.id, "persisted", "Sam said six");
+        cron::update_job_for_agent(
+            &cfg,
+            &job.id,
+            TEST_AGENT,
+            cron::CronJobPatch {
+                prompt: Some("repeat the chat above".into()),
+                ..cron::CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(cron::job_conversation_binding(&cfg, &job.id).unwrap(), None);
+
+        for key in [Some("telegram_42_42"), Some("telegram_99_99"), None] {
+            let seen = runs_seen_from(&cfg, &job.id, key).await;
+            assert!(!seen.contains("Sam said six"), "{seen}");
+        }
     }
 }

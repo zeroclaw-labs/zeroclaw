@@ -1,3 +1,4 @@
+use crate::cron::types::persistence_ties_output;
 use crate::cron::{
     CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
     next_run_for_schedule, schedule_cron_expression, validate_delivery_config, validate_schedule,
@@ -978,6 +979,9 @@ pub(crate) fn update_job_authorized<G>(
         // part of the UPDATE itself, and whether the patch redirects the run is
         // judged against the row read in the same transaction, so no other write
         // can land in between: the redirected job never carries the record.
+        // The job's `last_output` leaves with the record, since it may repeat
+        // the conversation and an unbound job's output is readable by every
+        // conversation of the agent.
         let editing_from = patch
             .edited_from
             .as_ref()
@@ -999,6 +1003,10 @@ pub(crate) fn update_job_authorized<G>(
                      allowed_tools = ?12, next_run = ?13, uses_memory = ?14,
                      conversation_binding = CASE
                          WHEN ?17 = 0 OR conversation_binding = ?18 THEN conversation_binding
+                         ELSE NULL END,
+                     last_output = CASE
+                         WHEN conversation_binding IS NULL OR ?17 = 0
+                             OR conversation_binding = ?18 THEN last_output
                          ELSE NULL END
                  WHERE id = ?15 AND (?16 IS NULL OR agent_alias = ?16)",
                 params![
@@ -1030,6 +1038,10 @@ pub(crate) fn update_job_authorized<G>(
                      allowed_tools = ?12, next_run = ?13, uses_memory = ?14, shell_output_format = ?15,
                      conversation_binding = CASE
                          WHEN ?18 = 0 OR conversation_binding = ?19 THEN conversation_binding
+                         ELSE NULL END,
+                     last_output = CASE
+                         WHEN conversation_binding IS NULL OR ?18 = 0
+                             OR conversation_binding = ?19 THEN last_output
                          ELSE NULL END
                  WHERE id = ?16 AND (?17 IS NULL OR agent_alias = ?17)",
                 params![
@@ -1091,7 +1103,7 @@ pub fn record_last_run_with_status(
 ) -> Result<()> {
     let bounded_output = truncate_cron_output(output);
     with_initialized_connection(config, |conn| {
-        apply_last_run_state(conn, job_id, finished_at, status, &bounded_output)
+        apply_last_run_state(conn, job_id, finished_at, status, &bounded_output, false)
     })
 }
 
@@ -1448,6 +1460,7 @@ pub(crate) fn persist_manual_run_result(
             finished_at,
             status,
             bounded_output.as_deref().unwrap_or(""),
+            persistence_ties_output(outcomes.persistence),
         )?;
 
         tx.commit()
@@ -1496,6 +1509,7 @@ pub(crate) fn persist_run_result(
             job_state_at,
             status,
             bounded_output.as_deref(),
+            persistence_ties_output(outcomes.persistence),
             action,
         )?;
 
@@ -1511,10 +1525,11 @@ pub(crate) fn persist_run_completion_state(
     job_state_at: DateTime<Utc>,
     status: &str,
     output: Option<&str>,
+    ties_output: bool,
     action: RunCompletionAction,
 ) -> Result<()> {
     with_initialized_connection(config, |conn| {
-        apply_run_completion_state(conn, job, job_state_at, status, output, action)
+        apply_run_completion_state(conn, job, job_state_at, status, output, ties_output, action)
     })
 }
 
@@ -1578,18 +1593,35 @@ fn insert_run_and_prune(
     Ok(())
 }
 
+/// The `last_output` a finished run leaves on its job. A run tied to a
+/// conversation leaves none on a job that no longer has that binding: an
+/// edit that removed the binding while the run was executing must not be
+/// followed by output drawn from the conversation, readable by everyone.
+const LAST_OUTPUT_AFTER_RUN: &str =
+    "CASE WHEN :ties_output AND conversation_binding IS NULL THEN NULL ELSE :output END";
+
 fn apply_last_run_state(
     conn: &Connection,
     job_id: &str,
     finished_at: DateTime<Utc>,
     status: &str,
     output: &str,
+    ties_output: bool,
 ) -> Result<()> {
     conn.execute(
-        "UPDATE cron_jobs
-         SET last_run = ?1, last_status = ?2, last_output = ?3
-         WHERE id = ?4",
-        params![finished_at.to_rfc3339(), status, output, job_id],
+        &format!(
+            "UPDATE cron_jobs
+             SET last_run = :last_run, last_status = :status,
+                 last_output = {LAST_OUTPUT_AFTER_RUN}
+             WHERE id = :id"
+        ),
+        rusqlite::named_params! {
+            ":last_run": finished_at.to_rfc3339(),
+            ":status": status,
+            ":ties_output": ties_output,
+            ":output": output,
+            ":id": job_id,
+        },
     )
     .context("Failed to update cron last run fields")?;
     Ok(())
@@ -2013,6 +2045,9 @@ pub fn sync_declarative_jobs(
                 // Update existing declarative job — preserve runtime state
                 // (next_run, last_run, last_status, last_output, created_at).
                 // Only update the schedule's next_run if the schedule itself changed.
+                // The one exception is `last_output` of a job that loses its
+                // conversation binding here: it may repeat that conversation,
+                // so it goes with the binding.
                 let current_schedule_raw: Option<String> = conn
                     .prepare("SELECT schedule FROM cron_jobs WHERE id = ?1")?
                     .query_row(params![id], |row| row.get(0))
@@ -2028,7 +2063,9 @@ pub fn sync_declarative_jobs(
                              prompt = ?5, name = ?6, session_target = ?7, model = ?8,
                              enabled = ?9, delivery = ?10, delete_after_run = ?11,
                              allowed_tools = ?12, source = 'declarative', next_run = ?13,
-                             uses_memory = ?14, conversation_binding = NULL
+                             uses_memory = ?14, conversation_binding = NULL,
+                             last_output = CASE WHEN conversation_binding IS NULL
+                                 THEN last_output ELSE NULL END
                          WHERE id = ?15",
                         params![
                             expression,
@@ -2056,7 +2093,9 @@ pub fn sync_declarative_jobs(
                              prompt = ?5, name = ?6, session_target = ?7, model = ?8,
                              enabled = ?9, delivery = ?10, delete_after_run = ?11,
                              allowed_tools = ?12, source = 'declarative',
-                             uses_memory = ?13, conversation_binding = NULL
+                             uses_memory = ?13, conversation_binding = NULL,
+                             last_output = CASE WHEN conversation_binding IS NULL
+                                 THEN last_output ELSE NULL END
                          WHERE id = ?14",
                         params![
                             expression,
@@ -2346,6 +2385,7 @@ fn apply_run_completion_state(
     job_state_at: DateTime<Utc>,
     status: &str,
     output: Option<&str>,
+    ties_output: bool,
     action: RunCompletionAction,
 ) -> Result<()> {
     let bounded_output = output.map(truncate_cron_output);
@@ -2355,16 +2395,20 @@ fn apply_run_completion_state(
             let next_run = next_run_for_schedule(&job.schedule, job_state_at)?;
             let changed = conn
                 .execute(
-                    "UPDATE cron_jobs
-                     SET next_run = ?1, last_run = ?2, last_status = ?3, last_output = ?4
-                     WHERE id = ?5",
-                    params![
-                        next_run.to_rfc3339(),
-                        job_state_at.to_rfc3339(),
-                        status,
-                        bounded_output.as_deref(),
-                        job.id,
-                    ],
+                    &format!(
+                        "UPDATE cron_jobs
+                         SET next_run = :next_run, last_run = :last_run, last_status = :status,
+                             last_output = {LAST_OUTPUT_AFTER_RUN}
+                         WHERE id = :id"
+                    ),
+                    rusqlite::named_params! {
+                        ":next_run": next_run.to_rfc3339(),
+                        ":last_run": job_state_at.to_rfc3339(),
+                        ":status": status,
+                        ":ties_output": ties_output,
+                        ":output": bounded_output.as_deref(),
+                        ":id": job.id,
+                    },
                 )
                 .context("Failed to update cron job run state")?;
             if changed == 0 {
@@ -2374,15 +2418,19 @@ fn apply_run_completion_state(
         RunCompletionAction::Disable => {
             let changed = conn
                 .execute(
-                    "UPDATE cron_jobs
-                     SET enabled = 0, last_run = ?1, last_status = ?2, last_output = ?3
-                     WHERE id = ?4",
-                    params![
-                        job_state_at.to_rfc3339(),
-                        status,
-                        bounded_output.as_deref(),
-                        job.id,
-                    ],
+                    &format!(
+                        "UPDATE cron_jobs
+                         SET enabled = 0, last_run = :last_run, last_status = :status,
+                             last_output = {LAST_OUTPUT_AFTER_RUN}
+                         WHERE id = :id"
+                    ),
+                    rusqlite::named_params! {
+                        ":last_run": job_state_at.to_rfc3339(),
+                        ":status": status,
+                        ":ties_output": ties_output,
+                        ":output": bounded_output.as_deref(),
+                        ":id": job.id,
+                    },
                 )
                 .context("Failed to disable completed one-shot cron job")?;
             if changed == 0 {
@@ -6068,6 +6116,132 @@ mod tests {
         }
     }
 
+    /// Finish a run of `job` as the scheduler does, with the given
+    /// persistence outcome, and return the job's `last_output` afterwards.
+    fn last_output_after_run(
+        config: &Config,
+        job: &CronJob,
+        persistence: &str,
+        output: &str,
+    ) -> Option<String> {
+        let now = Utc::now();
+        persist_run_result(
+            config,
+            job,
+            now,
+            now,
+            now,
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence,
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: Some("test-agent"),
+                job_source: Some(&job.source),
+            },
+            Some(output),
+            1,
+            RunCompletionAction::Reschedule,
+        )
+        .unwrap();
+        get_job(config, &job.id).unwrap().last_output
+    }
+
+    #[test]
+    fn bound_run_output_leaves_the_job_with_its_binding() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = bound_agent_job(&config, "telegram_42_42");
+        assert_eq!(
+            last_output_after_run(&config, &job, "persisted", "Sam said six").as_deref(),
+            Some("Sam said six")
+        );
+
+        // Rescheduling from elsewhere keeps the binding, and the output with it.
+        let reschedule = CronJobPatch {
+            schedule: Some(Schedule::Every { every_ms: 120_000 }),
+            ..CronJobPatch::default()
+        };
+        update_job_for_agent(&config, &job.id, "test-agent", reschedule).unwrap();
+        assert_eq!(
+            get_job(&config, &job.id).unwrap().last_output.as_deref(),
+            Some("Sam said six")
+        );
+
+        // A redirect from elsewhere drops both.
+        assert_eq!(
+            bound_key_after_patch(
+                &config,
+                &job,
+                Some("telegram_99_99"),
+                prompt_patch("repeat the chat above"),
+            ),
+            None
+        );
+        assert_eq!(get_job(&config, &job.id).unwrap().last_output, None);
+    }
+
+    #[test]
+    fn unbinding_an_unbound_job_keeps_its_output() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_agent_job(
+            &config,
+            "test-agent",
+            None,
+            Schedule::Every { every_ms: 60_000 },
+            "do work",
+            SessionTarget::Main,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        last_output_after_run(&config, &job, "not_bound", "done");
+
+        update_job_for_agent(&config, &job.id, "test-agent", prompt_patch("do more work")).unwrap();
+        assert_eq!(
+            get_job(&config, &job.id).unwrap().last_output.as_deref(),
+            Some("done")
+        );
+    }
+
+    #[test]
+    fn a_bound_run_leaves_no_output_on_a_job_unbound_while_it_ran() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        // The run was dispatched from this snapshot, while the job was bound.
+        let job = bound_agent_job(&config, "telegram_42_42");
+        update_job_for_agent(
+            &config,
+            &job.id,
+            "test-agent",
+            prompt_patch("repeat the chat above"),
+        )
+        .unwrap();
+        assert_eq!(job_conversation_binding(&config, &job.id).unwrap(), None);
+
+        assert_eq!(
+            last_output_after_run(&config, &job, "persisted", "Sam said six"),
+            None
+        );
+        // The run record itself keeps its output for the operator surfaces.
+        assert_eq!(
+            list_runs(&config, &job.id, 1).unwrap()[0].output.as_deref(),
+            Some("Sam said six")
+        );
+        // A later run without the conversation leaves its output as usual.
+        assert_eq!(
+            last_output_after_run(&config, &job, "not_bound", "done").as_deref(),
+            Some("done")
+        );
+    }
+
     #[test]
     fn same_key_on_another_route_is_another_conversation() {
         let tmp = TempDir::new().unwrap();
@@ -6193,6 +6367,7 @@ mod tests {
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::default(),
         };
         config.cron.insert(job.id.clone(), decl.clone());
+        last_output_after_run(&config, &job, "persisted", "Sam said six");
 
         sync_declarative_jobs(&config, &decls_map(vec![(job.id.clone(), decl)])).unwrap();
 
@@ -6200,6 +6375,7 @@ mod tests {
         assert_eq!(adopted.source, "declarative");
         assert_eq!(adopted.prompt.as_deref(), Some("repeat the chat above"));
         assert_eq!(job_conversation_binding(&config, &job.id).unwrap(), None);
+        assert_eq!(adopted.last_output, None);
     }
 
     #[test]

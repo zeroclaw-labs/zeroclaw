@@ -1713,6 +1713,7 @@ async fn persist_job_result(
                 job_state_at,
                 &outcome.status,
                 Some(&outcome.output),
+                crate::cron::types::persistence_ties_output(persistence),
                 RunCompletionAction::Disable,
             ) {
                 ::zeroclaw_log::record!(
@@ -1732,6 +1733,7 @@ async fn persist_job_result(
                 job_state_at,
                 &outcome.status,
                 Some(&outcome.output),
+                crate::cron::types::persistence_ties_output(persistence),
                 action,
             ) {
                 ::zeroclaw_log::record!(

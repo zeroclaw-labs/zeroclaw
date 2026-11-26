@@ -205,13 +205,27 @@ Each scheduled run of a bound job then does two things:
 
 The binding selects history only. Where the result is delivered is still the
 job's `delivery` settings, and the job gains no access to any other
-conversation or to another agent's conversations. Three rules keep it that
+conversation or to another agent's conversations. Four rules keep it that
 way:
 
 - **Manual runs.** A manual run returns the job's output to whoever triggered
   it, so it uses the conversation only when it is triggered from that same
   conversation (`cron_run` during one of its turns). Triggered anywhere else,
   including the gateway and RPC, the job runs without the conversation.
+- **Output.** A run's output can repeat what was said in the conversation, so
+  the agent's cron tools show it only there. `cron_runs` leaves out the
+  output of every run tied to a conversation (any `persistence` other than
+  `not_bound`) and marks it `output_withheld`, unless the call is made from
+  the conversation the job is bound to. `cron_list` does the same for a bound
+  job's `last_output` and marks it `last_output_withheld`. When a job loses
+  its binding, its `last_output` is cleared, and the output of its earlier
+  bound runs stays withheld from every conversation. A run that started
+  before the binding was removed leaves no `last_output` behind. Status,
+  timing and the outcome fields stay visible everywhere. Rescheduling or
+  resuming a bound job from elsewhere keeps the binding and can make it run
+  sooner, but its output still reaches only the conversation and the job's
+  delivery target. The operator surfaces (the CLI, the gateway cron API and
+  RPC) show run output in full.
 - **Edits.** Changing what a bound job is told, what it may use, or where its
   output goes (`prompt`, `name`, `delivery`, `model`, `allowed_tools`,
   `uses_memory`, `session_target`) from anywhere other than its conversation

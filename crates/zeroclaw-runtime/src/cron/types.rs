@@ -188,6 +188,14 @@ pub struct CronJob {
     pub last_output: Option<String>,
 }
 
+/// Whether a run with this persistence outcome was tied to a conversation:
+/// it ran with that conversation's history, or was meant to and could not
+/// reach it. Its output may then repeat what was said there, so only that
+/// conversation may read it back.
+pub(crate) fn persistence_ties_output(persistence: &str) -> bool {
+    persistence != "not_bound"
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CronRun {
     pub id: i64,
@@ -233,6 +241,16 @@ pub struct CronRun {
     /// `initialize_schema` in `cron::store`.
     #[serde(default)]
     pub owner_agent: Option<String>,
+}
+
+impl CronRun {
+    /// Whether this run was tied to a conversation. Rows recorded before the
+    /// persistence outcome existed predate bound jobs and are not.
+    pub fn ties_output_to_a_conversation(&self) -> bool {
+        self.persistence
+            .as_deref()
+            .is_some_and(persistence_ties_output)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
