@@ -814,11 +814,28 @@ pub(crate) fn legacy_env_segments_with_staged(
     } else {
         (ModelRef::from(format!("{family}.{alias}")), *field, rest)
     };
-    let model = config.providers.models.canonical_model(&reference)?;
-    let provider = staged
-        .and_then(|document| document["models"][reference.as_str()]["provider"].as_str())
-        .map(ProviderId::from)
-        .unwrap_or_else(|| model.provider().clone());
+    let (provider, legacy_kind) = if let Some(model) =
+        config.providers.models.canonical_model(&reference)
+    {
+        (
+            staged
+                .and_then(|document| document["models"][reference.as_str()]["provider"].as_str())
+                .map(ProviderId::from)
+                .unwrap_or_else(|| model.provider().clone()),
+            None,
+        )
+    } else if config.providers.models.iter_entries().any(
+        |(candidate_family, candidate_alias, _)| {
+            candidate_family == *family && candidate_alias == *alias
+        },
+    ) {
+        (
+            ProviderId::from(format!("legacy.{family}.{alias}")),
+            Some(*family),
+        )
+    } else {
+        return None;
+    };
     let kind = staged
         .and_then(|document| document["connections"][provider.as_str()]["kind"].as_str())
         .or_else(|| {
@@ -827,7 +844,8 @@ pub(crate) fn legacy_env_segments_with_staged(
                 .connections
                 .get(&provider)
                 .map(|c| c.kind())
-        })?;
+        })
+        .or(legacy_kind)?;
     let mut target = vec!["providers".into()];
     let model_field = if matches!(field, "model" | "id") {
         Some(vec!["model"])
