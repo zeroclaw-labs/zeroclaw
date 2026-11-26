@@ -24,7 +24,7 @@ pub struct ControlPlaneHandle {
     /// store to that trait alone would make the Goal extension unavailable to
     /// a trusted ingress adapter.  This is a second trait-object handle to
     /// the same allocation, not a second database or source of truth.
-    goal_store: Option<Arc<dyn GoalTaskRegistry>>,
+    goal_store: Option<Arc<SqliteTaskStore>>,
     pub boot_id: String,
     /// Process-local Goal executor coordination for this daemon process.
     ///
@@ -60,8 +60,16 @@ impl ControlPlaneHandle {
     pub fn goal_store(&self) -> Result<Arc<dyn GoalTaskRegistry>> {
         self.goal_store
             .as_ref()
-            .cloned()
+            .map(|store| Arc::clone(store) as Arc<dyn GoalTaskRegistry>)
             .ok_or_else(|| anyhow::Error::msg("control-plane handle has no Goal registry"))
+    }
+
+    /// Private session-disposition view of the canonical task store.
+    pub(crate) fn session_dispositions(&self) -> Result<Arc<SqliteTaskStore>> {
+        self.goal_store
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow::Error::msg("control-plane handle has no disposition store"))
     }
 
     /// Build a task-only handle for internal producers and test fixtures that
@@ -97,7 +105,6 @@ impl ControlPlaneRecoveryOwner {
         let sqlite_store = Arc::new(SqliteTaskStore::new(data_dir)?);
         let reconciled_goals = sqlite_store.reconcile_goal_boot_state(&boot_id)?;
         let store: Arc<dyn TaskRegistry> = sqlite_store.clone();
-        let goal_store: Arc<dyn GoalTaskRegistry> = sqlite_store;
         let reclaimed = reaper::recovery_pass(store.as_ref(), &boot_id).await?;
         if reconciled_goals > 0 {
             ::zeroclaw_log::record!(
@@ -122,7 +129,7 @@ impl ControlPlaneRecoveryOwner {
         Ok(Self {
             handle: ControlPlaneHandle {
                 store,
-                goal_store: Some(goal_store),
+                goal_store: Some(sqlite_store),
                 boot_id,
                 goal_execution_restart: Arc::new(GoalExecutionRestartCoordinator::new()),
             },

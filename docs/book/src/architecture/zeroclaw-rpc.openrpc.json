@@ -4480,6 +4480,10 @@
         "oneOf": [
           {
             "properties": {
+              "presentation_only": {
+                "description": "Display-only text from a Goal parent turn, such as a model fallback\nnotice. It is shown alongside the answer but is not part of the\nsaved candidate. Ordinary text chunks omit this field.",
+                "type": "boolean"
+              },
               "session_id": {
                 "type": "string"
               },

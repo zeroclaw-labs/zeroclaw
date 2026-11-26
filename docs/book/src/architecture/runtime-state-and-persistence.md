@@ -97,7 +97,30 @@ whenever it exists, whichever backend is configured.
 
 ## Session backend migration
 
-Selecting the SQLite session backend imports legacy `data/sessions/*.jsonl` files when a backend handle is constructed. The importer moves each source to a private `.jsonl.importing` generation while holding the process-local JSONL mutation lock, writes the messages, metadata, and a source-bound import receipt in one SQLite transaction, then retains the source as `.jsonl.migrated` for rollback.
+Selecting the SQLite session backend imports legacy `data/sessions/*.jsonl`
+files when a backend handle is constructed. Under the process-local and
+interprocess JSONL mutation locks, the importer stages each transcript as
+`.jsonl.importing`, writes its messages, metadata, and source-bound import
+receipt in one SQLite transaction, and keeps the source as `.jsonl.migrated`
+for rollback.
+
+On Unix, a witnessed Goal-bound deletion replaces the transcript atomically
+with a private tombstone at the same path. The tombstone contains no history.
+Reads, listings, and migration exclude it. Writers cannot reuse the path until
+the original cleanup acknowledges it. Non-Unix builds refuse this witnessed
+deletion before deleting the transcript.
+
+A Goal-bound deletion first reads the transcript strictly. If it cannot, the
+deletion is refused before any intent is recorded, and the Goal and session are
+kept. Only a strictly readable transcript at that path proves that a recorded
+deletion did not commit. Any other file there, including a damaged tombstone,
+leaves the deletion unresolved and its session fenced; recover it from backup
+as described below.
+
+Ordinary JSONL sessions still use the same transcript format. Writers take a
+cross-process directory lock and check SQLite import receipts before writing.
+Trim breadcrumb updates use a staged atomic rename. Metadata listings omit
+entries whose modification time cannot be read.
 
 The receipt binds the source filename, session key, SHA-256 digest, and byte length. Before the receipt transaction begins, the importer syncs the staged source file and, on Unix, the live-to-staged directory rename. Migration transactions use full SQLite synchronization for the import commit, then restore the normal runtime setting. Archive handoff likewise syncs directory metadata on Unix before removing the staged source. Backend construction restores the process-local inactive state from durable receipts before scanning source files. As soon as an import receipt is committed, JSONL mutations for that sessions directory remain inactive even if archive handoff or a later file fails. The next construction can verify the staged source against that receipt and finish the handoff without inserting duplicate messages. Empty and whitespace-only JSONL files are retained as zero-message SQLite sessions; a non-empty source with no valid messages still fails closed.
 
@@ -125,6 +148,14 @@ At minimum, include:
 Do not run two daemons against the same install root. Several stores use SQLite
 with a single-writer model, and the process-local caches assume one daemon owns
 the instance.
+
+Control-plane schema v15 adds `goal_session_dispositions`. Before downgrading,
+let a v15-aware daemon settle any pending records against the original session
+stores. Older writers do not honor these records or JSONL tombstones. If the
+records cannot settle and a rollback is unavoidable, stop the daemon and restore
+a consistent pre-upgrade backup of the control plane and the session stores.
+That discards changes made after the backup. Do not clear records or tombstones
+by hand or restore just one store.
 
 ## Source pointers
 

@@ -41,8 +41,8 @@ pub use goal_execution::{
     GoalControlAbandonReason, GoalControlAdmission, GoalDeferredClosed, GoalDeferredCommit,
     GoalDeferredControl, GoalDeferredReady, GoalDiagnosticTextGuard, GoalExecutionEngine,
     GoalExecutionOutcome, GoalExecutionRestartCoordinator, GoalExecutionSubmission,
-    GoalExecutionSupervisor, GoalLaunchFailureReported, GoalSupervisorRetired,
-    dispose_unowned_session_goal,
+    GoalExecutionSupervisor, GoalLaunchFailureReported, GoalSessionQuiescence,
+    GoalSupervisorRetired, dispose_unowned_session_goal,
 };
 pub use parent_input::{GoalParentTurnInput, goal_parent_turn_input};
 
@@ -329,6 +329,13 @@ pub trait GoalSessionDriver: Send + Sync {
     /// I/O, so it must be async-safe and must not be a lock that a Goal
     /// lifecycle path needs to acquire again.
     async fn bind(&self, ingress: &GoalIngressContext) -> Result<GoalSessionLease>;
+
+    /// Rebind an already admitted launch after its response. A surface with
+    /// a transient session-transition fence may let this handoff register
+    /// an executor, provided the foreground admission still prevents calls.
+    async fn bind_for_launch(&self, ingress: &GoalIngressContext) -> Result<GoalSessionLease> {
+        self.bind(ingress).await
+    }
 
     /// Attempt to own the existing ordinary-turn boundary without waiting.
     /// Surface drivers override this with their ordinary foreground permit.

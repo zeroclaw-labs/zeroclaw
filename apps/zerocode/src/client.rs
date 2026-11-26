@@ -260,6 +260,7 @@ pub enum SessionUpdate {
     AgentMessageChunk {
         session_id: String,
         text: String,
+        presentation_only: bool,
     },
     AgentThoughtChunk {
         session_id: String,
@@ -394,6 +395,10 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
         "agent_message_chunk" => Some(SessionUpdate::AgentMessageChunk {
             session_id: sid,
             text: params.get("text")?.as_str()?.to_string(),
+            presentation_only: params
+                .get("presentation_only")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
         }),
         "agent_thought_chunk" => Some(SessionUpdate::AgentThoughtChunk {
             session_id: sid,
@@ -6436,11 +6441,45 @@ mod notification_tests {
         });
         let update = parse_session_update(&params).unwrap();
         match update {
-            SessionUpdate::AgentMessageChunk { session_id, text } => {
+            SessionUpdate::AgentMessageChunk {
+                session_id,
+                text,
+                presentation_only,
+            } => {
                 assert_eq!(session_id, "s1");
                 assert_eq!(text, "hello");
+                assert!(!presentation_only);
             }
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_agent_message_chunk_presentation_only_requires_boolean_true() {
+        for (marker, expected) in [
+            (serde_json::json!(true), true),
+            (serde_json::json!(false), false),
+            (serde_json::json!("true"), false),
+            (serde_json::json!("yes"), false),
+            (serde_json::json!(1), false),
+            (serde_json::Value::Null, false),
+        ] {
+            let params = serde_json::json!({
+                "type": "agent_message_chunk",
+                "session_id": "s1",
+                "text": "same visible text",
+                "presentation_only": marker,
+            });
+            assert!(matches!(
+                parse_session_update(&params),
+                Some(SessionUpdate::AgentMessageChunk {
+                    session_id,
+                    text,
+                    presentation_only,
+                }) if session_id == "s1"
+                    && text == "same visible text"
+                    && presentation_only == expected
+            ));
         }
     }
 

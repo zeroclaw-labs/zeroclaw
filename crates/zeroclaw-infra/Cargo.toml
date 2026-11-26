@@ -23,6 +23,10 @@ tempfile = "3.26"
 sha2 = "0.10"
 tokio = { version = "1.50", default-features = false, features = ["sync", "time"] }
 url = "2.5"
+uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
 
 [dev-dependencies]
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }

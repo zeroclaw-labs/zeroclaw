@@ -889,7 +889,7 @@ async fn refresh_live_channel_handles_between_configs_detached(
 /// Per-connection dispatcher. Shared state lives in [`RpcContext`].
 /// A short final-effect hold, never carried across an await. Config is acquired
 /// before authority and released after it, matching policy publication ordering.
-struct LiveSessionEffect<'a> {
+pub(super) struct LiveSessionEffect<'a> {
     grants: Option<zeroclaw_api::grants::ResolvedGrants>,
     _authority: crate::rpc::auth::AuthorityLease<'a>,
     _config: zeroclaw_config::live::LiveConfigReadGuard<'a>,
@@ -975,6 +975,7 @@ pub struct RpcDispatcher {
     /// [`Self::spawn_handle`] clone; each token is a child of
     /// `connection_cancel`, so teardown ends them all.
     subscriptions: Arc<parking_lot::Mutex<std::collections::HashMap<String, CancellationToken>>>,
+    goal_destinations: Arc<parking_lot::Mutex<super::session::GoalDestinationRegistry>>,
     /// Chunked uploads this connection has begun and not yet committed.
     /// Owned by the connection: dropped, with their staged bytes, when it
     /// closes.
@@ -989,6 +990,48 @@ pub struct RpcDispatcher {
     /// on its ledger status (a revoked cert cannot self-renew, A5) and authz still
     /// resolves from the registry.
     peer_cert_fingerprint: Option<String>,
+}
+
+/// A prompt may finish a close while it still owns the actor permit. The
+/// turn registration keeps only a weak handoff, not a cycle back to its store.
+#[derive(Clone)]
+pub(super) struct GoalCloseHandoff(std::sync::Weak<GoalCloseAttempt>);
+
+#[cfg(test)]
+impl GoalCloseHandoff {
+    pub(super) fn detached_for_test() -> Self {
+        Self(std::sync::Weak::new())
+    }
+}
+
+struct GoalCloseAttempt {
+    dispatcher: RpcDispatcher,
+    session_id: String,
+    generation: u64,
+    host: super::session_disposition::DispositionHost,
+    task: zeroclaw_api::task::TaskRecord,
+    _fence: Arc<super::session::GoalLifecycleFence>,
+    result: parking_lot::Mutex<Option<Result<(), JsonRpcError>>>,
+}
+
+#[derive(Default)]
+struct GoalRemovalAdmission {
+    reservation: Option<zeroclaw_infra::session_queue::SessionQueueAdmission>,
+    fence: Option<Arc<super::session::GoalLifecycleFence>>,
+}
+
+impl GoalCloseAttempt {
+    fn commit(&self) -> Result<(), JsonRpcError> {
+        self.dispatcher
+            .commit_goal_live_removal(
+                &self.session_id,
+                self.generation,
+                Method::SessionClose,
+                self.host.clone(),
+                &self.task,
+            )
+            .map_err(|error| self.dispatcher.goal_disposition_rpc_error(&error))
+    }
 }
 
 /// Read an allowlisted personality file through a handle on `workspace`, with
@@ -1117,6 +1160,7 @@ impl RpcDispatcher {
             connection_activity: None,
             prompt_tasks: Vec::new(),
             subscriptions: Arc::default(),
+            goal_destinations: Arc::default(),
             uploads: std::sync::Mutex::default(),
             initialize_deadline: None,
             peer_cert_fingerprint: None,
@@ -1416,6 +1460,7 @@ impl From<JsonRpcError> for GoalRpcRefusal {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum GoalCommandPurpose {
+    ReadOnly,
     Control,
     Execution,
 }
@@ -1425,14 +1470,63 @@ impl GoalCommandPurpose {
         use zeroclaw_commands::goal::GoalCommand;
         match command {
             GoalCommand::Start { .. } | GoalCommand::Resume { .. } => Self::Execution,
-            GoalCommand::Help
-            | GoalCommand::Status
-            | GoalCommand::Budget
-            | GoalCommand::SetBudget(_)
-            | GoalCommand::Pause { .. }
-            | GoalCommand::Cancel => Self::Control,
+            GoalCommand::Help | GoalCommand::Status | GoalCommand::Budget => Self::ReadOnly,
+            GoalCommand::SetBudget(_) | GoalCommand::Pause { .. } | GoalCommand::Cancel => {
+                Self::Control
+            }
         }
     }
+}
+
+/// The current observer of a Goal stream. Its authority is revalidated for
+/// each frame independently of the connection that started the worker.
+pub(super) struct GoalFrameDestination(RpcDispatcher);
+
+impl GoalFrameDestination {
+    fn new(dispatcher: &RpcDispatcher) -> Arc<Self> {
+        let mut handle = dispatcher.spawn_handle();
+        handle.connection_activity = None;
+        Arc::new(Self(handle))
+    }
+
+    pub(super) fn matches(&self, outbound: &Arc<RpcOutbound>) -> bool {
+        Arc::ptr_eq(&self.0.rpc, outbound)
+    }
+
+    pub(super) fn outbound(&self) -> &RpcOutbound {
+        &self.0.rpc
+    }
+
+    pub(super) fn cancelled(&self) -> &CancellationToken {
+        &self.0.connection_cancel
+    }
+
+    pub(super) fn register(&self, recipient: &Arc<super::session::GoalRecipient>) -> bool {
+        self.0.goal_destinations.lock().register(recipient)
+    }
+
+    pub(super) fn admit_frame(
+        &self,
+        live: &super::session::RpcSession,
+    ) -> Result<LiveSessionEffect<'_>, JsonRpcError> {
+        let remote = self.0.access_policy == RpcAccessPolicy::RemoteSessionOwner;
+        if self.cancelled().is_cancelled()
+            || (remote
+                && (self.0.tui_id.is_none() || live.owner_tui_id() != self.0.tui_id.as_deref()))
+        {
+            return Err(self.0.stale_session_incarnation_error());
+        }
+        let authority = self.0.live_effect_lease(Method::SessionMessages, live)?;
+        if remote {
+            RpcDispatcher::ensure_session_channel_access(live.goal_reaction_channels())?;
+        }
+        Ok(authority)
+    }
+}
+
+struct GoalAttachIntent {
+    session_id: String,
+    generation: u64,
 }
 
 /// Re-resolves ordinary dispatcher authority and the canonical session after
@@ -1445,6 +1539,18 @@ pub(super) struct GoalSessionAuthorization {
 }
 
 impl GoalSessionAuthorization {
+    pub(super) fn frame_destination(&self) -> Arc<GoalFrameDestination> {
+        GoalFrameDestination::new(&self.dispatcher)
+    }
+
+    pub(super) fn issuing_connection_open(&self) -> bool {
+        !self.dispatcher.connection_cancel.is_cancelled()
+    }
+
+    pub(super) fn is_read_only(&self) -> bool {
+        self.purpose == GoalCommandPurpose::ReadOnly
+    }
+
     pub(super) fn new(
         mut dispatcher: RpcDispatcher,
         purpose: GoalCommandPurpose,
@@ -1563,7 +1669,7 @@ impl GoalSessionAuthorization {
         grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
         reaction: &crate::tools::PerToolChannelHandle,
     ) -> Result<(), GoalRpcRefusal> {
-        if self.purpose == GoalCommandPurpose::Control {
+        if self.purpose != GoalCommandPurpose::Execution {
             return Ok(());
         }
         if grants.is_some() {
@@ -3023,6 +3129,608 @@ impl RpcDispatcher {
         )
     }
 
+    // The caller must first establish ordinary authority over the session.
+    // Recovery may finish an exact old cleanup, but never repeats its effect.
+    async fn ensure_session_disposition_settled(
+        &self,
+        session_id: &str,
+    ) -> Result<(), JsonRpcError> {
+        match super::session_disposition::reconcile_session(&self.ctx, session_id).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(rpc_err(
+                SESSION_BUSY,
+                "The session is unavailable while its lifecycle change settles.",
+            )),
+            Err(error) => Err(self.goal_disposal_error(&error)),
+        }
+    }
+
+    async fn quiesce_goal_for_session_transition(
+        &self,
+        session_id: &str,
+        claim: super::session::GoalLifecycleCommandGuard,
+    ) -> Result<super::session::GoalLifecycleFence, JsonRpcError> {
+        let has_goal = self.has_goal_disposition_work(session_id).await?;
+        let fence = claim.fence_for_binding(has_goal);
+        if !has_goal {
+            return Ok(fence);
+        }
+        self.drain_goal_for_session_transition(session_id, fence)
+            .await
+    }
+
+    async fn has_goal_disposition_work(&self, session_id: &str) -> Result<bool, JsonRpcError> {
+        Ok(self.ctx.goal_runtime.supervisor(session_id).await.is_some()
+            || self.session_disposition_target(session_id).await?.is_some())
+    }
+
+    async fn drain_goal_for_session_transition(
+        &self,
+        session_id: &str,
+        fence: super::session::GoalLifecycleFence,
+    ) -> Result<super::session::GoalLifecycleFence, JsonRpcError> {
+        let dispatcher = self.spawn_handle();
+        let session_id = session_id.to_owned();
+        zeroclaw_spawn::spawn!(async move {
+            let quiescence = dispatcher
+                .ctx
+                .goal_runtime
+                .quiesce_for_session_transition(&session_id)
+                .await
+                .map_err(|error| dispatcher.goal_disposal_error(&error))?;
+            if let Some(quiescence) = quiescence.filter(|result| result.has_failure_notice()) {
+                // Return the actor reservation to its queue before the
+                // ordinary failure-notice path asks for that same permit.
+                let activity = dispatcher.connection_activity.clone();
+                zeroclaw_spawn::spawn!(async move {
+                    let _activity = activity;
+                    quiescence.deliver_notice().await;
+                });
+                return Err(rpc_err(
+                    SESSION_BUSY,
+                    "The session's Goal is still delivering its result. Try again.",
+                ));
+            }
+            Ok(fence)
+        })
+        .await
+        .map_err(|_| rpc_err(INTERNAL_ERROR, "Could not settle the session's Goal"))?
+    }
+
+    async fn fence_goal_for_session_removal(
+        &self,
+        session_id: &str,
+        generation: Option<u64>,
+        method: Method,
+        authorized: Option<&super::session::SessionRecord>,
+    ) -> Result<GoalRemovalAdmission, JsonRpcError> {
+        let Some(generation) = generation else {
+            return Ok(GoalRemovalAdmission::default());
+        };
+        let Some(guard) = self
+            .ctx
+            .sessions
+            .lock_goal_lifecycle(session_id, generation)
+            .await
+        else {
+            // The native, authorized cancellation check still compares the
+            // captured incarnation before the operation can reserve admission.
+            return Ok(GoalRemovalAdmission::default());
+        };
+        let needs_drain = self.has_goal_disposition_work(session_id).await?;
+        if !needs_drain {
+            // Fence concurrent Goal starts without changing ordinary session
+            // ordering. Signal before joining the ordinary FIFO, as before.
+            return Ok(GoalRemovalAdmission {
+                reservation: None,
+                fence: Some(Arc::new(guard.fence_for_binding(false))),
+            });
+        }
+        let grants = self.recheck_authority_after_admission(method)?;
+        let current = self
+            .revalidate_admitted_session(
+                session_id,
+                authorized,
+                self.scoped_principal_id_from(grants.as_ref()).as_deref(),
+            )
+            .await?;
+        if current.as_ref() != authorized {
+            return Err(self.stale_goal_lifecycle_error());
+        }
+        let fence = guard.fence_for_binding(true);
+        let reservation = self.reserve_session_removal(session_id).await?;
+        let fence = self
+            .drain_goal_for_session_transition(session_id, fence)
+            .await?;
+        Ok(GoalRemovalAdmission {
+            reservation: Some(reservation),
+            fence: Some(Arc::new(fence)),
+        })
+    }
+
+    async fn reserve_session_removal(
+        &self,
+        session_id: &str,
+    ) -> Result<zeroclaw_infra::session_queue::SessionQueueAdmission, JsonRpcError> {
+        self.ctx
+            .sessions
+            .session_queue
+            .reserve(session_id)
+            .await
+            .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))
+    }
+
+    async fn publish_replacement_with_goal(
+        &self,
+        session_id: String,
+        candidate: super::session::RpcSession,
+        generation: u64,
+        admission: zeroclaw_infra::session_queue::SessionGuard,
+        fence: super::session::GoalLifecycleFence,
+        config_writer: tokio::sync::OwnedMutexGuard<()>,
+    ) -> Result<
+        (
+            zeroclaw_infra::session_queue::SessionGuard,
+            tokio::sync::OwnedMutexGuard<()>,
+        ),
+        JsonRpcError,
+    > {
+        use super::session_disposition::{DispositionHost, ResolvedEffect};
+        use crate::control_plane::task_store_sqlite::session_disposition::{
+            DispositionResult, SessionDispositionKind, SessionDispositionOrigin,
+        };
+        use zeroclaw_goal::GoalTaskRegistry as _;
+
+        let host = DispositionHost::for_context(&self.ctx)
+            .map_err(|error| self.goal_disposal_error(&error))?;
+        let target = match (&host, zeroclaw_goal::GoalSessionKey::zero_code(&session_id)) {
+            (Some(host), Ok(key)) => host
+                .store
+                .current_goal_for_session(&key.durable_id())
+                .await
+                .map_err(|error| self.goal_disposal_error(&error))?,
+            _ => None,
+        };
+        if let (Some(host), Some(target)) = (host, target) {
+            let dispatcher = self.spawn_handle();
+            tokio::task::spawn_blocking(move || {
+                let _fence = fence;
+                let mut operation = host.prepare(
+                    &session_id,
+                    &target,
+                    SessionDispositionKind::Replace,
+                    SessionDispositionOrigin::Live,
+                    Some(generation),
+                )?;
+                let publication = dispatcher.ctx.sessions.publish_prepared_with_commit(
+                    session_id,
+                    candidate,
+                    generation,
+                    dispatcher.resume_access_fence(Some(generation)),
+                    |candidate| {
+                        if dispatcher.connection_cancel.is_cancelled() {
+                            return Err(SessionEffectDenied(rpc_err(
+                                SESSION_BUSY,
+                                "Connection closed before session replacement",
+                            ))
+                            .into());
+                        }
+                        let lease = dispatcher
+                            .live_effect_lease(Method::SessionNew, candidate)
+                            .map_err(SessionEffectDenied)?;
+                        match operation
+                            .store()
+                            .commit_live_session_disposition(&operation.record)?
+                        {
+                            DispositionResult::Applied => Ok(lease),
+                            _ => {
+                                Err(SessionEffectDenied(dispatcher.stale_goal_lifecycle_error())
+                                    .into())
+                            }
+                        }
+                    },
+                    |message| dispatcher.replacement_publication_error(message).into(),
+                );
+                match publication {
+                    Ok(()) => Ok((admission, config_writer)),
+                    Err(rejection) => match operation.resolve_effect()? {
+                        ResolvedEffect::NotCommitted => Err(rejection),
+                        ResolvedEffect::Committed => {
+                            anyhow::bail!("live disposition committed after a rejected publication")
+                        }
+                    },
+                }
+            })
+            .await
+            .map_err(|_| rpc_err(INTERNAL_ERROR, "Could not complete session replacement"))?
+            .map_err(|error| {
+                if let Some(denied) = error.downcast_ref::<SessionEffectDenied>() {
+                    denied.0.clone()
+                } else {
+                    self.goal_disposal_error(&error)
+                }
+            })
+        } else {
+            self.ctx
+                .sessions
+                .publish_prepared_authorized(
+                    session_id,
+                    candidate,
+                    Some(generation),
+                    self.resume_access_fence(Some(generation)),
+                    |candidate| self.live_effect_lease(Method::SessionNew, candidate),
+                    |message| self.replacement_publication_error(message).0,
+                )
+                .await?;
+            drop(fence);
+            Ok((admission, config_writer))
+        }
+    }
+
+    fn replacement_publication_error(&self, message: &'static str) -> SessionEffectDenied {
+        SessionEffectDenied(
+            if self.access_policy == RpcAccessPolicy::RemoteSessionOwner {
+                self.stale_session_incarnation_error()
+            } else {
+                rpc_err(SESSION_BUSY, message)
+            },
+        )
+    }
+
+    async fn commit_live_removal_with_goal(
+        &self,
+        session_id: &str,
+        generation: u64,
+        method: Method,
+        admission: zeroclaw_infra::session_queue::SessionGuard,
+        fence: Option<Arc<super::session::GoalLifecycleFence>>,
+    ) -> Result<(bool, zeroclaw_infra::session_queue::SessionGuard), JsonRpcError> {
+        let Some((host, target)) = self.session_disposition_target(session_id).await? else {
+            let removed = self
+                .remove_ordinary_generation(session_id, generation, method)
+                .await?;
+            drop(fence);
+            return Ok((removed, admission));
+        };
+        let fence = fence.ok_or_else(|| self.stale_goal_lifecycle_error())?;
+        let dispatcher = self.spawn_handle();
+        let session_id = session_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let _fence = fence;
+            dispatcher.commit_goal_live_removal(&session_id, generation, method, host, &target)?;
+            Ok::<_, anyhow::Error>((true, admission))
+        })
+        .await
+        .map_err(|_| rpc_err(INTERNAL_ERROR, "Could not complete session removal"))?
+        .map_err(|error| self.goal_disposition_rpc_error(&error))
+    }
+
+    async fn session_disposition_target(
+        &self,
+        session_id: &str,
+    ) -> Result<
+        Option<(
+            super::session_disposition::DispositionHost,
+            zeroclaw_api::task::TaskRecord,
+        )>,
+        JsonRpcError,
+    > {
+        use super::session_disposition::DispositionHost;
+        use zeroclaw_goal::GoalTaskRegistry as _;
+        let host = DispositionHost::for_context(&self.ctx)
+            .map_err(|error| self.goal_disposal_error(&error))?;
+        let (Some(host), Ok(key)) = (host, zeroclaw_goal::GoalSessionKey::zero_code(session_id))
+        else {
+            return Ok(None);
+        };
+        let target = host
+            .store
+            .current_goal_for_session(&key.durable_id())
+            .await
+            .map_err(|error| self.goal_disposal_error(&error))?;
+        Ok(target.map(|target| (host, target)))
+    }
+
+    async fn remove_ordinary_generation(
+        &self,
+        session_id: &str,
+        generation: u64,
+        method: Method,
+    ) -> Result<bool, JsonRpcError> {
+        let sessions = &self.ctx.sessions;
+        if method == Method::SessionKill {
+            sessions
+                .kill_session_generation_authorized(session_id, generation, |owner| {
+                    self.session_effect_lease(method, owner)
+                })
+                .await
+        } else {
+            sessions
+                .remove_generation_authorized(session_id, generation, |owner| {
+                    self.session_effect_lease(method, owner)
+                })
+                .await
+        }
+    }
+
+    fn goal_disposition_rpc_error(&self, error: &anyhow::Error) -> JsonRpcError {
+        for cause in error.chain() {
+            if let Some(denied) = cause.downcast_ref::<SessionEffectDenied>() {
+                return denied.0.clone();
+            }
+            if let Some(denied) = cause
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::get_ref)
+                .and_then(|source| source.downcast_ref::<SessionEffectDenied>())
+            {
+                return denied.0.clone();
+            }
+        }
+        self.goal_disposal_error(error)
+    }
+
+    fn commit_goal_live_removal(
+        &self,
+        session_id: &str,
+        generation: u64,
+        method: Method,
+        host: super::session_disposition::DispositionHost,
+        task: &zeroclaw_api::task::TaskRecord,
+    ) -> anyhow::Result<()> {
+        use super::session_disposition::ResolvedEffect;
+        use crate::control_plane::task_store_sqlite::session_disposition::{
+            DispositionResult, SessionDispositionKind, SessionDispositionOrigin,
+        };
+        let kind = match method {
+            Method::SessionClose => SessionDispositionKind::Close,
+            Method::SessionKill => SessionDispositionKind::Kill,
+            Method::SessionDelete => SessionDispositionKind::Delete,
+            _ => anyhow::bail!("invalid session removal method"),
+        };
+        if let Some(operation) = host.claim_committed_live_removal(session_id, generation, kind)? {
+            self.remove_goal_generation(session_id, generation, method, || Ok(()))?;
+            return self.finish_goal_removal(operation);
+        }
+        let mut operation = host.prepare(
+            session_id,
+            task,
+            kind,
+            SessionDispositionOrigin::Live,
+            Some(generation),
+        )?;
+        let removal =
+            self.remove_goal_generation(session_id, generation, method, || {
+                match operation
+                    .store()
+                    .commit_live_session_disposition(&operation.record)?
+                {
+                    DispositionResult::Applied => Ok(()),
+                    _ => Err(SessionEffectDenied(self.stale_goal_lifecycle_error()).into()),
+                }
+            });
+        match removal {
+            Ok(()) => Ok(()),
+            Err(rejection) => match operation.resolve_effect()? {
+                ResolvedEffect::NotCommitted => Err(rejection),
+                ResolvedEffect::Committed => {
+                    anyhow::bail!("live disposition committed after a rejected removal")
+                }
+            },
+        }
+    }
+
+    fn remove_goal_generation(
+        &self,
+        session_id: &str,
+        generation: u64,
+        method: Method,
+        commit: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        use super::session::CancelCause;
+        let cause = if method == Method::SessionKill {
+            CancelCause::AdminKill
+        } else {
+            CancelCause::SessionRemoved
+        };
+        let removed = self.ctx.sessions.remove_generation_with_commit(
+            session_id,
+            generation,
+            cause,
+            |owner| {
+                if self.connection_cancel.is_cancelled() {
+                    return Err(SessionEffectDenied(rpc_err(
+                        SESSION_BUSY,
+                        "Connection closed before session removal",
+                    ))
+                    .into());
+                }
+                self.session_effect_lease(method, owner)
+                    .map_err(|error| SessionEffectDenied(error).into())
+            },
+            commit,
+        )?;
+        if !removed {
+            return Err(SessionEffectDenied(self.stale_goal_lifecycle_error()).into());
+        }
+        Ok(())
+    }
+
+    fn finish_goal_removal(
+        &self,
+        operation: super::session_disposition::OwnedDisposition,
+    ) -> anyhow::Result<()> {
+        if let Err(error) = operation.finish_committed() {
+            self.goal_disposal_error(&error);
+            return Err(SessionEffectDenied(rpc_err(
+                INTERNAL_ERROR,
+                "The session was removed, but its previous Goal cleanup is pending.",
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Execute the native mutation and its Goal disposition under the same
+    /// actor admission. An ordinary session takes its existing path instead.
+    async fn try_witnessed_session_removal(
+        &self,
+        session_id: &str,
+        method: Method,
+        record: Option<&super::session::SessionRecord>,
+        admission: &Arc<zeroclaw_infra::session_queue::SessionGuard>,
+        fence: Option<&Arc<super::session::GoalLifecycleFence>>,
+    ) -> Result<Option<(bool, bool)>, JsonRpcError> {
+        use super::session_disposition::{
+            ResolvedEffect,
+            durable::{DurableRemoval, DurableRemovalOutcome},
+        };
+        use crate::control_plane::task_store_sqlite::session_disposition::SessionDispositionKind;
+
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        if record.live_generation.is_none() {
+            self.ensure_session_disposition_settled(session_id).await?;
+        }
+        let Some((host, task)) = self.session_disposition_target(session_id).await? else {
+            return Ok(None);
+        };
+        let kind = match method {
+            Method::SessionKill => SessionDispositionKind::Kill,
+            Method::SessionDelete => SessionDispositionKind::Delete,
+            _ => {
+                return Err(rpc_err(
+                    INTERNAL_ERROR,
+                    "Invalid durable session removal method",
+                ));
+            }
+        };
+        let durable =
+            match (&record.durable, method) {
+                (Some(DurableSession::Acp), _) => {
+                    let store = self.ctx.acp_session_store.clone().ok_or_else(|| {
+                        rpc_err(INTERNAL_ERROR, "ACP session store is not available")
+                    })?;
+                    let session_id = session_id.to_owned();
+                    Some(if method == Method::SessionKill {
+                        DurableRemoval::AcpKill { store, session_id }
+                    } else {
+                        DurableRemoval::AcpDelete { store, session_id }
+                    })
+                }
+                (Some(DurableSession::Chat { key }), Method::SessionDelete) => {
+                    let backend = self.ctx.session_backend.clone().ok_or_else(|| {
+                        rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
+                    })?;
+                    Some(DurableRemoval::ChatDelete {
+                        backend,
+                        key: key.clone(),
+                    })
+                }
+                _ => None,
+            };
+        let generation = record.live_generation;
+        let expected_owner = record.owner.clone();
+        let dispatcher = self.spawn_handle();
+        let session_id = session_id.to_owned();
+        let admission = Arc::clone(admission);
+        let fence = fence.cloned();
+        tokio::task::spawn_blocking(move || {
+            let _admission = admission;
+            let _fence = fence;
+            let resumed_effect = match generation {
+                Some(generation) => {
+                    host.claim_committed_live_removal(&session_id, generation, kind)?
+                }
+                None => None,
+            };
+            let complete = |operation, applied: anyhow::Result<DurableRemovalOutcome>| {
+                if let Some(generation) = generation
+                    && let Err(error) = dispatcher.remove_goal_generation(
+                        &session_id,
+                        generation,
+                        method,
+                        || Ok(()),
+                    )
+                {
+                    dispatcher.goal_disposal_error(&error);
+                    return Err(SessionEffectDenied(rpc_err(
+                        INTERNAL_ERROR,
+                        "The durable session change committed, but live removal is pending.",
+                    ))
+                    .into());
+                }
+                dispatcher.finish_goal_removal(operation)?;
+                if let Err(error) = applied {
+                    dispatcher.goal_disposal_error(&error);
+                    return Err(SessionEffectDenied(rpc_err(
+                        INTERNAL_ERROR,
+                        "The session change committed, but its backend reported an error.",
+                    ))
+                    .into());
+                }
+                Ok::<_, anyhow::Error>((true, generation.is_some()))
+            };
+            if let Some(operation) = resumed_effect {
+                if operation.record.kind != kind {
+                    return Err(SessionEffectDenied(rpc_err(
+                        SESSION_BUSY,
+                        "A different session removal has committed and still needs to finish.",
+                    ))
+                    .into());
+                }
+                return complete(operation, Ok(DurableRemovalOutcome::Changed));
+            }
+            if let Some(durable) = durable
+                && let Some(origin) = durable.origin()?
+            {
+                durable.validate_before_prepare(&origin)?;
+                let mut operation =
+                    host.clone()
+                        .prepare(&session_id, &task, kind, origin, generation)?;
+                let witness = operation
+                    .witness()?
+                    .ok_or_else(|| anyhow::Error::msg("missing session witness"))?;
+                let applied = durable.apply(&witness, expected_owner.as_deref(), &|actual| {
+                    if dispatcher.connection_cancel.is_cancelled() {
+                        return Err(SessionEffectDenied(rpc_err(
+                            SESSION_BUSY,
+                            "Connection closed before durable session removal",
+                        ))
+                        .into());
+                    }
+                    let lease = dispatcher.durable_effect_lease(
+                        method,
+                        expected_owner.as_deref(),
+                        actual,
+                    )?;
+                    Ok(Box::new(lease))
+                });
+                if operation.resolve_applied(&applied)? == ResolvedEffect::Committed {
+                    return complete(operation, applied);
+                }
+                anyhow::ensure!(
+                    applied? != DurableRemovalOutcome::Changed,
+                    "session removal returned without a receipt"
+                );
+            }
+            if let Some(generation) = generation {
+                dispatcher.commit_goal_live_removal(
+                    &session_id,
+                    generation,
+                    method,
+                    host,
+                    &task,
+                )?;
+            }
+            Ok((false, generation.is_some()))
+        })
+        .await
+        .map_err(|_| rpc_err(INTERNAL_ERROR, "Could not complete session removal"))?
+        .map(Some)
+        .map_err(|error| self.goal_disposition_rpc_error(&error))
+    }
+
     async fn ensure_method_session_access(
         &self,
         method: Method,
@@ -3250,6 +3958,7 @@ impl RpcDispatcher {
             connection_activity: self.connection_activity.clone(),
             prompt_tasks: Vec::new(),
             subscriptions: Arc::clone(&self.subscriptions),
+            goal_destinations: Arc::clone(&self.goal_destinations),
             // Prompt handles never serve upload methods; staging stays with
             // the connection's own dispatcher.
             uploads: std::sync::Mutex::default(),
@@ -3265,6 +3974,9 @@ impl RpcDispatcher {
     /// replacement connection cannot race invisible old-generation work.
     pub(crate) async fn shutdown(&mut self) {
         self.connection_cancel.cancel();
+        if self.owns_connection {
+            self.retire_goal_destinations();
+        }
         // Join each handle where it is stored, and remove it only once its
         // join has returned. Moving handles out first would detach whichever
         // prompt is being awaited if this future is itself dropped: the
@@ -3275,6 +3987,18 @@ impl RpcDispatcher {
                 Self::log_prompt_task_failure(task.await);
             }
             self.prompt_tasks.pop();
+        }
+    }
+
+    fn retire_goal_destinations(&self) {
+        let recipients = self.goal_destinations.lock().retire();
+        // Install takes the recipient lock before it registers. Never hold
+        // the registry lock while detaching.
+        for recipient in recipients
+            .into_iter()
+            .filter_map(|recipient| recipient.upgrade())
+        {
+            recipient.detach_connection(&self.rpc);
         }
     }
 
@@ -3714,6 +4438,7 @@ impl RpcDispatcher {
             self.commit_session_messages(req_id, params).await;
             return;
         }
+        let mut attach_intent = None;
         let result = match method {
             // Core
             Method::Initialize => self.handle_initialize(params).await,
@@ -3723,7 +4448,9 @@ impl RpcDispatcher {
             Method::DoctorRun => Box::pin(self.handle_doctor_run()).await,
 
             // Sessions
-            Method::SessionNew => self.handle_session_new(params).await,
+            Method::SessionNew => {
+                Box::pin(self.session_new_for_connection(params, None, &mut attach_intent)).await
+            }
             Method::SessionClose => self.handle_session_close(params).await,
             Method::SessionPrompt => {
                 // Always spawn — turn completion is signaled by a
@@ -3953,7 +4680,23 @@ impl RpcDispatcher {
 
         match result {
             Ok(v) => {
-                self.send_result(req_id, v).await;
+                if self.send_result(req_id, v).await
+                    && let Some(GoalAttachIntent {
+                        session_id,
+                        generation,
+                    }) = attach_intent
+                    && let Some(tui_id) = self.tui_id.as_deref()
+                {
+                    self.ctx
+                        .sessions
+                        .offer_goal_recipient(
+                            &session_id,
+                            generation,
+                            tui_id,
+                            GoalFrameDestination::new(self),
+                        )
+                        .await;
+                }
             }
             Err(e) => self.send_error(req_id, e.code, &e.message).await,
         }
@@ -4574,6 +5317,7 @@ impl RpcDispatcher {
         &self,
         agent: Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
         session_id: String,
+        defer_when_busy: bool,
     ) -> Result<(), JsonRpcError> {
         let approval_channel = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
             "rpc",
@@ -4615,7 +5359,7 @@ impl RpcDispatcher {
                 })
                 .await
         };
-        if remote {
+        if remote && !defer_when_busy {
             self.ctx
                 .sessions
                 .wait_test_effect_pause("remote-approval-agent")
@@ -4729,9 +5473,15 @@ impl RpcDispatcher {
         chat_mode: &crate::rpc::types::ChatMode,
         existing: crate::rpc::session::ResumedRpcSession,
         admission: Option<zeroclaw_infra::session_queue::SessionGuard>,
+        defer_approval_when_busy: bool,
+        attach_intent: &mut Option<GoalAttachIntent>,
     ) -> RpcResult {
-        self.rebind_rpc_approval_channel(Arc::clone(&existing.agent), session_id.clone())
-            .await?;
+        self.rebind_rpc_approval_channel(
+            Arc::clone(&existing.agent),
+            session_id.clone(),
+            defer_approval_when_busy,
+        )
+        .await?;
         // Do not retain remote admission across outbound capacity or hooks.
         drop(admission);
         if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
@@ -4746,12 +5496,20 @@ impl RpcDispatcher {
         if let Some(ref hooks) = self.ctx.hooks {
             hooks.fire_session_start(&session_id, "rpc").await;
         }
-        to_result(SessionNewResult {
-            session_id,
+        let generation = existing.generation;
+        let result = to_result(SessionNewResult {
+            session_id: session_id.clone(),
             agent_alias: existing.agent_alias,
             message_count: existing.message_count,
             workspace_dir: existing.workspace_dir,
-        })
+        })?;
+        if matches!(chat_mode, crate::rpc::types::ChatMode::Chat) {
+            *attach_intent = Some(GoalAttachIntent {
+                session_id,
+                generation,
+            });
+        }
+        Ok(result)
     }
 
     fn resume_access_fence(&self, expected_generation: Option<u64>) -> Option<(u64, Option<&str>)> {
@@ -4761,6 +5519,36 @@ impl RpcDispatcher {
                 expected_generation.map(|generation| (generation, self.tui_id.as_deref()))
             }
         }
+    }
+
+    // Timing only: the caller still rechecks admission, owner, capabilities
+    // and the exact incarnation before allowing the resume to take effect.
+    async fn live_goal_reattach_snapshot(
+        &self,
+        id: &str,
+        expected: Option<u64>,
+    ) -> Option<super::session::GoalSessionSnapshot> {
+        let snapshot = self.ctx.sessions.goal_session_snapshot(id).await?;
+        if self.access_policy != RpcAccessPolicy::RemoteSessionOwner
+            || snapshot.chat_mode != crate::rpc::types::ChatMode::Chat
+            || expected != Some(snapshot.generation)
+            || self.tui_id.is_none()
+            || self.tui_id.as_deref() != snapshot.owner_tui_id.as_deref()
+            || snapshot.goal_admission_is_fenced()
+        {
+            return None;
+        }
+        let key = zeroclaw_goal::GoalSessionKey::zero_code(id)
+            .ok()?
+            .durable_id();
+        let store = self
+            .ctx
+            .goal_runtime
+            .current_control_plane()?
+            .goal_store()
+            .ok()?;
+        let task = store.current_goal_for_session(&key).await.ok()??;
+        (task.status == zeroclaw_api::task::TaskStatus::Running).then_some(snapshot)
     }
 
     async fn resume_existing_session(
@@ -4775,6 +5563,9 @@ impl RpcDispatcher {
         crate::rpc::session::ResumeExistingError,
     > {
         let expected_principal = self.scoped_principal_id();
+        // Exact cleanup never authorizes rebinding. Report any unresolved
+        // disposition only after the current store owner passed its checks.
+        let disposition_ready = self.ensure_session_disposition_settled(session_id).await;
         self.ctx
             .sessions
             .resume_existing_authorized(
@@ -4786,12 +5577,14 @@ impl RpcDispatcher {
                 expected_principal.as_deref(),
                 self.resume_access_fence(expected_generation),
                 |alias, workspace, retained_environment, owner| {
-                    self.authorize_resumed_incarnation(
+                    let authority = self.authorize_resumed_incarnation(
                         alias,
                         workspace,
                         retained_environment,
                         owner,
-                    )
+                    )?;
+                    disposition_ready?;
+                    Ok(authority)
                 },
             )
             .await
@@ -4809,10 +5602,14 @@ impl RpcDispatcher {
             crate::rpc::session::ResumeExistingError::StaleIncarnation => {
                 self.stale_session_incarnation_error()
             }
+            crate::rpc::session::ResumeExistingError::LifecyclePending => {
+                rpc_err(SESSION_BUSY, error.message())
+            }
             _ => rpc_err(INVALID_PARAMS, error.message()),
         }
     }
 
+    #[cfg(test)]
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         Box::pin(self.session_new_with_mode(params, None)).await
     }
@@ -4827,6 +5624,15 @@ impl RpcDispatcher {
         &self,
         params: &Value,
         create_only: Option<&parking_lot::Mutex<Option<u64>>>,
+    ) -> RpcResult {
+        Box::pin(self.session_new_for_connection(params, create_only, &mut None)).await
+    }
+
+    async fn session_new_for_connection(
+        &self,
+        params: &Value,
+        create_only: Option<&parking_lot::Mutex<Option<u64>>>,
+        attach_intent: &mut Option<GoalAttachIntent>,
     ) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
         // A create-only call never resumes, so a supplied id that names no
@@ -4924,8 +5730,9 @@ impl RpcDispatcher {
         // under that lock, so a stamp that still carries a revoked
         // administrator bypass cannot rebind another principal's session.
         let mut retained_remote_admission = None;
-        let mut _replacement_goal_lifecycle_guard = None;
+        let mut replacement_goal_fence = None;
         let mut remote_replacement_checked = false;
+        let mut deferred_approval = false;
         if resuming && create_only.is_none() {
             let non_local = self.access_policy == RpcAccessPolicy::RemoteSessionOwner;
             if non_local {
@@ -5002,18 +5809,29 @@ impl RpcDispatcher {
                                 has_environment,
                             )?;
                         }
-                        self.ctx
-                            .goal_runtime
-                            .dispose_session(&session_id)
-                            .await
-                            .map_err(|error| self.goal_disposal_error(&error))?;
-                        _replacement_goal_lifecycle_guard = Some(guard);
+                        let fence = self
+                            .quiesce_goal_for_session_transition(&session_id, guard)
+                            .await?;
+                        replacement_goal_fence = Some((snapshot.generation, fence));
                     }
                 }
-                let guard = reservation
-                    .acquire()
-                    .await
-                    .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+                let running_chat = if chat_mode == crate::rpc::types::ChatMode::Chat {
+                    self.live_goal_reattach_snapshot(&session_id, expected_generation)
+                        .await
+                } else {
+                    None
+                };
+                if running_chat.is_some() {
+                    drop(reservation);
+                    deferred_approval = true;
+                } else {
+                    retained_remote_admission = Some(
+                        reservation
+                            .acquire()
+                            .await
+                            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?,
+                    );
+                }
                 let grants = self.recheck_authority_after_admission(Method::SessionNew)?;
                 if let Some(grants) = grants.as_ref() {
                     self.selector_session_agent_with_grants(
@@ -5040,10 +5858,11 @@ impl RpcDispatcher {
                         has_environment,
                     )?;
                 }
-                if let Some(agent) = self.ctx.sessions.get_agent(&session_id).await {
+                if let Some(snapshot) = running_chat {
+                    Self::ensure_session_channel_access(&snapshot.reaction_channels)?;
+                } else if let Some(agent) = self.ctx.sessions.get_agent(&session_id).await {
                     self.ensure_transport_can_use_session_agent(&agent).await?;
                 }
-                retained_remote_admission = Some(guard);
             }
             match self
                 .resume_existing_session(
@@ -5062,6 +5881,8 @@ impl RpcDispatcher {
                             &chat_mode,
                             existing,
                             retained_remote_admission,
+                            deferred_approval,
+                            attach_intent,
                         )
                         .await;
                 }
@@ -5073,8 +5894,8 @@ impl RpcDispatcher {
         }
 
         // Reserve this request's FIFO session position before Goal lifecycle
-        // serialization. Disposal may need an admitted Goal turn to settle, so
-        // waiting for the actor permit must remain after disposal; the
+        // serialization. An admitted Goal may need to settle, so
+        // waiting for the actor permit must remain after quiescence; the
         // reservation prevents later session requests from overtaking while
         // the lifecycle boundary is acquired.
         let session_admission = if retained_remote_admission.is_none() {
@@ -5091,11 +5912,10 @@ impl RpcDispatcher {
         };
 
         // A cross-mode replacement invalidates the old session's Goal
-        // binding. Serialize its disposal with Goal commands before awaiting
-        // the reserved actor permit, because disposal may need the active Goal
-        // worker to finish an already-admitted turn.
+        // binding only if it commits. Release command serialization while
+        // keeping that generation fenced before waiting for its actor.
         if !remote_replacement_checked && create_only.is_none() {
-            _replacement_goal_lifecycle_guard = if let Some(snapshot) =
+            replacement_goal_fence = if let Some(snapshot) =
                 self.ctx.sessions.goal_session_snapshot(&session_id).await
                 && snapshot.chat_mode != chat_mode
                 && Some(snapshot.generation) == expected_generation
@@ -5123,12 +5943,10 @@ impl RpcDispatcher {
                     .await?;
                     self.ensure_session_incarnation(&session_id, Some(generation))
                         .await?;
-                    self.ctx
-                        .goal_runtime
-                        .dispose_session(&session_id)
-                        .await
-                        .map_err(|error| self.goal_disposal_error(&error))?;
-                    Some(guard)
+                    let fence = self
+                        .quiesce_goal_for_session_transition(&session_id, guard)
+                        .await?;
+                    Some((generation, fence))
                 } else {
                     // An earlier same-target replacement may have changed the
                     // captured generation while this request waited for the
@@ -5157,7 +5975,7 @@ impl RpcDispatcher {
         // place. Publishing goes through `insert_admitted` (which does NOT
         // re-acquire the permit) rather than `insert`, so the permit-1
         // per-session semaphore is never acquired twice.
-        let _admission = if let Some(guard) = retained_remote_admission {
+        let mut admission_guard = if let Some(guard) = retained_remote_admission {
             guard
         } else {
             session_admission
@@ -5203,6 +6021,7 @@ impl RpcDispatcher {
         } else {
             None
         };
+        self.ensure_session_disposition_settled(&session_id).await?;
 
         if create_only.is_some()
             && (admitted_record.is_some()
@@ -5246,7 +6065,14 @@ impl RpcDispatcher {
         {
             let existing = existing?;
             return self
-                .finish_existing_session_resume(session_id, &chat_mode, existing, Some(_admission))
+                .finish_existing_session_resume(
+                    session_id,
+                    &chat_mode,
+                    existing,
+                    Some(admission_guard),
+                    false,
+                    attach_intent,
+                )
                 .await;
         }
         if admitted_mode.is_some() {
@@ -5445,7 +6271,7 @@ impl RpcDispatcher {
         // built from the prior generation (or publish midway through Agent
         // construction). Persistence lookup above does not depend on config and
         // deliberately remains outside this boundary.
-        let config_generation_guard = self.ctx.config_authority.lock_config_writer().await;
+        let mut config_generation_guard = self.ctx.config_authority.lock_config_writer().await;
         let config = self.ctx.config.read().clone();
 
         // The wait for the config-generation lock above is also unbounded, and
@@ -5642,7 +6468,7 @@ impl RpcDispatcher {
         let unpublished = if expected_generation.is_none() {
             self.ctx
                 .sessions
-                .insert_admitted_if_absent(&_admission, session_id.clone(), candidate)
+                .insert_admitted_if_absent(&admission_guard, session_id.clone(), candidate)
                 .await
                 .map_err(|message| {
                     if message == "session already exists" {
@@ -5931,29 +6757,42 @@ impl RpcDispatcher {
 
         if let Some(mut candidate) = unpublished {
             candidate.plan = plan;
-            self.ctx
-                .sessions
-                .publish_prepared_authorized(
-                    session_id.clone(),
-                    candidate,
-                    expected_generation,
-                    self.resume_access_fence(expected_generation),
-                    |candidate| self.live_effect_lease(Method::SessionNew, candidate),
-                    |message| {
-                        if self.access_policy == RpcAccessPolicy::RemoteSessionOwner {
-                            self.stale_session_incarnation_error()
-                        } else {
-                            rpc_err(SESSION_BUSY, message)
-                        }
-                    },
-                )
-                .await?;
+            if let Some((generation, fence)) = replacement_goal_fence {
+                if expected_generation != Some(generation) {
+                    return Err(self.stale_goal_lifecycle_error());
+                }
+                (admission_guard, config_generation_guard) = self
+                    .publish_replacement_with_goal(
+                        session_id.clone(),
+                        candidate,
+                        generation,
+                        admission_guard,
+                        fence,
+                        config_generation_guard,
+                    )
+                    .await?;
+            } else {
+                self.ctx
+                    .sessions
+                    .publish_prepared_authorized(
+                        session_id.clone(),
+                        candidate,
+                        expected_generation,
+                        self.resume_access_fence(expected_generation),
+                        |candidate| self.live_effect_lease(Method::SessionNew, candidate),
+                        |message| self.replacement_publication_error(message).0,
+                    )
+                    .await?;
+            }
         } else {
             self.ctx.sessions.set_plan(&session_id, plan).await;
         }
         let published_generation = self
             .session_generation_for_agent(&session_id, &candidate_agent)
             .await?;
+        // Keep the admitted permit through all remaining history/owner
+        // finalization, including after the blocking publication returned it.
+        let _admission = admission_guard;
         drop(config_generation_guard);
         self.forward_seed_event(&session_id, seed_event).await;
         self.replay_session_plan(
@@ -6227,56 +7066,59 @@ impl RpcDispatcher {
             });
         }
         self.ctx.sessions.wait_test_removal_signal_pause().await;
-        // Cancellation must be signalled before waiting: the admitted prompt
-        // owns this permit until its terminal state and transcript writes are
-        // complete. Removal then happens under the same incarnation fence.
+        let GoalRemovalAdmission {
+            reservation,
+            fence: goal_lifecycle_fence,
+        } = self
+            .fence_goal_for_session_removal(
+                &req.session_id,
+                requested_generation,
+                Method::SessionClose,
+                authorized.as_ref(),
+            )
+            .await?;
+        let goal_close = if let (Some((generation, ChatMode::Acp)), Some(fence)) =
+            (requested_identity.as_ref(), goal_lifecycle_fence.as_ref())
+        {
+            self.session_disposition_target(&req.session_id)
+                .await?
+                .map(|(host, task)| {
+                    Arc::new(GoalCloseAttempt {
+                        dispatcher: self.spawn_handle(),
+                        session_id: req.session_id.clone(),
+                        generation: *generation,
+                        host,
+                        task,
+                        _fence: Arc::clone(fence),
+                        result: parking_lot::Mutex::new(None),
+                    })
+                })
+        } else {
+            None
+        };
+        // Signal ordinary prompt cancellation while the actor may still be
+        // held by its turn. Any admitted Goal operation has already settled.
         self.ctx
             .sessions
-            .signal_cancellation_authorized(
+            .signal_cancellation_authorized_with_close(
                 &req.session_id,
                 expected_generation,
                 self.resume_access_fence(expected_generation),
                 crate::rpc::session::CancelCause::SessionRemoved,
                 |owner| self.session_effect_lease(Method::SessionClose, owner),
+                goal_close
+                    .as_ref()
+                    .map(|attempt| GoalCloseHandoff(Arc::downgrade(attempt))),
             )
             .await?
             .ok_or_else(|| self.stale_session_incarnation_error())?;
-        let session_admission = self
-            .ctx
-            .sessions
-            .session_queue
-            .reserve(&req.session_id)
-            .await
-            .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?;
-        let _goal_lifecycle_guard = match requested_generation {
-            Some(generation) => Some(
-                self.ctx
-                    .sessions
-                    .lock_goal_lifecycle(&req.session_id, generation)
-                    .await
-                    .ok_or_else(|| self.stale_goal_lifecycle_error())?,
-            ),
-            None => None,
+        self.ctx.sessions.notify_test_removal_signal_attempted();
+        let witnessed_close = reservation.is_some();
+        let session_admission = match reservation {
+            Some(reservation) => reservation,
+            None => self.reserve_session_removal(&req.session_id).await?,
         };
-        // A reaped target still follows ordinary queue admission: an admitted
-        // prompt may publish its incarnation before this close runs. It does
-        // not authorize Goal disposal by raw ID. Only the captured live
-        // generation, protected by its lifecycle guard, can dispose its Goal.
-        if requested_generation.is_some() {
-            let grants = self.recheck_authority_after_admission(Method::SessionClose)?;
-            self.revalidate_admitted_session(
-                &req.session_id,
-                authorized.as_ref(),
-                self.scoped_principal_id_from(grants.as_ref()).as_deref(),
-            )
-            .await?;
-            self.ctx
-                .goal_runtime
-                .dispose_session(&req.session_id)
-                .await
-                .map_err(|error| self.goal_disposal_error(&error))?;
-        }
-        let _guard = session_admission
+        let guard = session_admission
             .acquire()
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
@@ -6285,8 +7127,17 @@ impl RpcDispatcher {
         let grants = self.recheck_authority_after_admission(Method::SessionClose)?;
         let scope = self.scoped_principal_id_from(grants.as_ref());
         let current_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
+        if let Some(attempt) = &goal_close
+            && let Some(result) = attempt.result.lock().take()
+        {
+            result?;
+            return to_result(SessionCloseResult {
+                session_id: req.session_id,
+                closed: true,
+            });
+        }
         if current_identity != requested_identity {
-            if current_identity.is_none() && requested_identity.is_some() {
+            if goal_close.is_none() && current_identity.is_none() && requested_identity.is_some() {
                 // Hard-cancel finalization can already remove the captured owner.
                 // Acknowledge that close without repeating cleanup or end hooks.
                 return to_result(SessionCloseResult {
@@ -6312,6 +7163,7 @@ impl RpcDispatcher {
         let Some(live_generation) = admitted.as_ref().and_then(|r| r.live_generation) else {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
         };
+        let mut retiring_agent = None;
         if let Some(agent) = self.ctx.sessions.get_agent(&req.session_id).await {
             {
                 self.ctx
@@ -6329,7 +7181,9 @@ impl RpcDispatcher {
                             Method::SessionClose,
                             session.owner_principal_id.as_deref(),
                         )?;
-                        guard.channel_handles().unregister_channel("rpc");
+                        if !witnessed_close {
+                            guard.channel_handles().unregister_channel("rpc");
+                        }
                         Ok::<_, JsonRpcError>(())
                     })
                     .await?;
@@ -6362,17 +7216,31 @@ impl RpcDispatcher {
             // strong ref; `remove` then frees the Agent at removal time
             // rather than at end-of-scope, letting the allocator reclaim
             // promptly.
-            drop(agent);
+            if witnessed_close {
+                // A failed witness must leave the original live Agent usable.
+                retiring_agent = Some(agent);
+            } else {
+                drop(agent);
+            }
         }
-        if !self
-            .ctx
-            .sessions
-            .remove_generation_authorized(&req.session_id, live_generation, |owner| {
-                self.session_effect_lease(Method::SessionClose, owner)
-            })
-            .await?
-        {
+        let (removed, _guard) = self
+            .commit_live_removal_with_goal(
+                &req.session_id,
+                live_generation,
+                Method::SessionClose,
+                guard,
+                goal_lifecycle_fence,
+            )
+            .await?;
+        if !removed {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+        }
+        if let Some(agent) = retiring_agent {
+            agent
+                .lock()
+                .await
+                .channel_handles()
+                .unregister_channel("rpc");
         }
         if let Some(ref hooks) = self.ctx.hooks {
             hooks.fire_session_end(&req.session_id, "rpc").await;
@@ -6427,6 +7295,17 @@ impl RpcDispatcher {
         }
         self.ctx.sessions.wait_test_removal_signal_pause().await;
 
+        let GoalRemovalAdmission {
+            reservation,
+            fence: goal_fence,
+        } = self
+            .fence_goal_for_session_removal(
+                sid,
+                requested_generation,
+                Method::SessionKill,
+                authorized.as_ref(),
+            )
+            .await?;
         // Preserve kill semantics by signalling the admitted prompt first,
         // then wait for its finalization before reading mode or tombstoning
         // and removing this exact session incarnation.
@@ -6442,34 +7321,20 @@ impl RpcDispatcher {
             .await?
             .ok_or_else(|| self.stale_session_incarnation_error())?;
         self.ctx.sessions.notify_test_removal_signal_attempted();
-        let live_session_admission = if requested_generation.is_some() {
-            Some(
-                self.ctx
-                    .sessions
-                    .session_queue
-                    .reserve(sid)
-                    .await
-                    .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?,
-            )
-        } else {
-            None
+        let reservation = match reservation {
+            Some(reservation) => reservation,
+            None => self.reserve_session_removal(sid).await?,
         };
+        let admission = Arc::new(
+            reservation
+                .acquire()
+                .await
+                .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?,
+        );
         // For a reaped durable session, serialize Goal disposal with any
         // same-ID restoration, then prove the authorized durable row is still
         // the target. Live generations keep fence-before-drain ordering:
         // their Goal worker owns this permit while executing.
-        let reaped_session_guard = if requested_generation.is_none() {
-            Some(
-                self.ctx
-                    .sessions
-                    .session_queue
-                    .acquire(sid)
-                    .await
-                    .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?,
-            )
-        } else {
-            None
-        };
         if requested_generation.is_none() {
             let grants = self.recheck_authority_after_admission(Method::SessionKill)?;
             let scope = self.scoped_principal_id_from(grants.as_ref());
@@ -6505,43 +7370,6 @@ impl RpcDispatcher {
                 ));
             }
         }
-        let _goal_lifecycle_guard = match requested_generation {
-            Some(generation) => Some(
-                self.ctx
-                    .sessions
-                    .lock_goal_lifecycle(sid, generation)
-                    .await
-                    .ok_or_else(|| self.stale_goal_lifecycle_error())?,
-            ),
-            None => None,
-        };
-        if requested_generation.is_some() {
-            let grants = self.recheck_authority_after_admission(Method::SessionKill)?;
-            let scope = self.scoped_principal_id_from(grants.as_ref());
-            let current = self
-                .revalidate_admitted_session(sid, authorized.as_ref(), scope.as_deref())
-                .await?;
-            if current != authorized {
-                return Err(rpc_err(
-                    SESSION_NOT_FOUND,
-                    "Session was replaced before kill",
-                ));
-            }
-        }
-        self.ctx
-            .goal_runtime
-            .dispose_session(sid)
-            .await
-            .map_err(|error| self.goal_disposal_error(&error))?;
-        let _guard = if let Some(guard) = reaped_session_guard {
-            guard
-        } else {
-            live_session_admission
-                .expect("live session must reserve admission before lifecycle disposal")
-                .acquire()
-                .await
-                .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?
-        };
         // The wait can outlast the caller's authority: judge it, and the
         // ownership scope it gives, as it stands now.
         let grants = self.recheck_authority_after_admission(Method::SessionKill)?;
@@ -6615,6 +7443,23 @@ impl RpcDispatcher {
         let target_is_acp = matches!(chat_mode, ChatMode::Acp);
         let mut durable_kill = None;
         if target_is_acp {
+            self.ctx
+                .sessions
+                .wait_test_effect_pause("removal-store")
+                .await;
+        }
+        let witnessed = self
+            .try_witnessed_session_removal(
+                sid,
+                Method::SessionKill,
+                admitted.as_ref(),
+                &admission,
+                goal_fence.as_ref(),
+            )
+            .await?;
+        if let Some((durable_changed, _)) = witnessed {
+            durable_kill = Some(durable_changed);
+        } else if target_is_acp {
             let store = self
                 .ctx
                 .acp_session_store
@@ -6623,10 +7468,6 @@ impl RpcDispatcher {
             let sid_owned = sid.to_string();
             let expected_owner = admitted.as_ref().and_then(|record| record.owner.clone());
             let current = self.spawn_handle();
-            self.ctx
-                .sessions
-                .wait_test_effect_pause("removal-store")
-                .await;
             let transitioned = tokio::task::spawn_blocking(move || {
                 store.mark_session_killed_atomic_for_owner_authorized(
                     &sid_owned,
@@ -6671,16 +7512,20 @@ impl RpcDispatcher {
             }
         }
 
-        let live_killed = match live_generation {
-            Some(generation) => {
-                self.ctx
-                    .sessions
-                    .kill_session_generation_authorized(sid, generation, |owner| {
-                        self.session_effect_lease(Method::SessionKill, owner)
-                    })
-                    .await?
+        let live_killed = if let Some((_, removed)) = witnessed {
+            removed
+        } else {
+            match live_generation {
+                Some(generation) => {
+                    self.ctx
+                        .sessions
+                        .kill_session_generation_authorized(sid, generation, |owner| {
+                            self.session_effect_lease(Method::SessionKill, owner)
+                        })
+                        .await?
+                }
+                None => false,
             }
-            None => false,
         };
         let killed = durable_kill.unwrap_or(false) || live_killed;
         if killed {
@@ -6834,6 +7679,7 @@ impl RpcDispatcher {
                 &data.workspace_dir,
             )?;
         }
+        self.ensure_session_disposition_settled(sid).await?;
 
         if let Err(error) = recover_acp_checkpoint(
             self.spawn_handle(),
@@ -7556,6 +8402,12 @@ impl RpcDispatcher {
                 .await);
         }
 
+        if let Err(refused) = self.ensure_session_disposition_settled(sid).await {
+            return Err(self
+                .refuse_admitted_prompt(sid, req.client_turn_generation, refused)
+                .await);
+        }
+
         // Process inline attachments: upload each, append markers to prompt.
         let mut prompt = req.prompt.clone();
         if !req.attachments.is_empty() {
@@ -8038,7 +8890,7 @@ impl RpcDispatcher {
         // Drain the cancel cause BEFORE removing the token (removal clears the
         // cause map). Every cancel firing site records its cause before firing;
         // a cancel with no recorded cause is a bug, not user attribution.
-        let cancel_cause = cancel_registration.finish();
+        let (cancel_cause, goal_close) = cancel_registration.finish_with_goal_close();
 
         if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
             let live_turn_messages = acp_checkpoint_live_messages(&outcome);
@@ -8093,7 +8945,47 @@ impl RpcDispatcher {
                     }
                 }
                 Ok(AcpCheckpointFinish::RecoveryRequired) => {
-                    self.ctx.sessions.remove(sid).await;
+                    if matches!(outcome, Ok(TurnOutcome::Cancelled { .. }))
+                        && let Some(attempt) = goal_close.and_then(|ticket| ticket.0.upgrade())
+                    {
+                        let generation = attempt.generation;
+                        let result = {
+                            let attempt = Arc::clone(&attempt);
+                            tokio::task::spawn_blocking(move || {
+                                let result = attempt.commit();
+                                if result.is_ok() {
+                                    *attempt.result.lock() = Some(Ok(()));
+                                }
+                                result
+                            })
+                            .await
+                        }
+                        .unwrap_or_else(|_| {
+                            Err(rpc_err(INTERNAL_ERROR, "Could not complete session close"))
+                        });
+                        let removed =
+                            if self.ctx.sessions.get_generation(sid).await != Some(generation) {
+                                // Cleanup may have failed after the exact live effect.
+                                true
+                            } else {
+                                // A failed close is not a cleanup certificate. ACP
+                                // still must recover the interrupted turn from disk.
+                                self.ctx.sessions.remove_generation(sid, generation).await
+                            };
+                        *attempt.result.lock() = Some(result);
+                        if removed {
+                            live_agent
+                                .lock()
+                                .await
+                                .channel_handles()
+                                .unregister_channel("rpc");
+                            if let Some(hooks) = &self.ctx.hooks {
+                                hooks.fire_session_end(sid, "rpc").await;
+                            }
+                        }
+                    } else {
+                        self.ctx.sessions.remove(sid).await;
+                    }
                 }
                 Err(detail) => {
                     ::zeroclaw_log::record!(
@@ -8461,6 +9353,8 @@ impl RpcDispatcher {
                 "Caller does not own this session",
             ));
         }
+        self.ensure_session_disposition_settled(&req.session_id)
+            .await?;
         let command = zeroclaw_commands::goal::parse_goal_command(&req.command).map_err(|_| {
             rpc_err(
                 INVALID_PARAMS,
@@ -9812,6 +10706,15 @@ impl RpcDispatcher {
     }
 
     async fn commit_session_messages(&self, id: Value, params: &Value) {
+        let history_read = match parse_params::<SessionMessagesParams>(params) {
+            Ok(req) if req.before_index.is_none() && params.get("cursor").is_none() => {
+                self.ctx
+                    .sessions
+                    .goal_history_read(&req.session_id, &self.rpc)
+                    .await
+            }
+            _ => None,
+        };
         let prepared =
             self.handle_session_messages_record(params)
                 .await
@@ -9864,11 +10767,13 @@ impl RpcDispatcher {
                             return Err(self.stale_session_incarnation_error());
                         }
                         let owner = record.as_ref().and_then(|r| r.owner.as_deref());
+                        let mut sent = false;
                         let mut commit = |actual: Option<&str>| -> anyhow::Result<()> {
                             let _authority =
                                 self.durable_effect_lease(Method::SessionMessages, owner, actual)?;
                             if let (Some(permit), Some(frame)) = (permit.take(), frame.take()) {
                                 permit.send(frame);
+                                sent = true;
                             }
                             Ok(())
                         };
@@ -9896,7 +10801,11 @@ impl RpcDispatcher {
                         }
                         .map_err(|error| {
                             session_effect_error(error, "Failed to commit session messages")
-                        })
+                        })?;
+                        if sent && let (Some(gate), Some(live)) = (&history_read, live) {
+                            gate.promote(live, &self.rpc);
+                        }
+                        Ok(())
                     })
                     .await
             }
@@ -10246,6 +11155,17 @@ impl RpcDispatcher {
             ));
         }
         self.ctx.sessions.wait_test_removal_signal_pause().await;
+        let GoalRemovalAdmission {
+            reservation,
+            fence: goal_fence,
+        } = self
+            .fence_goal_for_session_removal(
+                &req.session_id,
+                requested_generation,
+                Method::SessionDelete,
+                authorized.as_ref(),
+            )
+            .await?;
         self.ctx
             .sessions
             .signal_cancellation_authorized(
@@ -10258,35 +11178,21 @@ impl RpcDispatcher {
             .await?
             .ok_or_else(|| self.stale_session_incarnation_error())?;
         self.ctx.sessions.notify_test_removal_signal_attempted();
-        let live_session_admission = if requested_generation.is_some() {
-            Some(
-                self.ctx
-                    .sessions
-                    .session_queue
-                    .reserve(&req.session_id)
-                    .await
-                    .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?,
-            )
-        } else {
-            None
+        let reservation = match reservation {
+            Some(reservation) => reservation,
+            None => self.reserve_session_removal(&req.session_id).await?,
         };
+        let admission = Arc::new(
+            reservation
+                .acquire()
+                .await
+                .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?,
+        );
         // A reaped durable session has no generation-owned Goal lock. Take
         // its ordinary actor permit before touching Goal state so a same-ID
         // session/new cannot publish a successor between validation and
         // disposal. Live generations keep the existing fence-before-drain
         // order because their Goal worker owns this permit during a turn.
-        let reaped_session_guard = if requested_generation.is_none() {
-            Some(
-                self.ctx
-                    .sessions
-                    .session_queue
-                    .acquire(&req.session_id)
-                    .await
-                    .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?,
-            )
-        } else {
-            None
-        };
         if requested_generation.is_none() {
             let grants = self.recheck_authority_after_admission(Method::SessionDelete)?;
             let scope = self.scoped_principal_id_from(grants.as_ref());
@@ -10329,43 +11235,6 @@ impl RpcDispatcher {
                 ));
             }
         }
-        let _goal_lifecycle_guard = match requested_generation {
-            Some(generation) => Some(
-                self.ctx
-                    .sessions
-                    .lock_goal_lifecycle(&req.session_id, generation)
-                    .await
-                    .ok_or_else(|| self.stale_goal_lifecycle_error())?,
-            ),
-            None => None,
-        };
-        if requested_generation.is_some() {
-            let grants = self.recheck_authority_after_admission(Method::SessionDelete)?;
-            let scope = self.scoped_principal_id_from(grants.as_ref());
-            let current = self
-                .revalidate_admitted_session(&req.session_id, authorized.as_ref(), scope.as_deref())
-                .await?;
-            if current != authorized {
-                return Err(rpc_err(
-                    SESSION_NOT_FOUND,
-                    "Session was replaced before delete",
-                ));
-            }
-        }
-        self.ctx
-            .goal_runtime
-            .dispose_session(&req.session_id)
-            .await
-            .map_err(|error| self.goal_disposal_error(&error))?;
-        let _guard = if let Some(guard) = reaped_session_guard {
-            guard
-        } else {
-            live_session_admission
-                .expect("live session must reserve admission before lifecycle disposal")
-                .acquire()
-                .await
-                .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?
-        };
         // The wait can outlast the caller's authority: judge it, and the
         // ownership scope it gives, as it stands now.
         let grants = self.recheck_authority_after_admission(Method::SessionDelete)?;
@@ -10428,6 +11297,29 @@ impl RpcDispatcher {
             .sessions
             .wait_test_effect_pause("removal-store")
             .await;
+        let retiring_agent = self.ctx.sessions.get_agent(&req.session_id).await;
+        if let Some((durable_deleted, live_removed)) = self
+            .try_witnessed_session_removal(
+                &req.session_id,
+                Method::SessionDelete,
+                record.as_ref(),
+                &admission,
+                goal_fence.as_ref(),
+            )
+            .await?
+        {
+            if live_removed && let Some(agent) = retiring_agent {
+                agent
+                    .lock()
+                    .await
+                    .channel_handles()
+                    .unregister_channel("rpc");
+            }
+            return self
+                .finish_session_delete(req.session_id, durable_deleted, live_removed)
+                .await;
+        }
+        drop(retiring_agent);
         let durable_deleted =
             match record.as_ref().and_then(|r| r.durable.clone()) {
                 Some(DurableSession::Acp) => {
@@ -10510,14 +11402,24 @@ impl RpcDispatcher {
             }
             None => false,
         };
+        self.finish_session_delete(req.session_id, durable_deleted, live_removed)
+            .await
+    }
+
+    async fn finish_session_delete(
+        &self,
+        session_id: String,
+        durable_deleted: bool,
+        live_removed: bool,
+    ) -> RpcResult {
         if live_removed && let Some(ref hooks) = self.ctx.hooks {
-            hooks.fire_session_end(&req.session_id, "rpc").await;
+            hooks.fire_session_end(&session_id, "rpc").await;
         }
         if !live_removed && !durable_deleted {
             return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
         }
         to_result(SessionDeleteResult {
-            session_id: req.session_id,
+            session_id,
             deleted: true,
         })
     }
@@ -14917,6 +15819,7 @@ impl Drop for RpcDispatcher {
             return;
         }
         self.connection_cancel.cancel();
+        self.retire_goal_destinations();
         for task in &self.prompt_tasks {
             task.abort();
         }
@@ -15595,11 +16498,12 @@ pub(crate) fn notification_for_turn_event_for_test(
     notification_for_turn_event(session_id, event)
 }
 
-fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<String> {
+pub(super) fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<String> {
     let update = match event {
         TurnEvent::Chunk { delta } => SessionUpdateEvent::AgentMessageChunk {
             session_id: session_id.to_string(),
             text: delta.clone(),
+            presentation_only: false,
         },
         TurnEvent::Thinking { delta } => SessionUpdateEvent::AgentThoughtChunk {
             session_id: session_id.to_string(),
@@ -15714,9 +16618,26 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<St
         _ => return None,
     };
 
-    let params = serde_json::to_value(update).ok()?;
-    let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
-    serde_json::to_string(&n).ok()
+    encode_session_update(update).ok()
+}
+
+pub(super) fn presentation_notification_for_chunk(
+    session_id: &str,
+    delta: String,
+) -> serde_json::Result<String> {
+    encode_session_update(SessionUpdateEvent::AgentMessageChunk {
+        session_id: session_id.to_owned(),
+        text: delta,
+        presentation_only: true,
+    })
+}
+
+fn encode_session_update(update: SessionUpdateEvent) -> serde_json::Result<String> {
+    let params = serde_json::to_value(update)?;
+    serde_json::to_string(&JsonRpcNotification::new(
+        notification::SESSION_UPDATE,
+        params,
+    ))
 }
 
 /// Forward a turn event through the outbound RPC writer as a
@@ -15765,7 +16686,7 @@ pub(super) async fn forward_turn_completion(
     }
 }
 
-fn turn_completion_notification(
+pub(super) fn turn_completion_notification(
     session_id: &str,
     outcome: crate::rpc::types::TurnCompletionOutcome,
     content: String,
@@ -15831,6 +16752,8 @@ fn replace_rpc_chat_conversation_state(
 
 #[cfg(test)]
 pub(crate) mod connection_test_support {
+    mod goal_history_tests;
+
     use super::RpcContext;
     use async_trait::async_trait;
     use std::path::Path;
@@ -16456,7 +17379,8 @@ pub(crate) mod connection_test_support {
         turn: HeldOrdinaryTurn,
         messages: Arc<std::sync::Mutex<Vec<zeroclaw_api::model_provider::ChatMessage>>>,
         rounds: AtomicUsize,
-        fail: bool,
+        mode: NativeBurstMode,
+        route: NativeBurstRoute,
     }
 
     impl Attributable for NativeBurstProvider {
@@ -16491,7 +17415,7 @@ pub(crate) mod connection_test_support {
         fn stream_chat(
             &self,
             request: zeroclaw_api::model_provider::ChatRequest<'_>,
-            _: &str,
+            model: &str,
             _: Option<f64>,
             _: zeroclaw_api::model_provider::StreamOptions,
         ) -> futures_util::stream::BoxStream<
@@ -16500,6 +17424,7 @@ pub(crate) mod connection_test_support {
         > {
             use futures_util::StreamExt as _;
             use zeroclaw_api::model_provider::{StreamChunk, StreamEvent, TokenUsage};
+            assert_eq!(model, self.route.served_model(), "physical parent request");
             *self.messages.lock().unwrap() = request.messages.to_vec();
             let round = self.rounds.fetch_add(1, Ordering::AcqRel);
             let usage = || {
@@ -16535,39 +17460,49 @@ pub(crate) mod connection_test_support {
             }
             assert_eq!(round, 1, "no provider successor after success or failure");
             let turn = self.turn.clone();
-            let fail = self.fail;
-            futures_util::stream::once(async move {
-                let _exit = DropSignal(Arc::clone(&turn.exited));
-                turn.calls.fetch_add(1, Ordering::AcqRel);
-                turn.started.notify_one();
-                turn.release.notified().await;
-                turn.completed.store(true, Ordering::Release);
-                let mut events = vec![
-                    Ok(StreamEvent::ThinkingDelta(
-                        "native-buffered-tail-thought\n".into(),
-                    )),
-                    Ok(StreamEvent::TextDelta(StreamChunk::delta(
-                        "ordinary answer",
-                    ))),
-                    Ok(StreamEvent::Usage(TokenUsage {
-                        input_tokens: Some(2),
-                        output_tokens: Some(1),
-                        ..Default::default()
-                    })),
-                ];
-                if fail {
-                    events.push(Err(
-                        zeroclaw_api::model_provider::StreamError::ModelProvider(
-                            "native buffered tail failure".into(),
-                        ),
-                    ));
-                } else {
-                    events.push(Ok(StreamEvent::Final));
-                }
-                futures_util::stream::iter(events)
-            })
-            .flatten()
-            .boxed()
+            let mode = self.mode;
+            let prefix = (mode == NativeBurstMode::SplitFinal)
+                .then(|| Ok(StreamEvent::TextDelta(StreamChunk::delta("Which option "))));
+            futures_util::stream::iter(prefix)
+                .chain(
+                    futures_util::stream::once(async move {
+                        let _exit = DropSignal(Arc::clone(&turn.exited));
+                        turn.calls.fetch_add(1, Ordering::AcqRel);
+                        turn.started.notify_one();
+                        turn.release.notified().await;
+                        turn.completed.store(true, Ordering::Release);
+                        let mut events = Vec::new();
+                        if mode != NativeBurstMode::SplitFinal {
+                            events.push(Ok(StreamEvent::ThinkingDelta(
+                                "native-buffered-tail-thought\n".into(),
+                            )));
+                        }
+                        events.push(Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                            if mode == NativeBurstMode::SplitFinal {
+                                "should I use?"
+                            } else {
+                                "ordinary answer"
+                            },
+                        ))));
+                        events.push(Ok(StreamEvent::Usage(TokenUsage {
+                            input_tokens: Some(2),
+                            output_tokens: Some(1),
+                            ..Default::default()
+                        })));
+                        if mode == NativeBurstMode::Failure {
+                            events.push(Err(
+                                zeroclaw_api::model_provider::StreamError::ModelProvider(
+                                    "native buffered tail failure".into(),
+                                ),
+                            ));
+                        } else {
+                            events.push(Ok(StreamEvent::Final));
+                        }
+                        futures_util::stream::iter(events)
+                    })
+                    .flatten(),
+                )
+                .boxed()
         }
     }
 
@@ -16630,10 +17565,84 @@ pub(crate) mod connection_test_support {
     pub(crate) struct NativeBurstFixture {
         server: wiremock::MockServer,
         child_observed: Arc<AtomicBool>,
+        actual: Arc<NativeBurstProvider>,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum NativeBurstRoute {
+        Primary,
+        StreamingFallback,
+        // The existing event-pressure controls pin a different model on one entry.
+        PinnedSubstitution,
+    }
+
+    impl NativeBurstRoute {
+        fn served_model(self) -> &'static str {
+            match self {
+                Self::Primary => "requested-native",
+                Self::StreamingFallback | Self::PinnedSubstitution => "served-native",
+            }
+        }
+    }
+
+    // Eligible for the native tool protocol, but not for streaming. Reliable
+    // must select the following entry without invoking or billing this one.
+    struct NonStreamingNativePrimary;
+
+    impl Attributable for NonStreamingNativePrimary {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "native-primary"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for NonStreamingNativePrimary {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _: zeroclaw_api::model_provider::ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+            _: zeroclaw_api::model_provider::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamEvent>,
+        > {
+            panic!("non-streaming primary must never receive a physical stream call");
+        }
+
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            panic!("stream routing must skip the non-streaming primary");
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum NativeBurstMode {
+        Success,
+        Failure,
+        Reattach,
+        SplitFinal,
     }
 
     impl NativeBurstFixture {
-        pub(crate) async fn assert_child_and_ledger(&self, path: &Path, task_id: &str) {
+        pub(crate) async fn assert_child_and_ledger(
+            &self,
+            path: &Path,
+            task_id: &str,
+        ) -> [String; 3] {
+            assert_eq!(self.actual.rounds.load(Ordering::Acquire), 2);
             assert!(self.child_observed.load(Ordering::Acquire));
             assert_eq!(self.server.received_requests().await.unwrap().len(), 1);
             let database = rusqlite::Connection::open(path.join("control_plane.db")).unwrap();
@@ -16667,6 +17676,31 @@ pub(crate) mod connection_test_support {
                     .len(),
                 3
             );
+            if self.actual.route != NativeBurstRoute::PinnedSubstitution {
+                let parent_model = self.actual.route.served_model();
+                let mut models: Vec<_> = rows
+                    .iter()
+                    .map(|row| {
+                        assert_eq!(row.provider_ref.as_deref(), Some("openai.fixture"));
+                        assert_eq!(
+                            (
+                                row.usage.input_tokens,
+                                row.usage.output_tokens,
+                                row.usage.total_tokens
+                            ),
+                            (2, 1, 3)
+                        );
+                        row.usage.model.as_str()
+                    })
+                    .collect();
+                models.sort_unstable();
+                assert_eq!(models, ["fixture-child", parent_model, parent_model]);
+            }
+            rows.into_iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap()
         }
     }
 
@@ -16676,6 +17710,30 @@ pub(crate) mod connection_test_support {
         session_id: &str,
         parent: &HeldGoalParent,
         fail: bool,
+    ) -> NativeBurstFixture {
+        let mode = if fail {
+            NativeBurstMode::Failure
+        } else {
+            NativeBurstMode::Success
+        };
+        prepare_native_burst_with_mode(
+            ctx,
+            path,
+            session_id,
+            parent,
+            mode,
+            NativeBurstRoute::PinnedSubstitution,
+        )
+        .await
+    }
+
+    async fn prepare_native_burst_with_mode(
+        ctx: &Arc<RpcContext>,
+        path: &Path,
+        session_id: &str,
+        parent: &HeldGoalParent,
+        mode: NativeBurstMode,
+        route: NativeBurstRoute,
     ) -> NativeBurstFixture {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -16727,21 +17785,38 @@ pub(crate) mod connection_test_support {
             observed: Arc::clone(&observed),
             tracker: Arc::clone(ctx.cost_tracker.as_ref().unwrap()),
         };
-        let burst: Arc<dyn ModelProvider> = Arc::new(NativeBurstProvider {
+        let burst = Arc::new(NativeBurstProvider {
             turn: parent.turn.clone(),
             messages: Arc::clone(&parent.messages),
             rounds: AtomicUsize::new(0),
-            fail,
+            mode,
+            route,
         });
+        let mut entries: Vec<(&str, &str, &str, Arc<dyn ModelProvider>)> = Vec::new();
+        if route == NativeBurstRoute::StreamingFallback {
+            entries.push((
+                "openai.fixture",
+                "native-primary",
+                "requested-native",
+                Arc::new(NonStreamingNativePrimary),
+            ));
+        }
+        entries.push((
+            "openai.fixture",
+            "native-burst",
+            route.served_model(),
+            burst.clone(),
+        ));
         let provider = zeroclaw_providers::reliable::ReliableModelProvider::new_pinned_for_test(
             "native-burst",
-            vec![("openai.fixture", "native-burst", "served-native", burst)],
+            entries,
             0,
             1,
         );
         let mut agent_config = zeroclaw_config::schema::AliasedAgentConfig::default();
         agent_config.resolved.tool_receipts.enabled = true;
-        agent_config.resolved.tool_receipts.show_in_response = true;
+        agent_config.resolved.tool_receipts.show_in_response =
+            matches!(mode, NativeBurstMode::Success | NativeBurstMode::Failure);
         let agent = crate::agent::agent::Agent::builder()
             .model_provider(Box::new(provider))
             .model_provider_name("openai.fixture".into())
@@ -16765,6 +17840,367 @@ pub(crate) mod connection_test_support {
         NativeBurstFixture {
             server,
             child_observed: observed,
+            actual: burst,
+        }
+    }
+
+    /// A real IPC or WSS peer. Reading the very next frame (rather than scanning
+    /// to a requested ID) makes premature notifications and replay observable.
+    pub(crate) trait GoalReattachPeer {
+        async fn write_request(
+            &mut self,
+            method: super::Method,
+            params: &serde_json::Value,
+            id: u64,
+        );
+        async fn read_frame(&mut self) -> serde_json::Value;
+
+        async fn next_frame(&mut self) -> serde_json::Value {
+            tokio::time::timeout(std::time::Duration::from_secs(5), self.read_frame())
+                .await
+                .expect("expected next Goal reattachment frame")
+        }
+
+        async fn result(
+            &mut self,
+            method: super::Method,
+            params: serde_json::Value,
+            id: u64,
+        ) -> serde_json::Value {
+            self.write_request(method, &params, id).await;
+            let frame = self.next_frame().await;
+            assert_eq!(
+                frame["id"], id,
+                "expected response before notifications: {frame}"
+            );
+            assert!(
+                frame["error"].is_null() && frame["result"].is_object(),
+                "{frame}"
+            );
+            frame["result"].clone()
+        }
+
+        async fn initialize(&mut self, ctx: &RpcContext, owner: &str, token: Option<&str>) {
+            let result = self.result(super::Method::Initialize, serde_json::json!({
+                "protocol_version":1, "tui_id":owner, "tui_sig":ctx.tui_registry.sign(owner),
+                "auth_token":token
+            }), 1).await;
+            assert_eq!(result["tui_id"], owner);
+        }
+    }
+
+    pub(crate) const REATTACH_SID: &str = "goal-stream-reattach";
+    pub(crate) const REATTACH_OWNER: &str = "goal-stream-owner";
+    const QUESTION: &str = "Which option should I use?";
+
+    pub(crate) struct GoalReattachFixture {
+        parent: HeldGoalParent,
+        burst: NativeBurstFixture,
+        verifier: HeldGoalVerifier,
+        registry: Arc<dyn zeroclaw_goal::GoalTaskRegistry>,
+        mode: NativeBurstMode,
+    }
+
+    impl GoalReattachFixture {
+        pub(crate) async fn new(
+            ctx: &mut Arc<RpcContext>,
+            path: &Path,
+            mode: NativeBurstMode,
+        ) -> Self {
+            Self::with_route(ctx, path, mode, NativeBurstRoute::Primary).await
+        }
+
+        pub(crate) async fn with_route(
+            ctx: &mut Arc<RpcContext>,
+            path: &Path,
+            mode: NativeBurstMode,
+            route: NativeBurstRoute,
+        ) -> Self {
+            assert!(route != NativeBurstRoute::PinnedSubstitution);
+            let (registry, parent) = prepare_held_goal_parent_fixture(
+                ctx,
+                path,
+                REATTACH_SID,
+                REATTACH_OWNER,
+                GoalParentAdmissionCase::DirectResume,
+            )
+            .await;
+            let burst =
+                prepare_native_burst_with_mode(ctx, path, REATTACH_SID, &parent, mode, route).await;
+            let verifier = match mode {
+                NativeBurstMode::SplitFinal => prepare_held_goal_verifier_for_candidate(ctx,
+                    Some(r#"{"decision":"blocked","reason":"A user choice is required","blockers":[{"kind":"needs_user_input","message":"Which option should I use?"}]}"#), QUESTION).await,
+                NativeBurstMode::Reattach => prepare_held_goal_verifier(ctx).await,
+                _ => panic!("expected a reattachment mode"),
+            };
+            Self {
+                parent,
+                burst,
+                verifier,
+                registry,
+                mode,
+            }
+        }
+
+        pub(crate) async fn start(&self, original: &mut impl GoalReattachPeer) {
+            use crate::rpc::types::{GoalResponseWire, SessionGoalResult};
+            let result = original
+                .result(
+                    super::Method::SessionGoal,
+                    serde_json::json!({
+                        "session_id": REATTACH_SID, "command": "/goal resume"
+                    }),
+                    2,
+                )
+                .await;
+            assert!(matches!(
+                serde_json::from_value::<SessionGoalResult>(result)
+                    .unwrap()
+                    .response,
+                GoalResponseWire::Resumed(_)
+            ));
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                self.parent.turn.started.notified(),
+            )
+            .await
+            .expect("round one must be held");
+            let mut prefix = NativeBurstEvents::default();
+            while prefix.results.is_empty()
+                || (self.mode == NativeBurstMode::SplitFinal
+                    && !prefix.text.ends_with("Which option "))
+            {
+                let frame = original.next_frame().await;
+                assert!(!prefix.observe(&frame, REATTACH_SID, GoalParentEnding::EventBurstSuccess));
+            }
+            assert_eq!(prefix.thoughts.len(), 72);
+            assert_eq!(prefix.calls, ["native-owned-child"]);
+            assert_eq!(prefix.results, prefix.calls);
+            assert_eq!(
+                prefix.text,
+                if self.mode == NativeBurstMode::SplitFinal {
+                    "draft before child\nWhich option "
+                } else {
+                    "draft before child\n"
+                }
+            );
+        }
+
+        pub(crate) async fn finish(
+            self,
+            ctx: &RpcContext,
+            path: &Path,
+            peer: &mut impl GoalReattachPeer,
+            before_release: impl FnOnce(),
+        ) {
+            use crate::rpc::types::{SessionGoalUpdate, SessionMessagesResult, SessionUpdateEvent};
+            use serde_json::json;
+            use zeroclaw_api::task::TaskStatus;
+            use zeroclaw_goal::control::GoalSessionKey;
+            let sid = REATTACH_SID;
+            let key = GoalSessionKey::zero_code(sid).unwrap().durable_id();
+            let running = self
+                .registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(running.status, TaskStatus::Running);
+            let generation = ctx.sessions.get_generation(sid).await.unwrap();
+            let opened = peer
+                .result(
+                    super::Method::SessionNew,
+                    json!({"session_id":sid,"agent_alias":"test-agent","chat_mode":"chat"}),
+                    3,
+                )
+                .await;
+            assert_eq!(opened["session_id"], sid);
+            let result = peer
+                .result(super::Method::SessionMessages, json!({"session_id":sid}), 4)
+                .await;
+            let snapshot: SessionMessagesResult = serde_json::from_value(result).unwrap();
+            assert_eq!(snapshot.session_id, sid);
+            assert_eq!(
+                snapshot
+                    .messages
+                    .iter()
+                    .map(|m| (m.role.as_str(), m.content.as_str()))
+                    .collect::<Vec<_>>(),
+                [
+                    ("user", "Choose a bounded repair."),
+                    ("assistant", QUESTION)
+                ]
+            );
+            // The newest-page response is enqueued and its offer promoted under the map lock.
+            assert_eq!(ctx.sessions.get_generation(sid).await, Some(generation));
+            assert!(!self.parent.turn.completed.load(Ordering::Acquire));
+            before_release();
+            self.parent.turn.release.notify_one();
+
+            let split = self.mode == NativeBurstMode::SplitFinal;
+            let candidate = if split { QUESTION } else { "ordinary answer" };
+            let mut tail = Vec::new();
+            loop {
+                let frame = peer.next_frame().await;
+                if frame["method"] == "session/goal_update" {
+                    let update: SessionGoalUpdate =
+                        serde_json::from_value(frame["params"].clone()).unwrap();
+                    assert!(
+                        matches!(update, SessionGoalUpdate::VerifiedCandidate { session_id, candidate: text } if session_id == sid && text == candidate)
+                    );
+                    break;
+                }
+                assert_eq!(frame["method"], "session/update", "{frame}");
+                match serde_json::from_value(frame["params"].clone()).unwrap() {
+                    SessionUpdateEvent::AgentThoughtChunk { session_id, text } => {
+                        assert_eq!(session_id, sid);
+                        tail.push(("thought", text));
+                    }
+                    SessionUpdateEvent::AgentMessageChunk {
+                        session_id,
+                        text,
+                        presentation_only,
+                    } => {
+                        assert_eq!(session_id, sid);
+                        if presentation_only {
+                            tail.push(("presentation", text));
+                        } else {
+                            assert!(
+                                frame["params"].get("presentation_only").is_none(),
+                                "ordinary text must retain its original wire shape: {frame}"
+                            );
+                            tail.push(("text", text));
+                        }
+                    }
+                    SessionUpdateEvent::ContextUsage { session_id, .. } => {
+                        assert_eq!(session_id, sid)
+                    }
+                    other => panic!("unexpected reattached event: {other:?}"),
+                }
+            }
+            let tail: Vec<_> = tail
+                .iter()
+                .map(|(kind, text)| (*kind, text.as_str()))
+                .collect();
+            let mut expected = if split {
+                vec![("text", "should I use?")]
+            } else {
+                vec![
+                    ("thought", "native-buffered-tail-thought\n"),
+                    ("text", "ordinary answer"),
+                ]
+            };
+            if self.burst.actual.route == NativeBurstRoute::StreamingFallback {
+                expected.push(("presentation", "\n\n⚡ requested-native (openai.fixture) was unavailable; this reply was served by served-native (openai.fixture)."));
+            }
+            assert_eq!(tail, expected);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                self.verifier.turn.started.notified(),
+            )
+            .await
+            .expect("verifier receives the complete candidate");
+            let pre_verifier_ids = self.burst.assert_child_and_ledger(path, &running.id).await;
+            // Reattaching changed the destination, not the running task or its fence.
+            let still_running = self
+                .registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(still_running.id, running.id);
+            assert_eq!(still_running.status, TaskStatus::Running);
+            assert_eq!(still_running.execution_epoch, running.execution_epoch);
+            self.verifier.turn.release.notify_one();
+            let notice = peer.next_frame().await;
+            assert_eq!(notice["method"], "session/goal_update", "{notice}");
+            let actual =
+                serde_json::from_value::<SessionGoalUpdate>(notice["params"].clone()).unwrap();
+            match actual {
+                SessionGoalUpdate::Completed { session_id } if !split => {
+                    assert_eq!(session_id, sid)
+                }
+                SessionGoalUpdate::PausedForBlocker { session_id } if split => {
+                    assert_eq!(session_id, sid)
+                }
+                other => panic!("unexpected verifier outcome: {other:?}"),
+            }
+            peer.result(super::Method::Status, json!({}), 5).await;
+            let task = self
+                .registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(task.id, running.id);
+            assert_eq!(
+                task.status,
+                if split {
+                    TaskStatus::Paused
+                } else {
+                    TaskStatus::Completed
+                }
+            );
+            if !split {
+                // Successful completion fences the worker exactly once.
+                assert_eq!(
+                    Some(task.execution_epoch),
+                    running.execution_epoch.checked_add(1)
+                );
+            }
+            let saved = ctx
+                .session_backend
+                .as_ref()
+                .unwrap()
+                .try_load(&format!("rpc_{sid}"))
+                .unwrap();
+            assert_eq!(
+                saved
+                    .iter()
+                    .map(|m| (m.role.as_str(), m.content.as_str()))
+                    .collect::<Vec<_>>(),
+                [
+                    ("user", "Choose a bounded repair."),
+                    ("assistant", QUESTION),
+                    ("assistant", candidate)
+                ]
+            );
+            let contents = tokio::fs::read_to_string(path.join("state/costs.jsonl"))
+                .await
+                .unwrap();
+            let rows: Vec<zeroclaw_config::cost::types::CostRecord> = contents
+                .lines()
+                .map(|row| serde_json::from_str(row).unwrap())
+                .collect();
+            assert_eq!(rows.len(), 4);
+            assert_eq!(
+                rows[..3]
+                    .iter()
+                    .map(|row| row.id.as_str())
+                    .collect::<Vec<_>>(),
+                pre_verifier_ids.each_ref().map(String::as_str)
+            );
+            assert_eq!(rows[3].provider_ref.as_deref(), Some("openai.fixture"));
+            assert_eq!(rows[3].usage.model, "fixture-verifier");
+            assert_eq!(rows[3].usage.total_tokens, 6);
+            assert_eq!(
+                rows.iter()
+                    .map(|r| &r.id)
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                4
+            );
+            assert!(
+                rows.iter()
+                    .all(|r| r.task_id.as_deref() == Some(task.id.as_str()))
+            );
+            assert_eq!(
+                rows.iter()
+                    .map(|r| (r.usage.input_tokens, r.usage.output_tokens))
+                    .collect::<Vec<_>>(),
+                [(2, 1), (2, 1), (2, 1), (4, 2)]
+            );
+            self.verifier.finish().await;
         }
     }
 
@@ -16801,6 +18237,7 @@ pub(crate) mod connection_test_support {
                         SessionUpdateEvent::AgentMessageChunk {
                             session_id: sid,
                             text,
+                            ..
                         } => {
                             assert_eq!(sid, session_id);
                             self.text.push_str(&text);
@@ -16961,36 +18398,40 @@ pub(crate) mod connection_test_support {
     }
 
     pub(crate) async fn assert_running_goal_replacement_fence(
+        ctx: &RpcContext,
         registry: &dyn zeroclaw_goal::GoalTaskRegistry,
-        key: &str,
+        session_id: &str,
+        generation: u64,
         before: &zeroclaw_api::task::TaskRecord,
         parent: &HeldGoalParent,
     ) {
+        let key = zeroclaw_goal::control::GoalSessionKey::zero_code(session_id)
+            .unwrap()
+            .durable_id();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                let task = registry
-                    .current_goal_for_session(key)
+                let original = ctx
+                    .sessions
+                    .goal_session_snapshot(session_id)
                     .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(task.id, before.id);
-                if task.status == zeroclaw_api::task::TaskStatus::Cancelled {
-                    assert_eq!(task.execution_epoch, before.execution_epoch + 1);
+                    .expect("an admitted parent retains the original live session");
+                assert_eq!(original.generation, generation);
+                if original.goal_admission_is_fenced() {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("replacement must fence while the parent call is held");
-        assert_eq!(
-            registry
-                .terminal_reason_for_session_goal(&before.id, key)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("session_disposed")
-        );
+        .expect("replacement must fence the original generation while the parent call is held");
+        let running = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .expect("the admitted Goal must survive the volatile fence");
+        assert_eq!(running.id, before.id);
+        assert_eq!(running.execution_epoch, before.execution_epoch);
+        assert_eq!(running.status, zeroclaw_api::task::TaskStatus::Running);
         assert_eq!(parent.turn.calls.load(Ordering::Acquire), 1);
         assert!(!parent.turn.completed.load(Ordering::Acquire));
         assert!(!parent.turn.exited.load(Ordering::Acquire));
@@ -17225,6 +18666,7 @@ pub(crate) mod connection_test_support {
                     if let SessionUpdateEvent::AgentMessageChunk {
                         session_id: actual,
                         text,
+                        ..
                     } = event
                     {
                         assert_eq!(actual, session_id);
@@ -17342,9 +18784,10 @@ pub(crate) mod connection_test_support {
     }
 
     async fn held_goal_verifier_response(
-        axum::extract::State((turn, content)): axum::extract::State<(
+        axum::extract::State((turn, content, candidate)): axum::extract::State<(
             HeldOrdinaryTurn,
             Option<&'static str>,
+            &'static str,
         )>,
         axum::Json(request): axum::Json<serde_json::Value>,
     ) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
@@ -17356,7 +18799,7 @@ pub(crate) mod connection_test_support {
                 .any(|message| {
                     message["content"]
                         .as_str()
-                        .is_some_and(|text| text.contains("ordinary answer"))
+                        .is_some_and(|text| text.contains(candidate))
                 })
         );
         assert_eq!(turn.calls.fetch_add(1, Ordering::AcqRel), 0);
@@ -17395,12 +18838,20 @@ pub(crate) mod connection_test_support {
         ctx: &Arc<RpcContext>,
         content: Option<&'static str>,
     ) -> HeldGoalVerifier {
+        prepare_held_goal_verifier_for_candidate(ctx, content, "ordinary answer").await
+    }
+
+    async fn prepare_held_goal_verifier_for_candidate(
+        ctx: &Arc<RpcContext>,
+        content: Option<&'static str>,
+        candidate: &'static str,
+    ) -> HeldGoalVerifier {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let uri = format!("http://{}", listener.local_addr().unwrap());
         let turn = HeldOrdinaryTurn::default();
         let router = axum::Router::new()
             .fallback(held_goal_verifier_response)
-            .with_state((turn.clone(), content));
+            .with_state((turn.clone(), content, candidate));
         let shutdown = tokio_util::sync::CancellationToken::new();
         let server_shutdown = shutdown.clone();
         let task = zeroclaw_spawn::spawn!(async move {
@@ -17482,6 +18933,7 @@ pub(crate) mod connection_test_support {
                         SessionUpdateEvent::AgentMessageChunk {
                             session_id: actual,
                             text,
+                            ..
                         } => {
                             assert_eq!(actual, session_id);
                             self.text.push_str(&text);
@@ -17727,6 +19179,7 @@ pub(crate) mod connection_test_support {
             SessionUpdateEvent::AgentMessageChunk {
                 session_id: actual,
                 text: delta,
+                ..
             } => {
                 assert_eq!(actual, session_id);
                 text.push_str(&delta);
@@ -28978,7 +30431,7 @@ mod tests {
             let mut logs = zeroclaw_log::subscribe_or_install();
             // This is the production nonblocking continuation used by resume.
             alice
-                .rebind_rpc_approval_channel(Arc::clone(&agent), "victim".into())
+                .rebind_rpc_approval_channel(Arc::clone(&agent), "victim".into(), false)
                 .await
                 .unwrap();
             assert!(Arc::ptr_eq(&original, &handles.get_channel("rpc").unwrap()));
@@ -35862,6 +37315,22 @@ mod tests {
             goal_admission_driver(&self.dispatcher, Self::SESSION, command).await
         }
 
+        async fn launched_driver(
+            &self,
+            command: &str,
+        ) -> crate::rpc::goal::ZeroCodeGoalSessionDriver {
+            use zeroclaw_goal::control::GoalSessionDriver;
+
+            let driver = self.driver(command).await;
+            drop(
+                driver
+                    .bind_for_launch(&self.ingress())
+                    .await
+                    .expect("successful fixture launch attaches its writer"),
+            );
+            driver
+        }
+
         async fn add_local_capability(&self) {
             let agent = self
                 .dispatcher
@@ -35883,7 +37352,7 @@ mod tests {
             assert_eq!(self.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         }
 
-        fn assert_single_refusal(&mut self) {
+        fn assert_single_execute_refusal(&mut self) {
             let frame: Value = serde_json::from_str(
                 &self
                     .receiver
@@ -35891,9 +37360,14 @@ mod tests {
                     .expect("ordinary refusal is delivered"),
             )
             .unwrap();
-            let text = frame.to_string();
-            assert!(text.contains("turn refused by daemon: Remote caller cannot use this session's local capabilities"), "{frame}");
-            assert!(!text.contains("turn failed: Agent turn failed"));
+            assert_eq!(frame["method"], "session/update");
+            assert_eq!(frame["params"]["type"], "turn_complete");
+            assert_eq!(frame["params"]["goal_owned"], true);
+            assert_eq!(frame["params"]["outcome"], "failed");
+            assert_eq!(
+                frame["params"]["content"],
+                "turn refused by daemon: Principal is not granted sessions:execute (required by session/goal)"
+            );
             assert!(
                 self.receiver.try_recv().is_err(),
                 "refusal must not be duplicated"
@@ -36968,6 +38442,12 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap();
+                let before_extension = registry.get_goal_task(&before.id).await.unwrap().unwrap();
+                let before_agent = context
+                    .sessions
+                    .get_agent(GoalAdmissionFixture::SESSION)
+                    .await
+                    .unwrap();
                 let generation = context
                     .sessions
                     .get_generation(GoalAdmissionFixture::SESSION)
@@ -36979,11 +38459,12 @@ mod tests {
                     .unwrap();
                 let connection =
                     rusqlite::Connection::open(data_dir.join("control_plane.db")).unwrap();
+                assert_eq!(key, "rpc_goal-admission");
                 connection
                     .execute_batch(
                         "CREATE TRIGGER fixture_refuse_goal_disposal
-                     BEFORE UPDATE OF status ON tasks
-                     WHEN NEW.kind = 'goal' AND NEW.status = 'cancelled'
+                     BEFORE INSERT ON goal_session_dispositions
+                     WHEN NEW.session_id = 'rpc_goal-admission' AND NEW.phase = 'prepared'
                      BEGIN SELECT RAISE(ABORT, 'private fixture disposal detail'); END;",
                     )
                     .unwrap();
@@ -37006,8 +38487,8 @@ mod tests {
                     }
                     _ => unreachable!("fixture covers removal and replacement handlers"),
                 };
-                let error = result
-                    .expect_err("the real disposal transition must reject the injected fault");
+                let error =
+                    result.expect_err("disposition preparation must reject the injected fault");
                 assert_eq!(error.code, INTERNAL_ERROR);
                 assert_eq!(
                     error.message,
@@ -37029,6 +38510,18 @@ mod tests {
                     .unwrap(),
                     serde_json::to_value(&before).unwrap()
                 );
+                assert_eq!(
+                    registry.get_goal_task(&before.id).await.unwrap(),
+                    Some(before_extension)
+                );
+                assert!(Arc::ptr_eq(
+                    &before_agent,
+                    &context
+                        .sessions
+                        .get_agent(GoalAdmissionFixture::SESSION)
+                        .await
+                        .unwrap()
+                ));
                 assert_eq!(
                     context
                         .sessions
@@ -37059,6 +38552,714 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum GoalLiveCommitOperation {
+        Close,
+        Replace,
+    }
+
+    enum GoalLiveCommitProbe {
+        Started,
+        Completed,
+    }
+
+    /// Releases the blocking-owner pause if a red assertion unwinds the test.
+    /// The assertion still runs while the owner is paused; this only prevents a
+    /// failed test from leaving its dedicated worker blocked on `recv()`.
+    struct GoalLiveCommitPauseRelease(Option<std::sync::mpsc::Sender<()>>);
+
+    impl GoalLiveCommitPauseRelease {
+        fn release(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    impl Drop for GoalLiveCommitPauseRelease {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    fn assert_goal_live_commit_releases_store_before_queued_session_waiter(
+        operation: GoalLiveCommitOperation,
+    ) {
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("goal-live-commit-map-order".into())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("current-thread runtime builds");
+                let started_tx = probe_tx.clone();
+                runtime.block_on(async move {
+                    let fixture = GoalAdmissionFixture::new(RpcAccessPolicy::TrustedLocal).await;
+                    let context = Arc::clone(&fixture.dispatcher.ctx);
+                    let data_dir = context.config.read().data_dir.clone();
+                    let registry = connection_test_support::install_paused_goal_control_fixture(
+                        &context,
+                        &data_dir,
+                        GoalAdmissionFixture::SESSION,
+                    )
+                    .await;
+                    let key = zeroclaw_goal::control::GoalSessionKey::zero_code(
+                        GoalAdmissionFixture::SESSION,
+                    )
+                    .unwrap()
+                    .durable_id();
+                    let original_goal = registry
+                        .current_goal_for_session(&key)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let original_generation = context
+                        .sessions
+                        .get_generation(GoalAdmissionFixture::SESSION)
+                        .await
+                        .unwrap();
+                    let (entered, release) = context
+                        .sessions
+                        .install_test_goal_live_commit_before_map_pause();
+                    let dispatcher = fixture.dispatcher.spawn_handle();
+                    let request = zeroclaw_spawn::spawn!(async move {
+                        match operation {
+                            GoalLiveCommitOperation::Close => {
+                                dispatcher
+                                    .handle_session_close(&json!({
+                                        "session_id": GoalAdmissionFixture::SESSION,
+                                    }))
+                                    .await
+                            }
+                            GoalLiveCommitOperation::Replace => {
+                                dispatcher
+                                    .handle_session_new_for_test(&json!({
+                                        "agent_alias": "test-agent",
+                                        "session_id": GoalAdmissionFixture::SESSION,
+                                        "chat_mode": "acp",
+                                    }))
+                                    .await
+                            }
+                        }
+                    });
+                    entered.notified().await;
+                    let mut release = GoalLiveCommitPauseRelease(Some(release));
+                    let held_map = context.sessions.hold_test_session_map().await;
+
+                    // Register exactly one FIFO map waiter without letting the
+                    // runtime drive it. The old order makes the synchronous
+                    // store read below wait for B's held connection while B
+                    // waits behind this queued waiter for the map.
+                    let mut waiter = Box::pin(
+                        context
+                            .sessions
+                            .get_generation(GoalAdmissionFixture::SESSION),
+                    );
+                    let waker = std::task::Waker::noop();
+                    let mut task_context = std::task::Context::from_waker(waker);
+                    assert!(matches!(
+                        std::future::Future::poll(waiter.as_mut(), &mut task_context),
+                        std::task::Poll::Pending
+                    ));
+                    release.release();
+                    drop(held_map);
+
+                    // This is deliberately driven before the queued waiter.
+                    // Its completion proves that B released the store before
+                    // it waited for the FIFO map.
+                    started_tx
+                        .send(GoalLiveCommitProbe::Started)
+                        .expect("watchdog receiver remains open");
+                    assert_eq!(
+                        registry
+                            .current_goal_for_session(&key)
+                            .await
+                            .unwrap()
+                            .as_ref()
+                            .map(|goal| goal.id.as_str()),
+                        Some(original_goal.id.as_str()),
+                        "the store read must complete before B can pass the queued map waiter"
+                    );
+                    assert_eq!(
+                        waiter.await,
+                        Some(original_generation),
+                        "the queued waiter must complete only after the synchronous store read"
+                    );
+                    request
+                        .await
+                        .expect("Goal live request task must not panic")
+                        .expect("Goal live request must succeed without SESSION_BUSY");
+
+                    match operation {
+                        GoalLiveCommitOperation::Close => assert!(
+                            context
+                                .sessions
+                                .get_generation(GoalAdmissionFixture::SESSION)
+                                .await
+                                .is_none(),
+                            "close must remove the exact live generation"
+                        ),
+                        GoalLiveCommitOperation::Replace => {
+                            let replacement = context
+                                .sessions
+                                .get_generation(GoalAdmissionFixture::SESSION)
+                                .await
+                                .expect("replacement must publish a successor generation");
+                            assert_ne!(replacement, original_generation);
+                        }
+                    }
+                    assert!(
+                        registry
+                            .get_goal_task(&original_goal.id)
+                            .await
+                            .unwrap()
+                            .is_none(),
+                        "the original Goal intent must be removed with its exact Goal"
+                    );
+                    assert!(
+                        registry
+                            .current_goal_for_session(&key)
+                            .await
+                            .unwrap()
+                            .is_none(),
+                        "the successful live effect must finalize the exact Goal"
+                    );
+                    let connection =
+                        rusqlite::Connection::open(data_dir.join("control_plane.db")).unwrap();
+                    let remaining: i64 = connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM goal_session_dispositions WHERE session_id = ?1",
+                            [&key],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(remaining, 0, "success must leave no live disposition row");
+                });
+                probe_tx
+                    .send(GoalLiveCommitProbe::Completed)
+                    .expect("watchdog receiver remains open");
+            })
+            .expect("dedicated current-thread worker starts");
+
+        match probe_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(GoalLiveCommitProbe::Started) => {
+                match probe_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                    Ok(GoalLiveCommitProbe::Completed) => {
+                        worker.join().expect("dedicated worker must not panic")
+                    }
+                    Ok(GoalLiveCommitProbe::Started) => {
+                        panic!("Goal live commit worker entered the store probe twice")
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                        "Goal live commit held the task-store connection while queued on the session map"
+                    ),
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        panic!("dedicated Goal live commit worker exited during the store probe")
+                    }
+                }
+            }
+            Ok(GoalLiveCommitProbe::Completed) => {
+                panic!("Goal live commit worker completed without entering the store probe")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("Goal live commit worker did not reach the verified pre-read boundary")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("dedicated Goal live commit worker exited before the store probe")
+            }
+        }
+    }
+
+    #[test]
+    fn goal_live_close_releases_store_before_queued_session_waiter() {
+        assert_goal_live_commit_releases_store_before_queued_session_waiter(
+            GoalLiveCommitOperation::Close,
+        );
+    }
+
+    #[test]
+    fn goal_live_replacement_releases_store_before_queued_session_waiter() {
+        assert_goal_live_commit_releases_store_before_queued_session_waiter(
+            GoalLiveCommitOperation::Replace,
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_live_close_waits_under_session_map_only_until_external_writer_releases() {
+        let fixture = GoalAdmissionFixture::new(RpcAccessPolicy::TrustedLocal).await;
+        let context = Arc::clone(&fixture.dispatcher.ctx);
+        let data_dir = context.config.read().data_dir.clone();
+        let registry = connection_test_support::install_paused_goal_control_fixture(
+            &context,
+            &data_dir,
+            GoalAdmissionFixture::SESSION,
+        )
+        .await;
+        let key = zeroclaw_goal::control::GoalSessionKey::zero_code(GoalAdmissionFixture::SESSION)
+            .unwrap()
+            .durable_id();
+        let original_goal = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        let (entered, release) = context
+            .sessions
+            .install_test_goal_live_commit_before_map_pause();
+        let dispatcher = fixture.dispatcher.spawn_handle();
+        let request = zeroclaw_spawn::spawn!(async move {
+            dispatcher
+                .handle_session_close(&json!({"session_id": GoalAdmissionFixture::SESSION}))
+                .await
+        });
+        entered.notified().await;
+        let mut release = GoalLiveCommitPauseRelease(Some(release));
+
+        // The pause is after prepare and before the map, so this writer is
+        // genuinely external contention against an already-prepared live row.
+        let writer = rusqlite::Connection::open(data_dir.join("control_plane.db")).unwrap();
+        writer
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("external writer takes the control-plane write lock");
+        release.release();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while context.sessions.try_test_session_map() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("close must acquire the map and wait for the external writer");
+        assert!(
+            !request.is_finished(),
+            "the close request must remain pending while the external writer holds SQLite"
+        );
+        writer
+            .execute_batch("ROLLBACK")
+            .expect("external writer releases inside the unchanged busy timeout");
+        request
+            .await
+            .expect("close request task must not panic")
+            .expect("close must complete after the writer releases");
+
+        assert!(
+            context
+                .sessions
+                .get_generation(GoalAdmissionFixture::SESSION)
+                .await
+                .is_none()
+        );
+        assert!(
+            registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            registry
+                .get_goal_task(&original_goal.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let remaining: i64 = rusqlite::Connection::open(data_dir.join("control_plane.db"))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM goal_session_dispositions WHERE session_id = ?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn goal_live_close_busy_expiry_leaves_prepared_disposition_for_reconciliation() {
+        let fixture = GoalAdmissionFixture::new(RpcAccessPolicy::TrustedLocal).await;
+        let context = Arc::clone(&fixture.dispatcher.ctx);
+        let data_dir = context.config.read().data_dir.clone();
+        let registry = connection_test_support::install_paused_goal_control_fixture(
+            &context,
+            &data_dir,
+            GoalAdmissionFixture::SESSION,
+        )
+        .await;
+        let key = zeroclaw_goal::control::GoalSessionKey::zero_code(GoalAdmissionFixture::SESSION)
+            .unwrap()
+            .durable_id();
+        let original_goal = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        let original_generation = context
+            .sessions
+            .get_generation(GoalAdmissionFixture::SESSION)
+            .await;
+        let original_agent = context
+            .sessions
+            .get_agent(GoalAdmissionFixture::SESSION)
+            .await
+            .unwrap();
+        let (entered, release) = context
+            .sessions
+            .install_test_goal_live_commit_before_map_pause();
+        let dispatcher = fixture.dispatcher.spawn_handle();
+        let request = zeroclaw_spawn::spawn!(async move {
+            dispatcher
+                .handle_session_close(&json!({"session_id": GoalAdmissionFixture::SESSION}))
+                .await
+        });
+        entered.notified().await;
+        let mut release = GoalLiveCommitPauseRelease(Some(release));
+
+        // This begins only after the operation prepared its live row and
+        // reached the pre-map boundary. Keep it through both the commit and
+        // recovery-abort attempts so the latter leaves the row prepared.
+        let writer = rusqlite::Connection::open(data_dir.join("control_plane.db")).unwrap();
+        writer
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("external writer takes the control-plane write lock");
+        release.release();
+        let error = request
+            .await
+            .expect("busy close task must not panic")
+            .expect_err("unchanged SQLite busy timeout must refuse the close");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert_eq!(
+            error.message,
+            "Goal Mode could not complete that command. Try again. If the problem continues, ask an operator to check the configuration and logs."
+        );
+        assert_eq!(
+            context
+                .sessions
+                .get_generation(GoalAdmissionFixture::SESSION)
+                .await,
+            original_generation
+        );
+        assert!(Arc::ptr_eq(
+            &original_agent,
+            &context
+                .sessions
+                .get_agent(GoalAdmissionFixture::SESSION)
+                .await
+                .unwrap()
+        ));
+        assert_eq!(
+            serde_json::to_value(
+                registry
+                    .current_goal_for_session(&key)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&original_goal).unwrap()
+        );
+        let phase: String = writer
+            .query_row(
+                "SELECT phase FROM goal_session_dispositions WHERE session_id = ?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(phase, "prepared");
+
+        writer
+            .execute_batch("ROLLBACK")
+            .expect("external writer releases after the unchanged busy timeout");
+
+        fixture
+            .dispatcher
+            .handle_session_close(&json!({"session_id": GoalAdmissionFixture::SESSION}))
+            .await
+            .expect("retry closes the session without a separate reconciliation request");
+        let remaining: i64 = rusqlite::Connection::open(data_dir.join("control_plane.db"))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM goal_session_dispositions WHERE session_id = ?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+        assert!(
+            context
+                .sessions
+                .get_generation(GoalAdmissionFixture::SESSION)
+                .await
+                .is_none()
+        );
+        assert!(
+            registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            registry
+                .get_goal_task(&original_goal.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    async fn assert_goal_live_commit_failure_is_sanitized_and_retriable(
+        operation: GoalLiveCommitOperation,
+    ) {
+        let fixture = GoalAdmissionFixture::new(RpcAccessPolicy::TrustedLocal).await;
+        let context = Arc::clone(&fixture.dispatcher.ctx);
+        let data_dir = context.config.read().data_dir.clone();
+        let registry = connection_test_support::install_paused_goal_control_fixture(
+            &context,
+            &data_dir,
+            GoalAdmissionFixture::SESSION,
+        )
+        .await;
+        let key = zeroclaw_goal::control::GoalSessionKey::zero_code(GoalAdmissionFixture::SESSION)
+            .unwrap()
+            .durable_id();
+        let original_goal = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        let original_generation = context
+            .sessions
+            .get_generation(GoalAdmissionFixture::SESSION)
+            .await;
+        let original_agent = context
+            .sessions
+            .get_agent(GoalAdmissionFixture::SESSION)
+            .await
+            .unwrap();
+        let connection = rusqlite::Connection::open(data_dir.join("control_plane.db")).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 CREATE TABLE injected_commit_parent(id TEXT PRIMARY KEY);
+                 CREATE TABLE injected_commit_child(
+                     parent_id TEXT NOT NULL REFERENCES injected_commit_parent(id)
+                         DEFERRABLE INITIALLY DEFERRED
+                 );
+                 CREATE TRIGGER fixture_fail_live_goal_commit
+                 AFTER DELETE ON tasks
+                 BEGIN
+                     INSERT INTO injected_commit_child(parent_id) VALUES('missing parent');
+                 END;",
+            )
+            .unwrap();
+
+        let result = match operation {
+            GoalLiveCommitOperation::Close => {
+                fixture
+                    .dispatcher
+                    .handle_session_close(&json!({"session_id": GoalAdmissionFixture::SESSION}))
+                    .await
+            }
+            GoalLiveCommitOperation::Replace => {
+                fixture
+                    .dispatcher
+                    .handle_session_new_for_test(&json!({
+                        "agent_alias": "test-agent",
+                        "session_id": GoalAdmissionFixture::SESSION,
+                        "chat_mode": "acp",
+                    }))
+                    .await
+            }
+        };
+        let error = result.expect_err("the deferred foreign-key failure must reject the request");
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert_eq!(
+            error.message,
+            "Goal Mode could not complete that command. Try again. If the problem continues, ask an operator to check the configuration and logs."
+        );
+        assert!(
+            !serde_json::to_string(&error)
+                .unwrap()
+                .contains("missing parent"),
+            "the injected SQLite detail must not cross the RPC boundary"
+        );
+        assert_eq!(
+            context
+                .sessions
+                .get_generation(GoalAdmissionFixture::SESSION)
+                .await,
+            original_generation
+        );
+        assert!(Arc::ptr_eq(
+            &original_agent,
+            &context
+                .sessions
+                .get_agent(GoalAdmissionFixture::SESSION)
+                .await
+                .unwrap()
+        ));
+        let retained = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.id, original_goal.id);
+        assert_eq!(retained.execution_epoch, original_goal.execution_epoch);
+        let remaining: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM goal_session_dispositions WHERE session_id = ?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0, "the failed live commit must be aborted");
+
+        connection
+            .execute_batch("DROP TRIGGER fixture_fail_live_goal_commit")
+            .unwrap();
+        match operation {
+            GoalLiveCommitOperation::Close => {
+                fixture
+                    .dispatcher
+                    .handle_session_close(&json!({"session_id": GoalAdmissionFixture::SESSION}))
+                    .await
+                    .expect("close retry succeeds after dropping the trigger");
+                assert!(
+                    context
+                        .sessions
+                        .get_generation(GoalAdmissionFixture::SESSION)
+                        .await
+                        .is_none()
+                );
+            }
+            GoalLiveCommitOperation::Replace => {
+                fixture
+                    .dispatcher
+                    .handle_session_new_for_test(&json!({
+                        "agent_alias": "test-agent",
+                        "session_id": GoalAdmissionFixture::SESSION,
+                        "chat_mode": "acp",
+                    }))
+                    .await
+                    .expect("replacement retry succeeds after dropping the trigger");
+                assert_ne!(
+                    context
+                        .sessions
+                        .get_generation(GoalAdmissionFixture::SESSION)
+                        .await,
+                    original_generation
+                );
+            }
+        }
+        assert!(
+            registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_live_close_commit_failure_is_sanitized_and_retriable() {
+        assert_goal_live_commit_failure_is_sanitized_and_retriable(GoalLiveCommitOperation::Close)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn goal_live_replacement_commit_failure_is_sanitized_and_retriable() {
+        assert_goal_live_commit_failure_is_sanitized_and_retriable(
+            GoalLiveCommitOperation::Replace,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn aborted_goal_live_replacement_retains_config_writer_through_effect() {
+        let fixture = GoalAdmissionFixture::new(RpcAccessPolicy::TrustedLocal).await;
+        let context = Arc::clone(&fixture.dispatcher.ctx);
+        let data_dir = context.config.read().data_dir.clone();
+        let registry = connection_test_support::install_paused_goal_control_fixture(
+            &context,
+            &data_dir,
+            GoalAdmissionFixture::SESSION,
+        )
+        .await;
+        let key = zeroclaw_goal::control::GoalSessionKey::zero_code(GoalAdmissionFixture::SESSION)
+            .unwrap()
+            .durable_id();
+        let original_goal = registry
+            .current_goal_for_session(&key)
+            .await
+            .unwrap()
+            .unwrap();
+        let original_generation = context
+            .sessions
+            .get_generation(GoalAdmissionFixture::SESSION)
+            .await
+            .unwrap();
+        let (entered, release) = context
+            .sessions
+            .install_test_goal_live_commit_before_map_pause();
+        let dispatcher = fixture.dispatcher.spawn_handle();
+        let request = zeroclaw_spawn::spawn!(async move {
+            dispatcher
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "session_id": GoalAdmissionFixture::SESSION,
+                    "chat_mode": "acp",
+                }))
+                .await
+        });
+        entered.notified().await;
+        let mut release = GoalLiveCommitPauseRelease(Some(release));
+
+        request.abort();
+        assert!(
+            request
+                .await
+                .expect_err("aborted request must not complete")
+                .is_cancelled(),
+            "the outer replacement task must observe cancellation"
+        );
+        assert!(
+            context.config_authority.config_write_lock_is_held(),
+            "the blocking live effect must retain the config writer after its outer request aborts"
+        );
+        release.release();
+
+        let _config_writer = context.config_authority.lock_config_writer().await;
+        let replacement = context
+            .sessions
+            .get_generation(GoalAdmissionFixture::SESSION)
+            .await
+            .expect("the blocking effect must publish a successor generation");
+        assert_ne!(replacement, original_generation);
+        assert!(
+            registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            registry
+                .get_goal_task(&original_goal.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let remaining: i64 = rusqlite::Connection::open(data_dir.join("control_plane.db"))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM goal_session_dispositions WHERE session_id = ?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -37251,6 +39452,137 @@ mod tests {
                 assert_ne!(frame["method"], "session/goal_update");
                 assert_ne!(frame["method"], "session/closed");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn session_goal_direct_launch_failure_reports_once_before_attachment() {
+        assert_goal_reported_launch_failure(GoalLaunchFailureFixture::DirectBind).await;
+    }
+
+    #[tokio::test]
+    async fn session_goal_deferred_audit_failure_reports_only_failed_after_queued_acknowledgement()
+    {
+        assert_goal_reported_launch_failure(GoalLaunchFailureFixture::DeferredAudit).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum GoalLaunchFailureFixture {
+        DirectBind,
+        DeferredAudit,
+    }
+
+    async fn assert_goal_reported_launch_failure(failure: GoalLaunchFailureFixture) {
+        use crate::rpc::types::{GoalQueuedControlWire, GoalResponseWire, SessionGoalResult};
+        use zeroclaw_goal::control::{GoalLaunchFailureReported, GoalSessionKey};
+
+        const SESSION: &str = GoalAdmissionFixture::SESSION;
+
+        for policy in [
+            RpcAccessPolicy::TrustedLocal,
+            RpcAccessPolicy::RemoteSessionOwner,
+        ] {
+            let mut fixture = GoalAdmissionFixture::new(policy).await;
+            let context = Arc::clone(&fixture.dispatcher.ctx);
+            let data_dir = context.config.read().data_dir.clone();
+            let registry = connection_test_support::install_paused_goal_control_fixture(
+                &context, &data_dir, SESSION,
+            )
+            .await;
+            let key = GoalSessionKey::zero_code(SESSION).unwrap().durable_id();
+            let before = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            let generation = context.sessions.get_generation(SESSION).await.unwrap();
+            let ordinary = match failure {
+                GoalLaunchFailureFixture::DirectBind => None,
+                GoalLaunchFailureFixture::DeferredAudit => Some(
+                    context
+                        .sessions
+                        .session_queue
+                        .acquire(SESSION)
+                        .await
+                        .unwrap(),
+                ),
+            };
+            let (value, control) = fixture
+                .dispatcher
+                .handle_session_goal(&json!({"session_id": SESSION, "command": "/goal resume"}))
+                .await
+                .unwrap();
+
+            assert!(fixture.dispatcher.send_result(json!(1), value).await);
+            let acknowledgement: Value =
+                serde_json::from_str(&fixture.receiver.try_recv().unwrap()).unwrap();
+            assert_eq!(acknowledgement["id"], 1);
+            let result: SessionGoalResult =
+                serde_json::from_value(acknowledgement["result"].clone()).unwrap();
+            assert!(matches!(
+                (failure, result.response),
+                (
+                    GoalLaunchFailureFixture::DirectBind,
+                    GoalResponseWire::Resumed(_)
+                ) | (
+                    GoalLaunchFailureFixture::DeferredAudit,
+                    GoalResponseWire::Queued(GoalQueuedControlWire::Resume),
+                )
+            ));
+            assert!(fixture.receiver.is_empty());
+
+            let expected_cause = match failure {
+                GoalLaunchFailureFixture::DirectBind => {
+                    context.goal_runtime.fail_test_next_bind(key.clone());
+                    "private fixture launch bind detail"
+                }
+                GoalLaunchFailureFixture::DeferredAudit => {
+                    let connection =
+                        rusqlite::Connection::open(data_dir.join("control_plane.db")).unwrap();
+                    // As in the Matrix fixture, fail only settlement of the applied transition.
+                    connection
+                        .execute_batch(
+                            "CREATE TRIGGER fixture_refuse_goal_audit
+                             BEFORE UPDATE OF state ON goal_control_intents
+                             WHEN NEW.state = 'applied'
+                             BEGIN SELECT RAISE(ABORT, 'private fixture audit detail'); END;",
+                        )
+                        .unwrap();
+                    "private fixture audit detail"
+                }
+            };
+            drop(ordinary);
+            let error =
+                tokio::time::timeout(std::time::Duration::from_secs(2), control.after_response())
+                    .await
+                    .expect("failed launch must settle the command")
+                    .expect_err("injected failure must be propagated");
+            assert!(
+                error.is::<GoalLaunchFailureReported>(),
+                "{policy:?}: {error:#}"
+            );
+            assert!(format!("{error:#}").contains(expected_cause));
+
+            let frame: Value = serde_json::from_str(
+                &fixture
+                    .receiver
+                    .try_recv()
+                    .expect("missing Goal failure notice"),
+            )
+            .unwrap();
+            assert!(fixture.receiver.is_empty(), "unexpected extra Goal frame");
+            assert!(!frame.to_string().contains("private fixture"));
+            connection_test_support::assert_goal_launch_failure(
+                &context,
+                registry.as_ref(),
+                &key,
+                &before,
+                SESSION,
+                generation,
+                &frame,
+            )
+            .await;
+            fixture.assert_no_provider_call();
         }
     }
 
@@ -38684,7 +41016,7 @@ mod tests {
         };
         let directory = tempfile::tempdir().unwrap();
         let mut dispatcher = environment_principal_fixture(&directory).await;
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        let (sender, receiver) = tokio::sync::mpsc::channel(64);
         dispatcher.rpc = Arc::new(RpcOutbound::new(sender));
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         dispatcher
@@ -38708,7 +41040,17 @@ mod tests {
             },
         )
         .unwrap();
-        drop(driver.bind(&ingress).await.unwrap());
+        drop(driver.bind_for_launch(&ingress).await.unwrap());
+        let recipient = dispatcher
+            .ctx
+            .sessions
+            .goal_session_snapshot("env-demotion")
+            .await
+            .unwrap()
+            .goal_recipient;
+        let (active, pending) = recipient.destinations_for_test();
+        assert!(active.unwrap().upgrade().unwrap().matches(&dispatcher.rpc));
+        assert!(pending.is_none());
         let permit = dispatcher
             .ctx
             .sessions
@@ -38757,19 +41099,34 @@ mod tests {
             serde_json::to_value(agent.lock().await.history()).unwrap(),
             history_before,
         );
-        let frame: Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
-        assert!(frame.to_string().contains(
-            "turn refused by daemon: Session retains a local operator environment; create a new session on this connection",
-        ));
-        assert!(receiver.is_empty(), "one refusal frame, no model output");
+        let (active, pending) = recipient.destinations_for_test();
+        assert!(active.is_none() && pending.is_none());
+        assert!(
+            receiver.is_empty(),
+            "the demoted reader must receive no frame"
+        );
     }
 
     #[tokio::test]
     async fn session_goal_resume_refuses_a_late_capability_before_persisting_the_answer() {
         use zeroclaw_goal::control::{GoalExecutionScope, GoalSessionDriver};
-        let mut fixture = GoalAdmissionFixture::new(RpcAccessPolicy::RemoteSessionOwner).await;
-        let driver = fixture.driver("/goal resume Choose A.").await;
-        drop(driver.bind(&fixture.ingress()).await.unwrap());
+        let fixture = GoalAdmissionFixture::new(RpcAccessPolicy::RemoteSessionOwner).await;
+        let driver = fixture.launched_driver("/goal resume Choose A.").await;
+        let recipient = fixture
+            .dispatcher
+            .ctx
+            .sessions
+            .goal_session_snapshot(GoalAdmissionFixture::SESSION)
+            .await
+            .unwrap()
+            .goal_recipient;
+        assert!(
+            recipient
+                .destinations_for_test()
+                .0
+                .and_then(|target| target.upgrade())
+                .is_some_and(|target| target.matches(&fixture.dispatcher.rpc))
+        );
         let scope = GoalExecutionScope::new("goal-test-task", driver.session_key().durable_id(), 1)
             .unwrap();
         let mut lease = driver
@@ -38785,9 +41142,11 @@ mod tests {
             .append_resume_response("Choose A.\nPreserve the existing scope.".into())
             .await
             .unwrap_err();
+        let refusal = error.downcast_ref::<GoalRpcRefusal>().unwrap();
+        assert_eq!(refusal.code, SESSION_NOT_OWNED);
         assert_eq!(
-            error.downcast_ref::<GoalRpcRefusal>().unwrap().code,
-            SESSION_NOT_OWNED
+            refusal.message,
+            "Remote caller cannot use this session's local capabilities",
         );
         let backend = fixture.dispatcher.ctx.session_backend.as_ref().unwrap();
         assert!(
@@ -38809,15 +41168,19 @@ mod tests {
                 .is_empty()
         );
         fixture.assert_no_provider_call();
-        fixture.assert_single_refusal();
+        assert!(recipient.destinations_for_test().0.is_none());
+        assert!(
+            fixture.receiver.is_empty(),
+            "a connection that can no longer read the session must receive no refusal frame"
+        );
     }
 
     #[tokio::test]
-    async fn session_goal_original_non_refusal_admission_error_is_rendered() {
+    async fn session_goal_original_non_refusal_admission_error_after_removal_emits_nothing() {
         use zeroclaw_goal::control::{
             GoalExecutionScope, GoalParentTurn, GoalParentTurnKind, GoalSessionDriver,
         };
-        let mut fixture = GoalAdmissionFixture::new(RpcAccessPolicy::TrustedLocal).await;
+        let fixture = GoalAdmissionFixture::new(RpcAccessPolicy::TrustedLocal).await;
         let driver = crate::rpc::goal::ZeroCodeGoalSessionDriver::new(
             Arc::clone(&fixture.dispatcher.ctx),
             Arc::clone(&fixture.dispatcher.rpc),
@@ -38834,6 +41197,21 @@ mod tests {
         )
         .await
         .unwrap();
+        drop(driver.bind_for_launch(&fixture.ingress()).await.unwrap());
+        assert!(
+            fixture
+                .dispatcher
+                .ctx
+                .sessions
+                .goal_session_snapshot(GoalAdmissionFixture::SESSION)
+                .await
+                .unwrap()
+                .goal_recipient
+                .destinations_for_test()
+                .0
+                .and_then(|target| target.upgrade())
+                .is_some_and(|target| target.matches(&fixture.dispatcher.rpc))
+        );
         let scope = GoalExecutionScope::new("goal-test-task", driver.session_key().durable_id(), 1)
             .unwrap();
         let mut lease = driver
@@ -38858,25 +41236,17 @@ mod tests {
             working_history: vec![],
         });
         let error = lease.canonical_history(&input).await.unwrap_err();
-        lease.publish_goal_core_error(&error).await.unwrap();
         assert!(error.downcast_ref::<GoalRpcRefusal>().is_none());
         assert_eq!(error.to_string(), "ZeroCode Goal session is absent");
-        fixture.assert_no_provider_call();
-        let frame: Value = serde_json::from_str(
-            &fixture
-                .receiver
-                .try_recv()
-                .expect("ordinary failure must be delivered"),
-        )
-        .unwrap();
-        assert!(
-            frame
-                .to_string()
-                .contains("turn failed: Agent turn failed: ZeroCode Goal session is absent")
+        let delivery = lease.publish_goal_core_error(&error).await.unwrap_err();
+        assert_eq!(
+            delivery.to_string(),
+            "ZeroCode Goal turn failure could not be delivered"
         );
+        fixture.assert_no_provider_call();
         assert!(
             fixture.receiver.is_empty(),
-            "failure must not be duplicated"
+            "a removed incarnation must not publish to its former recipient"
         );
     }
 
@@ -38917,7 +41287,7 @@ mod tests {
     async fn session_goal_original_handoff_preserves_typed_terminal_projection() {
         use zeroclaw_goal::control::{GoalExecutionScope, GoalSessionDriver};
         let mut fixture = GoalAdmissionFixture::new(RpcAccessPolicy::TrustedLocal).await;
-        let driver = fixture.driver("/goal resume").await;
+        let driver = fixture.launched_driver("/goal resume").await;
         let scope = GoalExecutionScope::new("goal-test-task", driver.session_key().durable_id(), 1)
             .unwrap();
         let mut lease = driver
@@ -38953,7 +41323,7 @@ mod tests {
     async fn session_goal_original_handoff_uses_the_ordinary_failure_frame() {
         use zeroclaw_goal::control::{GoalExecutionScope, GoalSessionDriver};
         let mut fixture = GoalAdmissionFixture::new(RpcAccessPolicy::TrustedLocal).await;
-        let driver = fixture.driver("/goal resume").await;
+        let driver = fixture.launched_driver("/goal resume").await;
         let scope = GoalExecutionScope::new("goal-test-task", driver.session_key().durable_id(), 1)
             .unwrap();
         let mut lease = driver
@@ -38969,6 +41339,9 @@ mod tests {
             .await
             .unwrap();
         let frame: Value = serde_json::from_str(&fixture.receiver.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["method"], "session/update");
+        assert_eq!(frame["params"]["type"], "turn_complete");
+        assert_eq!(frame["params"]["goal_owned"], true);
         assert_eq!(frame["params"]["outcome"], "failed");
         assert_eq!(
             frame["params"]["content"],
@@ -38981,8 +41354,8 @@ mod tests {
     #[tokio::test]
     async fn session_goal_original_handoff_does_not_repeat_a_typed_refusal() {
         use zeroclaw_goal::control::{GoalExecutionScope, GoalSessionDriver};
-        let mut fixture = GoalAdmissionFixture::new(RpcAccessPolicy::RemoteSessionOwner).await;
-        let driver = fixture.driver("/goal resume").await;
+        let mut fixture = GoalAdmissionFixture::scoped().await;
+        let driver = fixture.launched_driver("/goal resume").await;
         let scope = GoalExecutionScope::new("goal-test-task", driver.session_key().durable_id(), 1)
             .unwrap();
         let mut lease = driver
@@ -38993,13 +41366,16 @@ mod tests {
             )
             .await
             .unwrap();
-        fixture.add_local_capability().await;
+        fixture.revoke_execute();
         let error = lease
             .append_resume_response("Choose A.".into())
             .await
             .unwrap_err();
-        assert!(error.downcast_ref::<GoalRpcRefusal>().is_some());
-        fixture.assert_single_refusal();
+        assert_eq!(
+            error.downcast_ref::<GoalRpcRefusal>().unwrap().code,
+            FORBIDDEN
+        );
+        fixture.assert_single_execute_refusal();
         lease
             .publish_goal_core_error(&error.context("outer fixture context"))
             .await
@@ -39015,7 +41391,7 @@ mod tests {
     async fn session_goal_candidate_append_is_durable_seed_only() {
         use zeroclaw_goal::{GoalExecutionScope, GoalSessionDriver};
         let fixture = GoalAdmissionFixture::new(RpcAccessPolicy::TrustedLocal).await;
-        let driver = fixture.driver("/goal resume").await;
+        let driver = fixture.launched_driver("/goal resume").await;
         let scope = GoalExecutionScope::new("goal-test-task", driver.session_key().durable_id(), 1)
             .unwrap();
         let mut lease = driver
@@ -39163,7 +41539,7 @@ mod tests {
             .await
             .unwrap();
         let history_before = serde_json::to_value(agent.lock().await.history()).unwrap();
-        let driver = fixture.driver("/goal resume").await;
+        let driver = fixture.launched_driver("/goal resume").await;
         let scope = GoalExecutionScope::new("goal-test-task", driver.session_key().durable_id(), 1)
             .unwrap();
         let mut lease = driver
@@ -39560,7 +41936,7 @@ mod tests {
                 .ctx
                 .config_authority
                 .publish_for_test(stale.clone());
-            let driver = fixture.driver("/goal resume").await;
+            let driver = fixture.launched_driver("/goal resume").await;
             let scope =
                 GoalExecutionScope::new("goal-test-task", driver.session_key().durable_id(), 1)
                     .unwrap();
@@ -39690,7 +42066,7 @@ mod tests {
             .ctx
             .config_authority
             .publish_for_test(stale.clone());
-        let driver = fixture.driver("/goal resume").await;
+        let driver = fixture.launched_driver("/goal resume").await;
         let scope = GoalExecutionScope::new("goal-test-task", driver.session_key().durable_id(), 1)
             .unwrap();
         let mut lease = driver
@@ -39769,7 +42145,7 @@ mod tests {
         for before_first_effect in [true, false] {
             let mut fixture = GoalAdmissionFixture::scoped().await;
             let driver = fixture
-                .driver("/goal start --unlimited complete a bounded repair")
+                .launched_driver("/goal start --unlimited complete a bounded repair")
                 .await;
             let scope =
                 GoalExecutionScope::new("goal-test-task", driver.session_key().durable_id(), 1)
@@ -39819,18 +42195,7 @@ mod tests {
                 fixture.calls.load(std::sync::atomic::Ordering::SeqCst),
                 usize::from(!before_first_effect)
             );
-            let frame: Value = serde_json::from_str(&fixture.receiver.try_recv().unwrap()).unwrap();
-            assert_eq!(frame["method"], "session/update");
-            assert_eq!(frame["params"]["type"], "turn_complete");
-            assert_eq!(frame["params"]["goal_owned"], true);
-            assert_eq!(frame["params"]["outcome"], "failed");
-            assert!(
-                frame["params"]["content"]
-                    .as_str()
-                    .unwrap()
-                    .contains("Principal is not granted sessions:execute")
-            );
-            assert!(fixture.receiver.is_empty());
+            fixture.assert_single_execute_refusal();
         }
     }
 
@@ -39842,9 +42207,8 @@ mod tests {
         };
         let mut fixture = GoalAdmissionFixture::new(RpcAccessPolicy::RemoteSessionOwner).await;
         let driver = fixture
-            .driver("/goal start --unlimited Repair the bounded defect")
+            .launched_driver("/goal start --unlimited Repair the bounded defect")
             .await;
-        drop(driver.bind(&fixture.ingress()).await.unwrap());
         let scope = GoalExecutionScope::new("goal-test-task", driver.session_key().durable_id(), 1)
             .unwrap();
         let operation = GoalOperationScope::new(scope.clone());
@@ -39876,6 +42240,23 @@ mod tests {
             "ordinary first-turn events must be delivered"
         );
         while fixture.receiver.try_recv().is_ok() {}
+        let recipient = fixture
+            .dispatcher
+            .ctx
+            .sessions
+            .goal_session_snapshot(GoalAdmissionFixture::SESSION)
+            .await
+            .unwrap()
+            .goal_recipient;
+        let (active, pending) = recipient.destinations_for_test();
+        assert!(
+            active
+                .unwrap()
+                .upgrade()
+                .unwrap()
+                .matches(&fixture.dispatcher.rpc)
+        );
+        assert!(pending.is_none());
         fixture.add_local_capability().await;
         let error = fixture
             .run_parent(
@@ -39889,16 +42270,23 @@ mod tests {
             )
             .await
             .unwrap_err();
+        let refusal = error.downcast_ref::<GoalRpcRefusal>().unwrap();
+        assert_eq!(refusal.code, SESSION_NOT_OWNED);
         assert_eq!(
-            error.downcast_ref::<GoalRpcRefusal>().unwrap().code,
-            SESSION_NOT_OWNED
+            refusal.message,
+            "Remote caller cannot use this session's local capabilities"
         );
         assert_eq!(
             fixture.calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "refusal must prevent the second model call"
         );
-        fixture.assert_single_refusal();
+        let (active, pending) = recipient.destinations_for_test();
+        assert!(active.is_none() && pending.is_none());
+        assert!(
+            fixture.receiver.is_empty(),
+            "the detached reader must receive no frame"
+        );
     }
 
     #[tokio::test]
@@ -40016,8 +42404,7 @@ mod tests {
     async fn session_goal_epoch_rechecks_permission_after_the_session_permit_wait() {
         use zeroclaw_goal::control::{GoalExecutionScope, GoalSessionDriver};
         let mut fixture = GoalAdmissionFixture::scoped().await;
-        let driver = Arc::new(fixture.driver("/goal resume Choose A.").await);
-        drop(driver.bind(&fixture.ingress()).await.unwrap());
+        let driver = Arc::new(fixture.launched_driver("/goal resume Choose A.").await);
         let permit = fixture
             .dispatcher
             .ctx
@@ -40069,13 +42456,7 @@ mod tests {
                 .is_empty()
         );
         fixture.assert_no_provider_call();
-        let frame: Value = serde_json::from_str(&fixture.receiver.try_recv().unwrap()).unwrap();
-        assert!(
-            frame
-                .to_string()
-                .contains("turn refused by daemon: Principal is not granted sessions:execute")
-        );
-        assert!(fixture.receiver.is_empty());
+        fixture.assert_single_execute_refusal();
     }
 
     #[tokio::test]
@@ -40547,6 +42928,29 @@ mod tests {
 
         assert_eq!(ctx.agent, "ZeroClaw");
         assert!(!ctx.include_memory);
+    }
+
+    #[test]
+    fn presentation_chunk_notification_preserves_ordinary_bytes() {
+        // The original wire fields in declaration order. Use the same JSON map
+        // ordering as this build, whether or not serde_json preserves insertion order.
+        let golden = |fields: &str| {
+            serde_json::to_string(&JsonRpcNotification::new(
+                "session/update",
+                serde_json::from_str(fields).unwrap(),
+            ))
+            .unwrap()
+        };
+        let ordinary = r#"{"type":"agent_message_chunk","session_id":"s","text":"t"}"#;
+        let marked = r#"{"type":"agent_message_chunk","session_id":"s","text":"t","presentation_only":true}"#;
+        assert_eq!(
+            notification_for_turn_event("s", &TurnEvent::Chunk { delta: "t".into() }).unwrap(),
+            golden(ordinary)
+        );
+        assert_eq!(
+            presentation_notification_for_chunk("s", "t".into()).unwrap(),
+            golden(marked)
+        );
     }
 
     #[test]
@@ -42227,6 +44631,394 @@ mod tests {
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-stack:pid=1".into());
         dispatcher.set_authenticated_for_test();
         (dispatcher, sessions, rx)
+    }
+
+    #[tokio::test]
+    async fn goal_recipient_does_not_retain_idle_rpc_context() {
+        enum Attachment {
+            Pending,
+            Active,
+        }
+
+        async fn released_after_drop(attachment: Option<Attachment>) -> (bool, bool) {
+            const SESSION: &str = "idle-recipient-session";
+            const TUI: &str = "idle-recipient-tui";
+            let dir = tempfile::tempdir().unwrap();
+            let (mut dispatcher, sessions, receiver) =
+                make_acp_test_dispatcher_with_receiver(make_acp_test_config(&dir));
+            dispatcher.set_tui_id_for_test(Some(TUI.into()));
+            dispatcher
+                .handle_session_new_for_test(&json!({
+                    "agent_alias": "test-agent",
+                    "chat_mode": "chat",
+                    "session_id": SESSION,
+                }))
+                .await
+                .unwrap();
+            let generation = sessions.get_generation(SESSION).await.unwrap();
+            assert_eq!(
+                sessions.session_owner_tui_id(SESSION).await,
+                Some(Some(TUI.to_owned()))
+            );
+            let weak_context = Arc::downgrade(&dispatcher.ctx);
+            let weak_sessions = Arc::downgrade(&sessions);
+
+            match attachment {
+                None => {}
+                Some(Attachment::Pending) => assert!(
+                    sessions
+                        .offer_goal_recipient(
+                            SESSION,
+                            generation,
+                            TUI,
+                            GoalFrameDestination::new(&dispatcher),
+                        )
+                        .await
+                ),
+                Some(Attachment::Active) => assert!(
+                    sessions
+                        .attach_goal_recipient(
+                            SESSION,
+                            generation,
+                            TUI,
+                            GoalFrameDestination::new(&dispatcher),
+                        )
+                        .await
+                ),
+            }
+
+            drop(dispatcher);
+            drop(receiver);
+            drop(sessions);
+            (
+                weak_context.upgrade().is_none(),
+                weak_sessions.upgrade().is_none(),
+            )
+        }
+
+        assert_eq!(
+            released_after_drop(None).await,
+            (true, true),
+            "the ordinary idle session fixture must release both owners"
+        );
+        let pending = released_after_drop(Some(Attachment::Pending)).await;
+        let active = released_after_drop(Some(Attachment::Active)).await;
+        assert_eq!(
+            (pending, active),
+            ((true, true), (true, true)),
+            "both pending and active recipients must release the context and its session store"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_recipient_retires_real_offer_and_launch_without_a_frame() {
+        use zeroclaw_goal::control::GoalSessionDriver;
+
+        for active in [false, true] {
+            for shutdown in [false, true] {
+                let mut fixture = GoalAdmissionFixture::new(RpcAccessPolicy::TrustedLocal).await;
+                const SID: &str = GoalAdmissionFixture::SESSION;
+                let sessions = Arc::clone(&fixture.dispatcher.ctx.sessions);
+                let recipient = sessions
+                    .goal_session_snapshot(SID)
+                    .await
+                    .unwrap()
+                    .goal_recipient;
+                if active {
+                    let driver = fixture.driver("/goal resume").await;
+                    drop(driver.bind_for_launch(&fixture.ingress()).await.unwrap());
+                } else {
+                    fixture.dispatcher.process_line(&json!({
+                        "jsonrpc": "2.0", "id": 1, "method": "session/new",
+                        "params": {"session_id": SID, "agent_alias": "test-agent", "chat_mode": "chat"},
+                    }).to_string()).await;
+                    let reply: Value =
+                        serde_json::from_str(&fixture.receiver.try_recv().unwrap()).unwrap();
+                    assert_eq!(reply["id"], 1);
+                    assert_eq!(reply["result"]["session_id"], SID);
+                }
+                assert!(
+                    fixture.receiver.is_empty(),
+                    "no Goal frame may trigger lazy cleanup"
+                );
+                let (live, offered) = recipient.destinations_for_test();
+                let target = if active {
+                    assert!(offered.is_none());
+                    live.unwrap()
+                } else {
+                    assert!(live.is_none());
+                    offered.unwrap()
+                };
+                assert!(target.upgrade().is_some());
+                if shutdown {
+                    fixture.dispatcher.shutdown().await;
+                } else {
+                    drop(fixture);
+                }
+                assert!(
+                    target.upgrade().is_none(),
+                    "active={active} shutdown={shutdown}"
+                );
+                let (live, offered) = recipient.destinations_for_test();
+                assert!(
+                    live.is_none() && offered.is_none(),
+                    "active={active} shutdown={shutdown}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_recipient_vacant_install_respects_prior_claims_and_install_checks() {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Case {
+            Vacant,
+            Active,
+            Pending,
+            StaleGeneration,
+            DifferentOwner,
+            ClosedRecipient,
+            CancelledDestination,
+            ClosedRegistry,
+        }
+
+        const SID: &str = "vacant-recipient";
+        const TUI: &str = "vacant-recipient-tui";
+        for case in [
+            Case::Vacant,
+            Case::Active,
+            Case::Pending,
+            Case::StaleGeneration,
+            Case::DifferentOwner,
+            Case::ClosedRecipient,
+            Case::CancelledDestination,
+            Case::ClosedRegistry,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut existing, sessions, _existing_rx) =
+                make_acp_test_dispatcher_with_receiver(make_acp_test_config(&tmp));
+            existing.set_tui_id_for_test(Some(TUI.into()));
+            new_chat_session_for_eviction_test(&existing, SID, None).await;
+            let snapshot = sessions.goal_session_snapshot(SID).await.unwrap();
+            let recipient = snapshot.goal_recipient;
+            let (mut generation, mut owner) = (snapshot.generation, TUI);
+            let (sender, _issuer_rx) = tokio::sync::mpsc::channel(4);
+            let mut issuer = RpcDispatcher::new(Arc::clone(&existing.ctx), sender, "issuer".into());
+            issuer.set_authenticated_for_test();
+            issuer.set_tui_id_for_test(Some(TUI.into()));
+            let old = GoalFrameDestination::new(&existing);
+            let target = GoalFrameDestination::new(&issuer);
+            match case {
+                Case::Vacant => {}
+                Case::Active => assert!(
+                    sessions
+                        .attach_goal_recipient(SID, generation, TUI, Arc::clone(&old))
+                        .await
+                ),
+                Case::Pending => assert!(
+                    sessions
+                        .offer_goal_recipient(SID, generation, TUI, Arc::clone(&old))
+                        .await
+                ),
+                Case::StaleGeneration => generation += 1,
+                Case::DifferentOwner => owner = "different-fixture-tui",
+                Case::ClosedRecipient => recipient.close_for_test(),
+                Case::CancelledDestination => issuer.connection_cancel.cancel(),
+                Case::ClosedRegistry => issuer.retire_goal_destinations(),
+            }
+            assert_eq!(
+                target.cancelled().is_cancelled(),
+                case == Case::CancelledDestination
+            );
+            assert_eq!(
+                issuer.goal_destinations.lock().is_closed_for_test(),
+                case == Case::ClosedRegistry
+            );
+            let (epoch, superseded) = recipient.epoch_for_test();
+            let installed = sessions
+                .attach_vacant_goal_recipient(SID, generation, owner, Arc::clone(&target))
+                .await;
+            assert_eq!(installed, case == Case::Vacant, "{case:?}");
+            assert_eq!(
+                issuer.goal_destinations.lock().len_for_test(),
+                usize::from(installed),
+                "{case:?}"
+            );
+            assert_eq!(
+                recipient.epoch_for_test().0,
+                epoch + u64::from(installed),
+                "{case:?}"
+            );
+            assert_eq!(superseded.is_cancelled(), installed, "{case:?}");
+            let (active, pending) = recipient.destinations_for_test();
+            match case {
+                Case::Vacant => {
+                    assert!(active.unwrap().ptr_eq(&Arc::downgrade(&target)));
+                    assert!(pending.is_none());
+                }
+                Case::Active => {
+                    assert!(active.unwrap().ptr_eq(&Arc::downgrade(&old)));
+                    assert!(pending.is_none());
+                }
+                Case::Pending => {
+                    assert!(active.is_none());
+                    assert!(pending.unwrap().ptr_eq(&Arc::downgrade(&old)));
+                }
+                _ => assert!(active.is_none() && pending.is_none(), "{case:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_recipient_teardown_preserves_the_successor_and_prunes_retired_bindings() {
+        use crate::rpc::session::{GoalFrameClass, GoalFrameDelivery};
+
+        const SESSION: &str = "recipient-cutover";
+        const SUCCESSOR_SESSION: &str = "recipient-next-session";
+        const TUI: &str = "reattaching-fixture";
+        for (successor_is_active, shutdown) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut old, sessions, _old_receiver) =
+                make_acp_test_dispatcher_with_receiver(make_acp_test_config(&tmp));
+            old.set_tui_id_for_test(Some(TUI.into()));
+            new_chat_session_for_eviction_test(&old, SESSION, None).await;
+            let generation = sessions.get_generation(SESSION).await.unwrap();
+            let (tx, mut receiver) = tokio::sync::mpsc::channel(64);
+            let mut successor = RpcDispatcher::new(Arc::clone(&old.ctx), tx, "successor".into());
+            successor.set_authenticated_for_test();
+            successor.set_tui_id_for_test(Some(TUI.into()));
+
+            // Launch from a spawned authorization handle, not from the root.
+            let spawned = old.spawn_handle();
+            let old_target = GoalFrameDestination::new(&spawned);
+            let weak_old_target = Arc::downgrade(&old_target);
+            assert!(
+                sessions
+                    .attach_goal_recipient(SESSION, generation, TUI, old_target)
+                    .await
+            );
+            for _ in 0..3 {
+                assert!(
+                    sessions
+                        .offer_goal_recipient(
+                            SESSION,
+                            generation,
+                            TUI,
+                            GoalFrameDestination::new(&spawned),
+                        )
+                        .await
+                );
+            }
+            assert_eq!(old.goal_destinations.lock().len_for_test(), 1);
+            assert!(weak_old_target.upgrade().is_some());
+
+            let new_target = GoalFrameDestination::new(&successor);
+            let weak_new_target = Arc::downgrade(&new_target);
+            assert!(
+                sessions
+                    .offer_goal_recipient(SESSION, generation, TUI, new_target)
+                    .await
+            );
+            let promote = || async {
+                let history = sessions
+                    .goal_history_read(SESSION, &successor.rpc)
+                    .await
+                    .unwrap();
+                sessions
+                    .with_session_effect(SESSION, |live| {
+                        history.promote(live.unwrap(), &successor.rpc);
+                    })
+                    .await;
+            };
+            let old_pending = if successor_is_active {
+                promote().await;
+                let target = GoalFrameDestination::new(&spawned);
+                let weak = Arc::downgrade(&target);
+                assert!(
+                    sessions
+                        .offer_goal_recipient(SESSION, generation, TUI, target)
+                        .await
+                );
+                assert!(weak.upgrade().is_some());
+                Some(weak)
+            } else {
+                None
+            };
+            if shutdown {
+                old.shutdown().await;
+                assert!(old.goal_destinations.lock().is_closed_for_test());
+                assert!(
+                    !sessions
+                        .attach_goal_recipient(
+                            SESSION,
+                            generation,
+                            TUI,
+                            GoalFrameDestination::new(&spawned),
+                        )
+                        .await
+                );
+                assert!(weak_old_target.upgrade().is_none());
+                assert!(
+                    old_pending
+                        .as_ref()
+                        .is_none_or(|target| target.upgrade().is_none())
+                );
+                assert!(weak_new_target.upgrade().is_some());
+            }
+            drop(spawned);
+            drop(old);
+            assert!(weak_old_target.upgrade().is_none());
+            assert!(
+                old_pending
+                    .as_ref()
+                    .is_none_or(|target| target.upgrade().is_none())
+            );
+            assert!(weak_new_target.upgrade().is_some());
+            if !successor_is_active {
+                promote().await;
+            }
+
+            let recipient = sessions
+                .goal_session_snapshot(SESSION)
+                .await
+                .unwrap()
+                .goal_recipient;
+            let frame = "fixture goal frame".to_owned();
+            assert_eq!(
+                sessions
+                    .publish_goal_frame(
+                        SESSION,
+                        &recipient,
+                        frame.clone(),
+                        GoalFrameClass::ParentEvent
+                    )
+                    .await,
+                GoalFrameDelivery::Delivered
+            );
+            assert_eq!(receiver.try_recv().unwrap(), frame);
+            assert!(sessions.remove(SESSION).await);
+            assert!(weak_new_target.upgrade().is_none());
+            drop(recipient);
+
+            new_chat_session_for_eviction_test(&successor, SUCCESSOR_SESSION, None).await;
+            let generation = sessions.get_generation(SUCCESSOR_SESSION).await.unwrap();
+            for _ in 0..3 {
+                assert!(
+                    sessions
+                        .attach_goal_recipient(
+                            SUCCESSOR_SESSION,
+                            generation,
+                            TUI,
+                            GoalFrameDestination::new(&successor),
+                        )
+                        .await
+                );
+            }
+            let registrations = successor.goal_destinations.lock();
+            assert_eq!(registrations.len_for_test(), 1);
+        }
     }
 
     /// Create a Chat-mode session through the real `session/new` handler,
@@ -43962,6 +46754,9 @@ mod tests {
 
     #[tokio::test]
     async fn session_mode_replacement_construction_failure_preserves_both_modes() {
+        use zeroclaw_api::task::TaskStatus;
+        use zeroclaw_goal::{GoalTransitionResult, control::GoalSessionKey};
+
         for (original_mode, target_mode) in [("chat", "acp"), ("acp", "chat")] {
             let tmp = tempfile::TempDir::new().unwrap();
             let config = make_acp_test_config(&tmp);
@@ -44003,6 +46798,47 @@ mod tests {
             let chat_before = chat_backend.load(&format!("rpc_{sid}"));
             let acp_before = acp_store.load_session(sid).unwrap();
 
+            let goal_before = if original_mode == "chat" {
+                let registry = connection_test_support::install_paused_goal_control_fixture(
+                    &dispatcher.ctx,
+                    tmp.path(),
+                    sid,
+                )
+                .await;
+                let key = GoalSessionKey::zero_code(sid).unwrap().durable_id();
+                let started = registry
+                    .current_goal_for_session(&key)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    registry
+                        .finish_session_goal(
+                            &started.id,
+                            &key,
+                            started.execution_epoch,
+                            TaskStatus::Completed,
+                            None,
+                        )
+                        .await
+                        .unwrap(),
+                    GoalTransitionResult::Applied
+                );
+                let completed = registry
+                    .current_goal_for_session(&key)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let extension = registry
+                    .get_goal_task(&completed.id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                Some((registry, key, completed, extension))
+            } else {
+                None
+            };
+
             publish_test_config(&dispatcher.ctx, |config| {
                 config.agents.get_mut("test-agent").unwrap().model_provider =
                     "openai.missing-profile".into();
@@ -44020,6 +46856,18 @@ mod tests {
                 &sessions.get_agent(sid).await.unwrap()
             ));
             assert_eq!(sessions.get_generation(sid).await, Some(generation));
+            if let Some((registry, key, completed, extension)) = goal_before {
+                assert_eq!(
+                    serde_json::to_value(registry.current_goal_for_session(&key).await.unwrap())
+                        .unwrap(),
+                    serde_json::to_value(Some(completed.clone())).unwrap(),
+                    "rejected replacement must preserve the old session's completed Goal"
+                );
+                assert_eq!(
+                    registry.get_goal_task(&completed.id).await.unwrap(),
+                    Some(extension)
+                );
+            }
             assert_eq!(
                 serde_json::to_value(original.lock().await.history()).unwrap(),
                 serde_json::to_value(&original_history).unwrap()
@@ -48802,6 +51650,443 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_sqlite_delete_storage_failure_retains_exact_completed_goal() {
+        use zeroclaw_api::task::TaskStatus;
+        use zeroclaw_goal::{GoalTransitionResult, control::GoalSessionKey};
+
+        async fn request(
+            dispatcher: &mut RpcDispatcher,
+            replies: &mut tokio::sync::mpsc::Receiver<String>,
+            method: &str,
+            params: Value,
+        ) -> Value {
+            dispatcher
+                .process_line(
+                    &json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+                        .to_string(),
+                )
+                .await;
+            while let Ok(frame) = replies.try_recv() {
+                let response: Value = serde_json::from_str(&frame).unwrap();
+                if response["id"] == 1 {
+                    return response;
+                }
+            }
+            panic!("missing native {method} reply");
+        }
+
+        const SID: &str = "sqlite-delete-goal-retention";
+        const KEY: &str = "rpc_sqlite-delete-goal-retention";
+        for reaped in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = two_user_config(&tmp);
+            let data_dir = config.data_dir.clone();
+            let (fixture, sessions, chat, _) = make_persistence_test_dispatcher(config, &data_dir);
+            let (tx, mut replies) = tokio::sync::mpsc::channel(64);
+            let mut owner = RpcDispatcher::new(Arc::clone(&fixture.ctx), tx, "unix:test".into())
+                .with_transport(
+                    crate::rpc::transport::TransportKind::Local,
+                    crate::security::auth_provider::Credential::Peercred { uid: 4242 },
+                );
+            let initialized = request(&mut owner, &mut replies, "initialize", json!({})).await;
+            assert!(initialized.get("result").is_some(), "{initialized}");
+            let open = json!({"agent_alias": "test-agent", "chat_mode": "chat", "session_id": SID});
+            let params = json!({"session_id": SID});
+            let created = request(&mut owner, &mut replies, "session/new", open.clone()).await;
+            assert!(created.get("result").is_some(), "{created}");
+            let original_generation = sessions.get_generation(SID).await.unwrap();
+            let original_agent = sessions.get_agent(SID).await.unwrap();
+            chat.append(KEY, &ChatMessage::user("fixture question"))
+                .unwrap();
+            chat.append(KEY, &ChatMessage::assistant("fixture answer"))
+                .unwrap();
+            chat.set_session_name(KEY, "retained fixture").unwrap();
+
+            let registry = connection_test_support::install_paused_goal_control_fixture(
+                &fixture.ctx,
+                &data_dir,
+                SID,
+            )
+            .await;
+            let goal_key = GoalSessionKey::zero_code(SID).unwrap().durable_id();
+            assert_eq!(goal_key, KEY);
+            let paused = registry
+                .current_goal_for_session(&goal_key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                registry
+                    .finish_session_goal(
+                        &paused.id,
+                        &goal_key,
+                        paused.execution_epoch,
+                        TaskStatus::Completed,
+                        None,
+                    )
+                    .await
+                    .unwrap(),
+                GoalTransitionResult::Applied
+            );
+            let completed = registry
+                .current_goal_for_session(&goal_key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(completed.status, TaskStatus::Completed);
+            let completed_row = serde_json::to_value(&completed).unwrap();
+            let extension = registry
+                .get_goal_task(&completed.id)
+                .await
+                .unwrap()
+                .unwrap();
+
+            if reaped {
+                assert!(
+                    fixture
+                        .ctx
+                        .goal_runtime
+                        .can_retire_session_goal(SID)
+                        .await
+                        .unwrap()
+                );
+                assert!(fixture.ctx.goal_runtime.supervisor(SID).await.is_none());
+                assert!(sessions.remove(SID).await);
+            } else {
+                assert!(fixture.ctx.goal_runtime.supervisor(SID).await.is_some());
+            }
+            let expected_live_generation = (!reaped).then_some(original_generation);
+            let authorized = owner
+                .authorize_session_owner(SID, Method::SessionDelete)
+                .await
+                .unwrap()
+                .expect("scoped delete resolves an owned session");
+            assert_eq!(authorized.live_generation, expected_live_generation);
+            assert_eq!(authorized.owner.as_deref(), Some("user:alice"));
+            assert!(matches!(
+                authorized.durable,
+                Some(DurableSession::Chat { key }) if key == KEY
+            ));
+            let read_before =
+                request(&mut owner, &mut replies, "session/messages", params.clone()).await;
+            assert_eq!(
+                read_before["result"]["messages"].as_array().unwrap().len(),
+                2
+            );
+            assert_eq!(
+                read_before["result"]["messages"][0]["content"],
+                "fixture question"
+            );
+            assert_eq!(
+                read_before["result"]["messages"][1]["content"],
+                "fixture answer"
+            );
+
+            let db = rusqlite::Connection::open(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::db_path(&data_dir),
+            )
+            .unwrap();
+            let metadata_row = || -> Vec<rusqlite::types::Value> {
+                let mut stmt = db
+                    .prepare("SELECT rowid, * FROM session_metadata WHERE session_key = ?1")
+                    .unwrap();
+                let columns = stmt.column_count();
+                stmt.query_row([KEY], |row| (0..columns).map(|i| row.get(i)).collect())
+                    .unwrap()
+            };
+            let metadata_before = metadata_row();
+            // This trigger can abort only the owned metadata row, after
+            // the backend's first DML has removed its transcript rows.
+            db.execute_batch(
+                "CREATE TRIGGER reject_exact_chat_delete BEFORE DELETE ON session_metadata
+                 WHEN OLD.session_key = 'rpc_sqlite-delete-goal-retention' AND NOT EXISTS (
+                     SELECT 1 FROM sessions WHERE session_key = OLD.session_key
+                 )
+                 BEGIN SELECT RAISE(ABORT, 'fixture rejected metadata delete'); END;",
+            )
+            .unwrap();
+
+            let rejected =
+                request(&mut owner, &mut replies, "session/delete", params.clone()).await;
+            assert_eq!(
+                rejected["error"]["code"], INTERNAL_ERROR,
+                "reaped={reaped}: {rejected}"
+            );
+            assert_eq!(sessions.get_generation(SID).await, expected_live_generation);
+            if !reaped {
+                assert!(Arc::ptr_eq(
+                    &original_agent,
+                    &sessions.get_agent(SID).await.unwrap()
+                ));
+            }
+            let read_after =
+                request(&mut owner, &mut replies, "session/messages", params.clone()).await;
+            assert_eq!(
+                read_after, read_before,
+                "reaped={reaped}: native transcript"
+            );
+            assert_eq!(metadata_row(), metadata_before, "reaped={reaped}: metadata");
+            assert_eq!(
+                serde_json::to_value(registry.current_goal_for_session(&goal_key).await.unwrap())
+                    .unwrap(),
+                completed_row,
+                "reaped={reaped}: exact task row"
+            );
+            assert_eq!(
+                registry.get_goal_task(&completed.id).await.unwrap(),
+                Some(extension),
+                "reaped={reaped}: exact Goal extension"
+            );
+
+            db.execute_batch("DROP TRIGGER reject_exact_chat_delete;")
+                .unwrap();
+            let deleted = request(&mut owner, &mut replies, "session/delete", params.clone()).await;
+            assert_eq!(
+                deleted["result"]["deleted"], true,
+                "reaped={reaped}: {deleted}"
+            );
+            assert!(sessions.get_generation(SID).await.is_none());
+            assert!(chat.get_session_metadata(KEY).is_none());
+            assert!(chat.load(KEY).is_empty());
+            assert!(
+                registry
+                    .current_goal_for_session(&goal_key)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                registry
+                    .get_goal_task(&completed.id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+
+            let reused = request(&mut owner, &mut replies, "session/new", open).await;
+            assert!(reused.get("result").is_some(), "reaped={reaped}: {reused}");
+            let reuse_generation = sessions.get_generation(SID).await.unwrap();
+            assert_ne!(reuse_generation, original_generation);
+            let fresh = request(&mut owner, &mut replies, "session/messages", params).await;
+            assert_eq!(
+                fresh["result"]["messages"],
+                json!([]),
+                "reaped={reaped}: {fresh}"
+            );
+            assert!(
+                registry
+                    .current_goal_for_session(&goal_key)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn chat_jsonl_delete_refusal_keeps_goal_with_malformed_json() {
+        assert_chat_jsonl_delete_refusal_keeps_goal(b"corrupt ordinary JSONL\n").await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn chat_jsonl_delete_refusal_keeps_goal_with_invalid_utf8() {
+        assert_chat_jsonl_delete_refusal_keeps_goal(&[0xff, 0xfe, b'\n']).await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_chat_jsonl_delete_refusal_keeps_goal(malformed_line: &[u8]) {
+        use crate::{
+            control_plane::ControlPlaneHandle,
+            rpc::types::{GoalResponseWire, GoalTaskStatusWire, SessionGoalResult},
+        };
+        use zeroclaw_api::task::TaskStatus;
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        async fn request(
+            dispatcher: &mut RpcDispatcher,
+            replies: &mut tokio::sync::mpsc::Receiver<String>,
+            method: &str,
+            params: Value,
+        ) -> Value {
+            dispatcher
+                .process_line(
+                    &json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+                        .to_string(),
+                )
+                .await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while let Some(frame) = replies.recv().await {
+                    let response: Value = serde_json::from_str(&frame).unwrap();
+                    if response["id"] == 1 {
+                        return response;
+                    }
+                }
+                panic!("writer closed without a native {method} reply");
+            })
+            .await
+            .unwrap_or_else(|_| panic!("timed out awaiting native {method} reply"))
+        }
+
+        const SID: &str = "jsonl-delete-refusal";
+        const KEY: &str = "rpc_jsonl-delete-refusal";
+        let dir = tempfile::tempdir().unwrap();
+        let config = make_acp_test_config(&dir);
+        let data_dir = config.data_dir.clone();
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let chat = Arc::new(zeroclaw_infra::session_store::SessionStore::new(&data_dir).unwrap());
+        let context = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(chat.clone()),
+            None,
+        );
+        let (tx, mut replies) = tokio::sync::mpsc::channel(64);
+        let mut owner = RpcDispatcher::new(Arc::clone(&context), tx, "unix:fixture".into());
+        owner.set_authenticated_for_test();
+        owner.set_tui_id_for_test(Some("jsonl-delete-fixture".into()));
+        assert_eq!(owner.access_policy, RpcAccessPolicy::TrustedLocal);
+        let created = request(
+            &mut owner,
+            &mut replies,
+            "session/new",
+            json!({"agent_alias": "test-agent", "chat_mode": "chat", "session_id": SID}),
+        )
+        .await;
+        assert!(created.get("result").is_some(), "{created}");
+        let generation = sessions.get_generation(SID).await.unwrap();
+        chat.append(KEY, &ChatMessage::user("fixture question"))
+            .unwrap();
+        let registry =
+            connection_test_support::install_paused_goal_control_fixture(&context, &data_dir, SID)
+                .await;
+        let host = crate::rpc::session_disposition::DispositionHost::for_context(&context)
+            .unwrap()
+            .unwrap();
+        let original = registry
+            .current_goal_for_session(KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(original.status, TaskStatus::Paused);
+        let transcript = data_dir.join("sessions").join(format!("{KEY}.jsonl"));
+        let valid = std::fs::read(&transcript).unwrap();
+        let corrupt = [valid.as_slice(), malformed_line].concat();
+        std::fs::write(&transcript, &corrupt).unwrap();
+        assert_eq!(chat.load(KEY)[0].content, "fixture question");
+        assert!(chat.try_load(KEY).is_err());
+        let authorized = owner
+            .authorize_session_owner(SID, Method::SessionDelete)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(authorized.owner, None);
+        assert_eq!(authorized.live_generation, Some(generation));
+        assert!(matches!(authorized.durable, Some(DurableSession::Chat { key }) if key == KEY));
+
+        let params = json!({"session_id": SID});
+        let rejected = request(&mut owner, &mut replies, "session/delete", params.clone()).await;
+        assert_eq!(rejected["error"]["code"], INTERNAL_ERROR, "{rejected}");
+        assert_eq!(
+            rejected["error"]["message"],
+            "Goal Mode could not complete that command. Try again. If the problem continues, ask an operator to check the configuration and logs."
+        );
+        let dispositions = host.store.list_session_dispositions().unwrap();
+        assert_eq!(sessions.get_generation(SID).await, Some(generation));
+        assert_eq!(std::fs::read(&transcript).unwrap(), corrupt);
+        let retained = registry
+            .current_goal_for_session(KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.id, original.id);
+        assert_eq!(retained.execution_epoch, original.execution_epoch);
+        assert_eq!(retained.status, original.status);
+        let status = request(
+            &mut owner,
+            &mut replies,
+            "session/goal",
+            json!({"session_id": SID, "command": "/goal status"}),
+        )
+        .await;
+        assert!(
+            dispositions.is_empty(),
+            "failed delete left {dispositions:?}; status: {status}"
+        );
+        let reopened_handle = ControlPlaneHandle::open(&data_dir).unwrap();
+        let reopened = reopened_handle.session_dispositions().unwrap();
+        assert!(reopened.list_session_dispositions().unwrap().is_empty());
+        let restart_context = RpcContext::for_persistence_tests(
+            context.config.snapshot(),
+            Arc::new(crate::rpc::session::SessionStore::new(
+                16,
+                Arc::new(SessionActorQueue::new(4, 10, 60)),
+            )),
+            Some(chat.clone()),
+            None,
+        );
+        restart_context
+            .goal_runtime
+            .install_test_control_plane(reopened_handle);
+        assert_eq!(
+            restart_context
+                .reconcile_goal_session_dispositions()
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(reopened.list_session_dispositions().unwrap().is_empty());
+        assert!(status.get("result").is_some(), "{status}");
+        let result: SessionGoalResult = serde_json::from_value(status["result"].clone()).unwrap();
+        let GoalResponseWire::Status(status) = result.response else {
+            panic!("expected retained Goal status: {result:?}");
+        };
+        assert_eq!(status.task_id, original.id);
+        assert_eq!(status.execution_epoch, original.execution_epoch);
+        assert_eq!(status.status, GoalTaskStatusWire::Paused);
+        let cancelled = request(
+            &mut owner,
+            &mut replies,
+            "session/goal",
+            json!({"session_id": SID, "command": "/goal cancel"}),
+        )
+        .await;
+        assert!(cancelled.get("result").is_some(), "{cancelled}");
+        let result: SessionGoalResult =
+            serde_json::from_value(cancelled["result"].clone()).unwrap();
+        let GoalResponseWire::Cancelled(status) = result.response else {
+            panic!("expected cancelled Goal status: {result:?}");
+        };
+        assert_eq!(status.task_id, original.id);
+        assert_eq!(status.execution_epoch, original.execution_epoch + 1);
+        assert_eq!(status.status, GoalTaskStatusWire::Cancelled);
+
+        chat.rewrite_messages(KEY, &[ChatMessage::user("fixture question")])
+            .unwrap();
+        let deleted = request(&mut owner, &mut replies, "session/delete", params).await;
+        assert_eq!(deleted["result"]["deleted"], true, "{deleted}");
+        assert!(sessions.get_generation(SID).await.is_none());
+        assert!(!transcript.exists());
+        assert!(reopened.list_session_dispositions().unwrap().is_empty());
+        assert!(
+            registry
+                .current_goal_for_session(KEY)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            registry
+                .get_goal_task(&original.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn reaped_delete_with_unknown_id_does_not_dispose_orphan_goal() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
@@ -49605,6 +52890,284 @@ mod tests {
             message,
             chat if chat.content.contains(&synthetic) || chat.content.contains(&neutral)
         )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn goal_bound_acp_close_commits_in_hard_cancel_finalizer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use zeroclaw_api::task::TaskStatus;
+        use zeroclaw_goal::{GoalTransitionResult, control::GoalSessionKey};
+
+        const SID: &str = "acp-hard-close-completed-goal";
+        const WATCHDOG: Duration = Duration::from_secs(8);
+
+        struct PauseFirstEnd {
+            calls: Arc<AtomicUsize>,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait]
+        impl crate::hooks::HookHandler for PauseFirstEnd {
+            fn name(&self) -> &str {
+                "hard-close-end"
+            }
+
+            async fn on_session_end(&self, session_id: &str, channel: &str) {
+                assert_eq!((session_id, channel), (SID, "rpc"));
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+            }
+        }
+
+        for revoke in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config = two_user_config_with_administrator_alice(&tmp);
+            let workspace = config.agent_workspace_dir("test-agent");
+            std::fs::create_dir_all(&workspace).unwrap();
+            let workspace = workspace.canonicalize().unwrap();
+            let cwd = workspace.to_str().unwrap();
+            let data_dir = config.data_dir.clone();
+            let (mut dispatcher, sessions, _, acp) =
+                make_persistence_test_dispatcher(config, &data_dir);
+
+            let end_calls = Arc::new(AtomicUsize::new(0));
+            let end_entered = Arc::new(tokio::sync::Notify::new());
+            let release_end = Arc::new(tokio::sync::Notify::new());
+            if !revoke {
+                let mut hooks = crate::hooks::HookRunner::new();
+                hooks.register(Box::new(PauseFirstEnd {
+                    calls: Arc::clone(&end_calls),
+                    entered: Arc::clone(&end_entered),
+                    release: Arc::clone(&release_end),
+                }));
+                Arc::get_mut(&mut dispatcher.ctx).unwrap().hooks = Some(Arc::new(hooks));
+            }
+
+            acp.create_session(SID, "test-agent", cwd, Some("user:bob"))
+                .unwrap();
+            acp.append_turn(
+                SID,
+                &[
+                    ConversationMessage::Chat(ChatMessage::user("previous question")),
+                    ConversationMessage::Chat(ChatMessage::assistant("previous durable answer")),
+                ],
+            )
+            .unwrap();
+            let (pause, turn_entered, _never_release) =
+                crate::agent::agent::TestTurnEntryPause::new();
+            let agent = crate::agent::agent::Agent::builder()
+                .model_provider(Box::new(FailingProvider))
+                .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ))
+                .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+                .observer(Arc::new(crate::observability::noop::NoopObserver))
+                .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+                .workspace_dir(workspace.clone())
+                .agent_alias("test-agent".to_string())
+                .test_turn_entry_pause(pause)
+                .build()
+                .unwrap();
+            let mut live = crate::rpc::session::RpcSession::new(
+                agent,
+                "test-agent",
+                cwd,
+                crate::rpc::types::ChatMode::Acp,
+            );
+            live.owner_principal_id = Some("user:bob".into());
+            sessions.insert(SID.into(), live).await.unwrap();
+            let old_generation = sessions.get_generation(SID).await.unwrap();
+
+            let registry = connection_test_support::install_paused_goal_control_fixture(
+                &dispatcher.ctx,
+                &data_dir,
+                SID,
+            )
+            .await;
+            let key = GoalSessionKey::zero_code(SID).unwrap().durable_id();
+            let paused = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                registry
+                    .finish_session_goal(
+                        &paused.id,
+                        &key,
+                        paused.execution_epoch,
+                        TaskStatus::Completed,
+                        None,
+                    )
+                    .await
+                    .unwrap(),
+                GoalTransitionResult::Applied,
+            );
+            let completed = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(completed.status, TaskStatus::Completed);
+            let completed_row = serde_json::to_value(&completed).unwrap();
+            let extension = registry
+                .get_goal_task(&completed.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let disposition_store = dispatcher
+                .ctx
+                .goal_runtime
+                .current_control_plane()
+                .unwrap()
+                .session_dispositions()
+                .unwrap();
+
+            let (owner, _owner_frames) = roster_peer(&dispatcher.ctx, 4343).await;
+            let (administrator, _administrator_frames) = roster_peer(&dispatcher.ctx, 4242).await;
+            let prompt_handle = owner.spawn_handle();
+            let prompt = zeroclaw_spawn::spawn!(async move {
+                prompt_handle
+                    .handle_session_prompt(&json!({
+                        "session_id": SID, "prompt": "interrupted before provider",
+                    }))
+                    .await
+            });
+            tokio::time::timeout(WATCHDOG, turn_entered.notified())
+                .await
+                .unwrap();
+            assert!(
+                !prompt.is_finished(),
+                "prompt remains blocked inside the Agent"
+            );
+
+            let (close_entered, release_signal, signal_attempted) =
+                sessions.set_test_removal_signal_pause();
+            let close = zeroclaw_spawn::spawn!(async move {
+                administrator
+                    .handle_session_close(&json!({"session_id": SID}))
+                    .await
+            });
+            tokio::time::timeout(WATCHDOG, close_entered.notified())
+                .await
+                .unwrap();
+            release_signal.notify_one();
+            tokio::time::timeout(WATCHDOG, signal_attempted.notified())
+                .await
+                .unwrap();
+            let signalled_at = tokio::time::Instant::now();
+            assert!(!prompt.is_finished());
+            assert!(!close.is_finished());
+            assert_eq!(sessions.session_queue.queue_depth(SID).await, 2);
+            assert_eq!(
+                serde_json::to_value(registry.current_goal_for_session(&key).await.unwrap())
+                    .unwrap(),
+                completed_row,
+                "cancellation without a committed close must not change the Goal",
+            );
+
+            if revoke {
+                set_alice_administrator(&dispatcher.ctx, false);
+            } else {
+                // Tokio auto-advances this paused clock to the real RPC
+                // cancellation grace. Never release the Agent entry gate.
+                tokio::time::timeout(WATCHDOG, end_entered.notified())
+                    .await
+                    .unwrap();
+                assert!(signalled_at.elapsed() >= Duration::from_secs(5));
+                let depth_at_end = sessions.session_queue.queue_depth(SID).await;
+                let prompt_still_owns_actor = !prompt.is_finished();
+                let close_waiting = !close.is_finished();
+                let removed_generation = sessions.get_generation(SID).await;
+                let cleared_goal = registry
+                    .current_goal_for_session(&key)
+                    .await
+                    .unwrap()
+                    .is_none();
+                let cleared_extension = registry
+                    .get_goal_task(&completed.id)
+                    .await
+                    .unwrap()
+                    .is_none();
+                let cleared_disposition = disposition_store
+                    .session_disposition(&key)
+                    .unwrap()
+                    .is_none();
+                release_end.notify_one();
+
+                assert_eq!(
+                    depth_at_end, 2,
+                    "prompt must still own the actor during the end hook"
+                );
+                assert!(prompt_still_owns_actor && close_waiting);
+                assert_eq!(removed_generation, None);
+                assert!(cleared_goal && cleared_extension && cleared_disposition);
+            }
+
+            let prompt_result = tokio::time::timeout(WATCHDOG, prompt)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(prompt_result["stop_reason"], "cancelled");
+            assert_eq!(prompt_result["content"], "");
+            let result = tokio::time::timeout(WATCHDOG, close)
+                .await
+                .unwrap()
+                .unwrap();
+            if revoke {
+                assert_eq!(result.unwrap_err().code, FORBIDDEN);
+                assert_eq!(
+                    serde_json::to_value(registry.current_goal_for_session(&key).await.unwrap())
+                        .unwrap(),
+                    completed_row,
+                );
+                assert_eq!(
+                    registry.get_goal_task(&completed.id).await.unwrap(),
+                    Some(extension)
+                );
+            } else {
+                assert_eq!(result.unwrap()["closed"], true);
+                assert_eq!(end_calls.load(Ordering::SeqCst), 1);
+            }
+            assert!(
+                disposition_store
+                    .session_disposition(&key)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!acp.is_session_killed(SID).unwrap());
+            assert!(
+                acp.recover_turn_checkpoint(SID, "interrupted").unwrap(),
+                "close must leave the real ACP hard-abort checkpoint recoverable",
+            );
+            let data = acp.load_session(SID).unwrap().unwrap();
+            for expected in ["previous durable answer", "interrupted before provider"] {
+                assert!(data.messages.iter().any(|message| matches!(
+                    message, ConversationMessage::Chat(chat) if chat.content == expected
+                )));
+            }
+            if !revoke {
+                owner
+                    .handle_session_new_for_test(&json!({
+                        "agent_alias": "test-agent", "chat_mode": "acp", "session_id": SID,
+                    }))
+                    .await
+                    .unwrap();
+                assert_ne!(sessions.get_generation(SID).await.unwrap(), old_generation);
+                assert!(
+                    registry
+                        .current_goal_for_session(&key)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]

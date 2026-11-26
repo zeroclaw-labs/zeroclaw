@@ -2580,6 +2580,7 @@ impl Chat {
                     };
                     state.message_count = msgs.total;
                     state.load_history(msgs.messages, self.pane_kind == PaneKind::Acp);
+                    state.goal_join_state = GoalJoinState::for_resume(self.pane_kind);
                 }
                 // The carried entry remains canonical until both session/new
                 // and durable-history replay succeed.
@@ -2784,6 +2785,7 @@ impl Chat {
         };
         state.message_count = msgs.total;
         state.load_history(msgs.messages, self.pane_kind == PaneKind::Acp);
+        state.goal_join_state = GoalJoinState::for_resume(self.pane_kind);
         Ok(state)
     }
 
@@ -3041,8 +3043,8 @@ impl Chat {
                 state.mark_dirty_append();
             }
             GoalUpdate::VerifiedCandidate { candidate, .. } => {
-                // Ordinary session/update chunks are authoritative when present;
-                // the full candidate is a fallback for clients that missed them.
+                // Recover the full response and its marked tail only while
+                // this reattached pane has not committed any live text.
                 state.finish_goal_output(candidate);
             }
             GoalUpdate::Completed { .. } => {
@@ -10694,6 +10696,35 @@ struct CopyFeedback {
     shown_at: Instant,
 }
 
+#[derive(Debug, Default)]
+enum GoalJoinState {
+    #[default]
+    Inactive,
+    Joined {
+        presentation_from: Option<usize>,
+    },
+    // A tool inside one provider response can have committed a fragment.
+    // Keep that visible fragment and the remainder instead of repeating it.
+    TextCommitted,
+}
+
+impl GoalJoinState {
+    fn for_resume(pane_kind: PaneKind) -> Self {
+        match pane_kind {
+            PaneKind::Chat => Self::Joined {
+                presentation_from: None,
+            },
+            PaneKind::Acp => Self::Inactive,
+        }
+    }
+
+    fn record_text_commit(&mut self) {
+        if matches!(self, Self::Joined { .. }) {
+            *self = Self::TextCommitted;
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ChatState {
     pub session_id: String,
@@ -10752,6 +10783,8 @@ pub struct ChatState {
     /// Used by `commit_turn` to decide whether `full_text` is a fallback
     /// (no streaming happened) or a duplicate (streaming already committed).
     turn_had_streaming_text: bool,
+    /// The first Goal turn after reattaching can already be in progress.
+    goal_join_state: GoalJoinState,
     /// Agent-message entry committed by prompt-response fallback while its
     /// terminal notification may still be in flight. Continuation chunks for
     /// the same local generation extend this entry instead of creating a
@@ -10914,6 +10947,7 @@ impl ChatState {
             turn_generation: 0,
             optimistic_user_message: None,
             turn_had_streaming_text: false,
+            goal_join_state: GoalJoinState::Inactive,
             prompt_settled_stream_entry: None,
             turn_had_tool_calls: false,
             turn_status: TurnStatus::Idle,
@@ -12494,6 +12528,7 @@ impl ChatState {
         if !text.is_empty() {
             self.entries
                 .push(ChatEntry::AgentMessage(Arc::<str>::from(text)));
+            self.goal_join_state.record_text_commit();
             self.mark_dirty_append();
             true
         } else {
@@ -12550,7 +12585,11 @@ impl ChatState {
         }
 
         match update {
-            SessionUpdate::AgentMessageChunk { text, .. } => {
+            SessionUpdate::AgentMessageChunk {
+                text,
+                presentation_only,
+                ..
+            } => {
                 self.invalidate_url_interactions();
                 if !self.turn_in_flight && self.append_to_prompt_settled_stream(&text) {
                     return;
@@ -12559,6 +12598,11 @@ impl ChatState {
                 // so it appears inline at the right position, not piled at the end.
                 if self.streaming_text.is_empty() {
                     self.flush_streaming_thought();
+                }
+                if presentation_only
+                    && let GoalJoinState::Joined { presentation_from } = &mut self.goal_join_state
+                {
+                    presentation_from.get_or_insert(self.streaming_text.len());
                 }
                 self.streaming_text.push_str(&text);
                 // Guard: don't mutate turn_status after commit_turn has already
@@ -12894,6 +12938,29 @@ impl ChatState {
     // Finishing the Goal's presentation cannot settle an ordinary prompt
     // that the UI has submitted but the daemon has not yet admitted.
     fn finish_goal_output(&mut self, fallback: &str) {
+        if let GoalJoinState::Joined { presentation_from } =
+            std::mem::take(&mut self.goal_join_state)
+            && !fallback.is_empty()
+        {
+            let tail = presentation_from.map_or(Some(""), |start| self.streaming_text.get(start..));
+            debug_assert!(
+                tail.is_some(),
+                "Goal presentation offset must bound the current text"
+            );
+            if let Some(tail) = tail {
+                if !self.streaming_text.is_empty() {
+                    if tail.is_empty() {
+                        fallback.clone_into(&mut self.streaming_text);
+                    } else {
+                        let mut recovered = String::with_capacity(fallback.len() + tail.len());
+                        recovered.push_str(fallback);
+                        recovered.push_str(tail);
+                        self.streaming_text = recovered;
+                    }
+                }
+                self.turn_had_streaming_text = false;
+            }
+        }
         let streamed = self.flush_streaming_text() || self.turn_had_streaming_text;
         self.flush_streaming_thought();
         if !streamed && !fallback.is_empty() {
@@ -12947,6 +13014,7 @@ impl ChatState {
             self.turn_had_streaming_text = true;
             let entry_index = self.entries.len();
             self.entries.push(ChatEntry::AgentMessageContinuation(text));
+            self.goal_join_state.record_text_commit();
             self.prompt_settled_stream_entry = Some((self.turn_generation, entry_index));
             self.mark_dirty_append();
         }
@@ -13474,6 +13542,9 @@ impl ChatState {
         // timeout. Withdraw it so it is answered.
         self.withdraw_pending_elicitation(true);
         self.streaming_text.clear();
+        if let GoalJoinState::Joined { presentation_from } = &mut self.goal_join_state {
+            *presentation_from = None;
+        }
         self.streaming_thought.clear();
         self.turn_in_flight = false;
         self.optimistic_user_message = None;
@@ -13984,6 +14055,8 @@ impl ChatState {
         self.entries.clear();
         self.streaming_text.clear();
         self.streaming_thought.clear();
+        // Reusing this pane for a different session is not a reconnect.
+        self.goal_join_state = GoalJoinState::Inactive;
         self.transcript_layout.reset();
         self.entry_rects.clear();
         self.tool_header_rects.clear();
@@ -14907,6 +14980,7 @@ mod tests {
             SessionUpdate::AgentMessageChunk {
                 session_id: "sess-1".to_string(),
                 text: "/private".to_string(),
+                presentation_only: false,
             },
             SessionUpdate::AgentThoughtChunk {
                 session_id: "sess-1".to_string(),
@@ -21099,6 +21173,7 @@ mod tests {
         running.apply_update(SessionUpdate::AgentMessageChunk {
             session_id: "sess-running".to_string(),
             text: "partial answer".to_string(),
+            presentation_only: false,
         });
         let idle = state_for("sess-idle", "myagent");
         chat.phase = ChatPhase::Active(Box::new(running));
@@ -27228,6 +27303,717 @@ mod tests {
         assert!(!attachment.exists());
     }
 
+    const RECONNECT_PROMPT: &str = "Choose a bounded repair.";
+    const RECONNECT_QUESTION: &str = "Which option should I use?";
+    const RECONNECT_SUFFIX: &str = "should I use?";
+    const P5_FALLBACK_NOTICE: &str = "⚡ requested-native (openai.fixture) was unavailable; this reply was served by served-native (openai.fixture).";
+
+    #[derive(Clone, Copy)]
+    enum GoalReconnectPath {
+        StartResume,
+        AttachEntry,
+        AttachAcp,
+        StartFreshChat,
+    }
+
+    async fn goal_reconnect_chat(
+        path: GoalReconnectPath,
+        question_in_history: bool,
+    ) -> (Chat, mpsc::Receiver<String>, Arc<RpcOutbound>) {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let pane_kind = if matches!(path, GoalReconnectPath::AttachAcp) {
+            PaneKind::Acp
+        } else {
+            PaneKind::Chat
+        };
+        let resumed = !matches!(path, GoalReconnectPath::StartFreshChat);
+        let mut chat = Chat::new(rpc, pane_kind);
+        let entry = resume_entry("sess-1", "myagent", true);
+        let client = async {
+            match path {
+                GoalReconnectPath::StartResume => {
+                    chat.set_resume_sessions(vec![entry]);
+                    assert!(matches!(
+                        chat.start_session("myagent", None).await,
+                        SessionStartOutcome::Started
+                    ));
+                }
+                GoalReconnectPath::AttachEntry | GoalReconnectPath::AttachAcp => {
+                    let attached = chat.attach_resume_entry(&entry).await.expect("reattach");
+                    chat.phase = ChatPhase::Active(Box::new(attached));
+                }
+                GoalReconnectPath::StartFreshChat => {
+                    assert!(matches!(
+                        chat.start_session("myagent", Some("/w")).await,
+                        SessionStartOutcome::Started
+                    ));
+                }
+            }
+        };
+        let peer = async {
+            let request = next_rpc_request(&mut rx, "session builder must send session/new").await;
+            assert_eq!(request["method"], method::SESSION_NEW);
+            assert_eq!(request["params"]["agent_alias"], "myagent");
+            if resumed {
+                assert_eq!(request["params"]["session_id"], "sess-1");
+                assert!(request["params"]["cwd"].is_null());
+            } else {
+                assert!(request["params"]["session_id"].is_null());
+                assert_eq!(request["params"]["cwd"], "/w");
+            }
+            if pane_kind == PaneKind::Acp {
+                assert_eq!(request["params"]["chat_mode"], "acp");
+                assert_eq!(request["params"]["exclude_memory"], true);
+            } else {
+                assert!(request["params"]["chat_mode"].is_null());
+            }
+            respond_ok(
+                &outbound,
+                &request,
+                serde_json::json!({ "session_id": "sess-1", "workspace_dir": "/w" }),
+            );
+            let request =
+                next_rpc_request(&mut rx, "session builder requests model identity").await;
+            assert_eq!(request["method"], method::CONFIG_LIST);
+            respond_ok(&outbound, &request, serde_json::json!([]));
+            if !resumed {
+                return;
+            }
+            let request = next_rpc_request(&mut rx, "reconnect must load history").await;
+            assert_eq!(request["method"], "session/messages");
+            assert_eq!(request["params"]["session_id"], "sess-1");
+            let mut messages = vec![serde_json::json!({
+                "role": "user", "content": RECONNECT_PROMPT,
+            })];
+            if question_in_history {
+                messages.push(serde_json::json!({
+                    "role": "assistant", "content": RECONNECT_QUESTION,
+                }));
+            }
+            respond_ok(
+                &outbound,
+                &request,
+                serde_json::json!({ "messages": messages, "total": messages.len() }),
+            );
+        };
+        tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(client, peer) })
+            .await
+            .expect("scripted session builder must finish");
+
+        if !resumed {
+            assert!(active_state(&mut chat).entries().is_empty());
+            return (chat, rx, outbound);
+        }
+        let mut expected = vec![ChatEntry::UserMessage {
+            text: Some(RECONNECT_PROMPT.into()),
+            attachments: vec![],
+        }];
+        if question_in_history {
+            expected.push(ChatEntry::AgentMessage(RECONNECT_QUESTION.into()));
+        }
+        assert_eq!(active_state(&mut chat).entries(), expected.as_slice());
+        (chat, rx, outbound)
+    }
+
+    fn reconnect_chunk(chat: &Chat, text: &str) {
+        chat.rpc.push_notification_for_test(
+            "session/update",
+            serde_json::json!({
+                "type": "agent_message_chunk", "session_id": "sess-1", "text": text,
+            }),
+        );
+    }
+
+    fn reconnect_candidate(chat: &Chat, text: &str) {
+        chat.rpc.push_notification_for_test(
+            "session/goal_update",
+            serde_json::json!({ "verified_candidate": { "session_id": "sess-1", "candidate": text } }),
+        );
+    }
+
+    fn p5_marked_chunk(chat: &Chat, text: &str) {
+        chat.rpc.push_notification_for_test(
+            "session/update",
+            serde_json::json!({
+                "type": "agent_message_chunk", "session_id": "sess-1", "text": text,
+                "presentation_only": true,
+            }),
+        );
+    }
+
+    fn p5_tool(chat: &Chat, name: &str) -> ChatEntry {
+        chat.rpc.push_notification_for_test(
+            "session/update",
+            serde_json::json!({
+                "type": "tool_call", "session_id": "sess-1", "tool_call_id": "p5-tool",
+                "name": name, "raw_input": {},
+            }),
+        );
+        chat.rpc.push_notification_for_test(
+            "session/update",
+            serde_json::json!({
+                "type": "tool_result", "session_id": "sess-1", "tool_call_id": "p5-tool",
+                "raw_output": "p5 result",
+            }),
+        );
+        ChatEntry::Tool {
+            tool_call_id: "p5-tool".into(),
+            name: name.into(),
+            input_json: "{}".into(),
+            result: Some("p5 result".into()),
+        }
+    }
+
+    fn reconnect_pause(chat: &Chat) -> ChatEntry {
+        chat.rpc.push_notification_for_test(
+            "session/goal_update",
+            serde_json::json!({ "paused_for_blocker": { "session_id": "sess-1" } }),
+        );
+        ChatEntry::SystemMessage(crate::i18n::t("zc-goal-paused").into())
+    }
+
+    #[tokio::test]
+    async fn goal_reconnect_replaces_only_live_suffix_and_keeps_event_order() {
+        // Both builders must reconcile the same live suffix. A resume with no
+        // streamed text would exercise the old fallback and miss this bug.
+        for path in [
+            GoalReconnectPath::StartResume,
+            GoalReconnectPath::AttachEntry,
+        ] {
+            let (mut chat, _writer_rx, _outbound) = goal_reconnect_chat(path, true).await;
+            let mut expected = active_state(&mut chat).entries().to_vec();
+            chat.rpc.push_notification_for_test(
+                "session/update",
+                serde_json::json!({
+                    "type": "agent_thought_chunk", "session_id": "sess-1", "text": "t1",
+                }),
+            );
+            chat.rpc.push_notification_for_test(
+                "session/update",
+                serde_json::json!({
+                    "type": "tool_call", "session_id": "sess-1", "tool_call_id": "call-x",
+                    "name": "X", "raw_input": {},
+                }),
+            );
+            chat.rpc.push_notification_for_test(
+                "session/update",
+                serde_json::json!({
+                    "type": "tool_result", "session_id": "sess-1", "tool_call_id": "call-x",
+                    "raw_output": "result X",
+                }),
+            );
+            reconnect_chunk(&chat, RECONNECT_SUFFIX);
+            reconnect_candidate(&chat, RECONNECT_QUESTION);
+            expected.extend([
+                ChatEntry::AgentThought("t1".into()),
+                ChatEntry::Tool {
+                    tool_call_id: "call-x".into(),
+                    name: "X".into(),
+                    input_json: "{}".into(),
+                    result: Some("result X".into()),
+                },
+                ChatEntry::AgentMessage(RECONNECT_QUESTION.into()),
+                reconnect_pause(&chat),
+            ]);
+            chat.tick_transport_events();
+            assert_eq!(active_state(&mut chat).entries(), expected.as_slice());
+            assert_reconnect_question_in_terminal(&mut chat);
+
+            reconnect_chunk(&chat, "next answer");
+            reconnect_candidate(&chat, "next answer.");
+            expected.push(ChatEntry::AgentMessage("next answer".into()));
+            chat.tick_transport_events();
+            assert_eq!(active_state(&mut chat).entries(), expected.as_slice());
+        }
+    }
+
+    fn assert_reconnect_question_in_terminal(chat: &mut Chat) {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut acp = crate::acp::Acp::new(chat.rpc.clone());
+        let mut terminal = Terminal::new(TestBackend::new(120, 48)).unwrap();
+        terminal
+            .draw(|frame| {
+                crate::app::draw_app_frame(
+                    frame,
+                    crate::app::Mode::Chat,
+                    chat,
+                    &mut acp,
+                    |frame, rows, chat, _acp| {
+                        chat.draw_with_dock(frame, rows[1], None, None);
+                        chat.draw_dock_overlay(frame);
+                    },
+                );
+            })
+            .unwrap();
+        let area = active_state(chat)
+            .transcript_snapshot
+            .as_ref()
+            .expect("production chat draw captures transcript area")
+            .area;
+        let rendered = overlay_text(&terminal, area);
+        let paused = crate::i18n::t("zc-goal-paused");
+        assert_eq!(
+            rendered.matches(RECONNECT_QUESTION).count(),
+            2,
+            "{rendered}"
+        );
+        assert_eq!(rendered.matches(&paused).count(), 1, "{rendered}");
+        assert!(rendered.rfind(RECONNECT_QUESTION).unwrap() < rendered.find(&paused).unwrap());
+    }
+
+    #[tokio::test]
+    async fn goal_reconnect_preserves_fallback_notice_with_full_candidate() {
+        // The daemon streams this presentation-only attribution after the
+        // answer. Its durable candidate contains only the answer itself.
+        const NOTICE: &str = P5_FALLBACK_NOTICE;
+        let (mut chat, _writer_rx, _outbound) =
+            goal_reconnect_chat(GoalReconnectPath::StartResume, false).await;
+        let history = active_state(&mut chat).entries().to_vec();
+        reconnect_chunk(&chat, RECONNECT_SUFFIX);
+        p5_marked_chunk(&chat, &format!("\n\n{NOTICE}"));
+        reconnect_candidate(&chat, RECONNECT_QUESTION);
+        let paused = reconnect_pause(&chat);
+        chat.tick_transport_events();
+
+        let entries = active_state(&mut chat).entries();
+        assert_eq!(&entries[..history.len()], history.as_slice());
+        let (last, output) = entries[history.len()..].split_last().expect("Goal output");
+        assert_eq!(last, &paused);
+        // The attribution may share the answer row or have its own row.
+        let visible: Vec<_> = output
+            .iter()
+            .flat_map(|entry| match entry {
+                ChatEntry::AgentMessage(text) | ChatEntry::SystemMessage(text) => text.lines(),
+                other => panic!("unexpected Goal output: {other:?}"),
+            })
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(visible, [RECONNECT_QUESTION, NOTICE]);
+    }
+
+    #[tokio::test]
+    async fn goal_reconnect_presentation_tail_at_each_cutover() {
+        let annotations = ["\n\nR", "\n\nN"];
+        for (answer_tail, observed, expected) in [
+            (Some(RECONNECT_SUFFIX), &annotations[1..], "\n\nN"),
+            (None, &annotations[1..], "\n\nN"),
+            (None, &annotations[..], "\n\nR\n\nN"),
+        ] {
+            let (mut chat, _writer_rx, _outbound) =
+                goal_reconnect_chat(GoalReconnectPath::StartResume, false).await;
+            let mut entries = active_state(&mut chat).entries().to_vec();
+            if let Some(tail) = answer_tail {
+                reconnect_chunk(&chat, tail);
+            }
+            for annotation in observed {
+                p5_marked_chunk(&chat, annotation);
+            }
+            reconnect_candidate(&chat, RECONNECT_QUESTION);
+            entries.extend([
+                ChatEntry::AgentMessage(format!("{RECONNECT_QUESTION}{expected}").into()),
+                reconnect_pause(&chat),
+            ]);
+            chat.tick_transport_events();
+            assert_eq!(active_state(&mut chat).entries(), entries.as_slice());
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_reconnect_presentation_preserves_committed_loop_notice_once() {
+        let (mut chat, _writer_rx, _outbound) =
+            goal_reconnect_chat(GoalReconnectPath::StartResume, false).await;
+        let mut expected = active_state(&mut chat).entries().to_vec();
+        reconnect_chunk(&chat, "S\n\n");
+        reconnect_chunk(&chat, "narration");
+        let tool = p5_tool(&chat, "X");
+        reconnect_chunk(&chat, RECONNECT_QUESTION);
+        reconnect_candidate(&chat, &format!("S\n\n{RECONNECT_QUESTION}"));
+        let pause = reconnect_pause(&chat);
+        expected.extend([
+            ChatEntry::AgentMessage("S\n\nnarration".into()),
+            tool,
+            ChatEntry::AgentMessage(RECONNECT_QUESTION.into()),
+            pause,
+        ]);
+        chat.tick_transport_events();
+        assert_eq!(active_state(&mut chat).entries(), expected.as_slice());
+    }
+
+    #[tokio::test]
+    async fn goal_reconnect_presentation_preserves_provider_tool_split() {
+        let (mut chat, _writer_rx, _outbound) =
+            goal_reconnect_chat(GoalReconnectPath::StartResume, false).await;
+        let mut expected = active_state(&mut chat).entries().to_vec();
+        reconnect_chunk(&chat, "Which option ");
+        let tool = p5_tool(&chat, "P");
+        reconnect_chunk(&chat, RECONNECT_SUFFIX);
+        reconnect_candidate(&chat, RECONNECT_QUESTION);
+        expected.extend([
+            ChatEntry::AgentMessage("Which option ".into()),
+            tool,
+            ChatEntry::AgentMessage(RECONNECT_SUFFIX.into()),
+            reconnect_pause(&chat),
+        ]);
+        chat.tick_transport_events();
+        assert_eq!(active_state(&mut chat).entries(), expected.as_slice());
+    }
+
+    #[tokio::test]
+    async fn goal_reconnect_presentation_commit_state_does_not_leak_to_next_turn() {
+        let (mut chat, _writer_rx, _outbound) =
+            goal_reconnect_chat(GoalReconnectPath::StartResume, false).await;
+        reconnect_chunk(&chat, "S\n\n");
+        reconnect_chunk(&chat, "narration");
+        p5_tool(&chat, "X");
+        reconnect_chunk(&chat, RECONNECT_QUESTION);
+        reconnect_candidate(&chat, &format!("S\n\n{RECONNECT_QUESTION}"));
+        reconnect_pause(&chat);
+        chat.tick_transport_events();
+        let mut expected = active_state(&mut chat).entries().to_vec();
+
+        reconnect_chunk(&chat, "next answer");
+        reconnect_candidate(&chat, "next answer.");
+        expected.push(ChatEntry::AgentMessage("next answer".into()));
+        chat.tick_transport_events();
+        assert_eq!(active_state(&mut chat).entries(), expected.as_slice());
+    }
+
+    #[tokio::test]
+    async fn goal_reconnect_presentation_tool_without_text_keeps_full_final_round() {
+        let (mut chat, _writer_rx, _outbound) =
+            goal_reconnect_chat(GoalReconnectPath::AttachEntry, true).await;
+        let mut expected = active_state(&mut chat).entries().to_vec();
+        chat.rpc.push_notification_for_test(
+            "session/update",
+            serde_json::json!({
+                "type": "agent_thought_chunk", "session_id": "sess-1", "text": "t1",
+            }),
+        );
+        let tool = p5_tool(&chat, "X");
+        reconnect_chunk(&chat, "Which option ");
+        reconnect_chunk(&chat, RECONNECT_SUFFIX);
+        reconnect_candidate(&chat, RECONNECT_QUESTION);
+        expected.extend([
+            ChatEntry::AgentThought("t1".into()),
+            tool,
+            ChatEntry::AgentMessage(RECONNECT_QUESTION.into()),
+            reconnect_pause(&chat),
+        ]);
+        chat.tick_transport_events();
+        assert_eq!(active_state(&mut chat).entries(), expected.as_slice());
+    }
+
+    #[tokio::test]
+    async fn goal_reconnect_presentation_markers_are_inert_on_ordinary_panes() {
+        for path in [
+            None,
+            Some(GoalReconnectPath::StartFreshChat),
+            Some(GoalReconnectPath::AttachAcp),
+        ] {
+            let (mut chat, _writer_rx) = if let Some(path) = path {
+                let (chat, writer_rx, _outbound) = goal_reconnect_chat(path, false).await;
+                (chat, writer_rx)
+            } else {
+                let (mut chat, writer_rx) = test_chat();
+                chat.phase = ChatPhase::Active(Box::new(state()));
+                (chat, writer_rx)
+            };
+            let mut expected = active_state(&mut chat).entries().to_vec();
+            reconnect_chunk(&chat, "par");
+            p5_marked_chunk(&chat, "\n\nN");
+            reconnect_candidate(&chat, "partial");
+            expected.push(ChatEntry::AgentMessage("par\n\nN".into()));
+            chat.tick_transport_events();
+            assert_eq!(active_state(&mut chat).entries(), expected.as_slice());
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_reconnect_presentation_marker_is_inert_after_text_commit() {
+        let (mut chat, _writer_rx, _outbound) =
+            goal_reconnect_chat(GoalReconnectPath::StartResume, false).await;
+        let mut expected = active_state(&mut chat).entries().to_vec();
+        reconnect_chunk(&chat, "earlier text");
+        let tool = p5_tool(&chat, "X");
+        reconnect_chunk(&chat, RECONNECT_QUESTION);
+        p5_marked_chunk(&chat, "\n\nN");
+        reconnect_candidate(&chat, &format!("S\n\n{RECONNECT_QUESTION}"));
+        expected.extend([
+            ChatEntry::AgentMessage("earlier text".into()),
+            tool,
+            ChatEntry::AgentMessage(format!("{RECONNECT_QUESTION}\n\nN").into()),
+            reconnect_pause(&chat),
+        ]);
+        chat.tick_transport_events();
+        assert_eq!(active_state(&mut chat).entries(), expected.as_slice());
+    }
+
+    #[tokio::test]
+    async fn goal_reconnect_presentation_does_not_infer_unmarked_notice() {
+        let (mut chat, _writer_rx, _outbound) =
+            goal_reconnect_chat(GoalReconnectPath::StartResume, false).await;
+        let mut expected = active_state(&mut chat).entries().to_vec();
+        reconnect_chunk(&chat, RECONNECT_SUFFIX);
+        reconnect_chunk(&chat, &format!("\n\n{P5_FALLBACK_NOTICE}"));
+        reconnect_candidate(&chat, RECONNECT_QUESTION);
+        expected.extend([
+            ChatEntry::AgentMessage(RECONNECT_QUESTION.into()),
+            reconnect_pause(&chat),
+        ]);
+        chat.tick_transport_events();
+        assert_eq!(active_state(&mut chat).entries(), expected.as_slice());
+    }
+
+    #[tokio::test]
+    async fn goal_reconnect_presentation_replacement_initializes_ordinary_rendering() {
+        let (mut chat, _writer_rx, _outbound) =
+            goal_reconnect_chat(GoalReconnectPath::StartResume, false).await;
+        reconnect_chunk(&chat, "old session live answer");
+        p5_marked_chunk(&chat, "\n\nOld session notice");
+        chat.tick_transport_events();
+        active_state(&mut chat).reset_for_session(
+            "replacement".into(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+
+        chat.rpc.push_notification_for_test(
+            "session/update",
+            serde_json::json!({
+                "type": "agent_message_chunk", "session_id": "replacement", "text": "par",
+            }),
+        );
+        chat.rpc.push_notification_for_test(
+            "session/goal_update",
+            serde_json::json!({
+                "verified_candidate": { "session_id": "replacement", "candidate": "partial" },
+            }),
+        );
+        chat.tick_transport_events();
+        assert_eq!(
+            active_state(&mut chat).entries(),
+            &[ChatEntry::AgentMessage("par".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_reconnect_orphan_tool_result_does_not_add_a_row() {
+        let (mut chat, _writer_rx, _outbound) =
+            goal_reconnect_chat(GoalReconnectPath::AttachEntry, true).await;
+        let expected = active_state(&mut chat).entries().to_vec();
+        chat.rpc.push_notification_for_test(
+            "session/update",
+            serde_json::json!({
+                "type": "tool_result", "session_id": "sess-1", "tool_call_id": "orphan",
+                "raw_output": "result without a visible call",
+            }),
+        );
+        chat.tick_transport_events();
+        assert_eq!(active_state(&mut chat).entries(), expected.as_slice());
+    }
+
+    #[tokio::test]
+    async fn goal_reconnect_question_precedes_pause_whether_loaded_or_live() {
+        for question_in_history in [true, false] {
+            let (mut chat, _writer_rx, _outbound) =
+                goal_reconnect_chat(GoalReconnectPath::StartResume, question_in_history).await;
+            let mut expected = active_state(&mut chat).entries().to_vec();
+            if !question_in_history {
+                reconnect_candidate(&chat, RECONNECT_QUESTION);
+                expected.push(ChatEntry::AgentMessage(RECONNECT_QUESTION.into()));
+            }
+            expected.push(reconnect_pause(&chat));
+            chat.tick_transport_events();
+            assert_eq!(active_state(&mut chat).entries(), expected.as_slice());
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_reconnect_fully_streamed_answer_is_not_duplicated_and_next_turn_is_normal() {
+        let (mut chat, _writer_rx, _outbound) =
+            goal_reconnect_chat(GoalReconnectPath::StartResume, false).await;
+        let mut expected = active_state(&mut chat).entries().to_vec();
+        reconnect_chunk(&chat, "full answer");
+        reconnect_candidate(&chat, "full answer");
+        expected.push(ChatEntry::AgentMessage("full answer".into()));
+        chat.tick_transport_events();
+        assert_eq!(active_state(&mut chat).entries(), expected.as_slice());
+
+        reconnect_chunk(&chat, "next answer");
+        reconnect_candidate(&chat, "next answer.");
+        expected.push(ChatEntry::AgentMessage("next answer".into()));
+        chat.tick_transport_events();
+        assert_eq!(active_state(&mut chat).entries(), expected.as_slice());
+    }
+
+    #[tokio::test]
+    async fn goal_reconnect_does_not_change_ordinary_pane_stream_precedence() {
+        let (mut chat, _writer_rx) = test_chat();
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        reconnect_chunk(&chat, "par");
+        reconnect_candidate(&chat, "partial");
+        chat.tick_transport_events();
+        assert_eq!(
+            active_state(&mut chat).entries(),
+            &[ChatEntry::AgentMessage("par".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_reconnect_preserves_stream_precedence_on_resumed_acp() {
+        let (mut chat, _writer_rx, _outbound) =
+            goal_reconnect_chat(GoalReconnectPath::AttachAcp, false).await;
+        let mut expected = active_state(&mut chat).entries().to_vec();
+        reconnect_chunk(&chat, "par");
+        reconnect_candidate(&chat, "partial");
+        chat.tick_transport_events();
+        expected.push(ChatEntry::AgentMessage("par".into()));
+        assert_eq!(active_state(&mut chat).entries(), expected.as_slice());
+    }
+
+    #[tokio::test]
+    async fn goal_reconnect_preserves_stream_precedence_on_fresh_chat() {
+        let (mut chat, _writer_rx, _outbound) =
+            goal_reconnect_chat(GoalReconnectPath::StartFreshChat, false).await;
+        reconnect_chunk(&chat, "par");
+        reconnect_candidate(&chat, "partial");
+        chat.tick_transport_events();
+        assert_eq!(
+            active_state(&mut chat).entries(),
+            &[ChatEntry::AgentMessage("par".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_reconnect_failure_keeps_partial_before_error_and_next_turn_is_normal() {
+        let (mut chat, _writer_rx, _outbound) =
+            goal_reconnect_chat(GoalReconnectPath::AttachEntry, false).await;
+        let mut expected = active_state(&mut chat).entries().to_vec();
+        let error = "turn failed: provider returned 429";
+        reconnect_chunk(&chat, "par");
+        chat.rpc.push_notification_for_test(
+            "session/update",
+            serde_json::json!({
+                "type": "turn_complete", "session_id": "sess-1", "outcome": "failed",
+                "content": error, "goal_owned": true,
+            }),
+        );
+        expected.extend([
+            ChatEntry::AgentMessage("par".into()),
+            ChatEntry::SystemMessage(error.into()),
+        ]);
+        chat.tick_transport_events();
+        let active = active_state(&mut chat);
+        assert_eq!(active.entries(), expected.as_slice());
+        assert!(
+            active.last_error.is_none(),
+            "Goal failure is not an ordinary prompt failure"
+        );
+
+        reconnect_chunk(&chat, "next answer");
+        reconnect_candidate(&chat, "next answer.");
+        expected.push(ChatEntry::AgentMessage("next answer".into()));
+        chat.tick_transport_events();
+        assert_eq!(active_state(&mut chat).entries(), expected.as_slice());
+    }
+
+    #[tokio::test]
+    async fn goal_reconnect_empty_candidate_preserves_partial() {
+        let (mut chat, _writer_rx, _outbound) =
+            goal_reconnect_chat(GoalReconnectPath::StartResume, false).await;
+        let mut expected = active_state(&mut chat).entries().to_vec();
+        reconnect_chunk(&chat, "par");
+        reconnect_candidate(&chat, "");
+        expected.push(ChatEntry::AgentMessage("par".into()));
+        chat.tick_transport_events();
+        assert_eq!(active_state(&mut chat).entries(), expected.as_slice());
+    }
+
+    #[tokio::test]
+    async fn goal_reconnect_rejected_or_queued_command_does_not_steal_current_candidate() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        for (command, response, notice) in [
+            (
+                "/goal start Continue the repair",
+                serde_json::json!({ "kind": "already_active" }),
+                "zc-goal-already-active",
+            ),
+            (
+                "/goal resume",
+                serde_json::json!({ "kind": "queued", "status": "resume" }),
+                "zc-goal-queued-resume",
+            ),
+        ] {
+            let (mut chat, mut rx, outbound) =
+                goal_reconnect_chat(GoalReconnectPath::StartResume, false).await;
+            let mut expected = active_state(&mut chat).entries().to_vec();
+            reconnect_chunk(&chat, RECONNECT_SUFFIX);
+            chat.tick_transport_events();
+            assert_eq!(active_state(&mut chat).streaming_text, RECONNECT_SUFFIX);
+
+            // The initial transport tick polls branch status for the resumed cwd.
+            let request = next_rpc_request(&mut rx, "resumed pane polls branch status").await;
+            assert_eq!(request["method"], method::SESSION_GIT_BRANCH);
+            assert_eq!(request["params"]["session_id"], "sess-1");
+            respond_ok(
+                &outbound,
+                &request,
+                serde_json::json!({ "branch": null, "hash": null }),
+            );
+
+            active_state(&mut chat).input_bar.insert_text(command);
+            let mut terminal: crate::config_manager::Term = ratatui::Terminal::with_options(
+                crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+                },
+            )
+            .unwrap();
+            chat.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut terminal,
+            )
+            .await;
+            let request = next_rpc_request(&mut rx, "composer submits Goal command").await;
+            assert_eq!(request["method"], method::SESSION_GOAL);
+            assert_eq!(request["params"]["session_id"], "sess-1");
+            assert_eq!(request["params"]["command"], command);
+
+            reconnect_candidate(&chat, RECONNECT_QUESTION);
+            let pause = reconnect_pause(&chat);
+            chat.tick_transport_events();
+            assert_eq!(active_state(&mut chat).entries(), expected.as_slice());
+
+            respond_ok(
+                &outbound,
+                &request,
+                serde_json::json!({ "response": response }),
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while chat.goal_completion_rx.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("Goal acknowledgement must arrive");
+            chat.tick_transport_events();
+            expected.extend([
+                ChatEntry::SystemMessage(crate::i18n::t(notice).into()),
+                ChatEntry::AgentMessage(RECONNECT_QUESTION.into()),
+                pause,
+            ]);
+            assert_eq!(
+                active_state(&mut chat).entries(),
+                expected.as_slice(),
+                "{command}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn goal_start_ack_is_rendered_before_buffered_execution_events() {
         let (mut chat, _writer_rx) = test_chat();
@@ -28940,6 +29726,7 @@ mod tests {
         s.apply_update(SessionUpdate::AgentMessageChunk {
             session_id: "sess-1".to_string(),
             text: "streaming...".to_string(),
+            presentation_only: false,
         });
         assert_eq!(s.current_agent_text(), "streaming...");
     }
@@ -28961,10 +29748,12 @@ mod tests {
         s.apply_update(SessionUpdate::AgentMessageChunk {
             session_id: "sess-1".to_string(),
             text: "Hello".to_string(),
+            presentation_only: false,
         });
         s.apply_update(SessionUpdate::AgentMessageChunk {
             session_id: "sess-1".to_string(),
             text: " world".to_string(),
+            presentation_only: false,
         });
         assert_eq!(s.current_agent_text(), "Hello world");
     }
@@ -31740,6 +32529,7 @@ mod tests {
         s.apply_update(SessionUpdate::AgentMessageChunk {
             session_id: "sess-1".to_string(),
             text: "Here is".to_string(),
+            presentation_only: false,
         });
         // Thought entry committed before streaming text starts.
         assert_eq!(s.entries().len(), 1);
@@ -31759,10 +32549,12 @@ mod tests {
         s.apply_update(SessionUpdate::AgentMessageChunk {
             session_id: "sess-1".to_string(),
             text: "Hello".to_string(),
+            presentation_only: false,
         });
         s.apply_update(SessionUpdate::AgentMessageChunk {
             session_id: "sess-1".to_string(),
             text: " world".to_string(),
+            presentation_only: false,
         });
         // Only one AgentThought entry, not two.
         assert_eq!(s.entries().len(), 1);
@@ -31780,6 +32572,7 @@ mod tests {
         s.apply_update(SessionUpdate::AgentMessageChunk {
             session_id: "sess-1".to_string(),
             text: "I will run ls.".to_string(),
+            presentation_only: false,
         });
 
         // Tool call interrupts the text stream.
@@ -31821,6 +32614,7 @@ mod tests {
         s.apply_update(SessionUpdate::AgentMessageChunk {
             session_id: "sess-1".to_string(),
             text: "Running ls.".to_string(),
+            presentation_only: false,
         });
         // Tool call flushes pre-tool text.
         s.apply_update(SessionUpdate::ToolCall {
@@ -31839,6 +32633,7 @@ mod tests {
         s.apply_update(SessionUpdate::AgentMessageChunk {
             session_id: "sess-1".to_string(),
             text: "Done.".to_string(),
+            presentation_only: false,
         });
         assert_eq!(s.current_agent_text(), "Done.");
 
@@ -31897,6 +32692,7 @@ mod tests {
         s.apply_update(SessionUpdate::AgentMessageChunk {
             session_id: "sess-1".to_string(),
             text: "Before tool.".to_string(),
+            presentation_only: false,
         });
         s.apply_update(SessionUpdate::ToolCall {
             session_id: "sess-1".to_string(),
@@ -31979,6 +32775,7 @@ mod tests {
         s.apply_update(SessionUpdate::AgentMessageChunk {
             session_id: "sess-1".to_string(),
             text: "partial agent response".to_string(),
+            presentation_only: false,
         });
 
         s.apply_update(SessionUpdate::TurnComplete {
@@ -32026,6 +32823,7 @@ mod tests {
         s.apply_update(SessionUpdate::AgentMessageChunk {
             session_id: "sess-1".to_string(),
             text: "Done".to_string(),
+            presentation_only: false,
         });
         s.commit_turn("Done".to_string(), true);
         assert_eq!(s.current_agent_text(), "");
@@ -34790,6 +35588,7 @@ mod tests {
         state.apply_update(SessionUpdate::AgentMessageChunk {
             session_id: "sess-1".to_string(),
             text: "Answer this one:".to_string(),
+            presentation_only: false,
         });
         state.apply_update(SessionUpdate::ToolCall {
             session_id: "sess-1".to_string(),
@@ -35326,6 +36125,7 @@ mod tests {
                 active.apply_update(SessionUpdate::AgentMessageChunk {
                     session_id: "sess-1".to_string(),
                     text: "last streamed chunk".to_string(),
+                    presentation_only: false,
                 });
                 assert!(!matches!(active.turn_status, TurnStatus::Cancelling));
                 assert!(active.cancel_started_at.is_some());
@@ -35493,6 +36293,7 @@ mod tests {
         active_state(&mut chat).apply_update(SessionUpdate::AgentMessageChunk {
             session_id: "sess-1".to_string(),
             text: "https://example.com".to_string(),
+            presentation_only: false,
         });
         respond_ok(&chat.rpc_out, &request, serde_json::json!({}));
         tokio::task::yield_now().await;
@@ -35520,6 +36321,7 @@ mod tests {
         state.apply_update(SessionUpdate::AgentMessageChunk {
             session_id: "sess-1".to_string(),
             text: "/long-path?query=yes".to_string(),
+            presentation_only: false,
         });
         assert!(matches!(
             state.transcript_layout.view().dirty,
@@ -36180,6 +36982,7 @@ mod tests {
         active_state(&mut chat).apply_update(SessionUpdate::AgentMessageChunk {
             session_id: "sess-1".to_string(),
             text: "accepted result".to_string(),
+            presentation_only: false,
         });
 
         chat.drain_notifications();

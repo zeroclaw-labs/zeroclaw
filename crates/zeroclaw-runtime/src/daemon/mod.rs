@@ -1159,6 +1159,25 @@ pub async fn run_with_authority(
     };
 
     if let Some(ctx) = rpc_ctx.as_ref() {
+        match ctx.reconcile_goal_session_dispositions().await {
+            Ok(0) => {}
+            Ok(unresolved) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({ "unresolved": unresolved })),
+                    "RPC session Goal cleanup remains pending"
+                );
+            }
+            Err(_) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "RPC session Goal cleanup could not be scanned"
+                );
+            }
+        }
         inproc_connector.bind(std::sync::Arc::clone(ctx));
     }
 

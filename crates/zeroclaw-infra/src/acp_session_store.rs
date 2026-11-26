@@ -1,5 +1,9 @@
 //! ACP session persistence.
 
+use crate::session_disposition::{
+    SessionDispositionBackend, SessionDispositionEffect, SessionDispositionIdentity,
+    SessionDispositionObservation, SessionDispositionWitness, sqlite as disposition,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
@@ -188,12 +192,16 @@ const ACP_SESSION_CURSOR_VERSION: u8 = 1;
 const ACP_SESSION_MAX_PAGE_SIZE: usize = 1_000;
 
 impl AcpSessionStore {
+    fn db_path(workspace_dir: &Path) -> std::path::PathBuf {
+        workspace_dir.join("sessions").join("acp-sessions.db")
+    }
+
     pub fn new(workspace_dir: &Path) -> Result<Self> {
         let sessions_dir = workspace_dir.join("sessions");
         std::fs::create_dir_all(&sessions_dir).context("Failed to create sessions directory")?;
-        let db_path = sessions_dir.join("acp-sessions.db");
+        let db_path = Self::db_path(workspace_dir);
 
-        let conn = Connection::open(&db_path)
+        let mut conn = Connection::open(&db_path)
             .with_context(|| format!("Failed to open ACP session DB: {}", db_path.display()))?;
 
         conn.execute_batch(
@@ -290,6 +298,14 @@ impl AcpSessionStore {
 
         Self::ensure_retained_context_columns(&conn)
             .context("Failed to migrate ACP retained context columns")?;
+
+        disposition::with_full_sync(&mut conn, |conn| -> Result<()> {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            disposition::initialize(&tx, SessionDispositionBackend::AcpSqlite)?;
+            tx.commit()?;
+            Ok(())
+        })
+        .context("Failed to initialize ACP session disposition schema")?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -724,6 +740,79 @@ impl AcpSessionStore {
             .flatten())
     }
 
+    /// Bind a disposition to the current ACP row, not to its reusable UUID.
+    /// The caller still has to authorize the effect against that row at commit.
+    pub fn session_disposition_target(
+        &self,
+        session_uuid: &str,
+    ) -> Result<Option<(SessionDispositionIdentity, String)>> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
+                [session_uuid],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        Ok(Some((
+            disposition::identity(&tx, SessionDispositionBackend::AcpSqlite)?,
+            id.to_string(),
+        )))
+    }
+
+    /// Observe the witness in this store, without retrying the session effect.
+    pub fn observe_session_disposition(
+        &self,
+        witness: &SessionDispositionWitness,
+    ) -> Result<SessionDispositionObservation> {
+        Ok(disposition::observe(
+            &mut self.conn.lock(),
+            SessionDispositionBackend::AcpSqlite,
+            witness,
+        )?)
+    }
+
+    /// Remove an exact acknowledged receipt, never a session row.
+    pub fn acknowledge_session_disposition(
+        &self,
+        witness: &SessionDispositionWitness,
+    ) -> Result<()> {
+        Ok(disposition::acknowledge(
+            &mut self.conn.lock(),
+            SessionDispositionBackend::AcpSqlite,
+            witness,
+        )?)
+    }
+
+    /// Inspect an existing ACP database without creating or migrating a store.
+    pub fn observe_session_disposition_at(
+        workspace_dir: &Path,
+        witness: &SessionDispositionWitness,
+    ) -> Result<SessionDispositionObservation> {
+        Ok(disposition::observe_at(
+            &Self::db_path(workspace_dir),
+            SessionDispositionBackend::AcpSqlite,
+            witness,
+        )?)
+    }
+
+    /// Acknowledge an exact receipt in the original ACP database even without
+    /// a configured store handle, without creating or migrating a replacement.
+    pub fn acknowledge_session_disposition_at(
+        workspace_dir: &Path,
+        witness: &SessionDispositionWitness,
+    ) -> Result<()> {
+        Ok(disposition::acknowledge_at(
+            &Self::db_path(workspace_dir),
+            SessionDispositionBackend::AcpSqlite,
+            witness,
+        )?)
+    }
+
     /// Exact-owner deletion with a caller-owned guard at the write boundary.
     pub fn delete_session_authorized<G>(
         &self,
@@ -731,14 +820,78 @@ impl AcpSessionStore {
         expected_owner: Option<&str>,
         authorize: impl FnOnce(Option<&str>) -> Result<G>,
     ) -> Result<bool> {
-        let mut conn = self.conn.lock();
+        Self::delete_session_authorized_inner(
+            &mut self.conn.lock(),
+            session_uuid,
+            expected_owner,
+            authorize,
+            None,
+        )
+    }
+
+    /// Delete the authorized original ACP row and attest to that one commit.
+    pub fn delete_session_with_disposition<G>(
+        &self,
+        session_uuid: &str,
+        witness: &SessionDispositionWitness,
+        expected_owner: Option<&str>,
+        authorize: impl FnOnce(Option<&str>) -> Result<G>,
+    ) -> Result<bool> {
+        disposition::with_full_sync(&mut self.conn.lock(), |conn| {
+            Self::delete_session_authorized_inner(
+                conn,
+                session_uuid,
+                expected_owner,
+                authorize,
+                Some(witness),
+            )
+        })
+    }
+
+    fn effect_row(conn: &Connection, session_uuid: &str) -> Result<Option<(i64, Option<String>)>> {
+        Ok(conn
+            .query_row(
+                "SELECT id, principal_id FROM acp_sessions WHERE session_uuid = ?1",
+                [session_uuid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    fn delete_session_authorized_inner<G>(
+        conn: &mut Connection,
+        session_uuid: &str,
+        expected_owner: Option<&str>,
+        authorize: impl FnOnce(Option<&str>) -> Result<G>,
+        witness: Option<&SessionDispositionWitness>,
+    ) -> Result<bool> {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let owner = Self::effect_owner(&tx, session_uuid)?;
-        let _authority = authorize(owner.as_deref())?;
+        if let Some(witness) = witness {
+            disposition::ensure_new(
+                &tx,
+                SessionDispositionBackend::AcpSqlite,
+                SessionDispositionEffect::Delete,
+                witness,
+            )?;
+        }
+        let row = Self::effect_row(&tx, session_uuid)?;
+        let _authority = authorize(row.as_ref().and_then(|(_, owner)| owner.as_deref()))?;
+        let Some((id, _)) = row else {
+            return Ok(false);
+        };
+        if witness.is_some_and(|witness| witness.backend_key != id.to_string()) {
+            return Ok(false);
+        }
         let rows = tx.execute(
-            "DELETE FROM acp_sessions WHERE session_uuid = ?1 AND principal_id IS ?2",
-            params![session_uuid, expected_owner],
+            "DELETE FROM acp_sessions
+             WHERE session_uuid = ?1 AND principal_id IS ?2 AND id = ?3",
+            params![session_uuid, expected_owner, id],
         )?;
+        if let Some(witness) = witness
+            && rows == 1
+        {
+            disposition::record(&tx, witness)?;
+        }
         tx.commit()?;
         Ok(rows > 0)
     }
@@ -3138,31 +3291,82 @@ impl AcpSessionStore {
         owner_principal_id: Option<&str>,
         authorize: impl FnOnce(Option<&str>) -> Result<G>,
     ) -> Result<AcpSessionKillTransition> {
+        Self::mark_session_killed_inner(
+            &mut self.conn.lock(),
+            session_uuid,
+            owner_principal_id,
+            authorize,
+            None,
+        )
+    }
+
+    /// Attest only to a newly committed tombstone on the exact ACP row.
+    pub fn mark_session_killed_with_disposition<G>(
+        &self,
+        session_uuid: &str,
+        witness: &SessionDispositionWitness,
+        owner_principal_id: Option<&str>,
+        authorize: impl FnOnce(Option<&str>) -> Result<G>,
+    ) -> Result<AcpSessionKillTransition> {
+        disposition::with_full_sync(&mut self.conn.lock(), |conn| {
+            Self::mark_session_killed_inner(
+                conn,
+                session_uuid,
+                owner_principal_id,
+                authorize,
+                Some(witness),
+            )
+        })
+    }
+
+    fn mark_session_killed_inner<G>(
+        conn: &mut Connection,
+        session_uuid: &str,
+        owner_principal_id: Option<&str>,
+        authorize: impl FnOnce(Option<&str>) -> Result<G>,
+        witness: Option<&SessionDispositionWitness>,
+    ) -> Result<AcpSessionKillTransition> {
         let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("Failed to begin ACP session kill transition")?;
-        let owner = Self::effect_owner(&tx, session_uuid)?;
-        let _authority = authorize(owner.as_deref())?;
+        if let Some(witness) = witness {
+            disposition::ensure_new(
+                &tx,
+                SessionDispositionBackend::AcpSqlite,
+                SessionDispositionEffect::Kill,
+                witness,
+            )?;
+        }
+        let row = Self::effect_row(&tx, session_uuid)?;
+        let _authority = authorize(row.as_ref().and_then(|(_, owner)| owner.as_deref()))?;
+        let Some((id, _)) = row else {
+            return Ok(AcpSessionKillTransition::Missing);
+        };
+        if witness.is_some_and(|witness| witness.backend_key != id.to_string()) {
+            return Ok(AcpSessionKillTransition::Missing);
+        }
         let rows = tx
             .execute(
                 "UPDATE acp_sessions
                     SET killed_at = COALESCE(killed_at, ?1),
                         last_activity = ?1
-                  WHERE session_uuid = ?2 AND killed_at IS NULL
+                  WHERE session_uuid = ?2 AND killed_at IS NULL AND id = ?4
                     AND (?3 IS NULL OR principal_id = ?3)",
-                params![now, session_uuid, owner_principal_id],
+                params![now, session_uuid, owner_principal_id, id],
             )
             .context("Failed to mark ACP session killed")?;
         let transition = if rows == 1 {
+            if let Some(witness) = witness {
+                disposition::record(&tx, witness)?;
+            }
             AcpSessionKillTransition::Marked
         } else {
             let killed_at: Option<Option<String>> = tx
                 .query_row(
                     "SELECT killed_at FROM acp_sessions
-                     WHERE session_uuid = ?1 AND (?2 IS NULL OR principal_id = ?2)",
-                    params![session_uuid, owner_principal_id],
+                     WHERE session_uuid = ?1 AND (?2 IS NULL OR principal_id = ?2) AND id = ?3",
+                    params![session_uuid, owner_principal_id, id],
                     |row| row.get(0),
                 )
                 .optional()
@@ -3694,6 +3898,201 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = AcpSessionStore::new(tmp.path()).unwrap();
         (tmp, store)
+    }
+
+    fn acp_witness(
+        store: &AcpSessionStore,
+        operation_id: &str,
+        effect: SessionDispositionEffect,
+    ) -> SessionDispositionWitness {
+        let (identity, backend_key) = store.session_disposition_target("s").unwrap().unwrap();
+        SessionDispositionWitness {
+            operation_id: operation_id.into(),
+            effect,
+            backend_key,
+            identity,
+        }
+    }
+
+    #[test]
+    fn witnessed_acp_effects_are_atomic_and_bound_to_the_autoincrement_row() {
+        use AcpSessionKillTransition::{AlreadyKilled, Marked, Missing};
+        use SessionDispositionObservation::{Committed, Indeterminate, NotCommitted};
+
+        let (workspace, store) = open_store();
+        store
+            .create_session("s", "agent", "/unused", Some("user:alice"))
+            .unwrap();
+        store
+            .append_turn("s", &[ConversationMessage::Chat(ChatMessage::user("old"))])
+            .unwrap();
+        let kill = acp_witness(
+            &store,
+            "20000000-0000-4000-8000-000000000001",
+            SessionDispositionEffect::Kill,
+        );
+        let delete = acp_witness(
+            &store,
+            "20000000-0000-4000-8000-000000000002",
+            SessionDispositionEffect::Delete,
+        );
+        let authorize = |owner: Option<&str>| {
+            assert_eq!(owner, Some("user:alice"));
+            Ok(())
+        };
+        assert_eq!(
+            store
+                .mark_session_killed_with_disposition("s", &kill, Some("user:bob"), authorize)
+                .unwrap(),
+            Missing
+        );
+        assert!(
+            !store
+                .delete_session_with_disposition("s", &delete, Some("user:bob"), authorize)
+                .unwrap()
+        );
+        assert_eq!(
+            store.observe_session_disposition(&kill).unwrap(),
+            NotCommitted
+        );
+        assert_eq!(
+            store.observe_session_disposition(&delete).unwrap(),
+            NotCommitted
+        );
+        store
+            .conn
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER reject_receipt BEFORE INSERT ON session_disposition_receipts
+             BEGIN SELECT RAISE(ABORT, 'receipt fault'); END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .mark_session_killed_with_disposition("s", &kill, Some("user:alice"), authorize)
+                .is_err()
+        );
+        assert!(
+            store
+                .delete_session_with_disposition("s", &delete, Some("user:alice"), authorize)
+                .is_err()
+        );
+        drop(store);
+
+        let store = AcpSessionStore::new(workspace.path()).unwrap();
+        let old = store.load_session("s").unwrap().unwrap();
+        assert_eq!(old.messages.len(), 1);
+        assert!(!store.is_session_killed("s").unwrap());
+        assert_eq!(
+            store.observe_session_disposition(&kill).unwrap(),
+            NotCommitted
+        );
+        assert_eq!(
+            store.observe_session_disposition(&delete).unwrap(),
+            NotCommitted
+        );
+        store
+            .conn
+            .lock()
+            .execute_batch("DROP TRIGGER reject_receipt")
+            .unwrap();
+        assert_eq!(
+            store
+                .mark_session_killed_with_disposition("s", &kill, Some("user:alice"), authorize)
+                .unwrap(),
+            Marked
+        );
+        let already_killed = acp_witness(
+            &store,
+            "20000000-0000-4000-8000-000000000003",
+            SessionDispositionEffect::Kill,
+        );
+        assert_eq!(
+            store
+                .mark_session_killed_with_disposition(
+                    "s",
+                    &already_killed,
+                    Some("user:alice"),
+                    authorize
+                )
+                .unwrap(),
+            AlreadyKilled
+        );
+        assert_eq!(
+            store.observe_session_disposition(&already_killed).unwrap(),
+            NotCommitted
+        );
+        assert!(
+            store
+                .delete_session_with_disposition("s", &delete, Some("user:alice"), authorize)
+                .unwrap()
+        );
+        assert!(!store.contains_session("s").unwrap());
+        drop(store);
+
+        for receipt in [&kill, &delete] {
+            assert_eq!(
+                AcpSessionStore::observe_session_disposition_at(workspace.path(), receipt).unwrap(),
+                Committed
+            );
+        }
+        let (replacement_workspace, _) = open_store();
+        assert_eq!(
+            AcpSessionStore::observe_session_disposition_at(replacement_workspace.path(), &delete)
+                .unwrap(),
+            Indeterminate
+        );
+        let recreated = AcpSessionStore::new(workspace.path()).unwrap();
+        recreated
+            .create_session("s", "agent", "/unused", Some("user:alice"))
+            .unwrap();
+        let current = acp_witness(
+            &recreated,
+            "20000000-0000-4000-8000-000000000004",
+            SessionDispositionEffect::Delete,
+        );
+        assert_eq!(current.identity, delete.identity);
+        assert_ne!(current.backend_key, delete.backend_key);
+        let stale_delete = SessionDispositionWitness {
+            backend_key: delete.backend_key.clone(),
+            ..current
+        };
+        assert!(
+            !recreated
+                .delete_session_with_disposition("s", &stale_delete, Some("user:alice"), authorize)
+                .unwrap()
+        );
+        let stale_kill = SessionDispositionWitness {
+            operation_id: "20000000-0000-4000-8000-000000000005".into(),
+            ..already_killed
+        };
+        assert_eq!(
+            recreated
+                .mark_session_killed_with_disposition(
+                    "s",
+                    &stale_kill,
+                    Some("user:alice"),
+                    authorize
+                )
+                .unwrap(),
+            Missing
+        );
+        assert_eq!(
+            recreated
+                .observe_session_disposition(&stale_delete)
+                .unwrap(),
+            NotCommitted
+        );
+        assert_eq!(
+            recreated.observe_session_disposition(&stale_kill).unwrap(),
+            NotCommitted
+        );
+        for receipt in [&kill, &delete] {
+            AcpSessionStore::acknowledge_session_disposition_at(workspace.path(), receipt).unwrap();
+            recreated.acknowledge_session_disposition(receipt).unwrap();
+        }
+        assert!(recreated.contains_session("s").unwrap());
+        assert!(!recreated.is_session_killed("s").unwrap());
     }
 
     #[test]

@@ -1,7 +1,12 @@
 //! SQLite-backed session persistence with FTS5 search.
 
 use crate::session_backend::{
-    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
+    SessionBackend, SessionContext, SessionEffectAuthorization, SessionMetadata, SessionQuery,
+    SessionState,
+};
+use crate::session_disposition::{
+    SessionDispositionBackend, SessionDispositionEffect, SessionDispositionIdentity,
+    SessionDispositionObservation, SessionDispositionWitness, sqlite as disposition,
 };
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
@@ -128,8 +133,10 @@ impl SqliteSessionBackend {
             .context("Failed to set the session DB busy timeout")?;
 
         Self::enable_wal(&conn)?;
+        // Recovery can bind this identity before performing a witnessed
+        // deletion, so its first schema commit must survive a power loss.
         conn.execute_batch(
-            "PRAGMA synchronous = NORMAL;
+            "PRAGMA synchronous = FULL;
              PRAGMA temp_store = MEMORY;
              PRAGMA mmap_size = 4194304;",
         )?;
@@ -184,6 +191,8 @@ impl SqliteSessionBackend {
              END;",
         )
         .context("Failed to initialize session schema")?;
+        disposition::initialize(&tx, SessionDispositionBackend::ChatSqlite)
+            .context("Failed to initialize session disposition schema")?;
 
         for (column, ddl) in [
             ("name", "ALTER TABLE session_metadata ADD COLUMN name TEXT"),
@@ -257,10 +266,91 @@ impl SqliteSessionBackend {
                 .with_context(|| format!("Failed to create session index {index}"))?;
         }
         tx.commit().context("Failed to commit the session schema")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
 
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Inspect a persisted receipt even when Chat currently uses another backend.
+    /// The database must already exist; this cannot create or migrate it.
+    pub fn observe_session_disposition_at(
+        workspace_dir: &Path,
+        witness: &SessionDispositionWitness,
+    ) -> io::Result<SessionDispositionObservation> {
+        disposition::observe_at(
+            &Self::db_path(workspace_dir),
+            SessionDispositionBackend::ChatSqlite,
+            witness,
+        )
+    }
+
+    /// Acknowledge an exact receipt in the original database without
+    /// constructing a backend or touching any transcript.
+    pub fn acknowledge_session_disposition_at(
+        workspace_dir: &Path,
+        witness: &SessionDispositionWitness,
+    ) -> io::Result<()> {
+        disposition::acknowledge_at(
+            &Self::db_path(workspace_dir),
+            SessionDispositionBackend::ChatSqlite,
+            witness,
+        )
+    }
+
+    fn delete_session_authorized_inner(
+        conn: &mut Connection,
+        session_key: &str,
+        expected_owner: Option<&str>,
+        authorize: &SessionEffectAuthorization<'_>,
+        witness: Option<&SessionDispositionWitness>,
+    ) -> io::Result<bool> {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(io::Error::other)?;
+        if let Some(witness) = witness {
+            disposition::ensure_new(
+                &tx,
+                SessionDispositionBackend::ChatSqlite,
+                SessionDispositionEffect::Delete,
+                witness,
+            )?;
+        }
+        let row: Option<(i64, Option<String>)> = tx
+            .query_row(
+                "SELECT rowid, principal_id FROM session_metadata WHERE session_key = ?1",
+                [session_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(io::Error::other)?;
+        let _authority = authorize(row.as_ref().and_then(|(_, owner)| owner.as_deref()))?;
+        let Some((id, owner)) = row else {
+            return Ok(false);
+        };
+        if owner.as_deref() != expected_owner {
+            return Ok(false);
+        }
+        tx.execute("DELETE FROM sessions WHERE session_key = ?1", [session_key])
+            .map_err(io::Error::other)?;
+        let changed = tx
+            .execute(
+                "DELETE FROM session_metadata
+                 WHERE session_key = ?1 AND principal_id IS ?2 AND rowid = ?3",
+                params![session_key, expected_owner, id],
+            )
+            .map_err(io::Error::other)?;
+        if let Some(witness) = witness {
+            if changed != 1 {
+                return Err(io::Error::other(
+                    "session disposition deleted no metadata row",
+                ));
+            }
+            disposition::record(&tx, witness).map_err(io::Error::other)?;
+        }
+        tx.commit().map_err(io::Error::other)?;
+        Ok(true)
     }
 
     /// Switch the database to WAL, retrying while another connection holds it.
@@ -364,8 +454,7 @@ impl SqliteSessionBackend {
     }
 
     fn source_fingerprint(path: &Path, name: &str) -> Result<(String, i64)> {
-        let mut file = std::fs::File::open(path)
-            .with_context(|| format!("Failed to open JSONL session {name}"))?;
+        let mut file = Self::open_import_transcript(path, name)?;
         let mut hasher = Sha256::new();
         let mut source_len = 0_i64;
         let mut buffer = [0_u8; 64 * 1024];
@@ -384,6 +473,20 @@ impl SqliteSessionBackend {
         Ok((format!("{:x}", hasher.finalize()), source_len))
     }
 
+    fn open_import_transcript(path: &Path, name: &str) -> Result<std::fs::File> {
+        use crate::session_disposition::jsonl::{self, Entry};
+
+        match jsonl::classify(path)
+            .with_context(|| format!("Failed to open JSONL session {name}"))?
+        {
+            Entry::Transcript(file) => Ok(file),
+            Entry::Missing => bail!("JSONL migration source {name} is absent"),
+            Entry::Marker(_) => {
+                bail!("Unexpected disposition marker in JSONL migration source {name}")
+            }
+        }
+    }
+
     /// Migrate JSONL session files into SQLite. Renames migrated files to `.jsonl.migrated`.
     pub fn migrate_from_jsonl(&self, workspace_dir: &Path) -> Result<usize> {
         self.migrate_from_jsonl_with_archive(workspace_dir, |from, to, expected| {
@@ -396,6 +499,7 @@ impl SqliteSessionBackend {
         migrated_path: &Path,
         expected: &(String, i64),
     ) -> Result<()> {
+        Self::open_import_transcript(staged_path, "staged source")?;
         std::fs::hard_link(staged_path, migrated_path).with_context(|| {
             format!(
                 "Failed to create no-clobber JSONL archive {}",
@@ -411,6 +515,7 @@ impl SqliteSessionBackend {
             let _ = std::fs::remove_file(migrated_path);
             bail!("JSONL archive changed during filesystem handoff");
         }
+        Self::open_import_transcript(staged_path, "staged source")?;
         std::fs::remove_file(staged_path).with_context(|| {
             format!(
                 "Failed to remove staged JSONL source {}",
@@ -449,24 +554,27 @@ impl SqliteSessionBackend {
     }
 
     fn sync_staged_jsonl(path: &Path, name: &str) -> Result<()> {
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
+        let file = Self::open_import_transcript(path, name)?;
         #[cfg(windows)]
-        options.write(true);
-        options
-            .open(path)
-            .with_context(|| format!("Failed to open staged JSONL session {name} for sync"))?
-            .sync_all()
+        let file = {
+            drop(file);
+            crate::session_disposition::jsonl::open_regular_for_sync(path)
+                .with_context(|| format!("Failed to open staged JSONL session {name} for sync"))?
+        };
+        file.sync_all()
             .with_context(|| format!("Failed to sync staged JSONL session {name}"))
     }
 
     fn restore_uncommitted_jsonl(staged_path: &Path, live_path: &Path) -> Result<()> {
-        if live_path.exists() {
+        use crate::session_disposition::jsonl::{self, Entry};
+
+        if !matches!(jsonl::classify(live_path)?, Entry::Missing) {
             bail!(
                 "Refusing to replace JSONL session created while {} was staged",
                 live_path.display()
             );
         }
+        Self::open_import_transcript(staged_path, "staged source")?;
         std::fs::rename(staged_path, live_path).with_context(|| {
             format!(
                 "Failed to restore empty JSONL session {}",
@@ -570,10 +678,14 @@ impl SqliteSessionBackend {
         R: FnMut(&Connection, &str) -> Result<Option<(String, String, i64)>>,
         F: FnMut(&Path, &Path, &(String, i64)) -> Result<()>,
     {
+        use crate::session_disposition::jsonl::{self, Entry};
+
         let sessions_dir = workspace_dir.join("sessions");
         let mutation_lock = crate::session_store::mutation_lock_for(&sessions_dir)
             .context("Failed to acquire JSONL session mutation lock")?;
         let mut mutation_guard = mutation_lock.lock();
+        let _directory_guard = jsonl::lock_directory(&sessions_dir, true)
+            .context("Failed to acquire interprocess JSONL session mutation lock")?;
         let receipt_inventory = committed_jsonl_import_receipts_exist(&self.conn.lock());
         let has_committed_import: bool = match receipt_inventory {
             Ok(has_committed_import) => has_committed_import,
@@ -652,22 +764,30 @@ impl SqliteSessionBackend {
         for (name, key, live_path, staged_path, migrated_path, staged) in candidates {
             let candidate_may_have_committed_receipt = staged && has_committed_import;
             if staged {
-                if live_path.exists() {
+                if !matches!(jsonl::classify(&live_path)?, Entry::Missing) {
                     bail!(
                         "Refusing ambiguous JSONL migration with both {} and {}",
                         live_path.display(),
                         staged_path.display()
                     );
                 }
+                Self::open_import_transcript(&staged_path, &name)?;
             } else {
-                if staged_path.exists() {
+                match jsonl::classify(&live_path)? {
+                    // This backend can be switched before task cleanup;
+                    // leave the original marker and its breadcrumb intact.
+                    Entry::Marker(_) => continue,
+                    Entry::Transcript(_) => {}
+                    Entry::Missing => bail!("JSONL migration source {name} disappeared"),
+                }
+                if !matches!(jsonl::classify(&staged_path)?, Entry::Missing) {
                     bail!(
                         "Refusing ambiguous JSONL migration with both {} and {}",
                         live_path.display(),
                         staged_path.display()
                     );
                 }
-                if migrated_path.exists() {
+                if !matches!(jsonl::classify(&migrated_path)?, Entry::Missing) {
                     bail!(
                         "Refusing to replace existing migrated JSONL session {}",
                         migrated_path.display()
@@ -767,8 +887,7 @@ impl SqliteSessionBackend {
                     );
                 }
 
-                let file = std::fs::File::open(&staged_path)
-                    .with_context(|| format!("Failed to open staged JSONL session {name}"))?;
+                let file = Self::open_import_transcript(&staged_path, &name)?;
                 let now = Utc::now().to_rfc3339();
                 let mut inserted = 0_i64;
                 let mut has_non_whitespace_source = false;
@@ -818,26 +937,33 @@ impl SqliteSessionBackend {
                 // corruption, not a legitimate `false`, and importing it as
                 // one would let the migrated session mark an untrimmed
                 // transcript as trim-clean.
-                let trim_breadcrumb =
-                    match std::fs::read(sessions_dir.join(format!("{key}.trim_breadcrumb"))) {
-                        Ok(bytes) => match bytes.as_slice() {
-                            [b'0'] => Some(false),
-                            [b'1'] => Some(true),
-                            _ => {
-                                bail!(
-                                    "corrupt trim breadcrumb sidecar for JSONL session {name}: \
+                let trim_breadcrumb = match jsonl::open_regular(
+                    &sessions_dir.join(format!("{key}.trim_breadcrumb")),
+                    false,
+                )
+                .and_then(|file| {
+                    let mut bytes = Vec::new();
+                    file.take(2).read_to_end(&mut bytes)?;
+                    Ok(bytes)
+                }) {
+                    Ok(bytes) => match bytes.as_slice() {
+                        [b'0'] => Some(false),
+                        [b'1'] => Some(true),
+                        _ => {
+                            bail!(
+                                "corrupt trim breadcrumb sidecar for JSONL session {name}: \
                                      expected a single b'0' or b'1' byte, got {} byte(s)",
-                                    bytes.len()
-                                );
-                            }
-                        },
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                        Err(e) => {
-                            return Err(anyhow::Error::new(e).context(format!(
-                                "Failed to read trim breadcrumb sidecar for JSONL session {name}"
-                            )));
+                                bytes.len()
+                            );
                         }
-                    };
+                    },
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => {
+                        return Err(anyhow::Error::new(e).context(format!(
+                            "Failed to read trim breadcrumb sidecar for JSONL session {name}"
+                        )));
+                    }
+                };
                 tx.execute(
                     "INSERT INTO session_metadata \
                      (session_key, created_at, last_activity, message_count, trim_breadcrumb) \
@@ -905,7 +1031,7 @@ impl SqliteSessionBackend {
             .context("Failed to deactivate JSONL after committed SQLite import")?;
             drop(conn);
 
-            if migrated_path.exists() {
+            if !matches!(jsonl::classify(&migrated_path)?, Entry::Missing) {
                 if Self::source_fingerprint(&migrated_path, &name)? != expected {
                     bail!(
                         "Refusing incompatible migrated JSONL session {}",
@@ -913,6 +1039,7 @@ impl SqliteSessionBackend {
                     );
                 }
                 Self::sync_parent_directory(&migrated_path)?;
+                Self::open_import_transcript(&staged_path, &name)?;
                 std::fs::remove_file(&staged_path)
                     .with_context(|| format!("Failed to finish staged JSONL handoff for {name}"))?;
                 Self::sync_parent_directory(&staged_path)?;
@@ -1383,37 +1510,56 @@ impl SessionBackend for SqliteSessionBackend {
         expected_owner: Option<&str>,
         authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
     ) -> std::io::Result<bool> {
-        let mut conn = self.conn.lock();
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(std::io::Error::other)?;
-        let owner: Option<Option<String>> = tx
-            .query_row(
-                "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
-                params![session_key],
-                |row| row.get(0),
+        Self::delete_session_authorized_inner(
+            &mut self.conn.lock(),
+            session_key,
+            expected_owner,
+            authorize,
+            None,
+        )
+    }
+
+    fn session_disposition_identity(&self) -> io::Result<SessionDispositionIdentity> {
+        disposition::identity(&self.conn.lock(), SessionDispositionBackend::ChatSqlite)
+    }
+
+    fn delete_session_with_disposition(
+        &self,
+        witness: &SessionDispositionWitness,
+        expected_owner: Option<&str>,
+        authorize: &SessionEffectAuthorization<'_>,
+    ) -> io::Result<bool> {
+        disposition::with_full_sync(&mut self.conn.lock(), |conn| {
+            Self::delete_session_authorized_inner(
+                conn,
+                &witness.backend_key,
+                expected_owner,
+                authorize,
+                Some(witness),
             )
-            .optional()
-            .map_err(std::io::Error::other)?;
-        let _authority = authorize(owner.as_ref().and_then(|owner| owner.as_deref()))?;
-        if owner
-            .as_ref()
-            .is_none_or(|owner| owner.as_deref() != expected_owner)
-        {
-            return Ok(false);
-        }
-        tx.execute(
-            "DELETE FROM sessions WHERE session_key = ?1",
-            params![session_key],
+        })
+    }
+
+    fn observe_session_disposition(
+        &self,
+        witness: &SessionDispositionWitness,
+    ) -> io::Result<SessionDispositionObservation> {
+        disposition::observe(
+            &mut self.conn.lock(),
+            SessionDispositionBackend::ChatSqlite,
+            witness,
         )
-        .map_err(std::io::Error::other)?;
-        tx.execute(
-            "DELETE FROM session_metadata WHERE session_key = ?1 AND principal_id IS ?2",
-            params![session_key, expected_owner],
+    }
+
+    fn acknowledge_session_disposition(
+        &self,
+        witness: &SessionDispositionWitness,
+    ) -> io::Result<()> {
+        disposition::acknowledge(
+            &mut self.conn.lock(),
+            SessionDispositionBackend::ChatSqlite,
+            witness,
         )
-        .map_err(std::io::Error::other)?;
-        tx.commit().map_err(std::io::Error::other)?;
-        Ok(true)
     }
 
     fn set_session_state_authorized(
@@ -1978,6 +2124,215 @@ mod tests {
     use std::sync::{Arc, mpsc};
     use std::time::Duration as StdDuration;
     use tempfile::TempDir;
+
+    #[test]
+    fn witnessed_chat_delete_is_atomic_and_replay_observes_only_its_receipt() {
+        use crate::session_backend::SessionEffectGuard;
+        use SessionDispositionObservation::{Committed, Indeterminate, NotCommitted};
+
+        let workspace = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(workspace.path()).unwrap();
+        let witness = SessionDispositionWitness {
+            operation_id: "10000000-0000-4000-8000-000000000001".into(),
+            effect: SessionDispositionEffect::Delete,
+            backend_key: "chat".into(),
+            identity: backend.session_disposition_identity().unwrap(),
+        };
+        let authorize = |owner: Option<&str>| -> io::Result<Box<dyn SessionEffectGuard>> {
+            assert_eq!(owner, Some("user:alice"));
+            Ok(Box::new(()))
+        };
+        backend.set_session_principal("chat", "user:alice").unwrap();
+        backend
+            .append("chat", &ChatMessage::user("retained"))
+            .unwrap();
+        assert!(
+            !backend
+                .delete_session_with_disposition(&witness, Some("user:bob"), &authorize)
+                .unwrap()
+        );
+        let deny = |_: Option<&str>| -> io::Result<Box<dyn SessionEffectGuard>> {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "revoked"))
+        };
+        assert_eq!(
+            backend
+                .delete_session_with_disposition(&witness, Some("user:alice"), &deny)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        backend
+            .conn
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER reject_receipt BEFORE INSERT ON session_disposition_receipts
+             BEGIN SELECT RAISE(ABORT, 'receipt fault'); END;",
+            )
+            .unwrap();
+        assert!(
+            backend
+                .delete_session_with_disposition(&witness, Some("user:alice"), &authorize)
+                .is_err()
+        );
+        drop(backend);
+
+        let backend = SqliteSessionBackend::new(workspace.path()).unwrap();
+        assert_eq!(
+            backend.session_disposition_identity().unwrap(),
+            witness.identity
+        );
+        assert_eq!(backend.load("chat")[0].content, "retained");
+        assert_eq!(
+            backend.observe_session_disposition(&witness).unwrap(),
+            NotCommitted
+        );
+        backend
+            .conn
+            .lock()
+            .execute_batch("DROP TRIGGER reject_receipt")
+            .unwrap();
+        assert!(
+            backend
+                .delete_session_with_disposition(&witness, Some("user:alice"), &authorize)
+                .unwrap()
+        );
+        assert!(!backend.session_exists("chat"));
+        let absent = SessionDispositionWitness {
+            operation_id: "10000000-0000-4000-8000-000000000002".into(),
+            ..witness.clone()
+        };
+        let authorize_missing = |owner: Option<&str>| -> io::Result<Box<dyn SessionEffectGuard>> {
+            assert_eq!(owner, None);
+            Ok(Box::new(()))
+        };
+        assert!(
+            !backend
+                .delete_session_with_disposition(&absent, None, &authorize_missing)
+                .unwrap()
+        );
+        assert_eq!(
+            backend.observe_session_disposition(&absent).unwrap(),
+            NotCommitted
+        );
+        drop(backend);
+
+        assert_eq!(
+            SqliteSessionBackend::observe_session_disposition_at(workspace.path(), &witness)
+                .unwrap(),
+            Committed
+        );
+        let conflicting = SessionDispositionWitness {
+            backend_key: "another-chat".into(),
+            ..witness.clone()
+        };
+        assert_eq!(
+            SqliteSessionBackend::observe_session_disposition_at(workspace.path(), &conflicting)
+                .unwrap(),
+            Indeterminate
+        );
+        assert!(
+            SqliteSessionBackend::acknowledge_session_disposition_at(
+                workspace.path(),
+                &conflicting
+            )
+            .is_err()
+        );
+        let backend = SqliteSessionBackend::new(workspace.path()).unwrap();
+        backend.set_session_principal("chat", "user:alice").unwrap();
+        backend
+            .append("chat", &ChatMessage::user("new lifetime"))
+            .unwrap();
+        assert_eq!(
+            backend
+                .delete_session_with_disposition(&witness, Some("user:alice"), &authorize)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        for _ in 0..2 {
+            SqliteSessionBackend::acknowledge_session_disposition_at(workspace.path(), &witness)
+                .unwrap();
+        }
+        assert_eq!(backend.load("chat")[0].content, "new lifetime");
+        assert_eq!(
+            backend.observe_session_disposition(&witness).unwrap(),
+            NotCommitted
+        );
+    }
+
+    #[test]
+    fn chat_sqlite_disposition_probe_does_not_create_or_adopt_a_replacement_database() {
+        use SessionDispositionObservation::Indeterminate;
+
+        let workspace = TempDir::new().unwrap();
+        let db = SqliteSessionBackend::db_path(workspace.path());
+        let backend = SqliteSessionBackend::new(workspace.path()).unwrap();
+        let witness = SessionDispositionWitness {
+            operation_id: "10000000-0000-4000-8000-000000000001".into(),
+            effect: SessionDispositionEffect::Delete,
+            backend_key: "chat".into(),
+            identity: backend.session_disposition_identity().unwrap(),
+        };
+        drop(backend);
+        std::fs::rename(&db, db.with_extension("original")).unwrap();
+        assert_eq!(
+            SqliteSessionBackend::observe_session_disposition_at(workspace.path(), &witness)
+                .unwrap(),
+            Indeterminate
+        );
+        assert!(
+            SqliteSessionBackend::acknowledge_session_disposition_at(workspace.path(), &witness)
+                .is_err()
+        );
+        assert!(!db.exists());
+        // An existing pre-witness schema must remain pre-witness.
+        let legacy = Connection::open(&db).unwrap();
+        assert_eq!(
+            SqliteSessionBackend::observe_session_disposition_at(workspace.path(), &witness)
+                .unwrap(),
+            Indeterminate
+        );
+        let table_count: u64 = legacy
+            .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(table_count, 0);
+        drop(legacy);
+        let replacement = SqliteSessionBackend::new(workspace.path()).unwrap();
+        assert_ne!(
+            replacement.session_disposition_identity().unwrap(),
+            witness.identity
+        );
+        assert_eq!(
+            SqliteSessionBackend::observe_session_disposition_at(workspace.path(), &witness)
+                .unwrap(),
+            Indeterminate
+        );
+        assert!(
+            replacement
+                .delete_session_with_disposition(&witness, None, &|_| Ok(Box::new(())))
+                .is_err()
+        );
+
+        let current_witness = SessionDispositionWitness {
+            identity: replacement.session_disposition_identity().unwrap(),
+            ..witness
+        };
+        replacement
+            .conn
+            .lock()
+            .execute_batch("DROP TABLE session_disposition_receipts")
+            .unwrap();
+        drop(replacement);
+        assert_eq!(
+            SqliteSessionBackend::observe_session_disposition_at(
+                workspace.path(),
+                &current_witness
+            )
+            .unwrap(),
+            Indeterminate
+        );
+        assert!(SqliteSessionBackend::new(workspace.path()).is_err());
+    }
 
     #[test]
     fn round_trip_sqlite() {

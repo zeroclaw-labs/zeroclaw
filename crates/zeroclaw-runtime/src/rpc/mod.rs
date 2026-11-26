@@ -13,6 +13,7 @@ pub mod local;
 pub mod locales;
 pub mod orphans;
 pub mod session;
+mod session_disposition;
 pub mod subscription;
 pub mod transport;
 pub mod tui_identity;

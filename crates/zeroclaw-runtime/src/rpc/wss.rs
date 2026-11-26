@@ -1992,7 +1992,7 @@ mod accept_error_tests {
         }
     }
 
-    fn test_client_connector(
+    pub(super) fn test_client_connector(
         client_cert_pem: &str,
         client_key_pem: &str,
     ) -> tokio_tungstenite::Connector {
@@ -2629,6 +2629,12 @@ mod accept_error_tests {
             None
         };
         let key = GoalSessionKey::zero_code(SID).unwrap().durable_id();
+        let disposition_store = ctx
+            .goal_runtime
+            .current_control_plane()
+            .unwrap()
+            .session_dispositions()
+            .unwrap();
         let response = case.response();
         let predecessor = case.predecessor(registry.as_ref(), &key).await;
         #[cfg(unix)]
@@ -3191,7 +3197,15 @@ mod accept_error_tests {
             ))
             .await
             .unwrap();
-            assert_running_goal_replacement_fence(registry.as_ref(), &key, &before, &parent).await;
+            assert_running_goal_replacement_fence(
+                &ctx,
+                registry.as_ref(),
+                SID,
+                generation,
+                &before,
+                &parent,
+            )
+            .await;
             assert_eq!(ctx.sessions.get_generation(SID).await, Some(generation));
             turn.release.notify_one();
             tokio::time::timeout(Duration::from_secs(2), async {
@@ -3219,6 +3233,13 @@ mod accept_error_tests {
                 &parent,
             )
             .await;
+            assert!(
+                disposition_store
+                    .session_disposition(&key)
+                    .unwrap()
+                    .is_none(),
+                "successful replacement must clear its disposition row"
+            );
             let verifier = held_verifier.unwrap();
             assert_eq!(
                 verifier
@@ -4211,26 +4232,44 @@ mod accept_error_tests {
         std::fs::write(tmp.path().join(".secret_key"), "42".repeat(32)).unwrap();
         Arc::get_mut(&mut ctx).unwrap().tui_registry =
             Arc::new(crate::rpc::tui_identity::TuiRegistry::new(tmp.path()));
-        if matches!(completion, GoalBoundaryCompletion::Replace) {
+        let replacing = matches!(completion, GoalBoundaryCompletion::Replace);
+        let disposing = replacing || matches!(completion, GoalBoundaryCompletion::Dispose(_));
+        if replacing {
             crate::rpc::dispatch::connection_test_support::prepare_goal_replacement_fixture(
                 &mut ctx,
                 tmp.path(),
             );
         }
-        let held_turn = if matches!(
+        let (held_turn, goal_provider_probe) = if matches!(
             completion,
             GoalBoundaryCompletion::FinishOrdinaryTurn
                 | GoalBoundaryCompletion::ApplyBudgetWithInvalidUnusedDefault
         ) {
-            Some(insert_held_session_with_owner(&ctx, tmp.path(), SID, OWNER).await)
+            (
+                Some(insert_held_session_with_owner(&ctx, tmp.path(), SID, OWNER).await),
+                None,
+            )
+        } else if disposing {
+            // No prompt is submitted in these cases. Any call means the
+            // withdrawn control dispatched through the old session.
+            (
+                None,
+                Some(insert_held_session_with_owner(&ctx, tmp.path(), SID, OWNER).await),
+            )
         } else {
             insert_immediate_session_with_owner(&ctx, tmp.path(), SID, OWNER).await;
-            None
+            (None, None)
         };
         let original_generation = ctx.sessions.get_generation(SID).await.unwrap();
         let (registry, control) =
             prepare_queued_goal_control_fixture(&ctx, tmp.path(), SID, command).await;
         let key = GoalSessionKey::zero_code(SID).unwrap().durable_id();
+        let disposition_store = ctx
+            .goal_runtime
+            .current_control_plane()
+            .unwrap()
+            .session_dispositions()
+            .unwrap();
         let before = registry
             .current_goal_for_session(&key)
             .await
@@ -4428,8 +4467,6 @@ mod accept_error_tests {
             ctx.goal_runtime
                 .fail_test_launch_bind(key.clone(), before.execution_epoch + 1);
         }
-        let replacing = matches!(completion, GoalBoundaryCompletion::Replace);
-        let disposing = replacing || matches!(completion, GoalBoundaryCompletion::Dispose(_));
         if let GoalBoundaryCompletion::Dispose(method) = completion {
             sink.send(Message::Text(
                 rpc_request(method, &serde_json::json!({"session_id": SID}), 3).into(),
@@ -4652,25 +4689,45 @@ mod accept_error_tests {
         if disposing {
             match response {
                 GoalResponse::AlreadyPaused(status) | GoalResponse::Terminal(status) => {
+                    assert_eq!(status.task_id, before.id);
+                    assert_eq!(status.execution_epoch, before.execution_epoch);
                     assert_eq!(status.token_limit, Some(10));
                 }
-                GoalResponse::NoCurrentGoal | GoalResponse::Stale => {}
-                other => panic!("disposed control must not apply its transition: {other:?}"),
+                GoalResponse::Stale => {}
+                other => panic!("closed control must not apply its transition: {other:?}"),
             }
             tokio::time::timeout(Duration::from_secs(2), async {
-                while registry
-                    .current_goal_for_session(&key)
-                    .await
-                    .unwrap()
-                    .is_some()
-                {
+                loop {
+                    let original = ctx.sessions.goal_session_snapshot(SID).await.unwrap();
+                    assert_eq!(original.generation, original_generation);
+                    if original.goal_admission_is_fenced()
+                        && ctx.sessions.session_queue.queue_depth(SID).await == 2
+                    {
+                        break;
+                    }
                     tokio::task::yield_now().await;
                 }
             })
             .await
-            .expect("Goal disposal must finish before the ordinary turn releases");
-            assert_eq!(ctx.sessions.session_queue.queue_depth(SID).await, 2);
-            assert!(ctx.sessions.get_generation(SID).await.is_some());
+            .expect("the original generation must be fenced while removal waits for the actor");
+            let retained = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .expect("control closure cannot remove the Goal before session commit");
+            assert_eq!(
+                serde_json::to_value(&retained).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+            assert_eq!(
+                registry
+                    .get_goal_task(&before.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .effective_token_limit,
+                Some(10),
+            );
             drop(ordinary.take());
             let frame = tokio::time::timeout(
                 Duration::from_secs(2),
@@ -4679,6 +4736,26 @@ mod accept_error_tests {
             .await
             .expect("session removal must finish after the ordinary permit releases");
             assert!(frame["error"].is_null(), "{frame}");
+            let result = &frame["result"];
+            assert_eq!(result["session_id"], SID);
+            assert!(
+                registry
+                    .current_goal_for_session(&key)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the successful session commit must clear the retired Goal binding"
+            );
+            assert!(registry.get_goal_task(&before.id).await.unwrap().is_none());
+            assert_eq!(
+                goal_provider_probe
+                    .as_ref()
+                    .unwrap()
+                    .calls
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0,
+                "the withdrawn control must not dispatch a successor"
+            );
             if replacing {
                 assert_ne!(
                     ctx.sessions.get_generation(SID).await,
@@ -4689,7 +4766,21 @@ mod accept_error_tests {
                     Some(crate::rpc::types::ChatMode::Acp)
                 );
             } else {
+                let effect = match completion {
+                    GoalBoundaryCompletion::Dispose(Method::SessionClose) => "closed",
+                    GoalBoundaryCompletion::Dispose(Method::SessionDelete) => "deleted",
+                    GoalBoundaryCompletion::Dispose(Method::SessionKill) => "killed",
+                    _ => unreachable!("only native removal operations reach this branch"),
+                };
+                assert_eq!(result[effect], true, "{result}");
                 assert!(ctx.sessions.get_generation(SID).await.is_none());
+                assert!(
+                    disposition_store
+                        .session_disposition(&key)
+                        .unwrap()
+                        .is_none(),
+                    "successful session deletion must clear its disposition row"
+                );
             }
             assert_eq!(ctx.sessions.session_queue.queue_depth(SID).await, 0);
         } else {
@@ -5421,6 +5512,196 @@ mod accept_error_tests {
         assert!(!is_recoverable_accept_error(&Error::from(
             ErrorKind::InvalidInput
         )));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rpc::dispatch::{
+        Method,
+        connection_test_support::{
+            GoalReattachFixture, GoalReattachPeer, NativeBurstMode, NativeBurstRoute,
+            REATTACH_OWNER, REATTACH_SID,
+        },
+    };
+    use crate::rpc::session::SessionStore;
+    use zeroclaw_api::jsonrpc::JsonRpcRequest;
+    use zeroclaw_infra::session_queue::SessionActorQueue;
+
+    impl GoalReattachPeer for WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>> {
+        async fn write_request(&mut self, method: Method, params: &serde_json::Value, id: u64) {
+            let req = JsonRpcRequest::new(method.wire_name(), params.clone(), id.into());
+            self.send(Message::Text(serde_json::to_string(&req).unwrap().into()))
+                .await
+                .unwrap();
+        }
+
+        async fn read_frame(&mut self) -> serde_json::Value {
+            loop {
+                match self.next().await.expect("WSS peer closed").unwrap() {
+                    Message::Text(text) => return serde_json::from_str(&text).unwrap(),
+                    Message::Ping(_) | Message::Pong(_) => {}
+                    frame => panic!("unexpected Goal WSS frame: {frame:?}"),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_reattach_native_burst_wss() {
+        exercise_goal_reattach_native_burst(NativeBurstRoute::Primary).await;
+    }
+
+    #[tokio::test]
+    async fn goal_reattach_native_burst_streaming_fallback_wss() {
+        exercise_goal_reattach_native_burst(NativeBurstRoute::StreamingFallback).await;
+    }
+
+    async fn exercise_goal_reattach_native_burst(route: NativeBurstRoute) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().to_owned(),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        const TOKEN: &str = "synthetic-fixture-token";
+        config.gateway.paired_tokens = vec![TOKEN.into()];
+        let sessions = Arc::new(SessionStore::new(
+            64,
+            Arc::new(SessionActorQueue::new(4, 30, 60)),
+        ));
+        let mut ctx = RpcContext::minimal(config, sessions);
+        std::fs::write(tmp.path().join(".secret_key"), "42".repeat(32)).unwrap();
+        Arc::get_mut(&mut ctx).unwrap().tui_registry =
+            Arc::new(crate::rpc::tui_identity::TuiRegistry::new(tmp.path()));
+        let fixture =
+            GoalReattachFixture::with_route(&mut ctx, tmp.path(), NativeBurstMode::Reattach, route)
+                .await;
+        let materials = zeroclaw_tls::ensure_server_materials(tmp.path(), &[]).unwrap();
+        let client = zeroclaw_tls::issue_client_cert(
+            &std::fs::read_to_string(&materials.ca_cert_path).unwrap(),
+            &std::fs::read_to_string(&materials.ca_key_path).unwrap(),
+            "goal-reattach",
+        )
+        .unwrap();
+        let acceptor = build_tls_acceptor(
+            materials.server_cert_path.to_str().unwrap(),
+            materials.server_key_path.to_str().unwrap(),
+            materials.ca_cert_path.to_str().unwrap(),
+            &[],
+            "",
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("wss://{}/", listener.local_addr().unwrap());
+        let count = Arc::new(AtomicUsize::new(0));
+        let cancel = CancellationToken::new();
+        let server_ctx = Arc::clone(&ctx);
+        let server_cancel = cancel.clone();
+        let server_count = Arc::clone(&count);
+        let server = zeroclaw_spawn::spawn!(serve_wss_listener(
+            server_ctx,
+            server_cancel,
+            server_count,
+            acceptor,
+            listener,
+            WssLimits::default()
+        ));
+        let connect = || async {
+            let connector =
+                super::accept_error_tests::test_client_connector(&client.cert_pem, &client.key_pem);
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio_tungstenite::connect_async_tls_with_config(
+                    &url,
+                    None,
+                    false,
+                    Some(connector),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .0
+        };
+        let mut a = connect().await;
+        a.initialize(&ctx, REATTACH_OWNER, Some(TOKEN)).await;
+        fixture.start(&mut a).await;
+        a.close(None).await.unwrap();
+        drop(a);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while ctx.tui_registry.departure(REATTACH_OWNER).is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("original WSS transport must detach while parent held");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while count.load(std::sync::atomic::Ordering::Acquire) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("departed WSS issuer must remain counted while held");
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "the held worker still accounts for its departed connection"
+        );
+        let mut b = connect().await;
+        b.initialize(&ctx, REATTACH_OWNER, Some(TOKEN)).await;
+        fixture
+            .finish(&ctx, tmp.path(), &mut b, || {
+                // This fixture admits only B after departure. Subtract its live
+                // connection to observe the held issuer's count.
+                assert_eq!(
+                    count
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        .checked_sub(1),
+                    Some(1)
+                );
+            })
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while count.load(std::sync::atomic::Ordering::Acquire) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("only the live successor must be counted after the worker settles");
+        b.close(None).await.unwrap();
+        drop(b);
+        ctx.goal_runtime
+            .dispose_session(REATTACH_SID)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while count.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("settled issuer and closed WSS successor must drain before cancel");
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::Acquire), 0);
+        let weak_context = Arc::downgrade(&ctx);
+        let weak_sessions = Arc::downgrade(&ctx.sessions);
+        drop(ctx);
+        assert!(
+            weak_context.upgrade().is_none(),
+            "listener generation must be released"
+        );
+        assert!(
+            weak_sessions.upgrade().is_none(),
+            "listener session store must be released"
+        );
     }
 }
 

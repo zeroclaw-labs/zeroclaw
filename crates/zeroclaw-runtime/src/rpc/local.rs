@@ -2012,6 +2012,244 @@ mod tests {
     }
 
     #[cfg(unix)]
+    impl crate::rpc::dispatch::connection_test_support::GoalReattachPeer
+        for tokio::io::BufReader<tokio::net::UnixStream>
+    {
+        async fn write_request(&mut self, method: Method, params: &serde_json::Value, id: u64) {
+            self.get_mut()
+                .write_all(rpc_request(method, params, id).as_bytes())
+                .await
+                .unwrap();
+        }
+
+        async fn read_frame(&mut self) -> serde_json::Value {
+            let mut line = String::new();
+            assert_ne!(
+                self.read_line(&mut line).await.unwrap(),
+                0,
+                "IPC peer closed"
+            );
+            serde_json::from_str(&line).unwrap()
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_reattach_split_final_local_ipc() {
+        use crate::rpc::dispatch::connection_test_support::{NativeBurstMode, NativeBurstRoute};
+        exercise_goal_stream_reattach(
+            NativeBurstMode::SplitFinal,
+            NativeBurstRoute::Primary,
+            false,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_reattach_native_burst_local_ipc() {
+        use crate::rpc::dispatch::connection_test_support::{NativeBurstMode, NativeBurstRoute};
+        exercise_goal_stream_reattach(NativeBurstMode::Reattach, NativeBurstRoute::Primary, false)
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_reconnect_native_burst_local_ipc() {
+        use crate::rpc::dispatch::connection_test_support::{NativeBurstMode, NativeBurstRoute};
+        exercise_goal_stream_reattach(NativeBurstMode::Reattach, NativeBurstRoute::Primary, true)
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_reconnect_native_burst_streaming_fallback_local_ipc() {
+        use crate::rpc::dispatch::connection_test_support::{NativeBurstMode, NativeBurstRoute};
+        exercise_goal_stream_reattach(
+            NativeBurstMode::Reattach,
+            NativeBurstRoute::StreamingFallback,
+            true,
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    async fn exercise_goal_stream_reattach(
+        mode: crate::rpc::dispatch::connection_test_support::NativeBurstMode,
+        route: crate::rpc::dispatch::connection_test_support::NativeBurstRoute,
+        reconnect: bool,
+    ) {
+        use crate::rpc::dispatch::connection_test_support::{
+            GoalReattachFixture, GoalReattachPeer, REATTACH_OWNER, REATTACH_SID,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(tmp.path());
+        let fixture = GoalReattachFixture::with_route(&mut ctx, tmp.path(), mode, route).await;
+        let socket = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let server_ctx = Arc::clone(&ctx);
+        let server_cancel = cancel.clone();
+        let count = test_client_count();
+        let server_count = Arc::clone(&count);
+        let server = zeroclaw_spawn::spawn!(run_local_listener(
+            server_ctx,
+            server_cancel,
+            server_count,
+            None
+        ));
+        wait_for_socket(&socket).await;
+        let mut a =
+            tokio::io::BufReader::new(tokio::net::UnixStream::connect(&socket).await.unwrap());
+        a.initialize(&ctx, REATTACH_OWNER, None).await;
+        fixture.start(&mut a).await;
+        let mut old = if reconnect {
+            drop(a);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while ctx.tui_registry.departure(REATTACH_OWNER).is_none() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("original IPC transport must detach while parent held");
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while count.load(Ordering::Acquire) != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("departed IPC issuer must remain counted while held");
+            None
+        } else {
+            Some(a)
+        };
+        let mut b =
+            tokio::io::BufReader::new(tokio::net::UnixStream::connect(&socket).await.unwrap());
+        b.initialize(
+            &ctx,
+            if reconnect {
+                REATTACH_OWNER
+            } else {
+                "goal-stream-other-pane"
+            },
+            None,
+        )
+        .await;
+        fixture
+            .finish(&ctx, tmp.path(), &mut b, || {
+                if reconnect {
+                    // This fixture admits only B after departure. Subtract its
+                    // live connection to observe the held issuer's count.
+                    assert_eq!(count.load(Ordering::Acquire).checked_sub(1), Some(1));
+                }
+            })
+            .await;
+        if let Some(a) = &mut old {
+            a.result(Method::Status, serde_json::json!({}), 6).await;
+        }
+        drop(old);
+        drop(b);
+        ctx.goal_runtime
+            .dispose_session(REATTACH_SID)
+            .await
+            .unwrap();
+        if reconnect {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while count.load(Ordering::Acquire) != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("settled issuer and closed IPC successor must drain before cancel");
+        }
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if reconnect {
+            assert_eq!(count.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn goal_pending_recipient_does_not_retain_local_listener_generation() {
+        use crate::rpc::dispatch::connection_test_support::{
+            GoalParentAdmissionCase, GoalReattachPeer, REATTACH_OWNER, REATTACH_SID,
+            prepare_held_goal_parent_fixture,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ctx = test_ctx(tmp.path());
+        // Seed the same owned Chat and a paused Goal without starting a worker.
+        let (registry, parent) = prepare_held_goal_parent_fixture(
+            &mut ctx,
+            tmp.path(),
+            REATTACH_SID,
+            REATTACH_OWNER,
+            GoalParentAdmissionCase::DirectResume,
+        )
+        .await;
+        let socket = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let server_ctx = Arc::clone(&ctx);
+        let server_cancel = cancel.clone();
+        let server = zeroclaw_spawn::spawn!(run_local_listener(
+            server_ctx,
+            server_cancel,
+            test_client_count(),
+            None
+        ));
+        wait_for_socket(&socket).await;
+        let mut peer =
+            tokio::io::BufReader::new(tokio::net::UnixStream::connect(&socket).await.unwrap());
+        peer.initialize(&ctx, REATTACH_OWNER, None).await;
+        let reply = peer
+            .result(
+                Method::SessionNew,
+                serde_json::json!({
+                    "session_id": REATTACH_SID, "agent_alias": "test-agent", "chat_mode": "chat",
+                }),
+                2,
+            )
+            .await;
+        assert_eq!(reply["session_id"], REATTACH_SID);
+        let recipient = ctx
+            .sessions
+            .goal_session_snapshot(REATTACH_SID)
+            .await
+            .unwrap()
+            .goal_recipient;
+        let pending = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (active, pending) = recipient.destinations_for_test();
+                assert!(
+                    active.is_none(),
+                    "an idle session cannot have issued a launch target"
+                );
+                if let Some(pending) = pending {
+                    break pending;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an acknowledged resume must offer its pending target");
+        let weak_context = Arc::downgrade(&ctx);
+        let weak_sessions = Arc::downgrade(&ctx.sessions);
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        drop((peer, recipient, registry, parent, ctx));
+        assert!(weak_context.upgrade().is_none());
+        assert!(weak_sessions.upgrade().is_none());
+        assert!(pending.upgrade().is_none());
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn goal_disconnect_retires_settled_verifier_failure_local_ipc() {
         exercise_goal_disconnect_counts_until_worker_settles(HeldVerifierOutcome::InvalidVerdict)
@@ -2242,6 +2480,25 @@ mod tests {
             crate::rpc::dispatch::connection_test_support::prepare_goal_replacement_fixture(
                 &mut ctx,
                 tmp.path(),
+            );
+            // An ACP replacement builds the agent's configured memory and then
+            // discards it (`exclude_memory`). Disable that backend so this ordering
+            // test's deadline does not also time an unrelated memory startup; the
+            // WSS and queued-control replacement tests keep the default backend.
+            let mut config = ctx.config.snapshot();
+            config
+                .agents
+                .get_mut("test-agent")
+                .expect("replacement fixture configures test-agent")
+                .memory
+                .backend = zeroclaw_config::multi_agent::MemoryBackendKind::None;
+            ctx.config_authority.publish_for_test(config);
+            assert_eq!(
+                zeroclaw_memory::configured_memory_backend(
+                    &ctx.config.snapshot(),
+                    Some("test-agent")
+                ),
+                "none",
             );
         }
         let (registry, parent) =
@@ -2738,7 +2995,15 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_running_goal_replacement_fence(registry.as_ref(), &key, &before, &parent).await;
+            assert_running_goal_replacement_fence(
+                &ctx,
+                registry.as_ref(),
+                SID,
+                generation,
+                &before,
+                &parent,
+            )
+            .await;
             assert_eq!(ctx.sessions.get_generation(SID).await, Some(generation));
             turn.release.notify_one();
             tokio::time::timeout(Duration::from_secs(2), async {
@@ -2766,6 +3031,19 @@ mod tests {
                 &parent,
             )
             .await;
+            let disposition_store = ctx
+                .goal_runtime
+                .current_control_plane()
+                .unwrap()
+                .session_dispositions()
+                .unwrap();
+            assert!(
+                disposition_store
+                    .session_disposition(&key)
+                    .unwrap()
+                    .is_none(),
+                "successful replacement must clear its disposition row"
+            );
             let verifier = held_verifier.unwrap();
             assert_eq!(
                 verifier
@@ -3706,26 +3984,44 @@ mod tests {
         const OWNER: &str = "goal-local-owner";
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = test_ctx(tmp.path());
-        if matches!(completion, GoalBoundaryCompletion::Replace) {
+        let replacing = matches!(completion, GoalBoundaryCompletion::Replace);
+        let disposing = replacing || matches!(completion, GoalBoundaryCompletion::Dispose(_));
+        if replacing {
             crate::rpc::dispatch::connection_test_support::prepare_goal_replacement_fixture(
                 &mut ctx,
                 tmp.path(),
             );
         }
-        let held_turn = if matches!(
+        let (held_turn, goal_provider_probe) = if matches!(
             completion,
             GoalBoundaryCompletion::FinishOrdinaryTurn
                 | GoalBoundaryCompletion::ApplyBudgetWithInvalidUnusedDefault
         ) {
-            Some(insert_held_session_with_owner(&ctx, tmp.path(), SID, OWNER).await)
+            (
+                Some(insert_held_session_with_owner(&ctx, tmp.path(), SID, OWNER).await),
+                None,
+            )
+        } else if disposing {
+            // No prompt is submitted in these cases. Any call means the
+            // withdrawn control dispatched through the old session.
+            (
+                None,
+                Some(insert_held_session_with_owner(&ctx, tmp.path(), SID, OWNER).await),
+            )
         } else {
             insert_immediate_session_with_owner(&ctx, tmp.path(), SID, OWNER).await;
-            None
+            (None, None)
         };
         let original_generation = ctx.sessions.get_generation(SID).await.unwrap();
         let (registry, control) =
             prepare_queued_goal_control_fixture(&ctx, tmp.path(), SID, command).await;
         let key = GoalSessionKey::zero_code(SID).unwrap().durable_id();
+        let disposition_store = ctx
+            .goal_runtime
+            .current_control_plane()
+            .unwrap()
+            .session_dispositions()
+            .unwrap();
         let before = registry
             .current_goal_for_session(&key)
             .await
@@ -3894,8 +4190,6 @@ mod tests {
             ctx.goal_runtime
                 .fail_test_launch_bind(key.clone(), before.execution_epoch + 1);
         }
-        let replacing = matches!(completion, GoalBoundaryCompletion::Replace);
-        let disposing = replacing || matches!(completion, GoalBoundaryCompletion::Dispose(_));
         if let GoalBoundaryCompletion::Dispose(method) = completion {
             writer
                 .write_all(
@@ -4095,31 +4389,70 @@ mod tests {
         if disposing {
             match response {
                 GoalResponse::AlreadyPaused(status) | GoalResponse::Terminal(status) => {
+                    assert_eq!(status.task_id, before.id);
+                    assert_eq!(status.execution_epoch, before.execution_epoch);
                     assert_eq!(status.token_limit, Some(10));
                 }
-                GoalResponse::NoCurrentGoal | GoalResponse::Stale => {}
-                other => panic!("disposed control must not apply its transition: {other:?}"),
+                GoalResponse::Stale => {}
+                other => panic!("closed control must not apply its transition: {other:?}"),
             }
             tokio::time::timeout(Duration::from_secs(2), async {
-                while registry
-                    .current_goal_for_session(&key)
-                    .await
-                    .unwrap()
-                    .is_some()
-                {
+                loop {
+                    let original = ctx.sessions.goal_session_snapshot(SID).await.unwrap();
+                    assert_eq!(original.generation, original_generation);
+                    if original.goal_admission_is_fenced()
+                        && ctx.sessions.session_queue.queue_depth(SID).await == 2
+                    {
+                        break;
+                    }
                     tokio::task::yield_now().await;
                 }
             })
             .await
-            .expect("Goal disposal must finish before the ordinary turn releases");
-            assert_eq!(ctx.sessions.session_queue.queue_depth(SID).await, 2);
-            assert!(ctx.sessions.get_generation(SID).await.is_some());
+            .expect("the original generation must be fenced while removal waits for the actor");
+            let retained = registry
+                .current_goal_for_session(&key)
+                .await
+                .unwrap()
+                .expect("control closure cannot remove the Goal before session commit");
+            assert_eq!(
+                serde_json::to_value(&retained).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+            assert_eq!(
+                registry
+                    .get_goal_task(&before.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .effective_token_limit,
+                Some(10),
+            );
             drop(ordinary.take());
-            let (frame, _): (_, serde_json::Value) =
+            let (frame, result): (_, serde_json::Value) =
                 tokio::time::timeout(Duration::from_secs(2), read_result(&mut reader))
                     .await
                     .expect("session removal must finish after the ordinary permit releases");
             assert_eq!(frame["id"], serde_json::json!(3));
+            assert_eq!(result["session_id"], SID);
+            assert!(
+                registry
+                    .current_goal_for_session(&key)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the successful session commit must clear the retired Goal binding"
+            );
+            assert!(registry.get_goal_task(&before.id).await.unwrap().is_none());
+            assert_eq!(
+                goal_provider_probe
+                    .as_ref()
+                    .unwrap()
+                    .calls
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0,
+                "the withdrawn control must not dispatch a successor"
+            );
             if replacing {
                 assert_ne!(
                     ctx.sessions.get_generation(SID).await,
@@ -4130,7 +4463,21 @@ mod tests {
                     Some(crate::rpc::types::ChatMode::Acp)
                 );
             } else {
+                let effect = match completion {
+                    GoalBoundaryCompletion::Dispose(Method::SessionClose) => "closed",
+                    GoalBoundaryCompletion::Dispose(Method::SessionDelete) => "deleted",
+                    GoalBoundaryCompletion::Dispose(Method::SessionKill) => "killed",
+                    _ => unreachable!("only native removal operations reach this branch"),
+                };
+                assert_eq!(result[effect], true, "{result}");
                 assert!(ctx.sessions.get_generation(SID).await.is_none());
+                assert!(
+                    disposition_store
+                        .session_disposition(&key)
+                        .unwrap()
+                        .is_none(),
+                    "successful session deletion must clear its disposition row"
+                );
             }
             assert_eq!(ctx.sessions.session_queue.queue_depth(SID).await, 0);
         } else {

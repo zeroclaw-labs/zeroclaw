@@ -510,6 +510,32 @@ struct GoalLifecycleDrain {
     failure_notice: Option<GoalFailureNoticeDelivery>,
 }
 
+/// Result of settling a worker for a pending session transition. A failure
+/// notice may need the ordinary session actor, so its delivery is a separate
+/// step from draining the already-admitted work.
+#[must_use = "settle the exact interruption and deliver any outstanding notice"]
+pub struct GoalSessionQuiescence {
+    scope: GoalExecutionScope,
+    drain: GoalLifecycleDrain,
+    notice_in_flight: bool,
+}
+
+impl GoalSessionQuiescence {
+    pub fn scope(&self) -> &GoalExecutionScope {
+        &self.scope
+    }
+
+    pub fn has_failure_notice(&self) -> bool {
+        self.notice_in_flight || self.drain.failure_notice.is_some()
+    }
+
+    /// Deliver only after releasing command and actor admission, including
+    /// reservations that already hold a permit.
+    pub async fn deliver_notice(self) {
+        self.drain.deliver().await;
+    }
+}
+
 impl GoalLifecycleDrain {
     fn from_response(response: Option<GoalResponse>) -> Self {
         Self {
@@ -987,7 +1013,7 @@ impl GoalExecutionSupervisor {
             let scope = request.scope().clone();
             let lease = submission
                 .driver
-                .bind(&submission.ingress)
+                .bind_for_launch(&submission.ingress)
                 .await
                 .context("revalidate Goal session before executor launch")?;
             if !self.execution_is_current(&scope).await? {
@@ -1152,6 +1178,47 @@ impl GoalExecutionSupervisor {
             launch_guard.settled();
         }
         result
+    }
+
+    /// Close pending admission and settle the exact resident worker before a
+    /// host attempts a session transition. The host must keep its session's
+    /// admission fence and settle a still-Running returned epoch even if
+    /// the session effect is rejected. This method grants no disposal
+    /// authority and never removes the binding.
+    pub async fn quiesce_session_worker(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<GoalSessionQuiescence>> {
+        ensure!(
+            !session_id.trim().is_empty(),
+            "Goal disposition session id must be nonblank"
+        );
+        self.close_pending_boundaries(Some(session_id)).await;
+        let worker = self.workers.lock().await.get(session_id).cloned();
+        let Some(worker) = worker else {
+            return Ok(None);
+        };
+        let scope = {
+            let worker = worker.lock().await;
+            let scope = GoalExecutionScope::new(
+                worker.task_id.clone(),
+                session_id.to_owned(),
+                worker.execution_epoch,
+            )?;
+            // Close only successor admission. The operation already admitted
+            // by this checkpoint retains its lease, output and accounting.
+            worker.checkpoint.close();
+            scope
+        };
+        let drain = self.drain_lifecycle_fence(&scope).await?;
+        // If another drainer is delivering through the original transport,
+        // the registered publication still owns this exact worker.
+        let notice_in_flight = self.owns_scope(&scope).await;
+        Ok(Some(GoalSessionQuiescence {
+            scope,
+            drain,
+            notice_in_flight,
+        }))
     }
 
     /// Hard-dispose one trusted session's current Goal control state.

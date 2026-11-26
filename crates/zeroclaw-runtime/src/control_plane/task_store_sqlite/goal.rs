@@ -13,11 +13,15 @@ use crate::control_plane::task_registry::{TaskKind, TaskRecord, TaskStatus};
 
 use super::{
     SqliteTaskStore, add_column_if_missing, collect_skipping_bad_rows, insert_task_record,
-    log_unreadable_task_row, row_to_record, status_to_db,
+    log_unreadable_task_row, row_to_record, session_disposition, status_to_db,
 };
 
 #[path = "goal_control_intents.rs"]
 mod control_intents;
+
+pub(super) fn delete_settled_start_intents(conn: &Connection, session_id: &str) -> Result<()> {
+    control_intents::delete_settled_start_intents(conn, session_id)
+}
 
 fn transition_failure(conn: &Connection, task_id: &str) -> Result<GoalTransitionResult> {
     let row = conn
@@ -376,6 +380,20 @@ impl SqliteTaskStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("start goal boot reconciliation")?;
+        // An outstanding session operation owns recovery for its exact target.
+        // Check after acquiring the writer, since another process can prepare
+        // an operation after the ownership scan above.
+        tx.execute(
+            "DELETE FROM goal_recovery_candidates
+              WHERE EXISTS (
+                    SELECT 1 FROM tasks t JOIN goal_session_dispositions d
+                      ON d.session_id = t.session_id AND d.task_id = t.id
+                     AND d.execution_epoch = t.execution_epoch
+                     WHERE t.id = goal_recovery_candidates.task_id
+              )",
+            [],
+        )
+        .context("retain disposition-owned Goals for session recovery")?;
         let now = chrono::Utc::now().to_rfc3339();
         control_intents::abandon_previous_boot(&tx, boot_id, &now)?;
         let daemon_restart = pause_reason_to_db(GoalPauseReason::DaemonRestart)?;
@@ -546,6 +564,55 @@ impl SqliteTaskStore {
             (missing_extension + failed_accounting + cleared_terminal_pending + paused + exhausted)
                 as u64,
         )
+    }
+
+    /// Pause the exact running Goal after its live executor and admitted
+    /// operations have drained. Interruption is not a user choice, a verifier
+    /// blocker or a daemon restart, so it carries no invented pause reason.
+    pub(crate) async fn pause_running_goal_for_session_interruption(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        expected_epoch: i64,
+    ) -> Result<GoalTransitionResult> {
+        session_disposition::validate_zero_code_session(session_id)?;
+        let _dispatch_gate = self.goal_dispatch_gates.gate(session_id).lock_owned().await;
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .context("begin guarded interrupted Goal pause")?;
+        let changed = tx
+            .execute(
+                "UPDATE tasks
+                SET status = 'paused', error = NULL, finished_at = NULL,
+                    execution_epoch = execution_epoch + 1
+              WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
+                AND status = 'running' AND execution_epoch = ?3
+                AND execution_epoch < 9223372036854775807
+                AND EXISTS (
+                    SELECT 1 FROM goal_tasks WHERE task_id = tasks.id
+                      AND pending_call_id IS NULL AND pending_call_epoch IS NULL
+                      AND accounting_state = 'complete'
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM goal_session_dispositions WHERE session_id = ?2
+                )",
+                params![task_id, session_id, expected_epoch],
+            )
+            .context("fence interrupted Goal epoch")?;
+        if changed == 0 {
+            return transition_failure(&tx, task_id);
+        }
+        tx.execute(
+            "UPDATE goal_tasks
+                SET pause_reason = NULL, pause_description = NULL, blockers_json = '[]'
+              WHERE task_id = ?1",
+            params![task_id],
+        )
+        .context("clear obsolete pause metadata for interrupted Goal")?;
+        tx.commit()
+            .context("commit guarded interrupted Goal pause")?;
+        Ok(GoalTransitionResult::Applied)
     }
 }
 
@@ -784,7 +851,16 @@ impl GoalTaskRegistry for SqliteTaskStore {
         &self,
         intent: &zeroclaw_goal::task::GoalControlIntent,
     ) -> Result<()> {
-        control_intents::record(&self.conn.lock(), intent)
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("begin guarded Goal control intent recording")?;
+        if session_disposition::is_outstanding(&tx, &intent.session_id)? {
+            anyhow::bail!("session disposition fences new Goal controls");
+        }
+        control_intents::record(&tx, intent)?;
+        tx.commit()
+            .context("commit guarded Goal control intent recording")
     }
 
     async fn claim_control_intent(
@@ -792,7 +868,27 @@ impl GoalTaskRegistry for SqliteTaskStore {
         intent_id: &str,
         owner_boot_id: &str,
     ) -> Result<GoalTransitionResult> {
-        control_intents::claim(&self.conn.lock(), intent_id, owner_boot_id)
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("begin guarded Goal control intent claim")?;
+        let blocked = tx
+            .query_row(
+                "SELECT EXISTS(
+                SELECT 1 FROM goal_control_intents i JOIN goal_session_dispositions d
+                  ON i.session_id = d.session_id WHERE i.intent_id = ?1
+             )",
+                params![intent_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .context("check disposition fence for Goal control claim")?;
+        if blocked {
+            return Ok(GoalTransitionResult::Stale);
+        }
+        let result = control_intents::claim(&tx, intent_id, owner_boot_id)?;
+        tx.commit()
+            .context("commit guarded Goal control intent claim")?;
+        Ok(result)
     }
 
     async fn settle_control_intent(
@@ -1036,6 +1132,9 @@ impl GoalTaskRegistry for SqliteTaskStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("start create or replace session goal transaction")?;
+        if session_disposition::is_outstanding(&tx, session_id)? {
+            return Ok(GoalTransitionResult::Stale);
+        }
         let requested_id_exists = tx
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)",
@@ -1105,7 +1204,10 @@ impl GoalTaskRegistry for SqliteTaskStore {
                 "SELECT 1 FROM tasks t JOIN goal_tasks g ON g.task_id = t.id
                   WHERE t.id = ?1 AND t.kind = 'goal' AND t.session_id = ?2
                     AND t.status = 'running' AND t.execution_epoch = ?3
-                    AND g.pending_call_id = ?4 AND g.pending_call_epoch = ?3",
+                    AND g.pending_call_id = ?4 AND g.pending_call_epoch = ?3
+                    AND NOT EXISTS (
+                        SELECT 1 FROM goal_session_dispositions WHERE session_id = ?2
+                    )",
                 params![task_id, session_id, expected_epoch, pending_call_id],
                 |row| row.get::<_, i64>(0),
             )
@@ -1136,6 +1238,9 @@ impl GoalTaskRegistry for SqliteTaskStore {
                 AND execution_epoch < 9223372036854775807
                 AND EXISTS (
                     SELECT 1 FROM goal_tasks WHERE task_id = tasks.id
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM goal_session_dispositions WHERE session_id = ?2
                 )",
             params![task_id, session_id, expected_epoch,],
         )?;
@@ -1175,6 +1280,9 @@ impl GoalTaskRegistry for SqliteTaskStore {
                     SELECT 1 FROM goal_tasks
                      WHERE task_id = tasks.id AND accounting_state = 'complete'
                        AND pending_call_id IS NULL AND pending_call_epoch IS NULL
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM goal_session_dispositions WHERE session_id = ?2
                 )",
             params![
                 task_id,
@@ -1217,7 +1325,10 @@ impl GoalTaskRegistry for SqliteTaskStore {
                     execution_epoch = CASE WHEN execution_epoch < 9223372036854775807
                         THEN execution_epoch + 1 ELSE execution_epoch END
               WHERE id = ?1 AND kind = 'goal' AND session_id = ?2
-                AND status IN ('running', 'paused') AND execution_epoch = ?3",
+                AND status IN ('running', 'paused') AND execution_epoch = ?3
+                AND NOT EXISTS (
+                    SELECT 1 FROM goal_session_dispositions WHERE session_id = ?2
+                )",
             params![
                 task_id,
                 session_id,
@@ -1256,6 +1367,9 @@ impl GoalTaskRegistry for SqliteTaskStore {
                     SELECT 1 FROM tasks
                      WHERE id = goal_tasks.task_id AND kind = 'goal' AND session_id = ?2
                        AND status = 'running' AND execution_epoch = ?3
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM goal_session_dispositions WHERE session_id = ?2
                 )",
             params![task_id, session_id, expected_epoch, pending_call_id],
         )?;
@@ -1314,6 +1428,9 @@ impl GoalTaskRegistry for SqliteTaskStore {
                     SELECT 1 FROM tasks
                      WHERE id = goal_tasks.task_id AND kind = 'goal' AND session_id = ?2
                        AND status IN ('running', 'paused') AND execution_epoch = ?3
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM goal_session_dispositions WHERE session_id = ?2
                 )",
             params![task_id, session_id, expected_epoch, tokens, cost],
         )?;
@@ -1340,13 +1457,16 @@ impl GoalTaskRegistry for SqliteTaskStore {
                     SELECT 1 FROM goal_tasks
                      WHERE task_id = tasks.id
                        AND (pending_call_id IS NOT NULL OR pending_call_epoch IS NOT NULL)
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM goal_session_dispositions WHERE session_id = ?2
                 )",
             params![task_id, session_id, expected_epoch],
         )?;
         if deleted == 0 {
             return transition_failure(&tx, task_id);
         }
-        control_intents::delete_settled_start_intents(&tx, session_id)?;
+        delete_settled_start_intents(&tx, session_id)?;
         tx.commit().context("commit guarded goal deletion")?;
         Ok(GoalTransitionResult::Applied)
     }

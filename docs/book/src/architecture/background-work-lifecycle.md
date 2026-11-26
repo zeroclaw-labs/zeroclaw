@@ -63,6 +63,21 @@ Legacy delegate result files that contain status remain readable when no task ro
 
 Supervised Start/Resume retains exact process-local launch custody from the committed admission through projection, acknowledgement, and worker registration. Cancellation transfers an unlaunched epoch to the same supervisor before releasing admission guards. One tracked initial cleanup attempt, followed only by bounded explicit control or lifecycle retries, reconciles the canonical winner without executing or replaying the request. Storage failure retains the actual cause and cleanup duty, blocks retirement and restart reopening, and returns through the existing error boundary; it does not imply a successful pause. The restart coordinator retains these supervisors until retirement is proved. This custody is not durable recovery intent: process death still uses the existing conservative previous-boot recovery, with no automatic resume.
 
+Native RPC session disposition uses a separate durable recovery record in the
+task control plane. The record identifies the exact old Goal task and execution
+epoch. It neither changes the Goal status on its own nor authorizes a session
+mutation. For a live-only change, Goal disposal and removal of the recovery
+record commit together before the live session changes. A prepared live-only
+record found during recovery means the change did not commit.
+
+Startup and later session admission can reconcile pending records. Proof that
+the session operation did not commit preserves the Goal. Proof of a commit
+allows cleanup of only the recorded Goal. An independently committing session
+store must prove the operation at its original backend instance. A missing
+target or an unavailable or different store does not prove a commit. Unresolved
+operations block reuse of the affected session ID. Recovery neither replays the
+command nor resumes a Goal; resume still needs explicit authorization.
+
 Goal children invoked by `delegate` or `spawn_subagent` remain in the parent's foreground operation. They share its accountant and ledger and obey the cross-tool depth-one child limit. A Goal-spawned subagent requires an owner-bound task row linked to the Goal and settles that row before returning; synchronous delegation does not create an additional task row. Cancellation or deadline signals the child and awaits settlement and required row cleanup before the parent publishes its terminal outcome; dropping the caller's future is not a substitute for that cleanup. Existing authorization, approval, target, and ordinary spend policies still apply.
 
 The candidate's parent and verifier calls use the ordinary daily/monthly cost tracker as well as the Goal budget. The Goal accountant remains the only writer for their usage. An ordinary pre-call spend refusal can pause the Goal only after accounting and the actual tool phase are clean. Wait for the ordinary limit to reset or raise it, then explicitly resume; resumption checks the same ordinary gate again. Missing or invalid accounting, unresolved tool work, and genuine operation failures do not become resumable merely because a budget error is also present.

@@ -1867,6 +1867,11 @@ pub enum SessionUpdateEvent {
     AgentMessageChunk {
         session_id: String,
         text: String,
+        /// Display-only text from a Goal parent turn, such as a model fallback
+        /// notice. It is shown alongside the answer but is not part of the
+        /// saved candidate. Ordinary text chunks omit this field.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        presentation_only: bool,
     },
     AgentThoughtChunk {
         session_id: String,
@@ -2302,6 +2307,43 @@ mod tests {
     }
 
     #[test]
+    fn agent_message_chunk_presentation_marker_preserves_ordinary_wire_bytes() {
+        const ORDINARY: &[u8] = br#"{"type":"agent_message_chunk","session_id":"s","text":"t"}"#;
+        const MARKED: &[u8] =
+            br#"{"type":"agent_message_chunk","session_id":"s","text":"t","presentation_only":true}"#;
+        const EXPLICIT_FALSE: &[u8] =
+            br#"{"type":"agent_message_chunk","session_id":"s","text":"t","presentation_only":false}"#;
+
+        for (wire, expected_marker, canonical) in [
+            (ORDINARY, false, ORDINARY),
+            (MARKED, true, MARKED),
+            (EXPLICIT_FALSE, false, ORDINARY),
+        ] {
+            let event = serde_json::from_slice::<SessionUpdateEvent>(wire).unwrap();
+            assert!(matches!(&event,
+                SessionUpdateEvent::AgentMessageChunk { session_id, text, presentation_only }
+                    if session_id == "s" && text == "t" && *presentation_only == expected_marker
+            ));
+            assert_eq!(serde_json::to_vec(&event).unwrap(), canonical);
+        }
+    }
+
+    #[test]
+    fn agent_message_chunk_requires_text_with_or_without_presentation_marker() {
+        for wire in [
+            r#"{"type":"agent_message_chunk","session_id":"s"}"#,
+            r#"{"type":"agent_message_chunk","session_id":"s","presentation_only":true}"#,
+            r#"{"type":"agent_message_chunk","session_id":"s","presentation_only":false}"#,
+        ] {
+            let error = serde_json::from_str::<SessionUpdateEvent>(wire).unwrap_err();
+            assert!(
+                error.to_string().contains("missing field `text`"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn session_update_event_uses_snake_case_variants() {
         // Variants stay PascalCase → wire is snake_case, including the
         // multi-word ones that historically drifted when serde flattened
@@ -2310,6 +2352,7 @@ mod tests {
         let evt = SessionUpdateEvent::AgentMessageChunk {
             session_id: "s".into(),
             text: "t".into(),
+            presentation_only: false,
         };
         let v = serde_json::to_value(evt).unwrap();
         assert_eq!(v["type"], json!("agent_message_chunk"));

@@ -15,8 +15,9 @@ use super::task_registry::{
 };
 
 mod goal;
+pub(crate) mod session_disposition;
 
-const CONTROL_PLANE_SCHEMA_VERSION: i64 = 14;
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 15;
 
 pub struct SqliteTaskStore {
     conn: Mutex<Connection>,
@@ -205,52 +206,11 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .context("read control-plane schema version")?;
     if version < CONTROL_PLANE_SCHEMA_VERSION {
-        version = migrate_schema_transaction(conn, |tx| {
-            add_column_if_missing(
-                tx,
-                "tasks",
-                "session_id",
-                "ALTER TABLE tasks ADD COLUMN session_id TEXT",
-            )?;
-            add_column_if_missing(
-                tx,
-                "tasks",
-                "execution_epoch",
-                "ALTER TABLE tasks ADD COLUMN execution_epoch INTEGER NOT NULL DEFAULT 0",
-            )?;
-            add_column_if_missing(
-                tx,
-                "tasks",
-                "originator_chain",
-                "ALTER TABLE tasks ADD COLUMN originator_chain TEXT",
-            )?;
-            add_column_if_missing(
-                tx,
-                "tasks",
-                "progress",
-                "ALTER TABLE tasks ADD COLUMN progress TEXT",
-            )?;
-            tx.execute_batch(
-                "CREATE TABLE IF NOT EXISTS terminal_settlement_intents (
-                     task_id          TEXT PRIMARY KEY
-                                      REFERENCES tasks(id) ON DELETE CASCADE,
-                     owner_pid        INTEGER NOT NULL,
-                     owner_boot_id    TEXT NOT NULL,
-                     desired_status   TEXT NOT NULL,
-                     artifact_path    TEXT NOT NULL,
-                     artifact_ref     TEXT,
-                     artifact_sha256  TEXT NOT NULL,
-                     terminal_error   TEXT
-                 );
-                 CREATE INDEX IF NOT EXISTS idx_terminal_settlement_intents_owner
-                    ON terminal_settlement_intents(owner_pid, owner_boot_id);",
-            )
-            .context("ensure terminal settlement schema")?;
-            // Version 8 existed both as upstream terminal-settlement schema and as
-            // a provisional Goal schema. Converge older databases through Goal's
-            // additive final schema; its session index replaces the superseded
-            // context uniqueness index without recreating it on legacy rows.
-            goal::converge_schema(tx)?;
+        version = migrate_schema_transaction(conn, |tx, previous_version| {
+            if previous_version < 14 {
+                converge_to_v14(tx)?;
+            }
+            session_disposition::create_schema(tx)?;
             Ok(())
         })?;
     }
@@ -269,9 +229,57 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn converge_to_v14(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    add_column_if_missing(
+        tx,
+        "tasks",
+        "session_id",
+        "ALTER TABLE tasks ADD COLUMN session_id TEXT",
+    )?;
+    add_column_if_missing(
+        tx,
+        "tasks",
+        "execution_epoch",
+        "ALTER TABLE tasks ADD COLUMN execution_epoch INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        tx,
+        "tasks",
+        "originator_chain",
+        "ALTER TABLE tasks ADD COLUMN originator_chain TEXT",
+    )?;
+    add_column_if_missing(
+        tx,
+        "tasks",
+        "progress",
+        "ALTER TABLE tasks ADD COLUMN progress TEXT",
+    )?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS terminal_settlement_intents (
+                     task_id          TEXT PRIMARY KEY
+                                      REFERENCES tasks(id) ON DELETE CASCADE,
+                     owner_pid        INTEGER NOT NULL,
+                     owner_boot_id    TEXT NOT NULL,
+                     desired_status   TEXT NOT NULL,
+                     artifact_path    TEXT NOT NULL,
+                     artifact_ref     TEXT,
+                     artifact_sha256  TEXT NOT NULL,
+                     terminal_error   TEXT
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_terminal_settlement_intents_owner
+                    ON terminal_settlement_intents(owner_pid, owner_boot_id);",
+    )
+    .context("ensure terminal settlement schema")?;
+    // Version 8 existed both as upstream terminal-settlement schema and as
+    // a provisional Goal schema. Converge older databases through Goal's
+    // additive final schema; its session index replaces the superseded
+    // context uniqueness index without recreating it on legacy rows.
+    goal::converge_schema(tx)
+}
+
 fn migrate_schema_transaction(
     conn: &Connection,
-    apply_migrations: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<()>,
+    apply_migrations: impl FnOnce(&rusqlite::Transaction<'_>, i64) -> Result<()>,
 ) -> Result<i64> {
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .context("begin control-plane schema migration")?;
@@ -279,7 +287,7 @@ fn migrate_schema_transaction(
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .context("recheck control-plane schema version after acquiring migration lock")?;
     let final_version = if version < CONTROL_PLANE_SCHEMA_VERSION {
-        apply_migrations(&tx)?;
+        apply_migrations(&tx, version)?;
         tx.execute_batch(&format!(
             "PRAGMA user_version = {CONTROL_PLANE_SCHEMA_VERSION};"
         ))
@@ -1644,7 +1652,7 @@ CREATE TABLE IF NOT EXISTS terminal_settlement_intents (
             connection
                 .busy_handler(Some(signal_migration_lock))
                 .unwrap();
-            migrate_schema_transaction(&connection, |_| {
+            migrate_schema_transaction(&connection, |_, _| {
                 MIGRATION_CALLBACK_CALLED.store(true, Ordering::SeqCst);
                 Ok(())
             })

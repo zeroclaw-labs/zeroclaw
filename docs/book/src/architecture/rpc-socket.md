@@ -159,9 +159,22 @@ it is distinct from `no_current_goal`.
 Started/resumed notices precede execution; an agent's question precedes a
 verifier-blocked pause. The legacy `verified_candidate` update is a successful
 parent's presentation fallback after its ordinary event stream drains. It is
-not a verifier verdict or a persistence acknowledgement. Saving the candidate
-is a separate, once-only durable append; its failure remains visible as an
-original error and the typed `candidate_persistence_failed` lifecycle reason.
+not a verifier verdict or a persistence acknowledgement. A client that resumed
+while the parent was already running may use it to show the full response in
+place of the partial text it received. The daemon sets `presentation_only: true`
+on native `agent_message_chunk` events for a Goal parent's trailing tool
+receipts, model fallback notice, or safeguard notice. Clients display these
+chunks in arrival order after the answer; restoring the complete answer must
+not discard them. Ordinary text omits the field (equivalent to `false`).
+Clients that ignore the field still receive the notices as ordinary text.
+These notices are not part of the saved answer or the verifier input.
+
+If the pane has already displayed part of the answer before a tool call, it
+keeps that text and the tool in order instead of inserting the whole answer
+again. A client that joined midway through that text can therefore miss the
+beginning in the live view. The saved transcript contains the full candidate
+after the separate, once-only append succeeds. If the append fails, the client
+receives the original error and the typed `candidate_persistence_failed` reason.
 Native Goal core errors retain the ordinary `turn_complete` event with
 `goal_owned: true`. That provenance marks presentation only; it cannot
 finish a separately submitted `session/prompt`.
@@ -173,6 +186,20 @@ cancel a durable Goal. With a control plane installed, orphan retirement
 keeps live sessions with active, resumable, or unsettled Goals. Opening
 another same-mode session also keeps siblings with any bound Goal, including
 terminal ones. If a Goal lookup fails, the sweep retains the live session.
+
+Goal output follows the client that currently holds the session once it has
+loaded the session history. After a client reattaches, the rest of a parent turn
+already under way is delivered live from that point; earlier events of that
+turn are not replayed. Each frame is sent only while that client may still read
+the session. Output produced before the attach is not replayed; the saved
+transcript and `/goal status` remain available. Over WSS, the client that already
+owns the session can resume it while its Goal runs; the resume is checked
+against the same current credentials, policy, ownership, environment and
+channel rules, and approvals move to it between turns.
+
+An older ZeroCode client may show only the streamed tail of the final response
+until it reloads history. With an older daemon that does not deliver the live
+remainder, the current client still displays the response as it did before.
 
 If the daemon starts without control-plane supervision, ordinary live-session
 eviction can still run. Neither automatic sweep fences, settles, or deletes a
@@ -266,7 +293,27 @@ The lifecycle operations have distinct durable meanings:
 - `session/kill` retains the history but marks the row as tombstoned, so it is not eligible for runtime rehydration.
 - `session/delete` removes the ACP row and its recoverable checkpoint before unregistering and removing the live session when the target is a live ACP session, or when no live mode exists and an ACP durable row is selected. A live same-ID Chat session remains isolated from ACP storage.
 
-Kill and delete signal cancellation before attempting their fallible SQLite operation. If that operation fails for an idle target, the RPC reports an internal error and preserves the live owner and channel registration. If hard cancellation has already removed an active owner, the RPC cannot restore that live generation; the durable row and recoverable checkpoint remain available once storage is working again.
+Kill and delete can signal cancellation before attempting the SQLite operation.
+A definite rejection before that operation commits leaves the ACP row and its
+recoverable checkpoint in place. It also preserves an idle live owner and its
+channel registration. An active owner already evicted for hard-cancel recovery
+cannot be restored in place.
+
+### Goal-bound session disposition
+
+A rejected replacement, close, kill, or delete does not dispose of the bound
+Goal. Disposal is bound to the authorized change to the exact session, not the
+request or an early cancellation signal. For live-only changes, exact Goal
+disposal commits before the live session changes. A storage failure rejects
+the change and preserves the Goal. A previously running Goal may remain paused
+if its turn was interrupted. After storage recovers, an authorized retry of the
+same live removal can clear an abandoned preparation without replaying it.
+
+If an independent session store commits the change but the previous Goal's
+cleanup fails, the RPC reports an error. Pending cleanup can block same-ID
+admission; it cannot attach the old Goal to a new session or remove a
+successor's Goal. Recovery does not replay the command. See
+[Goal-mode target contract](./background-work-lifecycle.md#goal-mode-target-contract).
 
 ### Chunked uploads
 

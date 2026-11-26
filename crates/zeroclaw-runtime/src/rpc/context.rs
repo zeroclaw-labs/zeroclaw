@@ -272,6 +272,13 @@ pub struct ConfigCommitPause {
 }
 
 impl RpcContext {
+    /// Run cleanup-only recovery before making this generation available to
+    /// its RPC listeners. Unresolved rows keep their per-session admission
+    /// fence and do not block unrelated sessions.
+    pub(crate) async fn reconcile_goal_session_dispositions(&self) -> anyhow::Result<usize> {
+        super::session_disposition::reconcile_startup(self).await
+    }
+
     /// Admit one serialized config write on this context's authority.
     /// Fails closed once the daemon generation is closing.
     pub(crate) async fn begin_config_commit(&self) -> Result<ConfigCommit, ConfigCommitError> {

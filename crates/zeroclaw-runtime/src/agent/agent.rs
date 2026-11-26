@@ -612,6 +612,7 @@ impl PreparedIsolatedTurn {
         &mut self.agent
     }
 
+    #[cfg(test)]
     pub(crate) async fn run(
         self,
         source: IsolatedTranscriptSource,
@@ -624,8 +625,34 @@ impl PreparedIsolatedTurn {
             policy,
         } = self;
         agent
-            .run_isolated_turn_with_policy(source, &input, recall_query, event_tx, &policy)
+            .run_isolated_turn_with_policy(source, &input, recall_query, event_tx, &policy, None)
             .await
+    }
+
+    /// Return display-only decorations separately; ordinary events still stream live.
+    pub(crate) async fn run_with_presentation(
+        self,
+        source: IsolatedTranscriptSource,
+        recall_query: &str,
+        event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
+    ) -> Result<(IsolatedTurnOutcome, Vec<String>)> {
+        let Self {
+            mut agent,
+            input,
+            policy,
+        } = self;
+        let mut presentation = Vec::new();
+        let outcome = agent
+            .run_isolated_turn_with_policy(
+                source,
+                &input,
+                recall_query,
+                Some(event_tx),
+                &policy,
+                Some(&mut presentation),
+            )
+            .await?;
+        Ok((outcome, presentation))
     }
 }
 
@@ -1951,7 +1978,7 @@ impl Agent {
         recall_query: &str,
     ) -> Result<IsolatedTurnOutcome> {
         let policy = self.prepare_isolated_turn_policy(input)?;
-        self.run_isolated_turn_with_policy(source, input, recall_query, None, &policy)
+        self.run_isolated_turn_with_policy(source, input, recall_query, None, &policy, None)
             .await
     }
 
@@ -1967,8 +1994,15 @@ impl Agent {
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
     ) -> Result<IsolatedTurnOutcome> {
         let policy = self.prepare_isolated_turn_policy(input)?;
-        self.run_isolated_turn_with_policy(source, input, recall_query, Some(event_tx), &policy)
-            .await
+        self.run_isolated_turn_with_policy(
+            source,
+            input,
+            recall_query,
+            Some(event_tx),
+            &policy,
+            None,
+        )
+        .await
     }
 
     async fn run_isolated_turn_with_policy(
@@ -1978,10 +2012,18 @@ impl Agent {
         recall_query: &str,
         event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
         policy: &ResolvedTurnRoute,
+        presentation: Option<&mut Vec<String>>,
     ) -> Result<IsolatedTurnOutcome> {
         zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
             policy.allowed_provider_refs.clone(),
-            self.run_isolated_turn_inner(source, input, recall_query, event_tx, policy),
+            self.run_isolated_turn_inner(
+                source,
+                input,
+                recall_query,
+                event_tx,
+                policy,
+                presentation,
+            ),
         )
         .await
     }
@@ -1993,6 +2035,7 @@ impl Agent {
         recall_query: &str,
         event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
         policy: &ResolvedTurnRoute,
+        presentation: Option<&mut Vec<String>>,
     ) -> Result<IsolatedTurnOutcome> {
         if self.history.is_empty() {
             self.history
@@ -2290,7 +2333,11 @@ impl Agent {
         let response = result?;
 
         // Receipt presentation is separate from the candidate and transcript.
-        if let Some(event_tx) = event_tx.as_ref() {
+        // Only the receipt, provider fallback and safeguard can write here (at most
+        // three chunks). The private queue is drained after the shared renderer.
+        let projection = presentation.as_ref().map(|_| tokio::sync::mpsc::channel(4));
+        let decoration_tx = projection.as_ref().map(|(tx, _)| tx).or(event_tx.as_ref());
+        if let Some(event_tx) = decoration_tx {
             let block = self.append_receipts_block(String::new(), receipt_scope.as_ref());
             if !block.is_empty() {
                 let delta = if response.is_empty() {
@@ -2321,6 +2368,12 @@ impl Agent {
                         delta: delta.to_owned(),
                     })
                     .await;
+            }
+        }
+
+        if let (Some(presentation), Some((_, mut rx))) = (presentation, projection) {
+            while let Ok(TurnEvent::Chunk { delta }) = rx.try_recv() {
+                presentation.push(delta);
             }
         }
 
@@ -16053,6 +16106,114 @@ mod tests {
                 .iter()
                 .all(|chunk| !chunk.contains("private-category"))
         );
+    }
+
+    #[tokio::test]
+    async fn isolated_turn_opt_in_preserves_decoration_order_and_clean_histories() {
+        for safeguard in [false, true] {
+            let mut runs = Vec::new();
+            for collect in [false, true] {
+                let mut agent = if safeguard {
+                    blank_input_agent(Box::new(SafeguardNoticeProvider))
+                } else {
+                    streamed_agent_with_config(show_in_response_config(true))
+                };
+                let primary: Box<dyn ModelProvider> = if safeguard {
+                    Box::new(UnavailableCandidateProvider)
+                } else {
+                    // Already past its first tool call: fails every request, but
+                    // supports native tools just like the served echo fixture.
+                    Box::new(GoalReceiptFailureProvider {
+                        calls: AtomicUsize::new(1),
+                    })
+                };
+                let served = std::mem::replace(
+                    &mut agent.model_provider,
+                    Box::new(UnavailableCandidateProvider),
+                );
+                agent.model_provider =
+                    Box::new(zeroclaw_providers::reliable::ReliableModelProvider::new(
+                        "primary-fixture",
+                        vec![
+                            ("primary-fixture".into(), primary),
+                            ("fallback-fixture".into(), served),
+                        ],
+                        0,
+                        1,
+                    ));
+                agent.model_name = "requested-model".into();
+                agent.seed_history(&[ChatMessage::user("earlier message")]);
+                let agent = Arc::new(tokio::sync::Mutex::new(agent));
+                let input = zeroclaw_goal::control::goal_parent_turn_input(
+                    &zeroclaw_goal::GoalParentTurn {
+                        kind: zeroclaw_goal::GoalParentTurnKind::Start,
+                        objective: "finish".into(),
+                        working_history: Vec::new(),
+                    },
+                );
+                let mut prepared =
+                    PreparedIsolatedTurn::new(agent.clone().lock_owned().await, input).unwrap();
+                let source = IsolatedTranscriptSource::Canonical {
+                    prefix: prepared.canonical_prefix().await.unwrap(),
+                };
+                let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+                let (mut outcome, mut presentation) = if collect {
+                    prepared
+                        .run_with_presentation(source, "finish", tx)
+                        .await
+                        .unwrap()
+                } else {
+                    (
+                        prepared.run(source, "finish", Some(tx)).await.unwrap(),
+                        Vec::new(),
+                    )
+                };
+                let mut chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+                    .filter_map(|event| match event {
+                        TurnEvent::Chunk { delta } => Some(delta),
+                        _ => None,
+                    })
+                    .collect();
+                let count = if safeguard { 1 } else { 2 };
+                if !collect {
+                    assert!(chunks.len() >= count);
+                    presentation = chunks.split_off(chunks.len() - count);
+                }
+                assert_eq!(presentation.len(), count);
+                assert!(chunks.iter().all(|text| !presentation.contains(text)));
+                if safeguard {
+                    assert_eq!(outcome.response, "accepted response");
+                    assert!(presentation[0].contains("Safety safeguards"));
+                    assert!(!presentation[0].contains("private-category"));
+                } else {
+                    assert_eq!(outcome.response, "stream-done");
+                    let tool = outcome
+                        .working_history
+                        .iter_mut()
+                        .find(|row| row.role == "tool")
+                        .unwrap();
+                    let carrier: serde_json::Value = serde_json::from_str(&tool.content).unwrap();
+                    let body = carrier["content"].as_str().unwrap();
+                    let (_, signed) = body.rsplit_once("[receipt: ").unwrap();
+                    let token = signed.strip_suffix(']').unwrap();
+                    assert!(token.starts_with("zc-receipt-"));
+                    assert_eq!(
+                        presentation[0],
+                        format!("\n\n---\nTool receipts:\n  echo: {token}")
+                    );
+                    assert!(presentation[1].contains("fallback-fixture"));
+
+                    // These independent turns mint independent receipts. Compare
+                    // everything except the exact token already checked above.
+                    tool.content = tool.content.replace(token, "<signed>");
+                    presentation[0] = presentation[0].replace(token, "<signed>");
+                }
+                let working = serde_json::to_value(outcome.working_history).unwrap();
+                let canonical = serde_json::to_value(agent.lock().await.history()).unwrap();
+                runs.push((chunks, presentation, outcome.response, working, canonical));
+            }
+            assert_eq!(runs[0], runs[1]);
+        }
     }
 
     #[tokio::test]

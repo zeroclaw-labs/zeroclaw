@@ -168,7 +168,7 @@ async fn control_intent_v12_migration_preserves_existing_rows_and_reopens() {
         .lock()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, CONTROL_PLANE_SCHEMA_VERSION);
     let intent = start_intent("current-boot");
     store.record_control_intent(&intent).await.unwrap();
     drop(store);

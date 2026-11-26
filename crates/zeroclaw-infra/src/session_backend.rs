@@ -3,6 +3,10 @@
 use chrono::{DateTime, Utc};
 use zeroclaw_api::model_provider::ChatMessage;
 
+use crate::session_disposition::{
+    SessionDispositionIdentity, SessionDispositionObservation, SessionDispositionWitness,
+};
+
 /// Metadata about a persisted session.
 #[derive(Debug, Clone)]
 pub struct SessionMetadata {
@@ -415,6 +419,49 @@ pub trait SessionBackend: Send + Sync {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "guarded session deletion unsupported",
+        ))
+    }
+
+    /// Return the identity of a backend participating in witnessed Goal-bound
+    /// deletion. Unsupported stores retain ordinary non-Goal behavior.
+    fn session_disposition_identity(&self) -> std::io::Result<SessionDispositionIdentity> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "witnessed session deletion unsupported",
+        ))
+    }
+
+    /// Perform the existing authorized deletion and emit its witness at the
+    /// same commit point. An absent session must not produce a receipt.
+    fn delete_session_with_disposition(
+        &self,
+        _witness: &SessionDispositionWitness,
+        _expected_owner: Option<&str>,
+        _authorize: &SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<bool> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "witnessed session deletion unsupported",
+        ))
+    }
+
+    /// Inspect the exact operation without retrying the session effect.
+    fn observe_session_disposition(
+        &self,
+        _witness: &SessionDispositionWitness,
+    ) -> std::io::Result<SessionDispositionObservation> {
+        Ok(SessionDispositionObservation::Indeterminate)
+    }
+
+    /// Acknowledge only this operation after the canonical task store records
+    /// that it committed. A retry must not touch a reused session.
+    fn acknowledge_session_disposition(
+        &self,
+        _witness: &SessionDispositionWitness,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "witnessed session deletion unsupported",
         ))
     }
 
