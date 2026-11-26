@@ -2885,7 +2885,7 @@ mod tests {
                 name: "fetch".to_string(),
                 description: "fetch".to_string(),
                 kind: "http".to_string(),
-                command: "https://[2001:4860:4860::a00:1]/".to_string().into(),
+                command: "https://[2001:4860:4860::a00:1]/".into(),
                 args: Default::default(),
                 target: None,
                 locked_args: Default::default(),

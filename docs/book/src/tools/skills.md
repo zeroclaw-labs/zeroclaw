@@ -94,6 +94,24 @@ HTTP skill tools use only `http` and `https` URLs. Arguments are percent-encoded
 
 Each HTTP skill call shares one 30-second timeout across destination validation, DNS lookup, request dispatch, and response-body reading. A timeout returns a failed tool result without including the URL or argument values. This bounds the call's wait; a platform DNS lookup already running on a blocking worker may continue until the operating system's resolver timeout.
 
+### Pass text as one executable argument
+
+For `shell` or `script` tools, use `argv` instead of `command` when text must reach a CLI unchanged. The first element is a fixed executable; the others are arguments, not shell source. For example, a local recorder could declare:
+
+```toml
+[[tools]]
+name = "record"
+description = "Record a message as one argument"
+kind = "shell"
+argv = ["recorder", "--message={{text}}"]
+[tools.args]
+text = "Message, possibly multiple lines"
+```
+
+Spaces, quotes, newlines and placeholder-shaped text in `text` stay in that one argument. A literal empty argument stays empty. Pass strings for exactly the declared names. Do not include shell quoting, pipelines or a placeholder in the executable name. A tool cannot declare both `argv` and `command`. Legacy `command` tools keep their existing behavior.
+
+The initial direct executor targets native Unix. It requires an exact executable entry in `allowed_commands` (not just `*`); an absolute executable must be listed by that path. A bare name is resolved before changing directory. Unsupported runtimes, ambiguous executable identities and unsupported sandboxes refuse the call; they never fall back to a shell. The native executor uses the registry-selected sandbox. Direct calls without that sandbox cannot assume unsandboxed execution. Argument, workspace-path and risk checks still apply; a supervised operation that requires command approval is refused rather than treating a skill declaration or tool argument as approval. Choose a CLI and fixed options appropriate for your policy: literal transport prevents shell interpretation, not the CLI's own option parsing.
+
 ### Slash command options and localizations
 
 A skill tagged `slash` is surfaced as a chat-channel slash command (e.g. Discord `/search`). It may declare typed `[[skill.slash_options]]`; a skill that declares none falls back to a single required free-text input. Both the command description and each option description accept an optional `description_localizations` map keyed by locale code. Unknown or unsupported locale codes are dropped with a warning rather than failing registration, so a typo never wedges command registration.

@@ -19496,7 +19496,7 @@ mod tests {
                     name: t.to_string(),
                     description: format!("{t} tool"),
                     kind: "shell".to_string(),
-                    command: format!("echo {t}"),
+                    command: format!("echo {t}").into(),
                     args: std::collections::HashMap::new(),
                     target: None,
                     locked_args: std::collections::HashMap::new(),

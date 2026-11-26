@@ -219,16 +219,26 @@ mod unix {
             let root = tempfile::tempdir().unwrap();
             let argv = template(&recorder(root.path(), "recorder"));
             let marker = root.path().join("called");
-            for tool in assemble(
+            let tools = assemble(
                 root.path(),
                 kind,
                 &argv,
                 "other-recorder",
                 Arc::new(NativeRuntime::new()),
-            ) {
-                let result = tool.execute(input()).await;
-                assert!(!result.is_ok_and(|out| out.success));
-            }
+            );
+            let [tool] = tools.as_slice() else {
+                panic!("valid manifest must reach executable policy");
+            };
+            let error = tool
+                .execute(input())
+                .await
+                .expect_err("denied executable must not run");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Executable not allowed by security policy"),
+                "{error}"
+            );
             assert!(!marker.try_exists().unwrap(), "denied recorder started");
 
             // Keep the manifest, executable, input and workspace fixed. Change
@@ -244,6 +254,54 @@ mod unix {
             );
             assert_eq!(control.output.as_bytes(), expected().as_bytes());
         }
+    }
+
+    #[tokio::test]
+    async fn missing_sandbox_context_is_not_permission_for_host_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let argv = template(&recorder(root.path(), "recorder"));
+        let _control = registered(root.path(), "shell", &argv);
+        let (skills, dropped) = load_skills_from_directory(&root.path().join("skills"), false);
+        assert!(dropped.is_empty());
+        for setting in [None, Some(true)] {
+            let policy = Arc::new(SecurityPolicy {
+                workspace_dir: root.path().to_owned(),
+                allowed_commands: vec![argv[0].clone()],
+                sandbox_enabled: setting,
+                ..SecurityPolicy::default()
+            });
+            let tools = skills_to_tools_with_context_and_runtime(
+                &skills,
+                policy,
+                &[],
+                Arc::new(NativeRuntime::new()),
+                &[],
+            );
+            let [tool] = tools.as_slice() else {
+                panic!("expected registered skill");
+            };
+            assert!(tool.execute(input()).await.is_err());
+            assert!(!root.path().join("called").try_exists().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn supervised_skill_does_not_grant_itself_command_approval() {
+        let root = tempfile::tempdir().unwrap();
+        let argv = vec![
+            recorder(root.path(), "git").to_str().unwrap().to_owned(),
+            "{{text}}".into(),
+        ];
+        let tool = registered(root.path(), "shell", &argv);
+        let error = tool
+            .execute(json!({"text":"commit","label":""}))
+            .await
+            .expect_err("operation requires approval");
+        assert!(
+            error.to_string().contains("requires explicit approval"),
+            "{error}"
+        );
+        assert!(!root.path().join("called").try_exists().unwrap());
     }
 
     #[derive(Default)]
@@ -300,7 +358,12 @@ mod unix {
         let argv = vec![executable.to_str().unwrap().to_owned(), "{{text}}".into()];
         let tool = registered(root.path(), "shell", &argv);
         let call = |text| json!({"text":text,"label":""});
-        for blocked in ["config", "../outside-fixture"] {
+        for blocked in [
+            "config",
+            "../outside-fixture",
+            "--file=../outside-fixture",
+            "-C../outside-fixture",
+        ] {
             let result = tool.execute(call(blocked)).await;
             assert!(!result.is_ok_and(|out| out.success), "allowed: {blocked}");
             assert!(!root.path().join("called").exists());

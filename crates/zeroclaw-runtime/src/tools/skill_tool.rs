@@ -609,9 +609,7 @@ mod tests {
             name: "run_lint".to_string(),
             description: "Run the linter on a file".to_string(),
             kind: "shell".to_string(),
-            command: "lint --file {{file}} --format {{format}}"
-                .to_string()
-                .into(),
+            command: "lint --file {{file}} --format {{format}}".into(),
             args,
             target: None,
             locked_args: HashMap::new(),
@@ -751,7 +749,7 @@ mod tests {
             name: "simple".to_string(),
             description: "Simple tool".to_string(),
             kind: "shell".to_string(),
-            command: "echo hello".to_string().into(),
+            command: "echo hello".into(),
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),
@@ -770,7 +768,7 @@ mod tests {
             name: "hello".to_string(),
             description: "Say hello".to_string(),
             kind: "shell".to_string(),
-            command: "echo hello-skill".to_string().into(),
+            command: "echo hello-skill".into(),
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),
@@ -871,9 +869,7 @@ mod tests {
             name: "safe_pipeline".to_string(),
             description: "Run a safe PowerShell pipeline".to_string(),
             kind: "shell".to_string(),
-            command: "Write-Output \"quoted safe value\" | Select-Object -First 1"
-                .to_string()
-                .into(),
+            command: "Write-Output \"quoted safe value\" | Select-Object -First 1".into(),
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),
@@ -1566,7 +1562,7 @@ mod shell_grammar_tests {
             name: "heredoc".to_string(),
             description: "Print a heredoc".to_string(),
             kind: "shell".to_string(),
-            command: command.to_string().into(),
+            command: command.into(),
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),

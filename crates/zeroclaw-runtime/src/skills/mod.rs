@@ -5071,7 +5071,7 @@ mod prompt_callable_name_tests {
             name: name.to_string(),
             description: "desc".to_string(),
             kind: kind.to_string(),
-            command: "echo hi".to_string().into(),
+            command: "echo hi".into(),
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),
