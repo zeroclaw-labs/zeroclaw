@@ -1269,12 +1269,20 @@ mod tests {
         use zeroclaw_api::tool::ToolExecutionContext;
 
         let tmp = tempfile::TempDir::new().unwrap();
-        let mut config = Config::default();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config
+            .risk_profiles
+            .insert("default".into(), RiskProfileConfig::default());
         for alias in ["sender", "recipient"] {
             config.agents.insert(
                 alias.into(),
                 AliasedAgentConfig {
                     channels: vec!["telegram.prod".into()],
+                    risk_profile: "default".into(),
                     ..AliasedAgentConfig::default()
                 },
             );
@@ -1291,6 +1299,7 @@ mod tests {
         let control_plane = ControlPlaneHandle::open(tmp.path()).unwrap();
         let store = Arc::clone(&control_plane.store);
         let tool = SendMessageToPeerTool::new(Arc::new(config), "sender")
+            .expect("sender policy")
             .with_control_plane(control_plane);
         let args =
             json!({"channel": "telegram.prod", "target": " @Recipient ", "message": "status"});
