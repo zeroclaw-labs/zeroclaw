@@ -277,6 +277,80 @@ fn config_patch_json_success_emits_envelope_and_persists_change() {
     assert_eq!(parsed.gateway.host, "127.0.0.2");
 }
 
+fn run_cli_set_output(config_dir: &std::path::Path, prop: &str, value: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_zeroclaw"))
+        .env("ZEROCLAW_CONFIG_DIR", config_dir)
+        .env("RUST_LOG", "off")
+        .args(["config", "set", "--no-interactive", "--", prop, value])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run zeroclaw config set")
+}
+
+fn saved_vector_weight(config_dir: &std::path::Path) -> f64 {
+    let saved = std::fs::read_to_string(config_dir.join("config.toml")).expect("read saved config");
+    let parsed: Config = toml::from_str(&saved).expect("saved config should parse");
+    parsed.memory.vector_weight
+}
+
+/// `zeroclaw config set` and `zeroclaw config patch` refuse text that reads
+/// as infinity or NaN for a float field: the command fails and the value in
+/// the file stays. A finite value still stores.
+#[test]
+fn config_set_and_patch_refuse_non_finite_float_text() {
+    let config_dir = tempfile::tempdir().expect("temp config dir");
+    run_cli_patch_success(
+        config_dir.path(),
+        br#"[{"op":"replace","path":"/memory/vector_weight","value":0.6}]"#,
+    );
+    assert_eq!(saved_vector_weight(config_dir.path()), 0.6);
+
+    for text in [
+        "inf", "+inf", "-inf", "Infinity", "infinity", "NaN", "nan", "1e999", "-1e999",
+    ] {
+        let output = run_cli_set_output(config_dir.path(), "memory.vector_weight", text);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "config set {text}: {stderr}");
+        assert!(
+            stderr.contains("Invalid float value"),
+            "config set {text}: {stderr}"
+        );
+        assert_eq!(
+            saved_vector_weight(config_dir.path()),
+            0.6,
+            "config set {text}"
+        );
+
+        let patch = serde_json::json!([
+            {"op": "replace", "path": "/memory/vector_weight", "value": text}
+        ]);
+        let envelope = run_cli_patch(config_dir.path(), patch.to_string().as_bytes());
+        assert_eq!(
+            envelope["code"], "value_type_mismatch",
+            "config patch {text}: {envelope}"
+        );
+        assert_eq!(
+            envelope["path"], "memory.vector_weight",
+            "config patch {text}: {envelope}"
+        );
+        assert_eq!(
+            saved_vector_weight(config_dir.path()),
+            0.6,
+            "config patch {text}"
+        );
+    }
+
+    let output = run_cli_set_output(config_dir.path(), "memory.vector_weight", "0.65");
+    assert!(
+        output.status.success(),
+        "config set 0.65: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(saved_vector_weight(config_dir.path()), 0.65);
+}
+
 #[cfg(feature = "gateway")]
 #[tokio::test]
 async fn config_patch_json_failed_op_matches_http_error_envelope() {
