@@ -208,6 +208,29 @@ where
     }
 }
 
+/// Whether `timestamp` lies within the inclusive `since`/`until` recall bounds.
+/// RFC3339 values are compared as instants, since stored timestamps keep the
+/// offset of the host that wrote them; anything else keeps the text comparison.
+pub(crate) fn timestamp_in_range(
+    timestamp: &str,
+    since: Option<&str>,
+    until: Option<&str>,
+) -> bool {
+    let instant = chrono::DateTime::parse_from_rfc3339(timestamp).ok();
+    let compare = |bound: &str| {
+        match (
+            instant.as_ref(),
+            chrono::DateTime::parse_from_rfc3339(bound),
+        ) {
+            (Some(instant), Ok(bound)) => instant.cmp(&bound),
+            // Keep the legacy comparison for non-RFC3339 values.
+            _ => timestamp.cmp(bound),
+        }
+    };
+    since.is_none_or(|bound| !compare(bound).is_lt())
+        && until.is_none_or(|bound| !compare(bound).is_gt())
+}
+
 /// Extract the backend kind from a V3 dotted reference (`<kind>.<alias>`).
 /// Bare names (`"sqlite"`) are returned as-is. Returned lowercase.
 pub fn backend_kind_from_dotted(memory_backend: &str) -> String {

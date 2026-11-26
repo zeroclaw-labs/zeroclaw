@@ -644,17 +644,11 @@ impl Memory for AgentScopedMemory {
                 {
                     return false;
                 }
-                if let Some(ref since) = filter.since
-                    && e.timestamp.as_str() < since.as_str()
-                {
-                    return false;
-                }
-                if let Some(ref until) = filter.until
-                    && e.timestamp.as_str() > until.as_str()
-                {
-                    return false;
-                }
-                true
+                crate::timestamp_in_range(
+                    &e.timestamp,
+                    filter.since.as_deref(),
+                    filter.until.as_deref(),
+                )
             })
             .collect())
     }
@@ -1505,5 +1499,44 @@ mod tests {
             !hits.iter().any(|e| e.key == "rogue-key"),
             "caller allowlist must be intersected, not unioned"
         );
+    }
+
+    #[tokio::test]
+    async fn export_compares_rfc3339_bounds_as_instants() {
+        let (_tmp, inner) = fresh_sqlite();
+        let alpha = inner.ensure_agent_uuid("alpha").await.unwrap();
+        let wrapper = AgentScopedMemory::new(as_dyn(inner.clone()), &alpha, Vec::<String>::new());
+        let rows = [
+            ("inside", "2026-09-26T12:30:00+08:00"),       // 04:30Z
+            ("previous_day", "2026-09-26T04:30:00+08:00"), // 2026-09-25T20:30Z
+        ];
+        for (key, created_at) in rows {
+            wrapper
+                .store(key, key, MemoryCategory::Core, None)
+                .await
+                .unwrap();
+            inner
+                .connection()
+                .lock()
+                .execute(
+                    "UPDATE memories SET created_at = ?1 WHERE key = ?2",
+                    rusqlite::params![created_at, key],
+                )
+                .unwrap();
+        }
+
+        let filter = ExportFilter {
+            since: Some("2026-09-26T04:00:00Z".into()),
+            until: Some("2026-09-26T05:00:00Z".into()),
+            ..Default::default()
+        };
+        let keys: Vec<_> = wrapper
+            .export(&filter)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        assert_eq!(keys, ["inside"]);
     }
 }

@@ -493,6 +493,15 @@ impl SqliteMemory {
         .await?
     }
 
+    /// `created_at` keeps the offset of the host that wrote it, so recall
+    /// bounds are compared as instants rather than as text. Values SQLite
+    /// cannot parse keep the text comparison.
+    fn created_at_bound_sql(op: &str, idx: usize) -> String {
+        format!(
+            " AND COALESCE(julianday(m.created_at) {op} julianday(?{idx}), m.created_at {op} ?{idx})"
+        )
+    }
+
     fn category_to_str(cat: &MemoryCategory) -> String {
         match cat {
             MemoryCategory::Core => "core".into(),
@@ -1001,12 +1010,12 @@ impl SqliteMemory {
                 idx += 1;
             }
             if let Some(s) = since_ref {
-                let _ = write!(sql, " AND m.created_at >= ?{idx}");
+                sql.push_str(&Self::created_at_bound_sql(">=", idx));
                 param_values.push(Box::new(s.to_string()));
                 idx += 1;
             }
             if let Some(u) = until_ref {
-                let _ = write!(sql, " AND m.created_at <= ?{idx}");
+                sql.push_str(&Self::created_at_bound_sql("<=", idx));
                 param_values.push(Box::new(u.to_string()));
                 idx += 1;
             }
@@ -1292,14 +1301,9 @@ impl SqliteMemory {
                         tenant,
                     )) = entry_map.remove(&scored.id)
                     {
-                        if let Some(s) = since_ref
-                            && ts.as_str() < s {
-                                continue;
-                            }
-                        if let Some(u) = until_ref
-                            && ts.as_str() > u {
-                                continue;
-                            }
+                        if !crate::timestamp_in_range(&ts, since_ref, until_ref) {
+                            continue;
+                        }
                         let entry = MemoryEntry {
                             principal_id: None,
                             id: scored.id.clone(),
@@ -1374,11 +1378,11 @@ impl SqliteMemory {
                     let mut param_idx = patterns.len() * 2 + 1;
                     let mut time_conditions = String::new();
                     if since_ref.is_some() {
-                        let _ = write!(time_conditions, " AND m.created_at >= ?{param_idx}");
+                        time_conditions.push_str(&Self::created_at_bound_sql(">=", param_idx));
                         param_idx += 1;
                     }
                     if until_ref.is_some() {
-                        let _ = write!(time_conditions, " AND m.created_at <= ?{param_idx}");
+                        time_conditions.push_str(&Self::created_at_bound_sql("<=", param_idx));
                         param_idx += 1;
                     }
                     let mut agent_conditions = String::new();
@@ -2005,12 +2009,12 @@ impl Memory for SqliteMemory {
                 idx += 1;
             }
             if let Some(since) = since_owned.as_deref() {
-                let _ = write!(sql, " AND m.created_at >= ?{idx}");
+                sql.push_str(&Self::created_at_bound_sql(">=", idx));
                 param_values.push(Box::new(since.to_string()));
                 idx += 1;
             }
             if let Some(until) = until_owned.as_deref() {
-                let _ = write!(sql, " AND m.created_at <= ?{idx}");
+                sql.push_str(&Self::created_at_bound_sql("<=", idx));
                 param_values.push(Box::new(until.to_string()));
                 idx += 1;
             }
@@ -2197,12 +2201,12 @@ impl Memory for SqliteMemory {
                 idx += 1;
             }
             if let Some(ref since) = filter.since {
-                let _ = write!(sql, " AND m.created_at >= ?{idx}");
+                sql.push_str(&Self::created_at_bound_sql(">=", idx));
                 param_values.push(Box::new(since.clone()));
                 idx += 1;
             }
             if let Some(ref until) = filter.until {
-                let _ = write!(sql, " AND m.created_at <= ?{idx}");
+                sql.push_str(&Self::created_at_bound_sql("<=", idx));
                 param_values.push(Box::new(until.clone()));
             }
             sql.push_str(" ORDER BY m.created_at ASC");
@@ -2509,12 +2513,12 @@ impl Memory for SqliteMemory {
                 idx += 1;
             }
             if let Some(ref since) = filter.since {
-                let _ = write!(sql, " AND m.created_at >= ?{idx}");
+                sql.push_str(&Self::created_at_bound_sql(">=", idx));
                 param_values.push(Box::new(since.clone()));
                 idx += 1;
             }
             if let Some(ref until) = filter.until {
-                let _ = write!(sql, " AND m.created_at <= ?{idx}");
+                sql.push_str(&Self::created_at_bound_sql("<=", idx));
                 param_values.push(Box::new(until.clone()));
                 let _ = idx;
             }
@@ -6546,6 +6550,87 @@ mod tests {
                 again_keys, snapshot,
                 "list() must yield a deterministic order across reads"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn time_bounded_recall_compares_rfc3339_instants() {
+        let (_tmp, mem) = temp_sqlite();
+        let scope = PrincipalScope::new("user:alice");
+        // `store` writes `Local::now().to_rfc3339()`, so the stored offset
+        // follows the host time zone while callers usually pass UTC bounds.
+        let rows = [
+            ("a", "2026-09-26T12:00:00+08:00"), // 04:00Z, the since bound
+            ("b", "2026-09-26T04:30:00.123456789+00:00"), // inside
+            ("c", "2026-09-26T01:00:00-04:00"), // 05:00Z, the until bound
+            ("d", "2026-09-26T04:30:00+08:00"), // the previous day in UTC
+            ("e", "2026-09-26T05:00:00.001Z"),  // 1ms after the window
+        ];
+        for (key, _) in rows {
+            let content = format!("meeting {key}");
+            mem.store(key, &content, MemoryCategory::Core, None)
+                .await
+                .unwrap();
+            mem.store_for_principal(&scope, key, &content, MemoryCategory::Core, None)
+                .await
+                .unwrap();
+        }
+        {
+            let conn = mem.connection().lock();
+            for (key, created_at) in rows {
+                conn.execute(
+                    "UPDATE memories SET created_at = ?1 WHERE content = ?2",
+                    params![created_at, format!("meeting {key}")],
+                )
+                .unwrap();
+            }
+        }
+
+        let since = "2026-09-26T04:00:00Z";
+        let until = "2026-09-26T05:00:00Z";
+        let keys = |entries: Vec<MemoryEntry>| {
+            let mut keys: Vec<_> = entries.into_iter().map(|e| e.key).collect();
+            keys.sort();
+            keys
+        };
+        let filter = ExportFilter {
+            since: Some(since.into()),
+            until: Some(until.into()),
+            ..Default::default()
+        };
+        let results = [
+            (
+                "recent",
+                keys(
+                    mem.recall("*", 10, None, Some(since), Some(until))
+                        .await
+                        .unwrap(),
+                ),
+            ),
+            (
+                "keyword",
+                keys(
+                    mem.recall("meeting", 10, None, Some(since), Some(until))
+                        .await
+                        .unwrap(),
+                ),
+            ),
+            ("export", keys(mem.export(&filter).await.unwrap())),
+            (
+                "principal recall",
+                keys(
+                    mem.recall_for_principal(&scope, "meeting", 10, None, Some(since), Some(until))
+                        .await
+                        .unwrap(),
+                ),
+            ),
+            (
+                "principal export",
+                keys(mem.export_for_principal(&scope, &filter).await.unwrap()),
+            ),
+        ];
+        for (path, keys) in results {
+            assert_eq!(keys, ["a", "b", "c"], "{path} path");
         }
     }
 }

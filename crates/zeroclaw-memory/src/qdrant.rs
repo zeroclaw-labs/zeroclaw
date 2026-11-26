@@ -29,22 +29,6 @@ pub struct QdrantMemory {
 }
 
 impl QdrantMemory {
-    fn timestamp_in_range(timestamp: &str, since: Option<&str>, until: Option<&str>) -> bool {
-        let instant = chrono::DateTime::parse_from_rfc3339(timestamp).ok();
-        let compare = |bound: &str| {
-            match (
-                instant.as_ref(),
-                chrono::DateTime::parse_from_rfc3339(bound),
-            ) {
-                (Some(instant), Ok(bound)) => instant.cmp(&bound),
-                // Keep the legacy comparison for non-RFC3339 values.
-                _ => timestamp.cmp(bound),
-            }
-        };
-        since.is_none_or(|bound| !compare(bound).is_lt())
-            && until.is_none_or(|bound| !compare(bound).is_gt())
-    }
-
     fn add_time_range_filter(
         must: &mut Vec<serde_json::Value>,
         since: Option<&str>,
@@ -328,7 +312,7 @@ impl QdrantMemory {
                     _ => continue,
                 };
                 let timestamp = payload.timestamp.clone();
-                if !Self::timestamp_in_range(&timestamp, since, until) {
+                if !crate::timestamp_in_range(&timestamp, since, until) {
                     continue;
                 }
 
@@ -841,7 +825,7 @@ impl Memory for QdrantMemory {
             })
             .collect();
 
-        entries.retain(|entry| Self::timestamp_in_range(&entry.timestamp, since, until));
+        entries.retain(|entry| crate::timestamp_in_range(&entry.timestamp, since, until));
 
         Ok(entries)
     }
@@ -1227,7 +1211,7 @@ impl Memory for QdrantMemory {
             })
             .collect();
 
-        entries.retain(|entry| Self::timestamp_in_range(&entry.timestamp, since, until));
+        entries.retain(|entry| crate::timestamp_in_range(&entry.timestamp, since, until));
         Ok(entries)
     }
 }
