@@ -274,9 +274,10 @@ pub(crate) fn ensure_legacy_model(document: &mut Value, path: &str) -> Result<()
         .split('/')
         .map(|part| part.replace("~1", "/").replace("~0", "~"))
         .collect();
-    let ["providers", "models", model_ref, ..] = parts.as_slice() else {
+    if parts.len() < 3 || parts[0] != "providers" || parts[1] != "models" {
         return Ok(());
-    };
+    }
+    let model_ref = &parts[2];
     let root = document
         .as_object_mut()
         .ok_or_else(|| anyhow::Error::msg("provider registry must be a table"))?;
