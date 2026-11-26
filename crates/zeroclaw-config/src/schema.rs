@@ -13612,7 +13612,7 @@ fn default_fts_early_return_score() -> f64 {
     0.85
 }
 
-fn validate_memory_rerank_config(memory: &MemoryConfig) -> Result<()> {
+fn validate_memory_rerank_config(memory: &MemoryConfig, nat64_prefixes: &[String]) -> Result<()> {
     if !(1..=MAX_MEMORY_RERANK_CANDIDATE_MULTIPLIER).contains(&memory.candidate_multiplier) {
         anyhow::bail!(
             "memory.candidate_multiplier must be in 1..={MAX_MEMORY_RERANK_CANDIDATE_MULTIPLIER} (got {})",
@@ -13636,13 +13636,20 @@ fn validate_memory_rerank_config(memory: &MemoryConfig) -> Result<()> {
         .trim()
         .eq_ignore_ascii_case("external")
     {
-        validate_external_rerank_config(&memory.external_rerank)?;
+        validate_external_rerank_config(&memory.external_rerank, nat64_prefixes)?;
     }
 
     Ok(())
 }
 
-fn validate_external_rerank_config(external: &MemoryExternalRerankConfig) -> Result<()> {
+/// `nat64_prefixes` is the deployment's `security.nat64_prefixes`: the rerank
+/// client hands it to the network guard on every call and refuses every call
+/// when it does not parse, so a typo is reported here, once, with the key to
+/// fix, instead of as a quiet fallback to the local order on every turn.
+fn validate_external_rerank_config(
+    external: &MemoryExternalRerankConfig,
+    nat64_prefixes: &[String],
+) -> Result<()> {
     let endpoint = external.endpoint.trim();
     if endpoint.is_empty() {
         anyhow::bail!(
@@ -13691,6 +13698,13 @@ fn validate_external_rerank_config(external: &MemoryExternalRerankConfig) -> Res
             external.max_candidates
         );
     }
+    zeroclaw_infra::net_guard::parse_nat64_prefixes(nat64_prefixes, "security.nat64_prefixes")
+        .map_err(|error| {
+            anyhow::Error::msg(format!(
+                "{error} With memory.rerank_strategy = \"external\", every rerank call is \
+                 refused until this is fixed."
+            ))
+        })?;
     Ok(())
 }
 
@@ -25391,7 +25405,7 @@ impl Config {
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
-        validate_memory_rerank_config(&self.memory)?;
+        validate_memory_rerank_config(&self.memory, &self.security.nat64_prefixes)?;
         self.cost.rates.validate()?;
         self.validate_retired_gemini_cli()?;
 
@@ -31305,6 +31319,32 @@ allow_private_endpoint = true
         }
 
         external("https://rerank.example.com", false).expect("a public endpoint needs no opt-in");
+    }
+
+    #[::core::prelude::v1::test]
+    fn config_validate_checks_nat64_prefixes_when_the_external_rerank_is_on() {
+        let with_prefixes = |strategy: &str, prefixes: &[&str]| {
+            let mut config = super::Config::default();
+            config.memory.rerank_enabled = true;
+            config.memory.rerank_strategy = strategy.into();
+            config.memory.external_rerank.endpoint = "https://rerank.example.com/v1/rerank".into();
+            config.security.nat64_prefixes = prefixes.iter().map(|p| (*p).to_string()).collect();
+            config.validate()
+        };
+
+        with_prefixes("external", &[]).expect("no prefixes validates");
+        with_prefixes("external", &["64:ff9b::/96"]).expect("a valid prefix validates");
+        let err = with_prefixes("external", &["64:ff9b::/96", "not-a-prefix"])
+            .expect_err("a malformed prefix must fail validation");
+        let message = err.to_string();
+        assert!(message.contains("security.nat64_prefixes"), "{message}");
+        assert!(message.contains("not-a-prefix"), "{message}");
+        assert!(message.contains("rerank call is refused"), "{message}");
+
+        // Without the external strategy the rerank never reads the list, so
+        // this check leaves it to the paths that do.
+        with_prefixes("none", &["not-a-prefix"])
+            .expect("the list is not checked here when the external rerank is off");
     }
 
     #[::core::prelude::v1::test]
