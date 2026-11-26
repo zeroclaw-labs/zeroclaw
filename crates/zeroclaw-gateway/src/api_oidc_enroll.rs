@@ -218,7 +218,7 @@ async fn handle_certificate(
                 not_after: issued.not_after,
                 status: CertStatus::Active,
                 token_hash: String::new(),
-                actor: format!("oidc:{}", auth.principal.id.as_str()),
+                actor: auth.principal.id.as_str().to_owned(),
                 issued_at: chrono::Utc::now().timestamp(),
             },
             false,

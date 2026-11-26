@@ -2,16 +2,18 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::{Mutex, oneshot};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage,
-    ChannelModelPickerRequest, DraftProgress, ProgressEvent, RoomCreationOptions, SendMessage,
+    ChannelModelPickerRequest, DraftProgress, PollRequest, ProgressEvent, RoomCreationOptions,
+    SendMessage,
 };
 use zeroclaw_config::schema::{DEFAULT_REPLY_QUEUE_DEPTH, HasReplyPacing, PACING_RECIPIENT_CAP};
 
@@ -20,6 +22,7 @@ enum PacedOp {
     Send(SendMessage),
     /// A completed assistant response. Dispatches to `inner.send_final`.
     SendFinal(SendMessage),
+    SendPoll(PollRequest),
     /// A terminal draft write. Dispatches to `inner.finalize_draft` so the
     /// channel edits the existing draft rather than posting a new message.
     FinalizeDraft {
@@ -35,6 +38,7 @@ impl PacedOp {
     fn recipient(&self) -> &str {
         match self {
             Self::Send(message) | Self::SendFinal(message) => &message.recipient,
+            Self::SendPoll(poll) => &poll.recipient,
             Self::FinalizeDraft { recipient, .. } => recipient,
         }
     }
@@ -43,6 +47,14 @@ impl PacedOp {
     fn payload_chars(&self) -> usize {
         match self {
             Self::Send(message) | Self::SendFinal(message) => message.content.chars().count(),
+            Self::SendPoll(poll) => {
+                poll.question.chars().count()
+                    + poll
+                        .options
+                        .iter()
+                        .map(|option| option.chars().count())
+                        .sum::<usize>()
+            }
             Self::FinalizeDraft { text, .. } => text.chars().count(),
         }
     }
@@ -52,6 +64,7 @@ impl PacedOp {
         match self {
             Self::Send(message) => inner.send(&message).await,
             Self::SendFinal(message) => inner.send_final(&message).await,
+            Self::SendPoll(poll) => inner.send_poll(&poll).await,
             Self::FinalizeDraft {
                 recipient,
                 message_id,
@@ -73,6 +86,12 @@ struct PendingSend {
     /// the caller. The caller awaits this so a paced `send()` still
     /// returns the inner channel's result rather than swallowing it.
     reply: oneshot::Sender<Result<()>>,
+}
+
+impl PendingSend {
+    fn is_cancelled_poll(&self) -> bool {
+        matches!(self.op, PacedOp::SendPoll(_)) && self.reply.is_closed()
+    }
 }
 
 /// Per-recipient pacing state.
@@ -176,7 +195,7 @@ impl PacedChannel {
     async fn paced_dispatch(&self, op: PacedOp) -> Result<()> {
         let recipient_key = op.recipient().to_string();
 
-        let decision: (Option<PacedOp>, Option<oneshot::Receiver<Result<()>>>, bool) = {
+        let (immediate, awaited) = {
             let mut map = self.recipients.lock().await;
             map.evict_if_over_cap();
             let now = Instant::now();
@@ -193,14 +212,19 @@ impl PacedChannel {
                 });
             state.last_touched = touch;
 
-            if state.queue.is_empty()
+            // A cancelled poll no longer needs a slot. Scan only on pressure.
+            if state.queue.len() >= self.queue_depth {
+                state.queue.retain(|pending| !pending.is_cancelled_poll());
+            }
+
+            let ready = state.queue.is_empty()
                 && !state.worker_running
                 && !state.in_flight
-                && now >= state.next_allowed_at
-            {
+                && now >= state.next_allowed_at;
+            if ready && !matches!(op, PacedOp::SendPoll(_)) {
                 state.next_allowed_at = now + self.min_interval;
                 state.in_flight = true;
-                (Some(op), None, false)
+                (Some(op), None)
             } else if state.queue.len() >= self.queue_depth {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -215,19 +239,31 @@ impl PacedChannel {
                         })),
                     "paced channel queue full: dropping newest outbound message"
                 );
-                (None, None, false)
+                // The poll tool treats Ok as confirmation that the poll was posted.
+                if matches!(op, PacedOp::SendPoll(_)) {
+                    anyhow::bail!("paced channel queue full: native poll was not sent");
+                }
+                (None, None)
             } else {
                 let (tx, rx) = oneshot::channel();
-                state.queue.push_back(PendingSend { op, reply: tx });
-                let spawn = !state.worker_running;
-                if spawn {
+                let pending = PendingSend { op, reply: tx };
+                // The worker owns even a ready poll so dropping its caller
+                // during delivery cannot strand the recipient. Hand it to the
+                // worker directly, preserving the queue slots for waiters.
+                let first = if ready {
+                    Some(pending)
+                } else {
+                    state.queue.push_back(pending);
+                    None
+                };
+                if !state.worker_running {
                     state.worker_running = true;
+                    self.spawn_drain_worker(recipient_key.clone(), first);
                 }
-                (None, Some(rx), spawn)
+                (None, Some(rx))
             }
         };
 
-        let (immediate, awaited, spawn_worker) = decision;
         if let Some(op) = immediate {
             let result = op.dispatch(&self.inner).await;
             // Clear the in-flight marker under the lock. Sends that arrived
@@ -247,14 +283,11 @@ impl PacedChannel {
                 }
             };
             if spawn {
-                self.spawn_drain_worker(recipient_key);
+                self.spawn_drain_worker(recipient_key, None);
             }
             return result;
         }
         if let Some(rx) = awaited {
-            if spawn_worker {
-                self.spawn_drain_worker(recipient_key);
-            }
             return rx.await.unwrap_or_else(|_| {
                 Err(anyhow::Error::msg(
                     "paced channel worker dropped before send completed",
@@ -267,45 +300,36 @@ impl PacedChannel {
     /// Spawn the worker that drains a recipient's queue at the floor rate.
     /// One worker per recipient — re-entry is prevented by the
     /// `worker_running` flag held under the same lock that enqueues.
-    fn spawn_drain_worker(&self, recipient: String) {
+    fn spawn_drain_worker(&self, recipient: String, mut first: Option<PendingSend>) {
         let recipients = Arc::clone(&self.recipients);
         let inner = Arc::clone(&self.inner);
         let min_interval = self.min_interval;
         zeroclaw_spawn::spawn!(async move {
             loop {
-                // Wait until the floor has elapsed for this recipient.
-                let sleep_for = {
-                    let map = recipients.lock().await;
-                    let Some(state) = map.inner.get(&recipient) else {
-                        return;
-                    };
-                    state
-                        .next_allowed_at
-                        .saturating_duration_since(Instant::now())
-                };
-                if !sleep_for.is_zero() {
-                    tokio::time::sleep(sleep_for).await;
-                }
-
-                // Pop the next pending send, release the lock before
-                // awaiting the actual wire call. Re-stamp the floor based
-                // on when we dispatched.
-                let pending = {
+                let PendingSend { op, reply } = {
                     let mut map = recipients.lock().await;
                     let Some(state) = map.inner.get_mut(&recipient) else {
                         return;
                     };
-                    if state.queue.is_empty() {
+                    let now = Instant::now();
+                    let deadline = state.next_allowed_at;
+                    if (first.is_some() || !state.queue.is_empty()) && now < deadline {
+                        drop(map);
+                        tokio::time::sleep_until(deadline).await;
+                        continue;
+                    }
+                    let Some(pending) = first.take().or_else(|| state.queue.pop_front()) else {
                         state.worker_running = false;
                         return;
+                    };
+                    if pending.is_cancelled_poll() {
+                        continue;
                     }
-                    state.next_allowed_at = Instant::now() + min_interval;
-                    state.queue.pop_front()
+                    state.next_allowed_at = now + min_interval;
+                    pending
                 };
-                if let Some(PendingSend { op, reply }) = pending {
-                    let result = op.dispatch(&inner).await;
-                    let _ = reply.send(result);
-                }
+                let result = op.dispatch(&inner).await;
+                let _ = reply.send(result);
             }
         });
     }
@@ -533,14 +557,15 @@ impl Channel for PacedChannel {
         self.inner.invite_user(room_id, user_id).await
     }
 
-    /// Forwarded rather than paced: a poll is one stanza, and the inner
-    /// channel owns whatever limits apply to it.
     fn supports_native_polls(&self) -> bool {
         self.inner.supports_native_polls()
     }
 
-    async fn send_poll(&self, poll: &zeroclaw_api::channel::PollRequest) -> Result<()> {
-        self.inner.send_poll(poll).await
+    async fn send_poll(&self, poll: &PollRequest) -> Result<()> {
+        if !self.inner.supports_native_polls() {
+            return self.inner.send_poll(poll).await;
+        }
+        self.paced_dispatch(PacedOp::SendPoll(poll.clone())).await
     }
 
     /// Must be forwarded explicitly: the trait default returns `None`, so
@@ -739,10 +764,20 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct PollGate {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[derive(Default)]
     struct RoomManagementChannel {
         creates: AtomicUsize,
         invites: AtomicUsize,
+        sends: AtomicUsize,
         polls: AtomicUsize,
+        reject_polls: bool,
+        poll_gate: Option<PollGate>,
     }
 
     impl Attributable for RoomManagementChannel {
@@ -760,6 +795,7 @@ mod tests {
             "room-management"
         }
         async fn send(&self, _message: &SendMessage) -> Result<()> {
+            self.sends.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
         async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
@@ -781,7 +817,12 @@ mod tests {
         }
         async fn send_poll(&self, poll: &zeroclaw_api::channel::PollRequest) -> Result<()> {
             assert_eq!(poll.question, "Which tasting slot?");
+            if let Some(gate) = &self.poll_gate {
+                gate.started.notify_one();
+                gate.release.notified().await;
+            }
             self.polls.fetch_add(1, Ordering::SeqCst);
+            anyhow::ensure!(!self.reject_polls, "inner channel rejected the poll");
             Ok(())
         }
     }
@@ -1106,11 +1147,7 @@ mod tests {
 
     #[tokio::test]
     async fn room_management_forwards_to_inner_channel() {
-        let counting = Arc::new(RoomManagementChannel {
-            creates: AtomicUsize::new(0),
-            invites: AtomicUsize::new(0),
-            polls: AtomicUsize::new(0),
-        });
+        let counting = Arc::new(RoomManagementChannel::default());
         let inner: Arc<dyn Channel> = counting.clone();
         let cfg = PacingFixture {
             interval_secs: 3600,
@@ -1198,11 +1235,7 @@ mod tests {
     /// channel posts native polls, and every poll would silently become text.
     #[tokio::test]
     async fn native_polls_reach_the_inner_channel() {
-        let counting = Arc::new(RoomManagementChannel {
-            creates: AtomicUsize::new(0),
-            invites: AtomicUsize::new(0),
-            polls: AtomicUsize::new(0),
-        });
+        let counting = Arc::new(RoomManagementChannel::default());
         let inner: Arc<dyn Channel> = counting.clone();
         let paced = PacedChannel::wrap(
             inner,
@@ -1222,6 +1255,184 @@ mod tests {
             .await
             .expect("the inner channel accepts the poll");
         assert_eq!(counting.polls.load(Ordering::SeqCst), 1);
+    }
+
+    fn tasting_poll() -> PollRequest {
+        PollRequest::new(
+            "recipient",
+            "Which tasting slot?",
+            vec!["Friday".into(), "Saturday".into()],
+        )
+    }
+
+    fn paced_poll_channel(inner: &Arc<RoomManagementChannel>, depth: u16) -> Arc<dyn Channel> {
+        PacedChannel::wrap(
+            inner.clone(),
+            &PacingFixture {
+                interval_secs: 1,
+                depth,
+            },
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_queued_poll_frees_capacity_without_delaying_neighbors() {
+        let inner = Arc::new(RoomManagementChannel::default());
+        let paced = paced_poll_channel(&inner, 2);
+        let poll = tasting_poll();
+        let message = SendMessage::new("message", "recipient");
+        paced.send(&message).await.unwrap();
+
+        let mut cancelled = paced.send_poll(&poll);
+        assert!(futures_util::poll!(&mut cancelled).is_pending());
+        let mut queued_message = paced.send(&message);
+        assert!(futures_util::poll!(&mut queued_message).is_pending());
+        drop(cancelled);
+        // Unlike native polls, queued messages keep their delivery semantics
+        // even if the sender stops waiting for the result.
+        drop(queued_message);
+        let mut live = paced.send_poll(&poll);
+        assert!(
+            futures_util::poll!(&mut live).is_pending(),
+            "the cancelled poll must free its queue slot"
+        );
+
+        tokio::time::timeout(Duration::from_millis(2500), live)
+            .await
+            .expect("the live poll gets the slot after the message")
+            .unwrap();
+        assert_eq!(inner.sends.load(Ordering::SeqCst), 2);
+        assert_eq!(inner.polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_queued_poll_is_never_posted_and_leaves_the_recipient_idle() {
+        let inner = Arc::new(RoomManagementChannel::default());
+        let paced = paced_poll_channel(&inner, 1);
+        let poll = tasting_poll();
+        paced
+            .send(&SendMessage::new("message", "recipient"))
+            .await
+            .unwrap();
+
+        let mut queued = paced.send_poll(&poll);
+        assert!(futures_util::poll!(&mut queued).is_pending());
+        drop(queued);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(inner.polls.load(Ordering::SeqCst), 0);
+        tokio::time::timeout(Duration::from_millis(100), paced.send_poll(&poll))
+            .await
+            .expect("cancellation must not reserve another pacing interval")
+            .unwrap();
+        assert_eq!(inner.polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_caller_of_in_flight_first_poll_leaves_recipient_available() {
+        let inner = Arc::new(RoomManagementChannel {
+            poll_gate: Some(PollGate::default()),
+            ..Default::default()
+        });
+        let paced = paced_poll_channel(&inner, 1);
+        let poll = tasting_poll();
+        let message = SendMessage::new("message", "recipient");
+        let mut first = paced.send_poll(&poll);
+        assert!(futures_util::poll!(&mut first).is_pending());
+        let mut waiting = paced.send(&message);
+        assert!(
+            futures_util::poll!(&mut waiting).is_pending(),
+            "the in-flight poll leaves the queue slot available"
+        );
+        assert!(
+            paced
+                .send_poll(&poll)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("queue full")
+        );
+
+        let gate = inner.poll_gate.as_ref().unwrap();
+        gate.started.notified().await;
+        drop(first);
+        gate.release.notify_one();
+        waiting.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            matches!(
+                futures_util::poll!(paced.send(&message)),
+                std::task::Poll::Ready(Ok(()))
+            ),
+            "a finished poll must release the recipient for an immediate send"
+        );
+        assert_eq!(inner.sends.load(Ordering::SeqCst), 2);
+        assert_eq!(inner.polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_poll_waits_behind_queued_message_and_returns_delivery_result() {
+        let inner = Arc::new(RoomManagementChannel {
+            reject_polls: true,
+            ..Default::default()
+        });
+        let paced = paced_poll_channel(&inner, 2);
+        let message = SendMessage::new("message", "recipient");
+        let poll = tasting_poll();
+
+        paced.send(&message).await.unwrap();
+        let mut queued_message = paced.send(&message);
+        assert!(futures_util::poll!(&mut queued_message).is_pending());
+        let mut queued_poll = paced.send_poll(&poll);
+        assert!(futures_util::poll!(&mut queued_poll).is_pending());
+
+        // Both queue slots are occupied. A dropped poll must report failure.
+        let dropped = paced.send_poll(&poll).await.unwrap_err();
+        assert!(dropped.to_string().contains("queue full"));
+
+        let before_floor = Duration::from_millis(999);
+        assert!(
+            tokio::time::timeout(before_floor, &mut queued_message)
+                .await
+                .is_err()
+        );
+        queued_message.await.unwrap();
+        assert_eq!(inner.polls.load(Ordering::SeqCst), 0);
+        assert!(
+            tokio::time::timeout(before_floor, &mut queued_poll)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            queued_poll.await.unwrap_err().to_string(),
+            "inner channel rejected the poll"
+        );
+        assert_eq!(inner.polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unsupported_polls_keep_the_inner_error_without_waiting_for_pacing() {
+        let inner = Arc::new(CountingChannel {
+            sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
+        });
+        let paced = PacedChannel::wrap(
+            inner,
+            &PacingFixture {
+                interval_secs: 3600,
+                depth: 1,
+            },
+        );
+        paced
+            .send(&SendMessage::new("message", "recipient"))
+            .await
+            .unwrap();
+        let poll = zeroclaw_api::channel::PollRequest::new("recipient", "Question?", vec![]);
+        assert!(!paced.supports_native_polls());
+        let result = futures_util::poll!(paced.send_poll(&poll));
+        assert!(
+            matches!(result, std::task::Poll::Ready(Err(error)) if error.to_string() == "channel does not support native polls")
+        );
     }
 
     /// A channel whose `send` blocks until the test releases a gate, so the

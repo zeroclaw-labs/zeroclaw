@@ -3,6 +3,7 @@ import type {
   ApprovalDecision,
   PendingApproval,
   SessionMessagesResponse,
+  SessionStateResponse,
   WsMessage,
 } from '@/types/api';
 import {
@@ -26,6 +27,7 @@ import {
   listProps,
   getStatus,
   getSessionMessages,
+  getSessionState,
   abortSession,
   deleteSession,
   renameSession,
@@ -60,6 +62,8 @@ import {
 } from '@/lib/chatHistoryStorage';
 
 export interface ChatMessage {
+  /** Materialized from persisted history; not a newly completed live reply. */
+  fromHistory?: boolean;
   id: string;
   role: 'user' | 'agent';
   content: string;
@@ -252,6 +256,8 @@ export interface AgentSessionRuntime {
     autoReconnect?: boolean;
   }): SessionSocket;
   getMessages(sessionId: string): Promise<SessionMessagesResponse>;
+  /** Whether the session's turn is still running on the gateway. */
+  getState(sessionId: string, signal?: AbortSignal): Promise<SessionStateResponse>;
   delete(sessionId: string): Promise<{ deleted: boolean }>;
   rename(sessionId: string, name: string): Promise<{ session_id: string; name: string }>;
   mintId(): string;
@@ -260,10 +266,37 @@ export interface AgentSessionRuntime {
 const defaultSessionRuntime: AgentSessionRuntime = {
   createSocket: (options) => new WebSocketClient(options),
   getMessages: getSessionMessages,
+  getState: getSessionState,
   delete: deleteSession,
   rename: renameSession,
   mintId: newSessionId,
 };
+
+/** How often a page that shows a turn running on the gateway, but not on its
+ * own socket, asks whether that turn has ended. */
+export const DETACHED_TURN_POLL_MS = 2_000;
+
+/** How long one such check may take. A check without an answer by then reads
+ * as "not running", like a failed one, so a stuck request cannot keep the page
+ * waiting on it. */
+export const STATE_CHECK_TIMEOUT_MS = 10_000;
+
+/** Resolves after `ms`, or as soon as `signal` aborts. */
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener('abort', done, { once: true });
+  });
+}
 
 /** Shared empty array so panes with no siblings keep a stable context value. */
 const NO_RESERVED_SESSIONS: readonly string[] = [];
@@ -325,6 +358,52 @@ export function AgentProvider({
   // again: the turn may have finished on the server while no socket listened.
   const [transcriptVersion, setTranscriptVersion] = useState(0);
   const resyncOnOpenRef = useRef(false);
+  // Set while the page shows a turn that runs on the gateway but streams to
+  // no socket of this page (its socket closed mid-turn, or the page loaded
+  // while it ran). Aborting it ends the watch without a reload: the next
+  // hydration, a conversation switch or clear, a model switch, unmount and
+  // the close of the socket do that (the reopen reloads and asks again).
+  const detachedTurnWatchRef = useRef<AbortController | null>(null);
+  // The turn the current watch shows, so Stop can tell which turn the gateway
+  // disowned. Set only while `detachedTurnWatchRef` holds the same watch.
+  const watchedTurnRef = useRef<{ watch: AbortController; sid: string; turnId: string } | null>(null);
+  // The watched turn Stop got `no_active_response` for. The gateway also says
+  // that in the moment between a turn's end and its `idle` write, so this is
+  // only a suspicion until two checks that both started after the refusal
+  // still read the same turn running. Only the in-process route can refuse
+  // here: the core's abort, which also says it for a turn it will not stop,
+  // serves scoped accounts only, and their pages are `perSocket` and never
+  // watch a turn.
+  const stopRefusedRef = useRef<
+    { watch: AbortController; turnId: string; confirmations: number } | null
+  >(null);
+  // Turns whose stored state still read `running` after the gateway said it
+  // was not running them (a state write that failed): per conversation, that
+  // turn id. A later load does not lock the composer on that turn again; a
+  // turn with another id still does. Dropped once the conversation reads
+  // anything else.
+  const disownedTurnsRef = useRef(new Map<string, string>());
+  // Set while a hydration may still start such a watch: from its first state
+  // check until it has loaded the transcript. A clear or model switch in that
+  // window aborts it, so a late `running` answer cannot start a watch the
+  // page no longer wants. Kept apart from `detachedTurnWatchRef` because a
+  // conversation switch leaves only a watched turn running.
+  const pendingTurnCheckRef = useRef<AbortController | null>(null);
+  // What the current reload's first state check has said: `pending` until it
+  // answers. During a conversation's first turn the gateway has stored
+  // nothing yet, so a `session_start` reporting no stored messages means the
+  // conversation started over only when no turn is running there.
+  const reloadTurnCheckRef = useRef<
+    { watch: AbortController; state: 'pending' | 'running' | 'idle' } | null
+  >(null);
+  // Set from a reopen until its reload has started that check: a
+  // `session_start` can arrive before the reload has begun.
+  const reloadDueRef = useRef(false);
+  // Conversation whose started-over notice waits for the reload to settle.
+  // A `session_start` reporting no stored messages while the reload's state
+  // check is out, or while a failed load waits for its retry, defers the
+  // decision; that load applies it once the gateway's answer is known.
+  const pendingStartedOverRef = useRef<string | null>(null);
   // The last definite answer on whether the gateway stores transcripts.
   // `sessionPersistence` is null again while each reload is in flight, and a
   // `session_start` arriving then still needs to know.
@@ -381,6 +460,78 @@ export function AgentProvider({
     void primeModelProviderCatalog();
   }, []);
 
+  // The server holds nothing for this page's conversation, yet the transcript
+  // shows messages: the server started it over (it was closed to make room for
+  // another, or a restart ended it). Those messages are no longer its context,
+  // so they must not look like it.
+  const showStartedOver = useCallback(() => {
+    localMessageMutationVersionRef.current += 1;
+    setMessages([
+      {
+        id: generateUUID(),
+        role: 'agent',
+        content: t('agent.conversation_started_over'),
+        timestamp: new Date(),
+        ephemeral: true,
+        notice: true,
+      },
+    ]);
+    setContextInput(EMPTY_CONTEXT_INPUT);
+  }, []);
+
+  // A `session_start` reporting no stored messages cannot tell, on its own,
+  // between a conversation the gateway started over and its first turn still
+  // running (nothing is stored until a turn ends). While the reload is
+  // mid-flight its load makes that call; defer the decision here. Never
+  // defer for a check that already saw a running turn: that conversation is
+  // known to exist and its watch shows the turn.
+  const deferStartedOverDecision = (
+    sid: string | null,
+    reloadDue = false,
+  ): 'deferred' | 'running' | 'now' => {
+    // A check that already confirmed a running turn: the conversation is
+    // known to exist, its watch shows the turn. No notice.
+    if (reloadTurnCheckRef.current?.state === 'running') return 'running';
+    if (
+      sid !== null
+      && (
+        reloadDue
+        || reloadTurnCheckRef.current?.state === 'pending'
+        || hydrationFailedRef.current === sid
+      )
+    ) {
+      pendingStartedOverRef.current = sid;
+      return 'deferred';
+    }
+    // No reload in flight: nothing will answer later, decide now.
+    return 'now';
+  };
+
+  // Apply a deferred notice decision once the load has settled. Whether the
+  // conversation exists is judged from what the load itself saw, so a stale
+  // flag can never invent a notice. True means the notice was shown.
+  const runStartedOverDecision = (
+    sid: string | null,
+    sawStore: boolean,
+    sawMessages: boolean,
+  ): boolean => {
+    const fire = pendingStartedOverRef.current === sid;
+    pendingStartedOverRef.current = null;
+    if (
+      fire
+      && sid !== null
+      && sid === activeSessionIdRef.current
+      && sawStore
+      && !sawMessages
+      && !typingRef.current
+      && messagesRef.current.some((m) => !m.ephemeral)
+    ) {
+      showStartedOver();
+      return true;
+    }
+    return false;
+  };
+
   // Hydrate chat from server (preferred) or localStorage fallback. Re-runs on
   // every session switch, which is what rehydrates the transcript of the
   // conversation the operator just selected.
@@ -408,9 +559,78 @@ export function AgentProvider({
     setSessionPersistence(null);
     setHydratedSessionId(null);
     hydrationFailedRef.current = null;
+    if (pendingStartedOverRef.current !== sid) pendingStartedOverRef.current = null;
+    const watch = new AbortController();
+    // Whether the gateway is still running this conversation's turn. Any
+    // failure, including the 404 of a gateway without session persistence,
+    // reads as no: the page then keeps its single transcript load. So does a
+    // check without an answer by its deadline, or one the watch ends: each
+    // check is cancelled and stops being awaited, whatever its request does.
+    let runningTurnId = '';
+    const turnStillRunning = async (): Promise<boolean> => {
+      if (watch.signal.aborted) return false;
+      // Only a check that starts after Stop's refusal may confirm it: one
+      // already out may carry an answer the gateway gave before the turn ended.
+      const refusedAtStart = stopRefusedRef.current;
+      const check = new AbortController();
+      const end = () => check.abort();
+      const deadline = setTimeout(end, STATE_CHECK_TIMEOUT_MS);
+      watch.signal.addEventListener('abort', end);
+      try {
+        const ended = new Promise<never>((_, reject) => {
+          check.signal.addEventListener('abort', () => reject(new Error('state check ended')));
+        });
+        const res = await Promise.race([sessionRuntime.getState(sid, check.signal), ended]);
+        const turnId = res.state === 'running' ? res.turn_id ?? '' : null;
+        const disowned = disownedTurnsRef.current.get(sid);
+        if (disowned !== undefined && disowned !== turnId) disownedTurnsRef.current.delete(sid);
+        if (turnId === null) return false;
+        if (disowned === turnId) return false;
+        if (
+          refusedAtStart
+          && refusedAtStart === stopRefusedRef.current
+          && refusedAtStart.watch === watch
+        ) {
+          if (refusedAtStart.turnId !== turnId) {
+            // Another turn runs now: the refusal was about the one that ended.
+            stopRefusedRef.current = null;
+          } else if (++refusedAtStart.confirmations >= 2) {
+            // Still `running`, twice, after the gateway said it runs no turn
+            // here: the stored state is stale. End the watch like a finished turn.
+            stopRefusedRef.current = null;
+            disownedTurnsRef.current.set(sid, turnId);
+            return false;
+          }
+        }
+        runningTurnId = turnId;
+        if (watchedTurnRef.current?.watch === watch) {
+          watchedTurnRef.current = { watch, sid, turnId };
+        }
+        return true;
+      } catch {
+        return false;
+      } finally {
+        clearTimeout(deadline);
+        watch.signal.removeEventListener('abort', end);
+      }
+    };
 
     (async () => {
+      let watching = false;
+      pendingTurnCheckRef.current = watch;
+      reloadTurnCheckRef.current = { watch, state: 'pending' };
+      reloadDueRef.current = false;
       try {
+        // Ask before loading the transcript. The gateway stores a turn before
+        // it leaves `running`, so a turn that ends after this answer is either
+        // in the transcript or caught by the watch; asked afterwards, a turn
+        // ending between the two reads would leave its answer unloaded.
+        const runningBeforeLoad = await turnStillRunning();
+        if (cancelled) return;
+        reloadTurnCheckRef.current = { watch, state: runningBeforeLoad ? 'running' : 'idle' };
+        // A running turn means the gateway still has the conversation: a
+        // notice deferred before the check answered was about a live turn.
+        if (runningBeforeLoad) pendingStartedOverRef.current = null;
         const res = await sessionRuntime.getMessages(sid);
         if (cancelled) return;
         serverKeepsTranscriptsRef.current = res.session_persistence;
@@ -427,6 +647,17 @@ export function AgentProvider({
             // Keep that uncommitted tail instead of replacing it.
             setMessages([...hydrated, ...uncommittedLocalTail(snapshotUsers, browserCopy)]);
           }
+          // A turn running on the gateway may not be in this snapshot, and its
+          // answer will not reach this page's socket. Show it as running before
+          // the composer unlocks, instead of offering to send into it, unless
+          // a clear or model switch has ended the watch since.
+          if (runningBeforeLoad && !watch.signal.aborted && !typingRef.current) {
+            watching = true;
+            detachedTurnWatchRef.current = watch;
+            watchedTurnRef.current = { watch, sid, turnId: runningTurnId };
+            typingRef.current = true;
+            setTyping(true);
+          }
         } else if (!res.session_persistence) {
           setMessages((prev) => {
             if (prev.length > 0 || !keepsLocalTranscripts()) return prev;
@@ -434,6 +665,16 @@ export function AgentProvider({
             return ls.length ? persistedToUiMessages(ls) : prev;
           });
         }
+        // The notice a `session_start` deferred is judged here, from what
+        // this load itself saw: a store still empty at the end of a check
+        // that found no running turn means the gateway did start over; a
+        // turn that ended during the check is stored by now and loads, no
+        // notice.
+        runStartedOverDecision(
+          sid,
+          res.session_persistence === true,
+          res.messages.length > 0,
+        );
       } catch {
         if (!cancelled) {
           hydrationFailedRef.current = sid;
@@ -447,18 +688,53 @@ export function AgentProvider({
           // socket opens it. If that happened while this request was out, the
           // refusal may predate it: ask again.
           if (sessionStartsRef.current !== sessionStartsAtRequest) {
+            // That retry decides a notice deferred to this load.
             setTranscriptVersion((v) => v + 1);
+          } else {
+            // Nothing retries now, so nothing would decide: drop the deferred
+            // notice rather than let a later load fire it without a fresh
+            // `session_start`. The next `session_start` decides again.
+            pendingStartedOverRef.current = null;
           }
         }
       } finally {
+        if (pendingTurnCheckRef.current === watch) pendingTurnCheckRef.current = null;
+        if (reloadTurnCheckRef.current?.watch === watch) reloadTurnCheckRef.current = null;
         if (!cancelled) setHydratedSessionId(sid);
       }
+
+      if (!watching) return;
+      // Ask until the turn leaves `running`. The watch ends without a reload
+      // when it is aborted: by the next hydration, a conversation switch or
+      // clear, unmount, or a close of the socket (whose reopen reloads).
+      do {
+        await delay(DETACHED_TURN_POLL_MS, watch.signal);
+        // A check once the watch has ended answers no, without a request.
+      } while (await turnStillRunning());
+      // Aborted while the last check was out: whatever it said is not ours.
+      if (watch.signal.aborted) return;
+      // The gateway leaves `running` only after it has stored the turn, so
+      // this load has the answer.
+      detachedTurnWatchRef.current = null;
+      typingRef.current = false;
+      setTyping(false);
+      setTranscriptVersion((v) => v + 1);
     })();
 
     return () => {
       cancelled = true;
+      watch.abort();
+      // Every path that re-runs this effect mid-watch has already ended the
+      // watch; should one not have, its lock must not outlive it.
+      if (detachedTurnWatchRef.current === watch) {
+        detachedTurnWatchRef.current = null;
+        typingRef.current = false;
+        setTyping(false);
+      }
+      if (watchedTurnRef.current?.watch === watch) watchedTurnRef.current = null;
+      if (stopRefusedRef.current?.watch === watch) stopRefusedRef.current = null;
     };
-  }, [sessionId, sessionRuntime, transcriptVersion, perSocket]);
+  }, [sessionId, sessionRuntime, transcriptVersion, perSocket, showStartedOver]);
 
   // Mirror transcript to localStorage (bounded); server remains source of truth when persistence is on
   useEffect(() => {
@@ -526,18 +802,15 @@ export function AgentProvider({
           && !typingRef.current
           && messagesRef.current.some((m) => !m.ephemeral)
         ) {
-          localMessageMutationVersionRef.current += 1;
-          setMessages([
-            {
-              id: generateUUID(),
-              role: 'agent',
-              content: t('agent.conversation_started_over'),
-              timestamp: new Date(),
-              ephemeral: true,
-              notice: true,
-            },
-          ]);
-          setContextInput(EMPTY_CONTEXT_INPUT);
+          // A reload whose state check is still out, or a failed load about
+          // to retry, decides once the gateway's answer is known. A check
+          // that already saw a running turn confirms the conversation.
+          if (
+            deferStartedOverDecision(activeSessionIdRef.current, reloadDueRef.current)
+            === 'now'
+          ) {
+            showStartedOver();
+          }
         }
         // A transcript that failed to load, typically because the
         // conversation didn't exist until this socket opened it, loads now.
@@ -832,7 +1105,7 @@ export function AgentProvider({
         setPendingApproval(null);
         break;
     }
-  }, [foldTurnStream, perSocket]);
+  }, [foldTurnStream, perSocket, showStartedOver]);
 
   // Wire up a WebSocketClient instance with version-guarded callbacks.
   const attachSocketCallbacks = useCallback((ws: SessionSocket) => {
@@ -846,6 +1119,7 @@ export function AgentProvider({
       setError(null);
       if (resyncOnOpenRef.current) {
         resyncOnOpenRef.current = false;
+        reloadDueRef.current = true;
         setTranscriptVersion((v) => v + 1);
       }
 
@@ -895,6 +1169,10 @@ export function AgentProvider({
         setStreamingContent('');
         setStreamingThinking('');
         foldTurnStream({ type: 'reset' });
+        // A turn this page was watching on the gateway: the reopen below
+        // reloads and asks again.
+        detachedTurnWatchRef.current?.abort();
+        detachedTurnWatchRef.current = null;
         // A socket that is one conversation reopens onto a new one: there is
         // nothing to catch up on.
         if (!perSocket) resyncOnOpenRef.current = true;
@@ -1243,6 +1521,10 @@ export function AgentProvider({
       setStreamingThinking('');
       setTyping(false);
       typingRef.current = false;
+      detachedTurnWatchRef.current?.abort();
+      detachedTurnWatchRef.current = null;
+      pendingTurnCheckRef.current?.abort();
+      pendingTurnCheckRef.current = null;
       // The old socket's request_id no longer maps to anything on the server
       // after we tear it down. Clear here explicitly because we null out the
       // old socket's callbacks below, so its onClose will not fire to do it.
@@ -1311,6 +1593,10 @@ export function AgentProvider({
    */
   const resetTranscriptState = useCallback(() => {
     localMessageMutationVersionRef.current += 1;
+    detachedTurnWatchRef.current?.abort();
+    detachedTurnWatchRef.current = null;
+    pendingTurnCheckRef.current?.abort();
+    pendingTurnCheckRef.current = null;
     setMessages([]);
     foldTurnStream({ type: 'reset' });
     setStreamingContent('');
@@ -1435,7 +1721,10 @@ export function AgentProvider({
     // conversation no longer exists, so staying put is not a valid fallback.
     if (!force && sessionPersistenceRef.current !== true) return false;
 
-    if (typingRef.current) {
+    // A turn streaming on this page's socket is aborted. A detached turn the
+    // page only watches was never this page's to stop: it kept running when
+    // its socket went, and keeps running when the page moves on.
+    if (typingRef.current && !detachedTurnWatchRef.current) {
       void abortSession(currentSessionId).catch(() => {
         // Best-effort: never block the switch on a failed abort.
       });
@@ -1581,10 +1870,26 @@ export function AgentProvider({
       setPendingApproval(null);
       const target = perSocket ? conversationIdRef.current : sessionId;
       if (!target) return;
+      const watched = watchedTurnRef.current;
+      let status: string | undefined;
       try {
-        await abortSession(target);
+        status = (await abortSession(target))?.status;
       } catch {
         // Best-effort abort
+      }
+      // The gateway runs no turn for a page that only watches one. Either the
+      // turn has just ended, and the watch's next check sees it leave
+      // `running`, or its stored state is stale, and that check ends the watch.
+      // A turn without an id cannot be told apart from the next one, so it
+      // is never suspected.
+      if (
+        status === 'no_active_response'
+        && watched
+        && watched.turnId !== ''
+        && detachedTurnWatchRef.current === watched.watch
+        && stopRefusedRef.current?.watch !== watched.watch
+      ) {
+        stopRefusedRef.current = { watch: watched.watch, turnId: watched.turnId, confirmations: 0 };
       }
     },
     pendingApproval,
