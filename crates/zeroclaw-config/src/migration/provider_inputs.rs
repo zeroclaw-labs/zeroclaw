@@ -814,6 +814,9 @@ pub(crate) fn legacy_env_segments_with_staged(
     } else {
         (ModelRef::from(format!("{family}.{alias}")), *field, rest)
     };
+    if crate::helpers::validate_alias_key(alias).is_err() {
+        return None;
+    }
     let (provider, legacy_kind) = if let Some(model) =
         config.providers.models.canonical_model(&reference)
     {

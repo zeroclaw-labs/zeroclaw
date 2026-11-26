@@ -42,6 +42,20 @@ pub struct AppliedOverrides {
     pub snapshots: HashMap<String, String>,
 }
 
+fn is_legacy_model_env_for_loaded_profile(config: &Config, tail: &str) -> bool {
+    let parts: Vec<_> = tail.split(SEP).collect();
+    let ["providers", "models", family, alias, ..] = parts.as_slice() else {
+        return false;
+    };
+    config
+        .providers
+        .models
+        .iter_entries()
+        .any(|(candidate_family, candidate_alias, _)| {
+            candidate_family == *family && candidate_alias == *alias
+        })
+}
+
 /// Apply every `ZEROCLAW_<lowercase>` env var to `config`. Returns the set of
 /// dotted prop-paths that were overridden plus the pre-override raw values
 /// for each. Hard-errors on any env var that doesn't resolve to a known
@@ -74,6 +88,7 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
     let mut paths: HashSet<String> = HashSet::with_capacity(entries.len());
     let mut snapshots: HashMap<String, String> = HashMap::with_capacity(entries.len());
     let mut registry_edits = Vec::new();
+    let mut deferred_registry_edits = Vec::new();
     for (env_name, value, tail) in entries {
         // Recognized legacy `[todotracker]` vars are accepted and ignored so an
         // upgrade cannot turn a previously working deployment into a daemon
@@ -155,7 +170,17 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
             )?;
             crate::provider_registry::env_input::ensure_legacy_model(&mut registry_staged, &path)?;
             crate::provider_registry::env_input::stage(&mut registry_staged, &path, &value)?;
-            registry_edits.push((path.clone(), value.clone(), env_name.clone()));
+            let edit = (path.clone(), value.clone(), env_name.clone());
+            if is_legacy_model_env_for_loaded_profile(config, &tail) {
+                // Keep historical typed input intact until the normal V3→V4
+                // projection has materialized the canonical registry. Applying
+                // a canonical leaf to the raw typed map would create a mixed
+                // document and make the generated legacy connection look
+                // like an explicit conflicting connection.
+                deferred_registry_edits.push(edit);
+            } else {
+                registry_edits.push(edit);
+            }
             Ok(())
         } else {
             config.set_prop(&path, &value)
@@ -179,20 +204,25 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
         }
         paths.insert(path);
     }
-    if !registry_edits.is_empty() {
-        let edits: Vec<_> = registry_edits
-            .iter()
-            .map(|(path, value, _)| (path.clone(), value.clone()))
-            .collect();
-        crate::provider_registry::env_input::set_many(config, &edits).with_context(|| {
-            let names = registry_edits
+    let apply_registry_edits =
+        |config: &mut Config, edits: &[(String, String, String)]| -> Result<()> {
+            if edits.is_empty() {
+                return Ok(());
+            }
+            let values: Vec<_> = edits
                 .iter()
-                .map(|(_, _, name)| name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("registry environment overrides ({names})")
-        })?;
-    }
+                .map(|(path, value, _)| (path.clone(), value.clone()))
+                .collect();
+            crate::provider_registry::env_input::set_many(config, &values).with_context(|| {
+                let names = edits
+                    .iter()
+                    .map(|(_, _, name)| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("registry environment overrides ({names})")
+            })
+        };
+    apply_registry_edits(config, &registry_edits)?;
     if !paths.is_empty() {
         ::zeroclaw_log::record!(
             INFO,
@@ -209,6 +239,10 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
             .or_insert(snapshot);
     }
     crate::migration::provider_inputs::normalize(config)?;
+    // Historical typed profiles are now canonical. Apply their staged leaves
+    // against that canonical document, preserving the original raw input for
+    // save-time restoration through the existing snapshots.
+    apply_registry_edits(config, &deferred_registry_edits)?;
     Ok(AppliedOverrides {
         paths: config.env_overridden_paths.clone(),
         snapshots: config.pre_override_snapshots.clone(),
