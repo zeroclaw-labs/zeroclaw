@@ -423,9 +423,9 @@ fn touches_provider_registry(prop: &str) -> bool {
 
 /// Return the exact chat model references whose materialized construction
 /// inputs changed between two registry generations. Registry edits may touch
-/// one model while unrelated sessions continue using another model on the
-/// same process, so live refresh must be scoped before acquiring their turn
-/// guards.
+/// one model while other sessions keep their existing providers. An empty
+/// change set needs no session guards; otherwise admission remains ordered
+/// through publication even for sessions whose providers need no rebuilding.
 fn changed_chat_model_refs(previous: &Config, next: &Config) -> Result<Vec<String>, String> {
     let previous = previous
         .provider_registry()
@@ -810,7 +810,8 @@ struct PreparedLiveSessionRefresh {
     /// stale work cannot mutate a successor session.
     session_generation: u64,
     _model_provider_update: tokio::sync::OwnedMutexGuard<()>,
-    model_update: crate::agent::agent::PreparedModelUpdate,
+    // None retains ordering through publication without rebuilding an unchanged model.
+    model_update: Option<crate::agent::agent::PreparedModelUpdate>,
     /// New `model_provider` override value for a session whose stored override
     /// names an alias this transaction renames away. Applied in the same
     /// publication step as the provider box, so the override never survives as
@@ -3289,6 +3290,9 @@ impl RpcDispatcher {
             .next_revision()
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config revision unavailable: {e}")))?;
         for refresh in &effects.prepared_sessions {
+            if refresh.model_update.is_none() {
+                continue;
+            }
             commit.register_application(
                 crate::config_application::ConfigApplicationTarget::Session {
                     id: refresh.session_id.clone(),
@@ -10616,9 +10620,9 @@ impl RpcDispatcher {
             Self::prepare_live_sessions_refresh(Arc::clone(&self.ctx), &working, scope).await?;
         // Test-only: park after preparation so a regression can drive other
         // RPCs (`session/configure`, session rehydration) deterministically
-        // inside the prepared-and-skipped window — every skip decision (and
-        // its guard release) has happened, the `list_ids()` snapshot has
-        // passed, but the candidate config is not yet saved or swapped. A
+        // inside the prepared window — every rebuild decision has happened,
+        // all affected session boundaries are retained, and the `list_ids()`
+        // snapshot has passed, but the candidate is not yet saved or swapped. A
         // merely-notified hook cannot hold this window open: on a loaded
         // runner the commit can finish while the test is still observing
         // the mid-transaction state.
@@ -10637,6 +10641,11 @@ impl RpcDispatcher {
         config: &Config,
         scope: &LiveSessionRefreshScope,
     ) -> Result<Vec<PreparedLiveSessionRefresh>, JsonRpcError> {
+        // No chat construction changed, so even a running turn needs no
+        // admission boundary. Non-chat consumers publish independently.
+        if matches!(scope, LiveSessionRefreshScope::ModelRefs(changed) if changed.is_empty()) {
+            return Ok(Vec::new());
+        }
         let previous_config = ctx.config.read().clone();
         if matches!(scope, LiveSessionRefreshScope::SharedConstruction)
             && !zeroclaw_providers::model::chat_construction_changed(&previous_config, config)
@@ -10691,67 +10700,6 @@ impl RpcDispatcher {
             };
             if !scope.may_affect_agent(&agent_alias) {
                 continue;
-            }
-
-            // An idle agent's installed selection can exclude it before
-            // taking the per-session turn guard. Busy agents cannot expose
-            // a transient tool-selected model safely, so they use the bounded
-            // refusal below even when their saved selection looks unrelated.
-            // Re-read overrides under the guard before preparing an update.
-            if let LiveSessionRefreshScope::ModelRefs(_) = scope {
-                let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
-                    continue;
-                };
-                // A running tool may have selected a provider/model without
-                // persisting it in SessionOverrides. Include that transient
-                // identity when it is immediately observable; if the agent
-                // is busy, retain the conservative old path and acquire the
-                // ordering guard below, where the authoritative state is
-                // re-read under the session boundary.
-                let mut selection = overrides.clone();
-                let mut may_skip = true;
-                if let Some(agent) = ctx.sessions.get_agent(&session_id).await {
-                    match agent.try_lock() {
-                        Ok(agent) => {
-                            if let Some((active_ref, active_model)) = agent
-                                .model_selection_override(
-                                    overrides.model_provider.as_deref(),
-                                    overrides.model.as_deref(),
-                                )
-                            {
-                                selection.model_provider = Some(active_ref);
-                                selection.model = active_model;
-                            }
-                        }
-                        Err(_) => {
-                            // The installed selection is being used by a
-                            // turn. Let the ordered path below inspect it
-                            // after acquiring the session boundary instead
-                            // of risking a false skip from stale overrides.
-                            may_skip = false;
-                        }
-                    }
-                }
-                if may_skip
-                    && scope
-                        .resolve_provider_ref_for_update(
-                            &previous_config,
-                            config,
-                            &agent_alias,
-                            &selection,
-                        )
-                    .map_err(|error| {
-                        rpc_err(
-                            INVALID_PARAMS,
-                            format!(
-                                "Config update cannot scope live session `{session_id}`: {error}"
-                            ),
-                        )
-                    })?
-                    .is_none()
-                {
-                    continue;
-                }
             }
 
             // Acquire the per-session ordering boundary. This serialises
@@ -10852,6 +10800,17 @@ impl RpcDispatcher {
                     .as_ref()
                     .and(binding_overrides.model_provider.clone())
             }) else {
+                // Selection can change in the next turn. Keep this session's
+                // admission boundary through config publication even when its
+                // current model does not need rebuilding.
+                prepared.push(PreparedLiveSessionRefresh {
+                    session_id,
+                    application_paths: Vec::new(),
+                    session_generation,
+                    _model_provider_update: model_provider_update,
+                    model_update: None,
+                    override_migration: None,
+                });
                 continue;
             };
             config
@@ -10912,7 +10871,7 @@ impl RpcDispatcher {
                 session_id,
                 session_generation,
                 _model_provider_update: model_provider_update,
-                model_update,
+                model_update: Some(model_update),
                 override_migration,
             });
         }
@@ -10933,6 +10892,9 @@ impl RpcDispatcher {
                 model_update,
                 override_migration,
             } = refresh;
+            let Some(model_update) = model_update else {
+                continue;
+            };
             if revision
                 .is_some_and(|revision| ctx.config_authority.published_revision() != revision)
             {
@@ -34714,7 +34676,7 @@ mod tests {
     /// `config_commit_pause` hook so a regression can act deterministically
     /// inside the refresh transaction: `commit_config_with_live_session_refresh`
     /// parks after preparation — the `list_ids()` snapshot has run and every
-    /// skip decision (and its guard release) has happened — but before the
+    /// rebuild decision has happened, with session guards retained — before the
     /// candidate config is saved or swapped, all while `config_write_lock`
     /// stays held. The commit then only proceeds once the test releases it,
     /// so mid-transaction observations cannot race the commit's completion
@@ -44327,13 +44289,8 @@ model = "before"
         );
         assert_eq!(old_endpoint.received_requests().await.unwrap().len(), 1);
 
-        // An unrelated idle agent can be excluded even with its update gate held.
-        let other_guard = dispatcher
-            .ctx
-            .sessions
-            .lock_model_provider_update(&other_session)
-            .await
-            .unwrap();
+        // An unrelated idle model retains its provider while sharing the
+        // publication boundary with the updated session.
         let expected = editor::snapshot(&dispatcher.ctx.config.read()).unwrap();
         let mut registry = expected.clone();
         registry["connections"]["gateway.prod"]["uri"] = json!(new_endpoint.uri());
@@ -44341,8 +44298,7 @@ model = "before"
         dispatcher
             .handle_config_registry_set(&json!({"expected":expected,"registry":registry}))
             .await
-            .expect("a connection-only edit must skip the unrelated session gate");
-        drop(other_guard);
+            .expect("a connection-only edit must preserve the unrelated provider");
         assert!(
             main.lock()
                 .await
@@ -45028,6 +44984,204 @@ model = "before"
             .expect("session/configure must succeed after the update boundary is released");
     }
 
+    #[tokio::test]
+    async fn registry_saves_without_chat_changes_do_not_wait_for_running_turns() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::provider_registry::editor;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let endpoint = MockServer::start().await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let notify = Arc::clone(&entered);
+        Mock::given(method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                notify.notify_one();
+                // The task is cancelled below; no wall-clock delay is awaited.
+                ResponseTemplate::new(500).set_delay(std::time::Duration::from_secs(60))
+            })
+            .mount(&endpoint)
+            .await;
+        let mut config = make_model_refresh_test_config(&tmp);
+        config.providers = serde_json::from_value(json!({
+            "connections": {"gateway.prod": {"kind": "custom", "uri": endpoint.uri()}},
+            "models": {
+                "chat.main": {"capability": "chat", "provider": "gateway.prod", "model": "main"},
+                "embedding.main": {"capability": "embedding", "provider": "gateway.prod", "model": "embed"}
+            }
+        }))
+        .unwrap();
+        config.agents.get_mut("test-agent").unwrap().model_provider = "chat.main".into();
+        config.reliability.provider_retries = 0;
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        let agent = dispatcher
+            .ctx
+            .sessions
+            .get_agent(&session_id)
+            .await
+            .unwrap();
+        let sessions = Arc::clone(&dispatcher.ctx.sessions);
+        let turn = zeroclaw_spawn::spawn!(async move {
+            let _turn_guard = sessions
+                .lock_model_provider_update(&session_id)
+                .await
+                .unwrap();
+            agent
+                .lock()
+                .await
+                .turn("hold an actual turn in flight")
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("turn must reach the delayed endpoint while holding both locks");
+
+        for change in ["unchanged", "unused connection", "embedding model"] {
+            let expected = editor::snapshot(&dispatcher.ctx.config.read()).unwrap();
+            let mut registry = expected.clone();
+            match change {
+                "unused connection" => {
+                    registry["connections"]["unused"] =
+                        json!({"kind": "custom", "uri": endpoint.uri()});
+                }
+                "embedding model" => {
+                    registry["models"]["embedding.main"]["model"] = json!("embed-v2");
+                }
+                _ => {}
+            }
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                dispatcher.handle_config_registry_set(
+                    &json!({"expected": expected, "registry": registry}),
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{change} save must not wait for the running turn"))
+            .unwrap_or_else(|error| panic!("{change} save must succeed: {}", error.message));
+            assert!(!turn.is_finished(), "the request must still be in flight");
+        }
+        turn.abort();
+        assert!(turn.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn unchanged_session_orders_turn_and_model_switch_after_registry_publication() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for switch_model in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let old_endpoint = MockServer::start().await;
+            let new_endpoint = MockServer::start().await;
+            for endpoint in [&old_endpoint, &new_endpoint] {
+                Mock::given(method("POST"))
+                    .respond_with(ResponseTemplate::new(500))
+                    .mount(endpoint)
+                    .await;
+            }
+            let mut config = make_model_refresh_test_config(&tmp);
+            config.providers = serde_json::from_value(json!({
+                "connections": {
+                    "alpha": {"kind": "custom", "uri": old_endpoint.uri()},
+                    "beta": {"kind": "custom", "uri": old_endpoint.uri()}
+                },
+                "models": {
+                    "chat.alpha": {"capability": "chat", "provider": "alpha", "model": "alpha-model"},
+                    "chat.beta": {"capability": "chat", "provider": "beta", "model": "beta-model"}
+                }
+            }))
+            .unwrap();
+            config.agents.get_mut("test-agent").unwrap().model_provider = "chat.alpha".into();
+            config.reliability.provider_retries = 0;
+            let pause = Arc::new(crate::rpc::context::ConfigCommitPause::default());
+            let dispatcher = Arc::new(make_config_set_test_dispatcher_with_commit_pause(
+                config,
+                Arc::clone(&pause),
+            ));
+            let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+            let arrived = pause.arrived.notified();
+            let edit = registry_edit_params(
+                &dispatcher,
+                &["connections", "beta", "uri"],
+                json!(new_endpoint.uri()),
+            );
+            let writer = Arc::clone(&dispatcher);
+            let commit =
+                zeroclaw_spawn::spawn!(
+                    async move { writer.handle_config_registry_set(&edit).await }
+                );
+            tokio::time::timeout(std::time::Duration::from_secs(5), arrived)
+                .await
+                .expect("registry commit must pause after preparation");
+
+            let waiting = dispatcher.ctx.sessions.model_provider_update_waiting();
+            let turn_waiting = waiting.notified();
+            let reader = Arc::clone(&dispatcher);
+            let turn_sid = session_id.clone();
+            let turn = zeroclaw_spawn::spawn!(async move {
+                if switch_model {
+                    // Match prompt admission: hold the session boundary and
+                    // adopt the published generation before in-turn switching.
+                    let _turn_guard = reader
+                        .ctx
+                        .sessions
+                        .lock_model_provider_update(&turn_sid)
+                        .await
+                        .unwrap();
+                    let agent = reader.ctx.sessions.get_agent(&turn_sid).await.unwrap();
+                    agent.lock().await.sync_config_generation();
+                    switch_model_for_session(&reader, &turn_sid, "chat.beta", "beta-model").await;
+                    assert!(agent.lock().await.turn("use beta").await.is_err());
+                } else {
+                    assert!(
+                        reader
+                            .handle_session_prompt(&json!({
+                                "session_id": turn_sid, "prompt": "use alpha"
+                            }))
+                            .await
+                            .is_err()
+                    );
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), turn_waiting)
+                .await
+                .expect("turn admission must wait on the unchanged session's publication guard");
+            assert!(!turn.is_finished());
+            assert!(old_endpoint.received_requests().await.unwrap().is_empty());
+            assert!(new_endpoint.received_requests().await.unwrap().is_empty());
+
+            pause.release.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(5), commit)
+                .await
+                .unwrap()
+                .unwrap()
+                .expect("registry edit must commit");
+            tokio::time::timeout(std::time::Duration::from_secs(5), turn)
+                .await
+                .expect("turn must finish after publication")
+                .unwrap();
+            let old_requests = old_endpoint.received_requests().await.unwrap();
+            let new_requests = new_endpoint.received_requests().await.unwrap();
+            if switch_model {
+                assert!(
+                    old_requests.is_empty(),
+                    "switched model must use the committed endpoint"
+                );
+                assert_eq!(new_requests.len(), 1);
+                let body: Value = serde_json::from_slice(&new_requests[0].body).unwrap();
+                assert_eq!(body["model"], "beta-model");
+            } else {
+                assert_eq!(
+                    old_requests.len(),
+                    1,
+                    "unchanged alpha still serves its endpoint"
+                );
+                assert!(new_requests.is_empty());
+            }
+        }
+    }
+
     /// `session/configure` takes the daemon-wide config writer lock and then
     /// the session's `model_provider_update` guard, which a running turn holds
     /// until it ends. Configuring a mid-turn session must fail with a
@@ -45224,25 +45378,19 @@ model = "before"
     /// race between `config/set` and `session/configure`.
     ///
     /// A route-affecting `config/set` prepares its live-session refresh under
-    /// the config writer gate and SKIPS a session whose effective provider
-    /// override points away from the edited provider, dropping that session's
-    /// ordering guard before the candidate config commits. A
-    /// `session/configure` that selects the edited provider inside that window
-    /// must not build it from the still-installed old config: the transaction
-    /// then commits without rebuilding the skipped session, and the next
-    /// prompt dispatches through an old-generation provider box while
-    /// `sync_config_generation` publishes the committed config into the limits
-    /// cell. Holding the writer gate across the configure build closes both
-    /// orderings.
+    /// the config writer gate without rebuilding a session whose effective
+    /// provider points away from the edited provider. A `session/configure`
+    /// that selects the edited provider must wait for publication before
+    /// building it. The writer gate orders configure, and the retained session
+    /// boundary also orders turns that do not take the writer gate.
     ///
     /// The test-only commit pause parks `config/set` between prepare and
     /// commit, so the configure runs deterministically inside the window
     /// rather than by timing luck. While the commit is parked the configure
-    /// task is polled through a bounded yield loop and asserted unfinished —
-    /// the pre-fix code completes there (it does not take the writer gate),
-    /// so the regression fails deterministically at that point instead of
-    /// depending on the scheduler polling the configure before the released
-    /// commit resumes.
+    /// task is polled through a bounded yield loop and asserted unfinished.
+    /// After release, the request must use the published model. The adjacent
+    /// turn-admission test separately observes contention on the retained
+    /// session boundary without taking the writer gate.
     #[tokio::test]
     async fn session_configure_waits_for_prepared_and_skipped_config_transaction() {
         use wiremock::matchers::method;
@@ -45257,8 +45405,8 @@ model = "before"
 
         let mut config = make_model_refresh_test_config(&tmp);
         // The session pins to `pinned`; `config/set` edits `edited`, so the
-        // refresh prepare phase skips the session and releases its ordering
-        // guard before the candidate config commits.
+        // refresh prepare phase retains the session's ordering guard without
+        // rebuilding its unchanged provider before the candidate config commits.
         let pinned = config
             .providers
             .models
@@ -45289,7 +45437,7 @@ model = "before"
         let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
 
         // Pin the session away from the provider the config edit targets, so
-        // the refresh prepare phase skips it.
+        // the refresh prepare phase does not rebuild its provider.
         dispatcher
             .handle_session_configure(&json!({
                 "session_id": session_id,
@@ -45299,8 +45447,8 @@ model = "before"
             .expect("session/configure must pin the provider override");
 
         // config/set edits the OTHER provider. Its prepare phase inspects the
-        // pinned session, skips it (override != edited provider), and drops
-        // its ordering guard — then the commit pauses before saving.
+        // pinned session and retains its ordering guard without rebuilding
+        // (override != edited provider), then pauses before saving.
         let arrived = pause.arrived.notified();
         tokio::pin!(arrived);
         let config_dispatcher = Arc::clone(&dispatcher);
@@ -45338,10 +45486,9 @@ model = "before"
         // The paused transaction still owns the config writer gate, so the
         // configure must be parked on it — poll the task through a bounded
         // sleep-free yield loop and assert it never finishes. This is the
-        // negative-control point: without the production lock the configure
-        // runs to completion right here (nothing else blocks it — the skipped
-        // session's ordering guard was already dropped), publishing a
-        // provider built from the still-installed old config.
+        // ordering assertion covers an unchanged session as well as a rebuilt
+        // one. The turn-admission regression separately checks that its session
+        // guard remains held through publication.
         for _ in 0..50 {
             tokio::task::yield_now().await;
             assert!(
