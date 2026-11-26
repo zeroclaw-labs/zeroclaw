@@ -1329,10 +1329,12 @@ mod tests {
         assert!(!disk.contains("synthetic-credential"));
 
         for allowed in [true, false] {
+            let (_, catalog) = send(&router, "GET", url, OPERATOR.0, OPERATOR.1, None).await;
+            let revision = catalog["credentials"][0]["permission_revision"].clone();
             let update = serde_json::json!({
                 "name": "TEST_HTTP",
                 "operation": "replace",
-                "permissions": { "http_allowed": allowed }
+                "permissions": { "http_allowed": allowed, "expected_revision": revision }
             });
             assert_eq!(
                 send(&router, "POST", url, OPERATOR.0, OPERATOR.1, Some(update))
@@ -1344,6 +1346,85 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["credentials"][0]["http_allowed"], allowed);
         }
+    }
+
+    #[tokio::test]
+    async fn password_service_replacement_clears_grants_and_http_rejects_colon_usernames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let mut config = editor_config(
+            &tmp,
+            &idp.uri(),
+            &[Verb::Read, Verb::Create, Verb::Update, Verb::Delete],
+            &["*"],
+        );
+        config.secrets.encrypt = true;
+        zeroclaw_config::secrets::SecretStore::new(tmp.path(), true)
+            .encrypt("initialize-fixture-key")
+            .unwrap();
+        let router = router_for(config);
+        let url = "/api/config/http-credentials";
+        let create = serde_json::json!({"name":"LOGIN", "operation":"create", "credential":{
+            "origin":"https://a.example.test", "auth":{"kind":"user_password", "username":"fixture", "password":"synthetic"}
+        }});
+        assert_eq!(
+            send(&router, "POST", url, OPERATOR.0, OPERATOR.1, Some(create))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        for permissions in [
+            serde_json::json!({"http_origins":["https://a.example.test"]}),
+            serde_json::json!({"browser":{"origins":["https://a.example.test"]}}),
+        ] {
+            let (_, catalog) = send(&router, "GET", url, OPERATOR.0, OPERATOR.1, None).await;
+            let mut permissions = permissions;
+            permissions["expected_revision"] =
+                catalog["credentials"][0]["permission_revision"].clone();
+            assert_eq!(send(&router,"POST",url,OPERATOR.0,OPERATOR.1,Some(serde_json::json!({"name":"LOGIN","operation":"replace","permissions":permissions}))).await.0,StatusCode::NO_CONTENT);
+        }
+        for origin in ["https://a.example.test", "https://b.example.test"] {
+            let replace = serde_json::json!({"name":"LOGIN","operation":"replace","credential":{"origin":origin,
+                "auth":{"kind":"user_password","username":"fixture","password":"synthetic-rotation"}}});
+            assert_eq!(
+                send(&router, "POST", url, OPERATOR.0, OPERATOR.1, Some(replace))
+                    .await
+                    .0,
+                StatusCode::NO_CONTENT
+            );
+            let (_, catalog) = send(&router, "GET", url, OPERATOR.0, OPERATOR.1, None).await;
+            let row = &catalog["credentials"][0];
+            let expected = if origin == "https://a.example.test" {
+                serde_json::json!(["https://a.example.test"])
+            } else {
+                serde_json::json!([])
+            };
+            assert_eq!(row["http_origins"], expected);
+            assert_eq!(row["browser_origins"], expected);
+        }
+        let create = serde_json::json!({"name":"LDAP", "operation":"create", "credential":{
+            "origin":"ldaps://directory.example.test", "auth":{"kind":"user_password","username":"team:alice","password":"synthetic"}}});
+        assert_eq!(
+            send(&router, "POST", url, OPERATOR.0, OPERATOR.1, Some(create))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        let (_, catalog) = send(&router, "GET", url, OPERATOR.0, OPERATOR.1, None).await;
+        let row = catalog["credentials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "LDAP")
+            .unwrap();
+        let grant = serde_json::json!({"name":"LDAP","operation":"replace","permissions":{
+            "expected_revision":row["permission_revision"],"http_origins":["https://a.example.test"]}});
+        assert_eq!(
+            send(&router, "POST", url, OPERATOR.0, OPERATOR.1, Some(grant))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
     }
 
     #[tokio::test]
@@ -1384,6 +1465,19 @@ mod tests {
                 .0,
             StatusCode::NO_CONTENT
         );
+        for permissions in [
+            serde_json::json!({"http_origins": ["https://example.org"]}),
+            serde_json::json!({"http_allowed": true}),
+            serde_json::json!({"browser": {"origin": "https://example.org"}}),
+        ] {
+            let missing = serde_json::json!({"name":"TEST_HTTP", "operation":"replace", "permissions":permissions});
+            assert_eq!(
+                send(&router, "POST", url, OPERATOR.0, OPERATOR.1, Some(missing))
+                    .await
+                    .0,
+                StatusCode::CONFLICT
+            );
+        }
         // Both operator tabs loaded this revision before either edited it.
         let (_, catalog) = send(&router, "GET", url, OPERATOR.0, OPERATOR.1, None).await;
         let revision = catalog["credentials"][0]["permission_revision"].clone();

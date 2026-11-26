@@ -1403,7 +1403,7 @@ export function listHttpCredentials() {
 
 export function changeHttpCredential(mutation:
   | { name: string; operation: "create" | "replace"; credential: { origin: string; source: HttpCredentialSource; auth: HttpCredentialAuth } }
-  | { name: string; operation: "replace"; permissions: { expected_revision?: string } & ({ http_allowed: boolean } | { http_origins: string[] } | { destinations: SshDestination[] } | { browser: { origins: string[] } }) }
+  | { name: string; operation: "replace"; permissions: { expected_revision: string } & ({ http_allowed: boolean } | { http_origins: string[] } | { destinations: SshDestination[] } | { browser: { origins: string[] } }) }
   | { name: string; operation: "delete" }
 ) {
   return apiFetch<void>(httpCredentialsPath, { method: "POST", body: JSON.stringify(mutation) });

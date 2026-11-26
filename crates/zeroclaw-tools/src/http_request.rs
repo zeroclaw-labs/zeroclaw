@@ -519,6 +519,11 @@ impl HttpRequestTool {
                 }
             }
             ScopedHttpAuth::UserPassword { username, password } => {
+                anyhow::ensure!(
+                    !username.contains(':'),
+                    "{}",
+                    scoped_credential_message("tool-http-credential-invalid")
+                );
                 let password = resolve(credential.source, password).await?;
                 let pair = format!("{username}:{password}");
                 let encoded = base64::engine::general_purpose::STANDARD.encode(&pair);
@@ -1375,6 +1380,32 @@ mod tests {
                 crate::scoped_credentials::decode_scoped_value(source, output.to_vec()).is_err()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn scoped_basic_username_with_colon_is_refused_before_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tool = test_tool(vec!["example.com"]);
+        let credential: zeroclaw_config::schema::ScopedHttpCredential =
+            serde_json::from_value(json!({
+                "origin":"ldaps://directory.example.test", "http_origins":["https://example.com"],
+                "auth":{"kind":"user_password","username":"team:alice","password":"synthetic"}
+            }))
+            .unwrap();
+        tool.scoped_credential_fixture(dir.path(), credential);
+        let target = ValidatedHttpRequestTarget {
+            url: "https://example.com/protected".into(),
+            host: String::new(),
+            resolved_addrs: Vec::new(),
+        };
+        let mut headers = HeaderMap::new();
+        let result = tool
+            .apply_scoped_credential_with_resolver(&mut headers, "TEST", &target, |_, _| async {
+                panic!("invalid Basic username must not trigger a lookup")
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(headers.is_empty());
     }
 
     #[tokio::test]
