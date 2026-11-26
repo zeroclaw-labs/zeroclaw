@@ -9087,11 +9087,23 @@ mod tests {
             ctx.autonomy_level = autonomy;
             ctx.non_cli_excluded_tools = Arc::new(vec!["send_message_to_peer".into()]);
             let mut config = ctx.prompt_config.as_ref().clone();
-            config.agents.get_mut("test").unwrap().channels = vec!["matrix.default".into()];
+            config.data_dir = tmp.path().join("data");
+            config.config_path = tmp.path().join("config.toml");
+            config.risk_profiles.insert(
+                "fixture-peer-policy".into(),
+                zeroclaw_config::schema::RiskProfileConfig {
+                    level: autonomy,
+                    ..Default::default()
+                },
+            );
+            let sender = config.agents.get_mut("test").unwrap();
+            sender.channels = vec!["matrix.default".into()];
+            sender.risk_profile = "fixture-peer-policy".into();
             config.agents.insert(
                 "fixture-peer".into(),
                 zeroclaw_config::schema::AliasedAgentConfig {
                     channels: vec!["matrix.default".into()],
+                    risk_profile: "fixture-peer-policy".into(),
                     ..Default::default()
                 },
             );
@@ -9119,10 +9131,13 @@ mod tests {
             ctx.live_config = zeroclaw_config::live::LiveConfig::new(config).handle();
             ctx.tools_registry = Arc::new(
                 zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
-                    Box::new(zeroclaw_runtime::tools::SendMessageToPeerTool::new(
-                        ctx.prompt_config.clone(),
-                        "test",
-                    )),
+                    Box::new(
+                        zeroclaw_runtime::tools::SendMessageToPeerTool::new(
+                            ctx.prompt_config.clone(),
+                            "test",
+                        )
+                        .expect("fixture sender policy"),
+                    ),
                 ]),
             );
             let message = ChannelMessage::new(

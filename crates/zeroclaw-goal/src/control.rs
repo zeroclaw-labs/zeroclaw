@@ -648,9 +648,9 @@ Use a nonempty reason of at most 2000 characters. For complete and continue,
 blockers must be an empty array. For blocked, include 1 to 16 blockers, each
 with a nonempty message of at most 2000 characters and a kind of
 "needs_user_input", "human_escalation", or "external_dependency". The optional
-payload may contain only necessary structured context of at most 4096 bytes
-when encoded as compact JSON. Do not rewrite or downgrade a blocked decision
-to continue.
+payload must be a JSON object containing only necessary context, at most 4096
+bytes when encoded as compact JSON. Do not rewrite or downgrade a blocked
+decision to continue.
 "#;
 
 impl fmt::Debug for GoalVerifierTurn {
@@ -2513,6 +2513,7 @@ mod tests {
         assert!(normalized_prompt.contains("explicit final request for user clarification"));
         assert!(normalized_prompt.contains("Ordinary progress prose does not"));
         assert!(normalized_prompt.contains("1 to 16 blockers"));
+        assert!(normalized_prompt.contains("payload must be a JSON object"));
         assert!(normalized_prompt.contains(&format!(
             "at most {} bytes when encoded as compact JSON",
             goal_execution::MAX_VERIFIER_BLOCKER_PAYLOAD_BYTES

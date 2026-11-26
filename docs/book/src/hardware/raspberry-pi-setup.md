@@ -176,7 +176,7 @@ sudo install -m 0755 target/release/zeroclaw /usr/local/bin/
 
 ### GPIO support
 
-To drive Pi GPIO from skills, build with the relevant `peripherals` feature flag. Most agent workloads don't need it; see [Peripherals design](./hardware-peripherals-design.md).
+To drive Pi GPIO from skills, build with the `hardware` and `peripheral-rpi` features. Most agent workloads don't need it; see [Peripherals design](./hardware-peripherals-design.md).
 
 ## Containerized deployment (Podman recommended over Docker)
 

@@ -10,6 +10,20 @@ const RPC_RELOAD_REPLY_FLUSH_DELAY: std::time::Duration = std::time::Duration::f
 const RPC_RELOAD_GATEWAY_SHUTDOWN_DELAY: std::time::Duration =
     std::time::Duration::from_millis(200);
 const PROBE_MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// How long a client-facing handler that already holds the config writer lock
+/// (a config write's live-session refresh, or `session/configure`) waits for a
+/// live session's `model_provider_update` guard before refusing with
+/// `SESSION_BUSY`.
+///
+/// A running turn holds that guard for its whole duration, and these handlers
+/// run inline on the issuing connection's sequential dispatcher while holding
+/// the daemon-wide config writer lock. An unbounded wait therefore stalls the
+/// issuing client (and every other config writer) until the turn ends — or
+/// forever, when the turn is itself waiting on a frame from that client, such
+/// as a tool approval. The bound absorbs brief holders while staying well
+/// inside zerocode's default 5s RPC timeout, so the client receives a real,
+/// retryable error instead of a transport timeout.
+const SESSION_PROVIDER_UPDATE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 use crate::agent::agent::TurnEvent;
 use crate::goal_accounting::RuntimeGoalDiagnosticTextGuard;
 use crate::sop::SopGraphExt;
@@ -6698,21 +6712,25 @@ impl RpcDispatcher {
     }
 
     /// Rebuild a reaped ACP session from a restorable durable row so a fresh
-    /// prompt recovers to a working session instead of hanging. Returns the live
-    /// agent on success, `Ok(None)` for missing, killed, or unreadable durable
-    /// state, and `Err` when the current principal cannot resume the persisted
+    /// prompt or `session/configure` recovers to a working session instead of
+    /// reporting the live incarnation missing. Returns the live agent on
+    /// success, `Ok(None)` for missing, killed, or unreadable durable state,
+    /// and `Err` when the current principal cannot resume the persisted
     /// agent/workspace binding.
     ///
     /// Rehydrate a durable ACP session while the caller holds `session_queue`
     /// for `sid`, covering the owner check through insertion. The owner is
-    /// judged by the scope `grants` give, which the prompt path resolves after
+    /// judged by the scope `grants` give, which the caller resolves after
     /// admission, so a caller that lost the administrator bypass while it
     /// waited cannot recover or revive another principal's session.
+    /// `method` is the RPC that owns this recovery; leases and binding checks
+    /// are judged against it, not hard-wired to `session/prompt`.
     async fn rehydrate_reaped_session_under_guard(
         &self,
         sid: &str,
         cancel_generation: Option<u64>,
         grants: Option<&zeroclaw_api::grants::ResolvedGrants>,
+        method: Method,
     ) -> Result<Option<Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>>, JsonRpcError> {
         // The caller owns admission across durable loading, publication and
         // history/plan restoration. Do not reacquire the single permit here.
@@ -6809,7 +6827,7 @@ impl RpcDispatcher {
         {
             let config = self.ctx.config.read();
             self.authorize_session_binding(
-                Method::SessionPrompt,
+                method,
                 grants,
                 &config,
                 &data.agent_alias,
@@ -6819,7 +6837,7 @@ impl RpcDispatcher {
 
         if let Err(error) = recover_acp_checkpoint(
             self.spawn_handle(),
-            Method::SessionPrompt,
+            method,
             Arc::clone(&store),
             sid,
             data.principal_id.clone(),
@@ -6888,11 +6906,11 @@ impl RpcDispatcher {
 
         // Rebind the recovered row to the currently authorized canonical
         // workspace, not the pre-recovery row's spelling or earlier binding.
-        let current_grants = self.recheck_authority_after_admission(Method::SessionPrompt)?;
+        let current_grants = self.recheck_authority_after_admission(method)?;
         let workspace_dir = {
             let config = self.ctx.config.read();
             self.authorize_session_binding(
-                Method::SessionPrompt,
+                method,
                 current_grants.as_ref(),
                 &config,
                 &data.agent_alias,
@@ -7041,7 +7059,7 @@ impl RpcDispatcher {
         if let Err(error) = self
             .persist_seed_trim_before_notice(
                 sid,
-                Method::SessionPrompt,
+                method,
                 durable_owner.clone(),
                 seed_event.as_ref(),
             )
@@ -7088,7 +7106,7 @@ impl RpcDispatcher {
                         sid.to_string(),
                         session,
                         generation,
-                        |candidate| self.live_effect_lease(Method::SessionPrompt, candidate),
+                        |candidate| self.live_effect_lease(method, candidate),
                         |message| rpc_err(SESSION_BUSY, message),
                     )
                     .await
@@ -7101,7 +7119,7 @@ impl RpcDispatcher {
                         session,
                         None,
                         None,
-                        |candidate| self.live_effect_lease(Method::SessionPrompt, candidate),
+                        |candidate| self.live_effect_lease(method, candidate),
                         |message| rpc_err(SESSION_BUSY, message),
                     )
                     .await
@@ -7149,13 +7167,8 @@ impl RpcDispatcher {
             });
         }
         self.forward_seed_event(sid, seed_event).await;
-        self.replay_session_plan(
-            sid,
-            Method::SessionPrompt,
-            &published_agent,
-            published_generation,
-        )
-        .await?;
+        self.replay_session_plan(sid, method, &published_agent, published_generation)
+            .await?;
         self.ctx.sessions.touch(sid).await;
 
         ::zeroclaw_log::record!(
@@ -7183,7 +7196,7 @@ impl RpcDispatcher {
         let Ok(_admission) = self.ctx.sessions.session_queue.acquire(sid).await else {
             return Ok(None);
         };
-        self.rehydrate_reaped_session_under_guard(sid, None, grants)
+        self.rehydrate_reaped_session_under_guard(sid, None, grants, Method::SessionPrompt)
             .await
     }
 
@@ -7431,6 +7444,7 @@ impl RpcDispatcher {
                         sid,
                         Some(cancel_registration.generation()),
                         grants.as_ref(),
+                        Method::SessionPrompt,
                     )
                     .await
                 {
@@ -8620,12 +8634,61 @@ impl RpcDispatcher {
             .await?;
         validate_session_configure_overrides(&req.overrides)?;
 
+        #[cfg(test)]
+        {
+            let pause = self
+                .ctx
+                .sessions
+                .test_configure_live_lookup_pause
+                .lock()
+                .unwrap()
+                .take();
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                release.notified().await;
+            }
+        }
+        // A failed ACP turn drops the live incarnation (`RecoveryRequired`) so
+        // the next prompt rebuilds provider-safe history from the durable row.
+        // Zerocode `/model-provider` is `session/configure` and does not prompt,
+        // so without this restore a Code pane whose provider just rate-limited
+        // cannot switch: the row still exists, but configure only looked at
+        // the live map and returned SESSION_NOT_FOUND. Restore before taking
+        // the config writer gate — rehydration try-locks that same gate and
+        // must not park behind this handler.
+        if self.ctx.sessions.get_agent(&req.session_id).await.is_none() {
+            let admission = self
+                .ctx
+                .sessions
+                .session_queue
+                .acquire(&req.session_id)
+                .await
+                .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?;
+            let grants = self.recheck_authority_after_admission(Method::SessionConfigure)?;
+            // `None` also means another request restored the session while
+            // this one waited for admission; the wait below covers both.
+            self.rehydrate_reaped_session_under_guard(
+                &req.session_id,
+                None,
+                grants.as_ref(),
+                Method::SessionConfigure,
+            )
+            .await?;
+            drop(admission);
+        }
+
         // Wait for a provisional binding to be confirmed, for the same reason
         // `session/prompt` does: a session rehydrated during a route-affecting
-        // commit is live but unconfirmed, and committing an override against
-        // it would compose with a binding the reconciliation is about to
-        // replace. Precedes the ordering lock because the reconciliation task
-        // holds that same guard.
+        // commit is live but unconfirmed, and its reconciliation rebuilds the
+        // agent's configured provider. Committing an override first would
+        // report the selection as applied and then lose it to that rebuild.
+        //
+        // This must follow the optional restore above and run whichever
+        // request restored the session: this call, one that won admission
+        // first, or one that published between an earlier check and the live
+        // lookup. A wait before the lookup cannot see a binding published
+        // after it. It must also stay before the writer gate below, which the
+        // reconciliation task needs.
         //
         // The returned generation is discarded here, unlike in
         // `session/prompt`: this handler caches no `Agent`, and it already
@@ -8693,13 +8756,30 @@ impl RpcDispatcher {
             return Err(self.stale_session_incarnation_error());
         }
 
-        // Acquire the per-session ordering boundary.
-        let _model_provider_update = self
+        // Acquire the per-session ordering boundary. Bounded for the same
+        // reason as the config-write refresh: a mid-turn session holds this
+        // guard until its turn ends, and this handler runs inline on the
+        // connection's dispatcher while holding `config_write_lock`.
+        let _model_provider_update = match self
             .ctx
             .sessions
-            .lock_model_provider_update(&req.session_id)
+            .lock_model_provider_update_with_timeout(
+                &req.session_id,
+                SESSION_PROVIDER_UPDATE_LOCK_TIMEOUT,
+            )
             .await
-            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        {
+            Ok(guard) => guard,
+            Err(crate::rpc::session::WaitForProviderUpdateError::SessionNotFound) => {
+                return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+            }
+            Err(crate::rpc::session::WaitForProviderUpdateError::Timeout) => {
+                return Err(rpc_err(
+                    SESSION_BUSY,
+                    "Session is running a turn; retry configure after the turn finishes",
+                ));
+            }
+        };
 
         self.ensure_session_incarnation(&req.session_id, Some(session_generation))
             .await?;
@@ -11452,10 +11532,31 @@ impl RpcDispatcher {
             // The guard is BOUND (not dropped): it is moved into
             // `PreparedLiveSessionRefresh` and held through publication, so
             // preparation and apply are one ordered transition.
-            let Some(model_provider_update) =
-                ctx.sessions.lock_model_provider_update(&session_id).await
-            else {
-                continue;
+            //
+            // The wait is bounded: a session in scope that is mid-turn holds
+            // this guard until the turn ends, and parking here would stall
+            // the issuing connection's dispatcher and every config writer
+            // behind `config_write_lock`. Refusing drops the candidate
+            // config and every guard acquired so far, so nothing commits.
+            let model_provider_update = match ctx
+                .sessions
+                .lock_model_provider_update_with_timeout(
+                    &session_id,
+                    SESSION_PROVIDER_UPDATE_LOCK_TIMEOUT,
+                )
+                .await
+            {
+                Ok(guard) => guard,
+                Err(crate::rpc::session::WaitForProviderUpdateError::SessionNotFound) => continue,
+                Err(crate::rpc::session::WaitForProviderUpdateError::Timeout) => {
+                    return Err(rpc_err(
+                        SESSION_BUSY,
+                        format!(
+                            "Config update cannot refresh live session `{session_id}` while it \
+                             is running a turn; retry after the turn finishes"
+                        ),
+                    ));
+                }
             };
 
             // Re-verify the session has not been replaced while we waited
@@ -19025,6 +19126,288 @@ mod tests {
             .expect("restorable ACP session must rehydrate");
         let agent = recovered.lock().await;
         assert_local_session_channels(&agent);
+    }
+
+    /// A Code-pane ACP session whose live incarnation was dropped by a failed
+    /// turn, with a second provider profile `openai.provider-b` available to
+    /// `/model-provider`. The durable row still exists in the ACP store.
+    async fn make_reaped_acp_session_for_configure(
+        tmp: &tempfile::TempDir,
+        sid: &str,
+    ) -> (Arc<RpcDispatcher>, Arc<crate::rpc::session::SessionStore>) {
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let mut config = make_acp_test_config(tmp);
+        {
+            let base = config
+                .providers
+                .models
+                .ensure("openai", "provider-b")
+                .expect("`openai` slot must exist");
+            base.api_key = Some("test-key-b".into());
+            base.model = Some("model-b".into());
+            base.uri = Some("http://127.0.0.1:2".into());
+        }
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        dispatcher
+            .handle_session_new_for_test(&serde_json::json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should create the ACP session");
+        assert!(
+            sessions.remove(sid).await,
+            "a failed ACP turn drops the live incarnation"
+        );
+        assert!(
+            sessions.get_agent(sid).await.is_none(),
+            "configure must not depend on the dropped live map entry"
+        );
+        (Arc::new(dispatcher), sessions)
+    }
+
+    /// After reconciliation settles, the provider the session dispatches
+    /// through must be the one its override names, and both must be the
+    /// selection `/model-provider` reported as applied.
+    async fn assert_configured_provider_survived_reconciliation(
+        sessions: &crate::rpc::session::SessionStore,
+        sid: &str,
+        configured: serde_json::Value,
+    ) {
+        assert_eq!(
+            configured["overrides"]["model_provider"], "openai.provider-b",
+            "session/configure must report the selected provider"
+        );
+        assert!(
+            sessions
+                .await_pending_generation(sid, std::time::Duration::from_secs(5))
+                .await
+                .is_ok(),
+            "reconciliation must confirm the restored binding"
+        );
+        let override_provider = sessions
+            .get_overrides(sid)
+            .await
+            .and_then(|overrides| overrides.model_provider);
+        let agent = sessions
+            .get_agent(sid)
+            .await
+            .expect("the restored session must stay live");
+        let live_provider = agent
+            .lock()
+            .await
+            .resolved_route_for_test("anything")
+            .provider_name;
+        assert_eq!(
+            override_provider.as_deref(),
+            Some("openai.provider-b"),
+            "the stored override must keep the selection"
+        );
+        assert_eq!(
+            live_provider, "openai.provider-b",
+            "reconciliation must not revert the provider configure reported as selected"
+        );
+    }
+
+    /// A failed Code-pane turn drops the live incarnation so the next prompt
+    /// rehydrates provider-safe history. `/model-provider` is
+    /// `session/configure` and must restore that row instead of answering
+    /// SESSION_NOT_FOUND for a session that still exists in the ACP store.
+    #[tokio::test]
+    async fn session_configure_rehydrates_reaped_acp_session_before_provider_switch() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "cfg-reaped-acp";
+        let (dispatcher, sessions) = make_reaped_acp_session_for_configure(&tmp, sid).await;
+
+        dispatcher
+            .handle_session_configure_for_test(&serde_json::json!({
+                "session_id": sid,
+                "overrides": { "model_provider": "openai.provider-b" }
+            }))
+            .await
+            .expect("session/configure must rehydrate the reaped ACP session and switch provider");
+
+        let agent = sessions
+            .get_agent(sid)
+            .await
+            .expect("the reaped ACP session must be live again");
+        let agent = agent.lock().await;
+        assert_eq!(
+            agent.resolved_route_for_test("anything").provider_name,
+            "openai.provider-b",
+            "the restored session must serve the provider selected by /model-provider"
+        );
+    }
+
+    /// Another request restores the reaped session while configure waits for
+    /// admission, and publishes it pending because a config write held the
+    /// writer gate. Configure's own restore then finds a live agent and does
+    /// nothing; it must still wait for that binding to be confirmed instead
+    /// of committing its selection against a provider reconciliation is
+    /// about to replace.
+    #[tokio::test]
+    async fn session_configure_waits_for_binding_restored_during_admission_wait() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "cfg-restored-during-admission";
+        let (dispatcher, sessions) = make_reaped_acp_session_for_configure(&tmp, sid).await;
+        let pending_waiting = sessions.pending_generation_waiting();
+
+        let admission = sessions.session_queue.acquire(sid).await.unwrap();
+        let configure_dispatcher = Arc::clone(&dispatcher);
+        let configure = zeroclaw_spawn::spawn!(async move {
+            configure_dispatcher
+                .handle_session_configure_for_test(&serde_json::json!({
+                    "session_id": sid,
+                    "overrides": { "model_provider": "openai.provider-b" }
+                }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while sessions.session_queue.queue_depth(sid).await < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("configure must find the session reaped and queue for admission");
+
+        // A route-affecting config write holds the writer gate, so this
+        // restore publishes provisionally and leaves reconciliation queued.
+        let config_writer = dispatcher.ctx.config_authority.lock_config_writer().await;
+        assert!(
+            dispatcher
+                .rehydrate_reaped_session_under_guard(
+                    sid,
+                    None,
+                    dispatcher.stamped_grants(),
+                    Method::SessionPrompt,
+                )
+                .await
+                .expect("an operator's rehydration is never refused")
+                .is_some(),
+            "the competing request restores the session"
+        );
+        assert!(matches!(
+            sessions
+                .await_pending_generation(sid, std::time::Duration::from_millis(10))
+                .await,
+            Err(crate::rpc::session::WaitForProviderUpdateError::Timeout)
+        ));
+        // That probe parked on the marker too and left the test notifier's
+        // permit. Consume it so only configure's own wait can satisfy the
+        // check below.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pending_waiting.notified(),
+        )
+        .await
+        .expect("the pending probe signals its own wait");
+        drop(admission);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            pending_waiting.notified(),
+        )
+        .await
+        .expect("configure must wait for the binding another request restored");
+        assert!(
+            !configure.is_finished(),
+            "configure must not commit while the restored binding is pending"
+        );
+
+        drop(config_writer);
+        let configured = tokio::time::timeout(std::time::Duration::from_secs(5), configure)
+            .await
+            .expect("configure must finish after reconciliation")
+            .unwrap()
+            .expect("the provider switch must succeed");
+        assert_configured_provider_survived_reconciliation(&sessions, sid, configured).await;
+    }
+
+    /// Another request restores the reaped session after configure's earlier
+    /// checks found it absent but before configure looks for a live agent.
+    /// Configure then never restores anything itself. If it commits before
+    /// the pending binding is reconciled, reconciliation rebuilds the agent's
+    /// configured provider and the reported switch silently reverts.
+    #[tokio::test]
+    async fn session_configure_waits_for_binding_restored_before_live_lookup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sid = "cfg-restored-before-lookup";
+        let (dispatcher, sessions) = make_reaped_acp_session_for_configure(&tmp, sid).await;
+        let pending_waiting = sessions.pending_generation_waiting();
+
+        let lookup_entered = Arc::new(tokio::sync::Notify::new());
+        let lookup_release = Arc::new(tokio::sync::Notify::new());
+        *sessions.test_configure_live_lookup_pause.lock().unwrap() =
+            Some((Arc::clone(&lookup_entered), Arc::clone(&lookup_release)));
+        let configure_dispatcher = Arc::clone(&dispatcher);
+        let mut configure = zeroclaw_spawn::spawn!(async move {
+            configure_dispatcher
+                .handle_session_configure_for_test(&serde_json::json!({
+                    "session_id": sid,
+                    "overrides": { "model_provider": "openai.provider-b" }
+                }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), lookup_entered.notified())
+            .await
+            .expect("configure reaches its live-agent lookup");
+
+        // Restore under a held writer gate so the session publishes pending,
+        // then park the restorer after publication and before it spawns
+        // reconciliation. Releasing the gate leaves configure free to take it
+        // first if it skips the pending-binding wait.
+        let published = Arc::new(tokio::sync::Notify::new());
+        let publish_release = Arc::new(tokio::sync::Notify::new());
+        *sessions.test_rehydration_published_pause.lock().unwrap() =
+            Some((Arc::clone(&published), Arc::clone(&publish_release)));
+        let config_writer = dispatcher.ctx.config_authority.lock_config_writer().await;
+        let restore_dispatcher = Arc::clone(&dispatcher);
+        let restore = zeroclaw_spawn::spawn!(async move {
+            restore_dispatcher.rehydrate_reaped_session(sid, None).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), published.notified())
+            .await
+            .expect("the competing restore publishes the session");
+        drop(config_writer);
+        lookup_release.notify_one();
+
+        // A correct configure parks on the pending binding. A configure that
+        // skips that wait commits now, before reconciliation even starts.
+        let finished_early = tokio::select! {
+            () = pending_waiting.notified() => None,
+            result = &mut configure => Some(result),
+        };
+        publish_release.notify_one();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), restore)
+                .await
+                .unwrap()
+                .unwrap()
+                .expect("an operator's rehydration is never refused")
+                .is_some()
+        );
+        let configured = match finished_early {
+            Some(result) => result,
+            None => tokio::time::timeout(std::time::Duration::from_secs(5), configure)
+                .await
+                .expect("configure must finish after reconciliation"),
+        }
+        .unwrap()
+        .expect("the provider switch must succeed");
+        assert_configured_provider_survived_reconciliation(&sessions, sid, configured).await;
     }
 
     /// The personality filename allowlist constrains the name, not its target.
@@ -45635,6 +46018,7 @@ mod tests {
                             sid,
                             None,
                             dispatcher.stamped_grants(),
+                            Method::SessionPrompt,
                         )
                         .await
                         .expect("an operator's rehydration is never refused")
@@ -47754,7 +48138,12 @@ mod tests {
         let _guard = sessions.session_queue.acquire(sid).await.unwrap();
         assert!(
             dispatcher
-                .rehydrate_reaped_session_under_guard(sid, None, dispatcher.stamped_grants())
+                .rehydrate_reaped_session_under_guard(
+                    sid,
+                    None,
+                    dispatcher.stamped_grants(),
+                    Method::SessionPrompt,
+                )
                 .await
                 .expect("an operator's rehydration is never refused")
                 .is_some()
@@ -47803,7 +48192,12 @@ mod tests {
         let _guard = sessions.session_queue.acquire(sid).await.unwrap();
         assert!(
             dispatcher
-                .rehydrate_reaped_session_under_guard(sid, None, dispatcher.stamped_grants())
+                .rehydrate_reaped_session_under_guard(
+                    sid,
+                    None,
+                    dispatcher.stamped_grants(),
+                    Method::SessionPrompt,
+                )
                 .await
                 .expect("an operator's rehydration is never refused")
                 .is_none(),
@@ -48963,7 +49357,12 @@ mod tests {
 
         let _session_guard = sessions.session_queue.acquire(sid).await.unwrap();
         let recovered = dispatcher
-            .rehydrate_reaped_session_under_guard(sid, None, dispatcher.stamped_grants())
+            .rehydrate_reaped_session_under_guard(
+                sid,
+                None,
+                dispatcher.stamped_grants(),
+                Method::SessionPrompt,
+            )
             .await
             .expect("an operator's rehydration is never refused")
             .expect("a reaped ACP session must rehydrate to a working agent");
@@ -49143,7 +49542,12 @@ mod tests {
         );
         let _session_guard = sessions.session_queue.acquire(sid).await.unwrap();
         let recovered = dispatcher
-            .rehydrate_reaped_session_under_guard(sid, None, dispatcher.stamped_grants())
+            .rehydrate_reaped_session_under_guard(
+                sid,
+                None,
+                dispatcher.stamped_grants(),
+                Method::SessionPrompt,
+            )
             .await
             .expect("an operator's rehydration is never refused")
             .expect("the cancellation-produced ACP row must rehydrate");
@@ -52292,6 +52696,82 @@ mod tests {
             .expect("session/configure must succeed after the update boundary is released");
     }
 
+    /// `session/configure` takes the daemon-wide config writer lock and then
+    /// the session's `model_provider_update` guard, which a running turn holds
+    /// until it ends. Configuring a mid-turn session must fail with a
+    /// retryable `SESSION_BUSY` inside the client's RPC budget rather than
+    /// park the issuing connection's sequential dispatcher — and, through the
+    /// writer lock, every config writer on the daemon — for the whole turn.
+    #[tokio::test]
+    async fn session_configure_on_busy_session_fails_busy_instead_of_hanging() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        // A running turn holds this guard for its whole duration.
+        let busy_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&session_id)
+            .await
+            .expect("session update lock exists");
+
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(
+            SESSION_PROVIDER_UPDATE_LOCK_TIMEOUT + std::time::Duration::from_secs(2),
+            dispatcher.handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": { "temperature": 0.6 }
+            })),
+        )
+        .await
+        .expect("session/configure must not park behind a busy session's turn")
+        .expect_err("session/configure must refuse while the session is mid-turn");
+        assert_eq!(error.code, SESSION_BUSY);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the refusal must arrive inside the client's 5s RPC timeout"
+        );
+
+        // The override was not applied, and the writer lock is free again.
+        assert!(
+            dispatcher
+                .ctx
+                .config_authority
+                .try_lock_config_writer()
+                .is_some(),
+            "a refused session/configure must release the config writer lock"
+        );
+        assert_eq!(
+            dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .and_then(|overrides| overrides.temperature),
+            None,
+            "a refused session/configure must not commit its override"
+        );
+
+        // Once the turn ends, the same configure goes through.
+        drop(busy_guard);
+        dispatcher
+            .handle_session_configure(&json!({
+                "session_id": session_id,
+                "overrides": { "temperature": 0.6 }
+            }))
+            .await
+            .expect("session/configure must succeed once the session is idle");
+        assert_eq!(
+            dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .and_then(|overrides| overrides.temperature),
+            Some(0.6)
+        );
+    }
+
     /// Deterministic regression for the queued config-mutation → prompt race.
     ///
     /// This queues the real `config/set` transaction behind a held session
@@ -52693,6 +53173,90 @@ mod tests {
             "old-model"
         );
         drop(busy_guard);
+    }
+
+    /// Editing a setting that a mid-turn session is actively using must fail
+    /// with a retryable `SESSION_BUSY` error inside the client's RPC budget,
+    /// not park forever. `config/set` runs inline on the connection's
+    /// sequential dispatcher, so an unbounded wait here froze the issuing
+    /// TUI: every later frame from it — including the reply to a tool
+    /// approval the busy turn was itself waiting on — queued behind the
+    /// parked transaction, which held the global config writer lock too.
+    #[tokio::test]
+    async fn config_set_in_scope_of_busy_session_fails_busy_instead_of_hanging() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_model_refresh_test_config(&tmp);
+        let dispatcher = make_config_set_test_dispatcher(config);
+        let busy_session = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        // A running turn holds this guard for its whole duration.
+        let busy_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&busy_session)
+            .await
+            .expect("session update lock exists");
+
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(
+            SESSION_PROVIDER_UPDATE_LOCK_TIMEOUT + std::time::Duration::from_secs(2),
+            dispatcher.handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.model",
+                "value": "new-model"
+            })),
+        )
+        .await
+        .expect("config/set must not park behind a busy session's turn")
+        .expect_err("config/set must refuse to rebuild a session that is mid-turn");
+        assert_eq!(error.code, SESSION_BUSY);
+        assert!(
+            error.message.contains(&busy_session),
+            "the error must name the busy session: {}",
+            error.message
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the refusal must arrive inside the client's 5s RPC timeout"
+        );
+
+        // Nothing was committed, and the writer lock is free again so other
+        // config writers (and this client's next request) are not stalled.
+        assert!(
+            dispatcher
+                .ctx
+                .config_authority
+                .try_lock_config_writer()
+                .is_some(),
+            "a refused config/set must release the config writer lock"
+        );
+        assert_eq!(
+            model_name_for_session(&dispatcher, &busy_session).await,
+            "old-model"
+        );
+        assert_ne!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .get_prop("providers.models.openai.test-provider.model")
+                .ok()
+                .as_deref(),
+            Some("new-model"),
+            "a refused config/set must not publish the candidate config"
+        );
+
+        // Once the turn ends, the same edit goes through.
+        drop(busy_guard);
+        dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.model",
+                "value": "new-model"
+            }))
+            .await
+            .expect("config/set must succeed once the session is idle");
+        assert_eq!(
+            model_name_for_session(&dispatcher, &busy_session).await,
+            "new-model"
+        );
     }
 
     #[tokio::test]
@@ -53660,6 +54224,91 @@ mod tests {
         }
         // The swap replaced only the limits; today's recorded usage is intact.
         assert_eq!(tracker.get_daily_cost(today).unwrap(), 3.0);
+    }
+
+    /// `config/set` hands a string value to `set_prop` as typed, the same
+    /// parse `zeroclaw config set` text reaches. Text that `str::parse` reads
+    /// as infinity or NaN is refused for a float field, and the value already
+    /// set is unchanged in the daemon and on disk. A finite string still
+    /// stores. Covers a plain float (`memory.vector_weight`) and an optional
+    /// one (`runtime.docker.cpu_limit`).
+    #[tokio::test]
+    async fn config_set_refuses_non_finite_float_text_and_keeps_the_stored_value() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let config = zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        config.save().await.expect("seed config.toml");
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        let (vector_weight, cpu_limit) =
+            (config.memory.vector_weight, config.runtime.docker.cpu_limit);
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, sessions);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-cap:pid=1".into());
+        dispatcher.set_authenticated_for_test();
+
+        for text in [
+            "inf", "+inf", "-inf", "Infinity", "infinity", "NaN", "nan", "1e999", "-1e999",
+        ] {
+            for prop in ["memory.vector_weight", "runtime.docker.cpu_limit"] {
+                let response = rpc_roundtrip(
+                    &mut dispatcher,
+                    &mut rx,
+                    "config/set",
+                    json!({"prop": prop, "value": text}),
+                )
+                .await;
+                let message = response["error"]["message"].as_str().unwrap_or_default();
+                assert!(
+                    message.contains("Invalid float value"),
+                    "{text} {prop}: {response}"
+                );
+                {
+                    let live = dispatcher.ctx.config.read();
+                    assert_eq!(
+                        live.memory.vector_weight.to_bits(),
+                        vector_weight.to_bits(),
+                        "{text} {prop}"
+                    );
+                    assert_eq!(live.runtime.docker.cpu_limit, cpu_limit, "{text} {prop}");
+                }
+                assert_eq!(
+                    std::fs::read_to_string(&config_path).unwrap(),
+                    saved,
+                    "{text} {prop}"
+                );
+            }
+        }
+
+        for (prop, text) in [
+            ("memory.vector_weight", "0.6"),
+            ("runtime.docker.cpu_limit", "2.5"),
+        ] {
+            let response = rpc_roundtrip(
+                &mut dispatcher,
+                &mut rx,
+                "config/set",
+                json!({"prop": prop, "value": text}),
+            )
+            .await;
+            assert!(response.get("error").is_none(), "{prop}: {response}");
+        }
+        assert_eq!(dispatcher.ctx.config.read().memory.vector_weight, 0.6);
+        assert_eq!(
+            dispatcher.ctx.config.read().runtime.docker.cpu_limit,
+            Some(2.5)
+        );
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(written.contains("vector_weight = 0.6"), "{written}");
+        assert!(written.contains("cpu_limit = 2.5"), "{written}");
     }
 
     /// Send one request through `process_line` (the wire dispatch path, not
@@ -56587,7 +57236,7 @@ mod tests {
             // fallback; both must fail before the loop can trim and retry.
             if self
                 .overflows_left
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::SeqCst,
                     std::sync::atomic::Ordering::SeqCst,
                     |left| left.checked_sub(1),
@@ -59382,7 +60031,12 @@ mod tests {
         assert!(sessions.remove(&session_id).await);
         let _session_guard = sessions.session_queue.acquire(&session_id).await.unwrap();
         let rehydrated = dispatcher
-            .rehydrate_reaped_session_under_guard(&session_id, None, dispatcher.stamped_grants())
+            .rehydrate_reaped_session_under_guard(
+                &session_id,
+                None,
+                dispatcher.stamped_grants(),
+                Method::SessionPrompt,
+            )
             .await
             .expect("an operator's rehydration is never refused");
         assert!(

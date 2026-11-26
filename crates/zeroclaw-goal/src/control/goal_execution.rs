@@ -1293,6 +1293,7 @@ impl GoalExecutionSupervisor {
             };
             if let Some(current) = current
                 && current.id == scope.task_id()
+                && current.execution_epoch == scope.execution_epoch()
                 && current.status == TaskStatus::Running
             {
                 match self
@@ -2274,7 +2275,11 @@ impl GoalExecutionEngine {
         let mut lease = match acquired {
             Ok(lease) => lease,
             Err(error) => {
-                if self.exact_running_task_or_fenced(&scope).await?.is_none() {
+                // A restart can close local admission without committing its
+                // durable pause. Withdrawing the waiter isn't executor failure.
+                if checkpoint.is_closed()
+                    || self.exact_running_task_or_fenced(&scope).await?.is_none()
+                {
                     return Ok(GoalExecutionOutcome::Fenced);
                 }
                 if let Some(publication) = &failure_publication {
@@ -4092,17 +4097,18 @@ mod tests {
 
     #[test]
     fn verifier_protocol_bounds_payload_shape_and_size() {
-        let scalar_payload = serde_json::json!({
-            "decision": "blocked",
-            "reason": "choice required",
-            "blockers": [{
-                "kind": "needs_user_input",
-                "message": "Choose one option.",
-                "payload": "not structured context"
-            }]
-        })
-        .to_string();
-        assert!(parse_verifier_response(&scalar_payload).is_err());
+        for payload in [serde_json::json!("scalar"), serde_json::json!(["A", "B"])] {
+            let packet = serde_json::json!({
+                "decision": "blocked",
+                "reason": "choice required",
+                "blockers": [{
+                    "kind": "needs_user_input",
+                    "message": "Choose one option.",
+                    "payload": payload
+                }]
+            });
+            assert!(parse_verifier_response(&packet.to_string()).is_err());
+        }
 
         let oversized_payload = serde_json::json!({
             "decision": "blocked",

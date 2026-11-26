@@ -229,7 +229,8 @@ async fn previously_unknown_human_bootstraps_without_pairing_or_enroll_listener(
     drop(server);
     let records = f.ledger().list_active().unwrap();
     assert_eq!(records.len(), 1);
-    assert!(records[0].actor.starts_with("oidc:oidc:"));
+    let principal = zeroclaw_api::principal::PrincipalId::for_oidc(&f._idp.uri(), "new-user");
+    assert_eq!(records[0].actor, principal.as_str());
     assert!(records[0].token_hash.is_empty());
     assert_eq!(records[0].device_id, body["device_id"]);
     assert!(
