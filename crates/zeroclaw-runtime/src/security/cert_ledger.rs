@@ -36,6 +36,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::audit::{AuditEvent, AuditEventType, AuditLogger};
+use super::auth_provider::enrollment::ClientAuthentication;
+use super::auth_provider::refresh_grant::{GrantBinding, SealedRefreshGrant};
 
 /// The `issued_certs.status` value for a row that is committed but whose
 /// issuance has not been recorded as complete in the audit trail.
@@ -64,7 +66,32 @@ const PENDING_RECONCILE_GRACE_SECS: i64 = 60;
 /// * 2 - nullable `delivered_at`, so an active row records whether its
 ///   certificate actually reached its keyholder
 ///   ([`CertLedger::mark_delivered`]).
-const SCHEMA_VERSION: i64 = 2;
+/// * 3 - the `refresh_grants` table: one sealed IdP refresh token per provider
+///   alias and device ([`CertLedger::record_issued_with_refresh_grant`]).
+const SCHEMA_VERSION: i64 = 3;
+
+/// The `refresh_grants` table (schema v3). A grant belongs to a device, not to
+/// one certificate: `device_id` survives renewal, and a grant ends when the
+/// device's certificate is revoked or lapses unrenewed.
+///
+/// `refresh_token` holds only `SecretStore` ciphertext (`enc2:`); the sealing
+/// refuses to produce plaintext. `principal` is the canonical principal id,
+/// which already encodes the issuer and `sub`.
+const REFRESH_GRANTS_SCHEMA: &str = "
+     CREATE TABLE IF NOT EXISTS refresh_grants (
+         alias         TEXT NOT NULL,
+         device_id     TEXT NOT NULL,
+         issuer        TEXT NOT NULL,
+         client_id     TEXT NOT NULL,
+         principal     TEXT NOT NULL,
+         client_auth   TEXT NOT NULL
+                           CHECK(client_auth IN ('client_secret_basic','client_secret_post')),
+         refresh_token TEXT NOT NULL,
+         created_at    INTEGER NOT NULL,
+         PRIMARY KEY (alias, device_id)
+     );
+     CREATE INDEX IF NOT EXISTS idx_refresh_grants_device ON refresh_grants(device_id);
+";
 
 /// The `issued_certs` column definitions at [`SCHEMA_VERSION`].
 ///
@@ -388,6 +415,9 @@ impl CertLedger {
         // sweep that follows then sees only rows this ledger vouches for.
         ledger.reconcile_pending_issuances()?;
         ledger.reconcile_undelivered_issuances()?;
+        // After both: a grant survives only while its device holds a
+        // certificate this ledger vouches for and that has not expired.
+        ledger.sweep_lapsed_refresh_grants()?;
         // Refresh the materialized revocation list so it reflects the ledger at
         // startup (covers a missing/stale file).
         ledger.materialize_revocations()?;
@@ -419,6 +449,11 @@ impl CertLedger {
     /// `delivered_at`. Both therefore migrate to v2 in the SAME single pass -
     /// the copy selects only the columns they share, and the rebuild supplies
     /// `delivered_at` itself.
+    ///
+    /// v3 adds only the `refresh_grants` table. A v2 ledger therefore takes a
+    /// separate path that creates the table and nothing else: the rebuild's
+    /// backfill would mark its undelivered certificates delivered. A v0 or v1
+    /// ledger gets the table in the same transaction as its rebuild.
     ///
     /// **Backfill rule: a row that exists at migration time gets
     /// `delivered_at = issued_at`.** Those rows predate delivery tracking, so
@@ -461,10 +496,26 @@ impl CertLedger {
             conn.execute_batch(&format!(
                 "CREATE TABLE IF NOT EXISTS issued_certs ({ISSUED_CERTS_COLUMNS});
                  {ISSUED_CERTS_INDEXES}
+                 {REFRESH_GRANTS_SCHEMA}
                  PRAGMA user_version = {SCHEMA_VERSION};"
             ))
             .context("create cert-ledger schema")?;
             return Ok(());
+        }
+
+        if version == 2 {
+            // `issued_certs` is already current; v3 only adds the grant table.
+            // This must not reach the rebuild below, whose `delivered_at`
+            // backfill would mark every undelivered v2 certificate delivered.
+            let tx = conn
+                .transaction()
+                .context("begin cert-ledger schema migration")?;
+            tx.execute_batch(&format!(
+                "{REFRESH_GRANTS_SCHEMA}
+                 PRAGMA user_version = {SCHEMA_VERSION};"
+            ))
+            .context("add the cert-ledger refresh_grants table")?;
+            return tx.commit().context("commit cert-ledger schema migration");
         }
 
         let tx = conn
@@ -477,6 +528,7 @@ impl CertLedger {
              DROP TABLE issued_certs;
              ALTER TABLE {MIGRATION_TABLE} RENAME TO issued_certs;
              {ISSUED_CERTS_INDEXES}
+             {REFRESH_GRANTS_SCHEMA}
              PRAGMA user_version = {SCHEMA_VERSION};"
         ))
         .with_context(|| {
@@ -895,6 +947,39 @@ impl CertLedger {
         renewal: bool,
         still_active: Option<&str>,
     ) -> Result<()> {
+        self.publish_issuance(entry, renewal, still_active, None)
+    }
+
+    /// [`CertLedger::record_issued`] for a first issuance whose sign-in
+    /// returned a refresh token: the grant is stored for `entry.device_id` in
+    /// the same transaction that publishes the certificate (ADR-017).
+    ///
+    /// The two therefore land together or not at all. A grant never attaches
+    /// to a certificate it was not issued with, and a failed issuance stores
+    /// no grant: the caller's claim of the pending grant is then spent, and
+    /// the device simply has no refresh grant until its next sign-in.
+    ///
+    /// Only an active, first issuance carries a grant. A renewal keeps the
+    /// device's existing grant, because the grant is keyed by `device_id`,
+    /// which renewal preserves.
+    pub fn record_issued_with_refresh_grant(
+        &self,
+        entry: &LedgerEntry,
+        grant: &SealedRefreshGrant,
+    ) -> Result<()> {
+        if entry.status != CertStatus::Active {
+            bail!("a refresh grant is stored only with an active certificate");
+        }
+        self.publish_issuance(entry, false, None, Some(grant))
+    }
+
+    fn publish_issuance(
+        &self,
+        entry: &LedgerEntry,
+        renewal: bool,
+        still_active: Option<&str>,
+        grant: Option<&SealedRefreshGrant>,
+    ) -> Result<()> {
         // Best-effort, deliberately NOT `?`. This sweep is maintenance for
         // OTHER issuances; failing it would turn an unwritable CRL - or a
         // failing audit sink on some unrelated stale row - into a refusal to
@@ -929,7 +1014,7 @@ impl CertLedger {
             self.discard_staged(entry, staged);
             return Err(err);
         }
-        if let Err(err) = self.promote_staged(entry, still_active) {
+        if let Err(err) = self.promote_staged(entry, still_active, grant) {
             self.discard_staged(entry, staged);
             return Err(err);
         }
@@ -1027,7 +1112,15 @@ impl CertLedger {
     /// entirely after it (where `revoke_device` sweeps the new row too). A
     /// check outside this transaction could be overtaken between the two
     /// statements, which is exactly the race being closed.
-    fn promote_staged(&self, entry: &LedgerEntry, still_active: Option<&str>) -> Result<()> {
+    ///
+    /// `grant`, when given, is stored in the same transaction, so it is
+    /// published with the certificate or not at all.
+    fn promote_staged(
+        &self,
+        entry: &LedgerEntry,
+        still_active: Option<&str>,
+        grant: Option<&SealedRefreshGrant>,
+    ) -> Result<()> {
         let mut conn = self.conn.lock();
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -1059,6 +1152,9 @@ impl CertLedger {
                  published; nothing was delivered",
                 entry.fingerprint
             );
+        }
+        if let Some(grant) = grant {
+            Self::insert_refresh_grant(&tx, &entry.device_id, grant)?;
         }
         tx.commit().context("commit issuance publication")
     }
@@ -1241,6 +1337,14 @@ impl CertLedger {
                 )
                 .optional()
                 .context("lookup revoked cert")?;
+            // The device's refresh grant ends with any of its certificates,
+            // in the same transaction as the revocation (ADR-017).
+            tx.execute(
+                "DELETE FROM refresh_grants
+                     WHERE device_id = (SELECT device_id FROM issued_certs WHERE fingerprint = ?1)",
+                params![fingerprint],
+            )
+            .context("delete the revoked device's refresh grant")?;
             // Enforce BEFORE the ledger reports it (drives the A5 refusal from
             // the real revoke action); failure here rolls the flip back.
             self.materialize_on(&tx, self.revoked_path.as_deref())?;
@@ -1336,7 +1440,16 @@ impl CertLedger {
                     entries.len()
                 );
             }
+            // The device's refresh grants end with it, in the same transaction,
+            // even when it had no active certificate left to revoke.
+            tx.execute(
+                "DELETE FROM refresh_grants WHERE device_id = ?1",
+                params![device_id],
+            )
+            .context("delete the revoked device's refresh grants")?;
             if changed == 0 {
+                tx.commit()
+                    .context("commit device refresh-grant deletion")?;
                 return Ok(0);
             }
             // Enforce before the ledger reports it, from the in-transaction
@@ -1380,6 +1493,182 @@ impl CertLedger {
             }),
             None => Ok(revoked.len()),
         }
+    }
+
+    /// The refresh grant `device_id` holds for provider `alias`, if the device
+    /// still holds a live certificate.
+    ///
+    /// A grant whose device has no active, unexpired certificate has lapsed:
+    /// it is deleted here, in the same transaction as the check, and `None` is
+    /// returned. Lapse is decided at the point of use rather than by a timer,
+    /// so a grant can never outlive its device's last certificate by more than
+    /// the time until it is next read; [`CertLedger::open`] also sweeps them.
+    pub fn refresh_grant(
+        &self,
+        alias: &str,
+        device_id: &str,
+    ) -> Result<Option<SealedRefreshGrant>> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("begin refresh-grant read")?;
+        if !Self::device_has_live_certificate(&tx, device_id, now_unix())? {
+            tx.execute(
+                "DELETE FROM refresh_grants WHERE device_id = ?1",
+                params![device_id],
+            )
+            .context("delete a lapsed refresh grant")?;
+            tx.commit()
+                .context("commit lapsed refresh-grant deletion")?;
+            return Ok(None);
+        }
+        let grant = tx
+            .query_row(
+                "SELECT alias, issuer, client_id, principal, client_auth, refresh_token
+                     FROM refresh_grants WHERE alias = ?1 AND device_id = ?2",
+                params![alias, device_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("read refresh grant")?;
+        tx.commit().context("commit refresh-grant read")?;
+        grant
+            .map(
+                |(alias, issuer, client_id, principal, client_auth, sealed)| {
+                    Ok(SealedRefreshGrant::from_stored(
+                        GrantBinding {
+                            alias,
+                            issuer,
+                            client_id,
+                            principal: zeroclaw_api::principal::PrincipalId(principal),
+                        },
+                        client_auth_from_db(&client_auth)?,
+                        sealed,
+                    ))
+                },
+            )
+            .transpose()
+    }
+
+    /// Delete the refresh grant `device_id` holds for `alias`, as sign-out
+    /// does. Returns whether there was one.
+    pub fn delete_refresh_grant(&self, alias: &str, device_id: &str) -> Result<bool> {
+        let deleted = self
+            .conn
+            .lock()
+            .execute(
+                "DELETE FROM refresh_grants WHERE alias = ?1 AND device_id = ?2",
+                params![alias, device_id],
+            )
+            .context("delete refresh grant")?;
+        Ok(deleted > 0)
+    }
+
+    /// Delete every refresh grant whose provider entry is gone or now names a
+    /// different issuer or client. `current` lists each configured
+    /// `(alias, issuer, client_id)`; a grant matching none of them was issued
+    /// by a provider this daemon no longer trusts under that alias. Returns
+    /// how many grants were deleted.
+    pub fn delete_refresh_grants_not_issued_by(
+        &self,
+        current: &[(&str, &str, &str)],
+    ) -> Result<usize> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("begin refresh-grant provider sweep")?;
+        let stale: Vec<(String, String)> = {
+            let mut stmt = tx
+                .prepare("SELECT alias, device_id, issuer, client_id FROM refresh_grants")
+                .context("prepare refresh-grant provider sweep")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .context("query refresh grants")?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .context("collect refresh grants")?
+                .into_iter()
+                .filter(|(alias, _, issuer, client_id)| {
+                    !current
+                        .iter()
+                        .any(|(a, i, c)| a == alias && i == issuer && c == client_id)
+                })
+                .map(|(alias, device_id, _, _)| (alias, device_id))
+                .collect()
+        };
+        for (alias, device_id) in &stale {
+            tx.execute(
+                "DELETE FROM refresh_grants WHERE alias = ?1 AND device_id = ?2",
+                params![alias, device_id],
+            )
+            .context("delete a refresh grant from a changed provider")?;
+        }
+        tx.commit().context("commit refresh-grant provider sweep")?;
+        Ok(stale.len())
+    }
+
+    /// Delete every refresh grant whose device holds no active, unexpired
+    /// certificate. Run at open, alongside the other reconciliations.
+    fn sweep_lapsed_refresh_grants(&self) -> Result<usize> {
+        self.conn
+            .lock()
+            .execute(
+                "DELETE FROM refresh_grants WHERE device_id NOT IN (
+                     SELECT device_id FROM issued_certs
+                         WHERE status = 'active' AND not_after > ?1)",
+                params![now_unix()],
+            )
+            .context("sweep lapsed refresh grants")
+    }
+
+    fn device_has_live_certificate(conn: &Connection, device_id: &str, now: i64) -> Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM issued_certs
+                 WHERE device_id = ?1 AND status = 'active' AND not_after > ?2)",
+            params![device_id, now],
+            |row| row.get(0),
+        )
+        .context("check the device holds a live certificate")
+    }
+
+    fn insert_refresh_grant(
+        conn: &Connection,
+        device_id: &str,
+        grant: &SealedRefreshGrant,
+    ) -> Result<()> {
+        let binding = grant.binding();
+        conn.execute(
+            "INSERT INTO refresh_grants
+                 (alias, device_id, issuer, client_id, principal, client_auth, refresh_token, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                binding.alias,
+                device_id,
+                binding.issuer,
+                binding.client_id,
+                binding.principal.as_str(),
+                client_auth_to_db(grant.client_auth())?,
+                grant.sealed_refresh_token(),
+                now_unix(),
+            ],
+        )
+        .context("store the refresh grant")?;
+        Ok(())
     }
 
     /// All currently-active ledger rows.
@@ -1568,6 +1857,21 @@ impl CertAuditStage {
 /// query feeding this mapper filters pending out, and a reader that ever forgot
 /// to must fail loudly instead of reporting an undelivered certificate as a
 /// usable one.
+/// The stored `client_auth` column: the method's OAuth
+/// `token_endpoint_auth_method` name, from its serde form so the two cannot
+/// drift.
+fn client_auth_to_db(auth: ClientAuthentication) -> Result<String> {
+    match serde_json::to_value(auth).context("serialize client authentication")? {
+        serde_json::Value::String(name) => Ok(name),
+        other => bail!("client authentication serialized as {other}, not a name"),
+    }
+}
+
+fn client_auth_from_db(name: &str) -> Result<ClientAuthentication> {
+    serde_json::from_value(serde_json::Value::String(name.to_owned()))
+        .with_context(|| format!("stored refresh grant has unknown client authentication {name:?}"))
+}
+
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<LedgerEntry> {
     let status: String = row.get(5)?;
     let status = CertStatus::from_db(&status).ok_or_else(|| {
@@ -3594,5 +3898,466 @@ mod tests {
             .label(),
             "enroll:01234567"
         );
+    }
+
+    // ── Refresh grants (ADR-017) ──
+
+    use crate::security::SecretStore;
+    use crate::security::auth_provider::refresh_grant::PendingGrant;
+    use zeroclaw_api::principal::PrincipalId;
+
+    /// A certificate valid from now for 30 days, so its device is live.
+    fn live_entry(fp: &str, device: &str) -> LedgerEntry {
+        LedgerEntry {
+            not_before: now_unix() - 60,
+            not_after: now_unix() + 30 * 86_400,
+            ..entry(fp, device)
+        }
+    }
+
+    fn grant_binding(alias: &str, sub: &str) -> GrantBinding {
+        GrantBinding {
+            alias: alias.into(),
+            issuer: "https://idp.example".into(),
+            client_id: "zerocode-cli".into(),
+            principal: PrincipalId::for_oidc("https://idp.example", sub),
+        }
+    }
+
+    fn sealed(store: &SecretStore, alias: &str, sub: &str, token: &str) -> SealedRefreshGrant {
+        PendingGrant::new(
+            grant_binding(alias, sub),
+            ClientAuthentication::ClientSecretPost,
+            token.into(),
+        )
+        .seal(store)
+        .unwrap()
+    }
+
+    fn grant_rows(led: &CertLedger) -> Vec<(String, String)> {
+        let conn = led.conn.lock();
+        let mut stmt = conn
+            .prepare("SELECT alias, device_id FROM refresh_grants ORDER BY alias, device_id")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn pair(alias: &str, device: &str) -> (String, String) {
+        (alias.to_owned(), device.to_owned())
+    }
+
+    #[test]
+    fn a_refresh_grant_is_published_with_its_certificate() {
+        let keys = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(keys.path(), true);
+        let led = CertLedger::open_in_memory(None).unwrap();
+        led.record_issued_with_refresh_grant(
+            &live_entry("fp1", "dev_a"),
+            &sealed(&store, "corp", "alice", "rt-1"),
+        )
+        .unwrap();
+        assert_eq!(led.status_of("fp1").unwrap(), Some(CertStatus::Active));
+        let grant = led.refresh_grant("corp", "dev_a").unwrap().unwrap();
+        assert_eq!(grant.binding(), &grant_binding("corp", "alice"));
+        assert_eq!(grant.client_auth(), ClientAuthentication::ClientSecretPost);
+        assert_eq!(grant.unseal(&store).unwrap().as_str(), "rt-1");
+        // Keyed by alias as well as device.
+        assert!(led.refresh_grant("other", "dev_a").unwrap().is_none());
+
+        // Only ciphertext reaches the table.
+        let stored: String = led
+            .conn
+            .lock()
+            .query_row("SELECT refresh_token FROM refresh_grants", [], |r| r.get(0))
+            .unwrap();
+        assert!(SecretStore::is_secure_encrypted(&stored));
+        assert!(!stored.contains("rt-1"));
+    }
+
+    #[test]
+    fn a_refresh_grant_needs_an_active_certificate() {
+        let keys = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(keys.path(), true);
+        let led = CertLedger::open_in_memory(None).unwrap();
+        let revoked = LedgerEntry {
+            status: CertStatus::Revoked,
+            ..live_entry("fp1", "dev_a")
+        };
+        assert!(
+            led.record_issued_with_refresh_grant(&revoked, &sealed(&store, "corp", "alice", "rt"))
+                .is_err()
+        );
+        assert!(grant_rows(&led).is_empty());
+        assert_eq!(led.status_of("fp1").unwrap(), None);
+    }
+
+    #[test]
+    fn a_failed_publication_stores_no_refresh_grant() {
+        let keys = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(keys.path(), true);
+        let dir = tempfile::tempdir().unwrap();
+        let led = Arc::new(CertLedger::open(dir.path(), None).unwrap());
+        // The staged row vanishes before the publish, which then fails.
+        let racer = Arc::clone(&led);
+        once_hook(&led.hooks.after_stage, move || {
+            racer
+                .conn
+                .lock()
+                .execute("DELETE FROM issued_certs WHERE fingerprint = 'fp1'", [])
+                .unwrap();
+        });
+        assert!(
+            led.record_issued_with_refresh_grant(
+                &live_entry("fp1", "dev_a"),
+                &sealed(&store, "corp", "alice", "rt")
+            )
+            .is_err()
+        );
+        assert!(grant_rows(&led).is_empty());
+    }
+
+    #[test]
+    fn a_grant_that_cannot_be_stored_publishes_no_certificate() {
+        // The converse: the grant and the certificate land together or not
+        // at all, so a failing grant insert rolls the publication back.
+        let keys = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(keys.path(), true);
+        let led = CertLedger::open_in_memory(None).unwrap();
+        CertLedger::insert_refresh_grant(
+            &led.conn.lock(),
+            "dev_a",
+            &sealed(&store, "corp", "alice", "rt-old"),
+        )
+        .unwrap();
+        assert!(
+            led.record_issued_with_refresh_grant(
+                &live_entry("fp1", "dev_a"),
+                &sealed(&store, "corp", "alice", "rt-new")
+            )
+            .is_err()
+        );
+        assert_eq!(led.status_of("fp1").unwrap(), None);
+    }
+
+    #[test]
+    fn two_devices_of_one_principal_hold_separate_grants() {
+        let keys = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(keys.path(), true);
+        let led = CertLedger::open_in_memory(None).unwrap();
+        led.record_issued_with_refresh_grant(
+            &live_entry("fpL", "dev_laptop"),
+            &sealed(&store, "corp", "alice", "rt-laptop"),
+        )
+        .unwrap();
+        led.record_issued_with_refresh_grant(
+            &live_entry("fpP", "dev_phone"),
+            &sealed(&store, "corp", "alice", "rt-phone"),
+        )
+        .unwrap();
+        let laptop = led.refresh_grant("corp", "dev_laptop").unwrap().unwrap();
+        let phone = led.refresh_grant("corp", "dev_phone").unwrap().unwrap();
+        assert_eq!(laptop.unseal(&store).unwrap().as_str(), "rt-laptop");
+        assert_eq!(phone.unseal(&store).unwrap().as_str(), "rt-phone");
+    }
+
+    #[test]
+    fn renewal_keeps_the_grant_and_revoking_any_device_certificate_ends_it() {
+        let keys = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(keys.path(), true);
+        let led = CertLedger::open_in_memory(None).unwrap();
+        led.record_issued_with_refresh_grant(
+            &live_entry("fpOld", "dev_a"),
+            &sealed(&store, "corp", "alice", "rt"),
+        )
+        .unwrap();
+        led.record_issued_with_refresh_grant(
+            &live_entry("fpOther", "dev_b"),
+            &sealed(&store, "corp", "bob", "rt-b"),
+        )
+        .unwrap();
+        led.record_issued_requiring(&live_entry("fpNew", "dev_a"), true, Some("fpOld"))
+            .unwrap();
+        assert!(led.refresh_grant("corp", "dev_a").unwrap().is_some());
+
+        // The old certificate is revoked while the renewed one is active:
+        // the device's grant still ends, and no other device's does.
+        assert!(led.mark_revoked("fpOld", "operator").unwrap());
+        assert_eq!(grant_rows(&led), vec![pair("corp", "dev_b")]);
+    }
+
+    #[test]
+    fn revoking_a_device_ends_its_grants_even_with_no_active_certificate() {
+        let keys = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(keys.path(), true);
+        let led = CertLedger::open_in_memory(None).unwrap();
+        led.record_issued_with_refresh_grant(
+            &live_entry("fp1", "dev_a"),
+            &sealed(&store, "corp", "alice", "rt"),
+        )
+        .unwrap();
+        assert_eq!(led.revoke_device("dev_a", "operator").unwrap(), 1);
+        assert!(grant_rows(&led).is_empty());
+
+        // A grant left behind a device with nothing active to revoke.
+        CertLedger::insert_refresh_grant(
+            &led.conn.lock(),
+            "dev_a",
+            &sealed(&store, "corp", "alice", "rt"),
+        )
+        .unwrap();
+        assert_eq!(led.revoke_device("dev_a", "operator").unwrap(), 0);
+        assert!(grant_rows(&led).is_empty());
+    }
+
+    #[test]
+    fn the_undelivered_sweep_ends_the_grant_of_the_certificate_it_revokes() {
+        let keys = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(keys.path(), true);
+        let dir = tempfile::tempdir().unwrap();
+        let led = CertLedger::open(dir.path(), None).unwrap();
+        led.record_issued_with_refresh_grant(
+            &live_entry("fp1", "dev_a"),
+            &sealed(&store, "corp", "alice", "rt"),
+        )
+        .unwrap();
+        backdate_issuance(dir.path(), "fp1", UNDELIVERED_CERT_TTL_SECS + 60);
+        led.sweep_undelivered_certificates().unwrap();
+        assert_eq!(led.status_of("fp1").unwrap(), Some(CertStatus::Revoked));
+        assert!(grant_rows(&led).is_empty());
+    }
+
+    #[test]
+    fn a_grant_lapses_with_its_device_last_live_certificate() {
+        let keys = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(keys.path(), true);
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let led = CertLedger::open(dir.path(), None).unwrap();
+            // Expired, but never revoked.
+            let expired = LedgerEntry {
+                not_before: now_unix() - 7_200,
+                not_after: now_unix() - 60,
+                ..entry("fpExpired", "dev_expired")
+            };
+            led.record_issued_with_refresh_grant(&expired, &sealed(&store, "corp", "alice", "rt"))
+                .unwrap();
+            assert!(led.mark_delivered("fpExpired").unwrap());
+            // Read at the point of use: lapsed, deleted, and not returned.
+            assert!(led.refresh_grant("corp", "dev_expired").unwrap().is_none());
+            assert!(grant_rows(&led).is_empty());
+
+            CertLedger::insert_refresh_grant(
+                &led.conn.lock(),
+                "dev_expired",
+                &sealed(&store, "corp", "alice", "rt"),
+            )
+            .unwrap();
+            led.record_issued_with_refresh_grant(
+                &live_entry("fpLive", "dev_live"),
+                &sealed(&store, "corp", "bob", "rt"),
+            )
+            .unwrap();
+            assert!(led.mark_delivered("fpLive").unwrap());
+        }
+        // Opening the ledger sweeps the lapsed grant and keeps the live one.
+        let led = CertLedger::open(dir.path(), None).unwrap();
+        assert_eq!(grant_rows(&led), vec![pair("corp", "dev_live")]);
+    }
+
+    #[test]
+    fn sign_out_deletes_only_that_grant() {
+        let keys = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(keys.path(), true);
+        let led = CertLedger::open_in_memory(None).unwrap();
+        for (fp, device) in [("fp1", "dev_a"), ("fp2", "dev_b")] {
+            led.record_issued_with_refresh_grant(
+                &live_entry(fp, device),
+                &sealed(&store, "corp", "alice", "rt"),
+            )
+            .unwrap();
+        }
+        assert!(led.delete_refresh_grant("corp", "dev_a").unwrap());
+        assert!(!led.delete_refresh_grant("corp", "dev_a").unwrap());
+        assert_eq!(grant_rows(&led), vec![pair("corp", "dev_b")]);
+        // Sign-out ends the grant, not the certificate.
+        assert_eq!(led.status_of("fp1").unwrap(), Some(CertStatus::Active));
+    }
+
+    #[test]
+    fn grants_from_a_removed_or_repointed_provider_are_deleted() {
+        let keys = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(keys.path(), true);
+        let led = CertLedger::open_in_memory(None).unwrap();
+        for (fp, device, alias) in [
+            ("fp1", "dev_kept", "corp"),
+            ("fp2", "dev_removed", "gone"),
+            ("fp3", "dev_repointed", "moved"),
+        ] {
+            led.record_issued_with_refresh_grant(
+                &live_entry(fp, device),
+                &sealed(&store, alias, "alice", "rt"),
+            )
+            .unwrap();
+        }
+        let deleted = led
+            .delete_refresh_grants_not_issued_by(&[
+                ("corp", "https://idp.example", "zerocode-cli"),
+                // Same alias, another issuer.
+                ("moved", "https://elsewhere.example", "zerocode-cli"),
+            ])
+            .unwrap();
+        assert_eq!(deleted, 2);
+        assert_eq!(grant_rows(&led), vec![pair("corp", "dev_kept")]);
+    }
+
+    #[test]
+    fn a_v2_ledger_gains_the_grant_table_without_touching_delivery() {
+        // v2 -> v3 only adds a table. It must not run the v0/v1 rebuild,
+        // whose backfill would mark an undelivered certificate delivered.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tls")).unwrap();
+        {
+            let conn = Connection::open(dir.path().join("tls").join("ledger.db")).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE issued_certs ({ISSUED_CERTS_COLUMNS});
+                 {ISSUED_CERTS_INDEXES}
+                 PRAGMA user_version = 2;"
+            ))
+            .unwrap();
+            conn.execute(
+                "INSERT INTO issued_certs
+                     (fingerprint, device_id, token_hash, not_before, not_after, status, issued_at,
+                      actor, delivered_at)
+                 VALUES ('fpUndelivered', 'devU', '', 1, ?1, 'active', ?2, 'operator', NULL)",
+                params![now_unix() + 86_400, now_unix()],
+            )
+            .unwrap();
+        }
+        let keys = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(keys.path(), true);
+        let led = CertLedger::open(dir.path(), None).unwrap();
+        assert_eq!(user_version(dir.path()), SCHEMA_VERSION);
+        let delivered: Option<i64> = led
+            .conn
+            .lock()
+            .query_row(
+                "SELECT delivered_at FROM issued_certs WHERE fingerprint = 'fpUndelivered'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(delivered, None);
+        led.record_issued_with_refresh_grant(
+            &live_entry("fp1", "dev_a"),
+            &sealed(&store, "corp", "alice", "rt"),
+        )
+        .unwrap();
+        assert_eq!(grant_rows(&led), vec![pair("corp", "dev_a")]);
+    }
+
+    #[test]
+    fn older_and_fresh_ledgers_carry_the_grant_table() {
+        let fresh = tempfile::tempdir().unwrap();
+        CertLedger::open(fresh.path(), None).unwrap();
+        let v1 = tempfile::tempdir().unwrap();
+        create_v1_ledger(v1.path(), 1);
+        CertLedger::open(v1.path(), None).unwrap();
+        let v0 = tempfile::tempdir().unwrap();
+        create_v0_ledger(v0.path());
+        CertLedger::open(v0.path(), None).unwrap();
+        for dir in [fresh.path(), v1.path(), v0.path()] {
+            assert_eq!(user_version(dir), SCHEMA_VERSION);
+            let conn = Connection::open(dir.join("tls").join("ledger.db")).unwrap();
+            let tables: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'refresh_grants'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(tables, 1, "{}", dir.display());
+        }
+    }
+
+    #[test]
+    fn a_stored_grant_with_an_unknown_client_authentication_is_refused() {
+        let keys = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(keys.path(), true);
+        let led = CertLedger::open_in_memory(None).unwrap();
+        led.record_issued_with_refresh_grant(
+            &live_entry("fp1", "dev_a"),
+            &sealed(&store, "corp", "alice", "rt"),
+        )
+        .unwrap();
+        // The CHECK constraint keeps other values out of the column; a grant
+        // read back is still parsed strictly rather than defaulted.
+        assert!(client_auth_from_db("none").is_err());
+        assert_eq!(
+            client_auth_to_db(ClientAuthentication::ClientSecretBasic).unwrap(),
+            "client_secret_basic"
+        );
+        assert!(
+            led.conn
+                .lock()
+                .execute("UPDATE refresh_grants SET client_auth = 'none'", [])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_documented_downgrade_leaves_a_v2_ledger_with_every_certificate() {
+        // secure-transport.md, "Upgrading an existing issued-cert ledger".
+        const DOWNGRADE: &str = "DROP TABLE refresh_grants; PRAGMA user_version = 2;";
+        let keys = tempfile::tempdir().unwrap();
+        let store = SecretStore::new(keys.path(), true);
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let led = CertLedger::open(dir.path(), None).unwrap();
+            led.record_issued_with_refresh_grant(
+                &live_entry("fp1", "dev_a"),
+                &sealed(&store, "corp", "alice", "rt"),
+            )
+            .unwrap();
+            assert!(led.mark_delivered("fp1").unwrap());
+            led.record_issued(&live_entry("fp2", "dev_b"), false)
+                .unwrap();
+            assert!(led.mark_revoked("fp2", "operator").unwrap());
+        }
+        Connection::open(dir.path().join("tls").join("ledger.db"))
+            .unwrap()
+            .execute_batch(DOWNGRADE)
+            .unwrap();
+        assert_eq!(user_version(dir.path()), 2);
+        {
+            let conn = Connection::open(dir.path().join("tls").join("ledger.db")).unwrap();
+            let grant_tables: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE '%refresh_grants%'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(grant_tables, 0, "the table and its index are gone");
+        }
+        // What a v2 build reads is exactly its own shape, every row intact.
+        let fresh_v2 = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fresh_v2.path().join("tls")).unwrap();
+        Connection::open(fresh_v2.path().join("tls").join("ledger.db"))
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TABLE IF NOT EXISTS issued_certs ({ISSUED_CERTS_COLUMNS});
+                 {ISSUED_CERTS_INDEXES}"
+            ))
+            .unwrap();
+        assert_eq!(table_sql(dir.path()), table_sql(fresh_v2.path()));
+        assert_eq!(index_names(dir.path()), index_names(fresh_v2.path()));
+        // And upgrading again keeps every certificate, with no grant.
+        let led = CertLedger::open(dir.path(), None).unwrap();
+        assert_eq!(led.status_of("fp1").unwrap(), Some(CertStatus::Active));
+        assert_eq!(led.status_of("fp2").unwrap(), Some(CertStatus::Revoked));
+        assert!(grant_rows(&led).is_empty());
     }
 }
