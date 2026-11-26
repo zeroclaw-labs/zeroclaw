@@ -248,9 +248,13 @@ pub(crate) fn ensure_legacy_connection(document: &mut Value, path: &str) -> Resu
     let Some((kind, _alias)) = rest.split_once('.') else {
         return Ok(());
     };
-    let connections = document
-        .get_mut("connections")
-        .and_then(Value::as_object_mut)
+    let root = document
+        .as_object_mut()
+        .ok_or_else(|| anyhow::Error::msg("provider registry must be a table"))?;
+    let connections = root
+        .entry("connections".to_owned())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
         .ok_or_else(|| anyhow::Error::msg("provider connections must be a table"))?;
     connections
         .entry((*key).to_owned())
