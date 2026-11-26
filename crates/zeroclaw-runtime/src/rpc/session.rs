@@ -402,6 +402,10 @@ pub struct SessionStore {
     pub(crate) rehydration_publication_waiting: tokio::sync::Notify,
     #[cfg(test)]
     pub(crate) test_rehydration_published_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
+    /// Test-only pause in `session/configure` right before it checks whether
+    /// the session is live, so another request can restore it first.
+    #[cfg(test)]
+    pub(crate) test_configure_live_lookup_pause: std::sync::Mutex<Option<PromptRegistrationPause>>,
     #[cfg(test)]
     pub(crate) test_construction_publication_pause:
         std::sync::Mutex<Option<PromptRegistrationPause>>,
@@ -514,6 +518,8 @@ impl SessionStore {
             rehydration_publication_waiting: tokio::sync::Notify::new(),
             #[cfg(test)]
             test_rehydration_published_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_configure_live_lookup_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_construction_publication_pause: std::sync::Mutex::new(None),
             #[cfg(test)]

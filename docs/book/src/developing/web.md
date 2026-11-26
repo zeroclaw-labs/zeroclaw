@@ -107,7 +107,9 @@ existing paired-device record, and survive page reloads and gateway restarts.
 `GET` and `PUT /api/devices/me/voice` resolve that record from the authenticated
 paired bearer token; the own-device route cannot choose a different device ID. The device selector
 uses `GET/PUT /api/devices/{id}/voice` under the same operator authorization as
-listing/revoking devices. The selected record is distinct from the calling
+listing/revoking devices. A `PUT` changes only the fields in its body; fields left
+out keep their saved values, so a settings screen that has not reloaded cannot
+revert a change made from another computer. The selected record is distinct from the calling
 browser: chat controls always load their own paired record. Revoking
 or rotating a device removes its preferences along with the existing device
 record. Cookie-only OIDC sessions and unpaired access do not have a paired-device
