@@ -8,6 +8,8 @@
 tool-backup = Create, list, verify, and restore shared data directory backups
 
 tool-browser = Web/browser automation with pluggable backends (agent-browser, rust-native, computer_use). Supports DOM actions plus optional OS-level actions (mouse_move, mouse_click, mouse_drag, key_type, key_press, screen_capture) through a computer-use sidecar. Use 'snapshot' to map interactive elements to refs (@e1, @e2). Enforces browser.allowed_domains for open actions.
+tool-browser-error-zero-timeout = browser.timeout_secs must be > 0
+tool-browser-error-action-timeout = agent-browser '{ $action }' timed out after { $seconds }s (browser.timeout_secs); the subprocess was killed
 
 tool-browser-delegate = Delegate browser-based tasks to a browser-capable CLI for interacting with web applications like Teams, Outlook, Jira, Confluence
 
@@ -142,7 +144,7 @@ tool-git-forge-error-raw-requires-path = 'raw' requires 'path'.
 tool-git-forge-error-requires-resource = a typed call requires 'resource' (or use action 'raw'/'describe').
 tool-git-forge-error-missing-repo = Missing 'repo' (expected 'owner/repo').
 
-tool-glob-search = Search for files matching a glob pattern within the workspace. Returns a sorted list of matching file paths relative to the workspace root. Examples: '**/*.rs' (all Rust files), 'src/**/mod.rs' (all mod.rs in src).
+tool-glob-search = Search for files matching a glob pattern within the workspace, or under an allowed root with an absolute pattern. Returns a sorted list of matching file paths: relative to the workspace root, absolute for files outside it. Examples: '**/*.rs' (all Rust files), 'src/**/mod.rs' (all mod.rs in src).
 
 tool-google-workspace = Interact with Google Workspace services (Drive, Gmail, Calendar, Sheets, Docs, etc.) via the gws CLI. Requires gws to be installed and authenticated.
 
@@ -251,6 +253,15 @@ tool-web-search-tool-error-anysearch-invalid-response = Invalid AnySearch API re
 tool-web-search-tool-error-anysearch-api = AnySearch returned error (code { $code }): { $message }
 tool-web-search-tool-anysearch-no-title = No title
 tool-web-search-tool-anysearch-no-error-details = no error details
+tool-web-search-tool-error-firecrawl-api-key-not-configured = Firecrawl API key not configured. Set [web_search] firecrawl_api_key in config.toml (or ZEROCLAW_web_search__firecrawl_api_key). Obtain one at https://www.firecrawl.dev/app/api-keys?utm_source=zeroclaw&utm_medium=integration
+tool-web-search-tool-error-firecrawl-api-key-decrypted-empty = Firecrawl API key not configured (decrypted value is empty)
+tool-web-search-tool-error-firecrawl-config-read = Failed to read config file { $path } for Firecrawl API key: { $error }
+tool-web-search-tool-error-firecrawl-config-parse = Failed to parse config file { $path } for Firecrawl API key (error_code={ $error_code }{ $location }). Fix the TOML syntax; the parser message is withheld because it can quote the offending line.
+tool-web-search-tool-error-firecrawl-config-parse-line = , line={ $line }
+tool-web-search-tool-error-firecrawl-invalid-response = Invalid Firecrawl API response
+tool-web-search-tool-error-firecrawl-api = Firecrawl search returned an error: { $message }
+tool-web-search-tool-firecrawl-no-title = No title
+tool-web-search-tool-firecrawl-no-error-details = (no message)
 
 tool-workspace = Manage multi-client workspaces. Subcommands: list, switch, create, info, export. Each workspace provides isolated memory, audit, secrets, and tool restrictions.
 
@@ -274,3 +285,42 @@ tool-a2a-cancel = Cancel an in-flight A2A task on a peer. Returns the updated Ta
 tool-a2a-cancel-desc-peer = Configured peer name hosting the task.
 tool-a2a-cancel-desc-task-id = The task id to cancel.
 tool-a2a-cancel-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the cancel to the correct interface when discovery is re-run (the cached route is used first).
+
+tool-send-via-error-no-active-reply = No active channel reply to redirect. To start or resume a conversation, call send_via with both `target` and a non-empty `body`.
+
+tool-send-via-description-background =
+    Send a message immediately to a configured channel peer. Both `target` and a non-empty `body` are required: this task has no active channel reply to redirect. Sending starts or resumes the recipient's conversation; no inbound message is required. The target must be a channel alias or a peer group the active agent belongs to. `modality` defaults to the peer group's output modality.
+
+tool-send-via-description-routing =
+    Control where and how this turn's reply is delivered, or send an extra message to another channel.
+
+    WHEN TO USE: call this tool at the start of your response whenever the user requests a specific reply format or destination — e.g. "reply by text", "send as voice", "text only", "send to my email", "redirect to Discord". Do not wait for the user to name the tool; infer intent from natural language just as you would use a weather tool when asked for the weather.
+
+    Without `body` (routing instruction — affects this turn's main reply):
+    - `send_via(modality: "text")` — reply by text even on a voice-only peer
+    - `send_via(modality: "voice")` — reply by voice even on a text-only peer
+    - `send_via(target: "discord.main")` — redirect reply to another channel
+    - `send_via(target: "discord.main", modality: "voice")` — redirect + force modality
+    At least one of `target` or `modality` is required when `body` is absent.
+    Modality applies to this turn's final reply. Progress already streamed earlier in the turn (e.g. Telegram multi_message narration) keeps its streamed modality and is not retracted.
+
+    With `body` (immediate fanout — main reply still goes to originating channel):
+    - `send_via(target: "email.default", body: "...")` — send separate content elsewhere
+    `target` is required when `body` is present.
+
+    `target` must be a channel alias (e.g. `telegram.default`) or a peer group name the active agent belongs to. `modality` defaults to the peer group's output_modality.
+
+tool-send-via-param-target =
+    Channel alias (e.g. telegram.default) or peer group name. Required when body is present. Optional otherwise (omit = same channel).
+
+tool-send-via-param-modality =
+    Delivery modality. Omit to inherit from the peer group's output_modality.
+
+tool-send-via-param-body =
+    Message content for an immediate fanout send. Omit to set a routing instruction for the current reply instead.
+
+tool-send-via-param-background-target =
+    Required destination: a configured channel alias or authorized peer group.
+
+tool-send-via-param-background-body =
+    Required non-empty message content to send immediately.

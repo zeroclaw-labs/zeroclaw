@@ -40,6 +40,8 @@ pub struct SqliteMemory {
     keyword_weight: f32,
     cache_max: usize,
     search_mode: SearchMode,
+    /// Prepended to a recall query, never to stored content, before embedding.
+    query_prefix: Option<String>,
 }
 
 impl SqliteMemory {
@@ -68,6 +70,7 @@ impl SqliteMemory {
             keyword_weight: 0.3,
             cache_max: 10_000,
             search_mode: SearchMode::default(),
+            query_prefix: None,
         })
     }
 
@@ -92,7 +95,17 @@ impl SqliteMemory {
             keyword_weight,
             cache_max,
             search_mode,
+            query_prefix: None,
         })
+    }
+
+    /// Embed recall queries with `prefix` in front, for instruction-tuned
+    /// embedding models that expect the query side to carry an instruction.
+    /// Stored content is embedded unchanged.
+    #[must_use]
+    pub fn with_query_prefix(mut self, prefix: Option<String>) -> Self {
+        self.query_prefix = prefix.filter(|prefix| !prefix.is_empty());
+        self
     }
 
     /// Open and initialize a memory database using the canonical startup
@@ -1084,11 +1097,30 @@ impl SqliteMemory {
                 .collect());
         }
 
-        // Compute query embedding only when needed (skip for BM25-only mode)
-        let query_embedding = if self.search_mode == SearchMode::Bm25 {
-            None
-        } else {
-            self.get_or_compute_embedding(query).await?
+        // Compute query embedding only when needed (skip for BM25-only mode).
+        // In hybrid mode a failing embedder costs the vector stage, not the
+        // keyword results: recall carries on as BM25-only, the same path a
+        // deployment without an embedder takes.
+        let embedding_text =
+            super::embeddings::query_embedding_text(self.query_prefix.as_deref(), query);
+        let query_embedding = match self.search_mode {
+            SearchMode::Bm25 => None,
+            SearchMode::Embedding => self.get_or_compute_embedding(&embedding_text).await?,
+            SearchMode::Hybrid => match self.get_or_compute_embedding(&embedding_text).await {
+                Ok(embedding) => embedding,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{e}"),
+                            })),
+                        "memory recall: query embedding failed; using keyword results only"
+                    );
+                    None
+                }
+            },
         };
 
         let conn = self.conn.clone();
@@ -4026,6 +4058,57 @@ mod tests {
         assert_eq!(entry.content, "this content must be retained");
     }
 
+    #[tokio::test]
+    async fn hybrid_recall_keeps_keyword_results_when_embedding_fails() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(FailingEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::Hybrid,
+        )
+        .unwrap();
+        mem.store(
+            "budget",
+            "the quarterly budget review is on Friday",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let hits = mem
+            .recall("budget review", 5, None, None, None)
+            .await
+            .expect("recall must not fail when only the embedder does");
+        assert!(
+            hits.iter().any(|entry| entry.key == "budget"),
+            "keyword match must survive an embedder failure: {hits:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn embedding_only_recall_still_reports_an_embedder_failure() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(FailingEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::Embedding,
+        )
+        .unwrap();
+
+        assert!(mem.recall("anything", 5, None, None, None).await.is_err());
+    }
+
     // ── Embedder hot-swap────────────────────────────────
 
     /// A working embedder double that returns a fixed-length vector (each
@@ -4060,6 +4143,88 @@ mod tests {
                 .fetch_add(texts.len(), std::sync::atomic::Ordering::SeqCst);
             Ok(texts.iter().map(|_| vec![self.fill; self.dims]).collect())
         }
+    }
+
+    /// Records every text it is asked to embed, so a test can see exactly
+    /// which strings reach the embedding model.
+    struct RecordingEmbedding {
+        texts: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::embeddings::EmbeddingProvider for RecordingEmbedding {
+        fn name(&self) -> &str {
+            "recording"
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.texts
+                .lock()
+                .extend(texts.iter().map(|text| (*text).to_string()));
+            Ok(texts.iter().map(|_| vec![0.5_f32; 4]).collect())
+        }
+    }
+
+    fn recording_sqlite(
+        dir: &Path,
+        prefix: Option<&str>,
+    ) -> (SqliteMemory, Arc<Mutex<Vec<String>>>) {
+        let texts = Arc::new(Mutex::new(Vec::new()));
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            dir,
+            Arc::new(RecordingEmbedding {
+                texts: Arc::clone(&texts),
+            }),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::Hybrid,
+        )
+        .unwrap()
+        .with_query_prefix(prefix.map(str::to_string));
+        (mem, texts)
+    }
+
+    #[tokio::test]
+    async fn query_prefix_reaches_the_query_and_never_stored_content() {
+        let tmp = TempDir::new().unwrap();
+        let (mem, texts) = recording_sqlite(tmp.path(), Some("query: "));
+
+        mem.store("car", "red car", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.recall("red car", 5, None, None, None).await.unwrap();
+
+        // The stored memory is embedded as written; the query carries the
+        // prefix, and because the cache keys on the embedded text it is a
+        // fresh embedding rather than the stored memory's vector.
+        assert_eq!(
+            *texts.lock(),
+            vec!["red car".to_string(), "query: red car".to_string()]
+        );
+
+        // A repeated query is served from the cache under its prefixed text.
+        mem.recall("red car", 5, None, None, None).await.unwrap();
+        assert_eq!(texts.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn without_a_query_prefix_query_and_content_share_the_cache() {
+        let tmp = TempDir::new().unwrap();
+        let (mem, texts) = recording_sqlite(tmp.path(), Some(""));
+
+        mem.store("car", "red car", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.recall("red car", 5, None, None, None).await.unwrap();
+
+        // Unchanged behaviour: an empty prefix is no prefix, and the query
+        // reuses the cached vector of identical stored text.
+        assert_eq!(*texts.lock(), vec!["red car".to_string()]);
     }
 
     #[tokio::test]
