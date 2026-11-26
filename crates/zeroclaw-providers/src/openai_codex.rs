@@ -36,6 +36,12 @@ pub struct OpenAiCodexModelProvider {
     custom_endpoint: bool,
     gateway_api_key: Option<String>,
     reasoning_effort: Option<String>,
+    timeout_secs: u64,
+    timeout_configured: bool,
+    timeout_disabled: bool,
+    stream_request_timeout: crate::StreamRequestTimeout,
+    read_timeout_secs: Option<u64>,
+    read_timeout_disabled: bool,
     /// The configured `[multimodal]` policy.
     ///
     /// This provider normalizes image markers on its own boundary, and that
@@ -148,16 +154,68 @@ impl OpenAiCodexModelProvider {
             responses_url,
             gateway_api_key: gateway_api_key.map(ToString::to_string),
             reasoning_effort: options.reasoning_effort.clone(),
+            timeout_secs: options.provider_timeout_secs.unwrap_or(120),
+            timeout_configured: options.provider_timeout_secs.is_some(),
+            timeout_disabled: options.provider_timeout_disabled,
+            stream_request_timeout: options.provider_stream_request_timeout_secs.clone(),
+            read_timeout_secs: options.provider_read_timeout_secs,
+            read_timeout_disabled: options.provider_read_timeout_disabled,
             multimodal: options.multimodal.clone(),
         })
     }
 
-    fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_read_timeout(
+    fn http_client(&self) -> anyhow::Result<Client> {
+        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        // Buffered Responses requests include the retry path after a failed
+        // SSE decode. An explicit request timeout bounds that retry, while an
+        // omitted timeout intentionally keeps the streaming-era no-total
+        // policy; the independent read bound still prevents an idle hang.
+        if self.timeout_configured && !self.timeout_disabled {
+            builder = builder.timeout(std::time::Duration::from_secs(self.timeout_secs));
+        }
+        if !self.read_timeout_disabled {
+            let read_timeout = self.read_timeout_secs.unwrap_or(300);
+            builder = builder.read_timeout(std::time::Duration::from_secs(read_timeout));
+        }
+        let builder = crate::opencode_session::restrict_redirects(builder, &self.responses_url);
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
             "model_provider.openai",
-            300,
-            10,
-        )
+        );
+        Ok(builder.build()?)
+    }
+
+    fn streaming_timeouts(&self) -> super::StreamTimeouts {
+        super::StreamTimeouts {
+            request: super::stream_request_timeout(
+                &self.stream_request_timeout,
+                (self.timeout_configured && !self.timeout_disabled)
+                    .then(|| std::time::Duration::from_secs(self.timeout_secs)),
+            ),
+            read: (!self.read_timeout_disabled).then(|| {
+                self.read_timeout_secs.map_or_else(
+                    || super::stream_idle_timeout(self.timeout_secs),
+                    |secs| super::StreamIdleBound::Read(std::time::Duration::from_secs(secs)),
+                )
+            }),
+        }
+    }
+
+    fn streaming_client(&self) -> anyhow::Result<Client> {
+        let mut builder = Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+        let timeouts = self.streaming_timeouts();
+        if let Some(timeout) = timeouts.request {
+            builder = builder.timeout(timeout);
+        }
+        if let Some(timeout) = timeouts.read {
+            builder = builder.read_timeout(timeout.duration());
+        }
+        let builder = crate::opencode_session::restrict_redirects(builder, &self.responses_url);
+        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+            builder,
+            "model_provider.openai",
+        );
+        Ok(builder.build()?)
     }
 }
 
@@ -1399,9 +1457,52 @@ impl OpenAiCodexModelProvider {
         access_token: Option<&str>,
         use_gateway_api_key_auth: bool,
         request: &ResponsesRequest,
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
+        // Buffered chat still receives Responses SSE. Its wire timeout
+        // contract must match the public streaming path.
+        let client = if request.stream {
+            self.streaming_client()?
+        } else {
+            self.http_client()?
+        };
+        Ok(self.request_builder(
+            client,
+            bearer_token,
+            account_id,
+            access_token,
+            use_gateway_api_key_auth,
+            request,
+        ))
+    }
+
+    fn streaming_responses_request_builder(
+        &self,
+        bearer_token: &str,
+        account_id: Option<&str>,
+        access_token: Option<&str>,
+        use_gateway_api_key_auth: bool,
+        request: &ResponsesRequest,
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
+        Ok(self.request_builder(
+            self.streaming_client()?,
+            bearer_token,
+            account_id,
+            access_token,
+            use_gateway_api_key_auth,
+            request,
+        ))
+    }
+
+    fn request_builder(
+        &self,
+        client: Client,
+        bearer_token: &str,
+        account_id: Option<&str>,
+        access_token: Option<&str>,
+        use_gateway_api_key_auth: bool,
+        request: &ResponsesRequest,
     ) -> reqwest::RequestBuilder {
-        let mut request_builder = self
-            .http_client()
+        let mut request_builder = client
             .post(&self.responses_url)
             .header("Authorization", format!("Bearer {bearer_token}"))
             .header("OpenAI-Beta", "responses=experimental")
@@ -1485,7 +1586,7 @@ impl OpenAiCodexModelProvider {
             creds.access_token.as_deref(),
             creds.use_gateway_api_key_auth,
             &request,
-        );
+        )?;
 
         let response = request_builder.json(&request).send().await?;
 
@@ -1519,7 +1620,7 @@ impl OpenAiCodexModelProvider {
                         creds.access_token.as_deref(),
                         creds.use_gateway_api_key_auth,
                         &request,
-                    )
+                    )?
                     .json(&request)
                     .send()
                     .await?;
@@ -1730,21 +1831,27 @@ impl ModelProvider for OpenAiCodexModelProvider {
                 );
             }
 
-            let request_builder = provider
-                .responses_request_builder(
-                    &creds.bearer_token,
-                    creds.account_id.as_deref(),
-                    creds.access_token.as_deref(),
-                    creds.use_gateway_api_key_auth,
-                    &request,
-                )
-                .json(&request);
+            let request_builder = match provider.streaming_responses_request_builder(
+                &creds.bearer_token,
+                creds.account_id.as_deref(),
+                creds.access_token.as_deref(),
+                creds.use_gateway_api_key_auth,
+                &request,
+            ) {
+                Ok(builder) => builder.json(&request),
+                Err(err) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(err.to_string())))
+                        .await;
+                    return;
+                }
+            };
 
             crate::openai::run_responses_sse(
                 request_builder,
                 &tx,
                 count_tokens,
-                crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT),
+                provider.streaming_timeouts(),
             )
             .await;
         });
@@ -2161,6 +2268,33 @@ mod tests {
         assert_eq!(provider.multimodal.max_image_size_mb, 2);
     }
 
+    #[test]
+    fn buffered_responses_use_the_same_sse_deadline_policy_as_streaming() {
+        let options = ModelProviderRuntimeOptions::default();
+        let provider = OpenAiCodexModelProvider::new("test", &options, None).unwrap();
+        let timeouts = provider.streaming_timeouts();
+        assert_eq!(timeouts.request, None);
+        assert_eq!(
+            timeouts.read.unwrap().duration(),
+            std::time::Duration::from_secs(300)
+        );
+
+        let options = ModelProviderRuntimeOptions {
+            provider_timeout_secs: Some(600),
+            provider_stream_request_timeout_secs: Some(
+                zeroclaw_config::provider_registry::Override::Clear,
+            ),
+            provider_read_timeout_secs: Some(30),
+            ..Default::default()
+        };
+        let provider = OpenAiCodexModelProvider::new("test", &options, None).unwrap();
+        assert_eq!(provider.streaming_timeouts().request, None);
+        assert_eq!(
+            provider.streaming_timeouts().read.unwrap().duration(),
+            std::time::Duration::from_secs(30)
+        );
+    }
+
     #[tokio::test]
     async fn codex_responses_provider_honors_runtime_proxy_after_construction() {
         use axum::{Json, Router, extract::State, routing::post};
@@ -2247,8 +2381,9 @@ mod tests {
             tool_choice: None,
             parallel_tool_calls: None,
         };
-        let request_builder =
-            provider.responses_request_builder("test-key", None, None, true, &request);
+        let request_builder = provider
+            .responses_request_builder("test-key", None, None, true, &request)
+            .unwrap();
         set_runtime_proxy_config(ProxyConfig::default());
 
         let response_body: serde_json::Value = request_builder

@@ -871,7 +871,7 @@ mod tests {
     }
 
     const REFUSAL_GUIDANCE: &str = "The model's safety system declined this request. Rephrase it, \
-                                    or configure fallback_models on the provider to auto-switch \
+                                    or configure a target in [providers.fallback] to auto-switch \
                                     models.";
 
     fn private_refusal() -> zeroclaw_api::model_provider::ModelRefusalError {

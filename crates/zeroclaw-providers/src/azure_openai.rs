@@ -10,6 +10,7 @@ use zeroclaw_api::tool::ToolSpec;
 const DEFAULT_API_VERSION: &str = "2024-08-01-preview";
 
 pub struct AzureOpenAiModelProvider {
+    http_timeouts: crate::transport::ChatHttpTimeouts,
     /// `[providers.models.azure.<alias>]` config-key alias.
     alias: String,
     credential: Option<String>,
@@ -59,11 +60,11 @@ impl ResponseMessage {
     }
 }
 
-/// String-only completions have no native tool-call escape hatch. An empty or
-/// reasoning-only result is therefore a typed terminal failure, not a valid
-/// string result for direct callers that do not use the structured chat API.
+/// Validate only the raw wire content. Candidate-specific extraction belongs
+/// to Reliable, which knows the exact configured reference rather than only
+/// the upstream deployment ID sent to Azure.
 fn require_terminal_text(content: String) -> anyhow::Result<String> {
-    if zeroclaw_api::model_provider::strip_think_tags(&content).is_empty() {
+    if content.trim().is_empty() {
         return Err(anyhow::Error::new(
             zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
         ));
@@ -200,6 +201,7 @@ impl NativeResponseMessage {
 /// reasoning effort have sensible defaults.
 #[must_use]
 pub struct AzureOpenAiBuilder {
+    http_timeouts: crate::transport::ChatHttpTimeouts,
     alias: String,
     resource_name: Option<String>,
     deployment_name: Option<String>,
@@ -209,6 +211,11 @@ pub struct AzureOpenAiBuilder {
 }
 
 impl AzureOpenAiBuilder {
+    pub(crate) fn http_timeouts(mut self, options: &crate::ModelProviderRuntimeOptions) -> Self {
+        self.http_timeouts = crate::transport::ChatHttpTimeouts::from_options(options);
+        self
+    }
+
     /// The `<resource>` half of Azure's deployment URL
     /// `https://<resource>.openai.azure.com/…`. Required.
     pub fn resource_name(mut self, resource: &str) -> Self {
@@ -266,6 +273,7 @@ impl AzureOpenAiBuilder {
             resource_name, deployment_name
         );
         AzureOpenAiModelProvider {
+            http_timeouts: self.http_timeouts,
             alias: self.alias,
             credential: self.credential,
             api_version: version,
@@ -281,6 +289,7 @@ impl AzureOpenAiModelProvider {
     /// via a labelled chain method on the returned [`AzureOpenAiBuilder`].
     pub fn builder(alias: &str) -> AzureOpenAiBuilder {
         AzureOpenAiBuilder {
+            http_timeouts: Default::default(),
             alias: alias.to_string(),
             resource_name: None,
             deployment_name: None,
@@ -327,7 +336,7 @@ impl AzureOpenAiModelProvider {
         let tools_count = request.tools.as_ref().map_or(0, Vec::len);
         loop {
             let response = self
-                .http_client()
+                .http_client()?
                 .post(self.chat_completions_url())
                 .header("api-key", credential)
                 .json(request)
@@ -487,12 +496,8 @@ impl AzureOpenAiModelProvider {
         }
     }
 
-    fn http_client(&self) -> Client {
-        zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "model_provider.azure_openai",
-            120,
-            10,
-        )
+    fn http_client(&self) -> anyhow::Result<Client> {
+        self.http_timeouts.client("model_provider.azure_openai")
     }
 }
 
@@ -575,7 +580,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
         };
 
         let response = self
-            .http_client()
+            .http_client()?
             .post(self.chat_completions_url())
             .header("api-key", credential.as_str())
             .json(&request)
@@ -1325,10 +1330,10 @@ mod tests {
     }
 
     #[test]
-    fn string_completion_rejects_empty_and_think_only_text() {
-        for text in ["", "  \n", "<think>internal reasoning</think>"] {
+    fn string_completion_rejects_empty_wire_text() {
+        for text in ["", "  \n"] {
             let error = require_terminal_text(text.to_string())
-                .expect_err("a string-only semantic-empty completion must fail");
+                .expect_err("an empty wire completion must fail");
             assert!(error.chain().any(|cause| {
                 cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
             }));
@@ -1341,6 +1346,12 @@ mod tests {
             require_terminal_text("final answer".to_string()).unwrap(),
             "final answer"
         );
+    }
+
+    #[test]
+    fn string_completion_keeps_think_only_text_when_reasoning_extraction_is_disabled() {
+        let text = "<think>keep this literal</think>".to_string();
+        assert_eq!(require_terminal_text(text.clone()).unwrap(), text);
     }
 
     #[test]

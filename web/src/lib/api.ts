@@ -478,9 +478,9 @@ export async function getPublicHealth(): Promise<{
 /**
  * System status overview. Pass an `agent` alias to get the model, provider,
  * temperature, and memory backend resolved for that specific agent — the
- * gateway runs the same `resolved_model_provider_for_agent` logic it uses to
- * build the Agent, so the returned `model` reflects that agent's configured
- * provider entry. Omitting the alias returns the install-wide first-of-each
+ * gateway resolves the agent's canonical model reference before it builds the
+ * Agent, so the returned `model` reflects that agent's configured model.
+ * Omitting the alias returns the install-wide first-of-each
  * summary (the gateway default model), which is NOT correct for any
  * non-default agent.
  */
@@ -706,6 +706,33 @@ export function deleteProp(path: string): Promise<PropResponse> {
 export function listProps(prefix?: string): Promise<ListResponse> {
   const q = prefix ? `?prefix=${encodeURIComponent(prefix)}` : "";
   return apiFetch<ListResponse>(`/api/config/list${q}`);
+}
+
+// The editor snapshot always includes the four maps, including empty maps.
+// Their contents stay generated from the backend's capability-tagged schema.
+export type ProviderRegistryDocument = Required<components['schemas']['ProviderRegistry']>;
+export type ProviderRegistrySnapshot = ProviderRegistryDocument &
+  Pick<components['schemas']['RegistrySnapshot'], 'revision'>;
+
+export function getProviderRegistry(signal?: AbortSignal): Promise<ProviderRegistrySnapshot> {
+  return apiFetch('/api/config/provider-registry', { signal });
+}
+
+export async function saveProviderRegistry(
+  expected: ProviderRegistrySnapshot,
+  registry: ProviderRegistryDocument,
+): Promise<void> {
+  // A reload started before this write must never be reused for the post-save
+  // baseline. Existing callers may still receive its response; the next GET
+  // is forced to use a new request.
+  invalidateInFlightGet('/api/config/provider-registry');
+  await apiFetch('/api/config/provider-registry', {
+    method: 'PUT',
+    body: JSON.stringify({ expected, registry }),
+  });
+  invalidateInFlightGet('/api/config/provider-registry');
+  window.dispatchEvent(new Event('zeroclaw-provider-registry-mutated'));
+  window.dispatchEvent(new Event('zeroclaw-config-mutated'));
 }
 
 export async function patchConfig(
@@ -1584,6 +1611,7 @@ export interface SectionInfo {
     | "one_tier_alias_map"
     | "typed_family_map"
     | "backend_picker"
+    | "cost_rates"
     | null;
   /** Backend-owned cost-rate category for this section, emitted from
    *  `cost_category_for_provider_section`. One of `models` / `tts` /

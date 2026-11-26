@@ -196,7 +196,7 @@ mod tests {
             },
         );
         tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
-        Arc::new(config)
+        Arc::new(zeroclaw_config::migration::admit_test_input(&config))
     }
 
     #[tokio::test]

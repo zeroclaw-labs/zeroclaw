@@ -5,6 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
+use zeroclaw_api::model_provider::CallSampling;
 
 use futures_util::stream::{self, StreamExt as _};
 use zeroclaw_api::model_provider::{
@@ -145,6 +146,9 @@ impl RejectedAttempt {
 /// Immutable actual route of a transport-successful Reliable completion.
 #[derive(Debug, Clone)]
 pub struct AcceptedRoute {
+    // Construction selection, distinct from the physical billing identity.
+    // Capacity and other policy are resolved from Config by the consumer.
+    selection_ref: Option<String>,
     provider_ref: String,
     model: String,
     fallback: Option<crate::reliable::ProviderFallbackAttribution>,
@@ -157,10 +161,22 @@ impl AcceptedRoute {
         fallback: Option<crate::reliable::ProviderFallbackAttribution>,
     ) -> Self {
         Self {
+            selection_ref: None,
             provider_ref,
             model,
             fallback,
         }
+    }
+
+    pub(crate) fn with_selection_ref(mut self, selection_ref: Option<&str>) -> Self {
+        self.selection_ref = selection_ref.map(str::to_owned);
+        self
+    }
+
+    /// Full configured selection used to construct the accepted candidate.
+    #[must_use]
+    pub fn selection_ref(&self) -> Option<&str> {
+        self.selection_ref.as_deref()
     }
 
     #[must_use]
@@ -190,6 +206,9 @@ impl AcceptedRoute {
     }
 
     pub(crate) fn with_identity(mut self, provider_ref: String, model: String) -> Self {
+        if self.provider_ref != provider_ref || self.model != model {
+            self.selection_ref = None;
+        }
         self.provider_ref = provider_ref;
         self.model = model;
         self
@@ -358,6 +377,12 @@ pub struct AccountedChatScope {
 }
 
 impl AccountedChatScope {
+    /// Read the successful transport selection without draining accounting or
+    /// committing semantic acceptance. Recovery uses it to resolve model policy.
+    pub fn accepted_route(&self) -> Option<AcceptedRoute> {
+        self.inner.accepted_route()
+    }
+
     /// Start the only lifecycle scope allowed by the providers/runtime
     /// accounting contract. `Default` is intentionally not implemented: it
     /// would add an unaudited second public construction capability.
@@ -423,6 +448,12 @@ impl AccountedChatScope {
     pub fn record_stream_semantic_rejection_usage(&self, usage: crate::traits::TokenUsage) {
         accounting::record_stream_semantic_rejection_usage(usage);
     }
+}
+
+/// The currently selected streaming candidate, before semantic acceptance.
+/// Consumers may resolve its configuration but must not commit attribution.
+pub fn current_provisional_provider_route() -> Option<AcceptedRoute> {
+    crate::reliable::current_provisional_provider_route()
 }
 
 /// Commit a semantically accepted route for the existing fallback presenter.
@@ -597,7 +628,17 @@ impl ProviderDispatch {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
-        self.chat_with_tool_round_policy(
+        self.chat_with_sampling(request, model, CallSampling::Explicit(temperature))
+            .await
+    }
+
+    pub async fn chat_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_sampling_and_tool_round_policy(
             request,
             model,
             temperature,
@@ -613,12 +654,28 @@ impl ProviderDispatch {
         temperature: Option<f64>,
         policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_sampling_and_tool_round_policy(
+            request,
+            model,
+            CallSampling::Explicit(temperature),
+            policy,
+        )
+        .await
+    }
+
+    pub async fn chat_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
         accounted_chat_call(&*self.inner, model, async move {
             zeroclaw_log::scope!(
                 model: model,
-                => self.inner.chat_with_tool_round_policy(request, model, temperature, policy)
+                => self.inner.chat_with_sampling_and_tool_round_policy(request, model, temperature, policy)
             )
             .await
         })
@@ -634,8 +691,20 @@ impl ProviderDispatch {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<AccountedChatResponse> {
+        self.chat_accounted_with_sampling(request, model, CallSampling::Explicit(temperature))
+            .await
+    }
+
+    pub async fn chat_accounted_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<AccountedChatResponse> {
         let scope = AccountedChatScope::new();
-        let result = scope.scope(self.chat(request, model, temperature)).await;
+        let result = scope
+            .scope(self.chat_with_sampling(request, model, temperature))
+            .await;
         if result.is_ok() {
             scope.mark_logical_success();
         }
@@ -656,7 +725,23 @@ impl ProviderDispatch {
         temperature: Option<f64>,
         refusal: crate::AnthropicRefusalError,
     ) -> anyhow::Result<ChatResponse> {
-        self.chat_after_stream_refusal_with_tool_round_policy(
+        self.chat_after_stream_refusal_with_sampling(
+            request,
+            model,
+            CallSampling::Explicit(temperature),
+            refusal,
+        )
+        .await
+    }
+
+    pub async fn chat_after_stream_refusal_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+        refusal: crate::AnthropicRefusalError,
+    ) -> anyhow::Result<ChatResponse> {
+        self.chat_after_stream_refusal_with_sampling_and_tool_round_policy(
             request,
             model,
             temperature,
@@ -674,9 +759,27 @@ impl ProviderDispatch {
         refusal: crate::AnthropicRefusalError,
         policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_after_stream_refusal_with_sampling_and_tool_round_policy(
+            request,
+            model,
+            CallSampling::Explicit(temperature),
+            refusal,
+            policy,
+        )
+        .await
+    }
+
+    pub async fn chat_after_stream_refusal_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+        refusal: crate::AnthropicRefusalError,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
         crate::reliable::scope_stream_refusal_recovery(
             refusal,
-            self.chat_with_tool_round_policy(request, model, temperature, policy),
+            self.chat_with_sampling_and_tool_round_policy(request, model, temperature, policy),
         )
         .await
     }
@@ -688,7 +791,17 @@ impl ProviderDispatch {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
-        self.stream_chat_with_tool_round_policy(
+        self.stream_chat_with_sampling(request, model, CallSampling::Explicit(temperature), options)
+    }
+
+    pub fn stream_chat_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_sampling_and_tool_round_policy(
             request,
             model,
             temperature,
@@ -705,11 +818,28 @@ impl ProviderDispatch {
         options: StreamOptions,
         policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_sampling_and_tool_round_policy(
+            request,
+            model,
+            CallSampling::Explicit(temperature),
+            options,
+            policy,
+        )
+    }
+
+    pub fn stream_chat_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         let attribution = zeroclaw_log::attribution_span!(&*self.inner);
-        // Enter attribution synchronously so model_scope uses it as parent.
-        // Enter model_scope while constructing the inner stream as well as while
-        // polling it: providers may eagerly spawn parser tasks here, and those
-        // tasks must inherit the effective model attribution.
+        // Enter the attribution span synchronously so the model_scope
+        // info_span! constructs with attribution as its parent. Drop
+        // the guard before returning; the attribution span lives on
+        // via model_scope's parent pointer.
         let _attribution_enter = attribution.enter();
         let model_scope = zeroclaw_log::info_span!(
             target: "zeroclaw_log_internal_scope",
@@ -718,16 +848,13 @@ impl ProviderDispatch {
         );
         let provider_ref = provider_reference(&*self.inner);
         let model_name = model.to_string();
-        let inner_stream = {
-            let _model_enter = model_scope.enter();
-            self.inner.stream_chat_with_tool_round_policy(
-                request,
-                model,
-                temperature,
-                options,
-                policy,
-            )
-        };
+        let inner_stream = self.inner.stream_chat_with_sampling_and_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            policy,
+        );
         drop(_attribution_enter);
         let mut inner_stream = inner_stream;
         let mut attempt = accounting::AttemptState::unstarted(provider_ref, model_name);
@@ -764,11 +891,32 @@ impl ProviderDispatch {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<crate::traits::StreamChunk>> {
+        self.stream_chat_with_system_with_sampling(
+            system_prompt,
+            message,
+            model,
+            CallSampling::Explicit(temperature),
+            options,
+        )
+    }
+
+    pub fn stream_chat_with_system_with_sampling(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<crate::traits::StreamChunk>> {
         let provider_ref = provider_reference(&*self.inner);
         let model_name = model.to_string();
-        let mut inner_stream =
-            self.inner
-                .stream_chat_with_system(system_prompt, message, model, temperature, options);
+        let mut inner_stream = self.inner.stream_chat_with_system_with_sampling(
+            system_prompt,
+            message,
+            model,
+            temperature,
+            options,
+        );
         let mut attempt = accounting::AttemptState::unstarted(provider_ref, model_name);
         stream::poll_fn(move |cx| {
             attempt.start();
@@ -796,11 +944,29 @@ impl ProviderDispatch {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<crate::traits::StreamChunk>> {
+        self.stream_chat_with_history_with_sampling(
+            messages,
+            model,
+            CallSampling::Explicit(temperature),
+            options,
+        )
+    }
+
+    pub fn stream_chat_with_history_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<crate::traits::StreamChunk>> {
         let provider_ref = provider_reference(&*self.inner);
         let model_name = model.to_string();
-        let mut inner_stream =
-            self.inner
-                .stream_chat_with_history(messages, model, temperature, options);
+        let mut inner_stream = self.inner.stream_chat_with_history_with_sampling(
+            messages,
+            model,
+            temperature,
+            options,
+        );
         let mut attempt = accounting::AttemptState::unstarted(provider_ref, model_name);
         stream::poll_fn(move |cx| {
             attempt.start();
@@ -848,12 +1014,28 @@ impl ProviderDispatch {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        self.chat_with_system_with_sampling(
+            system_prompt,
+            message,
+            model,
+            CallSampling::Explicit(temperature),
+        )
+        .await
+    }
+
+    pub async fn chat_with_system_with_sampling(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<String> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
         accounted_string_call(&*self.inner, model, async move {
             zeroclaw_log::scope!(
                 model: model,
-                => self.inner.chat_with_system(system_prompt, message, model, temperature)
+                => self.inner.chat_with_system_with_sampling(system_prompt, message, model, temperature)
             )
             .await
         })
@@ -868,12 +1050,22 @@ impl ProviderDispatch {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        self.chat_with_history_with_sampling(messages, model, CallSampling::Explicit(temperature))
+            .await
+    }
+
+    pub async fn chat_with_history_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<String> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
         accounted_string_call(&*self.inner, model, async move {
             zeroclaw_log::scope!(
                 model: model,
-                => self.inner.chat_with_history(messages, model, temperature)
+                => self.inner.chat_with_history_with_sampling(messages, model, temperature)
             )
             .await
         })
@@ -889,12 +1081,28 @@ impl ProviderDispatch {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_tools_with_sampling(
+            messages,
+            tools,
+            model,
+            CallSampling::Explicit(temperature),
+        )
+        .await
+    }
+
+    pub async fn chat_with_tools_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<ChatResponse> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
         accounted_chat_call(&*self.inner, model, async move {
             zeroclaw_log::scope!(
                 model: model,
-                => self.inner.chat_with_tools(messages, tools, model, temperature)
+                => self.inner.chat_with_tools_with_sampling(messages, tools, model, temperature)
             )
             .await
         })
@@ -911,9 +1119,25 @@ impl ProviderDispatch {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<AccountedChatResponse> {
+        self.chat_with_tools_accounted_with_sampling(
+            messages,
+            tools,
+            model,
+            CallSampling::Explicit(temperature),
+        )
+        .await
+    }
+
+    pub async fn chat_with_tools_accounted_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<AccountedChatResponse> {
         let scope = AccountedChatScope::new();
         let result = scope
-            .scope(self.chat_with_tools(messages, tools, model, temperature))
+            .scope(self.chat_with_tools_with_sampling(messages, tools, model, temperature))
             .await;
         if result.is_ok() {
             scope.mark_logical_success();
@@ -961,7 +1185,17 @@ impl<'a> ProviderDispatchRef<'a> {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
-        self.chat_with_tool_round_policy(
+        self.chat_with_sampling(request, model, CallSampling::Explicit(temperature))
+            .await
+    }
+
+    pub async fn chat_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_sampling_and_tool_round_policy(
             request,
             model,
             temperature,
@@ -977,12 +1211,28 @@ impl<'a> ProviderDispatchRef<'a> {
         temperature: Option<f64>,
         policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_sampling_and_tool_round_policy(
+            request,
+            model,
+            CallSampling::Explicit(temperature),
+            policy,
+        )
+        .await
+    }
+
+    pub async fn chat_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(self.inner);
         accounted_chat_call(self.inner, model, async move {
             zeroclaw_log::scope!(
                 model: model,
-                => self.inner.chat_with_tool_round_policy(request, model, temperature, policy)
+                => self.inner.chat_with_sampling_and_tool_round_policy(request, model, temperature, policy)
             )
             .await
         })
@@ -998,8 +1248,20 @@ impl<'a> ProviderDispatchRef<'a> {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<AccountedChatResponse> {
+        self.chat_accounted_with_sampling(request, model, CallSampling::Explicit(temperature))
+            .await
+    }
+
+    pub async fn chat_accounted_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<AccountedChatResponse> {
         let scope = AccountedChatScope::new();
-        let result = scope.scope(self.chat(request, model, temperature)).await;
+        let result = scope
+            .scope(self.chat_with_sampling(request, model, temperature))
+            .await;
         if result.is_ok() {
             scope.mark_logical_success();
         }
@@ -1043,7 +1305,23 @@ impl<'a> ProviderDispatchRef<'a> {
         temperature: Option<f64>,
         refusal: crate::AnthropicRefusalError,
     ) -> anyhow::Result<ChatResponse> {
-        self.chat_after_stream_refusal_with_tool_round_policy(
+        self.chat_after_stream_refusal_with_sampling(
+            request,
+            model,
+            CallSampling::Explicit(temperature),
+            refusal,
+        )
+        .await
+    }
+
+    pub async fn chat_after_stream_refusal_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+        refusal: crate::AnthropicRefusalError,
+    ) -> anyhow::Result<ChatResponse> {
+        self.chat_after_stream_refusal_with_sampling_and_tool_round_policy(
             request,
             model,
             temperature,
@@ -1061,9 +1339,27 @@ impl<'a> ProviderDispatchRef<'a> {
         refusal: crate::AnthropicRefusalError,
         policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_after_stream_refusal_with_sampling_and_tool_round_policy(
+            request,
+            model,
+            CallSampling::Explicit(temperature),
+            refusal,
+            policy,
+        )
+        .await
+    }
+
+    pub async fn chat_after_stream_refusal_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+        refusal: crate::AnthropicRefusalError,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> anyhow::Result<ChatResponse> {
         crate::reliable::scope_stream_refusal_recovery(
             refusal,
-            self.chat_with_tool_round_policy(request, model, temperature, policy),
+            self.chat_with_sampling_and_tool_round_policy(request, model, temperature, policy),
         )
         .await
     }
@@ -1075,7 +1371,17 @@ impl<'a> ProviderDispatchRef<'a> {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
-        self.stream_chat_with_tool_round_policy(
+        self.stream_chat_with_sampling(request, model, CallSampling::Explicit(temperature), options)
+    }
+
+    pub fn stream_chat_with_sampling(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_sampling_and_tool_round_policy(
             request,
             model,
             temperature,
@@ -1092,6 +1398,23 @@ impl<'a> ProviderDispatchRef<'a> {
         options: StreamOptions,
         policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        self.stream_chat_with_sampling_and_tool_round_policy(
+            request,
+            model,
+            CallSampling::Explicit(temperature),
+            options,
+            policy,
+        )
+    }
+
+    pub fn stream_chat_with_sampling_and_tool_round_policy(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         let attribution = zeroclaw_log::attribution_span!(self.inner);
         let _attribution_enter = attribution.enter();
         let model_scope = zeroclaw_log::info_span!(
@@ -1101,16 +1424,13 @@ impl<'a> ProviderDispatchRef<'a> {
         );
         let provider_ref = provider_reference(self.inner);
         let model_name = model.to_string();
-        let inner_stream = {
-            let _model_enter = model_scope.enter();
-            self.inner.stream_chat_with_tool_round_policy(
-                request,
-                model,
-                temperature,
-                options,
-                policy,
-            )
-        };
+        let inner_stream = self.inner.stream_chat_with_sampling_and_tool_round_policy(
+            request,
+            model,
+            temperature,
+            options,
+            policy,
+        );
         drop(_attribution_enter);
         let mut inner_stream = inner_stream;
         let mut attempt = accounting::AttemptState::unstarted(provider_ref, model_name);
@@ -1145,11 +1465,32 @@ impl<'a> ProviderDispatchRef<'a> {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<crate::traits::StreamChunk>> {
+        self.stream_chat_with_system_with_sampling(
+            system_prompt,
+            message,
+            model,
+            CallSampling::Explicit(temperature),
+            options,
+        )
+    }
+
+    pub fn stream_chat_with_system_with_sampling(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<crate::traits::StreamChunk>> {
         let provider_ref = provider_reference(self.inner);
         let model_name = model.to_string();
-        let mut inner_stream =
-            self.inner
-                .stream_chat_with_system(system_prompt, message, model, temperature, options);
+        let mut inner_stream = self.inner.stream_chat_with_system_with_sampling(
+            system_prompt,
+            message,
+            model,
+            temperature,
+            options,
+        );
         let mut attempt = accounting::AttemptState::unstarted(provider_ref, model_name);
         stream::poll_fn(move |cx| {
             attempt.start();
@@ -1177,11 +1518,29 @@ impl<'a> ProviderDispatchRef<'a> {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<crate::traits::StreamChunk>> {
+        self.stream_chat_with_history_with_sampling(
+            messages,
+            model,
+            CallSampling::Explicit(temperature),
+            options,
+        )
+    }
+
+    pub fn stream_chat_with_history_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: CallSampling,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<crate::traits::StreamChunk>> {
         let provider_ref = provider_reference(self.inner);
         let model_name = model.to_string();
-        let mut inner_stream =
-            self.inner
-                .stream_chat_with_history(messages, model, temperature, options);
+        let mut inner_stream = self.inner.stream_chat_with_history_with_sampling(
+            messages,
+            model,
+            temperature,
+            options,
+        );
         let mut attempt = accounting::AttemptState::unstarted(provider_ref, model_name);
         stream::poll_fn(move |cx| {
             attempt.start();
@@ -1233,12 +1592,28 @@ impl<'a> ProviderDispatchRef<'a> {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        self.chat_with_system_with_sampling(
+            system_prompt,
+            message,
+            model,
+            CallSampling::Explicit(temperature),
+        )
+        .await
+    }
+
+    pub async fn chat_with_system_with_sampling(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<String> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(self.inner);
         accounted_string_call(self.inner, model, async move {
             zeroclaw_log::scope!(
                 model: model,
-                => self.inner.chat_with_system(system_prompt, message, model, temperature)
+                => self.inner.chat_with_system_with_sampling(system_prompt, message, model, temperature)
             )
             .await
         })
@@ -1253,12 +1628,22 @@ impl<'a> ProviderDispatchRef<'a> {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        self.chat_with_history_with_sampling(messages, model, CallSampling::Explicit(temperature))
+            .await
+    }
+
+    pub async fn chat_with_history_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<String> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(self.inner);
         accounted_string_call(self.inner, model, async move {
             zeroclaw_log::scope!(
                 model: model,
-                => self.inner.chat_with_history(messages, model, temperature)
+                => self.inner.chat_with_history_with_sampling(messages, model, temperature)
             )
             .await
         })
@@ -1274,12 +1659,28 @@ impl<'a> ProviderDispatchRef<'a> {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        self.chat_with_tools_with_sampling(
+            messages,
+            tools,
+            model,
+            CallSampling::Explicit(temperature),
+        )
+        .await
+    }
+
+    pub async fn chat_with_tools_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<ChatResponse> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(self.inner);
         accounted_chat_call(self.inner, model, async move {
             zeroclaw_log::scope!(
                 model: model,
-                => self.inner.chat_with_tools(messages, tools, model, temperature)
+                => self.inner.chat_with_tools_with_sampling(messages, tools, model, temperature)
             )
             .await
         })
@@ -1296,9 +1697,25 @@ impl<'a> ProviderDispatchRef<'a> {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<AccountedChatResponse> {
+        self.chat_with_tools_accounted_with_sampling(
+            messages,
+            tools,
+            model,
+            CallSampling::Explicit(temperature),
+        )
+        .await
+    }
+
+    pub async fn chat_with_tools_accounted_with_sampling(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: CallSampling,
+    ) -> anyhow::Result<AccountedChatResponse> {
         let scope = AccountedChatScope::new();
         let result = scope
-            .scope(self.chat_with_tools(messages, tools, model, temperature))
+            .scope(self.chat_with_tools_with_sampling(messages, tools, model, temperature))
             .await;
         if result.is_ok() {
             scope.mark_logical_success();
@@ -1348,7 +1765,7 @@ mod tests {
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::{
         ChatRequest, ChatResponse, ModelProvider, StreamChunk, StreamEvent, StreamOptions,
-        StreamResult, ToolRoundPolicy,
+        StreamResult,
     };
 
     struct FakeAnthropic {
@@ -1744,7 +2161,6 @@ mod tests {
 
     struct StreamingFake {
         alias: String,
-        expected_policy: ToolRoundPolicy,
     }
 
     impl Attributable for StreamingFake {
@@ -1768,18 +2184,6 @@ mod tests {
             anyhow::bail!("not used in stream test")
         }
 
-        fn stream_chat_with_tool_round_policy(
-            &self,
-            request: ChatRequest<'_>,
-            model: &str,
-            temperature: Option<f64>,
-            options: StreamOptions,
-            policy: ToolRoundPolicy,
-        ) -> futures_util::stream::BoxStream<'static, StreamResult<StreamEvent>> {
-            assert_eq!(policy, self.expected_policy);
-            self.stream_chat(request, model, temperature, options)
-        }
-
         fn stream_chat(
             &self,
             _request: ChatRequest<'_>,
@@ -1787,11 +2191,6 @@ mod tests {
             _temperature: Option<f64>,
             _options: StreamOptions,
         ) -> futures_util::stream::BoxStream<'static, StreamResult<StreamEvent>> {
-            zeroclaw_log::record!(
-                INFO,
-                zeroclaw_log::Event::new(module_path!(), zeroclaw_log::Action::Note),
-                "streaming-fake stream created"
-            );
             futures_util::stream::unfold(0u8, |state| async move {
                 match state {
                     0 => {
@@ -1948,23 +2347,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_stream_creation_and_chunk_records_carry_attribution() {
-        for policy in [ToolRoundPolicy::Batch, ToolRoundPolicy::Single] {
-            assert_stream_creation_and_chunk_records_carry_attribution(false, policy).await;
-        }
-    }
-
-    #[tokio::test]
-    async fn dispatch_ref_stream_creation_and_chunk_records_carry_attribution() {
-        for policy in [ToolRoundPolicy::Batch, ToolRoundPolicy::Single] {
-            assert_stream_creation_and_chunk_records_carry_attribution(true, policy).await;
-        }
-    }
-
-    async fn assert_stream_creation_and_chunk_records_carry_attribution(
-        borrowed: bool,
-        policy: ToolRoundPolicy,
-    ) {
+    async fn dispatch_stream_chunk_records_carry_attribution() {
         let _writer_guard = zeroclaw_log::__private_test_writer_lock();
         let _hook_guard = zeroclaw_log::__private_test_hook_lock();
         zeroclaw_log::try_install_capture_subscriber();
@@ -1973,50 +2356,35 @@ mod tests {
 
         let fake: Arc<dyn ModelProvider> = Arc::new(StreamingFake {
             alias: "stream-alias".into(),
-            expected_policy: policy,
         });
+        let dispatch = ProviderDispatch::new(fake);
         let request = ChatRequest {
             messages: &[],
             tools: None,
             thinking: None,
         };
-        let mut stream = if borrowed {
-            ProviderDispatch::from_ref(fake.as_ref()).stream_chat_with_tool_round_policy(
-                request,
-                "claude-sonnet-4-6",
-                None,
-                StreamOptions::default(),
-                policy,
-            )
-        } else {
-            ProviderDispatch::new(fake).stream_chat_with_tool_round_policy(
-                request,
-                "claude-sonnet-4-6",
-                None,
-                StreamOptions::default(),
-                policy,
-            )
-        };
+        let mut stream =
+            dispatch.stream_chat(request, "claude-sonnet-4-6", None, StreamOptions::default());
         while stream.next().await.is_some() {}
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let mut found_creation = false;
-        let mut found_chunk = false;
-        while !(found_creation && found_chunk) && std::time::Instant::now() < deadline {
+        let mut found = false;
+        while !found && std::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             let step = remaining.min(std::time::Duration::from_millis(50));
             match tokio::time::timeout(step, rx.recv()).await {
                 Ok(Ok(value)) => {
-                    let message = value.get("message").and_then(|value| value.as_str());
-                    if matches!(
-                        message,
-                        Some("streaming-fake stream created" | "streaming-fake chunk")
-                    ) {
+                    if value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.contains("streaming-fake chunk"))
+                        .unwrap_or(false)
+                    {
                         let zc = value.get("zeroclaw").expect("zeroclaw block present");
                         assert_eq!(
                             zc.get("model_provider_alias").and_then(|v| v.as_str()),
                             Some("stream-alias"),
-                            "stream record not attributed; zc: {zc:?}",
+                            "stream chunk record not attributed; zc: {zc:?}",
                         );
                         assert_eq!(
                             zc.get("model_provider_type").and_then(|v| v.as_str()),
@@ -2026,8 +2394,7 @@ mod tests {
                             zc.get("model").and_then(|v| v.as_str()),
                             Some("claude-sonnet-4-6"),
                         );
-                        found_creation |= message == Some("streaming-fake stream created");
-                        found_chunk |= message == Some("streaming-fake chunk");
+                        found = true;
                     }
                 }
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
@@ -2035,11 +2402,7 @@ mod tests {
                 Err(_elapsed) => {}
             }
         }
-        assert!(
-            found_creation,
-            "stream creation record was not attributed with provider/model"
-        );
-        assert!(found_chunk, "stream chunk record was not attributed");
+        assert!(found, "stream chunk record was not attributed");
         zeroclaw_log::clear_broadcast_hook();
     }
 

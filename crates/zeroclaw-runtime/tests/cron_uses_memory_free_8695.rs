@@ -63,6 +63,7 @@ async fn config_with_planted_memory(provider_uri: &str, workspace_dir: &std::pat
         base.api_key = Some("test-key".to_string());
         base.model = Some("test-model".to_string());
         base.uri = Some(provider_uri.to_string());
+        base.native_tools = Some(true);
     }
     let mut agents = HashMap::new();
     agents.insert(
@@ -106,6 +107,10 @@ async fn run_cron_once(config: Config, overrides: AgentRunOverrides) -> Vec<Stri
             .expect("`custom` slot must exist");
         base.uri = Some(provider_uri);
     }
+    // Integration tests do not activate the runtime library's internal
+    // `cfg(test)` admission hook. Project the historical typed fixture through
+    // the explicit migration boundary before invoking the canonical runner.
+    config = zeroclaw_config::migration::admit_test_input(&config);
 
     let prompt = "Any reminders to surface today? Pull anything relevant from memory.".to_string();
     let _ = zeroclaw_runtime::agent::run(

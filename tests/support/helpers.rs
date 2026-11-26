@@ -18,7 +18,7 @@ pub fn make_memory() -> Arc<dyn Memory> {
         backend: "none".into(),
         ..MemoryConfig::default()
     };
-    Arc::from(memory::create_memory(&cfg, &std::env::temp_dir(), None).unwrap())
+    Arc::from(memory::create_memory(&cfg, &std::env::temp_dir()).unwrap())
 }
 
 /// Create a `NoopObserver` for tests.
@@ -99,7 +99,7 @@ pub fn build_agent_with_sqlite_memory(
         backend: "sqlite".into(),
         ..MemoryConfig::default()
     };
-    let mem = Arc::from(memory::create_memory(&cfg, temp_dir, None).unwrap());
+    let mem = Arc::from(memory::create_memory(&cfg, temp_dir).unwrap());
     Agent::builder()
         .model_provider(model_provider)
         .tools(zeroclaw::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools))

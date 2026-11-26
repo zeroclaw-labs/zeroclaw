@@ -109,6 +109,12 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
     // runs.
     config.memory.min_relevance_score = 0.0;
 
+    // Directly constructed fixtures must pass through the same admission
+    // projection as loaded configuration before exercising canonical model
+    // resolution. This test intentionally uses the legacy typed provider
+    // slot to keep the memory assertion focused on scheduled-run isolation.
+    let config = zeroclaw_config::migration::admit_test_input(&config);
+
     let prompt = "Any reminders to surface today? Pull anything relevant from memory.".to_string();
     let run_result = zeroclaw_runtime::agent::run(
         config,

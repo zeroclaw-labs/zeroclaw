@@ -391,6 +391,10 @@ pub struct ScopedToolRegistry(
     /// The session memory route the registry's memory-starting tools share;
     /// see [`ScopedToolRegistry::pin_session_memory`].
     Option<Arc<zeroclaw_tools::session_memory::SessionMemoryRoute>>,
+    /// Concrete delegate retained for Agent lifecycle binding. The parent
+    /// tool handle above is enough for tool assembly, but model/memory routing
+    /// also needs the registered delegate instance itself.
+    Option<Arc<tools::DelegateTool>>,
 );
 
 impl std::ops::Deref for ScopedToolRegistry {
@@ -401,6 +405,10 @@ impl std::ops::Deref for ScopedToolRegistry {
 }
 
 impl ScopedToolRegistry {
+    pub(crate) fn delegate_tool(&self) -> Option<Arc<tools::DelegateTool>> {
+        self.6.clone()
+    }
+
     /// Consume the assembled registry into the owned `Vec` for non-turn
     /// consumers such as the gateway's listing-only registry. Turn carriers
     /// accept only the sealed type.
@@ -555,6 +563,7 @@ impl ScopedToolRegistry {
             Default::default(),
             None,
             None,
+            None,
         )
     }
 }
@@ -703,6 +712,7 @@ impl ScopedToolRegistry {
     ) -> ScopedAssembled {
         if construction == RegistryConstruction::SuppliedOnly {
             let mut built = spec.built;
+            let concrete_delegate = built.delegate_tool.clone();
             // The delegate's parent view gets the same memory/delivery context
             // filter as the registry, as it does in native compatibility mode.
             if let Some(parent) = built.delegate_handle.as_ref() {
@@ -744,6 +754,7 @@ impl ScopedToolRegistry {
                     built.native_memory,
                     built.delegate_handle.clone(),
                     built.session_memory,
+                    concrete_delegate,
                 ),
                 delegate_handle: built.delegate_handle,
                 ask_user_handle: built.ask_user_handle,
@@ -793,7 +804,7 @@ impl ScopedToolRegistry {
             capability_slots: _,
             // The Agent captures the concrete delegate before assembly, for owner
             // binding and to bind descendant registries to live RPC authority.
-            delegate_tool: _,
+            delegate_tool,
         } = built;
 
         // 1. Peripherals. Loading CONNECTS hardware (serial opens are exclusive for
@@ -1596,6 +1607,7 @@ impl ScopedToolRegistry {
                 native_memory,
                 delegate_handle.clone(),
                 session_memory,
+                delegate_tool,
             ),
             delegate_handle,
             ask_user_handle,
@@ -2436,31 +2448,28 @@ mod tests {
         let mut config = builtin_deferral_config(true);
         config.tools.optional.push("memory_export".into());
         let security = Arc::new(SecurityPolicy::default());
-        let mut built = tools::all_tools_with_runtime_context(
-            Arc::new(config.clone()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "default",
-            Arc::new(crate::platform::NativeRuntime::new()),
-            Arc::clone(&original),
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &security.workspace_dir,
-            &config.agents,
-            None,
-            &config,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        let mut built = {
+            let registry_config = Arc::new(config.clone());
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(crate::platform::NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> =
+                Arc::clone(&original);
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "default",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let registry_inputs = crate::composition::NativeRecipeInputs::new(
+                &registry_request,
+                &security.workspace_dir,
+            );
+            crate::tools::build_native_registry(
+                registry_inputs,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )
+        }
         .unwrap();
         built.tools.retain(|tool| tool.name() == "memory_export");
         let mut assembled = assemble_builtin_catalog(&config, &security, built, None, false).await;
@@ -2696,31 +2705,28 @@ mod tests {
             always: false,
             location: None,
         };
-        let built = tools::all_tools_with_runtime_context(
-            Arc::new(config.clone()),
-            &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
-            "default",
-            Arc::new(crate::platform::NativeRuntime::new()),
-            Arc::clone(&original),
-            None,
-            None,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &security.workspace_dir,
-            &config.agents,
-            None,
-            &config,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        let built = {
+            let registry_config = Arc::new(config.clone());
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(crate::platform::NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> =
+                Arc::clone(&original);
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "default",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let registry_inputs = crate::composition::NativeRecipeInputs::new(
+                &registry_request,
+                &security.workspace_dir,
+            );
+            crate::tools::build_native_registry(
+                registry_inputs,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )
+        }
         .unwrap();
         let parent = Arc::clone(built.delegate_handle.as_ref().unwrap());
         let before = parent.read().clone();
@@ -3228,6 +3234,7 @@ mod tests {
                 Default::default(),
                 None,
                 None,
+                None,
             );
             supplied_only
                 .check_session_memory_pin(&pin_target())
@@ -3247,6 +3254,7 @@ mod tests {
                 projection,
                 None,
                 None,
+                None,
             );
             native_compat
                 .check_session_memory_pin(&pin_target())
@@ -3258,6 +3266,7 @@ mod tests {
                 None,
                 RegistryConstruction::NativeCompat,
                 Default::default(),
+                None,
                 None,
                 None,
             );
@@ -3632,6 +3641,7 @@ mod tests {
                 None,
                 RegistryConstruction::NativeCompat,
                 Default::default(),
+                None,
                 None,
                 None,
             ),

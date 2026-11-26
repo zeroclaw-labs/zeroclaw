@@ -1,0 +1,1012 @@
+//! Admission-time validation and inheritance for the canonical registry.
+
+use std::num::NonZeroU64;
+
+use crate::schema::{DecisionWireApi, WireApi};
+use zeroclaw_api::capability::Capability;
+
+use super::{
+    AsrModelConfig, ChatModelConfig, ChatOptionsPatch, ModelDefinition, ModelPreset, ModelRef,
+    Override, Preset, PresetId, ProviderConnection, ProviderRegistry, RegistryError,
+    TtsModelConfig,
+};
+
+pub(super) fn validate_preset(name: &PresetId, preset: &ModelPreset) -> Result<(), RegistryError> {
+    // Preset IDs are TOML keys, not structured paths.  A dot in an ID is
+    // part of the key (for example `voice.en-US.default`) and must never be
+    // interpreted as a capability prefix.  Capability compatibility is
+    // checked where a model references the preset, by `ensure_preset` and the
+    // capability-specific resolvers below.
+    let _ = (name, preset);
+    Ok(())
+}
+
+impl ProviderRegistry {
+    pub(super) fn validate_connection(
+        &self,
+        name: &super::ProviderId,
+        connection: &ProviderConnection,
+    ) -> Result<(), RegistryError> {
+        if let Some(path) = connection.speech_path()
+            && (!path.starts_with('/') || path.starts_with("//") || path.contains(['?', '#']))
+        {
+            return Err(RegistryError::connection(
+                name,
+                "api.tts.path",
+                "speech path must be an absolute HTTP path without a query or fragment",
+            ));
+        }
+        if let Some(uri) = connection
+            .uri()
+            .map(str::trim)
+            .filter(|uri| !uri.is_empty())
+        {
+            let parsed = reqwest::Url::parse(uri).map_err(|_| {
+                RegistryError::connection(name, "uri", "uri must be a valid HTTP(S) URL")
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(RegistryError::connection(
+                    name,
+                    "uri",
+                    "uri must use http/https",
+                ));
+            }
+        }
+        let configured = connection.configured_apis();
+        for capability in configured {
+            if !connection.supports(capability) {
+                return Err(RegistryError::connection(
+                    name,
+                    "api",
+                    "configured API is unsupported by the connection kind",
+                ));
+            }
+        }
+        for (capability, path, preset) in [
+            (
+                Capability::Chat,
+                "api.chat.preset",
+                connection.chat_defaults().and_then(|(preset, _)| preset),
+            ),
+            (
+                Capability::Tts,
+                "api.tts.preset",
+                connection.tts_defaults().and_then(|(preset, _)| preset),
+            ),
+            (
+                Capability::Asr,
+                "api.asr.preset",
+                connection.asr_defaults().and_then(|(preset, _)| preset),
+            ),
+        ] {
+            if let Some(preset) = preset {
+                let found = self.model_presets.get(preset).ok_or_else(|| {
+                    RegistryError::connection(name, path, "preset does not exist")
+                })?;
+                if preset_capability(found) != capability {
+                    return Err(RegistryError::connection(
+                        name,
+                        path,
+                        "preset capability does not match API capability",
+                    ));
+                }
+            }
+        }
+        if let Some(wire_api) = connection.decision_api().and_then(|api| api.wire_api)
+            && !connection.decision_wire_apis().contains(&wire_api)
+        {
+            return Err(RegistryError::connection(
+                name,
+                "api.decision.wire_api",
+                "native decision protocol is unsupported by the connection kind",
+            ));
+        }
+        if connection.kind() == "azure" && connection.uri().is_some() {
+            return Err(RegistryError::connection(
+                name,
+                "uri",
+                "azure derives its endpoint from extra.resource",
+            ));
+        }
+        if connection.kind() == "system-one" && !connection.supports(Capability::Decision) {
+            return Err(RegistryError::connection(
+                name,
+                "capabilities",
+                "system-one must enable decision",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_model(
+        &self,
+        name: &ModelRef,
+        model: &ModelDefinition,
+    ) -> Result<(), RegistryError> {
+        let connection = self
+            .connections
+            .get(model.provider())
+            .ok_or_else(|| RegistryError::model(name, "provider", "connection does not exist"))?;
+        match model {
+            ModelDefinition::Chat(config) => {
+                self.validate_chat(name, config, connection)?;
+            }
+            ModelDefinition::Embedding(config) => {
+                if config.model.trim().is_empty() {
+                    return Err(RegistryError::model(
+                        name,
+                        "model",
+                        "embedding model must not be empty",
+                    ));
+                }
+            }
+            ModelDefinition::Tts(config) => self.validate_tts(name, config, connection)?,
+            ModelDefinition::Asr(config) => self.validate_asr(name, config, connection)?,
+            ModelDefinition::Decision(config) => {
+                if !connection.supports(Capability::Decision) {
+                    return Err(RegistryError::model(
+                        name,
+                        "provider",
+                        "connection does not support decision models",
+                    ));
+                }
+                if let Some(wire_api) = config.api.as_ref().and_then(|api| api.wire_api)
+                    && !connection.decision_wire_apis().contains(&wire_api)
+                {
+                    return Err(RegistryError::model(
+                        name,
+                        "api.wire_api",
+                        "native decision protocol is unsupported by the connection kind",
+                    ));
+                }
+                if config.model.trim().is_empty() {
+                    return Err(RegistryError::model(
+                        name,
+                        "model",
+                        "decision model must not be empty",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_chat(
+        &self,
+        name: &ModelRef,
+        config: &ChatModelConfig,
+        connection: &ProviderConnection,
+    ) -> Result<(), RegistryError> {
+        if config
+            .model
+            .as_deref()
+            .is_some_and(|model| model.trim().is_empty())
+        {
+            return Err(RegistryError::model(
+                name,
+                "model",
+                "model must not be empty when set",
+            ));
+        }
+        if config.metadata.context_window == Some(0) {
+            return Err(RegistryError::model(
+                name,
+                "metadata.context_window",
+                "context window must be greater than 0",
+            ));
+        }
+        let effective = self.resolve_chat(name)?;
+        if effective.stream_request_timeout_secs.is_some()
+            && matches!(
+                connection.kind(),
+                "gemini_cli" | "kilocli" | "grok_cli" | "antigravity_cli" | "hailo_ollama"
+            )
+        {
+            return Err(RegistryError::model(
+                name,
+                "api.stream_request_timeout_secs",
+                "HTTP streaming deadlines are unsupported by this connection kind",
+            ));
+        }
+        if effective.request_timeout_secs.is_some()
+            && matches!(connection.kind(), "gemini_cli" | "kilocli")
+        {
+            return Err(RegistryError::model(
+                name,
+                "api.request_timeout_secs",
+                "request deadline is fixed by this CLI connection",
+            ));
+        }
+        if effective.read_timeout_secs.is_some()
+            && matches!(
+                connection.kind(),
+                "hailo_ollama" | "gemini_cli" | "kilocli" | "grok_cli" | "antigravity_cli"
+            )
+        {
+            return Err(RegistryError::model(
+                name,
+                "api.read_timeout_secs",
+                "read deadlines are unsupported by this connection kind",
+            ));
+        }
+        if connection.kind() == "hailo_ollama"
+            && matches!(effective.request_timeout_secs, Some(Override::Clear))
+        {
+            return Err(RegistryError::model(
+                name,
+                "api.request_timeout_secs",
+                "request deadline cannot be disabled for this connection kind",
+            ));
+        }
+        if matches!(
+            connection,
+            ProviderConnection::GrokCli(_) | ProviderConnection::AntigravityCli(_)
+        ) && matches!(effective.request_timeout_secs, Some(Override::Clear))
+        {
+            return Err(RegistryError::model(
+                name,
+                "api.request_timeout_secs",
+                "subprocess deadline cannot be disabled",
+            ));
+        }
+        if let Some(super::Override::Set(temperature)) = effective.options.temperature {
+            crate::schema::validate_temperature(temperature)
+                .map_err(|error| RegistryError::model(name, "options.temperature", error))?;
+        }
+        if let Some(pricing) = &config.metadata.pricing {
+            for (field, value) in [
+                ("input_per_mtok", pricing.input_per_mtok),
+                ("output_per_mtok", pricing.output_per_mtok),
+                ("cached_input_per_mtok", pricing.cached_input_per_mtok),
+                ("cache_write_per_mtok", pricing.cache_write_per_mtok),
+            ] {
+                if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
+                    return Err(RegistryError::model(
+                        name,
+                        &format!("metadata.pricing.{field}"),
+                        "rate must be finite and non-negative",
+                    ));
+                }
+            }
+        }
+        if config.api.as_ref().is_some_and(|api| {
+            api.wire_api.is_some()
+                && matches!(
+                    connection.kind(),
+                    "hailo_ollama" | "gemini_cli" | "grok_cli" | "kilocli" | "antigravity_cli"
+                )
+        }) {
+            return Err(RegistryError::model(
+                name,
+                "api.wire_api",
+                "connection kind does not support a model-level wire API override",
+            ));
+        }
+        if let Some(extra) = &config.extra {
+            extra
+                .validate_connection(connection)
+                .map_err(|error| RegistryError::model(name, "extra", error.to_string()))?;
+        }
+        if let Some(preset) = config.preset.as_ref() {
+            ensure_preset(self, name, preset, Capability::Chat)?;
+        }
+        Ok(())
+    }
+
+    fn validate_tts(
+        &self,
+        name: &ModelRef,
+        config: &TtsModelConfig,
+        connection: &ProviderConnection,
+    ) -> Result<(), RegistryError> {
+        if let Some(preset) = config.preset.as_ref() {
+            ensure_preset(self, name, preset, Capability::Tts)?;
+        }
+        let _ = connection;
+        Ok(())
+    }
+
+    fn validate_asr(
+        &self,
+        name: &ModelRef,
+        config: &AsrModelConfig,
+        connection: &ProviderConnection,
+    ) -> Result<(), RegistryError> {
+        if let Some(preset) = config.preset.as_ref() {
+            ensure_preset(self, name, preset, Capability::Asr)?;
+        }
+        let _ = connection;
+        Ok(())
+    }
+
+    pub fn resolve_chat(&self, name: &ModelRef) -> Result<ResolvedChat<'_>, RegistryError> {
+        let selection = self.selection(name, Capability::Chat)?;
+        let ModelDefinition::Chat(model) = selection.model else {
+            unreachable!("selection checks capability")
+        };
+        let mut options = ChatOptionsPatch::default();
+        let mut wire_api = None;
+        let mut request_timeout_secs = None;
+        let mut stream_request_timeout_secs = None;
+        let subprocess_timeout = match selection.connection {
+            ProviderConnection::GrokCli(connection) => connection
+                .api
+                .chat
+                .as_ref()
+                .and_then(|api| api.request_timeout_secs),
+            ProviderConnection::AntigravityCli(connection) => connection
+                .api
+                .chat
+                .as_ref()
+                .and_then(|api| api.request_timeout_secs),
+            _ => None,
+        };
+        if let Some(timeout) = subprocess_timeout {
+            request_timeout_secs = Some(Override::Set(timeout));
+        }
+        let mut read_timeout_secs = None;
+        let mut queue_timeout_secs = match selection.connection {
+            ProviderConnection::HailoOllama(connection) => connection
+                .api
+                .chat
+                .as_ref()
+                .and_then(|api| api.queue_timeout_secs),
+            _ => None,
+        };
+        let mut live_pricing = None;
+        if let Some(api) = selection.connection.chat_api() {
+            wire_api = api.wire_api;
+            request_timeout_secs = api.request_timeout_secs.clone();
+            stream_request_timeout_secs = api.stream_request_timeout_secs.clone();
+            read_timeout_secs = api.read_timeout_secs.clone();
+            live_pricing = api.live_pricing;
+        }
+        // CLI and Hailo drivers have their own transport object, but inherit
+        // the same chat preset/options shape as HTTP drivers.
+        if let Some((preset, defaults)) = selection.connection.chat_defaults() {
+            if let Some(preset) = preset {
+                apply_chat_preset(&self.model_presets, preset, &mut options)?;
+            }
+            options.overlay(defaults);
+        }
+        if let Some(preset) = &model.preset {
+            apply_chat_preset(&self.model_presets, preset, &mut options)?;
+        }
+        if let Some(api) = &model.api {
+            wire_api = api.wire_api.or(wire_api);
+            request_timeout_secs = api.request_timeout_secs.clone().or(request_timeout_secs);
+            stream_request_timeout_secs = api
+                .stream_request_timeout_secs
+                .clone()
+                .or(stream_request_timeout_secs);
+            read_timeout_secs = api.read_timeout_secs.clone().or(read_timeout_secs);
+            queue_timeout_secs = api.queue_timeout_secs.or(queue_timeout_secs);
+        }
+        options.overlay(&model.options);
+        Ok(ResolvedChat {
+            selection,
+            wire_api,
+            request_timeout_secs,
+            stream_request_timeout_secs,
+            read_timeout_secs,
+            queue_timeout_secs,
+            live_pricing,
+            options,
+        })
+    }
+}
+
+fn ensure_preset(
+    registry: &ProviderRegistry,
+    model: &ModelRef,
+    preset: &PresetId,
+    capability: Capability,
+) -> Result<(), RegistryError> {
+    let found = registry
+        .model_presets
+        .get(preset)
+        .ok_or_else(|| RegistryError::model(model, "preset", "preset does not exist"))?;
+    if preset_capability(found) != capability {
+        return Err(RegistryError::model(
+            model,
+            "preset",
+            "preset capability does not match model capability",
+        ));
+    }
+    Ok(())
+}
+
+fn preset_capability(preset: &ModelPreset) -> Capability {
+    match preset {
+        ModelPreset::Chat(_) => Capability::Chat,
+        ModelPreset::Tts(_) => Capability::Tts,
+        ModelPreset::Asr(_) => Capability::Asr,
+    }
+}
+
+fn apply_chat_preset(
+    presets: &std::collections::BTreeMap<PresetId, ModelPreset>,
+    preset: &PresetId,
+    options: &mut ChatOptionsPatch,
+) -> Result<(), RegistryError> {
+    match presets.get(preset) {
+        Some(ModelPreset::Chat(Preset { options: patch })) => options.overlay(patch),
+        Some(_) => {
+            return Err(RegistryError::new(
+                ["providers", "model_presets", preset.as_str()],
+                "preset capability does not match chat",
+            ));
+        }
+        None => {
+            return Err(RegistryError::new(
+                ["providers", "model_presets", preset.as_str()],
+                "preset does not exist",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedChat<'a> {
+    pub selection: super::ModelSelection<'a>,
+    pub wire_api: Option<WireApi>,
+    pub request_timeout_secs: Option<Override<NonZeroU64>>,
+    pub stream_request_timeout_secs: Option<Override<NonZeroU64>>,
+    pub read_timeout_secs: Option<Override<NonZeroU64>>,
+    pub queue_timeout_secs: Option<NonZeroU64>,
+    pub live_pricing: Option<bool>,
+    pub options: ChatOptionsPatch,
+}
+
+impl ResolvedChat<'_> {
+    pub fn upstream_model(&self) -> Option<&str> {
+        self.selection.model.upstream_model()
+    }
+
+    /// Resolve explicit API/preset/model options over provider defaults.
+    #[must_use]
+    pub fn text_extraction(&self) -> super::TextExtraction {
+        let defaults = super::options::text_extraction_defaults(
+            self.selection.connection.kind(),
+            self.wire_api,
+            self.options.native_tools,
+        );
+        super::TextExtraction {
+            reasoning: self.options.extract_text_reasoning.or(defaults.reasoning),
+            tool_calls: self
+                .options
+                .extract_text_tool_calls
+                .unwrap_or(defaults.tool_calls),
+        }
+    }
+
+    /// Whether textual `<think>` blocks are extracted from the response.
+    #[must_use]
+    pub fn extract_text_reasoning(&self) -> bool {
+        self.text_extraction().reasoning.unwrap_or(true)
+    }
+
+    /// Whether textual XML/JSON tool-call envelopes are extracted from the
+    /// response. Native tool calls are unaffected by this setting.
+    #[must_use]
+    pub fn extract_text_tool_calls(&self) -> bool {
+        self.text_extraction().tool_calls
+    }
+}
+
+impl ProviderRegistry {
+    pub fn resolve_tts(&self, name: &ModelRef) -> Result<ResolvedTts<'_>, RegistryError> {
+        let selection = self.selection(name, Capability::Tts)?;
+        let super::ModelDefinition::Tts(model) = selection.model else {
+            unreachable!("selection checks capability")
+        };
+        let mut options = super::TtsOptionsPatch::default();
+        if let Some((preset, defaults)) = selection.connection.tts_defaults() {
+            if let Some(preset) = preset {
+                apply_tts_preset(&self.model_presets, preset, &mut options)?;
+            }
+            options.overlay(defaults);
+        }
+        if let Some(preset) = &model.preset {
+            apply_tts_preset(&self.model_presets, preset, &mut options)?;
+        }
+        options.overlay(&model.options);
+        Ok(ResolvedTts { selection, options })
+    }
+
+    pub fn resolve_asr(&self, name: &ModelRef) -> Result<ResolvedAsr<'_>, RegistryError> {
+        let selection = self.selection(name, Capability::Asr)?;
+        let super::ModelDefinition::Asr(model) = selection.model else {
+            unreachable!("selection checks capability")
+        };
+        let mut options = super::AsrOptionsPatch::default();
+        let mut endpoint = None;
+        let mut request_timeout_secs = None;
+        if let Some((preset, defaults)) = selection.connection.asr_defaults() {
+            if let Some(preset) = preset {
+                apply_asr_preset(&self.model_presets, preset, &mut options)?;
+            }
+            options.overlay(defaults);
+        }
+        if let super::ProviderConnection::LocalWhisper(connection) = selection.connection
+            && let Some(api) = &connection.api.asr
+        {
+            request_timeout_secs = api.request_timeout_secs.clone();
+        }
+        if let Some(preset) = &model.preset {
+            apply_asr_preset(&self.model_presets, preset, &mut options)?;
+        }
+        if let Some(api) = &model.api {
+            endpoint = api.endpoint.clone();
+            request_timeout_secs = api.request_timeout_secs.clone().or(request_timeout_secs);
+        }
+        options.overlay(&model.options);
+        Ok(ResolvedAsr {
+            selection,
+            endpoint,
+            request_timeout_secs,
+            options,
+        })
+    }
+
+    pub fn resolve_embedding(
+        &self,
+        name: &ModelRef,
+    ) -> Result<ResolvedEmbedding<'_>, RegistryError> {
+        let selection = self.selection(name, Capability::Embedding)?;
+        let super::ModelDefinition::Embedding(model) = selection.model else {
+            unreachable!("selection checks capability")
+        };
+        Ok(ResolvedEmbedding {
+            selection,
+            model: &model.model,
+            dimensions: model.metadata.dimensions,
+        })
+    }
+
+    pub fn resolve_decision(&self, name: &ModelRef) -> Result<ResolvedDecision<'_>, RegistryError> {
+        let selection = self.selection(name, Capability::Decision)?;
+        let super::ModelDefinition::Decision(model) = selection.model else {
+            unreachable!("selection checks capability")
+        };
+        Ok(ResolvedDecision {
+            selection,
+            model: &model.model,
+            wire_api: model
+                .api
+                .as_ref()
+                .and_then(|api| api.wire_api)
+                .or_else(|| {
+                    selection
+                        .connection
+                        .decision_api()
+                        .and_then(|api| api.wire_api)
+                })
+                .or_else(|| selection.connection.default_decision_wire_api())
+                .ok_or_else(|| {
+                    RegistryError::model(
+                        name,
+                        "provider",
+                        "connection has no native decision protocol",
+                    )
+                })?,
+            request_timeout_secs: model
+                .api
+                .as_ref()
+                .and_then(|api| api.request_timeout_secs.clone())
+                .or_else(|| {
+                    selection
+                        .connection
+                        .decision_api()
+                        .and_then(|api| api.request_timeout_secs.clone())
+                }),
+        })
+    }
+
+    pub fn fallback_targets(&self, source: &ModelRef) -> Result<&[ModelRef], RegistryError> {
+        let targets = self.fallback.get(source).map(Vec::as_slice).unwrap_or(&[]);
+        self.selection(source, Capability::Chat)?;
+        for target in targets {
+            self.selection(target, Capability::Chat)?;
+        }
+        Ok(targets)
+    }
+
+    /// Return every reachable fallback in declaration order. The source is
+    /// excluded; callers prepend it when constructing the primary attempt.
+    /// Duplicate edges are skipped while the graph's validation still rejects
+    /// duplicate targets and cycles in persisted configuration.
+    pub fn fallback_chain(&self, source: &ModelRef) -> Result<Vec<ModelRef>, RegistryError> {
+        self.fallback_targets(source)?;
+        let mut chain = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut pending: Vec<ModelRef> = self
+            .fallback
+            .get(source)
+            .into_iter()
+            .flat_map(|targets| targets.iter().rev().cloned())
+            .collect();
+
+        while let Some(candidate) = pending.pop() {
+            if !seen.insert(candidate.clone()) {
+                continue;
+            }
+            self.selection(&candidate, Capability::Chat)?;
+            chain.push(candidate.clone());
+            if let Some(targets) = self.fallback.get(&candidate) {
+                pending.extend(targets.iter().rev().cloned());
+            }
+        }
+        Ok(chain)
+    }
+}
+
+fn apply_tts_preset(
+    presets: &std::collections::BTreeMap<PresetId, ModelPreset>,
+    preset: &PresetId,
+    options: &mut super::TtsOptionsPatch,
+) -> Result<(), RegistryError> {
+    match presets.get(preset) {
+        Some(ModelPreset::Tts(Preset { options: patch })) => options.overlay(patch),
+        Some(_) => {
+            return Err(RegistryError::new(
+                ["providers", "model_presets", preset.as_str()],
+                "preset capability does not match tts",
+            ));
+        }
+        None => {
+            return Err(RegistryError::new(
+                ["providers", "model_presets", preset.as_str()],
+                "preset does not exist",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn apply_asr_preset(
+    presets: &std::collections::BTreeMap<PresetId, ModelPreset>,
+    preset: &PresetId,
+    options: &mut super::AsrOptionsPatch,
+) -> Result<(), RegistryError> {
+    match presets.get(preset) {
+        Some(ModelPreset::Asr(Preset { options: patch })) => options.overlay(patch),
+        Some(_) => {
+            return Err(RegistryError::new(
+                ["providers", "model_presets", preset.as_str()],
+                "preset capability does not match asr",
+            ));
+        }
+        None => {
+            return Err(RegistryError::new(
+                ["providers", "model_presets", preset.as_str()],
+                "preset does not exist",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedTts<'a> {
+    pub selection: super::ModelSelection<'a>,
+    pub options: super::TtsOptionsPatch,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedAsr<'a> {
+    pub selection: super::ModelSelection<'a>,
+    pub endpoint: Option<String>,
+    pub request_timeout_secs: Option<Override<NonZeroU64>>,
+    pub options: super::AsrOptionsPatch,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedEmbedding<'a> {
+    pub selection: super::ModelSelection<'a>,
+    pub model: &'a str,
+    pub dimensions: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedDecision<'a> {
+    pub selection: super::ModelSelection<'a>,
+    pub model: &'a str,
+    pub wire_api: DecisionWireApi,
+    pub request_timeout_secs: Option<Override<NonZeroU64>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Override, ProviderRegistry};
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn fixed_chat_connections_reject_unsupported_speech_apis() {
+        for kind in ["openrouter", "telnyx", "ovh", "copilot"] {
+            for capability in ["tts", "asr"] {
+                for (capabilities, expected) in [
+                    (
+                        String::new(),
+                        "configured API must be explicitly enabled in capabilities",
+                    ),
+                    (
+                        format!(r#"capabilities = ["chat", "{capability}"]"#),
+                        "capability is not implemented by this connection kind",
+                    ),
+                ] {
+                    for settings in ["", r#"preset = "missing""#] {
+                        let error = toml::from_str::<ProviderRegistry>(&format!(
+                            r#"
+[connections.gateway]
+kind = "{kind}"
+{capabilities}
+[connections.gateway.api.{capability}]
+{settings}
+"#
+                        ))
+                        .unwrap_err();
+                        assert!(
+                            error.to_string().contains(expected),
+                            "{kind}/{capability}: {error}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn antigravity_models_inherit_process_defaults_and_override_request_options() {
+        let registry: ProviderRegistry = toml::from_str(
+            r#"
+[connections."agy.business"]
+kind = "antigravity_cli"
+[connections."agy.business".api.chat]
+working_directory = "/workspace"
+auth_method = "agent_platform"
+state_directory = "/state/agy"
+request_timeout_secs = 30
+options = { temperature = 0.2 }
+
+[models."chat.inherited"]
+capability = "chat"
+provider = "agy.business"
+model = "gemini-model"
+
+[models."chat.overridden"]
+capability = "chat"
+provider = "agy.business"
+model = "gemini-model"
+api = { request_timeout_secs = 45 }
+options = { temperature = 0.6 }
+"#,
+        )
+        .unwrap();
+        for (name, timeout, temperature) in
+            [("chat.inherited", 30, 0.2), ("chat.overridden", 45, 0.6)]
+        {
+            let model = registry.resolve_chat(&name.into()).unwrap();
+            assert_eq!(
+                model.request_timeout_secs,
+                Some(Override::Set(NonZeroU64::new(timeout).unwrap()))
+            );
+            assert_eq!(model.options.temperature, Some(Override::Set(temperature)));
+            let super::super::ProviderConnection::AntigravityCli(connection) =
+                model.selection.connection
+            else {
+                panic!("expected an Antigravity connection")
+            };
+            let api = connection.api.chat.as_ref().unwrap();
+            assert_eq!(api.working_directory, "/workspace");
+            assert_eq!(api.state_directory.as_deref(), Some("/state/agy"));
+            assert_eq!(
+                api.auth_method,
+                crate::schema::AntigravityCliAuthMethod::AgentPlatform
+            );
+        }
+    }
+
+    #[test]
+    fn antigravity_models_reject_http_only_options_and_unbounded_process_requests() {
+        for (patch, field) in [
+            (r#"request_timeout_secs = "null""#, "request_timeout_secs"),
+            ("read_timeout_secs = 5", "read_timeout_secs"),
+            (r#"wire_api = "responses""#, "wire_api"),
+        ] {
+            let error = toml::from_str::<ProviderRegistry>(&format!(
+                r#"
+[connections.cli]
+kind = "antigravity_cli"
+[models.main]
+capability = "chat"
+provider = "cli"
+model = "gemini-model"
+api = {{ {patch} }}
+"#
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains(field), "{error}");
+        }
+    }
+
+    #[test]
+    fn asr_timeout_inherits_through_an_empty_model_api_and_can_be_cleared() {
+        let registry: ProviderRegistry = toml::from_str(
+            r#"
+[connections.whisper]
+kind = "local_whisper"
+uri = "http://127.0.0.1:9000"
+[connections.whisper.api.asr]
+request_timeout_secs = 42
+
+[models."asr.inherited"]
+capability = "asr"
+provider = "whisper"
+model = "base"
+api = {}
+
+[models."asr.cleared"]
+capability = "asr"
+provider = "whisper"
+model = "base"
+api = { request_timeout_secs = "null" }
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            registry
+                .resolve_asr(&"asr.inherited".into())
+                .unwrap()
+                .request_timeout_secs,
+            Some(Override::Set(NonZeroU64::new(42).unwrap()))
+        );
+        assert_eq!(
+            registry
+                .resolve_asr(&"asr.cleared".into())
+                .unwrap()
+                .request_timeout_secs,
+            Some(Override::Clear)
+        );
+    }
+
+    #[test]
+    fn model_wire_api_override_does_not_require_connection_defaults() {
+        for kind in ["openai", "custom", "vllm"] {
+            let registry: ProviderRegistry = toml::from_str(&format!(
+                r#"
+[connections.gateway]
+kind = "{kind}"
+uri = "https://example.test/v1"
+
+[models."chat.main"]
+capability = "chat"
+provider = "gateway"
+model = "base"
+api = {{ wire_api = "responses" }}
+"#
+            ))
+            .unwrap_or_else(|error| panic!("{kind}: {error}"));
+
+            assert_eq!(
+                registry
+                    .resolve_chat(&"chat.main".into())
+                    .unwrap()
+                    .wire_api
+                    .map(|wire| wire.as_str()),
+                Some("responses"),
+                "{kind}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn adapters_reject_deadlines_they_cannot_apply() {
+        for (kind, field, values) in [
+            (
+                "gemini_cli",
+                "request_timeout_secs",
+                vec![serde_json::json!(600), serde_json::json!("null")],
+            ),
+            (
+                "kilocli",
+                "request_timeout_secs",
+                vec![serde_json::json!(600), serde_json::json!("null")],
+            ),
+            (
+                "hailo_ollama",
+                "request_timeout_secs",
+                vec![serde_json::json!("null")],
+            ),
+            (
+                "hailo_ollama",
+                "read_timeout_secs",
+                vec![serde_json::json!(600), serde_json::json!("null")],
+            ),
+            (
+                "gemini_cli",
+                "read_timeout_secs",
+                vec![serde_json::json!(600)],
+            ),
+            ("kilocli", "read_timeout_secs", vec![serde_json::json!(600)]),
+            (
+                "grok_cli",
+                "read_timeout_secs",
+                vec![serde_json::json!(600)],
+            ),
+        ] {
+            for value in values {
+                let mut document = serde_json::json!({
+                    "connections": {"connection": {"kind": kind}},
+                    "models": {"chat": {"capability":"chat", "provider":"connection", "model":"test", "api":{}}}
+                });
+                if kind == "grok_cli" {
+                    document["connections"]["connection"]["api"] =
+                        serde_json::json!({"chat":{"working_directory":"/workspace"}});
+                }
+                document["models"]["chat"]["api"][field] = value;
+                let error = serde_json::from_value::<ProviderRegistry>(document).unwrap_err();
+                assert!(error.to_string().contains(field), "{kind}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn model_stream_deadline_overrides_connection_independently() {
+        let registry: ProviderRegistry = serde_json::from_value(serde_json::json!({
+            "connections": {"gateway": {"kind":"custom", "uri":"https://example.test/v1",
+                "api":{"chat":{"request_timeout_secs":30,"stream_request_timeout_secs":"null"}}}},
+            "models": {
+                "inherited":{"capability":"chat","provider":"gateway","model":"chat"},
+                "bounded":{"capability":"chat","provider":"gateway","model":"chat",
+                    "api":{"stream_request_timeout_secs":60}}
+            }
+        }))
+        .unwrap();
+        let inherited = registry.resolve_chat(&"inherited".into()).unwrap();
+        assert!(
+            matches!(inherited.request_timeout_secs, Some(Override::Set(value)) if value.get()==30)
+        );
+        assert!(matches!(
+            inherited.stream_request_timeout_secs,
+            Some(Override::Clear)
+        ));
+        let bounded = registry.resolve_chat(&"bounded".into()).unwrap();
+        assert!(
+            matches!(bounded.request_timeout_secs, Some(Override::Set(value)) if value.get()==30)
+        );
+        assert!(
+            matches!(bounded.stream_request_timeout_secs, Some(Override::Set(value)) if value.get()==60)
+        );
+    }
+
+    #[test]
+    fn grok_process_deadline_is_inherited_and_cannot_be_disabled() {
+        let document = serde_json::json!({
+            "connections":{"cli":{"kind":"grok_cli","api":{"chat":{
+                "working_directory":"/workspace","request_timeout_secs":30}}}},
+            "models":{"chat":{"capability":"chat","provider":"cli","model":"chat"}}
+        });
+        let registry: ProviderRegistry = serde_json::from_value(document.clone()).unwrap();
+        assert!(
+            matches!(registry.resolve_chat(&"chat".into()).unwrap().request_timeout_secs,
+            Some(Override::Set(value)) if value.get()==30)
+        );
+        let mut document = document;
+        document["models"]["chat"]["api"] = serde_json::json!({"request_timeout_secs":"null"});
+        let error = serde_json::from_value::<ProviderRegistry>(document).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("subprocess deadline cannot be disabled"),
+            "{error}"
+        );
+    }
+}
