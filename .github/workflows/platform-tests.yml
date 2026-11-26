@@ -56,7 +56,9 @@ jobs:
           - name: macOS
             os: macos-15
             nextest-platform: mac
-            timeout-minutes: 45
+            # A cold workspace build alone exceeds 45 minutes on macos-15.
+            # Only master runs save the cache that shortens later runs.
+            timeout-minutes: 90
           - name: Windows
             os: windows-latest
             nextest-platform: windows-tar

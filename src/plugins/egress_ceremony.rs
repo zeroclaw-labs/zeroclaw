@@ -1549,7 +1549,7 @@ mod tests {
         };
         assert_eq!(legacy_row, "weather-tool");
         assert_eq!(missing, v(&["api2.example.com"]));
-        assert!(invalid.is_empty());
+        assert!(invalid.is_empty(), "{invalid:?}");
         assert_eq!(rejected, None, "a valid row is not refused");
         assert_eq!(
             repair_incomplete, None,
