@@ -773,14 +773,40 @@ recover it two ways:
   must name permitted fallback targets, for example mapping `claude-fable-5` to
   `claude-opus-4-8`.
 
-Either way the delivered reply carries a short footer naming the requested and
-served models, so the switch is visible to the user. In the web dashboard chat
+When the fallback metadata identifies a switch, the delivered reply carries a
+short footer naming the requested and served models. In the web dashboard chat
 the same switch surfaces as an inline notice just before the answer, showing
 only the requested and served model names. When an ordinary provider failure
 already moved the request to a client-side fallback before Anthropic switched
-models on its side, the reply keeps the ordinary fallback notice as well, so
-the originally requested model stays visible and the two causes are not
-conflated.
+models on its side, the reply keeps the ordinary fallback notice as well. A
+handoff without an `iterations` breakdown does not produce a server-side
+fallback notice.
+
+For non-streaming structured chat responses that include a per-attempt usage
+breakdown, accounting can report each model's tokens separately.
+String-only provider entrypoints do not record that breakdown. In a recognized
+breakdown, the returned attempt is attributed using its iteration's model, or
+the response's model when the iteration omits it. Conflicting model IDs leave
+the attempt unattributed. An unrecognized or ambiguous breakdown retains only
+the top-level observation, without model attribution. Usage with no established
+model is labeled `(unattributed)` in the accounting report and is not priced.
+Because its cost is unknown, that usage does not increase the ordinary daily
+or monthly dollar totals used by cost limits.
+The ordinary ledger omits declined attempts with invalid counters, such as a
+missing token count; the accepted row instead uses the response's top-level
+usage. In an otherwise decodable, recognized breakdown, a malformed counter
+or model value in one entry does not discard valid entries. A structurally
+malformed response can fail to decode without retaining its usage. If a response
+shows a handoff but has no per-attempt breakdown, only the returned attempt's
+usage is known; the declined attempt's usage is unknown, not zero. Consumers
+requiring complete accounting must stop on such incomplete reports. If a
+returned attempt's top-level usage omits a counter present only in its
+iteration, an ordinary accepted cost row
+can omit that counter. Context limits remain those of the configured route, and
+reported tokens are not an invoice. When neither an iteration
+breakdown nor a handoff block is present, accounting retains the requested
+route identity; a sticky-routed response missing both cannot be distinguished
+from an ordinary single-model response.
 
 Streaming has a limit: a refusal that arrives after streamed output has begun
 keeps the existing interrupted-reply behavior; fallback applies only to refusals
