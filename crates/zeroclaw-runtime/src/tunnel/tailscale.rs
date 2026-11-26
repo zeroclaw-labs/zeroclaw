@@ -1351,9 +1351,16 @@ mod tests {
     /// stderr of a forwarder that lost the serve-config race (Tailscale 1.102.4).
     const CONFLICT_STDERR: &str = "Another client is changing the serve config; please try again.\nsending serve config: Preconditions failed: etag mismatch";
 
+    /// Fast polling and backoff for forwarder tests.
+    ///
+    /// The apply deadline is deliberately generous. These stand-ins end the
+    /// wait themselves, by exiting or by their session appearing, and a short
+    /// deadline would race a slow process start (stand-ins on macOS CI runners
+    /// have still been starting up past 300 ms) and report `NotApplied`
+    /// instead. A test of the deadline itself sets a short one explicitly.
     fn quick_startup() -> ForwarderStartup {
         ForwarderStartup {
-            apply_timeout: Duration::from_millis(300),
+            apply_timeout: Duration::from_secs(10),
             poll: Duration::from_millis(10),
             conflict_attempts: 3,
             conflict_backoff: Duration::from_millis(1),
@@ -1362,12 +1369,6 @@ mod tests {
 
     fn exit_with_stderr(stderr: &str) -> Child {
         spawn_stand_in(&format!("printf '%s' '{stderr}' >&2; exit 1"))
-    }
-
-    fn exit_with_stderr_after(delay_secs: &str, stderr: &str) -> Child {
-        spawn_stand_in(&format!(
-            "sleep {delay_secs}; printf '%s' '{stderr}' >&2; exit 1"
-        ))
     }
 
     #[test]
@@ -1582,31 +1583,143 @@ mod tests {
             .await;
     }
 
+    /// A stand-in forwarder that stays alive until its stdin is closed, then
+    /// prints `stderr` and exits with status 1. Returns the child and its stdin,
+    /// whose drop releases it, so a test decides exactly when it exits rather
+    /// than racing a sleep.
+    fn exit_with_stderr_on_release(stderr: &str) -> (Child, tokio::process::ChildStdin) {
+        let mut child = Command::new("sh")
+            .args([
+                "-c",
+                &format!("read _release; printf '%s' '{stderr}' >&2; exit 1"),
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn gated stand-in forwarder");
+        let stdin = child.stdin.take().expect("stand-in stdin is piped");
+        (child, stdin)
+    }
+
+    /// Wait until `pid`, a child of this process, has exited, without reaping
+    /// it, so the owner's own `try_wait()` still observes the exit.
+    ///
+    /// `WNOWAIT` leaves the child waitable; without `WNOHANG` the call blocks
+    /// until it exits, so it runs on the blocking pool.
+    #[cfg(unix)]
+    async fn wait_for_exit_unreaped(pid: u32) {
+        tokio::task::spawn_blocking(move || {
+            // SAFETY: an all-zero `siginfo_t` is a valid out-parameter; it is
+            // only written by `waitid`.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            loop {
+                // SAFETY: `info` is a live, writable `siginfo_t`, and `pid`
+                // names a child of this process that nothing else reaps
+                // while the caller is suspended in this wait.
+                let rc = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        libc::id_t::from(pid),
+                        &mut info,
+                        libc::WEXITED | libc::WNOWAIT,
+                    )
+                };
+                if rc == 0 {
+                    return;
+                }
+                let error = std::io::Error::last_os_error();
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted,
+                    "waitid on the stand-in failed: {error}"
+                );
+            }
+        })
+        .await
+        .expect("waitid task completes");
+    }
+
+    /// Wait until `pid`, a child of this process, has exited, without
+    /// consuming anything its owner's `try_wait()` reads.
+    ///
+    /// Windows keeps an exited process's object, and its PID, for as long as
+    /// any handle is open, and the owner's `Child` holds one, so polling a
+    /// second handle here is safe.
+    #[cfg(windows)]
+    async fn wait_for_exit_unreaped(pid: u32) {
+        use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        };
+
+        // SAFETY: plain FFI call; failure is reported through the `Result`.
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }
+            .expect("open the stand-in process");
+        loop {
+            // SAFETY: `handle` was returned by `OpenProcess` above and is
+            // closed only after this loop.
+            let wait = unsafe { WaitForSingleObject(handle, 0) };
+            if wait == WAIT_OBJECT_0 {
+                break;
+            }
+            assert_eq!(wait, WAIT_TIMEOUT, "waiting on the stand-in failed");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // SAFETY: `handle` was returned by `OpenProcess` in this function.
+        let _ = unsafe { CloseHandle(handle) };
+    }
+
     #[tokio::test]
     async fn start_forwarder_rechecks_the_process_after_the_probe() {
         // The process is alive when polled, then exits while the status probe
         // is in flight. A forward seen by that probe is not proof the process
         // still holds it.
+        //
+        // Both halves are made to happen, not timed: the stand-in cannot exit
+        // until the probe releases it, so the first poll sees it alive, and
+        // the probe reports the forward only once the stand-in has exited.
+        let gate: std::sync::Mutex<Option<(u32, tokio::process::ChildStdin)>> =
+            std::sync::Mutex::new(None);
         let probes = std::sync::atomic::AtomicUsize::new(0);
-        let err = start_forwarder(
-            quick_startup(),
-            || Ok(exit_with_stderr_after("0.05", "rejected")),
-            || {
-                let first = probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
-                async move {
-                    if first {
-                        return Some(sessions(&[]));
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            start_forwarder(
+                quick_startup(),
+                || {
+                    let (child, stdin) = exit_with_stderr_on_release("rejected");
+                    let pid = child.id().expect("a running stand-in has a pid");
+                    *gate.lock().expect("gate lock") = Some((pid, stdin));
+                    Ok(child)
+                },
+                || {
+                    let first = probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                    let released = gate.lock().expect("gate lock").take();
+                    async move {
+                        if first {
+                            return Some(sessions(&[]));
+                        }
+                        let (pid, stdin) =
+                            released.expect("the stand-in was spawned before this probe");
+                        drop(stdin);
+                        wait_for_exit_unreaped(pid).await;
+                        Some(sessions(&["mine"]))
                     }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    Some(sessions(&["mine"]))
-                }
-            },
+                },
+            ),
         )
         .await
+        .expect("start_forwarder settles once the stand-in exits")
         .expect_err("a process that exited during the probe is not published");
         assert!(
             matches!(err, ForwarderStartError::Exited { ref stderr, .. } if stderr.contains("rejected")),
             "{err:?}"
+        );
+        assert_eq!(
+            probes.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the forward is seen on the first probe after spawn"
         );
     }
 
@@ -1679,8 +1792,14 @@ mod tests {
         // Alive is not published: a forward that never shows up in the serve
         // config is reported and its process is not left behind.
         let pid = std::sync::atomic::AtomicU32::new(0);
+        // The deadline is what this test exercises, so it is short; the
+        // stand-in outlives it however slowly it starts.
+        let startup = ForwarderStartup {
+            apply_timeout: Duration::from_millis(300),
+            ..quick_startup()
+        };
         let err = start_forwarder(
-            quick_startup(),
+            startup,
             || {
                 let child = spawn_stand_in("sleep 30");
                 pid.store(child.id().unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
