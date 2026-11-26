@@ -9859,7 +9859,9 @@ mod tests {
                         "body": last_text
                     }
                 })))
-                .expect(1)
+                // The SDK can use the sync-populated event cache or fetch it.
+                // The failed edit and final send remain strictly required below.
+                .expect(0..=1)
                 .mount(&server)
                 .await;
 
