@@ -1103,8 +1103,10 @@ impl SqliteMemory {
         // In hybrid mode a failing embedder costs the vector stage, not the
         // keyword results: recall carries on as BM25-only, the same path a
         // deployment without an embedder takes.
-        let embedding_text =
-            super::embeddings::query_embedding_text(self.query_prefix.as_deref(), query);
+        let embedding_text = zeroclaw_providers::embedding::query_embedding_text(
+            self.query_prefix.as_deref(),
+            query,
+        );
         let query_embedding = match self.search_mode {
             SearchMode::Bm25 => None,
             SearchMode::Embedding => self.get_or_compute_embedding(&embedding_text).await?,

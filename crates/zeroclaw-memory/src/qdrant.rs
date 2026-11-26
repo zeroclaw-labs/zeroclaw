@@ -761,7 +761,7 @@ impl Memory for QdrantMemory {
         // Generate embedding for the query
         let embedder = self.embedder.read().clone();
         let embedding = embedder
-            .embed_one(&crate::embeddings::query_embedding_text(
+            .embed_one(&zeroclaw_providers::embedding::query_embedding_text(
                 self.query_prefix.as_deref(),
                 query,
             ))
@@ -1152,7 +1152,7 @@ impl Memory for QdrantMemory {
 
         let embedder = self.embedder.read().clone();
         let embedding = embedder
-            .embed_one(&crate::embeddings::query_embedding_text(
+            .embed_one(&zeroclaw_providers::embedding::query_embedding_text(
                 self.query_prefix.as_deref(),
                 query,
             ))
