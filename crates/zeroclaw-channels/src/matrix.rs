@@ -134,7 +134,159 @@ mod markers {
 
 // ─── mention ───────────────────────────────────────────────────────────────
 mod mention {
-    use matrix_sdk::ruma::UserId;
+    use matrix_sdk::ruma::{MatrixToUri, UserId};
+    use ruma_html::{Html, NodeRef};
+
+    /// Preserve a Goal command when Matrix placed an authenticated address in
+    /// front of it. This deliberately accepts only a leading address that
+    /// names this bot; ordinary prose containing `/goal` remains ordinary
+    /// chat input.
+    pub(super) fn normalize_addressed_goal_command(
+        bot_user_id: &UserId,
+        bot_display_name: Option<&str>,
+        m_mentions_user_ids: Option<&[String]>,
+        body: &str,
+        formatted_html: Option<&str>,
+    ) -> Option<String> {
+        let body = body.trim_start();
+        let command_start = goal_command_token_start(body)?;
+        let address = &body[..command_start];
+        if address.trim().is_empty() {
+            return Some(body.to_string());
+        }
+
+        // The room's mention-only gate has already run. Optional event-wide
+        // metadata is not proof of a leading address, but an explicit list
+        // targeting only other users must not be overridden by a plain alias.
+        let targets_only_other_users = m_mentions_user_ids
+            .is_some_and(|ids| !ids.is_empty() && !ids.iter().any(|id| id == bot_user_id.as_str()));
+        if targets_only_other_users
+            || !is_leading_bot_address(address, bot_user_id, bot_display_name, formatted_html)
+        {
+            return None;
+        }
+
+        Some(body[command_start..].to_string())
+    }
+
+    /// Find a complete `/goal` token without imposing syntax on the address
+    /// immediately before it; `is_leading_bot_address` owns that validation.
+    pub(super) fn goal_command_token_start(content: &str) -> Option<usize> {
+        content.match_indices('/').find_map(|(index, _)| {
+            let candidate = &content[index..];
+            let token = candidate.get(.."/goal".len())?;
+            (token.eq_ignore_ascii_case("/goal")
+                && candidate["/goal".len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(char::is_whitespace))
+            .then_some(index)
+        })
+    }
+
+    fn is_leading_bot_address(
+        prefix: &str,
+        bot_user_id: &UserId,
+        bot_display_name: Option<&str>,
+        formatted_html: Option<&str>,
+    ) -> bool {
+        let address = prefix.trim().trim_end_matches([':', ',']).trim();
+        if address.is_empty() {
+            return false;
+        }
+
+        let plain_target = explicit_plain_target(address, bot_user_id);
+        if let Some(matches) = formatted_html
+            .and_then(|html| leading_rich_address_matches(html, address, plain_target, bot_user_id))
+        {
+            return matches;
+        }
+
+        plain_target.unwrap_or_else(|| {
+            bot_display_name
+                .is_some_and(|name| !name.is_empty() && address.eq_ignore_ascii_case(name.trim()))
+        })
+    }
+
+    // A contradictory link vetoes a display-name fallback. When both forms
+    // identify a user, compare the targets, not their presentation labels.
+    fn leading_rich_address_matches(
+        html: &str,
+        address: &str,
+        plain_target: Option<bool>,
+        bot_user_id: &UserId,
+    ) -> Option<bool> {
+        let html = Html::parse(html);
+        let anchor = leading_link(&html)?;
+        let element = anchor.as_element()?;
+        let mentions_bot = element.attrs.borrow().iter().any(|attribute| {
+            attribute.name.local.as_ref() == "href"
+                && matrix_to_targets_bot(attribute.value.as_ref(), bot_user_id)
+        });
+        if !mentions_bot {
+            return Some(false);
+        }
+        if let Some(matches) = plain_target {
+            return Some(matches);
+        }
+        let mut label = String::new();
+        let mut pending = vec![anchor.children()];
+        while let Some(children) = pending.last_mut() {
+            let Some(node) = children.next() else {
+                pending.pop();
+                continue;
+            };
+            if let Some(text) = node.as_text() {
+                label.push_str(text.borrow().as_ref());
+            } else if node.as_element().is_some() {
+                pending.push(node.children());
+            }
+        }
+        Some(label.trim() == address)
+    }
+
+    fn leading_link(html: &Html) -> Option<NodeRef> {
+        let mut pending = vec![html.children()];
+        while let Some(children) = pending.last_mut() {
+            let Some(node) = children.next() else {
+                pending.pop();
+                continue;
+            };
+            if node
+                .as_text()
+                .is_some_and(|text| !text.borrow().trim().is_empty())
+            {
+                return None;
+            }
+            if let Some(element) = node.as_element() {
+                if element.name.local.as_ref() == "a" {
+                    return Some(node);
+                }
+                pending.push(node.children());
+            }
+        }
+        None
+    }
+
+    fn explicit_plain_target(address: &str, bot_user_id: &UserId) -> Option<bool> {
+        if let Some(url) = markdown_address_url(address) {
+            return Some(matrix_to_targets_bot(url, bot_user_id));
+        }
+        if let Ok(user_id) = <&UserId>::try_from(address) {
+            return Some(user_id == bot_user_id);
+        }
+        let localpart = format!("@{}", bot_user_id.localpart());
+        address.eq_ignore_ascii_case(&localpart).then_some(true)
+    }
+
+    fn markdown_address_url(address: &str) -> Option<&str> {
+        let (label, url) = address.strip_prefix('[')?.split_once("](")?;
+        (!label.is_empty()).then_some(url.strip_suffix(')')?)
+    }
+
+    fn matrix_to_targets_bot(url: &str, bot_user_id: &UserId) -> bool {
+        MatrixToUri::parse(url).is_ok_and(|uri| uri.id() == bot_user_id.matrix_to_uri().id())
+    }
 
     pub(super) fn is_mentioned(
         bot_user_id: &UserId,
@@ -2537,9 +2689,9 @@ mod inbound {
         let reply_target = extract_in_reply_to(&raw);
         let mut cached_reply_parent = None;
 
+        let mention_user_ids = extract_mentions_user_ids(&raw);
+        let display_name = ctx.bot_display_name.read().await.clone();
         if ctx.config.mention_only && is_group_room(&room).await {
-            let display_name = ctx.bot_display_name.read().await.clone();
-            let mention_user_ids = extract_mentions_user_ids(&raw);
             let mentioned = mention::is_mentioned(
                 &ctx.bot_user_id,
                 display_name.as_deref(),
@@ -2590,9 +2742,30 @@ mod inbound {
             }
         }
 
+        use matrix_sdk::ruma::events::room::message::{FormattedBody, MessageFormat};
+
+        #[derive(serde::Deserialize)]
+        struct FormattedEvent {
+            content: FormattedBody,
+        }
+
+        let formatted_html = mention::goal_command_token_start(&body)
+            .filter(|&index| !body[..index].trim().is_empty())
+            .and_then(|_| serde_json::from_str::<FormattedEvent>(raw.get()).ok())
+            .filter(|event| matches!(event.content.format, MessageFormat::Html))
+            .map(|event| event.content.body);
+        let normalized_goal_command = mention::normalize_addressed_goal_command(
+            &ctx.bot_user_id,
+            display_name.as_deref(),
+            mention_user_ids.as_deref(),
+            &body,
+            formatted_html.as_deref(),
+        );
+        let is_goal_command = normalized_goal_command.is_some();
         let thread_id = extract_thread_id(&raw);
-        let mut content = body.clone();
-        if let Some(tid) = thread_id.as_ref()
+        let mut content = normalized_goal_command.unwrap_or_else(|| body.clone());
+        if !is_goal_command
+            && let Some(tid) = thread_id.as_ref()
             && ctx_mod::claim_first_visit(&ctx.threads_seen, tid).await
         {
             match room.event(tid, None).await {
@@ -2669,7 +2842,7 @@ mod inbound {
                 ctx.transcription.as_ref(),
             )
             .await;
-        } else if let Some(reply_id) = reply_target.as_ref() {
+        } else if !is_goal_command && let Some(reply_id) = reply_target.as_ref() {
             let parent = if let Some(cached) = cached_reply_parent.take() {
                 Ok(cached)
             } else {
@@ -7465,13 +7638,7 @@ mod tests {
             // Parent-event fetch: /rooms/{roomId}/event/{eventId} returns the
             // parent m.audio event verbatim.
             let parent = voice_event_json("$parentaudio:localhost");
-            Mock::given(method("GET"))
-                .and(path_regex(
-                    r"^/_matrix/client/v3/rooms/.*/event/\$parentaudio:localhost$",
-                ))
-                .respond_with(ResponseTemplate::new(200).set_body_json(parent))
-                .mount(matrix.server())
-                .await;
+            mount_parent_event(&matrix, parent, 1).await;
 
             let stt = stt_server().await;
             let workspace = tempfile::tempdir().unwrap();
@@ -7516,6 +7683,26 @@ mod tests {
                 msg.content
             );
             assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
+
+            for (event_id, command) in [
+                ("$goal-status-reply:localhost", "/goal status"),
+                (
+                    "$goal-start-reply:localhost",
+                    "/goal start --unlimited Check the example",
+                ),
+            ] {
+                let json = plain_reply_event(event_id, "$parentaudio:localhost", command);
+                matrix
+                    .sync_room(
+                        &client,
+                        JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                    )
+                    .await;
+                let msg = recv_forwarded(&mut rx).await;
+                assert_eq!(msg.content, command);
+            }
+            assert_eq!(stt.received_requests().await.unwrap().len(), 1);
+            matrix.server().verify().await;
         }
 
         /// `voice_origin` is the event's own MSC3245 flag, forwarded so the
@@ -7764,6 +7951,160 @@ mod tests {
                     }
                 }
             })
+        }
+
+        #[tokio::test]
+        async fn rich_addressed_goal_command_forwards_as_the_exact_command() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = handler_ctx_with_resolver(None, workspace.path(), tx);
+            *ctx.bot_display_name.write().await = Some("zc-architect".to_string());
+            let _guards = register_event_handlers(&client, &ctx);
+
+            let addressed = "Project bot: /goal help";
+            for (event_id, mentions, expected) in [
+                (
+                    "$goal-help:localhost",
+                    Some(&["@bot:localhost"][..]),
+                    "/goal help",
+                ),
+                ("$legacy-goal-help:localhost", None, "/goal help"),
+                ("$empty-mentions:localhost", Some(&[][..]), "/goal help"),
+                (
+                    "$only-other-mentioned:localhost",
+                    Some(&["@other:localhost"][..]),
+                    addressed,
+                ),
+            ] {
+                let mut json = text_parent_event(event_id, "@alice:localhost", addressed);
+                if let Some(mentions) = mentions {
+                    json["content"]["m.mentions"] = serde_json::json!({"user_ids": mentions});
+                }
+                json["content"]["format"] = serde_json::json!("org.matrix.custom.html");
+                json["content"]["formatted_body"] = serde_json::json!(
+                    "<p><a href=\"https://matrix.to/#/@bot:localhost\">Project bot</a>: /goal help</p>"
+                );
+                matrix
+                    .sync_room(
+                        &client,
+                        JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                    )
+                    .await;
+                assert_eq!(recv_forwarded(&mut rx).await.content, expected);
+            }
+
+            let body = "Explain /goal help to Project bot";
+            let mut json = text_parent_event("$ordinary-help:localhost", "@alice:localhost", body);
+            json["content"]["m.mentions"] = serde_json::json!({"user_ids": ["@bot:localhost"]});
+            json["content"]["format"] = serde_json::json!("org.matrix.custom.html");
+            json["content"]["formatted_body"] = serde_json::json!(
+                "Explain /goal help to <a href=\"https://matrix.to/#/@bot:localhost\">Project bot</a>"
+            );
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+            assert_eq!(recv_forwarded(&mut rx).await.content, body);
+
+            for (event_id, msgtype, body, formatted, expected) in [
+                (
+                    "$plain-address:localhost",
+                    "m.text",
+                    "zc-architect: /goal status",
+                    "<p><strong>zc-architect</strong>: /goal status</p>",
+                    "/goal status",
+                ),
+                (
+                    "$other-address:localhost",
+                    "m.text",
+                    "zc-architect: /goal status for Project bot",
+                    "<p><strong><a href=\"https://matrix.to/#/@other:localhost\">zc-architect</a></strong>: /goal status for <a href=\"https://matrix.to/#/@bot:localhost\">Project bot</a></p>",
+                    "zc-architect: /goal status for Project bot",
+                ),
+                (
+                    "$styled-address:localhost",
+                    "m.text",
+                    "zc-architect: /goal pause now",
+                    "<a href=\"https://matrix.to/#/@bot:localhost\"><strong>zc-architect</strong></a>: /goal pause now",
+                    "/goal pause now",
+                ),
+                (
+                    "$markdown-address:localhost",
+                    "m.notice",
+                    "[Bot account](https://matrix.to/#/@bot:localhost) /goal status",
+                    "<a href=\"https://matrix.to/#/@bot:localhost\">Project bot</a> /goal status",
+                    "/goal status",
+                ),
+                (
+                    "$full-address:localhost",
+                    "m.text",
+                    "@bot:localhost: /goal status",
+                    "<a href=\"https://matrix.to/#/@bot:localhost\">Project bot</a>: /goal status",
+                    "/goal status",
+                ),
+                (
+                    "$different-full-address:localhost",
+                    "m.text",
+                    "@other:localhost: /goal status",
+                    "<a href=\"https://matrix.to/#/@bot:localhost\">@other:localhost</a>: /goal status",
+                    "@other:localhost: /goal status",
+                ),
+                (
+                    "$weak-label-mismatch:localhost",
+                    "m.text",
+                    "Explain /goal status",
+                    "<a href=\"https://matrix.to/#/@bot:localhost\">Project bot</a> /goal status",
+                    "Explain /goal status",
+                ),
+                (
+                    "$notice-other-address:localhost",
+                    "m.notice",
+                    "zc-architect: /goal status",
+                    "<a href=\"https://matrix.to/#/@other:localhost\">zc-architect</a>: /goal status",
+                    "zc-architect: /goal status",
+                ),
+                (
+                    "$emote-other-address:localhost",
+                    "m.emote",
+                    "zc-architect: /goal status",
+                    "<a href=\"https://matrix.to/#/@other:localhost\">zc-architect</a>: /goal status",
+                    "zc-architect: /goal status",
+                ),
+                (
+                    "$emote-matching-address:localhost",
+                    "m.emote",
+                    "Project bot: /goal status",
+                    "<a href=\"https://matrix.to/#/@bot:localhost\">Project bot</a>: /goal status",
+                    "/goal status",
+                ),
+                (
+                    "$contradictory-serializations:localhost",
+                    "m.text",
+                    "[Project bot](https://matrix.to/#/@other:localhost) /goal status",
+                    "<a href=\"https://matrix.to/#/@bot:localhost\">Project bot</a> /goal status",
+                    "[Project bot](https://matrix.to/#/@other:localhost) /goal status",
+                ),
+            ] {
+                let mut json = text_parent_event(event_id, "@alice:localhost", body);
+                json["content"]["msgtype"] = serde_json::json!(msgtype);
+                json["content"]["m.mentions"] =
+                    serde_json::json!({"user_ids": ["@other:localhost", "@bot:localhost"]});
+                json["content"]["format"] = serde_json::json!("org.matrix.custom.html");
+                json["content"]["formatted_body"] = serde_json::json!(formatted);
+                matrix
+                    .sync_room(
+                        &client,
+                        JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                    )
+                    .await;
+                assert_eq!(recv_forwarded(&mut rx).await.content, expected);
+            }
         }
 
         async fn mount_parent_event(
@@ -8679,8 +9020,196 @@ mod tests {
     }
 
     mod mention {
-        use super::super::mention::{admit_group_message, is_mentioned, sender_is_user};
+        use super::super::mention::{
+            admit_group_message, is_mentioned, normalize_addressed_goal_command, sender_is_user,
+        };
         use matrix_sdk::ruma::user_id;
+
+        #[test]
+        fn addressed_goal_command_is_normalized_before_forwarding() {
+            use zeroclaw_commands::goal::{GoalCommand, parse_goal_command};
+
+            let bot = user_id!("@zc-architect:example.org");
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("zc-architect"),
+                    Some(&["@zc-architect:example.org".to_string()]),
+                    "zc-architect: /goal help",
+                    None,
+                ),
+                Some("/goal help".to_string()),
+            );
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("zc-architect"),
+                    None,
+                    "@zc-architect:example.org /goal status",
+                    None,
+                ),
+                Some("/goal status".to_string()),
+            );
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("zc-architect"),
+                    None,
+                    "@zc-architect:example.org:/goal cancel",
+                    None,
+                ),
+                Some("/goal cancel".to_string()),
+            );
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("zc-architect"),
+                    None,
+                    "zc-architect:/GOAL CaNcEl",
+                    None,
+                ),
+                Some("/GOAL CaNcEl".to_string()),
+            );
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("zc-architect"),
+                    None,
+                    "zc-architect,/GoAl ReSuMe Keep This Case\nand this line too",
+                    None,
+                ),
+                Some("/GoAl ReSuMe Keep This Case\nand this line too".to_string()),
+            );
+            let resumed = normalize_addressed_goal_command(
+                bot,
+                Some("zc-architect"),
+                None,
+                "zc-architect,/GoAl ReSuMe Keep This Case\nand this line too",
+                None,
+            )
+            .expect("an authenticated comma-terminated address is preserved");
+            assert_eq!(
+                parse_goal_command(&resumed),
+                Ok(GoalCommand::Resume {
+                    response: Some("Keep This Case\nand this line too".to_string()),
+                })
+            );
+            let cancelled = normalize_addressed_goal_command(
+                bot,
+                Some("zc-architect"),
+                None,
+                "zc-architect:/GOAL CaNcEl",
+                None,
+            )
+            .expect("an authenticated colon-terminated address is preserved");
+            assert_eq!(cancelled, "/GOAL CaNcEl");
+            assert_eq!(parse_goal_command(&cancelled), Ok(GoalCommand::Cancel));
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("zc-architect"),
+                    Some(&["@zc-architect:example.org".to_string()]),
+                    "@zc-architect: /goal help",
+                    None,
+                ),
+                Some("/goal help".to_string()),
+            );
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("zc-architect"),
+                    Some(&["@zc-architect:example.org".to_string()]),
+                    "@zc-architect /goal status",
+                    None,
+                ),
+                Some("/goal status".to_string()),
+            );
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("different display name"),
+                    Some(&["@zc-architect:example.org".to_string()]),
+                    "zc-architect: /goal help",
+                    None,
+                ),
+                None,
+            );
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("different display name"),
+                    Some(&["@zc-architect:example.org".to_string()]),
+                    "[zc-architect](https://matrix.to/#/@zc-architect:example.org) /goal status",
+                    None,
+                ),
+                Some("/goal status".to_string()),
+            );
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("different display name"),
+                    Some(&["@zc-architect:example.org".to_string()]),
+                    "Please zc-architect /goal help",
+                    None,
+                ),
+                None,
+            );
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("zc-architect"),
+                    None,
+                    "@other:example.org /GOAL cancel",
+                    None,
+                ),
+                None,
+            );
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("zc-architect"),
+                    Some(&["@zc-architect:example.org".to_string()]),
+                    "Please ask zc-architect: /goal help",
+                    None,
+                ),
+                None,
+            );
+            assert_eq!(
+                normalize_addressed_goal_command(
+                    bot,
+                    Some("zc-architect"),
+                    None,
+                    "@zc-architect:example.org /GOALkeeper cancel",
+                    None,
+                ),
+                None,
+            );
+        }
+
+        #[test]
+        fn first_thread_goal_classifier_matches_complete_case_insensitive_token() {
+            use zeroclaw_commands::goal::{GoalCommand, GoalCommandParseError, parse_goal_command};
+
+            let bot = user_id!("@bot:example.org");
+            for input in ["/goal status", "/GOAL StAtUs", "\u{2003}/gOaL\tstatus"] {
+                let normalized = normalize_addressed_goal_command(bot, None, None, input, None);
+                assert_eq!(normalized.as_deref(), Some(input.trim_start()));
+                assert_eq!(parse_goal_command(input), Ok(GoalCommand::Status));
+            }
+            assert_eq!(
+                parse_goal_command("/goalkeeper status"),
+                Err(GoalCommandParseError::NotGoalCommand)
+            );
+            for input in [
+                "/goalkeeper status",
+                "/goal/status",
+                "ordinary prose /GOAL status",
+                "ordinary 🙂 /GOAL status",
+                "@other:example.org /GOAL status",
+            ] {
+                assert!(normalize_addressed_goal_command(bot, None, None, input, None).is_none());
+            }
+        }
 
         #[test]
         fn explicit_mention_in_user_ids_passes() {

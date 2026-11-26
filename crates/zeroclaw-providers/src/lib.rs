@@ -1298,11 +1298,32 @@ pub(crate) fn stream_idle_error_message(
 
 /// Build a sanitized model_provider error from a failed HTTP response.
 pub async fn api_error(model_provider: &str, response: reqwest::Response) -> anyhow::Error {
+    api_error_with_body(model_provider, response, |_| {}).await
+}
+
+pub(crate) async fn string_wire_api_error<T: dispatch::accounting::ObserveRejectedStringWire>(
+    model_provider: &str,
+    response: reqwest::Response,
+) -> anyhow::Error {
+    api_error_with_body(model_provider, response, |body| {
+        dispatch::accounting::observe_completed_string_wire_rejection::<T>(body.as_bytes());
+    })
+    .await
+}
+
+async fn api_error_with_body(
+    model_provider: &str,
+    response: reqwest::Response,
+    observe_complete_body: impl FnOnce(&str),
+) -> anyhow::Error {
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "<failed to read model_provider error body>".to_string());
+    let body = match response.text().await {
+        Ok(body) => {
+            observe_complete_body(&body);
+            body
+        }
+        Err(_) => "<failed to read model_provider error body>".to_string(),
+    };
     api_error_from_parts(model_provider, status, &body)
 }
 

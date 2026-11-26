@@ -2080,6 +2080,133 @@ fn normalize_token_count_float(value: f64) -> Option<u64> {
     Some(value.floor() as u64)
 }
 
+type CompatibleRawFields<'a> = std::collections::HashMap<String, &'a serde_json::value::RawValue>;
+
+fn compatible_raw_fields(wire: &str) -> Option<CompatibleRawFields<'_>> {
+    serde_json::from_str(wire).ok()
+}
+
+fn exact_compatible_cache_count(value: &serde_json::value::RawValue) -> Option<u64> {
+    let lexeme = value.get();
+    if lexeme.starts_with('"') {
+        exact_decimal_count(serde_json::from_str::<String>(lexeme).ok()?.trim())
+    } else {
+        exact_decimal_count(lexeme)
+    }
+}
+
+fn exact_decimal_count(scalar: &str) -> Option<u64> {
+    let (significand, exponent) = match scalar.split_once(['e', 'E']) {
+        Some((significand, exponent)) => (significand, exponent.parse::<i64>().ok()?),
+        None => (scalar, 0),
+    };
+    let negative = significand.starts_with('-');
+    let significand = significand.strip_prefix(['+', '-']).unwrap_or(significand);
+    let (whole, fraction) = significand.split_once('.').unwrap_or((significand, ""));
+    let digits = whole.bytes().chain(fraction.bytes());
+    let len = whole.len() + fraction.len();
+    if len == 0 || !digits.clone().all(|digit| digit.is_ascii_digit()) {
+        return None;
+    }
+    if digits.clone().all(|digit| digit == b'0') {
+        return Some(0);
+    }
+    if negative {
+        return None;
+    }
+    let shift = exponent.checked_sub(i64::try_from(fraction.len()).ok()?)?;
+    let keep = len.checked_sub(usize::try_from(shift.saturating_neg().max(0)).ok()?)?;
+    if digits.clone().skip(keep).any(|digit| digit != b'0') {
+        return None;
+    }
+    let count = digits.take(keep).try_fold(0_u64, |count, digit| {
+        count.checked_mul(10)?.checked_add(u64::from(digit - b'0'))
+    })?;
+    count.checked_mul(10_u64.checked_pow(u32::try_from(shift.max(0)).ok()?)?)
+}
+
+fn observe_compatible_string_body(body: &str, decoded: Option<&ApiChatResponseEnvelope>) {
+    if crate::dispatch::accounting::string_usage_observation_enabled()
+        && let Some(wire) = compatible_raw_fields(body)
+    {
+        let top = wire.get("usage").copied();
+        let wrapped = wire
+            .get("data")
+            .and_then(|data| compatible_raw_fields(data.get()))
+            .and_then(|data| data.get("usage").copied());
+        let usage = match decoded {
+            Some(ApiChatResponseEnvelope::Direct(_)) => top,
+            Some(ApiChatResponseEnvelope::Wrapped { .. }) => wrapped,
+            None => top.filter(|usage| usage.get() != "null").or(wrapped),
+        };
+        observe_compatible_string_usage(usage);
+    }
+}
+
+fn observe_compatible_string_usage(usage: Option<&serde_json::value::RawValue>) {
+    use crate::dispatch::accounting::{observe_malformed_string_usage, observe_string_usage};
+    use serde_json::value::RawValue;
+
+    let Some(usage) = usage.filter(|usage| usage.get() != "null") else {
+        return;
+    };
+    let fields = compatible_raw_fields(usage.get());
+    let mut malformed = fields.is_none();
+    let fields = fields.unwrap_or_default();
+    let details = fields
+        .get("prompt_tokens_details")
+        .copied()
+        .filter(|value| value.get() != "null");
+    let detail_fields = details.and_then(|value| compatible_raw_fields(value.get()));
+    malformed |= details.is_some() && detail_fields.is_none();
+    let mut read = |field: Option<&RawValue>, decode: fn(&RawValue) -> Option<u64>| {
+        let value = field.filter(|value| value.get() != "null")?;
+        let count = decode(value);
+        malformed |= count.is_none();
+        count
+    };
+    let integer = |value: &RawValue| serde_json::from_str::<u64>(value.get()).ok();
+    let input = read(fields.get("prompt_tokens").copied(), integer);
+    let output = read(fields.get("completion_tokens").copied(), integer);
+    let cache_read = read(
+        fields.get("cache_read_input_tokens").copied(),
+        exact_compatible_cache_count,
+    );
+    let cache_hit = read(
+        fields.get("prompt_cache_hit_tokens").copied(),
+        exact_compatible_cache_count,
+    );
+    let cache_details = read(
+        detail_fields
+            .as_ref()
+            .and_then(|value| value.get("cached_tokens"))
+            .copied(),
+        exact_compatible_cache_count,
+    );
+    let cache_write = read(
+        fields.get("cache_creation_input_tokens").copied(),
+        exact_compatible_cache_count,
+    );
+    let cache_write_details = read(
+        detail_fields
+            .as_ref()
+            .and_then(|value| value.get("cache_creation_input_tokens"))
+            .copied(),
+        exact_compatible_cache_count,
+    );
+    let observed = zeroclaw_api::model_provider::TokenUsage {
+        input_tokens: input,
+        output_tokens: output,
+        cached_input_tokens: cache_read.or(cache_hit).or(cache_details),
+        cache_creation_input_tokens: cache_write_details.or(cache_write),
+    };
+    if malformed {
+        observe_malformed_string_usage(observed);
+    } else {
+        observe_string_usage(Some(observed));
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
@@ -3080,24 +3207,26 @@ fn sse_bytes_to_events_for_contract(
 }
 
 fn parse_chat_response_body(name: &str, body: &str) -> anyhow::Result<ApiChatResponse> {
-    serde_json::from_str::<ApiChatResponseEnvelope>(body)
-        .map(ApiChatResponseEnvelope::into_response)
-        .map_err(|_| {
-            let sanitized = super::sanitize_api_error(body);
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "model_provider": name,
-                        "body": &sanitized,
-                    })),
-                "compatible: unexpected chat-completions payload"
-            );
-            anyhow::Error::msg(format!(
-                "{name} API returned an unexpected chat-completions payload; body={sanitized}"
-            ))
-        })
+    parse_chat_response_envelope(name, body).map(ApiChatResponseEnvelope::into_response)
+}
+
+fn parse_chat_response_envelope(name: &str, body: &str) -> anyhow::Result<ApiChatResponseEnvelope> {
+    serde_json::from_str(body).map_err(|_| {
+        let sanitized = super::sanitize_api_error(body);
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "model_provider": name,
+                    "body": &sanitized,
+                })),
+            "compatible: unexpected chat-completions payload"
+        );
+        anyhow::Error::msg(format!(
+            "{name} API returned an unexpected chat-completions payload; body={sanitized}"
+        ))
+    })
 }
 
 impl OpenAiCompatibleModelProvider {
@@ -4471,9 +4600,8 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             extra_body: self.extra_body.clone(),
         };
         // No cache breakpoints here, deliberately: this text-only helper
-        // never surfaces response usage to dispatch accounting, so a
-        // premium cache write it triggered could never be accounted for
-        // (fallback re-entries through this path return `usage: None`).
+        // must preserve its existing request policy even when an opted-in
+        // accounting scope observes usage returned on this path.
         // The flag is honored on the structured paths (`chat`,
         // `chat_with_tools`, `stream_chat`), which capture usage; the
         // provider docs describe this usage-capture boundary.
@@ -4497,11 +4625,15 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         if !response.status().is_success() {
             let status = response.status();
             let error = response.text().await?;
+            observe_compatible_string_body(&error, None);
+            crate::dispatch::accounting::finish_current_string_attempt_after_completed_response();
             return Err(provider_http_error(&self.name, status, &error));
         }
 
         let body = response.text().await?;
-        let chat_response = parse_chat_response_body(&self.name, &body)?;
+        let decoded = parse_chat_response_envelope(&self.name, &body);
+        observe_compatible_string_body(&body, decoded.as_ref().ok());
+        let chat_response = decoded?.into_response();
 
         chat_response
             .choices
@@ -5655,7 +5787,18 @@ mod tests {
     }
 
     async fn mock_non_streaming_response(
-        response_body: serde_json::Value,
+        response_body: impl serde::Serialize,
+    ) -> (
+        OpenAiCompatibleModelProvider,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        mock_non_streaming_response_with_status(axum::http::StatusCode::OK, response_body).await
+    }
+
+    async fn mock_non_streaming_response_with_status(
+        status: axum::http::StatusCode,
+        response_body: impl serde::Serialize,
     ) -> (
         OpenAiCompatibleModelProvider,
         std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
@@ -5664,6 +5807,7 @@ mod tests {
         use axum::{Json, Router, routing::post};
         use tokio::net::TcpListener;
 
+        let response_body = serde_json::to_string(&response_body).unwrap();
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured_for_route = std::sync::Arc::clone(&captured);
         let app = Router::new().route(
@@ -5673,7 +5817,11 @@ mod tests {
                 let response_body = response_body.clone();
                 async move {
                     captured.lock().unwrap().push(request);
-                    Json(response_body)
+                    (
+                        status,
+                        [("content-type", "application/json")],
+                        response_body,
+                    )
                 }
             }),
         );
@@ -5741,6 +5889,232 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn goal_string_usage_keeps_compatible_request_and_text_policy() {
+        let (provider, captured, server) = mock_non_streaming_response(serde_json::json!({
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 3}
+        }))
+        .await;
+        let dispatch = crate::dispatch::ProviderDispatch::new(std::sync::Arc::new(provider));
+        let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+        let text = scope
+            .scope(dispatch.chat_with_system(Some("be brief"), "hello", "test-model", None))
+            .await
+            .unwrap();
+        let report = scope.take();
+        let ordinary_scope = crate::dispatch::AccountedChatScope::new();
+        let ordinary_text = ordinary_scope
+            .scope(dispatch.chat_with_system(Some("be brief"), "hello", "test-model", None))
+            .await
+            .unwrap();
+        let ordinary_report = ordinary_scope.take();
+        server.abort();
+        assert_eq!(text, "ok");
+        assert_eq!(ordinary_text, text);
+        assert!(matches!(
+            ordinary_report.attempts()[0].outcome(),
+            crate::dispatch::AttemptUsageOutcome::Missing
+        ));
+        assert!(
+            matches!(report.attempts()[0].outcome(), crate::dispatch::AttemptUsageOutcome::Complete(usage)
+            if usage.input_tokens == Some(8) && usage.output_tokens == Some(3))
+        );
+        let requests = captured.lock().unwrap();
+        assert_eq!(
+            requests[0],
+            serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "system", "content": "be brief"}, {"role": "user", "content": "hello"}],
+                "stream": false
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_string_usage_compatible_http_rejection_keeps_direct_and_wrapped_counts() {
+        use crate::dispatch::{AccountedChatScope, AttemptUsageOutcome, ProviderDispatch};
+        use serde_json::json;
+
+        let usage =
+            json!({"prompt_tokens":8,"completion_tokens":3,"prompt_cache_hit_tokens":"2e0"});
+        for response in [
+            json!({"error":{"message":"fixture rejection"},"usage":usage}),
+            json!({"error":{"message":"fixture rejection"},"data":{"usage":usage}}),
+            json!({"error":{"message":"fixture rejection"},"usage":null,"data":{"usage":usage}}),
+            json!({"error":{"message":"fixture rejection"},"usage":usage,"data":{"usage":{
+                "prompt_tokens":17,"completion_tokens":11
+            }}}),
+        ] {
+            let (provider, captured, server) = mock_non_streaming_response_with_status(
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                response,
+            )
+            .await;
+            let dispatch = ProviderDispatch::from_ref(&provider);
+            let scope = AccountedChatScope::new_with_string_usage();
+            let error = scope
+                .scope(dispatch.chat_with_system(None, "hello", "model", None))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("fixture rejection"));
+            let ordinary = dispatch
+                .chat_with_system(None, "hello", "model", None)
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), ordinary.to_string());
+            let report = scope.take();
+            let [attempt] = report.attempts() else {
+                panic!("expected one scoped rejection");
+            };
+            assert!(matches!(
+                attempt.outcome(),
+                AttemptUsageOutcome::Complete(usage)
+                    if (usage.input_tokens, usage.output_tokens, usage.cached_input_tokens)
+                        == (Some(8), Some(3), Some(2))
+            ));
+            assert!(report.accepted_route().is_none());
+            assert_eq!(report.rejected_attempts().len(), 1);
+            assert_eq!(captured.lock().unwrap().len(), 2);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_string_usage_distinguishes_compatible_wire_cache_validity() {
+        use crate::dispatch::{
+            AccountedChatScope, AttemptUsageOutcome, InvalidUsageReason, ProviderDispatch,
+        };
+        use serde_json::json;
+
+        let cases = [
+            (
+                json!({"prompt_tokens":150,"completion_tokens":60,"prompt_tokens_details":{"cached_tokens":"5.0000000000000001"}}),
+                None,
+                true,
+                false,
+            ),
+            (
+                json!({"prompt_tokens":150,"completion_tokens":60}),
+                None,
+                false,
+                false,
+            ),
+            (
+                json!({"prompt_tokens":150,"completion_tokens":60,"prompt_cache_hit_tokens":0}),
+                Some(0),
+                false,
+                false,
+            ),
+            (
+                json!({"prompt_tokens":150,"completion_tokens":60,"prompt_tokens_details":{"cached_tokens":"1e2"}}),
+                Some(100),
+                false,
+                false,
+            ),
+            (
+                json!({"prompt_tokens":150,"completion_tokens":60,"prompt_cache_hit_tokens":-1,"prompt_tokens_details":{"cached_tokens":"bad"}}),
+                None,
+                true,
+                false,
+            ),
+            (
+                json!({"prompt_tokens":"150","completion_tokens":60}),
+                None,
+                true,
+                true,
+            ),
+        ];
+        for (usage, cache, invalid, rejects) in cases {
+            let response = json!({"data":{"choices":[{"message":{"content":"ok"}}],"usage":usage}});
+            let (provider, _, server) = mock_non_streaming_response(response).await;
+            let dispatch = ProviderDispatch::from_ref(&provider);
+            let ordinary = dispatch
+                .chat_with_system(None, "hello", "model", None)
+                .await;
+            let scope = AccountedChatScope::new_with_string_usage();
+            let result = scope
+                .scope(dispatch.chat_with_system(None, "hello", "model", None))
+                .await;
+            assert_eq!(result.is_err(), rejects);
+            assert_eq!(ordinary.is_err(), rejects);
+            if rejects {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    ordinary.unwrap_err().to_string()
+                );
+            } else {
+                assert_eq!(result.unwrap(), ordinary.unwrap());
+            }
+            let report = scope.take();
+            assert_eq!(report.attempts().len(), 1);
+            let observed = match report.attempts()[0].outcome() {
+                AttemptUsageOutcome::Complete(usage) if !invalid => usage,
+                AttemptUsageOutcome::Invalid {
+                    observed: usage,
+                    reason: InvalidUsageReason::MalformedUsage,
+                } if invalid => usage,
+                outcome => panic!("unexpected compatible usage: {outcome:?}"),
+            };
+            assert_eq!(observed.input_tokens, (!rejects).then_some(150));
+            assert_eq!(observed.output_tokens, Some(60));
+            assert_eq!(observed.cached_input_tokens, cache);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_string_usage_compatible_exact_numeric_cache_counts() {
+        use crate::dispatch::{
+            AccountedChatScope, AttemptUsageOutcome, InvalidUsageReason, ProviderDispatch,
+        };
+        use serde_json::value::RawValue;
+
+        for (lexeme, expected) in [
+            ("5.0", Some(5)),
+            ("5e0", Some(5)),
+            ("5.0000000000000001", None),
+        ] {
+            let response = RawValue::from_string(format!(
+                r#"{{"choices":[{{"message":{{"content":"ok"}}}}],"usage":{{"prompt_tokens":150,"completion_tokens":60,"prompt_tokens_details":{{"cached_tokens":{lexeme}}}}}}}"#
+            )).unwrap();
+            let (provider, _, server) = mock_non_streaming_response(response).await;
+            let dispatch = ProviderDispatch::from_ref(&provider);
+            let scope = AccountedChatScope::new_with_string_usage();
+            assert_eq!(
+                scope
+                    .scope(dispatch.chat_with_system(None, "hello", "model", None))
+                    .await
+                    .unwrap(),
+                "ok"
+            );
+            let report = scope.take();
+            let [attempt] = report.attempts() else {
+                panic!("expected one physical attempt");
+            };
+            let usage = match (expected, attempt.outcome()) {
+                (Some(_), AttemptUsageOutcome::Complete(usage)) => usage,
+                (
+                    None,
+                    AttemptUsageOutcome::Invalid {
+                        observed,
+                        reason: InvalidUsageReason::MalformedUsage,
+                    },
+                ) => observed,
+                (_, outcome) => panic!("unexpected cache usage for {lexeme}: {outcome:?}"),
+            };
+            assert_eq!(
+                (
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cached_input_tokens
+                ),
+                (Some(150), Some(60), expected)
+            );
+            server.abort();
+        }
+    }
+
     /// Capture mock for the TTL path: passthrough on or off, provider
     /// built with the requested `cache_ttl` when set. Same wire as
     /// [`Self::mock_streaming_cache_capture`] so tests pin both paths
@@ -5778,7 +6152,8 @@ mod tests {
                             .into_response();
                     }
                     Json(serde_json::json!({
-                        "choices": [{"message": {"content": "ok"}}]
+                        "choices": [{"message": {"content": "ok"}}],
+                        "usage": {"prompt_tokens": 8, "completion_tokens": 3}
                     }))
                     .into_response()
                 }
@@ -5803,6 +6178,31 @@ mod tests {
         let provider = builder.build();
 
         (provider, captured, server)
+    }
+
+    #[tokio::test]
+    async fn goal_string_usage_does_not_enable_premium_cache_breakpoints() {
+        let (provider, captured, server) =
+            mock_cache_capture_with_ttl(true, Some(CacheTtl::OneHour)).await;
+        let dispatch = crate::dispatch::ProviderDispatch::new(std::sync::Arc::new(provider));
+        let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+        assert_eq!(
+            scope
+                .scope(dispatch.chat_with_system(Some("system"), "hello", "model", None))
+                .await
+                .unwrap(),
+            "ok"
+        );
+        let report = scope.take();
+        server.abort();
+        assert!(
+            matches!(report.attempts()[0].outcome(), crate::dispatch::AttemptUsageOutcome::Complete(usage)
+            if usage.input_tokens == Some(8) && usage.output_tokens == Some(3))
+        );
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests[0]["messages"][0]["content"], "system");
+        assert_eq!(requests[0]["messages"][1]["content"], "hello");
+        assert!(!requests[0].to_string().contains("cache_control"));
     }
 
     /// D2 + D5: behind the flag, the 1h lifetime lands on every breakpoint

@@ -64,6 +64,27 @@ pub(super) struct ApiChatResponse {
     pub(super) eval_count: Option<u64>,
 }
 
+impl ApiChatResponse {
+    pub(super) fn rejected_string_usage(
+        wire: &serde_json::Value,
+    ) -> Option<crate::dispatch::AttemptUsageOutcome> {
+        crate::dispatch::accounting::project_string_usage_fields(
+            Some(wire),
+            "prompt_eval_count",
+            "eval_count",
+            None,
+        )
+    }
+}
+
+impl crate::dispatch::accounting::ObserveRejectedStringWire for ApiChatResponse {
+    fn observe_rejected_usage(wire: &serde_json::Value) {
+        if let Some(observation) = Self::rejected_string_usage(wire) {
+            crate::dispatch::accounting::observe_string_outcome(observation);
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(super) struct ResponseMessage {
     #[serde(default)]

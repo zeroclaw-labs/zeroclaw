@@ -629,6 +629,9 @@ impl OllamaModelProvider {
         );
 
         if !status.is_success() {
+            crate::dispatch::accounting::observe_completed_string_wire_rejection::<ApiChatResponse>(
+                &body,
+            );
             let raw = String::from_utf8_lossy(&body);
             let sanitized = super::sanitize_api_error(&raw);
             ::zeroclaw_log::record!(
@@ -650,6 +653,7 @@ impl OllamaModelProvider {
         let chat_response: ApiChatResponse = match serde_json::from_slice(&body) {
             Ok(r) => r,
             Err(e) => {
+                crate::dispatch::accounting::observe_rejected_string_wire::<ApiChatResponse>(&body);
                 let raw = String::from_utf8_lossy(&body);
                 let sanitized = super::sanitize_api_error(&raw);
                 ::zeroclaw_log::record!(
@@ -838,6 +842,19 @@ impl ModelProvider for OllamaModelProvider {
         let response = self
             .send_request(messages, &normalized_model, temperature, should_auth, None)
             .await?;
+
+        crate::dispatch::accounting::observe_string_usage(
+            if response.prompt_eval_count.is_some() || response.eval_count.is_some() {
+                Some(TokenUsage {
+                    input_tokens: response.prompt_eval_count,
+                    output_tokens: response.eval_count,
+                    cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
+                })
+            } else {
+                None
+            },
+        );
 
         // If model returned tool calls, format them for loop_.rs's parse_tool_calls
         if !response.message.tool_calls.is_empty() {
@@ -1171,6 +1188,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn goal_string_usage_preserves_ollama_tool_and_thinking_projection() {
+        use axum::{Json, Router, routing::post};
+        let replies = Arc::new(Mutex::new(std::collections::VecDeque::from(vec![
+            serde_json::json!({"message":{"content":"", "tool_calls":[{"id":"t", "function":{"name":"echo", "arguments":{"x":1}}}]}, "prompt_eval_count":8, "eval_count":3}),
+            serde_json::json!({"message":{"content":"", "thinking":"reasoned answer"}, "prompt_eval_count":8, "eval_count":3}),
+            serde_json::json!({"message":{"content":"unused"}, "prompt_eval_count":-1, "eval_count":3}),
+        ])));
+        let shared = Arc::clone(&replies);
+        let app = Router::new().route(
+            "/api/chat",
+            post(move || {
+                let shared = Arc::clone(&shared);
+                async move { Json(shared.lock().unwrap().pop_front().unwrap()) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = OllamaModelProvider::builder("test")
+            .base_url(Some(&url))
+            .build();
+        let dispatch = crate::dispatch::ProviderDispatch::new(Arc::new(provider));
+        for case in 0..2 {
+            let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+            let text = scope
+                .scope(dispatch.chat_with_system(None, "hello", "model", None))
+                .await
+                .unwrap();
+            let report = scope.take();
+            assert!(
+                matches!(report.attempts()[0].outcome(), crate::dispatch::AttemptUsageOutcome::Complete(usage)
+                if usage.input_tokens == Some(8) && usage.output_tokens == Some(3))
+            );
+            if case == 0 {
+                let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(json["tool_calls"][0]["function"]["name"], "echo");
+                assert_eq!(json["tool_calls"][0]["function"]["arguments"], "{\"x\":1}");
+            } else {
+                assert_eq!(text, "reasoned answer");
+            }
+        }
+        let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+        assert!(
+            scope
+                .scope(dispatch.chat_with_system(None, "hello", "model", None))
+                .await
+                .is_err()
+        );
+        let report = scope.take();
+        assert!(report.accepted_route().is_none());
+        assert!(matches!(
+            report.attempts()[0].outcome(),
+            crate::dispatch::AttemptUsageOutcome::Invalid {
+                observed: usage, reason: crate::dispatch::InvalidUsageReason::MalformedUsage,
+            } if usage.input_tokens.is_none() && usage.output_tokens == Some(3)
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn chat_with_tool_specs_omits_native_tools_payload() {
         use axum::{Json, Router, extract::State, routing::post};
         use tokio::net::TcpListener;
@@ -1239,6 +1318,25 @@ mod tests {
             )
             .await
             .expect("ollama chat request should succeed");
+        let structured_body = captured.lock().unwrap().take().unwrap();
+
+        let dispatch = crate::dispatch::ProviderDispatch::new(Arc::new(provider));
+        let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+        let text = scope
+            .scope(dispatch.chat_with_system(
+                Some("You are helpful."),
+                "read a file",
+                "llama3",
+                Some(0.2),
+            ))
+            .await
+            .expect("ollama String request should succeed");
+        let report = scope.take();
+        assert_eq!(text, "done");
+        assert!(
+            matches!(report.attempts()[0].outcome(), crate::dispatch::AttemptUsageOutcome::Complete(usage)
+            if usage.input_tokens == Some(10) && usage.output_tokens == Some(3))
+        );
 
         server.abort();
 
@@ -1254,11 +1352,15 @@ mod tests {
                 .and_then(|usage| usage.output_tokens),
             Some(3)
         );
-        let body = captured
+        let string_body = captured
             .lock()
             .expect("capture mutex poisoned")
             .take()
             .expect("request body should be captured");
+        assert_eq!(string_body["model"], "llama3");
+        assert_eq!(string_body["messages"][0]["content"], "You are helpful.");
+        assert_eq!(string_body["messages"][1]["content"], "read a file");
+        let body = structured_body;
         assert!(
             body.get("tools").is_none(),
             "Ollama chat() must not serialize native tools while supports_native_tools() is false: {body}"

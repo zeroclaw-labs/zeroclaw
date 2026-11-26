@@ -14,6 +14,12 @@ use zeroclaw_api::model_provider::{
 
 pub(crate) mod accounting;
 
+/// Display label for usage whose serving model could not be established.
+///
+/// The label alone does not determine priceability: a real model may have the
+/// same name. Use the attempt's `is_model_attributed()` method instead.
+pub const UNATTRIBUTED_MODEL: &str = "(unattributed)";
+
 /// Why a provider supplied usage observation cannot be billed as complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InvalidUsageReason {
@@ -21,6 +27,8 @@ pub enum InvalidUsageReason {
     MissingOutput,
     CachedInputExceedsInput,
     TotalOverflow,
+    /// An optional legacy String response usage field was malformed.
+    MalformedUsage,
 }
 
 /// Completeness of one physical provider attempt's usage observation.
@@ -37,7 +45,7 @@ pub enum AttemptUsageOutcome {
     },
 }
 
-/// Derived completeness of all physical leaves in one call report.
+/// Derived completeness of all reported model attempts in one call report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallAccountingState {
     Complete,
@@ -56,19 +64,27 @@ impl AttemptUsageOutcome {
     }
 }
 
-/// One actual physical provider leaf, in first-poll order.
+/// One provider/model attempt, in dispatch order. A provider may report more
+/// than one attempt within a single physical request.
 #[derive(Debug, Clone)]
 pub struct AccountedAttempt {
     provider_ref: String,
     model: String,
+    model_attributed: bool,
     outcome: AttemptUsageOutcome,
 }
 
 impl AccountedAttempt {
-    pub(crate) fn new(provider_ref: String, model: String, outcome: AttemptUsageOutcome) -> Self {
+    pub(crate) fn new(
+        provider_ref: String,
+        model: String,
+        model_attributed: bool,
+        outcome: AttemptUsageOutcome,
+    ) -> Self {
         Self {
             provider_ref,
             model,
+            model_attributed,
             outcome,
         }
     }
@@ -78,9 +94,16 @@ impl AccountedAttempt {
         &self.provider_ref
     }
 
+    /// Serving model, or [`UNATTRIBUTED_MODEL`] when it was not established.
     #[must_use]
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    /// Whether `model()` identifies the model that performed this attempt.
+    #[must_use]
+    pub fn is_model_attributed(&self) -> bool {
+        self.model_attributed
     }
 
     #[must_use]
@@ -97,6 +120,7 @@ impl AccountedAttempt {
 pub struct RejectedAttempt {
     provider_ref: String,
     model: String,
+    model_attributed: bool,
     usage: crate::traits::TokenUsage,
 }
 
@@ -104,11 +128,13 @@ impl RejectedAttempt {
     pub(crate) fn new(
         provider_ref: String,
         model: String,
+        model_attributed: bool,
         usage: crate::traits::TokenUsage,
     ) -> Self {
         Self {
             provider_ref,
             model,
+            model_attributed,
             usage,
         }
     }
@@ -120,13 +146,19 @@ impl RejectedAttempt {
     }
 
     #[must_use]
-    /// Served model used for rejected-cost attribution.
+    /// Served model, or [`UNATTRIBUTED_MODEL`] if it was not established.
     pub fn model(&self) -> &str {
         &self.model
     }
 
+    /// Whether `model()` identifies the model that performed this attempt.
     #[must_use]
-    /// Final cumulative usage snapshot for this one physical attempt.
+    pub fn is_model_attributed(&self) -> bool {
+        self.model_attributed
+    }
+
+    #[must_use]
+    /// Final cumulative usage snapshot for this rejected model attempt.
     pub fn usage(&self) -> &crate::traits::TokenUsage {
         &self.usage
     }
@@ -142,7 +174,9 @@ impl RejectedAttempt {
     }
 }
 
-/// Immutable actual route of a transport-successful Reliable completion.
+/// Immutable selected dispatch route of a transport-successful completion.
+/// A provider's server-side fallback can report a different serving model in
+/// the accounted attempts without changing this route's selected model.
 #[derive(Debug, Clone)]
 pub struct AcceptedRoute {
     provider_ref: String,
@@ -170,7 +204,8 @@ impl AcceptedRoute {
     }
 
     #[must_use]
-    /// Served model that produced the accepted candidate.
+    /// Model selected for the accepted dispatch route. It need not be the
+    /// model reported by a provider's server-side fallback.
     pub fn model(&self) -> &str {
         &self.model
     }
@@ -242,6 +277,7 @@ impl AccountedCallReport {
                 } => Some(RejectedAttempt::new(
                     attempt.provider_ref().to_string(),
                     attempt.model().to_string(),
+                    attempt.is_model_attributed(),
                     usage.clone(),
                 )),
                 _ => None,
@@ -251,7 +287,7 @@ impl AccountedCallReport {
         self
     }
 
-    /// Actual physical provider leaves, in first-poll order.
+    /// Reported provider/model attempts, in dispatch order.
     #[must_use]
     pub fn attempts(&self) -> &[AccountedAttempt] {
         &self.attempts
@@ -358,14 +394,24 @@ pub struct AccountedChatScope {
 }
 
 impl AccountedChatScope {
-    /// Start the only lifecycle scope allowed by the providers/runtime
-    /// accounting contract. `Default` is intentionally not implemented: it
-    /// would add an unaudited second public construction capability.
+    /// Start an ordinary accounting scope without legacy String capture.
+    /// `Default` is intentionally not implemented; callers select the
+    /// appropriate scope explicitly.
     #[allow(clippy::new_without_default)]
     #[must_use]
     pub fn new() -> Self {
         Self {
             collector: accounting::CallAccountingCollector::default(),
+            inner: crate::reliable::ReliableCallAccountingScope::default(),
+        }
+    }
+
+    /// Start an accounting scope that captures usage observed by eligible
+    /// legacy String response leaves. Ordinary scopes do not capture it.
+    #[must_use]
+    pub fn new_with_string_usage() -> Self {
+        Self {
+            collector: accounting::CallAccountingCollector::with_string_usage(),
             inner: crate::reliable::ReliableCallAccountingScope::default(),
         }
     }
@@ -540,13 +586,13 @@ where
     })
 }
 
-fn accounted_string_call<'a, F>(
+pub(crate) fn accounted_string_call<'a, T, F>(
     provider: &'a dyn ModelProvider,
     model: &'a str,
     future: F,
-) -> impl Future<Output = anyhow::Result<String>> + 'a
+) -> impl Future<Output = anyhow::Result<T>> + 'a
 where
-    F: Future<Output = anyhow::Result<String>> + 'a,
+    F: Future<Output = anyhow::Result<T>> + 'a,
 {
     let provider_ref = provider_reference(provider);
     let model = model.to_string();
@@ -554,6 +600,9 @@ where
     let mut attempt = accounting::AttemptState::unstarted(provider_ref, model);
     futures_util::future::poll_fn(move |cx| {
         attempt.start();
+        if let Some(lease) = attempt.lease() {
+            lease.enable_string_usage();
+        }
         let mut poll = || Pin::as_mut(&mut future).poll(cx);
         let result = match attempt.lease() {
             Some(lease) => lease.poll_scope(poll),
@@ -563,7 +612,7 @@ where
             && let Some(lease) = attempt.lease()
         {
             match result {
-                Ok(_) => lease.finish_missing_response(),
+                Ok(_) => lease.finish_string_response(),
                 Err(error) => {
                     lease.finish_error_with_usage(crate::reliable::terminal_error_usage(error))
                 }
