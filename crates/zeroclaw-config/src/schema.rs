@@ -6839,6 +6839,14 @@ pub struct LocalWhisperTranscriptionProviderConfig {
     /// Optional language hint (passed through to the local endpoint).
     #[serde(default)]
     pub language: Option<String>,
+    /// Optional model identifier sent to the endpoint as the multipart `model`
+    /// form field. Strict OpenAI-compatible servers (e.g. oMLX hosting a Qwen
+    /// ASR model) require it and rarely host a model literally named
+    /// `"whisper"`. Leave unset for servers that choose their model at startup
+    /// (`whisper.cpp`), which take no selector field and rely on the legacy
+    /// wire shape.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Maximum audio file size in bytes accepted by this endpoint.
     /// Defaults to 25 MB to match the cloud cap; raise as needed.
     #[serde(default = "default_local_whisper_max_audio_bytes")]
@@ -6870,6 +6878,7 @@ impl Default for LocalWhisperTranscriptionProviderConfig {
             uri: String::new(),
             bearer_token: None,
             language: None,
+            model: None,
             max_audio_bytes: default_local_whisper_max_audio_bytes(),
             timeout_secs: default_local_whisper_timeout_secs(),
         }
@@ -7010,6 +7019,12 @@ pub struct LocalWhisperConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bearer_token: Option<String>,
+    /// Optional model identifier sent to the endpoint as the multipart `model`
+    /// form field. Strict OpenAI-compatible servers (e.g. oMLX hosting a Qwen
+    /// ASR model) require it; leave unset for servers that choose their model
+    /// at startup (`whisper.cpp`).
+    #[serde(default)]
+    pub model: Option<String>,
     /// Maximum audio file size in bytes accepted by this endpoint.
     /// Defaults to 25 MB — matching the cloud API cap for a safe out-of-the-box
     /// experience. Self-hosted endpoints can accept much larger files; raise this
@@ -7046,6 +7061,7 @@ impl Default for LocalWhisperConfig {
         Self {
             url: String::new(),
             bearer_token: None,
+            model: None,
             max_audio_bytes: default_local_whisper_max_audio_bytes(),
             timeout_secs: default_local_whisper_timeout_secs(),
         }
@@ -9631,7 +9647,7 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), "bocha" (requires API key), "anysearch" (optional API key; anonymous requests use a lower quota), "serply" (Google web results, requires API key), or "keenable" (works without a key; a key only lifts rate limits, <https://keenable.ai>)
+    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), "bocha" (requires API key), "anysearch" (optional API key; anonymous requests use a lower quota), "serply" (Google web results, requires API key), "keenable" (works without a key; a key only lifts rate limits, <https://keenable.ai>), or "firecrawl" (requires API key)
     #[serde(default = "default_web_search_provider")]
     pub search_provider: String,
     /// Brave Search API key (required if search_provider is "brave")
@@ -9676,6 +9692,12 @@ pub struct WebSearchConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub keenable_api_key: Option<String>,
+    /// Firecrawl API key (required if search_provider is `"firecrawl"`). Obtain at <https://www.firecrawl.dev/app/api-keys?utm_source=zeroclaw&utm_medium=integration>.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub firecrawl_api_key: Option<String>,
     /// SearXNG instance URL (required if search_provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
@@ -9711,6 +9733,7 @@ impl Default for WebSearchConfig {
             anysearch_api_key: None,
             serply_api_key: None,
             keenable_api_key: None,
+            firecrawl_api_key: None,
             searxng_instance_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
@@ -17782,6 +17805,14 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub unauthorized_message: Option<String>,
+    /// Send replies with Bot API rich messages (native tables, headings, lists, and quotes).
+    ///
+    /// Some Telegram clients still show rich messages as unsupported, so this
+    /// stays off until every client in use can render them. With it off, tables
+    /// are delivered as preformatted text.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub rich_messages: bool,
     /// When `true` (default), group-chat sessions key on the sender, so
     /// distinct members of the same group (or forum topic) each get an
     /// isolated conversation context (matches the existing behavior). When
@@ -17866,6 +17897,7 @@ impl Default for TelegramConfig {
             interrupt_on_new_message: false,
             mention_only: false,
             unauthorized_message: None,
+            rich_messages: false,
             per_user_session: true,
             passive_group_context: false,
             ack_reactions: None,
@@ -35988,6 +36020,8 @@ auto_save = true
                         excluded_tools: vec![],
                         reply_min_interval_secs: 0,
                         reply_queue_depth_max: 0,
+
+                        rich_messages: false,
                     },
                 )]),
                 discord: HashMap::new(),
@@ -38052,6 +38086,8 @@ default_temperature = 0.7
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
             debounce_ms: None,
+
+            rich_messages: false,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -38088,6 +38124,15 @@ stream_mode = "single_message"
     async fn telegram_config_passive_group_context_defaults_off() {
         let parsed: TelegramConfig = serde_json::from_str(r#"{"bot_token":"t"}"#).unwrap();
         assert!(!parsed.passive_group_context);
+    }
+
+    #[test]
+    async fn telegram_config_rich_messages_defaults_off_and_parses_true() {
+        let parsed: TelegramConfig = serde_json::from_str(r#"{"bot_token":"t"}"#).unwrap();
+        assert!(!parsed.rich_messages);
+        let enabled: TelegramConfig =
+            serde_json::from_str(r#"{"bot_token":"t","rich_messages":true}"#).unwrap();
+        assert!(enabled.rich_messages);
     }
 
     #[test]
@@ -45189,6 +45234,8 @@ high_entropy_tokens = false
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+
+                rich_messages: false,
             },
         );
 
