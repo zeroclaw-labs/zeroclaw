@@ -266,11 +266,11 @@ hermes = "partial"
 openclaw = "supported"
 hermes = "supported"
 
-[providers.gemini_cli]
-openclaw = "supported"
+[providers.grok_cli]
+openclaw = "none"
 hermes = "none"
 
-[providers.grok_cli]
+[providers.antigravity_cli]
 openclaw = "none"
 hermes = "none"
 

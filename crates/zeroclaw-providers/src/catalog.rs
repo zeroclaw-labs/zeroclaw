@@ -22,8 +22,8 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         "azure" => (Some("azure"), None),
         "bedrock" => (Some("amazon-bedrock"), None),
         "gemini" => (Some("google"), Some("google")),
-        "gemini_cli" => (Some("google"), Some("google")),
         "grok_cli" => (Some("xai"), Some("x-ai")),
+        "antigravity_cli" => (Some("google"), Some("google")),
         "openrouter" => (Some("openrouter"), Some("openrouter")),
         "copilot" => (Some("github-copilot"), None),
         "minimax" => (Some("minimax"), Some("minimax")),
@@ -84,9 +84,8 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         "sambanova" | "hyperbolic" | "anyscale" | "nscale" | "lepton" | "yi" | "baichuan"
         | "avian" | "deepmyst" | "astrai" | "sglang" | "vllm" | "osaurus" | "litellm"
         | "llamacpp" | "ollama" | "hailo_ollama" | "manifest" | "morph" | "github_models"
-        | "upstage" | "featherless" | "arcee" | "lambda_ai" | "inception" | "custom" => {
-            (None, None)
-        }
+        | "upstage" | "featherless" | "arcee" | "lambda_ai" | "inception" | "cheaperinference"
+        | "custom" => (None, None),
         _ => return None,
     };
     Some(pair)
@@ -442,6 +441,9 @@ mod tests {
             zeroclaw_config::for_each_model_provider_slot!(collect_family_names);
         let mut missing: Vec<&str> = Vec::new();
         for family in &families {
+            if crate::RETIRED_MODEL_PROVIDER_SLOTS.contains(family) {
+                continue;
+            }
             if catalog_source_for(family).is_none() {
                 missing.push(family);
             }
