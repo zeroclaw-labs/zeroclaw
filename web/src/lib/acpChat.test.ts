@@ -192,8 +192,11 @@ test('ACP reconnect requests the turn cursor and keeps a single tool card', asyn
   const first = await connect('turn-one');
   const toolCall = {
     method: 'session/update',
-    params: { sessionId: 'conversation', update: { sessionUpdate: 'tool_call', toolCallId: 'tool', title: 'test' } },
-    _meta: { zeroclawTurn: { sessionId: 'conversation', turnId: 'turn-one', seq: 3 } },
+    params: {
+      sessionId: 'conversation',
+      update: { sessionUpdate: 'tool_call', toolCallId: 'tool', title: 'test' },
+      _meta: { zeroclawTurn: { sessionId: 'conversation', turnId: 'turn-one', seq: 3 } },
+    },
   };
   first.socket.receive(toolCall);
   first.socket.close();
@@ -205,8 +208,11 @@ test('ACP reconnect requests the turn cursor and keeps a single tool card', asyn
   second.socket.receive(toolCall);
   second.socket.receive({
     ...toolCall,
-    params: { ...toolCall.params, update: { ...toolCall.params.update, sessionUpdate: 'tool_call_update', body: 'done' } },
-    _meta: { zeroclawTurn: { sessionId: 'conversation', turnId: 'turn-one', seq: 4 } },
+    params: {
+      ...toolCall.params,
+      update: { ...toolCall.params.update, sessionUpdate: 'tool_call_update', body: 'done' },
+      _meta: { zeroclawTurn: { sessionId: 'conversation', turnId: 'turn-one', seq: 4 } },
+    },
   });
   assert.deepEqual(updates.filter((message) => message.type.startsWith('tool_')).map((message) => message.type),
     ['tool_call', 'tool_result']);
@@ -217,7 +223,10 @@ test('ACP reconnect requests the turn cursor and keeps a single tool card', asyn
   assert.equal(updates.filter((message) => message.type === 'turn_reset').length, 1);
   third.socket.receive({
     ...toolCall,
-    _meta: { zeroclawTurn: { sessionId: 'conversation', turnId: 'turn-two', seq: 1 } },
+    params: {
+      ...toolCall.params,
+      _meta: { zeroclawTurn: { sessionId: 'conversation', turnId: 'turn-two', seq: 1 } },
+    },
   });
   assert.equal(updates.filter((message) => message.type === 'tool_call').length, 2);
 
@@ -231,8 +240,8 @@ test('ACP reconnect requests the turn cursor and keeps a single tool card', asyn
           stopReason: 'end_turn',
           _meta: { zeroclaw: { transcriptPersisted: persisted } },
         },
+        _meta: { zeroclawTurn: { sessionId: 'conversation', turnId: 'turn-two', seq } },
       },
-      _meta: { zeroclawTurn: { sessionId: 'conversation', turnId: 'turn-two', seq } },
     });
     assert.equal(updates[updates.length - 1]?.replayed_completion, persisted);
   }

@@ -231,7 +231,10 @@ export class AcpChatSocket {
         this.permissions.clear();
         this.onClose?.(event);
         if (this.intentionallyClosed) return;
-        if (event.code === WS_CLOSE_CONVERSATION_LIMIT) return;
+        if (event.code === WS_CLOSE_CONVERSATION_LIMIT) {
+          this.onMessage?.({ type: 'error', code: 'CONVERSATION_LIMIT', message: event.reason });
+          return;
+        }
         if (routeSessionClose(event.code)) {
           this.haltedForAuth = true;
           return;
@@ -469,7 +472,8 @@ export class AcpChatSocket {
   }
 
   private recordTurnFrame(frame: AcpFrame): boolean {
-    const turn = record(record(record(frame)?._meta)?.zeroclawTurn);
+    const body = 'method' in frame ? frame.params : frame.result;
+    const turn = record(record(record(body)?._meta)?.zeroclawTurn);
     if (!turn) return true;
     if (turn.sessionId !== this.sessionId) return false;
     const turnId = stringValue(turn.turnId);
