@@ -17948,6 +17948,31 @@ pub enum DiscordReactionScope {
     All,
 }
 
+/// Whether a Discord mention in a regular guild channel moves the
+/// conversation into a thread.
+///
+/// Thread creation needs the bot's **Create Public Threads** permission and
+/// replying in the thread needs **Send Messages in Threads**. When Discord
+/// refuses to create the thread, the reply falls back to the channel and a
+/// warning is logged.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DiscordThreadMode {
+    /// Reply where the message was sent (default).
+    #[default]
+    Off,
+    /// When the bot is @-mentioned in a regular guild channel, start a thread
+    /// on that message (or reuse the one it already has) and reply inside it.
+    /// Messages already in a thread and direct messages are answered in place.
+    /// In a thread the bot's account created, follow-ups from people are
+    /// answered without a mention even when `mention_only` is on; other
+    /// threads, and other bots, keep the `mention_only` rule.
+    OnMention,
+}
+
 /// Discord bot channel configuration.
 ///
 /// `Default` is implemented below rather than derived. A derived `Default`
@@ -18007,10 +18032,19 @@ pub struct DiscordConfig {
     #[serde(default)]
     pub interrupt_on_new_message: bool,
     /// When true, only respond to messages that @-mention the bot.
-    /// Other messages in the guild are silently ignored.
+    /// Other messages in the guild are silently ignored, except follow-ups in
+    /// a thread the bot started under `thread_mode = "on_mention"`.
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
+    /// Where to answer a mention in a regular guild channel: in a new thread
+    /// started on that message (`on_mention`) or in the channel (`off`, the
+    /// default). `DiscordThreadMode` describes how each mode treats follow-ups.
+    /// Pair `on_mention` with `mention_only = true` to keep the channel quiet.
+    /// Needs the Create Public Threads and Send Messages in Threads permissions.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub thread_mode: DiscordThreadMode,
     /// When true, register and serve Discord slash commands (e.g. `/ask`)
     /// over the Gateway WebSocket, in addition to message handling. Default
     /// false. (Prototype: currently registers a single `/ask <prompt>`.)
@@ -38126,6 +38160,7 @@ stream_mode = "single_message"
             listen_to_bots: false,
             interrupt_on_new_message: false,
             mention_only: false,
+            thread_mode: DiscordThreadMode::Off,
             slash_commands: false,
             slash_command_scope: SlashCommandScope::default(),
             proxy_url: None,
@@ -38157,6 +38192,7 @@ stream_mode = "single_message"
             listen_to_bots: false,
             interrupt_on_new_message: false,
             mention_only: false,
+            thread_mode: DiscordThreadMode::Off,
             slash_commands: false,
             slash_command_scope: SlashCommandScope::default(),
             proxy_url: None,
@@ -38676,6 +38712,29 @@ allowed_users = ["U111"]
         let json = r#"{"bot_token":"tok","interrupt_on_new_message":true}"#;
         let parsed: DiscordConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.interrupt_on_new_message);
+    }
+
+    #[test]
+    async fn discord_config_thread_mode_defaults_off_and_parses_on_mention() {
+        let parsed: DiscordConfig = toml::from_str(r#"bot_token = "tok""#).unwrap();
+        assert_eq!(parsed.thread_mode, DiscordThreadMode::Off);
+
+        let parsed: DiscordConfig = toml::from_str(
+            r#"
+bot_token = "tok"
+thread_mode = "on_mention"
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.thread_mode, DiscordThreadMode::OnMention);
+
+        let rejected = toml::from_str::<DiscordConfig>(
+            r#"
+bot_token = "tok"
+thread_mode = "always"
+"#,
+        );
+        assert!(rejected.is_err(), "unknown thread modes are rejected");
     }
 
     #[test]

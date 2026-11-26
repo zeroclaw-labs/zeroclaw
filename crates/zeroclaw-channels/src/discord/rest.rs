@@ -259,6 +259,84 @@ pub(crate) async fn delete_discord_message(
     Ok(())
 }
 
+/// A thread Discord created on a message: the thread's channel id and the
+/// user Discord records as its creator (the bot, for threads it starts).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StartedThread {
+    pub(crate) id: String,
+    pub(crate) owner_id: Option<String>,
+}
+
+/// Discord's answer to a start-thread request that the caller can act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ThreadStart {
+    Created(StartedThread),
+    /// The message already has a thread (JSON error code 160004). Discord gives
+    /// a thread started on a message that message's id, so the caller can
+    /// reply in it without another request.
+    AlreadyExists,
+    /// HTTP 403: the bot lacks access or a permission in that channel. Carries
+    /// Discord's response body for the log.
+    Forbidden(String),
+}
+
+/// Discord's JSON error code for "a thread has already been created for this
+/// message".
+const DISCORD_THREAD_ALREADY_CREATED: u64 = 160_004;
+
+/// Start a thread on an existing guild message
+/// (`POST {api_base}/channels/{channel_id}/messages/{message_id}/threads`).
+///
+/// The auto-archive duration is left to the channel's own default. Statuses
+/// the caller handles differently come back as [`ThreadStart`] variants; any
+/// other failure is an error carrying Discord's status and body.
+pub(crate) async fn start_discord_thread_from_message(
+    client: &reqwest::Client,
+    api_base: &str,
+    bot_token: &str,
+    channel_id: &str,
+    message_id: &str,
+    name: &str,
+) -> anyhow::Result<ThreadStart> {
+    let url = format!("{api_base}/channels/{channel_id}/messages/{message_id}/threads");
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bot {bot_token}"))
+        .json(&serde_json::json!({ "name": name }))
+        .send()
+        .await?;
+    let status = resp.status();
+    if status.is_success() {
+        let body: serde_json::Value = resp.json().await?;
+        let id = body
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| anyhow::Error::msg("Discord start-thread response missing 'id' field"))?
+            .to_string();
+        let owner_id = body
+            .get("owner_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        return Ok(ThreadStart::Created(StartedThread { id, owner_id }));
+    }
+
+    let body = resp
+        .text()
+        .await
+        .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+    if status == reqwest::StatusCode::FORBIDDEN {
+        return Ok(ThreadStart::Forbidden(body));
+    }
+    let code = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("code").and_then(serde_json::Value::as_u64));
+    if code == Some(DISCORD_THREAD_ALREADY_CREATED) {
+        return Ok(ThreadStart::AlreadyExists);
+    }
+    anyhow::bail!("start thread failed ({status}): {body}")
+}
+
 pub(crate) fn encode_emoji_for_discord(emoji: &str) -> String {
     if emoji.contains(':') {
         return emoji.to_string();
