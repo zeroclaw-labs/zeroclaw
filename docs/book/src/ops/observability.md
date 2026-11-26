@@ -446,11 +446,13 @@ Span fields are visible inline.
 
 ## Schema migration
 
-On startup, if `log_persistence` is enabled and the file exists, the
-writer streams any schema-1 rows through an in-place migration to
-schema-2 before the first append. Pure streaming, bounded by a
-single line's allocation regardless of file size. The migrated file is
-atomically renamed into place. Files already at v2 are left untouched.
+On startup, if `log_persistence` is enabled and the active file exists,
+the writer scans the file for schema-1 rows, including rows after v2 or
+malformed entries. If it finds legacy rows, it streams the file one line
+at a time, converts those rows to schema-2, and atomically replaces the
+active file. Malformed rows remain in the file and trigger a warning
+during the rewrite. With no legacy rows, the file stays untouched.
+See [Logging architecture](../architecture/logging.md#schema-migration-is-an-active-file-rewrite) for the detection and rewrite details.
 
 If migration fails, the daemon logs a `warn` and continues writing v2
 appends; the old v1 rows remain readable by tools that still
