@@ -238,7 +238,8 @@ pub(crate) fn ensure_legacy_connection(document: &mut Value, path: &str) -> Resu
         .split('/')
         .map(|part| part.replace("~1", "/").replace("~0", "~"))
         .collect();
-    let ["providers", "connections", key, ..] = parts.as_slice() else {
+    let part_refs: Vec<_> = parts.iter().map(String::as_str).collect();
+    let ["providers", "connections", key, ..] = part_refs.as_slice() else {
         return Ok(());
     };
     let Some(rest) = key.strip_prefix("legacy.") else {
