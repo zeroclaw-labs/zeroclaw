@@ -656,6 +656,44 @@ model = "gemini-test"
     }
 
     #[tokio::test]
+    async fn mixed_oauth_env_names_preserve_a_numeric_client_secret() {
+        let _guard = super::env_test_lock().await;
+        let _secret = EnvVarGuard::set(
+            "ZEROCLAW_providers__connections__gemini__auth__client_secret",
+            "123",
+        );
+        let _mode = EnvVarGuard::set(
+            "ZEROCLAW_providers__connections__gemini__auth__mode",
+            "oauth",
+        );
+        let _client = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__gemini__work__oauth_client_id",
+            "env-client",
+        );
+        let mut config: Config = toml::from_str(
+            r#"
+[providers.connections.gemini]
+kind = "gemini"
+[providers.models."gemini.work"]
+capability = "chat"
+provider = "gemini"
+model = "gemini-test"
+"#,
+        )
+        .unwrap();
+        let before = serde_json::to_value(&config.providers).unwrap();
+        let applied = apply_env_overrides(&mut config).unwrap();
+        assert_eq!(
+            config
+                .gemini_oauth_client_credentials("gemini.work")
+                .unwrap(),
+            Some(("env-client".into(), "123".into()))
+        );
+        mask_env_overrides_for_save(&mut config, &applied.snapshots).unwrap();
+        assert_eq!(serde_json::to_value(&config.providers).unwrap(), before);
+    }
+
+    #[tokio::test]
     async fn historical_memory_env_overrides_rematerialize_a_loaded_model_without_persisting_it() {
         let _guard = super::env_test_lock().await;
         let _model = EnvVarGuard::set("ZEROCLAW_memory__embedding_model", "env-embedding");

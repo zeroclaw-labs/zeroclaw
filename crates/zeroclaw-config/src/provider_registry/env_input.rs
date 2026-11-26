@@ -224,8 +224,15 @@ fn typed_env_value(template: &Value, path: &str, parsed: Value, literal: Value) 
         Ok(literal)
     } else {
         // Another staged edit can complete an intermediate auth variant.
-        // The final decode below still rejects genuinely invalid batches.
-        Ok(parsed)
+        // Keep ambiguous scalar input literal until its type can be resolved;
+        // a later whole-auth expansion must never copy a numeric credential.
+        // Structured input retains its JSON shape. Final admission still
+        // rejects genuinely invalid batches.
+        Ok(if parsed.is_number() || parsed.is_boolean() {
+            literal
+        } else {
+            parsed
+        })
     }
 }
 
