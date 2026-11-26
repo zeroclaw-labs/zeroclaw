@@ -134,7 +134,8 @@ mod markers {
 
 // ─── mention ───────────────────────────────────────────────────────────────
 mod mention {
-    use matrix_sdk::ruma::UserId;
+    use matrix_sdk::ruma::{MatrixToUri, UserId};
+    use ruma_html::{Html, NodeRef};
 
     /// Preserve a Goal command when Matrix placed an authenticated address in
     /// front of it. This deliberately accepts only a leading address that
@@ -145,6 +146,7 @@ mod mention {
         bot_display_name: Option<&str>,
         m_mentions_user_ids: Option<&[String]>,
         body: &str,
+        formatted_html: Option<&str>,
     ) -> Option<String> {
         let body = body.trim_start();
         let command_start = goal_command_token_start(body)?;
@@ -153,10 +155,13 @@ mod mention {
             return Some(body.to_string());
         }
 
-        let explicit_mention =
-            m_mentions_user_ids.is_some_and(|ids| ids.iter().any(|id| id == bot_user_id.as_str()));
-        if !is_mentioned(bot_user_id, bot_display_name, m_mentions_user_ids, body)
-            || !is_leading_bot_address(address, bot_user_id, bot_display_name, explicit_mention)
+        // The room's mention-only gate has already run. Optional event-wide
+        // metadata is not proof of a leading address, but an explicit list
+        // targeting only other users must not be overridden by a plain alias.
+        let targets_only_other_users = m_mentions_user_ids
+            .is_some_and(|ids| !ids.is_empty() && !ids.iter().any(|id| id == bot_user_id.as_str()));
+        if targets_only_other_users
+            || !is_leading_bot_address(address, bot_user_id, bot_display_name, formatted_html)
         {
             return None;
         }
@@ -166,7 +171,7 @@ mod mention {
 
     /// Find a complete `/goal` token without imposing syntax on the address
     /// immediately before it; `is_leading_bot_address` owns that validation.
-    fn goal_command_token_start(content: &str) -> Option<usize> {
+    pub(super) fn goal_command_token_start(content: &str) -> Option<usize> {
         content.match_indices('/').find_map(|(index, _)| {
             let candidate = &content[index..];
             let token = candidate.get(.."/goal".len())?;
@@ -183,43 +188,104 @@ mod mention {
         prefix: &str,
         bot_user_id: &UserId,
         bot_display_name: Option<&str>,
-        explicit_mention: bool,
+        formatted_html: Option<&str>,
     ) -> bool {
         let address = prefix.trim().trim_end_matches([':', ',']).trim();
         if address.is_empty() {
             return false;
         }
 
-        let localpart = format!("@{}", bot_user_id.localpart());
-        if address.eq_ignore_ascii_case(bot_user_id.as_str())
-            || address.eq_ignore_ascii_case(&localpart)
-            || matrix_to_mention_matches(address, bot_user_id)
+        let plain_target = explicit_plain_target(address, bot_user_id);
+        if let Some(matches) = formatted_html
+            .and_then(|html| leading_rich_address_matches(html, address, plain_target, bot_user_id))
         {
-            return true;
+            return matches;
         }
-        bot_display_name
-            .is_some_and(|name| !name.is_empty() && address.eq_ignore_ascii_case(name.trim()))
-            // Some Element clients render a rich mention as only its visible
-            // label in `body`. The event's explicit Matrix mention still
-            // binds that label to this bot; require a single label so prose
-            // such as "please zc-main /goal" cannot become a command.
-            || (explicit_mention && !address.contains(char::is_whitespace))
+
+        plain_target.unwrap_or_else(|| {
+            bot_display_name
+                .is_some_and(|name| !name.is_empty() && address.eq_ignore_ascii_case(name.trim()))
+        })
     }
 
-    fn matrix_to_mention_matches(address: &str, bot_user_id: &UserId) -> bool {
-        let Some(label_and_url) = address.strip_prefix('[') else {
-            return false;
-        };
-        let Some((label, url)) = label_and_url.split_once("](") else {
-            return false;
-        };
-        if label.is_empty() {
-            return false;
+    // A contradictory link vetoes a display-name fallback. When both forms
+    // identify a user, compare the targets, not their presentation labels.
+    fn leading_rich_address_matches(
+        html: &str,
+        address: &str,
+        plain_target: Option<bool>,
+        bot_user_id: &UserId,
+    ) -> Option<bool> {
+        let html = Html::parse(html);
+        let anchor = leading_link(&html)?;
+        let element = anchor.as_element()?;
+        let mentions_bot = element.attrs.borrow().iter().any(|attribute| {
+            attribute.name.local.as_ref() == "href"
+                && matrix_to_targets_bot(attribute.value.as_ref(), bot_user_id)
+        });
+        if !mentions_bot {
+            return Some(false);
         }
-        let Some(url) = url.strip_suffix(')') else {
-            return false;
-        };
-        url.eq_ignore_ascii_case(&format!("https://matrix.to/#/{}", bot_user_id.as_str()))
+        if let Some(matches) = plain_target {
+            return Some(matches);
+        }
+        let mut label = String::new();
+        let mut pending = vec![anchor.children()];
+        while let Some(children) = pending.last_mut() {
+            let Some(node) = children.next() else {
+                pending.pop();
+                continue;
+            };
+            if let Some(text) = node.as_text() {
+                label.push_str(text.borrow().as_ref());
+            } else if node.as_element().is_some() {
+                pending.push(node.children());
+            }
+        }
+        Some(label.trim() == address)
+    }
+
+    fn leading_link(html: &Html) -> Option<NodeRef> {
+        let mut pending = vec![html.children()];
+        while let Some(children) = pending.last_mut() {
+            let Some(node) = children.next() else {
+                pending.pop();
+                continue;
+            };
+            if node
+                .as_text()
+                .is_some_and(|text| !text.borrow().trim().is_empty())
+            {
+                return None;
+            }
+            if let Some(element) = node.as_element() {
+                if element.name.local.as_ref() == "a" {
+                    return Some(node);
+                }
+                pending.push(node.children());
+            }
+        }
+        None
+    }
+
+    fn explicit_plain_target(address: &str, bot_user_id: &UserId) -> Option<bool> {
+        if let Some(url) = markdown_address_url(address) {
+            return Some(matrix_to_targets_bot(url, bot_user_id));
+        }
+        if let Ok(user_id) = <&UserId>::try_from(address) {
+            return Some(user_id == bot_user_id);
+        }
+        let localpart = format!("@{}", bot_user_id.localpart());
+        address.eq_ignore_ascii_case(&localpart).then_some(true)
+    }
+
+    fn markdown_address_url(address: &str) -> Option<&str> {
+        let (label, url) = address.strip_prefix('[')?.split_once("](")?;
+        (!label.is_empty()).then_some(url.strip_suffix(')')?)
+    }
+
+    fn matrix_to_targets_bot(url: &str, bot_user_id: &UserId) -> bool {
+        MatrixToUri::parse(url).is_ok_and(|uri| uri.id() == bot_user_id.matrix_to_uri().id())
     }
 
     pub(super) fn is_mentioned(
@@ -321,6 +387,20 @@ mod allowlist {
         allowed_rooms
             .iter()
             .any(|r| r == room_id || r.eq_ignore_ascii_case(room_id))
+    }
+
+    /// The peer list with every `*` grant removed, keeping named grants and
+    /// all denies. A sender this list admits was named by the operator rather
+    /// than let in by the wildcard.
+    pub(super) fn named_peers(peers: &[String]) -> Vec<String> {
+        peers
+            .iter()
+            .filter(|entry| {
+                !zeroclaw_config::schema::peer_grant_identity(entry)
+                    .is_some_and(zeroclaw_config::schema::peer_is_wildcard)
+            })
+            .cloned()
+            .collect()
     }
 }
 
@@ -2186,13 +2266,14 @@ mod inbound {
         config::SyncSettings,
         event_handler::RawEvent,
         ruma::{
-            OwnedEventId, OwnedUserId,
+            OwnedEventId, OwnedUserId, UserId,
             events::{
                 AnySyncTimelineEvent,
                 reaction::ReactionEventContent,
                 relation::Annotation,
                 room::{
                     encrypted::OriginalSyncRoomEncryptedEvent,
+                    member::{MembershipState, StrippedRoomMemberEvent},
                     message::{MessageType, OriginalSyncRoomMessageEvent},
                 },
             },
@@ -2239,6 +2320,7 @@ mod inbound {
     ) -> (
         matrix_sdk::event_handler::EventHandlerDropGuard,
         matrix_sdk::event_handler::EventHandlerDropGuard,
+        matrix_sdk::event_handler::EventHandlerDropGuard,
     ) {
         let handler_ctx = ctx.clone();
         let message_handler = client.add_event_handler(
@@ -2276,11 +2358,26 @@ mod inbound {
             });
         let encrypted_guard = client.event_handler_drop_guard(encrypted_handler);
 
-        (message_guard, encrypted_guard)
+        // matrix-sdk delivers an invite as the invited room's stripped
+        // `m.room.member` state event ("invites are special" in the
+        // add_event_handler docs). Without an acceptor here the bot stayed in
+        // `invited` state forever and silently missed every message in rooms
+        // it was invited to — the SDK never joins on the user's behalf.
+        let invite_ctx = ctx.clone();
+        let invite_handler =
+            client.add_event_handler(move |ev: StrippedRoomMemberEvent, room: Room| {
+                let ctx = invite_ctx.clone();
+                async move {
+                    handle_room_invite(&ctx, &ev, room);
+                }
+            });
+        let invite_guard = client.event_handler_drop_guard(invite_handler);
+
+        (message_guard, encrypted_guard, invite_guard)
     }
 
     pub(super) async fn run_sync_loop(client: Client, ctx: HandlerCtx) -> anyhow::Result<()> {
-        let (_message_handler_guard, _encrypted_handler_guard) =
+        let (_message_handler_guard, _encrypted_handler_guard, _invite_handler_guard) =
             register_event_handlers(&client, &ctx);
 
         ::zeroclaw_log::record!(
@@ -2359,6 +2456,178 @@ mod inbound {
                     ),
                 "matrix: failed to react ❓ on undecryptable event"
             );
+        }
+    }
+
+    /// Outcome of [`invite_admission`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum InviteDecision {
+        /// Join the room.
+        Accept,
+        /// The message-path gate refuses the inviter or the room.
+        NotAllowed,
+        /// The inviter is admitted only by a `*` grant and `allowed_rooms` is
+        /// empty, so accepting would let any Matrix user pull the bot into a
+        /// room of their choosing.
+        WildcardOnly,
+    }
+
+    /// Decide whether an invite of the bot into `room_id` by `inviter` should
+    /// be auto-accepted.
+    ///
+    /// First the message-path gate: the inviter must be an allowed peer and,
+    /// when `allowed_rooms` is non-empty, the room must be listed, so a sender
+    /// who could not talk to the bot in a joined room cannot pull the bot into
+    /// a new one either. An empty peer set denies everyone.
+    ///
+    /// Then, when `allowed_rooms` is empty, the inviter must be admitted by a
+    /// *named* grant: a `*` grant lets a sender talk to the bot in rooms the
+    /// operator put it in, but not choose new rooms for it. Without this, an
+    /// open peer set with no room allowlist would let any account on any
+    /// federated homeserver invite the bot into a room it controls.
+    ///
+    /// Pure so the gate is unit-testable without a homeserver double.
+    pub(super) fn invite_admission(
+        allowed_peers: &[String],
+        allowed_rooms: &[String],
+        room_id: &str,
+        inviter: &str,
+    ) -> InviteDecision {
+        if !allowlist::user_allowed(allowed_peers, inviter)
+            || !allowlist::room_allowed_static(allowed_rooms, room_id)
+        {
+            return InviteDecision::NotAllowed;
+        }
+        if allowed_rooms.is_empty()
+            && !allowlist::user_allowed(&allowlist::named_peers(allowed_peers), inviter)
+        {
+            return InviteDecision::WildcardOnly;
+        }
+        InviteDecision::Accept
+    }
+
+    /// Accept room invites addressed at the bot.
+    ///
+    /// Invites arrive as stripped `m.room.member` state on the invited room
+    /// (`StrippedRoomMemberEvent`). Events for other users' memberships and
+    /// non-invite transitions (including the bot's own join echo after a
+    /// successful accept) are filtered by the guards below, so the accept loop
+    /// terminates in one round-trip.
+    ///
+    /// The inviter is taken from the bot's stored membership
+    /// (`Room::invite_details`), not from the event being handled. matrix-sdk
+    /// runs this handler for every event in the room's `invite_state`, and
+    /// most of that list is the inviting server's unsigned
+    /// `invite_room_state`: a hostile server could include a member event for
+    /// the bot naming an allowed peer as `sender`. The store keeps the last
+    /// member event for the bot, which is the invite event the bot's own
+    /// homeserver appended after checking it (Synapse appends it last). Only
+    /// a handled event whose sender matches that stored invite proceeds, so a
+    /// forged event naming someone else is ignored.
+    ///
+    /// Everything past the cheap event filters runs in a spawned task.
+    /// matrix-sdk awaits event handlers while it processes a sync response, so
+    /// the store read in `invite_details` cannot complete from inside the
+    /// handler, and awaiting `/join` here would stall every other event in that
+    /// sync for a homeserver round-trip (longer for a DM, which also writes
+    /// account data).
+    fn handle_room_invite(ctx: &HandlerCtx, ev: &StrippedRoomMemberEvent, room: Room) {
+        // Only invites that name the bot as their target concern us.
+        if ev.content.membership != MembershipState::Invite || ev.state_key != ctx.bot_user_id {
+            return;
+        }
+        // `join()` is only meaningful from Invited state; stale member events
+        // replayed in joined/left rooms must not re-join.
+        if room.state() != RoomState::Invited {
+            return;
+        }
+        let ctx = ctx.clone();
+        let claimed_sender = ev.sender.clone();
+        zeroclaw_spawn::spawn!(async move {
+            accept_room_invite(&ctx, &claimed_sender, room).await;
+        });
+    }
+
+    /// Resolve the stored inviter, apply [`invite_admission`], and join.
+    /// Runs off the sync path; see [`handle_room_invite`].
+    async fn accept_room_invite(ctx: &HandlerCtx, claimed_sender: &UserId, room: Room) {
+        // The room may have left `Invited` while this task waited (joined by
+        // a task for a duplicate invite event, or the invite was withdrawn);
+        // that is not a failure worth a warning.
+        if room.state() != RoomState::Invited {
+            return;
+        }
+        let room_id = room.room_id().as_str();
+        let inviter = match room.invite_details().await {
+            Ok(invite) => invite.inviter_id,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "room": room_id,
+                            "error": format!("{e}"),
+                        })),
+                    "matrix: cannot resolve inviter for room invite"
+                );
+                return;
+            }
+        };
+        let inviter = inviter.as_str();
+        if claimed_sender.as_str() != inviter {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "claimed_sender": claimed_sender.as_str(),
+                        "inviter": inviter,
+                        "room": room_id,
+                    })),
+                "matrix: ignore stripped invite event that is not the stored invite"
+            );
+            return;
+        }
+        let allowed_peers = (ctx.peer_resolver)();
+        match invite_admission(&allowed_peers, &ctx.config.allowed_rooms, room_id, inviter) {
+            InviteDecision::Accept => {}
+            InviteDecision::NotAllowed => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"inviter": inviter, "room": room_id})),
+                    "matrix: decline invite from non-allowed sender or room"
+                );
+                return;
+            }
+            InviteDecision::WildcardOnly => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"inviter": inviter, "room": room_id})),
+                    "matrix: decline invite admitted only by wildcard peer grant"
+                );
+                return;
+            }
+        }
+        match room.join().await {
+            Ok(()) => ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"inviter": inviter, "room": room_id})),
+                "matrix: accepted room invite"
+            ),
+            Err(e) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "inviter": inviter,
+                        "room": room_id,
+                        "error": format!("{e}"),
+                    })),
+                "matrix: failed to accept room invite"
+            ),
         }
     }
 
@@ -2473,11 +2742,24 @@ mod inbound {
             }
         }
 
+        use matrix_sdk::ruma::events::room::message::{FormattedBody, MessageFormat};
+
+        #[derive(serde::Deserialize)]
+        struct FormattedEvent {
+            content: FormattedBody,
+        }
+
+        let formatted_html = mention::goal_command_token_start(&body)
+            .filter(|&index| !body[..index].trim().is_empty())
+            .and_then(|_| serde_json::from_str::<FormattedEvent>(raw.get()).ok())
+            .filter(|event| matches!(event.content.format, MessageFormat::Html))
+            .map(|event| event.content.body);
         let normalized_goal_command = mention::normalize_addressed_goal_command(
             &ctx.bot_user_id,
             display_name.as_deref(),
             mention_user_ids.as_deref(),
             &body,
+            formatted_html.as_deref(),
         );
         let is_goal_command = normalized_goal_command.is_some();
         let thread_id = extract_thread_id(&raw);
@@ -2560,7 +2842,7 @@ mod inbound {
                 ctx.transcription.as_ref(),
             )
             .await;
-        } else if let Some(reply_id) = reply_target.as_ref() {
+        } else if !is_goal_command && let Some(reply_id) = reply_target.as_ref() {
             let parent = if let Some(cached) = cached_reply_parent.take() {
                 Ok(cached)
             } else {
@@ -6552,6 +6834,7 @@ mod tests {
 
         fn local_whisper_config(url: &str) -> LocalWhisperConfig {
             LocalWhisperConfig {
+                model: None,
                 url: url.to_string(),
                 bearer_token: Some("test-token".to_string()),
                 max_audio_bytes: 10 * 1024 * 1024,
@@ -6714,6 +6997,7 @@ mod tests {
 
         fn local_whisper_config(url: &str) -> zeroclaw_config::schema::LocalWhisperConfig {
             zeroclaw_config::schema::LocalWhisperConfig {
+                model: None,
                 url: url.to_string(),
                 bearer_token: Some("test-token".to_string()),
                 max_audio_bytes: 10 * 1024 * 1024,
@@ -6967,18 +7251,21 @@ mod tests {
         use std::sync::atomic::AtomicBool;
         use std::time::Duration;
 
-        use matrix_sdk::ruma::events::AnySyncTimelineEvent;
+        use matrix_sdk::RoomState;
+        use matrix_sdk::ruma::events::{AnyStrippedStateEvent, AnySyncTimelineEvent};
         use matrix_sdk::ruma::serde::Raw;
         use matrix_sdk::ruma::{RoomId, room_id, user_id};
         use matrix_sdk::test_utils::mocks::MatrixMockServer;
-        use matrix_sdk_test::JoinedRoomBuilder;
+        use matrix_sdk_test::{InvitedRoomBuilder, JoinedRoomBuilder};
         use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc, oneshot};
         use wiremock::matchers::{method, path, path_regex};
         use wiremock::{Mock, ResponseTemplate};
         use zeroclaw_api::channel::ChannelApprovalResponse;
         use zeroclaw_config::schema::{MatrixConfig, TranscriptionConfig};
 
-        use super::super::inbound::{HandlerCtx, register_event_handlers};
+        use super::super::inbound::{
+            HandlerCtx, InviteDecision, invite_admission, register_event_handlers,
+        };
 
         const TRANSCRIPT: &str = "route level transcript of the voice note";
 
@@ -7066,6 +7353,7 @@ mod tests {
                     TranscriptionConfig {
                         enabled: true,
                         local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                            model: None,
                             url: stt_url.to_string(),
                             bearer_token: Some("test-token".to_string()),
                             max_audio_bytes: 10 * 1024 * 1024,
@@ -7350,13 +7638,7 @@ mod tests {
             // Parent-event fetch: /rooms/{roomId}/event/{eventId} returns the
             // parent m.audio event verbatim.
             let parent = voice_event_json("$parentaudio:localhost");
-            Mock::given(method("GET"))
-                .and(path_regex(
-                    r"^/_matrix/client/v3/rooms/.*/event/\$parentaudio:localhost$",
-                ))
-                .respond_with(ResponseTemplate::new(200).set_body_json(parent))
-                .mount(matrix.server())
-                .await;
+            mount_parent_event(&matrix, parent, 1).await;
 
             let stt = stt_server().await;
             let workspace = tempfile::tempdir().unwrap();
@@ -7401,6 +7683,26 @@ mod tests {
                 msg.content
             );
             assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
+
+            for (event_id, command) in [
+                ("$goal-status-reply:localhost", "/goal status"),
+                (
+                    "$goal-start-reply:localhost",
+                    "/goal start --unlimited Check the example",
+                ),
+            ] {
+                let json = plain_reply_event(event_id, "$parentaudio:localhost", command);
+                matrix
+                    .sync_room(
+                        &client,
+                        JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                    )
+                    .await;
+                let msg = recv_forwarded(&mut rx).await;
+                assert_eq!(msg.content, command);
+            }
+            assert_eq!(stt.received_requests().await.unwrap().len(), 1);
+            matrix.server().verify().await;
         }
 
         /// `voice_origin` is the event's own MSC3245 flag, forwarded so the
@@ -7663,21 +7965,146 @@ mod tests {
             *ctx.bot_display_name.write().await = Some("zc-architect".to_string());
             let _guards = register_event_handlers(&client, &ctx);
 
-            let mut json = text_parent_event(
-                "$goal-help:localhost",
-                "@alice:localhost",
-                "zc-architect: /goal help",
-            );
+            let addressed = "Project bot: /goal help";
+            for (event_id, mentions, expected) in [
+                (
+                    "$goal-help:localhost",
+                    Some(&["@bot:localhost"][..]),
+                    "/goal help",
+                ),
+                ("$legacy-goal-help:localhost", None, "/goal help"),
+                ("$empty-mentions:localhost", Some(&[][..]), "/goal help"),
+                (
+                    "$only-other-mentioned:localhost",
+                    Some(&["@other:localhost"][..]),
+                    addressed,
+                ),
+            ] {
+                let mut json = text_parent_event(event_id, "@alice:localhost", addressed);
+                if let Some(mentions) = mentions {
+                    json["content"]["m.mentions"] = serde_json::json!({"user_ids": mentions});
+                }
+                json["content"]["format"] = serde_json::json!("org.matrix.custom.html");
+                json["content"]["formatted_body"] = serde_json::json!(
+                    "<p><a href=\"https://matrix.to/#/@bot:localhost\">Project bot</a>: /goal help</p>"
+                );
+                matrix
+                    .sync_room(
+                        &client,
+                        JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                    )
+                    .await;
+                assert_eq!(recv_forwarded(&mut rx).await.content, expected);
+            }
+
+            let body = "Explain /goal help to Project bot";
+            let mut json = text_parent_event("$ordinary-help:localhost", "@alice:localhost", body);
             json["content"]["m.mentions"] = serde_json::json!({"user_ids": ["@bot:localhost"]});
+            json["content"]["format"] = serde_json::json!("org.matrix.custom.html");
+            json["content"]["formatted_body"] = serde_json::json!(
+                "Explain /goal help to <a href=\"https://matrix.to/#/@bot:localhost\">Project bot</a>"
+            );
             matrix
                 .sync_room(
                     &client,
                     JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
                 )
                 .await;
+            assert_eq!(recv_forwarded(&mut rx).await.content, body);
 
-            let msg = recv_forwarded(&mut rx).await;
-            assert_eq!(msg.content, "/goal help");
+            for (event_id, msgtype, body, formatted, expected) in [
+                (
+                    "$plain-address:localhost",
+                    "m.text",
+                    "zc-architect: /goal status",
+                    "<p><strong>zc-architect</strong>: /goal status</p>",
+                    "/goal status",
+                ),
+                (
+                    "$other-address:localhost",
+                    "m.text",
+                    "zc-architect: /goal status for Project bot",
+                    "<p><strong><a href=\"https://matrix.to/#/@other:localhost\">zc-architect</a></strong>: /goal status for <a href=\"https://matrix.to/#/@bot:localhost\">Project bot</a></p>",
+                    "zc-architect: /goal status for Project bot",
+                ),
+                (
+                    "$styled-address:localhost",
+                    "m.text",
+                    "zc-architect: /goal pause now",
+                    "<a href=\"https://matrix.to/#/@bot:localhost\"><strong>zc-architect</strong></a>: /goal pause now",
+                    "/goal pause now",
+                ),
+                (
+                    "$markdown-address:localhost",
+                    "m.notice",
+                    "[Bot account](https://matrix.to/#/@bot:localhost) /goal status",
+                    "<a href=\"https://matrix.to/#/@bot:localhost\">Project bot</a> /goal status",
+                    "/goal status",
+                ),
+                (
+                    "$full-address:localhost",
+                    "m.text",
+                    "@bot:localhost: /goal status",
+                    "<a href=\"https://matrix.to/#/@bot:localhost\">Project bot</a>: /goal status",
+                    "/goal status",
+                ),
+                (
+                    "$different-full-address:localhost",
+                    "m.text",
+                    "@other:localhost: /goal status",
+                    "<a href=\"https://matrix.to/#/@bot:localhost\">@other:localhost</a>: /goal status",
+                    "@other:localhost: /goal status",
+                ),
+                (
+                    "$weak-label-mismatch:localhost",
+                    "m.text",
+                    "Explain /goal status",
+                    "<a href=\"https://matrix.to/#/@bot:localhost\">Project bot</a> /goal status",
+                    "Explain /goal status",
+                ),
+                (
+                    "$notice-other-address:localhost",
+                    "m.notice",
+                    "zc-architect: /goal status",
+                    "<a href=\"https://matrix.to/#/@other:localhost\">zc-architect</a>: /goal status",
+                    "zc-architect: /goal status",
+                ),
+                (
+                    "$emote-other-address:localhost",
+                    "m.emote",
+                    "zc-architect: /goal status",
+                    "<a href=\"https://matrix.to/#/@other:localhost\">zc-architect</a>: /goal status",
+                    "zc-architect: /goal status",
+                ),
+                (
+                    "$emote-matching-address:localhost",
+                    "m.emote",
+                    "Project bot: /goal status",
+                    "<a href=\"https://matrix.to/#/@bot:localhost\">Project bot</a>: /goal status",
+                    "/goal status",
+                ),
+                (
+                    "$contradictory-serializations:localhost",
+                    "m.text",
+                    "[Project bot](https://matrix.to/#/@other:localhost) /goal status",
+                    "<a href=\"https://matrix.to/#/@bot:localhost\">Project bot</a> /goal status",
+                    "[Project bot](https://matrix.to/#/@other:localhost) /goal status",
+                ),
+            ] {
+                let mut json = text_parent_event(event_id, "@alice:localhost", body);
+                json["content"]["msgtype"] = serde_json::json!(msgtype);
+                json["content"]["m.mentions"] =
+                    serde_json::json!({"user_ids": ["@other:localhost", "@bot:localhost"]});
+                json["content"]["format"] = serde_json::json!("org.matrix.custom.html");
+                json["content"]["formatted_body"] = serde_json::json!(formatted);
+                matrix
+                    .sync_room(
+                        &client,
+                        JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                    )
+                    .await;
+                assert_eq!(recv_forwarded(&mut rx).await.content, expected);
+            }
         }
 
         async fn mount_parent_event(
@@ -7922,6 +8349,298 @@ mod tests {
             let approvals = ctx.pending_approvals.lock().await;
             assert!(approvals.contains_key("WRONG001"));
             assert!(approvals.contains_key("OTHER001"));
+        }
+
+        // ── invite auto-accept (StrippedRoomMemberEvent) ──────────────────
+
+        fn invite_room() -> &'static RoomId {
+            room_id!("!invite-room:localhost")
+        }
+
+        /// The gate must mirror message-path admission: peer allowlist AND
+        /// (when configured) the room allowlist decide, with an empty
+        /// allowlist meaning "allow all".
+        #[test]
+        fn invite_admission_mirrors_message_gating() {
+            let open = vec!["*".to_string()];
+            let listed = vec!["@alice:localhost".to_string()];
+            assert_eq!(
+                invite_admission(&listed, &[], "!r:localhost", "@alice:localhost"),
+                InviteDecision::Accept
+            );
+            assert_eq!(
+                invite_admission(
+                    &listed,
+                    &["!r:localhost".to_string()],
+                    "!r:localhost",
+                    "@alice:localhost"
+                ),
+                InviteDecision::Accept
+            );
+            assert_eq!(
+                invite_admission(&listed, &[], "!r:localhost", "@mallory:localhost"),
+                InviteDecision::NotAllowed,
+                "a sender outside the peer set must not be able to pull the bot into a room"
+            );
+            assert_eq!(
+                invite_admission(
+                    &open,
+                    &["!other:localhost".to_string()],
+                    "!r:localhost",
+                    "@alice:localhost"
+                ),
+                InviteDecision::NotAllowed,
+                "rooms outside a configured allowlist must stay unjoined"
+            );
+            assert_eq!(
+                invite_admission(&[], &[], "!r:localhost", "@alice:localhost"),
+                InviteDecision::NotAllowed,
+                "an empty peer set must deny every inviter"
+            );
+        }
+
+        /// A `*` grant lets anyone talk to the bot in rooms it is already in,
+        /// but must not let anyone choose a new room for it unless the room
+        /// allowlist bounds where it can go.
+        #[test]
+        fn invite_admission_wildcard_needs_named_inviter_or_room_allowlist() {
+            let open = vec!["*".to_string()];
+            assert_eq!(
+                invite_admission(&open, &[], "!r:localhost", "@anyone:localhost"),
+                InviteDecision::WildcardOnly,
+                "an open peer set with no room allowlist must not auto-join"
+            );
+            assert_eq!(
+                invite_admission(
+                    &open,
+                    &["!r:localhost".to_string()],
+                    "!r:localhost",
+                    "@anyone:localhost"
+                ),
+                InviteDecision::Accept,
+                "a room allowlist bounds the wildcard, so a listed room may be joined"
+            );
+            let open_and_named = vec!["*".to_string(), "@alice:localhost".to_string()];
+            assert_eq!(
+                invite_admission(&open_and_named, &[], "!r:localhost", "@alice:localhost"),
+                InviteDecision::Accept,
+                "an inviter named alongside the wildcard is admitted by name"
+            );
+            assert_eq!(
+                invite_admission(&open_and_named, &[], "!r:localhost", "@bob:localhost"),
+                InviteDecision::WildcardOnly
+            );
+            let open_with_deny = vec!["*".to_string(), "!@alice:localhost".to_string()];
+            assert_eq!(
+                invite_admission(&open_with_deny, &[], "!r:localhost", "@alice:localhost"),
+                InviteDecision::NotAllowed,
+                "a deny still wins over the wildcard"
+            );
+        }
+
+        /// A stripped `m.room.member` event as matrix-sdk delivers it in an
+        /// invited room's `invite_state`. Built by hand rather than with
+        /// matrix-sdk-test's `stripped_state_event!`, which expands to
+        /// `::ruma::…` and so only compiles in crates depending on ruma
+        /// directly; this crate reaches ruma through `matrix_sdk::ruma`.
+        fn member_event(
+            sender: &str,
+            target: &str,
+            membership: &str,
+        ) -> Raw<AnyStrippedStateEvent> {
+            Raw::new(&::serde_json::json!({
+                "type": "m.room.member",
+                "sender": sender,
+                "state_key": target,
+                "content": { "membership": membership }
+            }))
+            .expect("a static member event serializes")
+            .cast_unchecked()
+        }
+
+        fn invite_ctx(peers: Vec<String>, allowed_rooms: Vec<String>) -> HandlerCtx {
+            let (tx, _rx) = mpsc::channel(1);
+            HandlerCtx {
+                config: Arc::new(MatrixConfig {
+                    allowed_rooms,
+                    ..MatrixConfig::default()
+                }),
+                alias: "test".to_string(),
+                peer_resolver: Arc::new(move || peers.clone()),
+                transcription: None,
+                workspace_dir: None,
+                tx,
+                pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
+                threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
+                bot_user_id: user_id!("@bot:localhost").to_owned(),
+                bot_display_name: Arc::new(TokioRwLock::new(None)),
+                initial_sync_done: Arc::new(AtomicBool::new(true)),
+                undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
+            }
+        }
+
+        /// Sync `invite_room()` as an invited room carrying `event`, with a
+        /// succeeding `/join` mock mounted, and report how many `/join`
+        /// requests reached the homeserver plus the room's resulting state.
+        ///
+        /// The join is spawned off the sync path, so an admitted invite is
+        /// awaited until the room turns `Joined`; a denied one gets a grace
+        /// period in which a wrongly spawned join would land on the mock. The
+        /// mock answers 200 on purpose: a missing mock would 404 a wrong join
+        /// and leave the room `Invited`, so state alone cannot prove denial.
+        async fn deliver_invite(
+            ctx: &HandlerCtx,
+            event: Raw<AnyStrippedStateEvent>,
+            expect_join: bool,
+        ) -> (usize, RoomState) {
+            deliver_invite_state(ctx, vec![event], expect_join).await
+        }
+
+        /// [`deliver_invite`] with the whole `invite_state` list, in order.
+        async fn deliver_invite_state(
+            ctx: &HandlerCtx,
+            events: Vec<Raw<AnyStrippedStateEvent>>,
+            expect_join: bool,
+        ) -> (usize, RoomState) {
+            let matrix = MatrixMockServer::new().await;
+            // Log in as the bot `invite_ctx` names, so `Room::invite_details`
+            // reads the same member event the handler's target guard matched.
+            let client = matrix
+                .client_builder()
+                .logged_in_with_token(
+                    "token".to_owned(),
+                    user_id!("@bot:localhost").to_owned(),
+                    matrix_sdk::ruma::device_id!("BOTDEVICE").to_owned(),
+                )
+                .build()
+                .await;
+            let join_mock = matrix
+                .mock_room_join(invite_room())
+                .ok()
+                .named("room join")
+                .mount_as_scoped()
+                .await;
+            let _guards = register_event_handlers(&client, ctx);
+            let room = matrix
+                .sync_room(
+                    &client,
+                    InvitedRoomBuilder::new(invite_room()).add_state_bulk(events),
+                )
+                .await;
+            if expect_join {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while room.state() != RoomState::Joined {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("an admitted invite must join within 5s");
+            } else {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            (join_mock.received_requests().await.len(), room.state())
+        }
+
+        #[tokio::test]
+        async fn sync_ingress_accepts_invite_from_allowed_peer() {
+            let ctx = invite_ctx(vec!["@friend:localhost".to_string()], vec![]);
+            let event = member_event("@friend:localhost", "@bot:localhost", "invite");
+            assert_eq!(
+                deliver_invite(&ctx, event, true).await,
+                (1, RoomState::Joined),
+                "an invite from an allowed peer must join the room exactly once"
+            );
+        }
+
+        #[tokio::test]
+        async fn sync_ingress_declines_invite_from_non_allowed_peer() {
+            let ctx = invite_ctx(vec!["@friend:localhost".to_string()], vec![]);
+            let event = member_event("@evil:localhost", "@bot:localhost", "invite");
+            assert_eq!(
+                deliver_invite(&ctx, event, false).await,
+                (0, RoomState::Invited),
+                "an invite from a non-allowed peer must not join the bot"
+            );
+        }
+
+        #[tokio::test]
+        async fn sync_ingress_declines_invite_into_room_outside_allowlist() {
+            let ctx = invite_ctx(
+                vec!["*".to_string()],
+                vec!["!other-room:localhost".to_string()],
+            );
+            let event = member_event("@friend:localhost", "@bot:localhost", "invite");
+            assert_eq!(
+                deliver_invite(&ctx, event, false).await,
+                (0, RoomState::Invited),
+                "an allowed peer must not pull the bot into a room outside allowed_rooms"
+            );
+        }
+
+        #[tokio::test]
+        async fn sync_ingress_declines_invite_admitted_only_by_wildcard() {
+            let ctx = invite_ctx(vec!["*".to_string()], vec![]);
+            let event = member_event("@stranger:localhost", "@bot:localhost", "invite");
+            assert_eq!(
+                deliver_invite(&ctx, event, false).await,
+                (0, RoomState::Invited),
+                "an open peer set with no room allowlist must not let anyone pull the bot in"
+            );
+        }
+
+        /// A hostile inviting server can put a member event for the bot that
+        /// names an allowed peer into its unsigned `invite_room_state`. The
+        /// homeserver appends the real invite last, and only that one decides.
+        #[tokio::test]
+        async fn sync_ingress_ignores_forged_invite_in_stripped_state() {
+            let ctx = invite_ctx(vec!["@friend:localhost".to_string()], vec![]);
+            let forged = member_event("@friend:localhost", "@bot:localhost", "invite");
+            let real = member_event("@evil:localhost", "@bot:localhost", "invite");
+            assert_eq!(
+                deliver_invite_state(&ctx, vec![forged, real], false).await,
+                (0, RoomState::Invited),
+                "a forged stripped invite naming an allowed peer must not join the bot"
+            );
+        }
+
+        /// A stray member event for the bot earlier in `invite_state` must
+        /// neither block the real invite from an allowed peer nor cause a
+        /// second join: only the event matching the stored invite proceeds.
+        #[tokio::test]
+        async fn sync_ingress_accepts_real_invite_after_unrelated_forged_one() {
+            let ctx = invite_ctx(vec!["@friend:localhost".to_string()], vec![]);
+            let forged = member_event("@evil:localhost", "@bot:localhost", "invite");
+            let real = member_event("@friend:localhost", "@bot:localhost", "invite");
+            assert_eq!(
+                deliver_invite_state(&ctx, vec![forged, real], true).await,
+                (1, RoomState::Joined),
+                "the stored invite from an allowed peer must join exactly once"
+            );
+        }
+
+        #[tokio::test]
+        async fn sync_ingress_ignores_invites_targeting_other_users() {
+            // Even from a named peer, a stripped member event naming someone
+            // else is not OUR invite and must not join anything. The peer is
+            // named rather than `*` so the wildcard guard cannot mask this one.
+            let ctx = invite_ctx(vec!["@alice:localhost".to_string()], vec![]);
+            let event = member_event("@alice:localhost", "@carol:localhost", "invite");
+            assert_eq!(
+                deliver_invite(&ctx, event, false).await,
+                (0, RoomState::Invited),
+                "an invite for another user must not join the bot"
+            );
+        }
+
+        #[tokio::test]
+        async fn sync_ingress_ignores_non_invite_membership_for_bot() {
+            let ctx = invite_ctx(vec!["@alice:localhost".to_string()], vec![]);
+            let event = member_event("@alice:localhost", "@bot:localhost", "leave");
+            assert_eq!(
+                deliver_invite(&ctx, event, false).await,
+                (0, RoomState::Invited),
+                "only an `invite` membership for the bot may trigger a join"
+            );
         }
     }
 
@@ -8317,6 +9036,7 @@ mod tests {
                     Some("zc-architect"),
                     Some(&["@zc-architect:example.org".to_string()]),
                     "zc-architect: /goal help",
+                    None,
                 ),
                 Some("/goal help".to_string()),
             );
@@ -8326,6 +9046,7 @@ mod tests {
                     Some("zc-architect"),
                     None,
                     "@zc-architect:example.org /goal status",
+                    None,
                 ),
                 Some("/goal status".to_string()),
             );
@@ -8335,6 +9056,7 @@ mod tests {
                     Some("zc-architect"),
                     None,
                     "@zc-architect:example.org:/goal cancel",
+                    None,
                 ),
                 Some("/goal cancel".to_string()),
             );
@@ -8344,6 +9066,7 @@ mod tests {
                     Some("zc-architect"),
                     None,
                     "zc-architect:/GOAL CaNcEl",
+                    None,
                 ),
                 Some("/GOAL CaNcEl".to_string()),
             );
@@ -8353,6 +9076,7 @@ mod tests {
                     Some("zc-architect"),
                     None,
                     "zc-architect,/GoAl ReSuMe Keep This Case\nand this line too",
+                    None,
                 ),
                 Some("/GoAl ReSuMe Keep This Case\nand this line too".to_string()),
             );
@@ -8361,6 +9085,7 @@ mod tests {
                 Some("zc-architect"),
                 None,
                 "zc-architect,/GoAl ReSuMe Keep This Case\nand this line too",
+                None,
             )
             .expect("an authenticated comma-terminated address is preserved");
             assert_eq!(
@@ -8374,6 +9099,7 @@ mod tests {
                 Some("zc-architect"),
                 None,
                 "zc-architect:/GOAL CaNcEl",
+                None,
             )
             .expect("an authenticated colon-terminated address is preserved");
             assert_eq!(cancelled, "/GOAL CaNcEl");
@@ -8384,6 +9110,7 @@ mod tests {
                     Some("zc-architect"),
                     Some(&["@zc-architect:example.org".to_string()]),
                     "@zc-architect: /goal help",
+                    None,
                 ),
                 Some("/goal help".to_string()),
             );
@@ -8393,6 +9120,7 @@ mod tests {
                     Some("zc-architect"),
                     Some(&["@zc-architect:example.org".to_string()]),
                     "@zc-architect /goal status",
+                    None,
                 ),
                 Some("/goal status".to_string()),
             );
@@ -8402,8 +9130,9 @@ mod tests {
                     Some("different display name"),
                     Some(&["@zc-architect:example.org".to_string()]),
                     "zc-architect: /goal help",
+                    None,
                 ),
-                Some("/goal help".to_string()),
+                None,
             );
             assert_eq!(
                 normalize_addressed_goal_command(
@@ -8411,6 +9140,7 @@ mod tests {
                     Some("different display name"),
                     Some(&["@zc-architect:example.org".to_string()]),
                     "[zc-architect](https://matrix.to/#/@zc-architect:example.org) /goal status",
+                    None,
                 ),
                 Some("/goal status".to_string()),
             );
@@ -8420,6 +9150,7 @@ mod tests {
                     Some("different display name"),
                     Some(&["@zc-architect:example.org".to_string()]),
                     "Please zc-architect /goal help",
+                    None,
                 ),
                 None,
             );
@@ -8429,6 +9160,7 @@ mod tests {
                     Some("zc-architect"),
                     None,
                     "@other:example.org /GOAL cancel",
+                    None,
                 ),
                 None,
             );
@@ -8438,6 +9170,7 @@ mod tests {
                     Some("zc-architect"),
                     Some(&["@zc-architect:example.org".to_string()]),
                     "Please ask zc-architect: /goal help",
+                    None,
                 ),
                 None,
             );
@@ -8447,6 +9180,7 @@ mod tests {
                     Some("zc-architect"),
                     None,
                     "@zc-architect:example.org /GOALkeeper cancel",
+                    None,
                 ),
                 None,
             );
@@ -8458,7 +9192,7 @@ mod tests {
 
             let bot = user_id!("@bot:example.org");
             for input in ["/goal status", "/GOAL StAtUs", "\u{2003}/gOaL\tstatus"] {
-                let normalized = normalize_addressed_goal_command(bot, None, None, input);
+                let normalized = normalize_addressed_goal_command(bot, None, None, input, None);
                 assert_eq!(normalized.as_deref(), Some(input.trim_start()));
                 assert_eq!(parse_goal_command(input), Ok(GoalCommand::Status));
             }
@@ -8473,7 +9207,7 @@ mod tests {
                 "ordinary 🙂 /GOAL status",
                 "@other:example.org /GOAL status",
             ] {
-                assert!(normalize_addressed_goal_command(bot, None, None, input).is_none());
+                assert!(normalize_addressed_goal_command(bot, None, None, input, None).is_none());
             }
         }
 
@@ -12002,6 +12736,7 @@ mod tests {
         fn resolver_yields_a_manager_when_enabled() {
             let resolver = legacy_transcription_resolver(TranscriptionConfig {
                 local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                    model: None,
                     url: "http://127.0.0.1:9999/v1/transcribe".to_string(),
                     bearer_token: None,
                     max_audio_bytes: 10 * 1024 * 1024,

@@ -62,7 +62,7 @@ image = { version = "0.25", default-features = false, features = [
   "png",
   "webp",
 ], optional = true }
-lettre = { version = "0.11.22", default-features = false, features = [
+lettre = { version = "0.11.24", default-features = false, features = [
   "builder",
   "rustls-tls",
   "smtp-transport",
@@ -79,6 +79,7 @@ matrix-sdk = { version = "0.19", optional = true, default-features = false, feat
   "sqlite",
 ] }
 mime_guess = { version = "2", optional = true }
+ruma-html = { version = "0.9", optional = true }
 nostr-sdk = { version = "0.44", default-features = false, features = [
   "nip04",
   "nip59",
@@ -286,7 +287,7 @@ channel-webhook = ["dep:axum"]
 channel-whatsapp-cloud = []
 channel-voice-call = ["dep:axum"]
 channel-acp-server = ["dep:zeroclaw-tools"]
-channel-matrix = ["dep:matrix-sdk", "dep:mime_guess", "dep:zeroclaw-tools"]
+channel-matrix = ["dep:matrix-sdk", "dep:mime_guess", "dep:ruma-html", "dep:zeroclaw-tools"]
 voice-wake = ["dep:cpal"]
 
 [target.'cfg(unix)'.dependencies]

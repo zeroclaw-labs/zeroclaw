@@ -12,6 +12,8 @@ use crate::control_plane::{
 use crate::cron::scheduler::deliver_announcement;
 use crate::live_config_authority::{AgentExecutionAdmission, AgentExecutionCapability};
 use crate::peers::resolve_peer_set;
+use crate::security::SecurityPolicy;
+use crate::security::policy::ToolOperation;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -52,25 +54,51 @@ pub struct SendMessageToPeerTool {
     capabilities: crate::composition::CapabilitySlot,
     task_control_plane: Option<ControlPlaneHandle>,
     execution_capability: Option<AgentExecutionCapability>,
+    security: Arc<SecurityPolicy>,
 }
 
 impl SendMessageToPeerTool {
-    pub fn new(config: Arc<Config>, sender_alias: impl Into<String>) -> Self {
-        Self::new_with_live_config_and_capability(config, sender_alias, None, None)
+    /// Derive the sender's policy, propagating profile and workspace errors.
+    pub fn new(config: Arc<Config>, sender_alias: impl Into<String>) -> Result<Self> {
+        Self::new_with_capability(config, sender_alias, None)
     }
 
+    /// Derive the sender's policy before binding recipient admission capability.
     pub fn new_with_capability(
         config: Arc<Config>,
         sender_alias: impl Into<String>,
         execution_capability: Option<AgentExecutionCapability>,
-    ) -> Self {
-        Self::new_with_live_config_and_capability(config, sender_alias, None, execution_capability)
+    ) -> Result<Self> {
+        let sender_alias = sender_alias.into();
+        let security = Arc::new(SecurityPolicy::for_agent(config.as_ref(), &sender_alias)?);
+        Ok(Self::new_with_live_config_security_and_capability(
+            config,
+            sender_alias,
+            None,
+            security,
+            execution_capability,
+        ))
     }
 
-    pub(crate) fn new_with_live_config_and_capability(
+    pub fn new_with_security(
+        config: Arc<Config>,
+        sender_alias: impl Into<String>,
+        security: Arc<SecurityPolicy>,
+    ) -> Self {
+        Self::new_with_live_config_security_and_capability(
+            config,
+            sender_alias,
+            None,
+            security,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_live_config_security_and_capability(
         config: Arc<Config>,
         sender_alias: impl Into<String>,
         live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+        security: Arc<SecurityPolicy>,
         execution_capability: Option<AgentExecutionCapability>,
     ) -> Self {
         let sender_alias = sender_alias.into();
@@ -83,6 +111,7 @@ impl SendMessageToPeerTool {
             capabilities: Arc::new(std::sync::OnceLock::new()),
             task_control_plane: None,
             execution_capability,
+            security,
         }
     }
 
@@ -159,6 +188,19 @@ impl Tool for SendMessageToPeerTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
+        // Peer messaging starts another agent's turn or posts externally —
+        // treat it as Act, matching a2a_send / spawn_subagent / delegate.
+        if let Err(error) = self
+            .security
+            .enforce_tool_operation(ToolOperation::Act, "send_message_to_peer")
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error),
+            });
+        }
+
         let channel = args
             .get("channel")
             .and_then(|v| v.as_str())
@@ -352,23 +394,53 @@ impl Tool for SendMessageToPeerTool {
             let task_id = task.id.clone();
             let task_owner_pid = task.owner_pid;
             let task_owner_boot_id = task.owner_boot_id.clone();
+            // Captured here and restored inside the task: a detached spawn does
+            // not inherit task-locals, so the recipient would otherwise rebuild
+            // its full tool surface and escape the headless step's boundary.
+            // Sibling tools (`delegate`, `spawn_subagent`) already carry the
+            // active step scope across the same spawn edge.
+            let parent_step_scope = crate::sop::active_scope::active_headless_step_scope();
             zeroclaw_spawn::spawn!(async move {
-                let internal_principal =
-                    Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
-                        sender_alias: sender.clone(),
-                    });
-                let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> = match bound {
-                    Some(bound) => Box::pin(crate::agent::loop_::process_message_shared_with_capabilities(
-                        cfg, live_config, bound.capabilities, bound.principal,
-                        &turn_recipient_alias, &body, None,
-                        zeroclaw_api::ingress::TurnOrigin::AgentDirect, admission, internal_principal,
-                    )),
-                    None => Box::pin(crate::agent::loop_::process_message_shared_with_live_config_and_admission_and_principal(
-                        cfg, live_config, &turn_recipient_alias, &body, None,
-                        zeroclaw_api::ingress::TurnOrigin::AgentDirect, admission, internal_principal,
-                    )),
-                };
-                let result = run_peer_turn_with_panic_recovery(cost_ctx, turn_usage, turn).await;
+                let result = crate::sop::active_scope::with_inherited_headless_step_scope(
+                    parent_step_scope,
+                    async {
+                        let internal_principal =
+                            Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
+                                sender_alias: sender.clone(),
+                            });
+                        let turn: Pin<Box<dyn Future<Output = Result<String>> + Send + '_>> =
+                            match bound {
+                            Some(bound) => Box::pin(
+                                crate::agent::loop_::process_message_shared_with_capabilities(
+                                    cfg,
+                                    live_config,
+                                    bound.capabilities,
+                                    bound.principal,
+                                    &turn_recipient_alias,
+                                    &body,
+                                    None,
+                                    zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                                    admission,
+                                    internal_principal,
+                                ),
+                            ),
+                            None => Box::pin(
+                                crate::agent::loop_::process_message_shared_with_live_config_and_admission_and_principal(
+                                    cfg,
+                                    live_config,
+                                    &turn_recipient_alias,
+                                    &body,
+                                    None,
+                                    zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                                    admission,
+                                    internal_principal,
+                                ),
+                            ),
+                        };
+                        run_peer_turn_with_panic_recovery(cost_ctx, turn_usage, turn).await
+                    },
+                )
+                .await;
                 if let Err(error) = settle_peer_inbox_task(
                     task_store.as_ref(),
                     &PeerInboxTask {
@@ -809,7 +881,7 @@ mod tests {
 
     use crate::control_plane::{SqliteTaskStore, TaskSnapshot};
     use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig, PeerUsername};
-    use zeroclaw_config::schema::AliasedAgentConfig;
+    use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
 
     struct MockRegistry {
         create_error: bool,
@@ -1135,11 +1207,20 @@ mod tests {
 
     #[test]
     fn description_stays_channel_agnostic() {
-        let mut config = Config::default();
+        let install = tempfile::TempDir::new().expect("isolated install");
+        let mut config = Config {
+            data_dir: install.path().join("data"),
+            config_path: install.path().join("config.toml"),
+            ..Config::default()
+        };
+        config
+            .risk_profiles
+            .insert("default".into(), RiskProfileConfig::default());
         config.agents.insert(
             "aa".to_string(),
             AliasedAgentConfig {
                 channels: vec!["telegram.prod".into()],
+                risk_profile: "default".into(),
                 ..AliasedAgentConfig::default()
             },
         );
@@ -1167,7 +1248,7 @@ mod tests {
             },
         );
 
-        let tool = SendMessageToPeerTool::new(Arc::new(config), "aa");
+        let tool = SendMessageToPeerTool::new(Arc::new(config), "aa").expect("sender policy");
         assert!(crate::i18n::get_tool_description(tool.name()).is_none());
         let spec = tool.spec();
         let description = spec.description.as_str();
@@ -1691,6 +1772,7 @@ mod tests {
             "sender".to_string(),
             AliasedAgentConfig {
                 channels: vec!["telegram.prod".into()],
+                risk_profile: "default".into(),
                 ..AliasedAgentConfig::default()
             },
         );
@@ -1725,6 +1807,7 @@ mod tests {
             "sender",
             Some(authority.execution_capability()),
         )
+        .expect("sender policy")
         .with_control_plane(control_plane);
         let result = tool
             .execute(json!({
@@ -1874,6 +1957,517 @@ mod tests {
         .await
         .expect("recipient finishes persistence and releases admission");
         assert!(lifecycle.begin_delete("recipient").is_ok());
+        server.abort();
+    }
+
+    /// A headless SOP step that calls `send_message_to_peer` must keep the
+    /// recipient's turn inside the step's tool scope. Detached spawn drops
+    /// task-locals, so without restoring the scope the recipient rebuilds its
+    /// full surface (sibling tools `delegate` / `spawn_subagent` already carry
+    /// it).
+    #[tokio::test]
+    async fn peer_turn_started_inside_headless_step_keeps_step_tool_scope() {
+        use crate::control_plane::ControlPlaneHandle;
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{
+            ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig, SopConfig,
+        };
+
+        type Bodies = Arc<Mutex<Vec<serde_json::Value>>>;
+        async fn capture(
+            State(bodies): State<Bodies>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            bodies.lock().push(body);
+            Json(json!({
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+            }))
+        }
+
+        let bodies: Bodies = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(capture))
+            .with_state(bodies.clone());
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            config_path: workspace.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("mock-model".to_string()),
+                    uri: Some(format!("http://{addr}")),
+                    timeout_secs: Some(5),
+                    pricing: HashMap::new(),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "sender".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "recipient".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "ops".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("sender"), AgentAlias::new("recipient")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        // The step may only message a peer; everything else is scoped out.
+        let scope = crate::sop::active_scope::HeadlessStepScope {
+            run_id: "run-1".into(),
+            step: crate::sop::SopStep {
+                number: 1,
+                scope: Some(crate::sop::StepToolScope {
+                    allow: Some(vec!["send_message_to_peer".into()]),
+                    deny: Vec::new(),
+                }),
+                ..crate::sop::SopStep::default()
+            },
+            config: SopConfig {
+                step_scope_enforce: true,
+                ..SopConfig::default()
+            },
+        };
+
+        let control_plane = ControlPlaneHandle::open(workspace.path())
+            .expect("isolated control plane should initialize");
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let tool = SendMessageToPeerTool::new_with_capability(
+            Arc::new(config.clone()),
+            "sender",
+            Some(authority.execution_capability()),
+        )
+        .expect("sender policy")
+        .with_control_plane(control_plane);
+
+        let result = crate::sop::active_scope::with_active_headless_step_scope(
+            scope,
+            tool.execute(json!({
+                "channel": "telegram.prod",
+                "target": "recipient",
+                "message": "status?"
+            })),
+        )
+        .await
+        .expect("execute should accept the peer send");
+        assert!(result.success, "{result:?}");
+
+        let mut first = None;
+        for _ in 0..200_000 {
+            if let Some(body) = bodies.lock().first().cloned() {
+                first = Some(body);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let body = first.expect("the detached recipient turn must reach the provider");
+
+        let offered: Vec<String> = body["tools"]
+            .as_array()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|t| t["function"]["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !offered.is_empty(),
+            "precondition: the recipient request carried no native tool specs; body = {body}"
+        );
+        let outside: Vec<&String> = offered
+            .iter()
+            .filter(|name| name.as_str() != "send_message_to_peer")
+            .collect();
+        assert!(
+            outside.is_empty(),
+            "a peer turn started from inside a scoped headless SOP step was offered tools \
+             outside the step scope: {outside:?}"
+        );
+
+        server.abort();
+    }
+
+    fn peer_policy_config(install: &std::path::Path) -> Config {
+        let mut config = Config {
+            data_dir: install.join("data"),
+            config_path: install.join("config.toml"),
+            ..Config::default()
+        };
+        config
+            .risk_profiles
+            .insert("default".into(), RiskProfileConfig::default());
+        for alias in ["sender", "recipient"] {
+            config.agents.insert(
+                alias.to_string(),
+                AliasedAgentConfig {
+                    channels: vec!["telegram.prod".into()],
+                    risk_profile: "default".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        config.peer_groups.insert(
+            "ops".into(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("sender"), AgentAlias::new("recipient")],
+                external_peers: vec![PeerUsername::new("operator")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn peer_constructors_propagate_missing_risk_profile() {
+        let install = tempfile::TempDir::new().expect("isolated install");
+        let mut config = peer_policy_config(install.path());
+        config.agents.get_mut("sender").unwrap().risk_profile = "missing".into();
+        let config = Arc::new(config);
+
+        for with_capability in [false, true] {
+            let result = if with_capability {
+                SendMessageToPeerTool::new_with_capability(Arc::clone(&config), "sender", None)
+            } else {
+                SendMessageToPeerTool::new(Arc::clone(&config), "sender")
+            };
+            let error = result
+                .err()
+                .expect("invalid sender policy must refuse construction");
+            assert!(error.to_string().contains("no resolvable risk_profile"));
+            assert!(!config.agent_workspace_dir("sender").exists());
+            assert!(
+                !config.data_dir.exists(),
+                "construction must not create a task store"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_constructors_propagate_workspace_creation_failure() {
+        let install = tempfile::TempDir::new().expect("isolated install");
+        let config = Arc::new(peer_policy_config(install.path()));
+        let workspace = config.agent_workspace_dir("sender");
+        std::fs::create_dir_all(workspace.parent().unwrap()).expect("workspace parent");
+        std::fs::write(&workspace, b"keep this file").expect("block workspace creation");
+
+        for with_capability in [false, true] {
+            let result = if with_capability {
+                SendMessageToPeerTool::new_with_capability(Arc::clone(&config), "sender", None)
+            } else {
+                SendMessageToPeerTool::new(Arc::clone(&config), "sender")
+            };
+            let error = result
+                .err()
+                .expect("workspace error must refuse construction");
+            assert!(
+                error
+                    .to_string()
+                    .contains("failed to create agent workspace dir")
+            );
+            assert_eq!(std::fs::read(&workspace).unwrap(), b"keep this file");
+            assert!(
+                !config.data_dir.exists(),
+                "construction must not create a task store"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn send_message_to_peer_denied_in_readonly_autonomy() {
+        // Sibling contract of a2a_send_denied_in_readonly_autonomy:
+        // peer messaging is an Act and must refuse before any delivery.
+        use crate::security::{AutonomyLevel, SecurityPolicy};
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let install = tempfile::TempDir::new().expect("isolated install");
+        let config = peer_policy_config(install.path());
+        let control_plane = ControlPlaneHandle::open(&config.data_dir).expect("task store");
+        let task_store = Arc::clone(&control_plane.store);
+        let tool = SendMessageToPeerTool::new_with_security(
+            Arc::new(config),
+            "sender",
+            Arc::clone(&security),
+        )
+        .with_control_plane(control_plane);
+        for target in ["recipient", "@operator"] {
+            let result = tool
+                .execute(json!({
+                    "channel": "telegram.prod",
+                    "target": target,
+                    "message": "hola"
+                }))
+                .await
+                .expect("execute returns a ToolResult");
+            assert!(
+                !result.success,
+                "read-only sender must be refused; got {result:?}"
+            );
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("read-only")),
+                "error must mention read-only; got {result:?}"
+            );
+        }
+        assert!(
+            !security.is_rate_limited(),
+            "read-only refusals must not charge an action"
+        );
+        assert!(
+            task_store
+                .list_by_agent("recipient")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_to_peer_readonly_for_agent_creates_no_peer_inbox() {
+        // Profile-based path: SecurityPolicy::for_agent(ReadOnly) must refuse
+        // before admit_peer_inbox_task runs.
+        use crate::control_plane::ControlPlaneHandle;
+        use crate::security::{AutonomyLevel, SecurityPolicy};
+        use zeroclaw_config::schema::RiskProfileConfig;
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            config_path: workspace.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.agents.insert(
+            "sender".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                risk_profile: "ro".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "recipient".to_string(),
+            AliasedAgentConfig {
+                channels: vec!["telegram.prod".into()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.peer_groups.insert(
+            "ops".to_string(),
+            PeerGroupConfig {
+                channel: "telegram".into(),
+                agents: vec![AgentAlias::new("sender"), AgentAlias::new("recipient")],
+                ..PeerGroupConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "ro".to_string(),
+            RiskProfileConfig {
+                level: AutonomyLevel::ReadOnly,
+                ..RiskProfileConfig::default()
+            },
+        );
+
+        let policy = SecurityPolicy::for_agent(&config, "sender").expect("sender policy");
+        assert!(!policy.can_act(), "readonly profile must disable can_act");
+
+        let control_plane = ControlPlaneHandle::open(workspace.path())
+            .expect("isolated control plane should initialize");
+        let task_store = Arc::clone(&control_plane.store);
+        let tool = SendMessageToPeerTool::new(Arc::new(config), "sender")
+            .expect("sender policy")
+            .with_control_plane(control_plane);
+
+        let result = tool
+            .execute(json!({
+                "channel": "telegram.prod",
+                "target": "recipient",
+                "message": "hola"
+            }))
+            .await
+            .expect("execute returns a ToolResult");
+        assert!(
+            !result.success,
+            "read-only sender must be refused; got {result:?}"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("read-only"),
+            "error must mention read-only; got {result:?}"
+        );
+
+        let tasks = task_store
+            .list_by_agent("recipient")
+            .await
+            .expect("recipient tasks");
+        assert!(
+            tasks.is_empty(),
+            "readonly denial must not create a PeerInbox task in any state; got {tasks:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_to_peer_consumes_action_budget() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use zeroclaw_config::schema::{
+            ModelProviderConfig, OllamaModelProviderConfig, RuntimeProfileConfig,
+        };
+
+        async fn respond(State(requests): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+            requests.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"choices": [{"message": {"content": "peer received"}}]}))
+        }
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new()
+            .route("/v1/chat/completions", post(respond))
+            .with_state(Arc::clone(&requests));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, router).await.expect("local provider");
+        });
+        let install = tempfile::TempDir::new().expect("isolated install");
+        let mut config = peer_policy_config(install.path());
+        config.agents.get_mut("sender").unwrap().runtime_profile = "one-action".into();
+        config.runtime_profiles.insert(
+            "one-action".into(),
+            RuntimeProfileConfig {
+                max_actions_per_hour: 1,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.get_mut("recipient").unwrap().model_provider = "ollama.test".into();
+        config.providers.models.ollama.insert(
+            "test".into(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("mock-model".into()),
+                    uri: Some(format!("http://{address}")),
+                    timeout_secs: Some(5),
+                    ..ModelProviderConfig::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+        let control_plane = ControlPlaneHandle::open(&config.data_dir).expect("task store");
+        let task_store = Arc::clone(&control_plane.store);
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let config = Arc::new(config);
+        let tool = SendMessageToPeerTool::new_with_capability(
+            Arc::clone(&config),
+            "sender",
+            Some(authority.execution_capability()),
+        )
+        .expect("sender policy")
+        .with_control_plane(control_plane.clone());
+        let security = Arc::clone(&tool.security);
+        assert_eq!(security.max_actions_per_hour, 1);
+        assert!(!security.is_rate_limited());
+        let args = json!({
+            "channel": "telegram.prod",
+            "target": "recipient",
+            "message": "hola"
+        });
+        let first = tool
+            .execute(args.clone())
+            .await
+            .expect("first execute returns a ToolResult");
+        assert!(
+            first.success,
+            "the admitted peer send must succeed: {first:?}"
+        );
+        assert!(
+            security.is_rate_limited(),
+            "the successful Act must consume the slot"
+        );
+        let task_id = first
+            .output
+            .split_once("task_id=")
+            .unwrap()
+            .1
+            .trim_end_matches(')');
+        let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = task_store.get_snapshot(task_id).await.unwrap().unwrap();
+                if snapshot.task.status.is_terminal() {
+                    return snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recipient completes through the local provider");
+        assert_eq!(terminal.task.status, TaskStatus::Completed);
+        assert_eq!(terminal.output.as_deref(), Some("peer received"));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        let second_tool =
+            SendMessageToPeerTool::new_with_security(config, "sender", Arc::clone(&security))
+                .with_control_plane(control_plane);
+        let second = second_tool
+            .execute(args)
+            .await
+            .expect("second execute returns a ToolResult");
+        assert!(
+            !second.success,
+            "second send must be refused; got {second:?}"
+        );
+        assert_eq!(
+            second.error.as_deref(),
+            Some("Rate limit exceeded: action budget exhausted")
+        );
+        assert_eq!(
+            task_store.list_by_agent("recipient").await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "refused send must not reach the provider"
+        );
         server.abort();
     }
 }

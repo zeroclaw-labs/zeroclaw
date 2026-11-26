@@ -1,6 +1,10 @@
+# System-level unit template for hardware access (gpio, spi and i2c groups).
+# Replace @@RPI_USER@@ and adjust all paths for the service account and
+# install location before installing it.
+
 [Unit]
 Description=ZeroClaw AI Hardware Agent
-Documentation=https://github.com/zeroclaw/zeroclaw
+Documentation=https://github.com/zeroclaw-labs/zeroclaw
 After=network-online.target
 Wants=network-online.target
 
@@ -12,7 +16,7 @@ WorkingDirectory=/home/@@RPI_USER@@/zeroclaw
 ExecStart=/home/@@RPI_USER@@/zeroclaw/zeroclaw gateway start
 Restart=on-failure
 RestartSec=5
-EnvironmentFile=/home/@@RPI_USER@@/zeroclaw/.env
+EnvironmentFile=-/home/@@RPI_USER@@/zeroclaw/.env
 Environment=RUST_LOG=info
 
 # Expand ~ in config path

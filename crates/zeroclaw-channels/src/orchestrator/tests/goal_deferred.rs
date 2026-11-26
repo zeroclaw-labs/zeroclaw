@@ -5337,6 +5337,7 @@ async fn route_matrix_goal_fixture_control(
             matrix_goal_reset: None,
             ctx: context,
             agent_generation: 0,
+            inbound_content: message.content.clone(),
             msg: message,
             dispatch_ownership: ModelPickerDispatchOwnership::hold(&delivery_message_id),
             delivery_message_id,
@@ -6958,6 +6959,7 @@ async fn assert_matrix_goal_deferred_ingress(
 enum GoalInboundHook {
     Cancel,
     Rewrite,
+    RewriteToStatusText,
 }
 
 #[async_trait::async_trait]
@@ -6978,6 +6980,10 @@ impl zeroclaw_runtime::hooks::HookHandler for GoalInboundHook {
                 message.content = "rewritten ordinary request".into();
                 message.sender = "@other:example.test".into();
                 message.reply_target = "rewritten-room".into();
+                zeroclaw_runtime::hooks::HookResult::Continue(message)
+            }
+            Self::RewriteToStatusText => {
+                message.content = "/goal status".into();
                 zeroclaw_runtime::hooks::HookResult::Continue(message)
             }
         }
@@ -7037,6 +7043,39 @@ async fn matrix_goal_ingress_keeps_original_command_and_reply_authority() {
         replies[0].recipient,
         matrix_msg("@fixture:example.test").reply_target
     );
+}
+
+#[tokio::test]
+async fn matrix_goal_ingress_keeps_post_hook_control_text_as_ordinary_content() {
+    let channel = Arc::new(SendMessageRecordingChannel::matrix());
+    let provider = Arc::new(GatedProbeModelProvider::default());
+    let mut context = test_runtime_ctx_with_config_agent_and_provider_ref(
+        channel.clone(),
+        provider.clone(),
+        matrix_control_test_config(),
+        zeroclaw_config::schema::AliasedAgentConfig::default(),
+        "test-provider",
+        None,
+    );
+    let mut hooks = zeroclaw_runtime::hooks::HookRunner::new();
+    hooks.register(Box::new(GoalInboundHook::RewriteToStatusText));
+    Arc::get_mut(&mut context).unwrap().hooks = Some(Arc::new(hooks));
+    let (sender, receiver) = tokio::sync::mpsc::channel(8);
+    let mut message = matrix_msg("@fixture:example.test");
+    message.content = "ordinary request".into();
+    sender.send(message).await.unwrap();
+    drop(sender);
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        run_message_dispatch_loop(receiver, AgentRouter::single(context), 4),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(provider.entered_ids().len(), 1);
+    let replies = channel.sent_messages.lock().await;
+    assert_eq!(replies.len(), 1);
+    assert!(replies[0].content.contains("done for message_id="));
 }
 
 #[test]

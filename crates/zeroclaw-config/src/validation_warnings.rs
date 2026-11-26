@@ -44,6 +44,10 @@ pub const PRE_EXISTING_VALIDATION_ERROR: &str = "pre_existing_validation_error";
 /// Stable code for warnings whose details are withheld from a write-only client.
 pub const CONFIG_WARNING_DETAILS_HIDDEN: &str = "config_warning_details_hidden";
 
+/// Stable code for delegate grants the agent's risk profile can never fire:
+/// its delegation_policy forbids delegation or its tool policy blocks `delegate`.
+pub const DEAD_DELEGATE_GRANTS: &str = "dead_delegate_grants";
+
 /// Stable code for a half-configured email outbound pair: the channel loads and
 /// stays inbound-only even though the operator configured sending.
 pub const EMAIL_SMTP_PARTIALLY_CONFIGURED: &str = "email_smtp_partially_configured";
