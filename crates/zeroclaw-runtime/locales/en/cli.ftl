@@ -2,6 +2,9 @@ cli-about = The fastest, smallest AI assistant.
 cli-no-command-provided = No command provided.
 cli-try-quickstart = Try `zeroclaw quickstart` to create your first agent.
 
+cli-tool-file-read-directory = Cannot read a directory as a file. Specify a file path.
+cli-tool-file-read-failed = Failed to read file: {$error}
+
 cli-quickstart-about = Create your first agent end-to-end
 cli-agent-about = Start the AI agent loop
 cli-gateway-about = Manage the gateway server (webhooks, websockets)
@@ -1226,6 +1229,7 @@ cli-desktop-download-at = {"  "}Download it at: {$url}
 cli-config-legend = Legend: 💉 env-overridden  🔒 secret
 cli-config-secret-set = {$path} is set (encrypted secret — value not displayed)
 cli-config-secret-unset = {$path} is not set (encrypted secret)
+cli-config-value-prompt = Enter value for {$path}
 cli-config-updated = {$path} updated.
 cli-config-review-hint = Run `zeroclaw config list` to review, then set required fields.
 cli-config-catalog-unavailable-manual = {"  "}⚠ Catalog for {$provider} is unavailable ({$error}); enter the model ID manually.
@@ -1260,6 +1264,23 @@ cli-auth-refresh-ok = ✓ Token refresh OK (profile {$profile})
 cli-auth-removed = Removed auth profile {$provider}:{$profile}
 cli-auth-not-found = Auth profile not found: {$provider}:{$profile}
 cli-auth-xai-imported = Imported xAI auth profile from {$path}
+cli-auth-gemini-personal-account-warning =
+    ================================================================================
+    WARNING: PERSONAL GOOGLE ACCOUNTS DO NOT WORK WITH THIS LOGIN
+    ================================================================================
+    Google stopped serving Gemini Code Assist to Google AI free, Pro, and Ultra
+    accounts on June 18, 2026, and suspends accounts that use a consumer Google
+    login from third-party tools such as ZeroClaw. Do not sign in with a personal
+    Google account here.
+
+    Continue only with your own Google Cloud OAuth client and an account licensed
+    for Gemini Code Assist Standard or Enterprise.
+
+    For everything else, use one of:
+      - providers.models.gemini.<alias> with an API key
+      - providers.models.antigravity_cli.<alias> with a Gemini API key, Agent
+        Platform, or Gemini Enterprise
+    ================================================================================
 cli-auth-xai-device-code-started = xAI device-code login started.
 cli-auth-oauth-visit = Visit: {$uri}
 cli-auth-oauth-code = Code:  {$code}
@@ -1315,6 +1336,9 @@ cli-channels-build-hint = {"  "}Build from source with `./install.sh --source --
 cli-channels-start-hint = To start channels: zeroclaw channel start
 cli-channels-doctor-hint = To check health:    zeroclaw channel doctor
 cli-channels-configure-hint = To configure:      zeroclaw config set channels.<name>.<field>=<value>
+# Refusal when a cron announcement or one-off send names a channel instance
+# whose `enabled` is false. `table` is the config table (`lark` for Feishu).
+cli-channels-delivery-disabled = [channels.{$table}.{$alias}] is disabled; set enabled = true to deliver
 
 cli-models-set-ok = Default model set to "{ $model }" on { $provider }.
 cli-models-status-current = Default model: { $model } (provider: { $provider })
@@ -1650,6 +1674,7 @@ cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is inv
 cli-doctor-degraded-section = config section `{$path}` is malformed and was reset to defaults; values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-doctor-verifiable-intent-tool-withheld = verifiable_intent.enabled is set, but the vi_verify tool is withheld from the model-visible registry until a credential chain verifier exists. Enabling the section does not enable credential verification on commerce tool calls. The issuance and verification library paths are unaffected.
 cli-doctor-security-audit-disabled-drops-certificate-record = security.audit.enabled=false: certificates are issued and renewed with no audit record. Command execution is not audited either way, because no production path records tool commands. Leave the section enabled to keep the certificate trail, and use an external supervisor or logging wrapper that observes the ZeroClaw process, or OS-level process accounting, if you need a record of what ran.
+cli-doctor-dead-delegate-grants = Delegate grants at {$path} can never run: the agent's risk profile forbids delegation (delegation_policy.mode) or blocks the `delegate` tool (allowed_tools, deny_all_tools or excluded_tools). Allow delegation in that profile or remove the grants.
 sop-approval-deferred-at-capacity = Approval could not resume run {$run_id}: execution slots are full. The gate remains waiting; retry after a slot frees.
 sop-approval-policy-unavailable = Approval failed because the parked SOP step is unavailable: {$reason}. The run remains waiting.
 sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current state.
@@ -1662,6 +1687,12 @@ sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
 tool-runtime-command-build-failed = Failed to build runtime command: {$error}
 tool-runtime-command-docker-workspace-path = Failed to build runtime command: Failed to canonicalize Docker workspace path {$path}: {$cause}
 tool-runtime-command-docker-allowed-root = Failed to build runtime command: Failed to canonicalize Docker workspace root {$path}: {$cause}
+
+# ── Shell tool failure labels (user-facing ToolComplete.error) ──
+tool-shell-exit-status = exit status { $code }
+tool-shell-killed-by-signal = killed by signal { $signal }
+tool-shell-exited-unsuccessfully = exited unsuccessfully
+tool-shell-failure-with-detail = { $status }: { $detail }
 
 # ── Terminal tool approval ──
 # The ASCII shortcut tokens stay aligned with the Rust-owned response parser.

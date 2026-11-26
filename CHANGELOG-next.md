@@ -148,6 +148,7 @@ Plus the dashboard through ZeroRelay, a CLI-only server build, and tighter isola
 | Install | Install and uninstall messages show the package version, not the build id (#12159, closes #12154) |
 | CLI | Leaving quickstart says nothing was configured, instead of claiming no config was written (#12162, closes #12155) |
 | Config | Lifecycle remedy commands work when the config directory starts with a dash (#12172, closes #11952) |
+| Config | A decimal setting refuses `inf`, `NaN`, and text too large for the field such as `1e999`, instead of storing a value that is not a number or that compares above every limit. This applies to `zeroclaw config set`, `zeroclaw config patch`, the gateway's config `PATCH` API, ZeroCode and RPC `config/set`; a `ZEROCLAW_…` environment override with such a value now stops the config from loading, as a non-number already did |
 | Channels | Allowlisted Discord bots can't answer tool approvals (#12065, closes #12064) |
 | Channels | Telegram withdraws its acknowledgement reaction when a reply finishes (#11739) |
 | Channels | "Reply delivered" is logged only after the platform accepts the reply (#11979, closes #12093) |
