@@ -2196,6 +2196,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wake_agent_spends_the_last_host_call_then_is_unavailable() {
+        let (mut state, recorder) = wake_state("main", [PluginPermission::AgentDispatch], None);
+        state.start_call(PluginCallPhase::ToolExecute);
+        state.host_calls_remaining = 1;
+
+        assert_eq!(
+            state
+                .wake_agent("alpha".to_string(), "first".to_string())
+                .await,
+            Ok(()),
+            "the frame's last host call may still dispatch"
+        );
+        assert_eq!(
+            state
+                .wake_agent("alpha".to_string(), "second".to_string())
+                .await,
+            Err(AgentWakeError::Unavailable),
+            "the call after the last one must be refused"
+        );
+        assert_eq!(
+            recorder.recorded().len(),
+            1,
+            "only the budgeted call reaches the backend"
+        );
+        state.finish_call();
+    }
+
+    #[tokio::test]
     async fn wake_agent_denies_a_tool_frame_without_the_grant() {
         let (mut state, recorder) = wake_state("main", [], None);
         state.start_call(PluginCallPhase::ToolExecute);
@@ -2254,6 +2282,8 @@ mod tests {
             "   ".to_string(),
             "\n\t ".to_string(),
             "p".repeat(1025),
+            // 513 two-byte characters: under 1024 characters, over 1024 bytes.
+            "é".repeat(513),
             "bell\u{7}".to_string(),
             "cr\r".to_string(),
             "escape\u{1b}[2J".to_string(),
@@ -2290,6 +2320,18 @@ mod tests {
                 prompt,
             }]
         );
+
+        // The ceiling counts UTF-8 bytes: 512 two-byte characters fit exactly.
+        let (mut state, recorder) = wake_state("main", [PluginPermission::AgentDispatch], None);
+        state.start_call(PluginCallPhase::ToolExecute);
+        let multibyte = "é".repeat(512);
+        assert_eq!(multibyte.len(), 1024);
+        assert_eq!(
+            state.wake_agent("alpha".to_string(), multibyte).await,
+            Ok(())
+        );
+        state.finish_call();
+        assert_eq!(recorder.recorded().len(), 1);
     }
 
     #[tokio::test]
