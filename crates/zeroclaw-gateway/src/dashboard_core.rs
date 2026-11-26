@@ -178,6 +178,11 @@ pub(crate) struct PlaceGuard {
 }
 
 impl PlaceGuard {
+    /// Whether this place is charged to the given dashboard sign-in.
+    pub(crate) fn belongs_to_sign_in(&self, binding: &Arc<CoreBinding>) -> bool {
+        Arc::ptr_eq(&self.binding, binding)
+    }
+
     fn hold(&self, core_id: &str, chat: OpenChat) {
         self.binding
             .held
@@ -2906,8 +2911,13 @@ mod tests {
         addr: SocketAddr,
         cookie: &str,
         agent: Option<&str>,
+        resume: Option<&str>,
     ) -> Result<ChatSocket, tokio_tungstenite::tungstenite::Error> {
-        let path = agent.map_or_else(|| "/acp".to_owned(), |agent| format!("/acp?agent={agent}"));
+        let mut path =
+            agent.map_or_else(|| "/acp".to_owned(), |agent| format!("/acp?agent={agent}"));
+        if let Some(sid) = resume {
+            path.push_str(&format!("&resumeSession={sid}"));
+        }
         let mut request = dashboard_ws_request(addr, cookie, &path);
         request
             .headers_mut()
@@ -2951,10 +2961,12 @@ mod tests {
         let addr = serve(fixture.router()).await;
         let (alice, _) = fixture.sign_in("alice").await;
         let (bob, _) = fixture.sign_in("bob").await;
-        let mut alice = open_scoped_acp(addr, &alice, Some("support"))
+        let mut alice = open_scoped_acp(addr, &alice, Some("support"), None)
             .await
             .unwrap();
-        let mut bob = open_scoped_acp(addr, &bob, Some("support")).await.unwrap();
+        let mut bob = open_scoped_acp(addr, &bob, Some("support"), None)
+            .await
+            .unwrap();
         let created = call_acp(
             &mut alice,
             1,
@@ -3009,12 +3021,12 @@ mod tests {
         let mut sockets = Vec::new();
         for _ in 1..MAX_LIVE_CONVERSATIONS {
             sockets.push(
-                open_scoped_acp(addr, &cookie, Some("support"))
+                open_scoped_acp(addr, &cookie, Some("support"), None)
                     .await
                     .unwrap(),
             );
         }
-        let mut over_budget = open_scoped_acp(addr, &cookie, Some("support"))
+        let mut over_budget = open_scoped_acp(addr, &cookie, Some("support"), None)
             .await
             .unwrap();
         let (_, code) = read_to_close(&mut over_budget).await;
@@ -3084,14 +3096,16 @@ mod tests {
         let addr = serve(fixture.router()).await;
         let (cookie, _) = fixture.sign_in("alice").await;
         for (agent, status) in [(None, 400), (Some("forbidden"), 403)] {
-            let refused = open_scoped_acp(addr, &cookie, agent).await.unwrap_err();
+            let refused = open_scoped_acp(addr, &cookie, agent, None)
+                .await
+                .unwrap_err();
             assert!(matches!(
                 refused,
                 tokio_tungstenite::tungstenite::Error::Http(response)
                     if response.status().as_u16() == status
             ));
         }
-        let mut socket = open_scoped_acp(addr, &cookie, Some("support"))
+        let mut socket = open_scoped_acp(addr, &cookie, Some("support"), None)
             .await
             .unwrap();
         assert_eq!(
@@ -3115,6 +3129,109 @@ mod tests {
         }
         let (frames, _) = read_to_close(&mut socket).await;
         assert!(frames.is_empty(), "{frames:?}");
+    }
+
+    async fn receive_acp_method(socket: &mut ChatSocket, method: &str) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let message = socket.next().await.unwrap().unwrap();
+                let frame: Value = serde_json::from_str(&message.into_text().unwrap()).unwrap();
+                if frame["method"] == method {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("ACP method")
+    }
+
+    #[tokio::test]
+    async fn scoped_acp_reconnects_at_capacity_and_answers_pending_approval() {
+        let fixture = Fixture::with_config(asking_file_read).await;
+        let note = fixture
+            .config
+            .agent_workspace_dir("support")
+            .join("note.txt");
+        std::fs::create_dir_all(note.parent().unwrap()).unwrap();
+        let marker = "reconnected ACP read this fixture note";
+        std::fs::write(note, marker).unwrap();
+        let addr = serve(fixture.router()).await;
+        let (cookie, _) = fixture.sign_in("alice").await;
+        let mut sockets = Vec::new();
+        for _ in 0..MAX_LIVE_CONVERSATIONS {
+            sockets.push(
+                open_scoped_acp(addr, &cookie, Some("support"), None)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut origin = sockets.pop().unwrap();
+        let created = call_acp(&mut origin, 1, "session/new", json!({})).await;
+        let sid = created["result"]["sessionId"].as_str().unwrap();
+        send_acp(
+            &mut origin,
+            2,
+            "session/prompt",
+            json!({
+                "sessionId":sid,"prompt":[{"type":"text","text":"please read the note"}],
+            }),
+        )
+        .await;
+        let original = receive_acp_method(&mut origin, "session/request_permission").await;
+        origin.close(None).await.unwrap();
+        read_to_close(&mut origin).await;
+
+        let mut replacement = open_scoped_acp(addr, &cookie, Some("support"), Some(sid))
+            .await
+            .unwrap();
+        let forbidden = call_acp(&mut replacement, 3, "session/new", json!({})).await;
+        assert_eq!(forbidden["error"]["code"], FORBIDDEN);
+        let resume = call_acp(
+            &mut replacement,
+            4,
+            "session/resume",
+            json!({"sessionId":sid}),
+        )
+        .await;
+        assert!(resume["result"].is_object(), "{resume}");
+        let reattach = call_acp(
+            &mut replacement,
+            5,
+            "_zeroclaw/session/reattach",
+            json!({"sessionId":sid}),
+        )
+        .await;
+        assert_eq!(reattach["result"]["inFlight"], true, "{reattach}");
+        let replay = receive_acp_method(&mut replacement, "session/request_permission").await;
+        assert_eq!(replay["id"], original["id"]);
+        let mut duplicate = open_scoped_acp(addr, &cookie, Some("support"), Some(sid))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_to_close(&mut duplicate).await.1,
+            Some(WS_CLOSE_CONVERSATION_LIMIT)
+        );
+
+        let allowed = replay["params"]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|option| option["kind"] == "allow_once")
+            .unwrap();
+        replacement
+            .send(ClientMessage::Text(
+                json!({
+                    "jsonrpc":"2.0","id":replay["id"],
+                    "result":{"outcome":{"outcome":"selected","optionId":allowed["optionId"]}}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let done = receive_acp_method(&mut replacement, "_zeroclaw/turn_complete").await;
+        assert_eq!(done["params"]["result"]["stopReason"], "end_turn", "{done}");
+        assert!(model_requests_with(&fixture._model, marker).await > 0);
     }
 
     /// Drive `open` until the core has started creating its session behind

@@ -410,7 +410,7 @@ You can also supply the bearer token directly via `ZEROCLAW_ACP_BRIDGE_TOKEN` if
 
 ### Dashboard sign-in and turn reattachment
 
-When pairing is required, `/acp` also accepts same-origin dashboard sign-in cookies. An explicit pairing token takes precedence. Administrators have operator access. A scoped account must set `?agent=<alias>` and have permission to chat with that agent. It can open one live ACP session per socket, with a shared limit of four conversations across ACP and `/ws/chat` per sign-in, and an 8 MiB frame and message limit. Detached turns keep their conversation slots until they finish.
+When pairing is required, `/acp` also accepts same-origin dashboard sign-in cookies. An explicit pairing token takes precedence. Administrators have operator access. A scoped account must set `?agent=<alias>` and have permission to chat with that agent. It can open one live ACP session per socket, with a shared limit of four conversations across ACP and `/ws/chat` per sign-in, and an 8 MiB frame and message limit. A detached turn keeps its conversation slot while it runs. A replacement socket from the same sign-in can send `?agent=<alias>&resumeSession=<id>` to reuse that slot for the same session, including when all four slots are occupied.
 
 Scoped ACP sessions use the signed-in principal's tool grants. The WebChat surface enables the principal's own memory plane. MCP bundles, external channel handles, and turn steering are reserved for operator access. A sign-out, expiry, or grant change closes the connection and cancels its running turns.
 
