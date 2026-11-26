@@ -235,7 +235,7 @@ pub(crate) async fn run_oneshot_subprocess<A>(
     select_auth: A,
 ) -> AcpSubprocessOutcome
 where
-    A: FnOnce(&Value) -> Result<Value, AcpError>,
+    A: FnOnce(&Value) -> Result<Option<Value>, AcpError>,
 {
     #[cfg(not(windows))]
     cmd.kill_on_drop(true);
