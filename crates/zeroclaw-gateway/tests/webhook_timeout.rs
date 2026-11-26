@@ -132,12 +132,10 @@ impl Fixture {
         configure(&mut config);
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
-                config.sop.clone(),
-                &config.decision_models,
-                &config.data_dir,
-                &config.install_root_dir(),
+                &config,
                 Arc::new(zeroclaw_memory::none::NoneMemory::new("fixture")),
                 Default::default(),
+                None,
             );
             (Some(engine), Some(audit))
         } else {
