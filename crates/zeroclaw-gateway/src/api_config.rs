@@ -4768,7 +4768,11 @@ mod tests {
     async fn patch_enabling_an_opt_in_tool_follows_whether_the_build_carries_it() {
         use zeroclaw_config::opt_in_tools::OptInTool;
         let tmp = tempfile::tempdir().unwrap();
-        let config = temp_config(&tmp);
+        let mut config = temp_config(&tmp);
+        // `[web_search]` defaults to enabled and reports its own
+        // tool_compiled_out line in lean builds; this test counts the
+        // microsoft365 warning only.
+        config.web_search.enabled = false;
         config.save().await.unwrap();
         let state = test_state(config);
         let (status, json) = response_json(
@@ -4805,6 +4809,133 @@ mod tests {
                 .collect();
             assert_eq!(compiled_out.len(), 1, "{json}");
             assert_eq!(compiled_out[0]["path"], "microsoft365.enabled");
+        }
+    }
+
+    /// A string that `str::parse` reads as infinity or NaN is refused for a
+    /// float field with the field named, the whole patch is refused (an
+    /// earlier op in it is not applied), and the stored values are unchanged
+    /// in memory and on disk. A finite string still stores. Covers a plain
+    /// float (`memory.vector_weight`) and an optional one
+    /// (`runtime.docker.cpu_limit`).
+    #[tokio::test]
+    async fn patch_refuses_non_finite_float_text_and_keeps_the_stored_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = temp_config(&tmp);
+        config.save().await.unwrap();
+        let config_path = config.config_path.clone();
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        let (vector_weight, keyword_weight, cpu_limit) = (
+            config.memory.vector_weight,
+            config.memory.keyword_weight,
+            config.runtime.docker.cpu_limit,
+        );
+        let state = test_state(config);
+        let patch = |ops: serde_json::Value| {
+            let state = state.clone();
+            async move {
+                response_json(
+                    handle_patch(State(state), None, HeaderMap::new(), axum::Json(ops)).await,
+                )
+                .await
+            }
+        };
+
+        for text in [
+            "inf", "+inf", "-inf", "Infinity", "infinity", "NaN", "nan", "1e999", "-1e999",
+        ] {
+            for (pointer, prop) in [
+                ("/memory/vector_weight", "memory.vector_weight"),
+                ("/runtime/docker/cpu_limit", "runtime.docker.cpu_limit"),
+            ] {
+                let (status, json) = patch(serde_json::json!([
+                    {"op": "replace", "path": "/memory/keyword_weight", "value": 0.5},
+                    {"op": "replace", "path": pointer, "value": text}
+                ]))
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{text} {prop}: {json}");
+                assert_eq!(json["code"], "value_type_mismatch", "{text} {prop}: {json}");
+                assert_eq!(json["path"], prop, "{text}: {json}");
+                assert_eq!(json["op_index"], 1, "{text} {prop}: {json}");
+                {
+                    let live = state.config.read();
+                    assert_eq!(
+                        live.memory.vector_weight.to_bits(),
+                        vector_weight.to_bits(),
+                        "{text} {prop}"
+                    );
+                    assert_eq!(
+                        live.memory.keyword_weight.to_bits(),
+                        keyword_weight.to_bits(),
+                        "{text} {prop}"
+                    );
+                    assert_eq!(live.runtime.docker.cpu_limit, cpu_limit, "{text} {prop}");
+                }
+                assert_eq!(
+                    std::fs::read_to_string(&config_path).unwrap(),
+                    saved,
+                    "{text} {prop}"
+                );
+            }
+        }
+
+        let (status, json) = patch(serde_json::json!([
+            {"op": "replace", "path": "/memory/vector_weight", "value": "0.6"},
+            {"op": "replace", "path": "/runtime/docker/cpu_limit", "value": "2.5"}
+        ]))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(state.config.read().memory.vector_weight, 0.6);
+        assert_eq!(state.config.read().runtime.docker.cpu_limit, Some(2.5));
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(written.contains("vector_weight = 0.6"), "{written}");
+        assert!(written.contains("cpu_limit = 2.5"), "{written}");
+    }
+
+    /// `energy_threshold` is an `f32`. `1e39` is finite as an `f64`, so it
+    /// passes coercion, but the field would store infinity. As a JSON string
+    /// or a JSON number it is refused with the same code as other text that
+    /// is not a usable number, and the stored value is kept.
+    #[tokio::test]
+    async fn patch_refuses_a_value_too_large_for_an_f32_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.channels.voice_wake.insert(
+            "test".to_string(),
+            zeroclaw_config::schema::VoiceWakeConfig::default(),
+        );
+        config.save().await.unwrap();
+        let before = config.channels.voice_wake["test"].energy_threshold;
+        let state = test_state(config);
+
+        for value in [serde_json::json!("1e39"), serde_json::json!(1e39)] {
+            let (status, json) = response_json(
+                handle_patch(
+                    State(state.clone()),
+                    None,
+                    HeaderMap::new(),
+                    axum::Json(serde_json::json!([{
+                        "op": "replace",
+                        "path": "/channels/voice_wake/test/energy_threshold",
+                        "value": value
+                    }])),
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{value}: {json}");
+            assert_eq!(json["code"], "value_type_mismatch", "{value}: {json}");
+            assert_eq!(
+                json["path"], "channels.voice_wake.test.energy_threshold",
+                "{value}: {json}"
+            );
+            assert_eq!(
+                state.config.read().channels.voice_wake["test"]
+                    .energy_threshold
+                    .to_bits(),
+                before.to_bits(),
+                "{value}"
+            );
         }
     }
 

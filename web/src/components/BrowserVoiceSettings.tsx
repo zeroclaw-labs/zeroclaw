@@ -75,9 +75,10 @@ export default function BrowserVoiceSettings() {
     return () => { active = false; };
   }, [prefs.language, currentDevice]);
   const update = async (patch: Partial<typeof prefs>) => {
-    const next = { ...prefs, ...patch };
-    setDraft(next); setSaving(true);
-    try { await saveVoicePreferences(next, selectedDeviceId); setError(''); }
+    setDraft({ ...prefs, ...patch }); setSaving(true);
+    // Send only the change. The gateway keeps every other saved field, so this
+    // screen's copy cannot revert a setting changed elsewhere since it loaded.
+    try { await saveVoicePreferences(patch, selectedDeviceId); setError(''); }
     catch { setError(t('voice.storage_error')); }
     finally { setDraft(null); setSaving(false); }
   };
