@@ -96,21 +96,36 @@ struct SettledFrame {
     save_failed: bool,
 }
 
+/// How the saved copy of a canvas compares with what the canvas shows, as
+/// one [`CanvasStore::sync_to_disk`] call saw both, so a report never mixes
+/// the state before a concurrent change with the outcome after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Synced {
+    /// The saved copy matches, or the store keeps nothing across restarts.
+    Matches,
+    /// The canvas shows content that could not be saved.
+    NotSaved,
+    /// The canvas shows nothing, but the saved copy of what it showed before
+    /// could not be removed.
+    NotRemoved,
+}
+
 /// What a successful [`CanvasStore::render`] did.
 #[derive(Debug, Clone)]
 pub struct Rendered {
     /// The frame pushed to the canvas.
     pub frame: CanvasFrame,
-    /// The canvas shows content that a persistent store could not save, so
-    /// it will not come back after a restart. Always `false` for an
-    /// in-memory store, which promises nothing across restarts.
+    /// A persistent store's saved copy does not match what the canvas
+    /// shows, so a restart may not bring back what it shows now. Always
+    /// `false` for an in-memory store, which promises nothing across
+    /// restarts.
     pub save_failed: bool,
-    /// The canvas shows nothing: it was cleared and this frame is an `eval`
-    /// request, which is not content. A `save_failed` then means the cleared
-    /// content's saved copy could not be removed, so it may come back after a
-    /// restart. Always `false` for an in-memory store, which does not track
-    /// what is shown.
-    pub shows_nothing: bool,
+    /// Set with `save_failed` when the canvas shows nothing (it was cleared
+    /// and this frame is an `eval` request, which is not content) and the
+    /// cleared content's saved copy could not be removed, so that content
+    /// may come back after a restart. Decided in the same step as
+    /// `save_failed`, so the two always describe one state.
+    pub cleared_copy_remains: bool,
 }
 
 /// What [`CanvasStore::clear`] did.
@@ -303,12 +318,12 @@ impl CanvasStore {
     /// a frame that could not be saved, remove the file so a restart never
     /// brings back content that was replaced.
     ///
-    /// Returns whether the saved copy failed to match what the canvas shows,
-    /// so the caller can tell whoever asked for the change. A frame settled
-    /// earlier reports the outcome recorded when it was settled.
-    fn sync_to_disk(&self, canvas_id: &str) -> bool {
+    /// Returns how the saved copy compares with what the canvas showed when
+    /// this ran, so the caller can tell whoever asked for the change. A frame
+    /// settled earlier reports the outcome recorded when it was settled.
+    fn sync_to_disk(&self, canvas_id: &str) -> Synced {
         let Some(persistence) = &self.persistence else {
-            return false;
+            return Synced::Matches;
         };
         let mut settled = persistence.settled.lock();
         let unsettled = {
@@ -318,11 +333,22 @@ impl CanvasStore {
                 .and_then(|entry| entry.displayed.as_ref())
             {
                 Some(frame) => match settled.get(canvas_id) {
-                    Some(known) if known.frame_id == frame.frame_id => return known.save_failed,
+                    Some(known) if known.frame_id == frame.frame_id => {
+                        return if known.save_failed {
+                            Synced::NotSaved
+                        } else {
+                            Synced::Matches
+                        };
+                    }
                     _ => Some(frame.clone()),
                 },
                 None => None,
             }
+        };
+        let failure = if unsettled.is_some() {
+            Synced::NotSaved
+        } else {
+            Synced::NotRemoved
         };
         let outcome = match unsettled {
             Some(frame) => {
@@ -348,7 +374,7 @@ impl CanvasStore {
             }
         };
         match outcome {
-            Ok(()) => false,
+            Ok(()) => Synced::Matches,
             Err(error) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -357,7 +383,7 @@ impl CanvasStore {
                         .with_attrs(::serde_json::json!({"error": error})),
                     "canvas: could not update the saved frame; this canvas will not survive a restart"
                 );
-                true
+                failure
             }
         }
     }
@@ -392,7 +418,6 @@ impl CanvasStore {
         if self.persistence.is_some() && content_type != "eval" {
             entry.displayed = Some(frame.clone());
         }
-        let shows_nothing = self.persistence.is_some() && entry.displayed.is_none();
         entry.history.push(frame.clone());
         if entry.history.len() > MAX_HISTORY_FRAMES {
             let excess = entry.history.len() - MAX_HISTORY_FRAMES;
@@ -403,12 +428,12 @@ impl CanvasStore {
         let _ = entry.tx.send(frame.clone());
 
         drop(store);
-        let save_failed = self.sync_to_disk(canvas_id);
+        let synced = self.sync_to_disk(canvas_id);
 
         Some(Rendered {
             frame,
-            save_failed,
-            shows_nothing,
+            save_failed: synced != Synced::Matches,
+            cleared_copy_remains: synced == Synced::NotRemoved,
         })
     }
 
@@ -455,7 +480,10 @@ impl CanvasStore {
             }
             unwatched.is_some()
         };
-        let save_failed = existed && self.sync_to_disk(canvas_id);
+        // Only a copy left behind is this clear's failure. If a render
+        // replaced the cleared canvas before the sync ran, that render
+        // reports whether its own content was saved.
+        let save_failed = existed && self.sync_to_disk(canvas_id) == Synced::NotRemoved;
         Cleared {
             existed,
             save_failed,
@@ -693,7 +721,7 @@ impl Tool for CanvasTool {
                     Some(Rendered {
                         frame,
                         save_failed,
-                        shows_nothing,
+                        cleared_copy_remains,
                     }) => {
                         let mut output = format!(
                             "Eval request sent to canvas '{}' (frame: {}). \
@@ -701,7 +729,7 @@ impl Tool for CanvasTool {
                             canvas_id, frame.frame_id
                         );
                         if save_failed {
-                            let key = if shows_nothing {
+                            let key = if cleared_copy_remains {
                                 "tool-canvas-clear-not-saved"
                             } else {
                                 "tool-canvas-render-not-saved"
@@ -1296,7 +1324,7 @@ mod tests {
         );
         let eval = store.render("report", "eval", "document.title").unwrap();
         assert!(
-            eval.save_failed && !eval.shows_nothing,
+            eval.save_failed && !eval.cleared_copy_remains,
             "an eval reports that what the canvas shows is still unsaved"
         );
 
@@ -1326,7 +1354,15 @@ mod tests {
         assert!(store.snapshot("report").is_none());
 
         let eval = store.render("report", "eval", "document.title").unwrap();
-        assert!(eval.save_failed && eval.shows_nothing);
+        assert!(eval.save_failed && eval.cleared_copy_remains);
+
+        let rendered = store.render("report", "html", "<p>v2</p>").unwrap();
+        assert!(
+            rendered.save_failed && !rendered.cleared_copy_remains,
+            "content shown again is reported as unsaved, not as a leftover copy"
+        );
+        let eval = store.render("report", "eval", "document.title").unwrap();
+        assert!(eval.save_failed && !eval.cleared_copy_remains);
     }
 
     #[test]
