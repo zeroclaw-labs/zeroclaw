@@ -1264,6 +1264,23 @@ cli-auth-refresh-ok = ✓ Token refresh OK (profile {$profile})
 cli-auth-removed = Removed auth profile {$provider}:{$profile}
 cli-auth-not-found = Auth profile not found: {$provider}:{$profile}
 cli-auth-xai-imported = Imported xAI auth profile from {$path}
+cli-auth-gemini-personal-account-warning =
+    ================================================================================
+    WARNING: PERSONAL GOOGLE ACCOUNTS DO NOT WORK WITH THIS LOGIN
+    ================================================================================
+    Google stopped serving Gemini Code Assist to Google AI free, Pro, and Ultra
+    accounts on June 18, 2026, and suspends accounts that use a consumer Google
+    login from third-party tools such as ZeroClaw. Do not sign in with a personal
+    Google account here.
+
+    Continue only with your own Google Cloud OAuth client and an account licensed
+    for Gemini Code Assist Standard or Enterprise.
+
+    For everything else, use one of:
+      - providers.models.gemini.<alias> with an API key
+      - providers.models.antigravity_cli.<alias> with a Gemini API key, Agent
+        Platform, or Gemini Enterprise
+    ================================================================================
 cli-auth-xai-device-code-started = xAI device-code login started.
 cli-auth-oauth-visit = Visit: {$uri}
 cli-auth-oauth-code = Code:  {$code}
