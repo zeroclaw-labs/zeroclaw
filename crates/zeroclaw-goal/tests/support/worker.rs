@@ -14,6 +14,7 @@ use zeroclaw_goal::{
 };
 
 struct Script {
+    lease_entered: Semaphore,
     entered: Semaphore,
     release: Semaphore,
     published: AtomicUsize,
@@ -26,6 +27,7 @@ struct Script {
 impl Default for Script {
     fn default() -> Self {
         Self {
+            lease_entered: Semaphore::new(0),
             entered: Semaphore::new(0),
             release: Semaphore::new(0),
             published: AtomicUsize::new(0),
@@ -110,6 +112,7 @@ impl GoalSessionDriver for WorkerDriver {
         _scope: &GoalExecutionScope,
         checkpoint: &GoalParentTurnCheckpoint,
     ) -> Result<Box<dyn GoalSessionExecutionLease>> {
+        self.script.lease_entered.add_permits(1);
         let guard = tokio::select! {
             biased;
             () = checkpoint.wait_closed() => bail!("script execution admission closed"),
@@ -171,11 +174,14 @@ impl GoalSessionExecutionLease for WorkerLease {
     }
 }
 
-async fn running_worker() -> (
+async fn launched_worker(
+    hold_lease: bool,
+) -> (
     Arc<WorkerDriver>,
     GoalIngressContext,
     Arc<Registry>,
     Arc<GoalExecutionSupervisor>,
+    Option<OwnedMutexGuard<()>>,
 ) {
     let config = goal_config();
     let live = LiveConfig::new(config.clone());
@@ -202,16 +208,88 @@ async fn running_worker() -> (
         )
         .await
         .unwrap();
+    let held = if hold_lease {
+        Some(driver.ordinary.boundary.clone().lock_owned().await)
+    } else {
+        None
+    };
     supervisor
         .launch_after_response(&settings_source, &mut submission)
         .await
         .unwrap();
+    (driver, ingress, registry, supervisor, held)
+}
+
+async fn running_worker() -> (
+    Arc<WorkerDriver>,
+    GoalIngressContext,
+    Arc<Registry>,
+    Arc<GoalExecutionSupervisor>,
+) {
+    let (driver, ingress, registry, supervisor, _) = launched_worker(false).await;
     tokio::time::timeout(Duration::from_secs(1), driver.script.entered.acquire())
         .await
         .expect("actual parent operation must have started")
         .unwrap()
         .forget();
     (driver, ingress, registry, supervisor)
+}
+
+#[tokio::test]
+async fn restart_pause_write_failure_withdraws_the_lease_wait_without_failing_the_goal() {
+    let (driver, _, registry, supervisor, held) = launched_worker(true).await;
+    let _held = held.expect("ordinary work still owns the foreground lease");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        driver.script.lease_entered.acquire(),
+    )
+    .await
+    .expect("worker must be waiting to acquire execution")
+    .unwrap()
+    .forget();
+    registry.0.lock().unwrap().restart_pause_write_failure = Some(Arc::new(Semaphore::new(0)));
+
+    let error = tokio::time::timeout(Duration::from_secs(1), supervisor.pause_for_restart())
+        .await
+        .expect("restart must not wait for ordinary foreground work")
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), "fixture restart pause write failed");
+    assert_eq!(driver.script.entered.available_permits(), 0);
+    assert_eq!(driver.script.published.load(Ordering::SeqCst), 0);
+    assert_eq!(driver.script.verified.load(Ordering::SeqCst), 0);
+    assert!(retire_without_waiting(&supervisor).await);
+    let state = registry.0.lock().unwrap();
+    assert_eq!(state.task.as_ref().unwrap().status, TaskStatus::Running);
+    assert_eq!(state.transitions, ["start"]);
+}
+
+#[tokio::test]
+async fn restart_pause_write_failure_fences_the_worker_and_preserves_the_error() {
+    let (driver, _, registry, supervisor) = running_worker().await;
+    let failed = Arc::new(Semaphore::new(0));
+    registry.0.lock().unwrap().restart_pause_write_failure = Some(Arc::clone(&failed));
+
+    let (restart, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(supervisor.pause_for_restart(), async {
+            failed.acquire().await.unwrap().forget();
+            assert_eq!(driver.script.published.load(Ordering::SeqCst), 0);
+            driver.script.release.add_permits(1);
+        })
+    })
+    .await
+    .expect("restart must drain the admitted operation without admitting another");
+
+    assert_eq!(
+        restart.unwrap_err().to_string(),
+        "fixture restart pause write failed"
+    );
+    assert_eq!(driver.script.published.load(Ordering::SeqCst), 1);
+    assert_eq!(driver.script.verified.load(Ordering::SeqCst), 0);
+    assert!(retire_without_waiting(&supervisor).await);
+    let state = registry.0.lock().unwrap();
+    assert_eq!(state.task.as_ref().unwrap().status, TaskStatus::Running);
+    assert_eq!(state.transitions, ["start"]);
 }
 
 #[tokio::test]

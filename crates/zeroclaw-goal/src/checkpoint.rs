@@ -185,6 +185,10 @@ impl GoalParentTurnCheckpoint {
         self.inner.generation
     }
 
+    pub(crate) fn is_closed(&self) -> bool {
+        self.inner.lock_state().closed
+    }
+
     /// Wait until this execution epoch can no longer admit work.
     ///
     /// Session adapters use this only while waiting to acquire the ordinary
@@ -196,7 +200,7 @@ impl GoalParentTurnCheckpoint {
             let notified = self.inner.closed_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.inner.lock_state().closed {
+            if self.is_closed() {
                 return;
             }
             notified.await;

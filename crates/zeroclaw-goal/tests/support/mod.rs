@@ -27,6 +27,7 @@ pub struct RegistryState {
     pub reject_claim: bool,
     pub fail_record: bool,
     pub fail_settlement: bool,
+    pub restart_pause_write_failure: Option<Arc<tokio::sync::Semaphore>>,
     pub settlement_wait: Option<Arc<tokio::sync::Semaphore>>,
     pub settlement_entered: Option<Arc<tokio::sync::Semaphore>>,
     pub transitions: Vec<&'static str>,
@@ -255,6 +256,12 @@ impl GoalTaskRegistry for Registry {
         epoch: i64,
         pause: GoalPauseState,
     ) -> Result<GoalTransitionResult> {
+        if pause.reason == zeroclaw_goal::GoalPauseReason::DaemonRestart
+            && let Some(failed) = &self.0.lock().unwrap().restart_pause_write_failure
+        {
+            failed.add_permits(1);
+            bail!("fixture restart pause write failed");
+        }
         Ok(self.guarded(id, session, epoch, |state| {
             let task = state.task.as_mut().unwrap();
             assert_eq!(task.status, TaskStatus::Running);

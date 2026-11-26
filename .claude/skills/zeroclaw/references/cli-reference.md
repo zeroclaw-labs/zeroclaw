@@ -187,20 +187,9 @@ zeroclaw channel doctor      # Check channel health
 
 ## Security & Emergency Stop
 
-```bash
-zeroclaw estop --level kill-all                              # Stop everything
-zeroclaw estop --level network-kill                          # Block all network access
-zeroclaw estop --level domain-block --domain "*.example.com" # Block specific domains
-zeroclaw estop --level tool-freeze --tool shell              # Freeze specific tool
-zeroclaw estop status                                        # Check estop state
-zeroclaw estop resume --network                              # Resume (may require OTP)
-```
+**Emergency stop is not enforced.** No running agent, daemon, or tool reads the state file `zeroclaw estop` used to write, so it stops nothing. Every form of the command (including `status` and `resume`) refuses to run and changes no state. Do not use it to halt the agent. To halt the agent now, stop the ZeroClaw process itself.
 
-**Estop levels:**
-- `kill-all` — nuclear option, stops all agent activity
-- `network-kill` — blocks all outbound network
-- `domain-block` — blocks specific domain patterns
-- `tool-freeze` — freezes individual tools
+The command still accepts `--level kill-all|network-kill|domain-block|tool-freeze`, `--domain`, `--tool`, `resume --network|--domain|--tool`, and `resume --otp`, but each invocation ends with the not-enforced error.
 
 Autonomy lives on a risk profile and a runtime profile, both alias-keyed; the agent points at them via `[agents.<alias>] risk_profile = "..."` and `runtime_profile = "..."`:
 

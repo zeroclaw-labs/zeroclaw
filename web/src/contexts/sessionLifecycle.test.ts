@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import test, { beforeEach } from 'node:test';
+import test, { beforeEach, mock } from 'node:test';
 import React, { createElement } from 'react';
 import { Check } from 'lucide-react';
 import {
@@ -8,7 +8,12 @@ import {
   type ReactTestInstance,
   type ReactTestRenderer,
 } from 'react-test-renderer';
-import type { ApprovalDecision, SessionMessagesResponse, WsMessage } from '../types/api.ts';
+import type {
+  ApprovalDecision,
+  SessionMessagesResponse,
+  SessionStateResponse,
+  WsMessage,
+} from '../types/api.ts';
 import type {
   AgentContextValue,
   AgentSessionRuntime,
@@ -30,6 +35,8 @@ const storage = new MemoryStorage();
 const fakeWindow = {
   location: { protocol: 'http:', host: 'localhost' },
   dispatchEvent: () => true,
+  addEventListener: () => {},
+  removeEventListener: () => {},
 };
 // Document listeners are kept so a test can dispatch a key press to them.
 type DocumentListener = (event: { key?: string; defaultPrevented?: boolean; isComposing?: boolean }) => void;
@@ -94,6 +101,9 @@ const focusedNode = () => lastFocused;
 // not which element it ran on.
 const containedNodes = new Set<unknown>();
 
+// The `status` the abort route answers with; unset, it answers 404.
+let abortReply: string | null = null;
+
 // Every request URL, for tests that check what was (not) asked of the gateway.
 const requestedUrls: string[] = [];
 
@@ -114,6 +124,9 @@ globalThis.fetch = async (input, init) => {
     body = { path: request.path, value: request.value };
   } else if (url.includes('/api/config/prop')) body = { path: '', value: '<unset>' };
   else if (url.includes('/api/config/list')) body = { entries: configListEntries };
+  else if (/\/api\/sessions\/[^/]+\/abort$/.test(url) && init?.method === 'POST' && abortReply) {
+    body = { status: abortReply };
+  }
   else if (url.endsWith('/api/sessions')) {
     // `sessionsResponder` lets a test control when each listing resolves, so
     // out-of-order list responses can be reproduced deterministically.
@@ -138,7 +151,9 @@ globalThis.fetch = async (input, init) => {
   });
 };
 
-const { AgentProvider, useAgent } = await import('./AgentContext.tsx');
+const { AgentProvider, useAgent, DETACHED_TURN_POLL_MS, STATE_CHECK_TIMEOUT_MS } = await import(
+  './AgentContext.tsx'
+);
 const { deleteSession, HttpError, ApiError } = await import('../lib/api.ts');
 const { DraftContext } = await import('../hooks/useDraft.ts');
 const { AgentChatInner } = await import('../pages/AgentChat.tsx');
@@ -200,6 +215,7 @@ class FakeSocket implements SessionSocket {
 }
 
 type MessageFactory = () => Promise<SessionMessagesResponse>;
+type StateFactory = () => Promise<SessionStateResponse>;
 type DeleteFactory = () => Promise<{ deleted: boolean }>;
 
 class FakeSessionRuntime implements AgentSessionRuntime {
@@ -207,7 +223,9 @@ class FakeSessionRuntime implements AgentSessionRuntime {
   readonly deleteCalls: string[] = [];
   readonly renameCalls: Array<{ id: string; name: string }> = [];
   readonly messageCalls: string[] = [];
+  readonly stateCalls: Array<{ id: string; signal: AbortSignal | undefined }> = [];
   readonly messagePlans = new Map<string, MessageFactory[]>();
+  readonly statePlans = new Map<string, StateFactory[]>();
   readonly deletePlans = new Map<string, DeleteFactory[]>();
   readonly renameDeferred = new Map<string, Deferred<{ session_id: string; name: string }>>();
   mintedIds: string[] = [];
@@ -226,6 +244,13 @@ class FakeSessionRuntime implements AgentSessionRuntime {
     this.messageCalls.push(sessionId);
     const plan = this.messagePlans.get(sessionId)?.shift();
     return plan ? plan() : Promise.resolve(messagesResponse(sessionId, true));
+  }
+
+  // Unplanned, a conversation has no turn running.
+  getState(sessionId: string, signal?: AbortSignal): Promise<SessionStateResponse> {
+    this.stateCalls.push({ id: sessionId, signal });
+    const plan = this.statePlans.get(sessionId)?.shift();
+    return plan ? plan() : Promise.resolve(sessionState(sessionId, 'idle'));
   }
 
   delete(sessionId: string): Promise<{ deleted: boolean }> {
@@ -252,6 +277,18 @@ class FakeSessionRuntime implements AgentSessionRuntime {
     this.messagePlans.set(sessionId, plans);
   }
 
+  queueStates(sessionId: string, ...states: string[]): void {
+    const plans = this.statePlans.get(sessionId) ?? [];
+    for (const state of states) plans.push(() => Promise.resolve(sessionState(sessionId, state)));
+    this.statePlans.set(sessionId, plans);
+  }
+
+  queueStatePlan(sessionId: string, plan: StateFactory): void {
+    const plans = this.statePlans.get(sessionId) ?? [];
+    plans.push(plan);
+    this.statePlans.set(sessionId, plans);
+  }
+
   queueDelete(sessionId: string, plan: DeleteFactory): void {
     const plans = this.deletePlans.get(sessionId) ?? [];
     plans.push(plan);
@@ -269,6 +306,10 @@ function messagesResponse(
     session_persistence: sessionPersistence,
     messages: contents.map((content) => ({ role: 'user', content, created_at: null })),
   };
+}
+
+function sessionState(sessionId: string, state: string, turnId?: string): SessionStateResponse {
+  return turnId ? { session_id: sessionId, state, turn_id: turnId } : { session_id: sessionId, state };
 }
 
 interface MountedChat {
@@ -399,6 +440,7 @@ beforeEach(() => {
   delete fakeDocument.activeElement;
   containedNodes.clear();
   sessionsResponder = null;
+  abortReply = null;
   storage.setItem('zeroclaw_active_session.ops', 'A');
   listedSessions = [
     {
@@ -1232,6 +1274,747 @@ test('a socket closed while idle reconnects without reloading the transcript', a
   await unmount(mounted.renderer);
 });
 
+/** Lets promise chains finish without timers. The suite's `settle()` waits on
+ * a real `setTimeout`, which never fires while timers are mocked. */
+async function flushPromises(): Promise<void> {
+  await act(async () => {
+    for (let i = 0; i < 50; i += 1) await Promise.resolve();
+  });
+}
+
+/** One poll interval of a detached-turn watch, with timers mocked. */
+async function advancePoll(): Promise<void> {
+  await act(async () => { mock.timers.tick(DETACHED_TURN_POLL_MS); });
+  await flushPromises();
+}
+
+const answered = (...contents: string[]): SessionMessagesResponse => ({
+  session_id: 'A',
+  session_persistence: true,
+  messages: contents.map((content, i) => ({
+    role: i % 2 === 0 ? 'user' : 'assistant',
+    content,
+    created_at: null,
+  })),
+});
+
+const stateCallsFor = (runtime: FakeSessionRuntime, id: string) =>
+  runtime.stateCalls.filter((call) => call.id === id).length;
+
+test('a socket that reopens while its turn still runs shows the turn and loads the answer once it ends', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  await settle();
+  await act(async () => { mounted.context().sendMessage('hello'); });
+
+  // The socket drops mid-turn and the gateway keeps running the turn. It
+  // stores a turn only when the turn ends, so the reload on reopen has no
+  // answer yet, and the state route still reports the turn running.
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  runtime.queueStates('A', 'running', 'running', 'idle');
+  runtime.queueMessages('A', () => Promise.resolve(answered('hello', 'finished while away')));
+  await act(async () => { runtime.sockets[0]!.emitClose(1006); });
+  assert.equal(mounted.context().typing, false);
+
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const messageCallsBefore = runtime.messageCalls.length;
+    await openSocket(runtime, 0);
+    await flushPromises();
+    assert.equal(mounted.context().hydrated, true);
+    assert.equal(mounted.context().typing, true, 'the page shows the turn as running');
+    assert.equal(
+      mounted.context().messages.filter((m) => m.content === 'hello').length,
+      1,
+      'the prompt shows once while the turn runs',
+    );
+    assert.ok(!mounted.context().messages.some((m) => m.content === 'finished while away'));
+    assert.equal(runtime.messageCalls.length, messageCallsBefore + 1);
+
+    await advancePoll();
+    assert.equal(mounted.context().typing, true, 'still running');
+    assert.equal(runtime.messageCalls.length, messageCallsBefore + 1);
+
+    await advancePoll();
+    assert.equal(mounted.context().typing, false);
+    assert.equal(runtime.messageCalls.length, messageCallsBefore + 2);
+    assert.ok(
+      mounted.context().messages.some((m) => m.content === 'finished while away'),
+      'the answer appears without a page reload',
+    );
+    // The prompt shows once, and the page never sent it again: the gateway
+    // ran it once, so no tool action can repeat from this page.
+    assert.equal(
+      mounted.context().messages.filter((m) => m.content === 'hello').length,
+      1,
+    );
+    assert.deepEqual(runtime.sockets.flatMap((socket) => socket.sent), ['hello']);
+
+    // The watch ended with the turn.
+    const stateCalls = runtime.stateCalls.length;
+    await advancePoll();
+    await advancePoll();
+    assert.equal(runtime.stateCalls.length, stateCalls);
+    assert.equal(runtime.messageCalls.length, messageCallsBefore + 2);
+  } finally {
+    mock.timers.reset();
+  }
+  await unmount(mounted.renderer);
+});
+
+test('a page that loads while its turn runs shows the turn and loads the outcome once it ends', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(answered('earlier', 'reply')));
+  // A turn that ends in an error is stored too, before the state leaves `running`.
+  runtime.queueStates('A', 'running', 'error');
+  runtime.queueMessages('A', () => Promise.resolve(answered('earlier', 'reply', 'long task')));
+
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const mounted = await mountChat(runtime, true);
+    await flushPromises();
+    assert.equal(mounted.context().typing, true);
+    await openSocket(runtime, 0);
+    await flushPromises();
+    assert.equal(mounted.context().typing, true, 'a socket opening does not end the watch');
+    assert.equal(
+      textarea(mounted.renderer).props.disabled,
+      true,
+      'the chat page offers no composer into the running turn',
+    );
+
+    await advancePoll();
+    assert.equal(mounted.context().typing, false);
+    assert.equal(runtime.messageCalls.length, 2);
+    assert.ok(mounted.context().messages.some((m) => m.content === 'long task'));
+    await flushPromises();
+    assert.equal(textarea(mounted.renderer).props.disabled, false);
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('Stop aborts a detached turn the page is watching', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueStates('A', 'running', 'idle');
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const mounted = await mountChat(runtime);
+    await flushPromises();
+    assert.equal(mounted.context().typing, true);
+    await act(async () => { await mounted.context().abortSession(); });
+    assert.ok(requestedUrls.includes('POST /api/sessions/A/abort'));
+    await advancePoll();
+    assert.equal(mounted.context().typing, false);
+    assert.equal(runtime.messageCalls.length, 2, 'the stored outcome is loaded');
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+// A state write that fails leaves `running` stored for a turn the gateway no
+// longer runs. Its abort route says so, and Stop must not stay a no-op.
+for (const [label, reloadTurn, locksAgain] of [
+  ['the same stale turn', 'turn-1', false],
+  ['a new turn', 'turn-2', true],
+] as const) {
+  test(`Stop on a turn the gateway is not running ends the watch; a reload showing ${label} ${locksAgain ? 'locks again' : 'stays unlocked'}`, async () => {
+    const runtime = new FakeSessionRuntime();
+    abortReply = 'no_active_response';
+    // On load, the first poll, two polls after Stop, then the reload's check.
+    for (const turn of ['turn-1', 'turn-1', 'turn-1', 'turn-1', reloadTurn]) {
+      runtime.queueStatePlan('A', () => Promise.resolve(sessionState('A', 'running', turn)));
+    }
+    mock.timers.enable({ apis: ['setTimeout'] });
+    try {
+      const mounted = await mountChat(runtime, true);
+      await flushPromises();
+      assert.equal(mounted.context().typing, true);
+      await openSocket(runtime, 0);
+      await flushPromises();
+      await advancePoll();
+      assert.equal(mounted.context().typing, true, 'a stale running state keeps the watch on its own');
+      assert.equal(runtime.messageCalls.length, 1);
+
+      await act(async () => { await mounted.context().abortSession(); });
+      await flushPromises();
+      assert.ok(requestedUrls.includes('POST /api/sessions/A/abort'));
+      assert.equal(mounted.context().typing, true, 'one answer is not proof: the turn may just have ended');
+      assert.equal(runtime.messageCalls.length, 1);
+      await advancePoll();
+      await flushPromises();
+      assert.equal(mounted.context().typing, true, 'one check after the refusal is not enough');
+      await advancePoll();
+      await flushPromises();
+      assert.equal(runtime.messageCalls.length, 2, 'the second check ends the watch and reloads');
+      assert.equal(mounted.context().typing, locksAgain);
+      await flushPromises();
+      assert.equal(textarea(mounted.renderer).props.disabled, locksAgain);
+      if (!locksAgain) {
+        const checks = runtime.stateCalls.length;
+        await advancePoll();
+        assert.equal(runtime.stateCalls.length, checks, 'nothing is watched any more');
+      }
+      await unmount(mounted.renderer);
+    } finally {
+      mock.timers.reset();
+    }
+  });
+}
+
+test('Stop in the moment a turn ends, before its idle write, still loads the answer', async () => {
+  const runtime = new FakeSessionRuntime();
+  abortReply = 'no_active_response';
+  runtime.queueStatePlan('A', () => Promise.resolve(sessionState('A', 'running', 'turn-1')));
+  runtime.queueStatePlan('A', () => Promise.resolve(sessionState('A', 'idle')));
+  runtime.queueMessages('A', () => Promise.resolve(answered('earlier', 'reply')));
+  runtime.queueMessages('A', () => Promise.resolve(answered('earlier', 'reply', 'just finished')));
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const mounted = await mountChat(runtime);
+    await flushPromises();
+    await act(async () => { await mounted.context().abortSession(); });
+    await advancePoll();
+    await flushPromises();
+    assert.equal(mounted.context().typing, false);
+    assert.ok(mounted.context().messages.some((m) => m.content === 'just finished'));
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+/** Mounts a page watching a detached turn and presses Stop, which the gateway
+ * refuses with `no_active_response`. */
+async function refusedStop(runtime: FakeSessionRuntime): Promise<MountedChat> {
+  abortReply = 'no_active_response';
+  const mounted = await mountChat(runtime);
+  await flushPromises();
+  assert.equal(mounted.context().typing, true);
+  await act(async () => { await mounted.context().abortSession(); });
+  return mounted;
+}
+
+test('a state check already out when Stop is refused cannot confirm it', async () => {
+  const runtime = new FakeSessionRuntime();
+  const outCheck = new Deferred<SessionStateResponse>();
+  runtime.queueStatePlan('A', () => Promise.resolve(sessionState('A', 'running', 'turn-1')));
+  runtime.queueStatePlan('A', () => outCheck.promise);
+  for (const turn of ['turn-1', 'turn-1']) {
+    runtime.queueStatePlan('A', () => Promise.resolve(sessionState('A', 'running', turn)));
+  }
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    abortReply = 'no_active_response';
+    const mounted = await mountChat(runtime);
+    await flushPromises();
+    await advancePoll();
+    assert.equal(runtime.stateCalls.length, 2, 'a check is out');
+    await act(async () => { await mounted.context().abortSession(); });
+    await act(async () => { outCheck.resolve(sessionState('A', 'running', 'turn-1')); });
+    await flushPromises();
+    await advancePoll();
+    assert.equal(mounted.context().typing, true, 'only one check started after the refusal');
+    assert.equal(runtime.messageCalls.length, 1);
+    await advancePoll();
+    await flushPromises();
+    assert.equal(mounted.context().typing, false);
+    assert.equal(runtime.messageCalls.length, 2);
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('a refused Stop followed by another running turn keeps watching it', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueStatePlan('A', () => Promise.resolve(sessionState('A', 'running', 'turn-1')));
+  for (const turn of ['turn-2', 'turn-2', 'turn-2']) {
+    runtime.queueStatePlan('A', () => Promise.resolve(sessionState('A', 'running', turn)));
+  }
+  runtime.queueStates('A', 'idle');
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const mounted = await refusedStop(runtime);
+    for (let i = 0; i < 3; i += 1) await advancePoll();
+    assert.equal(mounted.context().typing, true, 'the new turn is not disowned');
+    assert.equal(runtime.messageCalls.length, 1);
+    await advancePoll();
+    await flushPromises();
+    assert.equal(mounted.context().typing, false);
+    assert.equal(runtime.messageCalls.length, 2, 'its end loads the answer');
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('a refused Stop on a turn without an id never disowns it', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueStates('A', 'running', 'running', 'running', 'running', 'idle');
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const mounted = await refusedStop(runtime);
+    for (let i = 0; i < 3; i += 1) await advancePoll();
+    assert.equal(mounted.context().typing, true);
+    await advancePoll();
+    await flushPromises();
+    assert.equal(mounted.context().typing, false);
+    assert.equal(runtime.messageCalls.length, 2);
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('a socket closing while the first state check is out still watches the running turn', async () => {
+  const runtime = new FakeSessionRuntime();
+  const firstCheck = new Deferred<SessionStateResponse>();
+  runtime.queueStatePlan('A', () => firstCheck.promise);
+  runtime.queueStates('A', 'idle');
+  runtime.queueMessages('A', () => Promise.resolve(answered('earlier', 'reply')));
+  runtime.queueMessages('A', () => Promise.resolve(answered('earlier', 'reply', 'done while away')));
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const mounted = await mountChat(runtime);
+    await openSocket(runtime, 0);
+    await act(async () => { runtime.sockets[0]!.emitClose(1006); });
+    await act(async () => { firstCheck.resolve(sessionState('A', 'running', 'turn-1')); });
+    await flushPromises();
+    assert.equal(mounted.context().typing, true, 'the turn is shown running');
+    await advancePoll();
+    await flushPromises();
+    assert.equal(mounted.context().typing, false);
+    assert.ok(mounted.context().messages.some((m) => m.content === 'done while away'));
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('Stop that the gateway accepts keeps watching until the turn leaves running', async () => {
+  const runtime = new FakeSessionRuntime();
+  abortReply = 'aborted';
+  runtime.queueStates('A', 'running', 'idle');
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const mounted = await mountChat(runtime);
+    await flushPromises();
+    await act(async () => { await mounted.context().abortSession(); });
+    assert.equal(mounted.context().typing, true, 'the turn is still stopping');
+    assert.equal(runtime.messageCalls.length, 1);
+    await advancePoll();
+    assert.equal(mounted.context().typing, false);
+    assert.equal(runtime.messageCalls.length, 2);
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('switching conversation stops watching a detached turn without aborting it', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueStates('A', 'running');
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const mounted = await mountChat(runtime);
+    await flushPromises();
+    assert.equal(mounted.context().typing, true);
+
+    assert.equal(await goToSession(mounted, 'B'), true);
+    await flushPromises();
+    assert.equal(mounted.context().typing, false);
+    assert.ok(
+      !requestedUrls.some((url) => url.includes('/abort')),
+      'the turn keeps running on the gateway',
+    );
+
+    const callsForA = stateCallsFor(runtime, 'A');
+    await advancePoll();
+    await advancePoll();
+    assert.equal(stateCallsFor(runtime, 'A'), callsForA, 'no more questions about A');
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('a socket closing during the watch stops it, and the reopen asks again', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueStates('A', 'running');
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const mounted = await mountChat(runtime);
+    await flushPromises();
+    await openSocket(runtime, 0);
+    await flushPromises();
+    assert.equal(mounted.context().typing, true);
+
+    await act(async () => { runtime.sockets[0]!.emitClose(4401); });
+    assert.equal(mounted.context().typing, false);
+    await advancePoll();
+    assert.equal(runtime.stateCalls.length, 1, 'no polling while the socket is closed');
+
+    await openSocket(runtime, 0);
+    await flushPromises();
+    assert.equal(runtime.messageCalls.length, 2);
+    assert.equal(runtime.stateCalls.length, 2, 'the reload asks again');
+    assert.equal(mounted.context().typing, false);
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('a state route that answers 404 keeps the single transcript load', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueStatePlan('A', () => Promise.reject(
+    new HttpError(404, '{"error":"Session persistence is disabled"}'),
+  ));
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const mounted = await mountChat(runtime);
+    await flushPromises();
+    assert.equal(mounted.context().typing, false);
+    await advancePoll();
+    await advancePoll();
+    assert.equal(runtime.stateCalls.length, 1);
+    assert.equal(runtime.messageCalls.length, 1);
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('a gateway that stores no transcripts keeps its single load', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', false)));
+  // Asked before the load reveals that nothing is stored: the route answers 404.
+  runtime.queueStatePlan('A', () => Promise.reject(
+    new HttpError(404, '{"error":"Session persistence is disabled"}'),
+  ));
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const mounted = await mountChat(runtime);
+    await flushPromises();
+    assert.equal(runtime.stateCalls.length, 1);
+    assert.equal(mounted.context().typing, false);
+    await advancePoll();
+    await advancePoll();
+    assert.equal(runtime.stateCalls.length, 1);
+    assert.equal(runtime.messageCalls.length, 1);
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('a turn that ends while the transcript loads still gets its answer loaded', async () => {
+  const runtime = new FakeSessionRuntime();
+  // The gateway as it orders things: the turn ends, and is stored, just after
+  // this snapshot is read. Asked before the read, the state route still says
+  // `running`; asked after it, it would already say `idle`.
+  let turnEnded = false;
+  runtime.queueMessages('A', () => {
+    turnEnded = true;
+    return Promise.resolve(answered('long task'));
+  });
+  runtime.queueStatePlan('A', () => Promise.resolve(sessionState('A', turnEnded ? 'idle' : 'running')));
+  runtime.queueMessages('A', () => Promise.resolve(answered('long task', 'stored answer')));
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const mounted = await mountChat(runtime);
+    await flushPromises();
+    assert.equal(mounted.context().typing, true);
+    assert.ok(!mounted.context().messages.some((m) => m.content === 'stored answer'));
+    await advancePoll();
+    assert.equal(mounted.context().typing, false);
+    assert.equal(runtime.messageCalls.length, 2);
+    assert.ok(
+      mounted.context().messages.some((m) => m.content === 'stored answer'),
+      'the answer stored between the two reads is loaded',
+    );
+    const stateCalls = runtime.stateCalls.length;
+    await advancePoll();
+    await advancePoll();
+    assert.equal(runtime.stateCalls.length, stateCalls, 'one extra load, no loop');
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+for (const [when, end] of [
+  ['clearing the conversation', (ctx: ReturnType<typeof useAgent>) => { ctx.clearAllMessages(); }],
+  ['a model switch', (ctx: ReturnType<typeof useAgent>) => { void ctx.switchModel('kilo.new-model'); }],
+] as const) {
+  test(`${when} while the first state check is out starts no watch`, async () => {
+    const runtime = new FakeSessionRuntime();
+    const lateCheck = new Deferred<SessionStateResponse>();
+    runtime.queueStatePlan('A', () => lateCheck.promise);
+    mock.timers.enable({ apis: ['setTimeout'] });
+    try {
+      const mounted = await mountChat(runtime);
+      await openSocket(runtime, 0);
+      await flushPromises();
+      assert.equal(runtime.stateCalls.length, 1, 'the first check is out');
+      await act(async () => { end(mounted.context()); });
+      await flushPromises();
+      assert.equal(runtime.stateCalls[0]!.signal?.aborted, true, 'the check is cancelled');
+      await act(async () => { lateCheck.resolve(sessionState('A', 'running')); });
+      await flushPromises();
+      assert.equal(mounted.context().typing, false, 'a late `running` is ignored');
+      await advancePoll();
+      await advancePoll();
+      assert.equal(runtime.stateCalls.length, 1, 'no polling after it');
+      await unmount(mounted.renderer);
+    } finally {
+      mock.timers.reset();
+    }
+  });
+}
+
+test('clearing the conversation while its transcript loads starts no watch', async () => {
+  const runtime = new FakeSessionRuntime();
+  const lateLoad = new Deferred<SessionMessagesResponse>();
+  runtime.queueStates('A', 'running');
+  runtime.queueMessages('A', () => lateLoad.promise);
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const mounted = await mountChat(runtime);
+    await flushPromises();
+    assert.equal(runtime.stateCalls.length, 1);
+    assert.equal(runtime.messageCalls.length, 1, 'the check said running; the load is out');
+    await act(async () => { mounted.context().clearAllMessages(); });
+    await act(async () => { lateLoad.resolve(answered('earlier', 'reply')); });
+    await flushPromises();
+    assert.equal(mounted.context().typing, false);
+    await advancePoll();
+    await advancePoll();
+    assert.equal(runtime.stateCalls.length, 1, 'no watch after the clear');
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('a failed state check during the watch ends it with one reload', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueStates('A', 'running');
+  runtime.queueStatePlan('A', () => Promise.reject(new Error('network')));
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const mounted = await mountChat(runtime);
+    await flushPromises();
+    assert.equal(mounted.context().typing, true);
+    await advancePoll();
+    assert.equal(mounted.context().typing, false);
+    assert.equal(runtime.messageCalls.length, 2);
+    const stateCalls = runtime.stateCalls.length;
+    await advancePoll();
+    await advancePoll();
+    assert.equal(runtime.stateCalls.length, stateCalls, 'it does not retry in a loop');
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('clearing the conversation stops watching its detached turn', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueStates('A', 'running');
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const mounted = await mountChat(runtime);
+    await flushPromises();
+    assert.equal(mounted.context().typing, true);
+    await act(async () => { mounted.context().clearAllMessages(); });
+    await flushPromises();
+    assert.equal(mounted.context().typing, false);
+    await advancePoll();
+    await advancePoll();
+    assert.equal(runtime.stateCalls.length, 1);
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('a model switch stops watching a detached turn', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueStates('A', 'running');
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const mounted = await mountChat(runtime);
+    await openSocket(runtime, 0);
+    await flushPromises();
+    assert.equal(mounted.context().typing, true);
+    await act(async () => { await mounted.context().switchModel('kilo.new-model'); });
+    await flushPromises();
+    assert.equal(mounted.context().typing, false);
+    await advancePoll();
+    await advancePoll();
+    assert.equal(runtime.stateCalls.length, 1);
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('a socket closing while a state check is out ends the watch without a reload', async () => {
+  const runtime = new FakeSessionRuntime();
+  const lateCheck = new Deferred<SessionStateResponse>();
+  runtime.queueStates('A', 'running');
+  runtime.queueStatePlan('A', () => lateCheck.promise);
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const mounted = await mountChat(runtime);
+    await openSocket(runtime, 0);
+    await flushPromises();
+    assert.equal(mounted.context().typing, true);
+    await advancePoll();
+    assert.equal(runtime.stateCalls.length, 2, 'a check is out');
+    await act(async () => { runtime.sockets[0]!.emitClose(1006); });
+    await act(async () => { lateCheck.resolve(sessionState('A', 'idle')); });
+    await flushPromises();
+    assert.equal(runtime.messageCalls.length, 1, 'the reopen reloads, not the stale check');
+    assert.equal(mounted.context().typing, false);
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('a state check that never answers lets hydration finish by its deadline', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueStatePlan('A', () => new Promise<SessionStateResponse>(() => {}));
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const mounted = await mountChat(runtime);
+    await flushPromises();
+    assert.equal(mounted.context().hydrated, false, 'the first check is still out');
+    await act(async () => { mock.timers.tick(STATE_CHECK_TIMEOUT_MS); });
+    await flushPromises();
+    assert.equal(runtime.stateCalls[0]!.signal?.aborted, true, 'the stuck request is cancelled');
+    assert.equal(mounted.context().hydrated, true);
+    assert.equal(mounted.context().typing, false);
+    await advancePoll();
+    await advancePoll();
+    assert.equal(runtime.stateCalls.length, 1, 'no watch starts');
+    assert.equal(runtime.messageCalls.length, 1, 'the single load stays');
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('a state check that never answers during the watch ends it with one reload', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueStates('A', 'running');
+  runtime.queueStatePlan('A', () => new Promise<SessionStateResponse>(() => {}));
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const mounted = await mountChat(runtime);
+    await flushPromises();
+    assert.equal(mounted.context().typing, true);
+    await advancePoll();
+    assert.equal(runtime.stateCalls.length, 2, 'a check is out');
+    assert.equal(mounted.context().typing, true);
+    await act(async () => { mock.timers.tick(STATE_CHECK_TIMEOUT_MS - DETACHED_TURN_POLL_MS); });
+    await flushPromises();
+    assert.equal(mounted.context().typing, true, 'not before its deadline');
+    await act(async () => { mock.timers.tick(DETACHED_TURN_POLL_MS); });
+    await flushPromises();
+    assert.equal(runtime.stateCalls[1]!.signal?.aborted, true, 'the stuck request is cancelled');
+    assert.equal(mounted.context().typing, false);
+    assert.equal(runtime.messageCalls.length, 2);
+    // The reload asks once more, as every load does, and hears `idle`.
+    const stateCalls = runtime.stateCalls.length;
+    await advancePoll();
+    await advancePoll();
+    assert.equal(runtime.stateCalls.length, stateCalls, 'it does not retry in a loop');
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('switching conversation cancels a state check that is out', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueStates('A', 'running');
+  runtime.queueStatePlan('A', () => new Promise<SessionStateResponse>(() => {}));
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const mounted = await mountChat(runtime);
+    await flushPromises();
+    await advancePoll();
+    assert.equal(runtime.stateCalls.length, 2, 'a check is out');
+    assert.equal(await goToSession(mounted, 'B'), true);
+    await flushPromises();
+    assert.equal(runtime.stateCalls[1]!.signal?.aborted, true);
+    assert.equal(mounted.context().typing, false);
+    assert.ok(!requestedUrls.some((url) => url.includes('/abort')));
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('unmounting the page cancels the watch', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueStates('A', 'running');
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    const mounted = await mountChat(runtime);
+    await flushPromises();
+    assert.equal(mounted.context().typing, true);
+    await unmount(mounted.renderer);
+    await advancePoll();
+    assert.equal(runtime.stateCalls.length, 1);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
+test('a turn streaming on the page\'s own socket is not watched', async () => {
+  const runtime = new FakeSessionRuntime();
+  const firstLoad = new Deferred<SessionMessagesResponse>();
+  runtime.queueMessages('A', () => firstLoad.promise);
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  // The first load asks before its live turn starts; the retry asks during
+  // it, and the state route reports the page's own turn as running.
+  runtime.queueStates('A', 'idle', 'running');
+  const mounted = await mountChat(runtime);
+  await openSocket(runtime, 0);
+  // The socket opens the conversation while the first load is still out, so
+  // that load's failure triggers a second one, during the live turn below.
+  await act(async () => { runtime.sockets[0]!.emitMessage(sessionStart(0)); });
+  await act(async () => { mounted.context().sendMessage('live'); });
+  assert.equal(mounted.context().typing, true);
+
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    await act(async () => { firstLoad.reject(new Error('offline')); });
+    await flushPromises();
+    assert.equal(runtime.messageCalls.length, 2);
+    assert.equal(runtime.stateCalls.length, 2);
+    await act(async () => {
+      runtime.sockets[0]!.emitMessage({ type: 'done', full_response: 'live answer' } as WsMessage);
+    });
+    assert.equal(mounted.context().typing, false);
+    await advancePoll();
+    await advancePoll();
+    assert.equal(runtime.stateCalls.length, 2, 'the live turn needs no watch');
+    assert.equal(runtime.messageCalls.length, 2, 'and no reload after it');
+    await unmount(mounted.renderer);
+  } finally {
+    mock.timers.reset();
+  }
+});
+
 test('F5 while a detached turn is still running keeps the prompt the browser already showed', async () => {
   // First page load: conversation A is empty on the server.
   const runtime1 = new FakeSessionRuntime();
@@ -1637,6 +2420,178 @@ test('an idle reload that ended the conversation drops the old transcript on rec
     assertStartedOver(mounted);
     await unmount(mounted.renderer);
   }
+});
+
+const startedOverNotices = (mounted: MountedChat) =>
+  mounted.context().messages.filter((m) => m.notice && m.content.includes('started over'));
+
+for (const [label, beforeReload] of [
+  ['while the reload asks for the turn state', false],
+  ['before the reload starts', true],
+] as const) {
+  test(`a reopen during a first turn whose session_start arrives ${label} shows the turn, not a started-over notice`, async () => {
+    const runtime = new FakeSessionRuntime();
+    const mounted = await mountChat(runtime);
+    await startSocket(runtime, 0);
+    await act(async () => { mounted.context().sendMessage('hello'); });
+
+    // The gateway stores a turn only when it ends, so during a conversation's
+    // first turn it reports no stored messages, yet the turn is running.
+    const check = new Deferred<SessionStateResponse>();
+    runtime.queueStatePlan('A', () => check.promise);
+    runtime.queueStates('A', 'idle');
+    runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+    runtime.queueMessages('A', () => Promise.resolve(answered('hello', 'the answer')));
+    await act(async () => { runtime.sockets[0]!.emitClose(1006); });
+
+    mock.timers.enable({ apis: ['setTimeout'] });
+    try {
+      if (beforeReload) {
+        // The frame arrives before the reload the reopen asked for has begun.
+        await act(async () => {
+          runtime.sockets[0]!.emitOpen();
+          runtime.sockets[0]!.emitMessage(sessionStart(0));
+        });
+      } else {
+        await openSocket(runtime, 0);
+        await act(async () => { runtime.sockets[0]!.emitMessage(sessionStart(0)); });
+      }
+      assert.equal(startedOverNotices(mounted).length, 0, 'no notice before the state check answers');
+
+      await act(async () => { check.resolve(sessionState('A', 'running', 'turn-1')); });
+      await flushPromises();
+      assert.equal(startedOverNotices(mounted).length, 0);
+      assert.equal(mounted.context().typing, true, 'the page shows the turn as running');
+      assert.equal(
+        mounted.context().messages.filter((m) => m.content === 'hello').length,
+        1,
+        'the prompt stays while the turn runs',
+      );
+
+      await advancePoll();
+      assert.equal(mounted.context().typing, false);
+      assert.ok(mounted.context().messages.some((m) => m.content === 'the answer'));
+      assert.equal(startedOverNotices(mounted).length, 0);
+    } finally {
+      mock.timers.reset();
+    }
+    await unmount(mounted.renderer);
+  });
+}
+
+test('a first turn that ends while the reopen asks for its state loads the answer without a notice', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountChat(runtime);
+  await startSocket(runtime, 0);
+  await act(async () => { mounted.context().sendMessage('hello'); });
+  const check = new Deferred<SessionStateResponse>();
+  runtime.queueStatePlan('A', () => check.promise);
+  // By the time the check answers, the turn has ended and the gateway has stored it.
+  runtime.queueMessages('A', () => Promise.resolve(answered('hello', 'the answer')));
+  await act(async () => { runtime.sockets[0]!.emitClose(1006); });
+
+  await openSocket(runtime, 0);
+  await act(async () => { runtime.sockets[0]!.emitMessage(sessionStart(0)); });
+  await act(async () => { check.resolve(sessionState('A', 'idle')); });
+  await flushPromises();
+  assert.equal(startedOverNotices(mounted).length, 0);
+  assert.ok(mounted.context().messages.some((m) => m.content === 'the answer'));
+  assert.equal(mounted.context().messages.filter((m) => m.content === 'hello').length, 1);
+  await unmount(mounted.renderer);
+});
+
+test('a reopen whose reload finds no running turn and nothing stored still shows the started-over notice', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountWithHistory(runtime);
+  await act(async () => { mounted.context().sendMessage('hello'); });
+  const check = new Deferred<SessionStateResponse>();
+  runtime.queueStatePlan('A', () => check.promise);
+  runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));
+  await act(async () => { runtime.sockets[0]!.emitClose(1006); });
+
+  await openSocket(runtime, 0);
+  await act(async () => { runtime.sockets[0]!.emitMessage(sessionStart(0)); });
+  assert.ok(
+    mounted.context().messages.some((m) => m.content === 'an earlier answer'),
+    'the transcript stays until the state check answers',
+  );
+
+  await act(async () => { check.resolve(sessionState('A', 'idle')); });
+  await flushPromises();
+  assertStartedOver(mounted);
+  assert.equal(mounted.context().typing, false);
+  await unmount(mounted.renderer);
+});
+
+test('a started-over notice deferred to a load that fails is not shown by a later reload', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountWithHistory(runtime);
+  await act(async () => { mounted.context().sendMessage('hello'); });
+  // The reopen's load fails; nothing retries it, since the socket's
+  // `session_start` arrived before that load began.
+  runtime.queueMessages('A', () => Promise.reject(new Error('network')));
+  await act(async () => { runtime.sockets[0]!.emitClose(1006); });
+  await act(async () => {
+    runtime.sockets[0]!.emitOpen();
+    runtime.sockets[0]!.emitMessage(sessionStart(0));
+  });
+  await flushPromises();
+  assert.equal(startedOverNotices(mounted).length, 0);
+  assert.ok(mounted.context().messages.some((m) => m.content === 'an earlier answer'));
+
+  // A later reopen whose socket reports nothing new: no notice from the old frame.
+  await act(async () => { mounted.context().sendMessage('again'); });
+  await act(async () => { runtime.sockets[0]!.emitClose(1006); });
+  await openSocket(runtime, 0);
+  await flushPromises();
+  assert.equal(startedOverNotices(mounted).length, 0);
+  await unmount(mounted.renderer);
+});
+
+test('a started-over notice deferred to a load that fails is decided by its retry', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountWithHistory(runtime);
+  const check = new Deferred<SessionStateResponse>();
+  await act(async () => { mounted.context().sendMessage('hello'); });
+  runtime.queueStatePlan('A', () => check.promise);
+  runtime.queueMessages('A', () => Promise.reject(new Error('network')));
+  await act(async () => { runtime.sockets[0]!.emitClose(1006); });
+
+  await openSocket(runtime, 0);
+  // Arrives while the reload's check is out, so the failed load retries.
+  await act(async () => { runtime.sockets[0]!.emitMessage(sessionStart(0)); });
+  await act(async () => { check.resolve(sessionState('A', 'idle')); });
+  await flushPromises();
+  // The retry finds no running turn and nothing stored: the gateway started over.
+  assert.deepEqual(runtime.messageCalls, ['A', 'A', 'A'], 'mount, reload, retry');
+  assertStartedOver(mounted);
+  await unmount(mounted.renderer);
+});
+
+test('a session_start reporting no messages after a failed load waits for the retry', async () => {
+  const runtime = new FakeSessionRuntime();
+  const mounted = await mountWithHistory(runtime);
+  await act(async () => { mounted.context().sendMessage('hello'); });
+  runtime.queueMessages('A', () => Promise.reject(new Error('network')));
+  await act(async () => { runtime.sockets[0]!.emitClose(1006); });
+  await openSocket(runtime, 0);
+  await flushPromises();
+  assert.ok(mounted.context().messages.some((m) => m.content === 'an earlier answer'));
+
+  // A first turn is running on the gateway: nothing is stored yet. The
+  // frame's retry asks for the turn state; until it answers, the transcript
+  // stays and no notice shows.
+  const retryCheck = new Deferred<SessionStateResponse>();
+  runtime.queueStatePlan('A', () => retryCheck.promise);
+  await act(async () => { runtime.sockets[0]!.emitMessage(sessionStart(0)); });
+  assert.equal(startedOverNotices(mounted).length, 0, 'no notice while the retry asks');
+  assert.ok(mounted.context().messages.some((m) => m.content === 'an earlier answer'));
+
+  await act(async () => { retryCheck.resolve(sessionState('A', 'running')); });
+  await flushPromises();
+  assert.equal(startedOverNotices(mounted).length, 0);
+  assert.equal(mounted.context().typing, true);
+  await unmount(mounted.renderer);
 });
 
 test('a reload in the middle of a turn that ended the conversation keeps only the notice', async () => {

@@ -868,11 +868,11 @@ impl GoalExecutionSupervisor {
     /// transports.
     pub async fn pause_for_restart(&self) -> Result<()> {
         let fence = self.fence_for_restart().await;
-        self.drain_restart_fence(fence.scopes).await?;
+        let drained = self.drain_restart_fence(fence.scopes).await;
         if let Some(error) = fence.error {
             return Err(error);
         }
-        Ok(())
+        drained
     }
 
     /// Fence every resident epoch without waiting for any worker. The restart
@@ -898,10 +898,12 @@ impl GoalExecutionSupervisor {
             ) {
                 Ok(scope) => scope,
                 Err(candidate) => {
+                    worker.checkpoint.close();
                     error.get_or_insert(candidate);
                     continue;
                 }
             };
+            let checkpoint = worker.checkpoint.clone();
             drop(worker);
             let current = match self
                 .engine
@@ -911,6 +913,7 @@ impl GoalExecutionSupervisor {
             {
                 Ok(current) => current,
                 Err(candidate) => {
+                    checkpoint.close();
                     error.get_or_insert(candidate);
                     scopes.push(scope);
                     continue;
@@ -918,6 +921,7 @@ impl GoalExecutionSupervisor {
             };
             if let Some(current) = current
                 && current.id == scope.task_id()
+                && current.execution_epoch == scope.execution_epoch()
                 && current.status == TaskStatus::Running
             {
                 match self
@@ -941,6 +945,9 @@ impl GoalExecutionSupervisor {
                         | GoalTransitionResult::Missing,
                     ) => {}
                     Err(candidate) => {
+                        // The durable row still permits work. Close admission
+                        // locally while the already-admitted operation settles.
+                        checkpoint.close();
                         error.get_or_insert(candidate);
                     }
                 }
@@ -1422,7 +1429,11 @@ impl GoalExecutionEngine {
         let mut lease = match acquired {
             Ok(lease) => lease,
             Err(error) => {
-                if self.exact_running_task_or_fenced(&scope).await?.is_none() {
+                // A restart can close local admission without committing its
+                // durable pause. Withdrawing the waiter isn't executor failure.
+                if checkpoint.is_closed()
+                    || self.exact_running_task_or_fenced(&scope).await?.is_none()
+                {
                     return Ok(GoalExecutionOutcome::Fenced);
                 }
                 return Err(error).context("acquire Goal session execution lease");
@@ -2649,17 +2660,18 @@ mod tests {
 
     #[test]
     fn verifier_protocol_bounds_payload_shape_and_size() {
-        let scalar_payload = serde_json::json!({
-            "decision": "blocked",
-            "reason": "choice required",
-            "blockers": [{
-                "kind": "needs_user_input",
-                "message": "Choose one option.",
-                "payload": "not structured context"
-            }]
-        })
-        .to_string();
-        assert!(parse_verifier_response(&scalar_payload).is_err());
+        for payload in [serde_json::json!("scalar"), serde_json::json!(["A", "B"])] {
+            let packet = serde_json::json!({
+                "decision": "blocked",
+                "reason": "choice required",
+                "blockers": [{
+                    "kind": "needs_user_input",
+                    "message": "Choose one option.",
+                    "payload": payload
+                }]
+            });
+            assert!(parse_verifier_response(&packet.to_string()).is_err());
+        }
 
         let oversized_payload = serde_json::json!({
             "decision": "blocked",
