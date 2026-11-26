@@ -85,13 +85,9 @@ For `scoped`, the Windows job passes explicit `-p` arguments to `cargo nextest`;
 
 ### Scheduled Platform Tests (`platform-tests.yml`)
 
-Runs `cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast` on `macos-15` and `windows-latest` after a cheap Linux formatting check. This nightly full-workspace run is the backstop for label-selected Windows coverage and inventories failures with `--no-fail-fast`. The matrix runs for:
+Runs `cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast` on `macos-15` and `windows-latest` after a cheap Linux formatting check. This full-workspace run is the backstop for label-selected Windows coverage. The matrix runs nightly at 03:17 UTC, on manual dispatch, and for pull requests that match the [workflow's path filters](https://github.com/zeroclaw-labs/zeroclaw/blob/master/.github/workflows/platform-tests.yml).
 
-- pull requests that change `platform-tests.yml` itself;
-- manual dispatches; and
-- the nightly 03:17 UTC schedule.
-
-The jobs use `continue-on-error` and do not feed `CI Required Gate`. They are portability evidence, not merge requirements. Ordinary code PRs do not launch this full matrix automatically; maintainers can manually dispatch it against a branch when full platform proof is useful. The workflow does not run for ordinary `push` or `merge_group` events. Nightly and manually dispatched runs on `master` can write trusted caches; pull-request runs cannot. `--no-fail-fast` keeps every platform failure visible in a single run.
+A macOS test failure makes the workflow fail. The Windows leg currently uses `continue-on-error` while a known test failure is open. Inspect its `Run tests` step to confirm the result. This workflow supplies portability evidence outside `CI Required Gate`. For pull requests outside the path filter, maintainers can dispatch the workflow against the branch when full platform proof is useful. Cache writes are reserved for runs on `master`.
 
 ### Desktop App Check (`desktop-check.yml`)
 
