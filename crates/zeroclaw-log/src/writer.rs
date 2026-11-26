@@ -25,7 +25,7 @@
 //! pending writes.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
@@ -321,6 +321,9 @@ fn worker_main(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
     let mut writes_since_sync: u64 = 0;
     let mut last_sync = Instant::now();
     let mut shutdown_ack = None;
+    // A previous writer, or a write that failed partway, may have left a
+    // record without its line terminator.
+    let mut check_tail = true;
 
     loop {
         let job = match rx.recv_timeout(IDLE_TICK) {
@@ -332,7 +335,8 @@ fn worker_main(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
         if let Some(job) = job {
             match job {
                 WriterJob::Write(value) => {
-                    if let Err(err) = write_one(&state, &value) {
+                    if let Err(err) = write_one(&state, &value, check_tail) {
+                        check_tail = true;
                         tracing::warn!(
                             target: "zeroclaw_log_internal",
                             error = ?err,
@@ -340,6 +344,7 @@ fn worker_main(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
                             "log: worker write failed"
                         );
                     } else {
+                        check_tail = false;
                         writes_since_sync += 1;
                     }
                 }
@@ -396,7 +401,7 @@ fn worker_main(rx: Receiver<WriterJob>, state: Arc<WorkerState>) {
 /// rotation hooks inline (so they can rename the file out from under
 /// the next write), and drops the handle on return. No `sync_data` —
 /// durability is the worker's periodic `sync_all`.
-fn write_one(state: &Arc<WorkerState>, value: &Value) -> Result<()> {
+fn write_one(state: &Arc<WorkerState>, value: &Value, check_tail: bool) -> Result<()> {
     // Date-boundary rotation runs *before* the append so a new day's
     // first event lands in a fresh file. Idempotent when no rotation
     // is needed.
@@ -416,8 +421,33 @@ fn write_one(state: &Arc<WorkerState>, value: &Value) -> Result<()> {
         }
     }
     let mut file = open_active_file(state)?;
+    // Read after the pre-append rotations so adding the separator cannot
+    // change the timestamp used to decide which day owns the old file.
+    let needs_separator = if check_tail && file.metadata()?.len() != 0 {
+        match has_unterminated_tail(&state.policy.path) {
+            Ok(needs_separator) => needs_separator,
+            Err(err) => {
+                tracing::warn!(
+                    target: "zeroclaw_log_internal",
+                    error = ?err,
+                    path = %state.policy.path.display(),
+                    "log: could not inspect the last row before append"
+                );
+                // Read access can be unavailable even when the writer can append.
+                // A separator still isolates the new event from any partial row.
+                true
+            }
+        }
+    } else {
+        false
+    };
     {
         let mut writer = BufWriter::new(&mut file);
+        if needs_separator {
+            writer
+                .write_all(b"\n")
+                .context("terminating the last log row before append")?;
+        }
         write_jsonl_line(&mut writer, value)?;
         writer.flush()?;
     }
@@ -446,10 +476,7 @@ fn sync_active_file(state: &Arc<WorkerState>) -> Result<()> {
     Ok(())
 }
 
-/// Open (or create) the active log file in append mode with the
-/// 0o600 Unix permission bit. Called once at worker startup and again
-/// after any operation that may have renamed the file out from under
-/// us (rotation, rolling trim).
+/// Open or create the active log file in append mode with Unix mode 0o600.
 fn open_active_file(state: &Arc<WorkerState>) -> Result<File> {
     if let Some(parent) = state.policy.path.parent() {
         fs::create_dir_all(parent)
@@ -471,6 +498,16 @@ fn open_active_file(state: &Arc<WorkerState>) -> Result<File> {
         let _ = fs::set_permissions(&state.policy.path, fs::Permissions::from_mode(0o600));
     }
     Ok(file)
+}
+
+fn has_unterminated_tail(path: &Path) -> Result<bool> {
+    let mut file = File::open(path).context("opening the active log to read its last byte")?;
+    file.seek(SeekFrom::End(-1))
+        .context("seeking to the last byte of the active log")?;
+    let mut last_byte = [0];
+    file.read_exact(&mut last_byte)
+        .context("reading the last byte of the active log")?;
+    Ok(last_byte != [b'\n'])
 }
 
 /// Public accessor for the canonical log file path. Used by the gateway's
@@ -1862,6 +1899,70 @@ mod tests {
                 .iter()
                 .any(|line| line["message"] == "first-event-after-migration")
         );
+    }
+
+    fn assert_first_append_keeps_unterminated_tail_separate(tail: &[u8]) {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = LogConfig {
+            log_persistence: "full".into(),
+            ..LogConfig::default()
+        };
+        let path = ResolvedPolicy::from_config(&cfg, tmp.path()).path;
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, tail).unwrap();
+
+        init_from_config(&cfg, tmp.path());
+        emit("first-event-after-restart");
+
+        let bytes = fs::read(&path).unwrap();
+        let separator = bytes
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .expect("the writer must delimit both records");
+        assert!(
+            &bytes[..separator] == tail,
+            "the original row must end before the newly appended JSON"
+        );
+        let event: LogEvent = serde_json::from_slice(&bytes[separator + 1..]).unwrap();
+        assert_eq!(event.message.as_deref(), Some("first-event-after-restart"));
+    }
+
+    #[test]
+    fn first_append_keeps_unterminated_current_row_separate() {
+        let event = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
+        assert_first_append_keeps_unterminated_tail_separate(&serde_json::to_vec(&event).unwrap());
+    }
+
+    #[test]
+    fn first_append_keeps_truncated_row_separate() {
+        assert_first_append_keeps_unterminated_tail_separate(br#"{"schema_version":2,"message":"#);
+    }
+
+    #[test]
+    fn daily_rotation_precedes_first_append_to_an_unterminated_log() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = LogConfig {
+            log_persistence: "rotating".into(),
+            log_persistence_rotate_daily: true,
+            ..LogConfig::default()
+        };
+        let path = ResolvedPolicy::from_config(&cfg, tmp.path()).path;
+        let event = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
+        let original = serde_json::to_vec(&event).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &original).unwrap();
+        set_mtime(&path, SystemTime::now() - Duration::from_secs(86_400));
+
+        init_from_config(&cfg, tmp.path());
+        emit("first-event-today");
+
+        let archives = list_archives(&path).unwrap();
+        assert_eq!(archives.len(), 1);
+        assert_eq!(fs::read(&archives[0].0).unwrap(), original);
+        let active: LogEvent = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(active.message.as_deref(), Some("first-event-today"));
     }
 
     // ── Rotation (StoragePolicy::Rotating) ───────────────────────
