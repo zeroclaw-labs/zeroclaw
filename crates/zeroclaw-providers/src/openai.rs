@@ -1370,12 +1370,8 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             messages.push(ChatMessage::system(sys));
         }
         messages.push(ChatMessage::user(message));
-        let (instructions, input) = build_responses_input(&messages);
-        let instructions = if instructions.is_empty() {
-            None
-        } else {
-            Some(instructions)
-        };
+        let (instructions, input) = build_responses_input(&messages, model);
+        let instructions = instructions.filter(|text| !text.is_empty());
         let req = self.build_request(instructions, input, None, model, temperature, false);
         let response = self
             .apply_opencode_session_header(
@@ -1419,12 +1415,8 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let credential = self.credential.as_ref().ok_or_else(|| {
             anyhow::Error::msg("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml.")
         })?;
-        let (instructions, input) = build_responses_input(request.messages);
-        let instructions = if instructions.is_empty() {
-            None
-        } else {
-            Some(instructions)
-        };
+        let (instructions, input) = build_responses_input(request.messages, model);
+        let instructions = instructions.filter(|text| !text.is_empty());
         let tools = convert_tools(request.tools);
         let tools_count = tools.as_ref().map_or(0, Vec::len);
         let mut req = self.build_request(instructions, input, tools, model, temperature, false);
@@ -1526,12 +1518,8 @@ impl ModelProvider for OpenAiResponsesModelProvider {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
         let handle = ::zeroclaw_spawn::spawn!(async move {
-            let (instructions, input) = build_responses_input(&messages_owned);
-            let instructions = if instructions.is_empty() {
-                None
-            } else {
-                Some(instructions)
-            };
+            let (instructions, input) = build_responses_input(&messages_owned, &model);
+            let instructions = instructions.filter(|text| !text.is_empty());
             let tools = convert_tools(tools_owned.as_deref());
             let tools_count = tools.as_ref().map_or(0, Vec::len);
             let has_tools = has_responses_tools(tools.as_deref());
@@ -2271,6 +2259,184 @@ mod tests {
         }
         assert_eq!(text.as_deref(), Some("fallback"));
         assert!(saw_final, "response.completed must emit Final");
+    }
+
+    async fn capture_responses_bodies(
+        stream: bool,
+    ) -> (
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        String,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::http::header;
+        use axum::response::IntoResponse;
+        use axum::{Json, Router, routing::post};
+        use std::sync::{Arc, Mutex};
+        let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&captured);
+        let app = Router::new().route(
+            "/responses",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.lock().unwrap().push(body);
+                    if stream {
+                        (
+                            [(header::CONTENT_TYPE, "text/event-stream")],
+                            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"output_text\":\"ok\"}}\n\n",
+                        )
+                            .into_response()
+                    } else {
+                        Json(serde_json::json!({"output_text": "ok", "output": []}))
+                            .into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (captured, format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn responses_api_key_requests_use_developer_prompt_for_gpt62_only() {
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let messages = vec![
+            ChatMessage::system("PROMPT-UNIQUE"),
+            ChatMessage::user("hi"),
+        ];
+        let tools = vec![ToolSpec::new(
+            "shell",
+            "run",
+            serde_json::json!({"type": "object"}),
+        )];
+
+        for stream in [false, true] {
+            let (captured, url, server) = capture_responses_bodies(stream).await;
+            let provider = OpenAiResponsesModelProvider::builder("test")
+                .api_url(&url)
+                .credential(Some("test-key"))
+                .build();
+            for model in ["gpt-6.2-sol", "us.openai.gpt-6.2-astra", "gpt-6.1"] {
+                let request = ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                };
+                if stream {
+                    let mut events =
+                        provider.stream_chat(request, model, None, StreamOptions::new(true));
+                    while let Some(event) = events.next().await {
+                        event.expect("stream event");
+                    }
+                } else {
+                    provider.chat(request, model, None).await.expect("chat");
+                }
+            }
+            server.abort();
+
+            let bodies = captured.lock().unwrap();
+            assert_eq!(bodies.len(), 3);
+            for body in &bodies[..2] {
+                assert!(
+                    body.get("instructions").is_none(),
+                    "stream={stream}: {body}"
+                );
+                let input = body["input"].as_array().unwrap();
+                assert_eq!(input[0]["type"], "message");
+                assert_eq!(input[0]["role"], "developer");
+                assert_eq!(input[0]["content"][0]["type"], "input_text");
+                assert_eq!(input[0]["content"][0]["text"], "PROMPT-UNIQUE");
+                assert_eq!(input[1]["role"], "user");
+                assert_eq!(body.to_string().matches("PROMPT-UNIQUE").count(), 1);
+                assert_eq!(body["tools"][0]["name"], "shell");
+            }
+            assert_eq!(bodies[1]["model"], "us.openai.gpt-6.2-astra");
+            let legacy = &bodies[2];
+            assert_eq!(legacy["instructions"], "PROMPT-UNIQUE");
+            assert_eq!(legacy["input"].as_array().unwrap().len(), 1);
+            assert_eq!(legacy["input"][0]["role"], "user");
+            assert_eq!(legacy["tools"][0]["name"], "shell");
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_api_key_empty_system_keeps_instructions_semantically_valid() {
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let (captured, url, server) = capture_responses_bodies(false).await;
+        let provider = OpenAiResponsesModelProvider::builder("test")
+            .api_url(&url)
+            .credential(Some("test-key"))
+            .build();
+        let messages = vec![ChatMessage::system(""), ChatMessage::user("hi")];
+        for model in ["gpt-6.2-sol", "gpt-6.1"] {
+            provider
+                .chat(
+                    ProviderChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    model,
+                    None,
+                )
+                .await
+                .expect("chat");
+        }
+        server.abort();
+        let bodies = captured.lock().unwrap();
+        for body in bodies.iter() {
+            assert!(body.get("instructions").is_none(), "{body}");
+        }
+        // No empty developer placeholder for GPT-6.2; only the user turn remains.
+        assert_eq!(bodies[0]["input"].as_array().unwrap().len(), 1);
+        assert_eq!(bodies[0]["input"][0]["role"], "user");
+    }
+
+    #[tokio::test]
+    async fn responses_api_key_missing_system_preserves_default_prompt() {
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let (captured, url, server) = capture_responses_bodies(false).await;
+        let provider = OpenAiResponsesModelProvider::builder("test")
+            .api_url(&url)
+            .credential(Some("test-key"))
+            .build();
+        let messages = [ChatMessage::user("hi")];
+        for model in ["gpt-6.2-sol", "gpt-6.1"] {
+            provider
+                .chat(
+                    ProviderChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    model,
+                    None,
+                )
+                .await
+                .expect("chat");
+        }
+        server.abort();
+
+        let bodies = captured.lock().unwrap();
+        let [modern, legacy] = bodies.as_slice() else {
+            panic!("expected two requests, got {}", bodies.len());
+        };
+        let fallback = "You are ZeroClaw, a concise and helpful coding assistant.";
+        let user = serde_json::json!({
+            "type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]
+        });
+        let developer = serde_json::json!({
+            "type": "message", "role": "developer",
+            "content": [{"type": "input_text", "text": fallback}]
+        });
+        assert!(modern.get("instructions").is_none(), "{modern}");
+        assert_eq!(modern["input"], serde_json::json!([developer, &user]));
+        assert_eq!(legacy["instructions"], fallback);
+        assert_eq!(legacy["input"], serde_json::json!([user]));
     }
 
     #[tokio::test]

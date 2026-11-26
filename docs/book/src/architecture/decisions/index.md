@@ -49,6 +49,6 @@ ADR-015 remains proposed until unified catalog projections preserve source-of-tr
 
 ADR-016 remains proposed until the holding-crate contract states the exception rule and carries an active-exception table, and at least one exception has been granted or refused through the process.
 
-ADR-017 remains proposed until canonical identity and grant resolution, native and peer-credential compatibility, RPC/WSS enforcement, OIDC and gateway integration, principal-owned session and private-memory storage, migration/recovery documentation, and internal-origin ownership rules meet the acceptance gates in the record.
+ADR-017 remains proposed until canonical identity and grant resolution, native and peer-credential compatibility, RPC/WSS enforcement, OIDC and gateway integration, daemon-held refresh for device sessions, verified Okta and Entra ID support, principal-owned session and private-memory storage, migration/recovery documentation, and internal-origin ownership rules meet the acceptance gates in the record.
 
 ADR-018 remains proposed until the runtime action pipeline, ingress/provenance envelope, internal-principal conversation binding, peer reply provenance, separated outcomes, durable audit path, and implementation ratchets meet the acceptance gates in the record.
