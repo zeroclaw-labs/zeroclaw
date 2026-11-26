@@ -24,12 +24,11 @@ export type SopDecisionSpec = NonNullable<Schemas['Sop']['decision']>;
 export type SopDecisionMode = 'auto' | 'supervised' | 'step_by_step';
 /// Execution modes a decision model may choose between.
 export const sopDecisionModes: readonly SopDecisionMode[] = ['auto', 'supervised', 'step_by_step'];
-/// A configured `[decision_models.<alias>]` entry, as listed by the gateway.
+/// A canonical decision model, as listed by the gateway.
 export interface DecisionModelOption {
   alias: string;
-  provider: 'jev' | 'laya' | 'custom';
+  provider: string;
   model: string;
-  base_url: string;
 }
 export type SopTrigger = Schemas['SopTrigger'];
 export type SopPriority = Schemas['SopPriority'];

@@ -23,6 +23,10 @@ pub enum SectionShape {
     /// flips a top-level field, then the schema form for the chosen
     /// backend/provider renders.
     BackendPicker,
+    /// Provider rate-sheet navigation. The section selects a provider family
+    /// and opens the canonical `cost.rates.providers.*` map; it never edits
+    /// the retired provider configuration maps.
+    CostRates,
 }
 
 /// Display group for a curated or schema-derived configuration section.
@@ -519,7 +523,13 @@ pub fn section_for_path(path: &str) -> Option<Section> {
 
 pub fn section_has_signal(cfg: &crate::schema::Config, section: Section) -> bool {
     match section {
-        Section::ModelProviders => !cfg.providers.models.is_empty(),
+        Section::ModelProviders => {
+            !cfg.providers.models.is_empty()
+                || cfg
+                    .providers
+                    .models
+                    .has_canonical_capability(zeroclaw_api::capability::Capability::Chat)
+        }
         Section::Channels => cfg.prop_fields().iter().any(|f| {
             f.name
                 .strip_prefix("channels.")
@@ -622,7 +632,8 @@ mod tests {
     fn alias_map_section_wire_keys_match_map_key_sections() {
         use crate::schema::Config;
         let sections = Config::map_key_sections();
-        let paths: std::collections::BTreeSet<&str> = sections.iter().map(|s| s.path).collect();
+        let paths: std::collections::BTreeSet<&str> =
+            sections.iter().map(|s| s.path.as_str()).collect();
         let alias_map_sections = [
             Section::PeerGroups,
             Section::DecisionModels,

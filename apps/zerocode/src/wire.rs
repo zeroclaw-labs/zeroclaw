@@ -350,6 +350,7 @@ pub enum SectionShape {
     OneTierAliasMap,
     TypedFamilyMap,
     BackendPicker,
+    CostRates,
 }
 
 // ── Filesystem RPC shapes ──────────────────────────────────────

@@ -5,10 +5,89 @@ use crate::schema::Config;
 use crate::schema::v1::V1Config;
 use crate::schema::v2::V2Config;
 
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod embedding_fixtures;
+mod model_routes;
+pub(crate) mod provider_inputs;
+
+/// Structural V5 input changes shared by explicit migration and dirty saves.
+/// Unrelated V3/V4 documents can retain their original TOML representation.
+pub(crate) fn document_needs_structural_migration(value: &toml::Value) -> bool {
+    model_routes::needs_migration(value) || provider_inputs::document_needs_migration(value)
+}
+
+/// Legacy input adapter for the canonical registry. Keep this conversion in
+/// config; downstream consumers only resolve exact model references.
+pub(crate) fn legacy_chat_definition(
+    raw: &serde_json::Value,
+    family: &str,
+    entry: Option<&crate::schema::ModelEntryConfig>,
+    model_override: Option<&str>,
+) -> anyhow::Result<(serde_json::Value, serde_json::Value)> {
+    model_routes::legacy_model(raw, family, entry, model_override)
+}
+
+/// Adapt existing provider test fixtures to canonical route model definitions.
+/// This is test-only fixture construction; current configuration never accepts
+/// route-owned model ids or credentials.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn bind_test_route_model(
+    config: &mut Config,
+    reference: &str,
+    model_id: &str,
+    api_key: Option<&str>,
+) {
+    use crate::provider_registry::{ModelRef, ProviderId};
+    let (mut connection, mut model) = if let Some(model) = config
+        .providers
+        .models
+        .canonical_model(&ModelRef::from(reference))
+    {
+        let connection = &config.providers.connections[model.provider()];
+        (
+            serde_json::to_value(connection).unwrap(),
+            serde_json::to_value(model).unwrap(),
+        )
+    } else if let Some(selection) = config.resolve_model_selection(reference) {
+        let profiles = serde_json::to_value(&config.providers.models).unwrap();
+        model_routes::legacy_model(
+            &profiles[selection.family][selection.alias],
+            selection.family,
+            selection.model_entry,
+            Some(model_id),
+        )
+        .unwrap()
+    } else {
+        (
+            serde_json::json!({"kind":"custom", "uri":"https://example.invalid/v1"}),
+            serde_json::json!({"capability":"chat", "provider":""}),
+        )
+    };
+    if let Some(api_key) = api_key {
+        connection["auth"] = serde_json::json!({"mode":"api_key", "api_key":api_key});
+    }
+    let connection_ref = format!("test.{reference}");
+    model["provider"] = connection_ref.clone().into();
+    if !model_id.trim().is_empty() {
+        model["model"] = model_id.into();
+    }
+    config.providers.connections.insert(
+        ProviderId::from(connection_ref),
+        serde_json::from_value(connection).unwrap(),
+    );
+    config.providers.models.insert_canonical_model(
+        ModelRef::from(reference),
+        serde_json::from_value(model).unwrap(),
+    );
+}
+
 /// The schema version this binary writes and expects on disk.
 ///
-/// V4 retires keys listed in [`RETIRED_KEYS`] (first: `[security.nevis]`).
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+/// V4 is the released layout; new registry shapes belong to V5.
+/// The V4 → V5 step is isolated from the frozen earlier migrations.
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+
+mod v4_to_v5;
 
 /// Something a migration changed or assumed about the operator's config.
 ///
@@ -103,6 +182,12 @@ pub struct RetiredKey {
     pub reason_id: &'static str,
 }
 
+const RETIRED_TEXT_TOOL_PARSING: &str = "text tool parsing is configured per chat model; use \
+    `options.extract_text_tool_calls = false` instead of `strict_tool_parsing = true`";
+
+const RETIRED_PROFILE_FALLBACK: &str = "profile-level fallback lists were replaced by the exact-key \
+    `[providers.fallback]` graph; define each target as a complete model reference there";
+
 /// Every retired key, applied by the migration chain when it reaches
 /// `retired_in`, and again on every load of a current config so a key that
 /// reappears is dropped with a notice rather than silently ignored. Retiring
@@ -166,6 +251,24 @@ pub const RETIRED_KEYS: &[RetiredKey] = &[
         path: &["agents", ANY_KEY, "strict_tool_parsing"],
         reason: INERT_AGENT_TUNABLE,
         reason_id: "cli-config-retired-reason-agent-tunable",
+    },
+    RetiredKey {
+        retired_in: 5,
+        path: &["runtime_profiles", ANY_KEY, "strict_tool_parsing"],
+        reason: RETIRED_TEXT_TOOL_PARSING,
+        reason_id: "cli-config-retired-reason-text-tool-parsing",
+    },
+    RetiredKey {
+        retired_in: 5,
+        path: &["providers", "models", ANY_KEY, ANY_KEY, "fallback"],
+        reason: RETIRED_PROFILE_FALLBACK,
+        reason_id: "cli-config-retired-reason-profile-fallback",
+    },
+    RetiredKey {
+        retired_in: 5,
+        path: &["providers", "models", ANY_KEY, ANY_KEY, "fallback_models"],
+        reason: RETIRED_PROFILE_FALLBACK,
+        reason_id: "cli-config-retired-reason-profile-fallback",
     },
     RetiredKey {
         retired_in: 4,
@@ -447,16 +550,17 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
                 );
                 let fix = match retired {
                     Some((path, reason)) => format!(
-                        "`{path}` is retired ({reason}), so if the rest of the file is current, \
+                        "`{path}` is retired ({reason}), so if the rest of the file is in the released V4 layout, \
                          adding `schema_version = 4` as its first line is the whole fix: the \
                          current layout then drops it with a notice. If the whole file is \
                          older, add `schema_version = 1` or `schema_version = 2` instead"
                     ),
-                    None => "Rewrite the older settings in the current layout and add \
-                             `schema_version = 4` as the first line, or, if the whole file is \
-                             older, add `schema_version = 1` or `schema_version = 2` instead; \
-                             `zeroclaw config migrate` then rewrites it in the current layout"
-                        .to_string(),
+                    None => format!(
+                        "Rewrite the older settings in the released V4 layout and add \
+                         `schema_version = 4` as the first line, or, if the whole file is \
+                         older, add `schema_version = 1` or `schema_version = 2` instead; \
+                         `zeroclaw config migrate` then applies the V4 → V5 migration"
+                    ),
                 };
                 anyhow::bail!(
                     "config has no `schema_version` and mixes layouts: {current}, but {legacy}. \
@@ -475,7 +579,8 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
                     "config has no `schema_version`, and {detail}. Add `schema_version` as the \
                      first line of the file with the version it was written for, so it is not \
                      guessed: `schema_version = 1` or `schema_version = 2` for an older file, \
-                     `schema_version = 3` or `schema_version = 4` for the current layout"
+                     `schema_version = 3` or `schema_version = 4` for their released layouts, \
+                     or `schema_version = {CURRENT_SCHEMA_VERSION}` only when the file was written by a V5-aware binary"
                 )
             }
         },
@@ -507,8 +612,8 @@ enum UnversionedShape {
     /// A section only the V3 layout has beside a setting only an older one
     /// has. Either reading reshapes or drops part of the file, so neither is
     /// chosen. `retired` names the older setting, and the reason, when the
-    /// current layout retires it anyway, so stating the current version is
-    /// the whole fix.
+    /// released V4 layout retires it anyway, so stating V4 lets the normal
+    /// V4 → V5 migration apply afterward.
     Mixed {
         current: String,
         legacy: String,
@@ -627,6 +732,38 @@ const LEGACY_LAYOUT_PATHS: &[&[&str]] = &[
 ///
 /// A V4 file has the V3 shape, so an unversioned V4 file is read as V3 too;
 /// its V3 -> V4 step changes nothing it has not already done.
+/// Return evidence that the file uses the canonical provider registry. This
+/// registry is part of schema V5; it must be recognized as V3-shaped for an
+/// omitted version so the V3→V4 step stamps the file without sending it
+/// through the destructive V1/V2 reshapers.
+fn canonical_registry_evidence(table: &toml::Table) -> Option<String> {
+    let providers = table.get("providers").and_then(toml::Value::as_table)?;
+    for section in ["connections", "model_presets", "fallback"] {
+        if providers
+            .get(section)
+            .and_then(toml::Value::as_table)
+            .is_some_and(|entries| !entries.is_empty())
+        {
+            return Some(format!(
+                "`[providers.{section}]` is in the canonical V5 layout"
+            ));
+        }
+    }
+    providers
+        .get("models")
+        .and_then(toml::Value::as_table)
+        .and_then(|models| {
+            models.iter().find_map(|(model_ref, value)| {
+                value
+                    .as_table()
+                    .and_then(|entry| entry.contains_key("capability").then_some(model_ref))
+            })
+        })
+        .map(|model_ref| {
+            format!("`[providers.models.{model_ref}]` declares a canonical V5 capability model")
+        })
+}
+
 fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
     let provider_families = table
         .get("providers")
@@ -665,7 +802,7 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
                 })
         });
 
-    let mut current = None;
+    let mut current = canonical_registry_evidence(table);
     let mut legacy = legacy_layout_evidence(table);
     let mut ambiguous = None;
     for (entry_kind, root, name, section) in provider_families.chain(channel_types) {
@@ -673,6 +810,20 @@ fn unversioned_shape(table: &toml::Table) -> UnversionedShape {
             continue;
         };
         if section.is_empty() {
+            continue;
+        }
+        // A canonical model row also sits directly below `providers.models`,
+        // but its `capability` discriminator makes it a model definition, not
+        // a V2 family field or V3 alias map. Partial dotted model rows are
+        // current-layout evidence too; legacy URL family names can contain
+        // dots in their hostname and must remain on the V1 migration path.
+        if section.contains_key("capability")
+            || (root == "providers.models"
+                && name.contains('.')
+                && !name.contains("://")
+                && section.values().any(|value| !value.is_table()))
+        {
+            current.get_or_insert_with(|| format!("`[{root}.{name}]` is a canonical model"));
             continue;
         }
         let path = format!("{root}.{name}");
@@ -1368,9 +1519,17 @@ fn migrate_toml(value: toml::Value) -> Result<Option<Migrated>> {
             apply_retired_keys(&mut value, version, RETIRED_KEYS, &mut notices);
         }
         lower_capped_keys(&mut value, &mut notices);
-        if notices.is_empty() && !selector_omitted {
+        // Normalize retired inputs only at the configuration admission boundary.
+        // Canonical model consumers never parse or project legacy profiles.
+        let routes_changed = model_routes::needs_migration(&value);
+        if notices.is_empty()
+            && !selector_omitted
+            && !routes_changed
+            && !provider_inputs::document_needs_migration(&value)
+        {
             return Ok(None);
         }
+        value = model_routes::migrate(value)?;
         (value, notices)
     } else {
         let mut notices: Vec<MigrationNotice> =
@@ -1416,12 +1575,13 @@ pub fn migrate_file(input: &str) -> Result<Option<String>> {
 }
 
 /// The oldest schema version from which reaching [`CURRENT_SCHEMA_VERSION`]
-/// changes a config only by retiring keys and re-stamping `schema_version`.
-/// A file at or above it is migrated by editing its document in place, so
+/// can change a config only by retiring keys and re-stamping `schema_version`.
+/// Files requiring structural route conversion are excluded from this path.
+/// Other files at or above it are edited in place, so
 /// everything the migration does not change keeps its exact bytes: quoting,
 /// number spelling, comments. Older files need the structural steps and are
-/// rebuilt from the migrated value. Raise this if a later version adds a
-/// structural migration step.
+/// rebuilt from the migrated value. Conditional V5 structural changes are
+/// checked separately by [`document_needs_structural_migration`].
 pub(crate) const FIRST_RETIREMENT_ONLY_VERSION: u32 = 3;
 
 /// [`migrate_file`], also returning what the migration changed or assumed.
@@ -1429,6 +1589,7 @@ pub fn migrate_file_with_notices(input: &str) -> Result<Option<(String, Vec<Migr
     let value: toml::Value = toml::from_str(input).context("failed to parse config TOML")?;
     let from = detect_version(&value)?;
     if (FIRST_RETIREMENT_ONLY_VERSION..=CURRENT_SCHEMA_VERSION).contains(&from)
+        && !document_needs_structural_migration(&value)
         && let Ok(mut doc) = input.parse::<toml_edit::DocumentMut>()
     {
         let selector_omitted = !value
@@ -1456,6 +1617,7 @@ pub fn migrate_file_with_notices(input: &str) -> Result<Option<(String, Vec<Migr
     let Some(Migrated { value, notices }) = migrate_toml(value)? else {
         return Ok(None);
     };
+    let value = provider_inputs::migrate_document(value)?;
     let migrated_table = match value {
         toml::Value::Table(t) => t,
         _ => {
@@ -1530,6 +1692,9 @@ pub fn generate(target_version: u32, opts: &GenerateOptions<'_>) -> Result<Strin
     };
 
     let mut value = value;
+    if target_version == CURRENT_SCHEMA_VERSION {
+        value = provider_inputs::migrate_document(value)?;
+    }
     // Generation creates a new installation, even when the requested schema
     // is historical. Write its full default selection so the document states
     // it and `config migrate` has nothing to normalize.
@@ -1616,7 +1781,7 @@ fn encrypt_in_place(value: &mut toml::Value, store: &crate::secrets::SecretStore
     Ok(())
 }
 
-/// Versioned TOML → validated V3 `Config`, strict: any defect errors.
+/// Versioned TOML → current `Config`, strict: any deserialize defect errors.
 /// Used by repair tooling (`zeroclaw config migrate`, `model_routing_config`)
 /// that needs the precise failure. Daemon load uses the resilient path.
 pub fn migrate_to_current(input: &str) -> Result<Config> {
@@ -1876,6 +2041,18 @@ fn prune_bad_provider_aliases(value: &mut toml::Value, dropped: &mut Vec<String>
     else {
         return;
     };
+
+    // V5 uses an exact-key registry (`connections`, canonical `models`,
+    // presets, and fallback edges), while this salvage pass also handles the
+    // retired V3/V4 family/alias layout below. Never walk canonical connection
+    // entries as if they were nested provider families: doing so drops healthy
+    // connections when an unrelated top-level field requires salvage.
+    if provider_kinds.contains_key("connections")
+        || provider_kinds.contains_key("model_presets")
+        || provider_kinds.contains_key("fallback")
+    {
+        return;
+    }
 
     // Non-table nodes where a kind/family map is required (e.g.
     // `[providers.models] ollama = "oops"`) would otherwise still sink the
@@ -2511,9 +2688,10 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
             .context("failed to deserialize as V2 schema")?;
         v2.migrate().context("failed to migrate V2 → V3")
     },
-    // V3 → V4: no shape change; the chain applies the V4 entries in
-    // `RETIRED_KEYS` after this step.
+    // V3 → V4 is frozen: only stamp the version and apply V4 retirements.
     |value| stamp_schema_version(value, 4),
+    // Registry/model-route reshaping belongs to the new version boundary.
+    v4_to_v5::migrate,
 ];
 
 const _: () = assert!(
@@ -2554,6 +2732,10 @@ fn run_chain_until(
         .take(target as usize)
         .skip(from as usize)
     {
+        // Report fields before the V5 projection removes legacy tables.
+        if index == 4 {
+            v4_to_v5::preserve_strict_tool_parsing(&mut cur)?;
+        }
         cur = step(cur)?;
         // Step `index` produces schema version `index + 1`. Apply every key
         // retired at or before that version: a file starting past an entry's
@@ -2564,10 +2746,10 @@ fn run_chain_until(
             apply_retired_keys(&mut cur, version, RETIRED_KEYS, notices);
         }
     }
-    // Caps belong to the current schema: a chain that stops at a historical
-    // version produces what that version wrote, while every route to the
-    // current one (load, migrate, `config generate`) gets the caps applied.
-    if target == CURRENT_SCHEMA_VERSION {
+    // Caps belong to V4 and later: a chain that stops at a historical version
+    // produces what that version wrote, while every route through V4 or V5
+    // (load, migrate, `config generate`) gets the caps applied.
+    if target >= 4 {
         lower_capped_keys(&mut cur, notices);
     }
     Ok(cur)
@@ -2923,6 +3105,44 @@ pub(crate) fn toml_value_to_edit_item(value: &toml::Value) -> toml_edit::Item {
     };
     let doc: toml_edit::DocumentMut = serialized.parse().unwrap_or_default();
     doc.get("__v").cloned().unwrap_or(toml_edit::Item::None)
+}
+
+/// Admit an explicitly constructed historical fixture through the same input
+/// normalization as deserialization. Production consumers never call this.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn normalize_test_input(config: &mut Config) {
+    let _ = provider_inputs::normalize_for_test(config);
+}
+
+/// An explicit input boundary for fixtures that keep their historical source
+/// mutable while exercising canonical consumers. Preserve non-serialized state.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn try_admit_test_input(input: &Config) -> Result<Config> {
+    let mut config = input.clone();
+    provider_inputs::normalize_for_test(&mut config)?;
+    Ok(config)
+}
+
+/// Admit a valid historical fixture, preserving the existing test-helper API.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn admit_test_input(input: &Config) -> Config {
+    try_admit_test_input(input).unwrap_or_else(|_| input.clone())
+}
+
+#[cfg(test)]
+/// Inspect the versioned adapter's provider output before final Config
+/// admission. This intentionally raw fixture never reaches a consumer.
+pub(crate) fn migrated_provider_input_fixture(input: &str) -> Result<Config> {
+    let (document, _) = migrate_value(input)?;
+    let providers = document
+        .get("providers")
+        .cloned()
+        .map(toml::Value::try_into)
+        .transpose()?
+        .unwrap_or_default();
+    let mut config: Config = document.try_into()?;
+    config.providers = providers;
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -3669,23 +3889,15 @@ temperature = "hot"
         let load = migrate_to_current_salvaged(raw);
         assert_eq!(load.dropped, vec!["providers.models.custom.broken"]);
         assert!(
-            load.config.providers.models.find("ollama", "ai").is_some(),
+            load.config.resolve_model_id("ollama.ai").is_some(),
             "valid alias in another family must survive"
         );
         assert!(
-            load.config
-                .providers
-                .models
-                .find("custom", "rag_bot")
-                .is_some(),
+            load.config.resolve_model_id("custom.rag_bot").is_some(),
             "valid sibling alias must survive"
         );
         assert!(
-            load.config
-                .providers
-                .models
-                .find("custom", "broken")
-                .is_none(),
+            load.config.resolve_model_id("custom.broken").is_none(),
             "only the malformed alias is pruned"
         );
     }
@@ -3711,7 +3923,7 @@ vision_model = "a-vision-capable-openrouter-model"
 enabled = true
 describe_images = true
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openrouter.default"),
@@ -3787,7 +3999,7 @@ model = "m"
 [multimodal]
 vision_model_provider = "grok"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("xai.default"),
@@ -3821,7 +4033,7 @@ default_model = "vision-model"
 [multimodal]
 vision_model_provider = "grok"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("xai.default"),
@@ -3860,7 +4072,7 @@ model = "grok-model"
 [multimodal]
 vision_model_provider = "grok"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("xai.default"),
@@ -3932,7 +4144,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "custom"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("custom"),
@@ -3977,7 +4189,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "custom"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("custom"),
@@ -4024,7 +4236,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "custom:https://b.example.invalid/v1"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("custom.default"),
@@ -4066,7 +4278,7 @@ default_model = "vision-model"
 [multimodal]
 vision_model_provider = "custom:https://b.example.invalid/v1"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("custom.default"),
@@ -4106,7 +4318,7 @@ default_model = "vision-model"
 [multimodal]
 vision_model_provider = "openai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai.default"),
@@ -4141,7 +4353,7 @@ model = "m"
 [multimodal]
 vision_model_provider = "openai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai.default"),
@@ -4173,7 +4385,7 @@ model = "m"
 [multimodal]
 vision_model_provider = "openai-codex"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai.codex"),
@@ -4209,7 +4421,7 @@ default_model = "vision-model"
 [multimodal]
 vision_model_provider = "openai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai"),
@@ -4249,7 +4461,7 @@ api_key = "sk-opencode-test"
 [multimodal]
 vision_model_provider = "openai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai"),
@@ -4289,7 +4501,7 @@ api_key = "opencode-key"
 [multimodal]
 vision_model_provider = "openai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai.default"),
@@ -4322,7 +4534,7 @@ model = "m"
 [multimodal]
 vision_model_provider = "llama.cpp"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("llamacpp.default"),
@@ -4350,7 +4562,7 @@ model = "m"
 [multimodal]
 vision_model_provider = "openai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai"),
@@ -4379,7 +4591,7 @@ model = "m"
 [multimodal]
 vision_model_provider = "qwen"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("qwen"),
@@ -4407,7 +4619,7 @@ model = "m"
 [multimodal]
 vision_model_provider = "qwen-intl"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("qwen-intl"),
@@ -4461,7 +4673,7 @@ model = "m2"
 [multimodal]
 vision_model_provider = "openai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai.default"),
@@ -4497,7 +4709,7 @@ model = "m2"
 [multimodal]
 vision_model_provider = "qwen"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("qwen"),
@@ -4555,7 +4767,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "xai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("xai"),
@@ -4628,7 +4840,7 @@ default_model = "vision-model"
 [multimodal]
 vision_model_provider = "xai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("xai.default"),
@@ -4659,7 +4871,7 @@ model = "grok-model"
 [multimodal]
 vision_model_provider = "xai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("xai.default"),
@@ -4702,7 +4914,7 @@ model = "grok-model"
 [multimodal]
 vision_model_provider = "xai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("xai.default"),
@@ -4734,7 +4946,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "custom"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("custom.default"),
@@ -4766,7 +4978,7 @@ default_model = "vision-model"
 [multimodal]
 vision_model_provider = "openrouter"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openrouter.default"),
@@ -4792,7 +5004,7 @@ model = "m"
 [multimodal]
 vision_model_provider = "grok"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("xai.default"),
@@ -4820,7 +5032,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "custom:https://vision.example.invalid/v1"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("custom.default"),
@@ -4881,7 +5093,7 @@ endpoint = "intl"
 [multimodal]
 vision_model_provider = "qwen-intl"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("qwen.default"),
@@ -4927,7 +5139,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "custom"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("custom.default"),
@@ -4962,7 +5174,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "stepfun"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("stepfun"),
@@ -4998,7 +5210,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "stepfun-intl"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("stepfun.default"),
@@ -5038,7 +5250,7 @@ uri = "https://api.stepfun.com/intl/v1/"
 [multimodal]
 vision_model_provider = "stepfun-intl"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("stepfun.default"),
@@ -5103,7 +5315,7 @@ requires_openai_auth = true
 [multimodal]
 vision_model_provider = "openai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai.default"),
@@ -5148,7 +5360,7 @@ oauth_refresh_token = "test-token"
 [multimodal]
 vision_model_provider = "qwen"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("qwen.default"),
@@ -5193,7 +5405,7 @@ wire_api = "responses"
 [multimodal]
 vision_model_provider = "openai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai.default"),
@@ -5247,7 +5459,7 @@ model = "vision-model"
 vision_model_provider = "{raw_source}"
 "#
             );
-            let cfg = migrate_to_current(&raw)
+            let cfg = migrated_provider_input_fixture(&raw)
                 .unwrap_or_else(|e| panic!("legacy variant {raw_source} must migrate: {e}"));
             assert_eq!(
                 cfg.multimodal.vision_model_provider.as_deref(),
@@ -5293,7 +5505,7 @@ model = "vision-model"
 vision_model_provider = "{raw_source}"
 "#
             );
-            let cfg = migrate_to_current(&raw)
+            let cfg = migrated_provider_input_fixture(&raw)
                 .unwrap_or_else(|e| panic!("legacy variant {raw_source} must migrate: {e}"));
             assert_eq!(
                 cfg.multimodal.vision_model_provider.as_deref(),
@@ -5335,7 +5547,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "qwen"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("qwen"),
@@ -5378,7 +5590,7 @@ model = "other-model"
 [multimodal]
 vision_model_provider = "openai"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("openai.default"),
@@ -5412,7 +5624,7 @@ default_model = "vision-model"
 [multimodal]
 vision_model_provider = "custom:https://vision.example.invalid/v1"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("custom.default"),
@@ -5447,7 +5659,7 @@ model = "vision-model"
 [multimodal]
 vision_model_provider = "custom:https://vision.example.invalid"
 "#;
-        let cfg = migrate_to_current(raw).unwrap();
+        let cfg = migrated_provider_input_fixture(raw).unwrap();
         assert_eq!(
             cfg.multimodal.vision_model_provider.as_deref(),
             Some("custom:https://vision.example.invalid"),
@@ -5498,11 +5710,7 @@ model = "m"
         let load = migrate_to_current_salvaged(raw);
         assert_eq!(load.dropped, vec!["providers.models.ollama"]);
         assert!(
-            load.config
-                .providers
-                .models
-                .find("custom", "rag_bot")
-                .is_some(),
+            load.config.resolve_model_id("custom.rag_bot").is_some(),
             "valid alias must survive a scalar sibling family"
         );
     }
@@ -5552,6 +5760,33 @@ enabled = "not-a-bool"
         // `[heartbeat]` reverted to its serde default; load did not panic.
         assert!(!cfg.heartbeat.enabled);
         assert_eq!(cfg.heartbeat.interval_minutes, 30);
+    }
+
+    #[test]
+    fn resilient_v5_load_keeps_canonical_connections_when_other_section_is_bad() {
+        let raw = r#"
+schema_version = 5
+locale = 42
+
+[providers.connections."healthy.prod"]
+kind = "custom"
+uri = "https://example.test/v1"
+
+[providers.models."chat.main"]
+capability = "chat"
+provider = "healthy.prod"
+model = "model-a"
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert_eq!(
+            load.config
+                .providers
+                .connections
+                .get("healthy.prod")
+                .and_then(|connection| connection.uri()),
+            Some("https://example.test/v1")
+        );
+        assert!(load.dropped.iter().any(|path| path == "locale"));
     }
 
     #[test]
@@ -5854,7 +6089,7 @@ client_secret = "plaintext-nevis-secret"
             .expect("a V3 config migrates to V4");
 
         let value: toml::Value = toml::from_str(&migrated).unwrap();
-        assert_eq!(detect_version(&value).unwrap(), 4);
+        assert_eq!(detect_version(&value).unwrap(), CURRENT_SCHEMA_VERSION);
         let security = value["security"].as_table().expect("[security] kept");
         assert!(!security.contains_key("nevis"), "{migrated}");
         assert_eq!(
@@ -6004,6 +6239,164 @@ mention_only = false
             INFERRED_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION,
             "read as the current version, the file would skip the V3 -> V4 step"
         );
+    }
+
+    #[test]
+    fn an_unversioned_canonical_registry_is_carried_to_v5_without_v1_reshaping() {
+        let raw = r#"
+[providers.connections."gateway.prod"]
+kind = "custom"
+uri = "https://gateway.example/v1"
+
+[providers.models."chat.fast.prod"]
+capability = "chat"
+provider = "gateway.prod"
+model = "fast-model"
+"#;
+        let value: toml::Value = toml::from_str(raw).unwrap();
+        assert_eq!(detect_version(&value).unwrap(), INFERRED_SCHEMA_VERSION);
+
+        let (migrated, notices) = migrate_file_with_notices(raw).unwrap().unwrap();
+        assert_eq!(notices, vec![MigrationNotice::InferredV3]);
+        let migrated: toml::Value = toml::from_str(&migrated).unwrap();
+        assert_eq!(migrated["schema_version"].as_integer(), Some(5));
+        assert_eq!(
+            migrated["providers"]["connections"]["gateway.prod"]["uri"].as_str(),
+            Some("https://gateway.example/v1")
+        );
+        assert_eq!(
+            migrated["providers"]["models"]["chat.fast.prod"]["model"].as_str(),
+            Some("fast-model")
+        );
+    }
+
+    #[test]
+    fn explicit_v3_canonical_registry_is_stamped_without_splitting_dotted_keys() {
+        let raw = r#"
+schema_version = 3
+
+[providers.connections."gateway.prod"]
+kind = "custom"
+uri = "https://gateway.example/v1"
+
+[providers.models."chat.fast.prod"]
+capability = "chat"
+provider = "gateway.prod"
+model = "fast-model"
+"#;
+        let (migrated, notices) = migrate_file_with_notices(raw).unwrap().unwrap();
+        assert!(notices.is_empty());
+        let migrated: toml::Value = toml::from_str(&migrated).unwrap();
+        assert_eq!(migrated["schema_version"].as_integer(), Some(5));
+        assert!(
+            migrated["providers"]["connections"]
+                .as_table()
+                .is_some_and(|connections| connections.contains_key("gateway.prod"))
+        );
+        assert!(
+            migrated["providers"]["models"]
+                .as_table()
+                .is_some_and(|models| models.contains_key("chat.fast.prod"))
+        );
+    }
+
+    #[test]
+    fn old_routes_migrate_identically_in_memory_and_on_disk_from_v3_and_v4() {
+        for version in [3, CURRENT_SCHEMA_VERSION] {
+            let raw = format!(
+                r#"schema_version = {version}
+[tools]
+optional = ["*"]
+[providers.models.openai."primary.prod"]
+model = "primary-model"
+api_key = "profile-fixture-key"
+temperature = 0.4
+[providers.connections."stable.connection"]
+kind = "openai"
+[providers.models."chat.stable"]
+capability = "chat"
+provider = "stable.connection"
+model = "stable-model"
+[[model_routes]]
+hint = "fast"
+model_provider = "openai.primary.prod"
+model = "route-model"
+api_key = "route-fixture-key"
+[[model_routes]]
+hint = "inherited"
+model_provider = "openai.primary.prod"
+[[model_routes]]
+hint = "stable"
+model_ref = "chat.stable"
+"#
+            );
+            let in_memory = migrate_to_current(&raw).unwrap();
+            let (migrated, notices) = migrate_file_with_notices(&raw).unwrap().unwrap();
+            assert!(notices.is_empty());
+            let from_disk = migrate_to_current(&migrated).unwrap();
+            assert_eq!(from_disk.schema_version, CURRENT_SCHEMA_VERSION);
+            assert_eq!(
+                serde_json::to_value(&in_memory.model_routes).unwrap(),
+                serde_json::to_value(&from_disk.model_routes).unwrap()
+            );
+            let memory_registry = in_memory.provider_registry().unwrap();
+            let disk_registry = from_disk.provider_registry().unwrap();
+            assert_eq!(
+                serde_json::to_value(&memory_registry).unwrap(),
+                serde_json::to_value(&disk_registry).unwrap()
+            );
+            for (index, model, key) in [
+                (0, "route-model", "route-fixture-key"),
+                (1, "primary-model", "profile-fixture-key"),
+            ] {
+                let reference = from_disk.model_routes[index].model_ref.as_str().into();
+                let resolved = disk_registry.resolve_chat(&reference).unwrap();
+                assert_eq!(resolved.upstream_model(), Some(model));
+                assert_eq!(resolved.selection.connection.api_key(), Some(key));
+                assert_eq!(
+                    resolved.options.temperature,
+                    Some(crate::provider_registry::Override::Set(0.4))
+                );
+            }
+            assert_eq!(from_disk.model_routes[2].model_ref, "chat.stable");
+            assert_eq!(
+                from_disk.resolve_model_id("openai.primary.prod").as_deref(),
+                Some("primary-model"),
+                "route overrides must not change the original model"
+            );
+            let salvaged = migrate_to_current_salvaged(&raw);
+            assert!(salvaged.dropped.is_empty() && salvaged.dropped_security.is_empty());
+            assert_eq!(salvaged.config.model_routes.len(), 3);
+            assert!(migrate_file_with_notices(&migrated).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn v3_gemini_oauth_route_preserves_implicit_clients_in_memory_and_on_disk() {
+        let raw = r#"schema_version = 3
+[providers.models.gemini.work]
+model = "gemini-test"
+oauth_client_id = "test-client"
+oauth_client_secret = "test-client-secret"
+[[model_routes]]
+hint = "oauth"
+model_provider = "gemini.work"
+"#;
+        let memory = migrate_to_current(raw).unwrap();
+        let (disk, notices) = migrate_file_with_notices(raw).unwrap().unwrap();
+        assert!(notices.is_empty());
+        let disk = migrate_to_current(&disk).unwrap();
+        for config in [memory, disk] {
+            let reference = &config.model_routes[0].model_ref;
+            assert_eq!(
+                config.resolve_model_id(reference).as_deref(),
+                Some("gemini-test")
+            );
+            assert_eq!(
+                config.gemini_oauth_client_credentials(reference).unwrap(),
+                Some(("test-client".into(), "test-client-secret".into()))
+            );
+        }
     }
 
     #[test]
@@ -6415,9 +6808,10 @@ mention_only = false
 
     /// The value at a dotted path, or `None`.
     fn value_at<'a>(value: &'a toml::Value, dotted: &str) -> Option<&'a toml::Value> {
-        dotted
-            .split('.')
-            .try_fold(value, |value, key| value.get(key))
+        toml_edit::Key::parse(dotted)
+            .ok()?
+            .iter()
+            .try_fold(value, |value, key| value.get(key.get()))
     }
 
     /// One file per way an older layout differs from the current one, each
@@ -6860,7 +7254,7 @@ mention_only = false
     /// own: every section of the bundled V4 fixture, and every section the
     /// default config writes.
     fn current_layout_sections() -> Vec<(String, toml::Table)> {
-        let fixture: toml::Table = toml::from_str(include_str!("../fixtures/v4.toml")).unwrap();
+        let fixture: toml::Table = toml::from_str(include_str!("../fixtures/v5.toml")).unwrap();
         let defaults = match toml::Value::try_from(Config::default()).unwrap() {
             toml::Value::Table(table) => table,
             other => panic!("the default config is not a table: {other}"),
@@ -6929,6 +7323,15 @@ mention_only = false
                 PropKind::Float => current
                     .parse::<f64>()
                     .map_or_else(|_| "1.5".to_string(), |x| (x + 0.5).to_string()),
+                // V5 admission parses the retired decision endpoint while
+                // deriving its native protocol path. Keep the layout probe
+                // a valid URL rather than testing malformed input here.
+                PropKind::String
+                    if field.name.starts_with("decision_models.")
+                        && field.name.ends_with(".base_url") =>
+                {
+                    "https://decision-probe.invalid".to_string()
+                }
                 // A provider reference is current content only in the dotted
                 // `<family>.<alias>` form; a bare one is the form the older
                 // layouts' migration completes.
@@ -6962,7 +7365,7 @@ mention_only = false
         for _ in 0..4 {
             let mut created = false;
             for section in Config::map_key_sections() {
-                if config.create_map_key(section.path, "probe") == Ok(true) {
+                if config.create_map_key(&section.path, "probe") == Ok(true) {
                     created = true;
                 }
             }
@@ -7069,7 +7472,7 @@ mention_only = false
     fn top_level_aliases() -> Vec<(&'static str, String)> {
         let canonical = current_top_level_sections();
         let defaults = toml::Value::try_from(Config::default()).unwrap();
-        let fixture: toml::Value = toml::from_str(include_str!("../fixtures/v4.toml")).unwrap();
+        let fixture: toml::Value = toml::from_str(include_str!("../fixtures/v5.toml")).unwrap();
         accepted_keys::<Config>()
             .iter()
             .copied()
@@ -7129,7 +7532,7 @@ mention_only = false
                 "{label}: refused on its own"
             );
         }
-        let mut fixture: toml::Table = toml::from_str(include_str!("../fixtures/v4.toml")).unwrap();
+        let mut fixture: toml::Table = toml::from_str(include_str!("../fixtures/v5.toml")).unwrap();
         fixture.remove("schema_version");
         assert_eq!(
             detect_version(&toml::Value::Table(fixture)).ok(),
@@ -7143,8 +7546,9 @@ mention_only = false
         match value {
             toml::Value::Table(table) => {
                 for (key, child) in table {
+                    let key = toml_edit::Key::new(key.as_str()).to_string();
                     let path = if prefix.is_empty() {
-                        key.clone()
+                        key
                     } else {
                         format!("{prefix}.{key}")
                     };
@@ -7229,9 +7633,15 @@ mention_only = false
             );
         }
 
-        let mut fixture: toml::Table = toml::from_str(include_str!("../fixtures/v4.toml")).unwrap();
+        let mut fixture: toml::Table = toml::from_str(include_str!("../fixtures/v5.toml")).unwrap();
         for key in ["schema_version", "tools"] {
             fixture.remove(key);
+        }
+        // Canonical registry sections are also newer-layout evidence.
+        if let Some(toml::Value::Table(providers)) = fixture.get_mut("providers") {
+            for key in ["connections", "model_presets", "fallback"] {
+                providers.remove(key);
+            }
         }
         for path in V3_ONLY_SECTIONS {
             let (last, parents) = path.split_last().unwrap();
@@ -7256,11 +7666,8 @@ mention_only = false
         assert!(differ.is_empty(), "the V1 reading differs at {differ:?}");
     }
 
-    /// The current `[transcription]` still reads V2's Groq settings and
-    /// per-family STT tables, spelled as V2 spelled them, so the V1 reading
-    /// leaves them where they are, with every value: no move to a
-    /// `[providers.transcription]` alias whose fields differ (`uri` for
-    /// `url`, no endpoint for Groq).
+    /// V1 transcription input is projected to the canonical ASR model
+    /// registry while retaining every supported setting.
     #[test]
     fn the_v1_reading_keeps_the_shared_transcription_settings_in_place() {
         let file: toml::Table = toml::from_str(
@@ -7276,18 +7683,17 @@ mention_only = false
             detect_version(&toml::Value::Table(file.clone())).ok(),
             Some(1)
         );
-        let (as_v1, typed_v1) = stated_reading(&file, 1);
+        let (_as_v1, typed_v1) = stated_reading(&file, 1);
         for (path, kept) in [
-            ("transcription.api_url", "https://stt.example.invalid/v1"),
-            ("transcription.model", "whisper-keep"),
-            ("transcription.openai.model", "whisper-1"),
-            ("transcription.google.language_code", "de-DE"),
+            (r#"providers.models."asr.groq".model"#, "whisper-keep"),
+            (r#"providers.models."asr.openai".model"#, "whisper-1"),
+            (r#"providers.models."asr.google".options.language"#, "de-DE"),
             (
-                "transcription.local_whisper.url",
+                r#"providers.connections."legacy.asr.section.local_whisper".uri"#,
                 "http://127.0.0.1:8001/v1/transcribe",
             ),
             (
-                "transcription.local_whisper.bearer_token",
+                r#"providers.connections."legacy.asr.section.local_whisper".auth.api_key"#,
                 "KEEP-LOCAL-TOKEN",
             ),
         ] {
@@ -7298,14 +7704,15 @@ mention_only = false
             );
         }
         assert_eq!(
-            value_at(&typed_v1, "transcription.local_whisper.timeout_secs")
+            value_at(&typed_v1, r#"providers.connections."legacy.asr.section.local_whisper".api.asr.request_timeout_secs"#)
                 .and_then(toml::Value::as_integer),
             Some(17)
         );
-        assert!(
-            value_at(&as_v1, "providers.transcription").is_none(),
-            "nothing moves under `[providers.transcription]`: {as_v1:#?}"
-        );
+        // V1 is admitted into the canonical provider registry before the
+        // typed read; the canonical projection is observable in the typed
+        // value, while the historical intermediate value may omit the
+        // transient provider table entirely.
+        assert!(value_at(&typed_v1, "providers.models").is_some());
         assert!(readings_differ(&file).is_empty());
     }
 
@@ -7350,7 +7757,7 @@ mention_only = false
         // The mapping names the right types: each accepts every key the
         // default config or the fixture writes there.
         let defaults = toml::Value::try_from(Config::default()).unwrap();
-        let fixture: toml::Value = toml::from_str(include_str!("../fixtures/v4.toml")).unwrap();
+        let fixture: toml::Value = toml::from_str(include_str!("../fixtures/v5.toml")).unwrap();
         for parent in [
             "",
             "providers",
@@ -7543,17 +7950,17 @@ mention_only = false
 
     /// `root` with `value` set at a dotted path, creating tables on the way.
     fn set_at(root: &mut toml::Value, dotted: &str, value: toml::Value) {
-        let mut keys: Vec<&str> = dotted.split('.').collect();
+        let mut keys = toml_edit::Key::parse(dotted).unwrap();
         let last = keys.pop().unwrap();
         let mut table = root.as_table_mut().unwrap();
         for key in keys {
             table = table
-                .entry(key)
+                .entry(key.get())
                 .or_insert_with(|| toml::Value::Table(toml::Table::new()))
                 .as_table_mut()
                 .unwrap_or_else(|| panic!("`{dotted}` crosses a value"));
         }
-        table.insert(last.to_string(), value);
+        table.insert(last.get().to_string(), value);
     }
 
     /// An older setting beside a V3 value at a place its own migration
@@ -7630,6 +8037,18 @@ mention_only = false
         (
             "agents.x.strict_tool_parsing",
             "[agents.x]\nstrict_tool_parsing = true\n",
+        ),
+        (
+            "runtime_profiles.x.strict_tool_parsing",
+            "[runtime_profiles.x]\nstrict_tool_parsing = true\n",
+        ),
+        (
+            "providers.models.x.x.fallback",
+            "[providers.models.x.x]\nfallback = [\"custom.backup\"]\n",
+        ),
+        (
+            "providers.models.x.x.fallback_models",
+            "[providers.models.x.x]\nfallback_models = [\"backup\"]\n",
         ),
         (
             "runtime_profiles.x.context_compression.summary_model",
@@ -7744,7 +8163,7 @@ mention_only = false
             assert!(
                 err.contains("is retired (")
                     && err.contains(
-                        "so if the rest of the file is current, adding `schema_version = 4` \
+                        "so if the rest of the file is in the released V4 layout, adding `schema_version = 4` \
                          as its first line is the whole fix"
                     ),
                 "{err}"
@@ -8791,7 +9210,9 @@ summary_model = "opus"
         assert!(notices.is_empty(), "{notices:?}");
         assert_eq!(
             migrated,
-            format!("schema_version = 4  # stamped by an older zeroclaw\n{UNTOUCHED_V3_BODY}"),
+            format!(
+                "schema_version = {CURRENT_SCHEMA_VERSION}  # stamped by an older zeroclaw\n{UNTOUCHED_V3_BODY}"
+            ),
             "everything but the version must keep its exact bytes"
         );
     }
@@ -9094,6 +9515,44 @@ summary_model = "opus"
             );
             assert!(out.contains("provider_retries = 3"), "{out}");
         }
+    }
+
+    #[test]
+    fn v3_profile_fallback_fields_are_retired_into_the_canonical_graph() {
+        let raw = r#"schema_version = 3
+
+[providers.models.custom."gateway.prod"]
+model = "primary"
+fallback = ["custom.backup"]
+fallback_models = ["backup"]
+
+[providers.models.custom.backup]
+model = "backup"
+"#;
+        let (migrated, notices) = migrate_file_with_notices(raw)
+            .unwrap()
+            .expect("retired profile fallback fields must trigger a rewrite");
+        let paths = removed_paths(&notices);
+        assert!(paths.contains(&"providers.models.custom.gateway.prod.fallback"));
+        assert!(paths.contains(&"providers.models.custom.gateway.prod.fallback_models"));
+        let value: toml::Value = toml::from_str(&migrated).unwrap();
+        let profile = &value["providers"]["models"]["custom.gateway.prod"];
+        assert!(profile.get("fallback").is_none());
+        assert!(profile.get("fallback_models").is_none());
+        assert_eq!(
+            value["providers"]["fallback"]["custom.gateway.prod"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|entry| entry.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fallback.custom.gateway.prod.backup", "custom.backup"]
+        );
+        assert!(notices.iter().all(|notice| matches!(
+            notice,
+            MigrationNotice::Removed { reason, .. }
+                if reason.contains("profile-level fallback")
+        )));
     }
 
     #[test]

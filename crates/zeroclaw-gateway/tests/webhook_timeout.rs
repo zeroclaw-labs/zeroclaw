@@ -10,9 +10,7 @@ use axum::{Json, Router, routing::post};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zeroclaw_config::multi_agent::{AgentMemoryConfig, AgentWorkspaceConfig, MemoryBackendKind};
-use zeroclaw_config::schema::{
-    AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig, RiskProfileConfig,
-};
+use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
 
 struct Fixture {
     addr: SocketAddr,
@@ -97,16 +95,23 @@ impl Fixture {
         config.memory.auto_save = false;
         config.memory.response_cache_enabled = false;
         config.reliability.provider_retries = 0;
-        config.providers.models.custom.insert(
-            "fixture".into(),
-            CustomModelProviderConfig {
-                base: ModelProviderConfig {
-                    uri: Some(format!("http://{provider_addr}/v1")),
-                    model: Some("fixture-model".into()),
-                    ..ModelProviderConfig::default()
-                },
+        config.providers = serde_json::from_value(json!({
+            "connections": {
+                "fixture": {
+                    "kind": "custom",
+                    "uri": format!("http://{provider_addr}/v1"),
+                    "auth": {"mode": "api_key", "api_key": "test-key"}
+                }
             },
-        );
+            "models": {
+                "custom.fixture": {
+                    "capability": "chat",
+                    "provider": "fixture",
+                    "model": "fixture-model"
+                }
+            }
+        }))
+        .expect("canonical provider fixture");
         config.risk_profiles.insert(
             "fixture".into(),
             RiskProfileConfig {
@@ -132,12 +137,10 @@ impl Fixture {
         configure(&mut config);
         let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
             let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
-                config.sop.clone(),
-                &config.decision_models,
-                &config.data_dir,
-                &config.install_root_dir(),
+                &config,
                 Arc::new(zeroclaw_memory::none::NoneMemory::new("fixture")),
                 Default::default(),
+                None,
             );
             (Some(engine), Some(audit))
         } else {

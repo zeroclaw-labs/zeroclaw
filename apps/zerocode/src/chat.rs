@@ -2661,7 +2661,7 @@ impl Chat {
                     .await;
                 }
             }
-            ModelPickerOverlay::ConfiguredProviderStage(p) => {
+            ModelPickerOverlay::ConfiguredModel(p) => {
                 let choice = p.selected().map(str::to_string);
                 state.model_picker = ModelPickerOverlay::None;
                 if let Some(model_provider) = choice {
@@ -4372,8 +4372,7 @@ impl Chat {
             // Movement first.
             if up || down {
                 match &mut state.model_picker {
-                    ModelPickerOverlay::Model(p)
-                    | ModelPickerOverlay::ConfiguredProviderStage(p) => {
+                    ModelPickerOverlay::Model(p) | ModelPickerOverlay::ConfiguredModel(p) => {
                         if up {
                             p.move_up();
                         } else {
@@ -5210,23 +5209,24 @@ impl Chat {
             Ok(result) => {
                 let model = result.overrides.model.unwrap_or_default();
                 let model_provider = result.overrides.model_provider.unwrap_or_default();
-                let summary = if !model_provider.is_empty() {
-                    crate::i18n::t_args(
-                        "zc-model-switch-provider-ok",
-                        &[("provider", &model_provider), ("model", &model)],
-                    )
-                } else {
-                    crate::i18n::t_args("zc-model-switch-model-ok", &[("model", &model)])
-                };
-                state.info_message = Some(crate::widgets::InfoMessage::note(summary));
                 let provider_ref = (!model_provider.is_empty()).then_some(model_provider.as_str());
                 let resolved_model = if !model.is_empty() {
-                    Some(model.clone())
+                    Some(model)
                 } else if let Some(r) = provider_ref {
                     Self::configured_model(rpc, r).await
                 } else {
                     None
                 };
+                let model_label = resolved_model.as_deref().unwrap_or_default();
+                let summary = if !model_provider.is_empty() {
+                    crate::i18n::t_args(
+                        "zc-model-switch-provider-ok",
+                        &[("provider", &model_provider), ("model", model_label)],
+                    )
+                } else {
+                    crate::i18n::t_args("zc-model-switch-model-ok", &[("model", model_label)])
+                };
+                state.info_message = Some(crate::widgets::InfoMessage::note(summary));
                 state.set_model_identity(provider_ref, resolved_model.as_deref());
                 // A model_provider switch changes the catalog — drop the cache
                 // so the next `/model` use refetches.
@@ -5252,7 +5252,7 @@ impl Chat {
         }
     }
 
-    /// Resolve the agent's configured model_provider reference (`<type>.<alias>`)
+    /// Resolve the agent's configured model reference (an exact registry key)
     /// from config.
     async fn resolve_model_provider_ref(rpc: &RpcClient, agent_alias: &str) -> Option<String> {
         let prop = format!("agents.{agent_alias}.model_provider");
@@ -5264,17 +5264,15 @@ impl Chat {
         })
     }
 
-    /// Read the model configured for a dotted model_provider ref
-    /// (`providers.models.<family>.<alias>.model`), used to pre-select the
-    /// current model in the picker.
+    /// Read the upstream model ID for an exact configured model reference.
     async fn configured_model(rpc: &RpcClient, model_provider_ref: &str) -> Option<String> {
-        let prop = format!("providers.models.{model_provider_ref}.model");
-        let entries = rpc.config_list(Some(&prop)).await.ok()?;
-        entries.into_iter().find(|e| e.path == prop).and_then(|e| {
-            e.value
-                .as_ref()
-                .and_then(|v| v.as_str().map(str::to_string))
-        })
+        let registry = rpc.provider_registry().await.ok()?;
+        registry
+            .get("models")?
+            .get(model_provider_ref)?
+            .get("model")?
+            .as_str()
+            .map(str::to_owned)
     }
 
     /// Fetch the model catalog for a configured model_provider reference while
@@ -5410,7 +5408,7 @@ impl Chat {
         state.mark_dirty_full();
     }
 
-    /// Open stage 1 of the two-stage model_provider picker.
+    /// Select an exact configured model reference in a single step.
     async fn open_provider_picker(rpc: &RpcClient, state: &mut ChatState) {
         match rpc.quickstart_state().await {
             Ok(snap) => {
@@ -5427,7 +5425,7 @@ impl Chat {
                     None => Self::resolve_model_provider_ref(rpc, &state.agent_alias).await,
                 };
                 state.input_bar.set_provider_catalog(providers.clone());
-                state.model_picker = ModelPickerOverlay::ConfiguredProviderStage(
+                state.model_picker = ModelPickerOverlay::ConfiguredModel(
                     crate::widgets::PickerState::new(providers, current.as_deref()),
                 );
                 state.mark_dirty_full();
@@ -6882,7 +6880,7 @@ fn render_with_plan_placement(
             )
             .render(f, area);
         }
-        ModelPickerOverlay::ConfiguredProviderStage(picker) => {
+        ModelPickerOverlay::ConfiguredModel(picker) => {
             crate::widgets::PickerModal::new(
                 &crate::i18n::t("zc-model-provider-picker-title"),
                 &picker.items,
@@ -6908,13 +6906,11 @@ fn model_picker_overlay_area(model_picker: &ModelPickerOverlay, area: Rect) -> O
             &picker.items,
             area,
         ),
-        ModelPickerOverlay::ConfiguredProviderStage(picker) => {
-            crate::widgets::PickerModal::area_for(
-                &crate::i18n::t("zc-model-provider-picker-title"),
-                &picker.items,
-                area,
-            )
-        }
+        ModelPickerOverlay::ConfiguredModel(picker) => crate::widgets::PickerModal::area_for(
+            &crate::i18n::t("zc-model-provider-picker-title"),
+            &picker.items,
+            area,
+        ),
         ModelPickerOverlay::None => None,
     }
 }
@@ -10195,9 +10191,8 @@ enum SessionOverlay {
     },
 }
 
-/// Active model / model_provider picker overlay. `None` when no picker is open.
-/// The model_provider variant is two-stage: pick a model_provider, then (after a
-/// catalog fetch) pick a model from it.
+/// Pick a configured model reference directly, or browse upstream model IDs
+/// through the active connection. `None` when no picker is open.
 #[derive(Debug, Clone, Default)]
 enum ModelPickerOverlay {
     /// No picker open.
@@ -10208,7 +10203,7 @@ enum ModelPickerOverlay {
     Loading,
     /// Single-stage model picker over the active model_provider's catalog.
     Model(crate::widgets::PickerState),
-    ConfiguredProviderStage(crate::widgets::PickerState),
+    ConfiguredModel(crate::widgets::PickerState),
 }
 
 impl ModelPickerOverlay {
@@ -10218,7 +10213,7 @@ impl ModelPickerOverlay {
 
     fn item_count(&self) -> usize {
         match self {
-            Self::Model(p) | Self::ConfiguredProviderStage(p) => p.items.len(),
+            Self::Model(p) | Self::ConfiguredModel(p) => p.items.len(),
             Self::Loading => 1,
             Self::None => 0,
         }
@@ -10226,7 +10221,7 @@ impl ModelPickerOverlay {
 
     fn picker_mut(&mut self) -> Option<&mut crate::widgets::PickerState> {
         match self {
-            Self::Model(p) | Self::ConfiguredProviderStage(p) => Some(p),
+            Self::Model(p) | Self::ConfiguredModel(p) => Some(p),
             Self::Loading | Self::None => None,
         }
     }
@@ -13812,6 +13807,106 @@ mod tests {
             "myagent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn configured_model_resolves_exact_registry_key() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = RpcClient::with_rpc(Arc::clone(&rpc));
+        let task = tokio::spawn(async move {
+            Chat::configured_model(&client, "custom.gateway.prod.fast.v1").await
+        });
+        let request = next_rpc_request(&mut rx, "canonical registry").await;
+        assert_eq!(request["method"], "config/provider-registry");
+        respond_ok(
+            &rpc,
+            &request,
+            serde_json::json!({"models": {
+                "custom.gateway.prod.fast.v1": {"capability": "chat", "provider": "gateway.prod", "model": "upstream-id"}
+            }}),
+        );
+        assert_eq!(task.await.unwrap().as_deref(), Some("upstream-id"));
+        assert!(
+            rx.try_recv().is_err(),
+            "canonical names must never use flattened profile paths"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_model_switch_notice_uses_resolved_registry_model() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = RpcClient::with_rpc(Arc::clone(&rpc));
+        let task = tokio::spawn(async move {
+            let mut active = state();
+            active.set_model_identity(Some("chat.old"), Some("old-model"));
+            Chat::apply_session_override(
+                &client,
+                &mut active,
+                crate::client::SessionOverrides {
+                    model_provider: Some("chat.demo.gateway".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            active
+        });
+        let configure = next_rpc_request(&mut rx, "session configure").await;
+        assert_eq!(configure["method"], "session/configure");
+        respond_ok(
+            &rpc,
+            &configure,
+            serde_json::json!({
+                "session_id": "sess-1",
+                "overrides": {"model_provider": "chat.demo.gateway"}
+            }),
+        );
+        let registry = next_rpc_request(&mut rx, "canonical registry").await;
+        assert_eq!(registry["method"], "config/provider-registry");
+        respond_ok(
+            &rpc,
+            &registry,
+            serde_json::json!({"models": {
+                "chat.demo.gateway": {"capability": "chat", "provider": "gateway.prod", "model": "upstream-id"}
+            }}),
+        );
+        let active = task.await.unwrap();
+        assert_eq!(
+            active.model_provider_ref.as_deref(),
+            Some("chat.demo.gateway")
+        );
+        assert_eq!(active.model.as_deref(), Some("upstream-id"));
+        assert_eq!(
+            active.info_message.unwrap().text,
+            crate::i18n::t_args(
+                "zc-model-switch-provider-ok",
+                &[("provider", "chat.demo.gateway"), ("model", "upstream-id")]
+            )
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "one registry lookup serves both UI labels"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_configured_model_does_not_probe_legacy_profile_paths() {
+        for reference in ["custom.gw.v2.fast.v1", "main"] {
+            let (tx, mut rx) = mpsc::channel(8);
+            let rpc = Arc::new(RpcOutbound::new(tx));
+            let client = RpcClient::with_rpc(Arc::clone(&rpc));
+            let task =
+                tokio::spawn(async move { Chat::configured_model(&client, reference).await });
+            let request = next_rpc_request(&mut rx, "canonical registry").await;
+            assert_eq!(request["method"], "config/provider-registry");
+            respond_ok(&rpc, &request, serde_json::json!({"models": {}}));
+            assert!(task.await.unwrap().is_none());
+            assert!(
+                rx.try_recv().is_err(),
+                "a missing key must not become a legacy profile lookup"
+            );
+        }
     }
 
     #[tokio::test]
@@ -18583,11 +18678,10 @@ mod tests {
     #[test]
     fn model_provider_picker_overlay_rows_are_hit_testable() {
         let mut s = state();
-        s.model_picker =
-            ModelPickerOverlay::ConfiguredProviderStage(crate::widgets::PickerState::new(
-                vec!["openai.default".into(), "deepseek.default".into()],
-                None,
-            ));
+        s.model_picker = ModelPickerOverlay::ConfiguredModel(crate::widgets::PickerState::new(
+            vec!["openai.default".into(), "deepseek.default".into()],
+            None,
+        ));
 
         let area = Rect::new(0, 0, 80, 20);
         let modal = model_picker_overlay_area(&s.model_picker, area).unwrap();
@@ -18663,7 +18757,7 @@ mod tests {
         let model =
             ModelPickerOverlay::Model(crate::widgets::PickerState::new(vec!["a".into()], None));
         assert!(model.is_open());
-        let stage1 = ModelPickerOverlay::ConfiguredProviderStage(crate::widgets::PickerState::new(
+        let stage1 = ModelPickerOverlay::ConfiguredModel(crate::widgets::PickerState::new(
             vec!["anthropic.personal_code".into()],
             None,
         ));

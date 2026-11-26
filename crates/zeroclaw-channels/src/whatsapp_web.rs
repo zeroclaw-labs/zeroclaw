@@ -415,10 +415,11 @@ pub struct WhatsAppWebChannel {
     tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
     /// Voice transcription (STT) config
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
-    transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+    transcription_manager:
+        Option<std::sync::Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
     /// Text-to-speech runtime for voice replies (built from
     /// `tts_providers.<type>.<alias>`).
-    tts_manager: Option<Arc<super::tts::TtsManager>>,
+    tts_manager: Option<Arc<zeroclaw_providers::tts::TtsManager>>,
     /// Chats awaiting a voice reply — maps chat JID to the latest substantive
     /// reply text. A background task debounces and sends the voice note after
     /// the agent finishes its turn (no new send() for 3 seconds).
@@ -484,7 +485,7 @@ struct WhatsAppInboundContext {
     dm_mention_patterns: Arc<Vec<regex::Regex>>,
     group_mention_patterns: Arc<Vec<regex::Regex>>,
     transcription_config: Option<zeroclaw_config::schema::TranscriptionConfig>,
-    transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
+    transcription_manager: Option<Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
@@ -639,15 +640,13 @@ impl WhatsAppWebChannel {
 
     /// Configure voice transcription from a `[transcription]` snapshot.
     ///
-    /// Compatibility and test path. The daemon routes every channel through
-    /// `with_transcription_manager` with a manager built from live
-    /// config and the owning agent's resolved provider; this path can only see
-    /// the legacy section, so it binds a lone registered provider and
-    /// otherwise leaves the choice unbound (see
-    /// `transcription::manager_from_snapshot`).
+    /// Test fixture only: project historical input before constructing the
+    /// canonical manager. Production injects a manager built from the live
+    /// configuration and the owning agent's exact model reference.
     #[cfg(feature = "whatsapp-web")]
-    pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
-        let manager = super::transcription::manager_from_snapshot(&config);
+    #[cfg(test)]
+    fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
+        let manager = crate::transcription_fixture(&config);
         self.with_transcription_manager(config, manager)
     }
 
@@ -658,7 +657,7 @@ impl WhatsAppWebChannel {
     pub(crate) fn with_transcription_manager(
         mut self,
         config: zeroclaw_config::schema::TranscriptionConfig,
-        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+        manager: Option<std::sync::Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
     ) -> Self {
         if let Some(manager) = manager {
             self.transcription_manager = Some(manager);
@@ -669,9 +668,9 @@ impl WhatsAppWebChannel {
 
     #[cfg(feature = "whatsapp-web")]
     pub fn with_tts(mut self, config: &zeroclaw_config::schema::Config) -> Self {
-        if config.tts.enabled {
+        if zeroclaw_providers::tts::is_enabled(config) {
             let owner = config.agent_for_channel(&format!("whatsapp.{}", self.alias));
-            match super::tts::TtsManager::from_config_for_agent(config, owner) {
+            match zeroclaw_providers::tts::TtsManager::from_config_for_agent(config, owner) {
                 Ok(m) => self.tts_manager = Some(Arc::new(m)),
                 Err(e) => ::zeroclaw_log::record!(
                     WARN,
@@ -1497,7 +1496,7 @@ impl WhatsAppWebChannel {
         client: &whatsapp_rust::Client,
         audio: &waproto::whatsapp::message::AudioMessage,
         transcription_config: Option<&zeroclaw_config::schema::TranscriptionConfig>,
-        transcription_manager: Option<&super::transcription::TranscriptionManager>,
+        transcription_manager: Option<&zeroclaw_providers::transcription::TranscriptionManager>,
     ) -> Option<String> {
         let config = transcription_config?;
         let manager = transcription_manager?;
@@ -2045,7 +2044,7 @@ impl WhatsAppWebChannel {
         client: &whatsapp_rust::Client,
         to: &wacore_binary::jid::Jid,
         text: &str,
-        tts_manager: &super::tts::TtsManager,
+        tts_manager: &zeroclaw_providers::tts::TtsManager,
     ) -> Result<()> {
         let audio_bytes = tts_manager.synthesize_opus(text).await?;
         let audio_len = audio_bytes.len();
@@ -4795,14 +4794,15 @@ impl WhatsAppWebChannel {
         Self { _private: () }
     }
 
-    pub fn with_transcription(self, _config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
+    #[cfg(test)]
+    fn with_transcription(self, _config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
         self
     }
 
     pub(crate) fn with_transcription_manager(
         self,
         _config: zeroclaw_config::schema::TranscriptionConfig,
-        _manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+        _manager: Option<std::sync::Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
     ) -> Self {
         self
     }
@@ -7438,7 +7438,7 @@ mod tests {
             },
         );
         let manager =
-            super::super::transcription::build_channel_transcription_manager(&config, "groq.fast")
+            zeroclaw_providers::transcription::build_transcription_manager(&config, "groq.fast")
                 .expect("typed provider must build a manager");
 
         let cfg = zeroclaw_config::schema::WhatsAppConfig {

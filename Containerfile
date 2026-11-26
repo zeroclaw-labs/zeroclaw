@@ -15,7 +15,7 @@ RUN <<-EOF
     # is safe — the runtime sandboxes network access. The port is only reachable
     # when the operator explicitly publishes it via -p/--publish.
     printf '%s\n' \
-        'schema_version = 4' \
+        'schema_version = 5' \
         'default_provider = "custom"' \
         'default_model = "opencode/big-pickle"' \
         'default_temperature = 0.7' \

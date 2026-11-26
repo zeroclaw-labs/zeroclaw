@@ -15,10 +15,11 @@ see [Configuration](./configuration.md); for the one-line catalog entry see the
 
 ## Config
 
-Codex subscription auth lives on the `openai` slot. Set `wire_api = "responses"`
-to route through `POST /v1/responses` (the Codex backend, not the chat
-completions API) and `requires_openai_auth = true` to pull credentials from
-ZeroClaw's stored `openai-codex` auth profile instead of an `api_key` field:
+Codex subscription auth lives on an OpenAI connection. Set
+`api.chat.wire_api = "responses"` to route through `POST /v1/responses` (the
+Codex backend, not the chat completions API) and `auth.mode = "codex"` to pull
+credentials from ZeroClaw's stored `openai-codex` auth profile instead of an
+`api_key` field:
 
 ```bash
 # Reuse an existing Codex CLI login:
@@ -34,22 +35,29 @@ Quickstart can write the provider entry for you:
 zeroclaw quickstart --model-provider openai-codex --model gpt-5.4
 ```
 
-Manual config uses the same canonical OpenAI slot:
+Manual config uses one reusable connection and two canonical chat models:
 
 ```toml
-[providers.models.openai.coding]
-model                = "gpt-5.4"
-wire_api             = "responses"
-requires_openai_auth = true
+[providers.connections."openai.codex"]
+kind = "openai"
+auth = { mode = "codex" }
 
-[providers.models.openai.review]
-model                = "codex-auto-review"
-wire_api             = "responses"
-requires_openai_auth = true
+[providers.connections."openai.codex".api.chat]
+wire_api = "responses"
+
+[providers.models."chat.openai.coding"]
+capability = "chat"
+provider = "openai.codex"
+model = "gpt-5.4"
+
+[providers.models."chat.openai.review"]
+capability = "chat"
+provider = "openai.codex"
+model = "codex-auto-review"
 ```
 
-There is no `api_key` field; `requires_openai_auth = true` is the switch that
-reads the stored Codex login rather than a key on the entry. See
+There is no `api_key` field; `auth.mode = "codex"` is the setting that reads
+the stored Codex login rather than a key on the entry. See
 [Configuration → OAuth and subscription auth](./configuration.md#oauth-and-subscription-auth).
 
 ### Astra on the Codex subscription backend
@@ -60,14 +68,14 @@ catalog serves the same ID, or any Astra ID, to this account. Query the live
 Codex catalog as described below, then use the exact returned string:
 
 ```toml
-[providers.models.openai.astra_subscription]
-model                = "<exact-astra-id-from-codex-catalog>"
-wire_api             = "responses"
-requires_openai_auth = true
+[providers.models."chat.openai.astra_subscription"]
+capability = "chat"
+provider = "openai.codex"
+model = "<exact-astra-id-from-codex-catalog>"
 ```
 
-Keep `api_key` and `temperature` unset. `requires_openai_auth = true` selects
-the stored Codex login; it is not an alternative spelling for API-key auth.
+Keep `api_key` and `temperature` unset. `auth.mode = "codex"` selects the
+stored Codex login; it is not an alternative spelling for API-key auth.
 Use a reasoning level shared by the current ZeroClaw validator and the selected
 backend, such as `low`, `medium`, `high`, or `xhigh`, and verify it with a real
 request. Follow the [Astra configuration checklist](./configuration.md#openai-astra-setup)
@@ -79,7 +87,7 @@ live catalog contains the configured ID, and an agent request returns output.
 API-key verification and Codex-subscription verification are independent.
 
 The alias half (`coding`, `review`) is operator-chosen; pick whatever fits.
-Reference it from an agent with `model_provider = "openai.coding"`.
+Reference it from an agent with `model_provider = "chat.openai.coding"`.
 
 ## Models
 
@@ -339,8 +347,8 @@ A healthy run returns model output with `exit_code=0`. Two failure signatures:
    (move aside any foreign `auth-profiles.json` first).
 3. `zeroclaw auth status` shows `openai-codex:default ... kind=OAuth ...
    expires=<future>`.
-4. An `openai` entry with `wire_api = "responses"`, `requires_openai_auth =
-   true`, and an exact served model ID.
+4. An OpenAI connection with `api.chat.wire_api = "responses"`,
+   `auth.mode = "codex"`, and a canonical model bound to an exact served ID.
 5. Daemon on `--config-dir ~/.zeroclaw` (the default).
 6. Drive the agent once → `exit_code=0` with real output.
 7. Router maps roles to current served IDs (don't pin a version you will have

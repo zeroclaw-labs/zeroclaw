@@ -40,7 +40,7 @@ export function configHref(
   if (c === 'platform') return null;
 
   if (c.includes('model')) {
-    return key ? `/config/providers.models/${key}` : '/config/providers.models';
+    return '/config/providers.registry';
   }
   if (c.includes('chat') || c.includes('channel')) {
     return key ? `/config/channels/${key}` : '/config/channels';

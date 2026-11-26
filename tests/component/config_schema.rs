@@ -9,6 +9,22 @@ fn migrate(toml_str: &str) -> Config {
     migration::migrate_to_current(toml_str).expect("migration succeeds")
 }
 
+fn model_temperature(config: &Config) -> Option<f64> {
+    let models = serde_json::to_value(&config.providers.models).unwrap();
+    models.as_object()?.values().find_map(|family| {
+        family
+            .as_object()
+            .and_then(|entries| {
+                entries.values().find_map(|entry| {
+                    entry["options"]["temperature"]
+                        .as_f64()
+                        .or_else(|| entry["temperature"].as_f64())
+                })
+            })
+            .or_else(|| family["options"]["temperature"].as_f64())
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Invalid value fail-fast
 // ─────────────────────────────────────────────────────────────────────────────
@@ -34,17 +50,7 @@ totally_unknown_key = "should be ignored"
 another_fake = 42
 "#,
     );
-    assert!(
-        (config
-            .providers
-            .models
-            .find("openai", "default")
-            .and_then(|e| e.temperature)
-            .unwrap_or(0.7)
-            - 0.7)
-            .abs()
-            < f64::EPSILON
-    );
+    assert!((model_temperature(&config).unwrap_or(0.7) - 0.7).abs() < f64::EPSILON);
 }
 
 #[test]
@@ -81,18 +87,8 @@ fn config_out_of_range_temperature_fails() {
 api_key = "sk-test"
 temperature = 99.0
 "#;
-    let config: Config = toml::from_str(toml_str).expect("parses");
-    // Out-of-range temperature is stored but caught by validate().
-    assert_eq!(
-        config
-            .providers
-            .models
-            .find("openai", "default")
-            .expect("entry exists")
-            .temperature,
-        Some(99.0)
-    );
-    let err = config.validate().expect_err("temperature 99.0 should fail");
+    let err = toml::from_str::<Config>(toml_str)
+        .expect_err("temperature 99.0 must fail configuration admission");
     assert!(
         err.to_string().contains("temperature"),
         "expected temperature validation error, got: {err}"
@@ -106,17 +102,8 @@ fn config_negative_temperature_fails() {
 api_key = "sk-test"
 temperature = -0.5
 "#;
-    let config: Config = toml::from_str(toml_str).expect("parses");
-    assert_eq!(
-        config
-            .providers
-            .models
-            .find("openai", "default")
-            .expect("entry exists")
-            .temperature,
-        Some(-0.5)
-    );
-    let err = config.validate().expect_err("temperature -0.5 should fail");
+    let err = toml::from_str::<Config>(toml_str)
+        .expect_err("temperature -0.5 must fail configuration admission");
     assert!(
         err.to_string().contains("temperature"),
         "expected temperature validation error, got: {err}"
@@ -460,17 +447,7 @@ fn config_minimal_toml_with_temperature_uses_defaults() {
 #[test]
 fn config_only_temperature_parses() {
     let config = migrate("default_temperature = 1.2\ndefault_provider = \"openai\"\n");
-    assert!(
-        (config
-            .providers
-            .models
-            .find("openai", "default")
-            .and_then(|e| e.temperature)
-            .unwrap_or(0.7)
-            - 1.2)
-            .abs()
-            < f64::EPSILON
-    );
+    assert!((model_temperature(&config).unwrap_or(0.7) - 1.2).abs() < f64::EPSILON);
     let agent = config
         .agent("default")
         .expect("migration synthesized agents.default");
@@ -488,17 +465,7 @@ future_feature = true
 value = 123
 "#,
     );
-    assert!(
-        (config
-            .providers
-            .models
-            .find("openai", "default")
-            .and_then(|e| e.temperature)
-            .unwrap_or(0.7)
-            - 0.5)
-            .abs()
-            < f64::EPSILON
-    );
+    assert!((model_temperature(&config).unwrap_or(0.7) - 0.5).abs() < f64::EPSILON);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

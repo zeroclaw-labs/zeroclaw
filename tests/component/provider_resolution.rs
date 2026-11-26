@@ -1,13 +1,18 @@
 //! TG1: ModelProvider End-to-End Resolution Tests
 
 use zeroclaw::providers::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
-use zeroclaw::providers::{
-    create_model_provider, create_model_provider_with_options, create_model_provider_with_url,
-};
+use zeroclaw::providers::create_model_provider;
 
 /// Helper: assert model_provider creation succeeds
 fn assert_provider_ok(name: &str, key: Option<&str>, url: Option<&str>) {
-    let result = create_model_provider_with_url(name, key, url);
+    let result = create_model_provider(
+        name,
+        key,
+        &zeroclaw::providers::ModelProviderRuntimeOptions {
+            provider_api_url: url.map(str::to_owned),
+            ..Default::default()
+        },
+    );
     assert!(
         result.is_ok(),
         "{name} model_provider should resolve: {}",
@@ -104,7 +109,7 @@ fn factory_custom_https_url_resolves() {
 
 #[test]
 fn factory_custom_ftp_url_rejected() {
-    let result = create_model_provider_with_url("custom:ftp://example.com", None, None);
+    let result = create_model_provider("custom:ftp://example.com", None, &Default::default());
     assert!(result.is_err(), "ftp scheme should be rejected");
     let err_msg = result.err().unwrap().to_string();
     assert!(
@@ -115,13 +120,13 @@ fn factory_custom_ftp_url_rejected() {
 
 #[test]
 fn factory_custom_empty_url_rejected() {
-    let result = create_model_provider_with_url("custom:", None, None);
+    let result = create_model_provider("custom:", None, &Default::default());
     assert!(result.is_err(), "empty custom URL should be rejected");
 }
 
 #[test]
 fn factory_unknown_provider_rejected() {
-    let result = create_model_provider_with_url("nonexistent_provider_xyz", None, None);
+    let result = create_model_provider("nonexistent_provider_xyz", None, &Default::default());
     assert!(
         result.is_err(),
         "unknown model_provider name should be rejected"
@@ -222,7 +227,7 @@ fn convenience_factory_resolves_major_providers() {
         "fireworks",
         "perplexity",
     ] {
-        let result = create_model_provider(provider_name, Some("test-key"));
+        let result = create_model_provider(provider_name, Some("test-key"), &Default::default());
         assert!(
             result.is_ok(),
             "convenience factory should resolve {provider_name}: {}",
@@ -233,7 +238,7 @@ fn convenience_factory_resolves_major_providers() {
 
 #[test]
 fn convenience_factory_ollama_no_key() {
-    let result = create_model_provider("ollama", None);
+    let result = create_model_provider("ollama", None, &Default::default());
     assert!(
         result.is_ok(),
         "ollama should not require api key: {}",
@@ -273,7 +278,7 @@ fn factory_resolves_synthetic_provider() {
 #[test]
 fn factory_resolves_openai_codex_provider() {
     let options = zeroclaw::providers::ModelProviderRuntimeOptions::default();
-    let result = create_model_provider_with_options("openai-codex", None, &options);
+    let result = create_model_provider("openai-codex", None, &options);
     assert!(
         result.is_ok(),
         "openai-codex model_provider should resolve: {}",

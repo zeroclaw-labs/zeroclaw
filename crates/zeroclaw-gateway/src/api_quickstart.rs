@@ -337,7 +337,10 @@ mod tests {
                 provider_type: "anthropic".into(),
                 alias: "anthropic".into(),
                 model: "claude-sonnet-4-5".into(),
-                fields: std::collections::HashMap::from([("api_key".into(), "sk-test".into())]),
+                fields: std::collections::HashMap::from([(
+                    "auth.api_key".into(),
+                    "sk-test".into(),
+                )]),
             }),
             risk_profile: SelectorChoice::Fresh("balanced".into()),
             runtime_profile: SelectorChoice::Fresh("balanced".into()),

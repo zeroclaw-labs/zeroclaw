@@ -3,14 +3,14 @@ import test from 'node:test';
 
 import { configHref } from './integrations.logic.ts';
 
-test('model providers route on the API config key, not a display-name slug', () => {
+test('model provider families open the canonical connections editor', () => {
   assert.equal(
     configHref('Z.AI', 'AiModel', 'zai'),
-    '/config/providers.models/zai',
+    '/config/providers.registry',
   );
   assert.equal(
     configHref('Azure OpenAI', 'AiModel', 'azure'),
-    '/config/providers.models/azure',
+    '/config/providers.registry',
   );
 });
 
@@ -24,7 +24,7 @@ test('chat channels route on the ChannelsConfig map key', () => {
 });
 
 test('entries without a config key fall back to the bare section', () => {
-  assert.equal(configHref('Custom Model', 'AiModel', null), '/config/providers.models');
+  assert.equal(configHref('Custom Model', 'AiModel', null), '/config/providers.registry');
   assert.equal(configHref('Mystery Chat', 'Chat', undefined), '/config/channels');
 });
 

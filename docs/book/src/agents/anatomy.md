@@ -9,14 +9,17 @@ running build. Click a field to expand it; click again to see how to set it.
 
 ## Where the references point
 
-Most of an agent's config is dotted aliases pointing at things configured in
-their own sections. The agent owns none of them, it points, and the same target
+Most of an agent's config is references to things configured in their own
+sections. The agent owns none of them, it points, and the same target
 can be shared by many agents. The field table above is the authoritative list;
 here is where each kind of reference leads:
 
-- **Providers** ([Model Providers](../providers/overview.md)): the agent's
-  chat model and its companion text-to-speech, transcription, and classifier
-  providers each name a `[providers.models.<type>.<alias>]` entry.
+- **Models** ([Model Providers](../providers/overview.md)): the agent's
+  chat, text-to-speech, transcription, and classifier selectors each name an
+  exact key in `providers.models`. For example, `model_provider = "chat.prod"`
+  selects `[providers.models."chat.prod"]`. That model references a reusable
+  connection in `providers.connections`; dots in either name stay part of the
+  key.
 - **Profiles** ([Security & Autonomy](../security/autonomy.md)): the risk
   profile sets the autonomy and sandbox posture; the runtime profile sets
   operational tuning (tool-iteration caps, budgets, timeouts, context limits).
@@ -38,6 +41,10 @@ on-disk side of the join, covered in
 ## Validation
 
 `Config::validate()` fails loud at startup if `model_provider` does not resolve
-to a configured provider entry, or if `risk_profile` does not resolve to a
-configured risk profile. A bad reference is caught before the agent runs, not
-silently ignored.
+to an exact key in `providers.models` with the required chat capability, or if
+`risk_profile` does not resolve to a configured risk profile. For example,
+`model_provider = "chat.gateway.prod"` selects
+`[providers.models."chat.gateway.prod"]`; the reference is not split into
+provider, profile, and model components. Older configuration layouts are
+converted at the config migration boundary before validation. A bad reference
+is caught before the agent runs, not silently ignored.
