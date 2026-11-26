@@ -818,6 +818,10 @@ What a signed-in account can do follows its permission profile:
     open it. Use zerocode when an account needs history that outlasts its
     chat.
 
+Completing sign-in in one dashboard tab tells the other open dashboard
+tabs to check their session. A tab showing the sign-in screen then opens
+the dashboard. Ordinary reloads keep other tabs quiet.
+
 Sign-out ends the session in this ZeroClaw and drops its cookie, also
 when the session had already ended; it does not sign the user out of the
 identity provider. When a session ends (sign-out, expiry, or a
@@ -1087,9 +1091,10 @@ opens inside an allowed root instead.
 
 ### Keycloak access-token client attribution
 
-JWKS verification accepts a signed `azp` as the OAuth client identifier when a
-typed access token has no `client_id` and the configured client declaration or
-`actor_claim` establishes a human actor. The issuer, signature, token purpose,
+With the default claim names, JWKS verification accepts a signed `azp` as the
+OAuth client identifier when a typed access token has no `client_id` and the
+configured client declaration or `actor_claim` establishes a human actor.
+The issuer, signature, token purpose,
 audience, lifetime and actor-classification checks still apply. An `azp`-only
 token cannot authenticate a service, including one classified by `actor_claim`;
 service actors still require `client_id`. A blank `client_id`, contradictory

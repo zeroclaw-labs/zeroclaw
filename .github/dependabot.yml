@@ -10,12 +10,18 @@ updates:
     labels:
       - "dependencies"
     groups:
-      rust-all:
+      # Patch updates get their own PR, so a security fix that ships as a
+      # patch release is not held behind a large batch of minor updates.
+      rust-patch:
+        patterns:
+          - "*"
+        update-types:
+          - patch
+      rust-minor:
         patterns:
           - "*"
         update-types:
           - minor
-          - patch
 
   - package-ecosystem: npm
     directory: "/web"

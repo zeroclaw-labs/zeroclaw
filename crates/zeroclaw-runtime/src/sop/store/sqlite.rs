@@ -27,6 +27,12 @@ CREATE TABLE IF NOT EXISTS sop_runs (
     json             TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sop_runs_terminal ON sop_runs(terminal);
+CREATE TRIGGER IF NOT EXISTS trg_sop_runs_keep_terminal
+BEFORE UPDATE OF terminal ON sop_runs
+WHEN OLD.terminal = 1 AND NEW.terminal = 0
+BEGIN
+    SELECT RAISE(ABORT, 'a terminal SOP run cannot be reopened');
+END;
 CREATE TABLE IF NOT EXISTS sop_events (
     seq     INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id  TEXT NOT NULL,
@@ -963,6 +969,76 @@ mod tests {
             a.load_run("r1").unwrap().unwrap().run.status,
             SopRunStatus::Completed
         );
+    }
+
+    #[test]
+    fn sqlite_schema_refuses_only_the_terminal_to_active_transition() {
+        let store = SqliteRunStore::open_in_memory().unwrap();
+        let conn = store.lock().unwrap();
+        conn.execute_batch(
+            "INSERT INTO sop_runs(run_id, revision, json) VALUES ('run', 0, '{}');
+             UPDATE sop_runs SET terminal=0, revision=1;
+             UPDATE sop_runs SET terminal=1, revision=2;
+             UPDATE sop_runs SET terminal=1;",
+        )
+        .unwrap();
+
+        let err = conn
+            .execute("UPDATE sop_runs SET terminal=0, revision=3", [])
+            .unwrap_err();
+        assert_eq!(
+            err.sqlite_extended_error_code(),
+            Some(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER)
+        );
+        let row: (i64, i64) = conn
+            .query_row("SELECT terminal, revision FROM sop_runs", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(row, (1, 2));
+    }
+
+    #[test]
+    fn opening_existing_sqlite_store_protects_terminal_history_from_older_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db");
+        let old_writer = Connection::open(&path).unwrap();
+        // A database with the sop_runs schema from before the terminal trigger.
+        old_writer
+            .execute_batch(
+                "CREATE TABLE sop_runs (
+                    run_id TEXT PRIMARY KEY, revision INTEGER NOT NULL,
+                    terminal INTEGER NOT NULL DEFAULT 0, last_progress_at TEXT, json TEXT NOT NULL
+                 );
+                 INSERT INTO sop_runs VALUES ('run', 7, 1, 'before', '{}');",
+            )
+            .unwrap();
+
+        drop(SqliteRunStore::open(&path).unwrap());
+        drop(SqliteRunStore::open(&path).unwrap());
+        // The older save_run writer uses ON CONFLICT DO UPDATE on its own connection.
+        let err = old_writer
+            .execute(
+                "INSERT INTO sop_runs VALUES ('run', 8, 0, 'after', 'new')
+                 ON CONFLICT(run_id) DO UPDATE SET terminal=excluded.terminal,
+                     revision=excluded.revision, last_progress_at=excluded.last_progress_at,
+                     json=excluded.json",
+                [],
+            )
+            .unwrap_err();
+        assert_eq!(
+            err.sqlite_extended_error_code(),
+            Some(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER)
+        );
+        let preserved: bool = old_writer
+            .query_row(
+                "SELECT revision=7 AND terminal=1 AND last_progress_at='before' AND json='{}'
+                 FROM sop_runs WHERE run_id='run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(preserved);
     }
 
     #[test]
