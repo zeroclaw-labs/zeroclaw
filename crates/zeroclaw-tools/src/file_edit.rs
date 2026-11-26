@@ -368,6 +368,39 @@ mod tests {
         assert_eq!(tool.name(), "file_edit");
     }
 
+    #[tokio::test]
+    async fn file_edit_matches_unicode_exactly_and_preserves_surrounding_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("document.txt");
+        let original = "  café 🦀\r\n  cafe\u{301} 中文\r\ncafé tail\r\n";
+        std::fs::write(&path, original).unwrap();
+        let tool = test_tool(dir.path().to_path_buf());
+
+        let ambiguous = tool
+            .execute(json!({"path": "document.txt", "old_string": "café", "new_string": "changed"}))
+            .await
+            .unwrap();
+        assert!(!ambiguous.success);
+        assert!(
+            ambiguous
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("matches 2 times")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original.as_bytes());
+
+        let edited = tool
+            .execute(json!({"path": "document.txt", "old_string": "cafe\u{301}", "new_string": "修正 🦀"}))
+            .await
+            .unwrap();
+        assert!(edited.success, "{:?}", edited.error);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            "  café 🦀\r\n  修正 🦀 中文\r\ncafé tail\r\n".as_bytes()
+        );
+    }
+
     // ── Ephemeral-workspace warning────────────────
 
     #[tokio::test]

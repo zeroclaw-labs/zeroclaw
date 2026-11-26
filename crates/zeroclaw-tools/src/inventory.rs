@@ -84,6 +84,9 @@ impl BuiltinToolCompilation {
                     OptInTool::CodexCli => cfg!(feature = "tool-codex-cli"),
                     OptInTool::GeminiCli => cfg!(feature = "tool-gemini-cli"),
                     OptInTool::OpenCodeCli => cfg!(feature = "tool-opencode-cli"),
+                    // Web search has no owner feature beyond its own: `compiled()`
+                    // already carries `tools-external`.
+                    OptInTool::WebSearch => true,
                 };
                 owner_compiled && tool.compiled()
             }
@@ -739,6 +742,20 @@ mod tests {
         assert_eq!(
             core, expected,
             "the Core tier must be exactly the retained core set"
+        );
+    }
+
+    #[test]
+    fn core_rows_match_configured_core_names() {
+        let mut core: Vec<_> = builtin_tools_in(ToolTier::Core)
+            .map(|spec| spec.name)
+            .collect();
+        let mut configured = zeroclaw_config::builtin_tools::CORE_TOOL_NAMES.to_vec();
+        core.sort_unstable();
+        configured.sort_unstable();
+        assert_eq!(
+            core, configured,
+            "Core inventory and CORE_TOOL_NAMES differ"
         );
     }
 
