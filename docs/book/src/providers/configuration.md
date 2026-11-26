@@ -304,9 +304,11 @@ used for backward compatibility.
 
 ## Native thinking display (Anthropic)
 
-`agent.thinking.display` controls how Anthropic extended thinking is
-delivered when native thinking is enabled (`agent.thinking.native_thinking
-= true`). Accepted values:
+Set `display` in `[runtime_profiles.<profile>.thinking]` to control how
+Anthropic extended thinking is delivered. Select that profile with
+`runtime_profile` in the agent's `[agents.<alias>]` table. The display
+setting applies when `native_thinking = true` and the selected thinking
+level has a native token budget (`high` or `max`). Accepted values:
 
 - `off` (default): no `display` field is sent; requests are byte-identical
   to earlier ZeroClaw versions and thinking requests use the non-streaming
@@ -322,10 +324,15 @@ delivered when native thinking is enabled (`agent.thinking.native_thinking
 - `summarized`: same streaming behavior, requesting summarized thinking.
 
 ```toml
-[agent.thinking]
+[runtime_profiles.deep.thinking]
+default_level = "high"
 native_thinking = true
 display = "updates"
 ```
+
+Set `runtime_profile = "deep"` in an existing agent entry to use this
+example. If the agent already selects a runtime profile, put the
+thinking settings in that profile instead.
 
 The setting requires an Anthropic account enrolled in the
 `thinking-display-updates` beta; without enrollment the API rejects the
