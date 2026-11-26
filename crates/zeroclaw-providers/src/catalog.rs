@@ -72,6 +72,10 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         // Atlas Cloud exposes a no-auth OpenAI-compatible `/models` endpoint.
         // `list_models_for_family` handles that path before using this tuple.
         "atlascloud" => (None, None),
+        // TrustedRouter exposes a no-auth OpenAI-compatible `/v1/models` endpoint
+        // (`PUBLIC_MODEL_LISTING`); live listing and pricing come directly from it,
+        // never from models.dev or OpenRouter.
+        "trustedrouter" => (None, None),
         "synthetic" => (Some("synthetic"), None),
         "opencode" => (Some("opencode"), None),
         "atomic_chat" => (Some("atomic-chat"), None),
@@ -500,6 +504,13 @@ mod tests {
     #[test]
     fn atlascloud_family_uses_provider_catalog_source() {
         let (md, or) = catalog_source_for("atlascloud").expect("atlascloud is canonical");
+        assert_eq!(md, None);
+        assert_eq!(or, None);
+    }
+
+    #[test]
+    fn trustedrouter_family_uses_public_provider_listing() {
+        let (md, or) = catalog_source_for("trustedrouter").expect("trustedrouter is canonical");
         assert_eq!(md, None);
         assert_eq!(or, None);
     }

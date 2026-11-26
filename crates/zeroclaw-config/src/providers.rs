@@ -27,9 +27,9 @@ use super::schema::{
     PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
     RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
     SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
-    TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
-    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
-    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    TelnyxModelProviderConfig, TogetherModelProviderConfig, TrustedRouterModelProviderConfig,
+    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
+    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
     ZerorouterModelProviderConfig,
 };
 use super::schema::{
@@ -203,6 +203,7 @@ macro_rules! for_each_model_provider_slot {
             (cloudflare, "cloudflare", CloudflareModelProviderConfig),
             (atlascloud, "atlascloud", AtlasCloudModelProviderConfig),
             (cheaperinference, "cheaperinference", CheaperInferenceModelProviderConfig),
+            (trustedrouter, "trustedrouter", TrustedRouterModelProviderConfig),
             (ovh, "ovh", OvhModelProviderConfig),
             (copilot, "copilot", CopilotModelProviderConfig),
             (lmstudio, "lmstudio", LmstudioModelProviderConfig),

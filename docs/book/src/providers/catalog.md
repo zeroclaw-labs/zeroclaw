@@ -622,6 +622,30 @@ To bridge an existing `CHEAPER_INFERENCE_API_KEY` shell variable into
 ZeroClaw's schema-mirror env surface, set
 `ZEROCLAW_providers__models__cheaperinference__default__api_key="$CHEAPER_INFERENCE_API_KEY"`.
 
+**TrustedRouter**: slot `trustedrouter`. An OpenAI-compatible LLM gateway
+exposing multi-vendor models and routing pools through one endpoint,
+`https://api.trustedrouter.com/v1`, with bearer-token auth. Model IDs include
+vendor-prefixed IDs (for example `anthropic/claude-sonnet-4.6` or
+`openai/gpt-5.4-mini`) and TrustedRouter routing pools (`trustedrouter/auto`,
+`trustedrouter/zdr`, `trustedrouter/e2e`, `trustedrouter/fast`,
+`trustedrouter/cheap`, `trustedrouter/free`). The `/v1/models` endpoint is
+public (`PUBLIC_MODEL_LISTING`), so model discovery and per-token pricing load
+live without a credential. Inference requires an API key from
+[trustedrouter.com](https://trustedrouter.com); current models and pricing are
+listed at [trustedrouter.com/models](https://trustedrouter.com/models). Use the
+canonical `trustedrouter` slot only; `trusted-router` and `trusted_router` are
+not runtime aliases.
+
+```toml
+[providers.models.trustedrouter.default]
+model = "trustedrouter/auto"
+api_key = "..."
+```
+
+To bridge an existing `TRUSTEDROUTER_API_KEY` shell variable into ZeroClaw's
+schema-mirror env surface, set
+`ZEROCLAW_providers__models__trustedrouter__default__api_key="$TRUSTEDROUTER_API_KEY"`.
+
 > Credentials come only from config (`api_key`) or the `--credential` override at run
 > time, these slots do **not** read a per-provider `*_API_KEY` environment variable.
 

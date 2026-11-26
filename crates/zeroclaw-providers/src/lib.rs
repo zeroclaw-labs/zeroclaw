@@ -2388,6 +2388,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("cloudflare", "Cloudflare AI", false),
             ("atlascloud", "Atlas Cloud", false),
             ("cheaperinference", "Cheaper Inference", false),
+            ("trustedrouter", "TrustedRouter", false),
             ("moonshot", "Moonshot", false),
             ("synthetic", "Synthetic", false),
             ("opencode", "OpenCode", false),
@@ -2699,6 +2700,42 @@ mod tests {
         assert!(
             create_model_provider("cheaperinference", Some("provider-test-credential")).is_ok(),
             "Cheaper Inference should construct through the OpenAI-compatible family factory"
+        );
+    }
+
+    #[test]
+    fn resolve_trustedrouter_credential_stays_on_typed_alias_boundary() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("TRUSTEDROUTER_API_KEY", Some("  trustedrouter-env-key  "));
+        assert!(resolve_model_provider_credential("trustedrouter", None).is_none());
+        assert_eq!(
+            resolve_model_provider_credential("trustedrouter", Some("  explicit-key  ")).as_deref(),
+            Some("explicit-key")
+        );
+    }
+
+    #[test]
+    fn trustedrouter_uses_canonical_provider_id_only() {
+        assert_eq!(
+            canonicalize_v2_model_provider_name("trustedrouter"),
+            "trustedrouter"
+        );
+        for alias in ["trusted-router", "trusted_router"] {
+            assert_eq!(canonicalize_v2_model_provider_name(alias), alias);
+        }
+    }
+
+    #[test]
+    fn trustedrouter_provider_is_listed_and_constructible() {
+        let providers = list_model_providers();
+        let trustedrouter = providers
+            .iter()
+            .find(|provider| provider.name == "trustedrouter")
+            .expect("TrustedRouter provider should be listed");
+        assert_eq!(trustedrouter.display_name, "TrustedRouter");
+        assert!(
+            create_model_provider("trustedrouter", Some("provider-test-credential")).is_ok(),
+            "TrustedRouter should construct through the OpenAI-compatible family factory"
         );
     }
 
@@ -4083,6 +4120,10 @@ mod tests {
         assert_eq!(
             default_model_provider_url("cheaperinference"),
             Some("https://api.cheaperinference.com/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("trustedrouter"),
+            Some("https://api.trustedrouter.com/v1")
         );
     }
 

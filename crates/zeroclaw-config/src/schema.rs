@@ -2772,6 +2772,78 @@ model = "gpt-5.4-mini"
     }
 }
 
+// ── TrustedRouter ──
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TrustedRouterEndpoint {
+    #[default]
+    Default,
+}
+
+impl TrustedRouterEndpoint {
+    /// Canonical TrustedRouter endpoint. Single source of truth:
+    /// `CompatFamilySpec::DEFAULT_URL` for `TrustedRouterModelProviderConfig`
+    /// references this const so the schema and factory surfaces never drift.
+    pub const DEFAULT_URI: &'static str = "https://api.trustedrouter.com/v1";
+}
+
+impl ModelEndpoint for TrustedRouterEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => Self::DEFAULT_URI,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.trustedrouter"]
+pub struct TrustedRouterModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+#[cfg(test)]
+mod trustedrouter_tests {
+    use super::*;
+
+    #[test]
+    fn trustedrouter_endpoint_uri() {
+        assert_eq!(
+            TrustedRouterEndpoint::Default.uri(),
+            "https://api.trustedrouter.com/v1"
+        );
+    }
+
+    #[test]
+    fn trustedrouter_config_defaults_empty() {
+        let cfg = TrustedRouterModelProviderConfig::default();
+        assert!(cfg.base.api_key.is_none());
+        assert!(cfg.base.model.is_none());
+    }
+
+    #[test]
+    fn trustedrouter_alias_round_trips_through_config() {
+        let toml = r#"
+[providers.models.trustedrouter.default]
+model = "trustedrouter/auto"
+"#;
+        let config: Config = toml::from_str(toml).expect("trustedrouter alias deserializes");
+        let alias = config
+            .providers
+            .models
+            .trustedrouter
+            .get("default")
+            .expect("trustedrouter.default present");
+        assert_eq!(alias.base.model.as_deref(), Some("trustedrouter/auto"));
+    }
+}
+
 // ── OVH ──
 
 #[derive(
@@ -3977,6 +4049,7 @@ impl_default_family_endpoint! {
     CloudflareModelProviderConfig,
     AtlasCloudModelProviderConfig,
     CheaperInferenceModelProviderConfig,
+    TrustedRouterModelProviderConfig,
     OvhModelProviderConfig,
     CopilotModelProviderConfig,
     DoubaoModelProviderConfig,
