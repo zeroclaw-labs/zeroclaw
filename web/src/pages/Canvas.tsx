@@ -292,7 +292,6 @@ export default function Canvas() {
 
   return (
     <div className="p-6 space-y-4 h-full flex flex-col">
-      {/* Header */}
       <PageHeader
         title={
           <span className="inline-flex items-center gap-2.5">
@@ -347,7 +346,6 @@ export default function Canvas() {
         </div>
       )}
 
-      {/* Canvas selector */}
       <div className="flex items-center gap-2 flex-wrap">
         <input
           type="text"
@@ -389,9 +387,7 @@ export default function Canvas() {
         )}
       </div>
 
-      {/* Main content area */}
       <div className="flex-1 flex gap-4 min-h-0">
-        {/* Canvas viewer */}
         <div className="flex-1 rounded-[var(--radius-lg)] border border-pc-border bg-pc-base overflow-hidden shadow-[var(--pc-shadow-sm)]">
           {currentFrame ? (
             <iframe
@@ -416,7 +412,6 @@ export default function Canvas() {
           )}
         </div>
 
-        {/* History panel */}
         {showHistory && (
           <Card padded={false} className="w-64 overflow-y-auto">
             <div className="px-3 py-2 border-b border-pc-border text-[11px] font-medium uppercase tracking-wide text-pc-text-faint sticky top-0 bg-pc-surface">
@@ -460,7 +455,6 @@ export default function Canvas() {
         )}
       </div>
 
-      {/* Frame info bar */}
       {currentFrame && (
         <div className="flex items-center justify-between px-3 py-2 rounded-[var(--radius-md)] text-xs bg-pc-elevated border border-pc-border text-pc-text-muted">
           <span>

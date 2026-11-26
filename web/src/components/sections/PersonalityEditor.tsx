@@ -4,8 +4,8 @@
 // prompt at request time — this component is the dashboard's authoring
 // surface for them.
 //
-// `agent` is reserved for #5890 (multi-agent workspaces). Today it is
-// passed through to the API client and ignored by the gateway.
+// `agent` selects the agent whose workspace personality files are listed,
+// read and saved.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import MarkdownEditor from '@/components/MarkdownEditor';
@@ -339,7 +339,6 @@ export default function PersonalityEditor({ agent }: Props) {
         {t('personality.editor_intro')}
       </p>
 
-      {/* Tab strip */}
       <div
         className="flex flex-wrap gap-1 border-b"
         style={{ borderColor: 'var(--pc-border)' }}
@@ -358,10 +357,8 @@ export default function PersonalityEditor({ agent }: Props) {
         ))}
       </div>
 
-      {/* Editor */}
       {active && (
         <div className="flex flex-col gap-2">
-          {/* Edit ↔ Preview segmented toggle */}
           <div
             className="inline-flex self-end rounded-lg border overflow-hidden"
             style={{ borderColor: 'var(--pc-border)' }}

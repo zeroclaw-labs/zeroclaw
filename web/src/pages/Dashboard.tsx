@@ -478,7 +478,6 @@ function OverviewTab({
 
   return (
     <>
-      {/* Status Cards Grid */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 stagger-children">
         {STATUS_CARDS.map(
           ({ icon: Icon, accent, labelKey, getValue, getSub }) => (
@@ -520,7 +519,6 @@ function OverviewTab({
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 stagger-children">
-        {/* Cost Widget */}
         <div className="card p-5 animate-slide-in-up">
           <div className="flex items-center gap-2 mb-5">
             <DollarSign
@@ -604,7 +602,6 @@ function OverviewTab({
           </div>
         </div>
 
-        {/* Active Channels */}
         <div className="card p-5 animate-slide-in-up">
           <div className="flex items-center gap-2 mb-5">
             <Radio className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
@@ -837,7 +834,6 @@ function OverviewTab({
         </div>
       </div>
 
-      {/* Connected TUIs */}
       {tuis.length > 0 && (
         <div className="card p-5 animate-slide-in-up">
           <div className="flex items-center gap-2 mb-5">
@@ -1589,7 +1585,6 @@ function ChannelsTab() {
             e.currentTarget.style.boxShadow = "none";
           }}
         >
-          {/* Header */}
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-3 min-w-0">
               <div
@@ -1866,7 +1861,6 @@ export default function Dashboard() {
         ))}
       </div>
 
-      {/* Tab Content */}
       {activeTab === "overview" && (
         <OverviewTab
           status={status}

@@ -41,9 +41,8 @@ export interface UseFocusTrapOptions {
 }
 
 /**
- * Shared modal focus trap, extracted from the near-identical hand-rolled effects
- * in AgentDrawer / AliasPromptDialog / DoctorFixModal (and mirrored by
- * ui/ConfirmDialog). While `enabled`:
+ * Shared modal focus trap for AgentDrawer / AliasPromptDialog / DoctorFixModal
+ * (ui/ConfirmDialog keeps an equivalent effect of its own). While `enabled`:
  *
  * - remembers `document.activeElement` on enable and restores focus to it on
  *   disable/unmount (the trigger that opened the dialog);
@@ -52,10 +51,10 @@ export interface UseFocusTrapOptions {
  *
  * It deliberately does NOT move initial focus into the dialog — each consumer
  * focuses its own preferred element (close button, search input, …) in a
- * separate effect, so that behavior is preserved exactly.
+ * separate effect.
  *
- * The handler is registered on `window` (matching the original effects), so the
- * trap fires regardless of where focus currently sits within the dialog.
+ * The handler is registered on `window`, so the trap fires regardless of where
+ * focus currently sits within the dialog.
  */
 export function useFocusTrap(
   ref: RefObject<HTMLElement | null>,

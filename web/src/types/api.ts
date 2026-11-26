@@ -198,7 +198,7 @@ export interface ChannelReadiness {
 }
 
 export interface ChannelDetail {
-  /** Composite `<type>.<alias>` identifier (v0.8.0). */
+  /** Composite `<type>.<alias>` identifier. */
   name: string;
   /** Channel type as the schema emits it (kebab; e.g. `"discord"`). */
   type: string;
@@ -266,7 +266,7 @@ export interface WsMessage {
   // the authoritative "unsatisfiable" signal. Absent for ordinary trims and
   // older daemons.
   unsatisfiable_floor?: boolean;
-  // Supervised-mode tool approval (server → client). See #6522.
+  // Supervised-mode tool approval (server → client).
   request_id?: string;
   tool?: string;
   arguments_summary?: string;
@@ -278,12 +278,11 @@ export interface WsMessage {
   // Safety-safeguard fallback notice (server → client), present only on
   // "safeguard_fallback" frames. Display-only: the gateway sends just the
   // model names and which layer switched (`server`/`client`) — never the
-  // classifier category or refusal explanation. See #9262-#9268 (provider
-  // plumbing) plus the gateway/web surfacing built on top of it.
+  // classifier category or refusal explanation.
   requested_model?: string;
   served_model?: string;
   fallback_kind?: "server" | "client" | "client_server";
-  // Context window info (present on "done" frames). See #7311.
+  // Context window info (present on "done" frames).
   // `max_context_tokens` is the preemptive-trim budget the bar fills toward;
   // `model_context_window` is the model's full capacity (bar denominator when present).
   max_context_tokens?: number;

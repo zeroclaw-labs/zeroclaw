@@ -17,9 +17,10 @@ export default function AliasPromptDialog({ label, suggestion, onConfirm, onCanc
   const panelRef = useRef<HTMLDivElement>(null);
 
   // Esc closes; Tab is trapped inside the dialog panel; focus is restored to the
-  // trigger on close. Matches the prior hand-rolled effect (default selector —
-  // no select/textarea, no visibility filter, Esc does not preventDefault).
-  // The dialog is mounted only while open, so the trap is always enabled.
+  // trigger on close. The trap uses the default selector (no select or
+  // textarea) and skips visibility filtering; Escape closes without calling
+  // `preventDefault()`. The dialog is mounted only while open, so the trap is
+  // always enabled.
   // Declared before the focus-on-open effect so the trap captures the trigger as
   // the restore target before focus moves into the input.
   useFocusTrap(panelRef, { onClose: onCancel });
@@ -49,7 +50,6 @@ export default function AliasPromptDialog({ label, suggestion, onConfirm, onCanc
         className="relative w-full max-w-sm mx-4 rounded-[var(--radius-xl)] border border-pc-border bg-pc-base shadow-[var(--pc-shadow-md)] animate-fade-in"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-pc-border">
           <h2 className="text-sm font-semibold text-pc-text">
             {t('alias_prompt.name_this_prefix')}{label}{t('alias_prompt.name_this_suffix')}
@@ -64,7 +64,6 @@ export default function AliasPromptDialog({ label, suggestion, onConfirm, onCanc
           </button>
         </div>
 
-        {/* Body */}
         <div className="px-6 py-5 flex flex-col gap-3">
           <p className="text-xs text-pc-text-muted">
             {t('alias_prompt.description_prefix')}{' '}
@@ -87,7 +86,6 @@ export default function AliasPromptDialog({ label, suggestion, onConfirm, onCanc
           />
         </div>
 
-        {/* Footer */}
         <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-pc-border">
           <Button variant="ghost" onClick={onCancel}>
             {t('common.cancel')}

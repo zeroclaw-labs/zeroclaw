@@ -1,7 +1,7 @@
 import { createContext, useState, useEffect, useCallback, type ReactNode } from 'react';
 import { colorThemeMap, DEFAULT_DARK_THEME, DEFAULT_LIGHT_THEME, type ColorThemeId } from './colorThemes';
 
-// ── Types (was ThemeContextDef.ts) ───────────────────────────────────────────
+// ── Types ────────────────────────────────────────────────────────────────────
 
 export type ThemeMode = 'system' | 'dark' | 'light' | 'oled';
 export type AccentColor = 'cyan' | 'violet' | 'emerald' | 'amber' | 'rose' | 'blue';
@@ -58,7 +58,7 @@ export const ThemeContext = createContext<ThemeContextValue>({
   setMonoFontSize: () => {},
 });
 
-// ── Font loader (was fontLoader.ts) ──────────────────────────────────────────
+// ── Font loader ──────────────────────────────────────────────────────────────
 
 const loadedFonts: Set<string> = new Set();
 
@@ -85,7 +85,7 @@ function loadMonoFont(font: string) {
   if (font === 'cascadia') loadGoogleFont('Cascadia Code');
 }
 
-// ── Locale storage (was localeStorage.ts) ────────────────────────────────────
+// ── Locale storage ───────────────────────────────────────────────────────────
 
 export const LOCALE_STORAGE_KEY = 'zeroclaw-locale';
 
@@ -97,7 +97,7 @@ export function saveLocale(locale: string) {
   localStorage.setItem(LOCALE_STORAGE_KEY, locale);
 }
 
-// ── Theme storage (was themeStorage.ts) ──────────────────────────────────────
+// ── Theme storage ────────────────────────────────────────────────────────────
 
 const STORAGE_KEY = 'zeroclaw-theme';
 

@@ -13,8 +13,7 @@ import { useEffect, useRef, type DependencyList } from "react";
  *
  * The callback receives `isStale()` — true once this effect has been cleaned up
  * (unmounted or re-armed via `deps`). Guard any `setState` with it so a slow
- * in-flight request can't write stale data after the inputs changed (replaces
- * the hand-rolled `cancelled` flags the call sites used to carry).
+ * in-flight request can't write stale data after the inputs changed.
  *
  * `deps` re-arms the loop like a normal effect dependency array.
  */

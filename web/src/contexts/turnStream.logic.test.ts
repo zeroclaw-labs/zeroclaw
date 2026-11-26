@@ -23,11 +23,11 @@ function runFrames(frames: TurnStreamFrame[]) {
   return { state, completions };
 }
 
-// ── The reasoning-only bug this PR fixes ────────────────────────────────────
+// ── Reasoning-only turn → commit with captured thinking ─────────────────────
 
 test('reasoning-only turn commits with empty content and captured thinking', () => {
   // GLM/Qwen/DeepSeek: whole answer arrives as reasoning deltas, content is
-  // empty, no tool calls. Before the fix this produced no bubble at all.
+  // empty, no tool calls. The turn must still produce a bubble.
   const { completions } = runFrames([
     { type: 'thinking', content: 'The user asks why ' },
     { type: 'thinking', content: 'the 21:00 shutdown ' },
@@ -78,7 +78,7 @@ test('normal content commits the concatenated stream', () => {
   });
 });
 
-// ── #6702: whitespace-only content alongside a tool_call → skip ─────────────
+// ── Whitespace-only content alongside a tool_call → skip ────────────────────
 
 test('whitespace-only content with a tool call skips (issue #6702)', () => {
   const { completions } = runFrames([
@@ -90,7 +90,7 @@ test('whitespace-only content with a tool call skips (issue #6702)', () => {
   assert.deepEqual(completions[0], { kind: 'skip' });
 });
 
-// ── A nameless telemetry tool_call must not flip hadToolCall (#7151) ────────
+// ── A nameless telemetry tool_call must not flip hadToolCall ────────────────
 
 test('nameless tool_call frame does not count as a tool call', () => {
   // Empty completion after only a nameless (telemetry) tool_call must still
@@ -118,7 +118,7 @@ test('chunk_reset captures thinking so the commit keeps it', () => {
   });
 });
 
-// ── The invariant the reviewer called out: state resets across turns ────────
+// ── Per-turn state resets across turns ──────────────────────────────────────
 
 test('per-turn state resets between turns', () => {
   // Turn 1: tool-only (skip). Turn 2: reasoning-only (commit). Turn 2 must NOT
@@ -155,7 +155,7 @@ test('empty second turn diagnoses instead of inheriting turn 1 tool call', () =>
 });
 
 test('error then new turn discards thinking captured before the error', () => {
-  // Regression sequence from review: the first turn snapshots reasoning, then
+  // Regression sequence: the first turn snapshots reasoning, then
   // fails. Starting a new turn must not let that stale reasoning turn an empty
   // completion into a reasoning-only assistant message.
   const { state, completions } = runFrames([

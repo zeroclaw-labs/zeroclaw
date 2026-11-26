@@ -171,7 +171,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.failed_switch_model': '切换模型失败',
     'agent.model_switch_timeout': '模型切换超时，请检查网络后重试',
 
-    // Supervised-mode tool approval (#6522)
+    // Supervised-mode tool approval
     'agent.approval_title': '需要授权工具调用',
     'agent.approval_tool': '工具',
     'agent.approval_arguments': '参数',
@@ -181,7 +181,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.approval_always': '始终批准',
     'agent.approval_always_hint': '本会话内自动批准此工具',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': '未知命令：{cmd}。输入 /help 查看可用命令。',
     'agent.cmd_help_header': '可用命令：',
     'agent.cmd_help_help': '显示此命令列表',
@@ -642,9 +642,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'plugins.registry_capabilities': "Registry capabilities",
     'plugins.permissions': "Requested permissions",
     'plugins.install_source': "Package identity",
-    // ── i18n sweep: keys added by the conversion workflow ──
-    // Self-review follow-ups: singular forms for Doctor severity pills + the
-    // relative-time suffixes used by lib/format.ts formatRelative.
+    // Singular forms for Doctor severity pills + the relative-time suffixes
+    // used by lib/format.ts formatRelative.
     'doctor.severity_warning': "warning",
     'doctor.severity_error': "error",
     'agent.rel_minutes': "m ago",
@@ -1720,7 +1719,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.model_switch_timeout': 'Model switch timed out. Please check your connection and try again.',
     'agent.clear_all': 'Clear all',
     'agent.delete_message': 'Delete message',
-    // Multi-session chat (#7543)
+    // Multi-session chat
     'agent.sessions': 'Conversations',
     'agent.sessions_loading': 'Loading conversations…',
     'agent.sessions_load_failed': "Couldn't load conversations.",
@@ -1741,7 +1740,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.sessions_unavailable': 'Conversation switching is unavailable until session storage is confirmed.',
     'agent.session_delete_confirm_action': 'Delete',
     'agent.session_delete_cancel': 'Cancel',
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Unknown command: {cmd}. Type /help to see available commands.',
     'agent.cmd_help_header': 'Available commands:',
     'agent.cmd_help_help': 'show this list of commands',
@@ -1763,7 +1762,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.tool_activity_hide': 'Hide tool activity',
     'agent.thinking_keep_collapsed': 'Keep thinking collapsed',
     'agent.running': 'Running…',
-    // Supervised-mode tool approval (#6522)
+    // Supervised-mode tool approval
     'agent.approval_title': 'Tool approval required',
     'agent.approval_tool': 'Tool',
     'agent.approval_arguments': 'Arguments',
@@ -2441,7 +2440,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Bağlandı',
     'agent.disconnected_status': 'Bağlantı kesildi',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Bilinmeyen komut: {cmd}. Kullanılabilir komutları görmek için /help yazın.',
     'agent.cmd_help_header': 'Kullanılabilir komutlar:',
     'agent.cmd_help_help': 'bu komut listesini göster',
@@ -2907,7 +2906,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'متصل',
     'agent.disconnected_status': 'غير متصل',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'أمر غير معروف: {cmd}. اكتب /help لرؤية الأوامر المتاحة.',
     'agent.cmd_help_header': 'الأوامر المتاحة:',
     'agent.cmd_help_help': 'عرض قائمة الأوامر هذه',
@@ -3351,7 +3350,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'সংযুক্ত',
     'agent.disconnected_status': 'সংযোগ বিচ্ছিন্ন',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'অজানা কমান্ড: {cmd}। উপলব্ধ কমান্ড দেখতে /help টাইপ করুন।',
     'agent.cmd_help_header': 'উপলব্ধ কমান্ড:',
     'agent.cmd_help_help': 'এই কমান্ড তালিকা দেখান',
@@ -3795,7 +3794,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Připojeno',
     'agent.disconnected_status': 'Odpojeno',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Neznámý příkaz: {cmd}. Napište /help pro zobrazení dostupných příkazů.',
     'agent.cmd_help_header': 'Dostupné příkazy:',
     'agent.cmd_help_help': 'zobrazit tento seznam příkazů',
@@ -4239,7 +4238,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Forbundet',
     'agent.disconnected_status': 'Afbrudt',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Ukendt kommando: {cmd}. Skriv /help for at se tilgængelige kommandoer.',
     'agent.cmd_help_header': 'Tilgængelige kommandoer:',
     'agent.cmd_help_help': 'vis denne liste over kommandoer',
@@ -4738,7 +4737,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Verbunden',
     'agent.disconnected_status': 'Getrennt',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Unbekannter Befehl: {cmd}. Geben Sie /help ein, um verfügbare Befehle zu sehen.',
     'agent.cmd_help_header': 'Verfügbare Befehle:',
     'agent.cmd_help_help': 'diese Befehlsliste anzeigen',
@@ -5182,7 +5181,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Συνδεδεμένο',
     'agent.disconnected_status': 'Αποσυνδεδεμένο',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Άγνωστη εντολή: {cmd}. Πληκτρολογήστε /help για να δείτε τις διαθέσιμες εντολές.',
     'agent.cmd_help_header': 'Διαθέσιμες εντολές:',
     'agent.cmd_help_help': 'εμφάνιση αυτής της λίστας εντολών',
@@ -5681,7 +5680,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Conectado',
     'agent.disconnected_status': 'Desconectado',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Comando desconocido: {cmd}. Escribe /help para ver los comandos disponibles.',
     'agent.cmd_help_header': 'Comandos disponibles:',
     'agent.cmd_help_help': 'mostrar esta lista de comandos',
@@ -6125,7 +6124,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Yhdistetty',
     'agent.disconnected_status': 'Yhteys katkaistu',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Tuntematon komento: {cmd}. Kirjoita /help nähdäksesi käytettävissä olevat komennot.',
     'agent.cmd_help_header': 'Käytettävissä olevat komennot:',
     'agent.cmd_help_help': 'näytä tämä komentoluettelo',
@@ -6624,7 +6623,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Connecté',
     'agent.disconnected_status': 'Déconnecté',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Commande inconnue : {cmd}. Tapez /help pour voir les commandes disponibles.',
     'agent.cmd_help_header': 'Commandes disponibles :',
     'agent.cmd_help_help': 'afficher cette liste de commandes',
@@ -7082,7 +7081,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'מחובר',
     'agent.disconnected_status': 'מנותק',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'פקודה לא ידועה: {cmd}. הקלד /help כדי לראות פקודות זמינות.',
     'agent.cmd_help_header': 'פקודות זמינות:',
     'agent.cmd_help_help': 'הצג רשימת פקודות זו',
@@ -7526,7 +7525,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'कनेक्टेड',
     'agent.disconnected_status': 'डिस्कनेक्टेड',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'अज्ञात कमांड: {cmd}. उपलब्ध कमांड देखने के लिए /help टाइप करें।',
     'agent.cmd_help_header': 'उपलब्ध कमांड:',
     'agent.cmd_help_help': 'यह कमांड सूची दिखाएं',
@@ -7970,7 +7969,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Csatlakoztatva',
     'agent.disconnected_status': 'Leválasztva',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Ismeretlen parancs: {cmd}. Írja be a /help parancsot az elérhető parancsok megtekintéséhez.',
     'agent.cmd_help_header': 'Elérhető parancsok:',
     'agent.cmd_help_help': 'parancsok listájának megjelenítése',
@@ -8414,7 +8413,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Terhubung',
     'agent.disconnected_status': 'Terputus',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Perintah tidak dikenal: {cmd}. Ketik /help untuk melihat perintah yang tersedia.',
     'agent.cmd_help_header': 'Perintah yang tersedia:',
     'agent.cmd_help_help': 'tampilkan daftar perintah ini',
@@ -8913,7 +8912,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Connesso',
     'agent.disconnected_status': 'Disconnesso',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Comando sconosciuto: {cmd}. Digita /help per vedere i comandi disponibili.',
     'agent.cmd_help_header': 'Comandi disponibili:',
     'agent.cmd_help_help': 'mostra questo elenco di comandi',
@@ -9412,7 +9411,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': '接続済み',
     'agent.disconnected_status': '切断済み',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': '不明なコマンド: {cmd}。利用可能なコマンドを見るには /help と入力してください。',
     'agent.cmd_help_header': '利用可能なコマンド:',
     'agent.cmd_help_help': 'コマンド一覧を表示する',
@@ -9870,7 +9869,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': '연결됨',
     'agent.disconnected_status': '연결 끊김',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': '알 수 없는 명령: {cmd}. 사용 가능한 명령을 보려면 /help을 입력하세요.',
     'agent.cmd_help_header': '사용 가능한 명령:',
     'agent.cmd_help_help': '이 명령 목록 표시',
@@ -10314,7 +10313,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Tilkoblet',
     'agent.disconnected_status': 'Frakoblet',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Ukjent kommando: {cmd}. Skriv /help for å se tilgjengelige kommandoer.',
     'agent.cmd_help_header': 'Tilgjengelige kommandoer:',
     'agent.cmd_help_help': 'vis denne listen over kommandoer',
@@ -10758,7 +10757,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Verbonden',
     'agent.disconnected_status': 'Niet verbonden',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Onbekend commando: {cmd}. Typ /help om beschikbare commando\'s te zien.',
     'agent.cmd_help_header': 'Beschikbare commando\'s:',
     'agent.cmd_help_help': 'toon deze lijst met commando\'s',
@@ -11202,7 +11201,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Połączono',
     'agent.disconnected_status': 'Rozłączono',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Nieznane polecenie: {cmd}. Wpisz /help, aby zobaczyć dostępne polecenia.',
     'agent.cmd_help_header': 'Dostępne polecenia:',
     'agent.cmd_help_help': 'pokaż tę listę poleceń',
@@ -11710,7 +11709,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Conectado',
     'agent.disconnected_status': 'Desconectado',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Comando desconhecido: {cmd}. Digite /help para ver os comandos disponíveis.',
     'agent.cmd_help_header': 'Comandos disponíveis:',
     'agent.cmd_help_help': 'mostrar esta lista de comandos',
@@ -12154,7 +12153,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Conectat',
     'agent.disconnected_status': 'Deconectat',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Comandă necunoscută: {cmd}. Tastați /help pentru a vedea comenzile disponibile.',
     'agent.cmd_help_header': 'Comenzi disponibile:',
     'agent.cmd_help_help': 'afișează această listă de comenzi',
@@ -12653,7 +12652,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Подключено',
     'agent.disconnected_status': 'Отключено',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Неизвестная команда: {cmd}. Введите /help, чтобы увидеть доступные команды.',
     'agent.cmd_help_header': 'Доступные команды:',
     'agent.cmd_help_help': 'показать этот список команд',
@@ -13111,7 +13110,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Ansluten',
     'agent.disconnected_status': 'Frånkopplad',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Okänt kommando: {cmd}. Skriv /help för att se tillgängliga kommandon.',
     'agent.cmd_help_header': 'Tillgängliga kommandon:',
     'agent.cmd_help_help': 'visa denna kommandolista',
@@ -13555,7 +13554,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'เชื่อมต่อแล้ว',
     'agent.disconnected_status': 'ตัดการเชื่อมต่อ',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'คำสั่งที่ไม่รู้จัก: {cmd} พิมพ์ /help เพื่อดูคำสั่งที่ใช้ได้',
     'agent.cmd_help_header': 'คำสั่งที่ใช้ได้:',
     'agent.cmd_help_help': 'แสดงรายการคำสั่งนี้',
@@ -13999,7 +13998,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Konektado',
     'agent.disconnected_status': 'Hindi Konektado',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Hindi kilalang utos: {cmd}. I-type ang /help para makita ang mga available na utos.',
     'agent.cmd_help_header': 'Mga available na utos:',
     'agent.cmd_help_help': 'ipakita ang listahan ng mga utos na ito',
@@ -14443,7 +14442,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Підключено',
     'agent.disconnected_status': 'Відключено',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Невідома команда: {cmd}. Введіть /help, щоб побачити доступні команди.',
     'agent.cmd_help_header': 'Доступні команди:',
     'agent.cmd_help_help': 'показати цей список команд',
@@ -14887,7 +14886,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'جڑا ہوا',
     'agent.disconnected_status': 'منقطع',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'نامعلوم کمانڈ: {cmd}۔ دستیاب کمانڈز دیکھنے کے لیے /help ٹائپ کریں۔',
     'agent.cmd_help_header': 'دستیاب کمانڈز:',
     'agent.cmd_help_help': 'کمانڈز کی یہ فہرست دکھائیں',
@@ -15331,7 +15330,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.connected_status': 'Đã kết nối',
     'agent.disconnected_status': 'Đã ngắt kết nối',
 
-    // Slash commands (#7137)
+    // Slash commands
     'agent.cmd_unknown': 'Lệnh không xác định: {cmd}. Gõ /help để xem các lệnh khả dụng.',
     'agent.cmd_help_header': 'Các lệnh khả dụng:',
     'agent.cmd_help_help': 'hiển thị danh sách lệnh này',

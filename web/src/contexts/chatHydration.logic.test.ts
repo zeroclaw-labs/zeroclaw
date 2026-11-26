@@ -74,9 +74,9 @@ test('known limit: a repeated prompt is lost when the local copy was truncated b
   // the newest 100 bubbles, so the browser holds 3 committed ones plus the
   // in-flight one (4 occurrences, as many as the snapshot). Without a turn id or a reliable created_at the client
   // cannot tell "repeated and committed" from "repeated and in flight", so the
-  // tail is empty and the prompt is dropped, exactly as before the fix. This
-  // pins the limit so it is not changed by accident; only a server-side commit
-  // of the prompt on accept removes it.
+  // tail is empty and the prompt is dropped. This pins the limit so it is not
+  // changed by accident; only a server-side commit of the prompt on accept
+  // removes it.
   const committed = [stamp('continue'), stamp('continue'), stamp('continue'), stamp('continue')];
   const local = [
     user('continue', true),

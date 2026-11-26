@@ -63,11 +63,10 @@ const RESTART_TIMEOUT_MS = 60_000;
 const RELOAD_AFTER_RECONCILE_MS = 800;
 
 /**
- * Upgrade dialog covering the read-only info view (Phase 1), applying an upgrade
- * (Phase 2), and supervised exit-to-restart with version reconciliation
- * (Phase 3). The gateway only ever exits to restart; relaunch is the
- * supervisor's job, so the `restarting` view polls `/api/status` (not the
- * upgrade endpoint) until the new version reports in.
+ * Upgrade dialog covering the read-only info view, applying an upgrade, and
+ * the restart that follows, with version reconciliation. With a baseline
+ * version, the dialog polls `/api/status` (not the upgrade endpoint) across
+ * the restart until the new version reports in or the restart check times out.
  */
 export function UpgradeDialog({
   open,
@@ -331,7 +330,6 @@ export function UpgradeDialog({
             )}
           </div>
 
-          {/* ── Version summary (always shown except terminal states) ── */}
           {(view === 'info' || view === 'confirm') &&
             (loading && info == null ? (
               <div className="text-xs text-pc-text-muted">{t('upgrade.checking')}</div>
@@ -405,14 +403,12 @@ export function UpgradeDialog({
               </>
             ))}
 
-          {/* ── Confirm ── */}
           {view === 'confirm' && (
             <div className="text-xs text-pc-text-muted rounded-[var(--radius-md)] border border-pc-border bg-pc-surface px-3 py-2">
               {t('upgrade.confirm_body')}
             </div>
           )}
 
-          {/* ── Progress (active upgrade) ── */}
           {view === 'progress' && (() => {
             const cur = status?.phase ?? 0;
             const pct = Math.round((Math.min(cur, 6) / 6) * 100);
@@ -424,7 +420,6 @@ export function UpgradeDialog({
                   {t('upgrade.upgrading')}
                 </div>
 
-                {/* Progress bar */}
                 <div className="h-1 w-full overflow-hidden rounded-full bg-pc-surface">
                   <div
                     className="h-full rounded-full transition-all duration-500 ease-out"
@@ -432,7 +427,6 @@ export function UpgradeDialog({
                   />
                 </div>
 
-                {/* Live last-line ticker */}
                 {lastLine && (
                   <div className="font-mono text-[11px] text-pc-text-muted truncate" title={lastLine}>
                     {lastLine}
@@ -471,7 +465,6 @@ export function UpgradeDialog({
                   })}
                 </ol>
 
-                {/* Full log (collapsed) */}
                 {status?.log_tail && status.log_tail.length > 0 && (
                   <details className="text-xs">
                     <summary className="cursor-pointer text-pc-text-muted">
@@ -530,7 +523,6 @@ export function UpgradeDialog({
             );
           })()}
 
-          {/* ── Done ── */}
           {view === 'done' && (
             <div className="text-xs text-pc-text flex flex-col gap-1">
               <div>
@@ -573,7 +565,6 @@ export function UpgradeDialog({
             </div>
           )}
 
-          {/* ── Failed ── */}
           {view === 'failed' && (
             <div className="text-xs text-pc-text-muted">
               <div className="text-pc-text">✗ {t('upgrade.failed')}</div>
@@ -582,7 +573,6 @@ export function UpgradeDialog({
           )}
         </div>
 
-        {/* ── Footer ── */}
         <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-pc-border">
           {view === 'info' && info?.release_url && (
             <a

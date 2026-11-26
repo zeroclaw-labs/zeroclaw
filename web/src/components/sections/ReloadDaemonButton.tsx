@@ -1,10 +1,10 @@
-// "Reload daemon" button (#6175). Tears down + re-instantiates every daemon
+// "Reload daemon" button. Tears down + re-instantiates every daemon
 // subsystem in place — same PID. Used when config changes need the daemon
 // to re-consume them (channels listener rebind, MCP server respawn, etc.).
 //
 // UX:
 //  1. Click — modal opens explaining what reload does.
-//  2. Confirm — POST /admin/reload (raises SIGUSR1 inside the daemon).
+//  2. Confirm — POST /admin/reload.
 //  3. Poll /health every 500ms with timeout 30s. Briefly the daemon is
 //     unreachable (gateway listener drops + rebinds); button shows
 //     "Reloading..." then "Waiting for daemon..." then "Daemon back ✓".

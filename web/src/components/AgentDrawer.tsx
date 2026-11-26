@@ -90,11 +90,11 @@ export default function AgentDrawer({
   const open = agent !== null;
 
   // Esc closes; Tab is trapped inside the drawer panel; focus is restored to the
-  // opener (the row that opened the drawer) on close. Matches the prior
-  // hand-rolled effect (wide selector that includes select/textarea, no
-  // visibility filter, Esc does not preventDefault). Declared before the
-  // focus-on-open effect so the trap captures the opener as the restore target
-  // before focus moves into the panel.
+  // opener (the row that opened the drawer) on close. The trap counts select
+  // and textarea controls and skips visibility filtering; Escape closes without
+  // calling `preventDefault()`. Declared before the focus-on-open effect so the
+  // trap captures the opener as the restore target before focus moves into the
+  // panel.
   useFocusTrap(panelRef, {
     onClose,
     enabled: open,
@@ -124,7 +124,6 @@ export default function AgentDrawer({
       className="fixed inset-0 z-50 flex justify-end"
       onClick={onClose}
     >
-      {/* Backdrop */}
       <div className="absolute inset-0 bg-pc-base/70 backdrop-blur-sm" />
 
       {/* Panel: full-screen on mobile, right-side drawer on >= sm. */}
@@ -133,7 +132,6 @@ export default function AgentDrawer({
         className="relative h-full w-full sm:max-w-md flex flex-col bg-pc-base border-l border-pc-border shadow-[var(--pc-shadow-md)] animate-slide-in-right overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Header: identity + close */}
         <div className="flex items-start justify-between gap-3 px-5 py-4 border-b border-pc-border">
           <div className="flex items-center gap-3 min-w-0">
             <div className="h-10 w-10 rounded-[var(--radius-md)] flex-shrink-0 flex items-center justify-center bg-pc-accent/10">
@@ -176,9 +174,7 @@ export default function AgentDrawer({
           </button>
         </div>
 
-        {/* Scrollable body */}
         <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-5">
-          {/* Status */}
           <div className="flex items-center justify-between gap-3">
             <span className="text-[11px] uppercase tracking-wide text-pc-text-faint">
               {t('common.status')}
@@ -199,7 +195,6 @@ export default function AgentDrawer({
             </button>
           </div>
 
-          {/* Configuration facts */}
           <DetailGroup icon={Wifi} label={t('agent.section.channels')}>
             {channelCount === 0 ? (
               <span className="text-pc-text-muted">{t('agent.none_bound')}</span>
@@ -346,7 +341,6 @@ export default function AgentDrawer({
             </DetailGroup>
           )}
 
-          {/* Activity stats: sessions / memories / spend */}
           <div className="grid grid-cols-3 gap-2 pt-4 border-t border-pc-border">
             <div className="min-w-0">
               <div className="flex items-center gap-1 text-[11px] text-pc-text-faint">

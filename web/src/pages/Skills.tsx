@@ -129,7 +129,6 @@ export default function Skills() {
 
   return (
     <div className="p-6 space-y-6 animate-fade-in">
-      {/* Header row */}
       <div className="flex items-center justify-between gap-4 flex-wrap">
         <div className="flex items-center gap-3 flex-1 flex-wrap">
           <select
@@ -173,7 +172,6 @@ export default function Skills() {
         </button>
       </div>
 
-      {/* Section header */}
       <div className="flex items-center gap-2">
         <BookOpen className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
         <span
@@ -218,7 +216,6 @@ export default function Skills() {
         </p>
       )}
 
-      {/* Skill cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 stagger-children">
         {filtered.map((skill) => {
           const key = skillKey(skill);

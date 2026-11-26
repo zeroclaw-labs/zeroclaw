@@ -30,7 +30,7 @@ function originLabel(skill: AgentSkillEntry): string {
 
 export const SkillCard = ({ skill, onExpand, isExpanded, skillDetail }: SkillCardProps) => {
   // Only bundle skills can be expanded for detail / edited; other origins are
-  // read-only list entries (#6700 read-only browser).
+  // read-only list entries.
   const canExpand = skill.editable && !!onExpand;
   const editHref = skill.editable && skill.bundle
     ? `/config/skill_bundles/${encodeURIComponent(skill.bundle)}?tab=skills&skill=${encodeURIComponent(skill.name)}`
@@ -101,7 +101,6 @@ export const SkillCard = ({ skill, onExpand, isExpanded, skillDetail }: SkillCar
         </div>
       )}
 
-      {/* Origin / meta row */}
       <div
         className="flex items-center gap-2 px-4 py-3 border-t"
         style={{ borderColor: 'var(--pc-border)' }}

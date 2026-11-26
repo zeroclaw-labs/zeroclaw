@@ -107,7 +107,6 @@ export function ConfirmDialog({
         className="relative w-full max-w-sm mx-4 rounded-[var(--radius-xl)] border border-pc-border bg-pc-base shadow-[var(--pc-shadow-md)] animate-fade-in"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Body */}
         <div className="px-6 pt-5 pb-4 flex flex-col gap-2">
           <h2 id={titleId} className="text-sm font-semibold text-pc-text">
             {title}
@@ -119,7 +118,6 @@ export function ConfirmDialog({
           )}
         </div>
 
-        {/* Footer */}
         <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-pc-border">
           <Button variant="ghost" onClick={onClose}>
             {cancelLabel}

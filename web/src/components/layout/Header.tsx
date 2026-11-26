@@ -132,7 +132,6 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
             <Search className="h-[20px] w-[20px] shrink-0" />
           </Button>
 
-          {/* Settings */}
           <Button
             variant="ghost"
             onClick={() => setSettingsOpen(true)}
@@ -142,7 +141,6 @@ export default function Header({ onMenuToggle, onOpenPalette }: HeaderProps) {
             <Settings className="h-[20px] w-[20px] shrink-0" />
           </Button>
 
-          {/* Language switcher dropdown */}
           <div ref={langRef} className="relative" style={{ zIndex: 9999 }}>
             <Button
               variant="ghost"

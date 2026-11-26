@@ -50,9 +50,9 @@ export default function DoctorFixModal({
   const titleId = useId();
 
   // Esc closes; Tab is trapped inside the dialog panel; focus is restored to the
-  // trigger on close. Matches the prior hand-rolled effect (wide selector that
-  // includes select/textarea, visible-only tab stops, Esc preventDefaults).
-  // Declared before the focus-on-open effect so the trap captures the trigger as
+  // trigger on close. The trap counts select and textarea controls, uses only
+  // visible tab stops, and calls `preventDefault()` on Escape. Declared before
+  // the focus-on-open effect so the trap captures the trigger as
   // the restore target before focus moves into the panel.
   useFocusTrap(panelRef, {
     onClose,
@@ -84,7 +84,6 @@ export default function DoctorFixModal({
         className="relative w-full max-w-2xl mx-4 rounded-[var(--radius-lg)] border border-pc-border bg-pc-base shadow-[var(--pc-shadow-md)] animate-fade-in"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Header */}
         <div className="flex items-center justify-between gap-3 px-6 pt-5 pb-4 border-b border-pc-border">
           <div className="min-w-0">
             <p className="text-[11px] font-semibold uppercase tracking-wider text-pc-text-muted">

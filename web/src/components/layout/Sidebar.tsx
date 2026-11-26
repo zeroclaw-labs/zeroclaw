@@ -357,7 +357,6 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
 
   return (
     <>
-      {/* Backdrop — mobile only */}
       {open && (
         <div
           className="md:hidden fixed inset-0 z-40 bg-black/60 backdrop-blur-sm transition-opacity"

@@ -1,4 +1,4 @@
-// Operator Console — shared UI primitives (Wave 1).
+// Operator Console — shared UI primitives.
 // Token-classed, accessible, dependency-light. Compose surfaces on top of these.
 
 export { Card } from './Card';

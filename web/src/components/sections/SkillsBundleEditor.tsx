@@ -234,7 +234,6 @@ export default function SkillsBundleEditor({ bundle }: Props) {
         {t('skills_bundle.intro_subdirs')}
       </p>
 
-      {/* Skill picker strip */}
       <div className="flex flex-wrap gap-2 items-center">
         {skills.map((s) => (
           <button
@@ -286,7 +285,6 @@ export default function SkillsBundleEditor({ bundle }: Props) {
         </div>
       )}
 
-      {/* Create form */}
       {creating && (
         <div
           className="rounded-xl border p-4 flex flex-col gap-3"
@@ -343,7 +341,6 @@ export default function SkillsBundleEditor({ bundle }: Props) {
         </div>
       )}
 
-      {/* Editor */}
       {active && buffer && (
         <div
           ref={editorRef}
@@ -505,10 +502,10 @@ interface TagsFieldProps {
 
 /**
  * Tags editor + the slash-command opt-in. The `slash` tag is surfaced as a
- * boolean toggle (it makes the skill a Discord slash command — see
- * zeroclaw-labs/zeroclaw#7490); `open-skills` is loader-managed and shown
- * read-only. Everything else is an editable badge. The full tag list (including
- * `slash`/`open-skills`) is preserved on save.
+ * boolean toggle (it makes the skill a Discord slash command); `open-skills`
+ * is loader-managed and shown read-only. Everything else is an editable
+ * badge. The full tag list (including `slash`/`open-skills`) is preserved
+ * on save.
  */
 function TagsField({ tags, onTagsChange }: TagsFieldProps) {
   const [tagInput, setTagInput] = useState('');
@@ -623,10 +620,10 @@ function Field({ label, value, onChange, placeholder }: FieldProps) {
   );
 }
 
-// The typed slash-option model (zeroclaw-labs/zeroclaw#8021), shaped after
-// Discord's application command option types. The kind list and which
-// constraints each kind carries (choices / numeric bounds / length bounds) are
-// NOT restated here: the editor fetches the backend registry
+// The typed slash-option model follows Discord's application command option
+// types. The kind list and which constraints each kind carries (choices /
+// numeric bounds / length bounds) are NOT restated here: the editor fetches
+// the backend registry
 // (`listSlashOptionKinds`, built by walking the backend `SlashOptionKind` enum)
 // and walks it. The Discord layer drops bounds/choices that don't match the
 // type and sorts required options first, so the editor only gates which inputs
