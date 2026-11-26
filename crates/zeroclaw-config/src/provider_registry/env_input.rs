@@ -202,13 +202,27 @@ fn env_value(value: &str) -> (Value, Value) {
 /// earlier edits before the final registry is admitted.
 pub(crate) fn stage(document: &mut Value, path: &str, value: &str) -> Result<()> {
     let (parsed, literal) = env_value(value);
-    let value = typed_env_value(document, path, parsed, literal)?;
+    let value = typed_env_value(document, path, &parsed, &literal)?.unwrap_or({
+        // An incomplete auth variant cannot reveal a leaf's type yet. Keep
+        // scalar input literal so later whole-auth expansion cannot copy a
+        // numeric credential. Final batch admission resolves the actual type.
+        if parsed.is_number() || parsed.is_boolean() {
+            literal
+        } else {
+            parsed
+        }
+    });
     set_document(document, path, value, None)
 }
 
-fn typed_env_value(template: &Value, path: &str, parsed: Value, literal: Value) -> Result<Value> {
+fn typed_env_value(
+    template: &Value,
+    path: &str,
+    parsed: &Value,
+    literal: &Value,
+) -> Result<Option<Value>> {
     if parsed == literal {
-        return Ok(parsed);
+        return Ok(Some(parsed.clone()));
     }
     // The schema is the source for the leaf's type, including credentials
     // that happen to look like JSON numbers. Probe independently so a valid
@@ -216,23 +230,14 @@ fn typed_env_value(template: &Value, path: &str, parsed: Value, literal: Value) 
     let mut probe = template.clone();
     set_document(&mut probe, path, parsed.clone(), None)?;
     if serde_json::from_value::<crate::providers::Providers>(probe).is_ok() {
-        return Ok(parsed);
+        return Ok(Some(parsed.clone()));
     }
     let mut probe = template.clone();
     set_document(&mut probe, path, literal.clone(), None)?;
     if serde_json::from_value::<crate::providers::Providers>(probe).is_ok() {
-        Ok(literal)
+        Ok(Some(literal.clone()))
     } else {
-        // Another staged edit can complete an intermediate auth variant.
-        // Keep ambiguous scalar input literal until its type can be resolved;
-        // a later whole-auth expansion must never copy a numeric credential.
-        // Structured input retains its JSON shape. Final admission still
-        // rejects genuinely invalid batches.
-        Ok(if parsed.is_number() || parsed.is_boolean() {
-            literal
-        } else {
-            parsed
-        })
+        Ok(None)
     }
 }
 
@@ -244,16 +249,17 @@ pub(crate) fn set_many(config: &mut Config, edits: &[(String, String)]) -> Resul
     let mut parsed_edits = Vec::with_capacity(edits.len());
     for (path, value) in edits {
         let (parsed, literal) = env_value(value);
-        // Stage unambiguous strings (including enum tags) and removals in
-        // the type probe as well, so OAuth leaves see their final auth mode.
-        if parsed == literal {
-            set_document(&mut type_template, path, literal.clone(), None)?;
+        // Enum tags, removals and whole-object replacements must all be in
+        // the completed type probe. A legacy OAuth edit replaces the entire
+        // auth object and removes fields from its former API-key variant.
+        if parsed == literal || parsed.is_object() || parsed.is_array() {
+            set_document(&mut type_template, path, parsed.clone(), None)?;
         }
         parsed_edits.push((path, parsed, literal));
     }
 
     for (path, parsed, literal) in parsed_edits {
-        let value = typed_env_value(&type_template, path, parsed, literal)?;
+        let value = typed_env_value(&type_template, path, &parsed, &literal)?.unwrap_or(parsed);
         set_document(&mut document, path, value, None)?;
     }
     for (path, _) in edits {

@@ -694,6 +694,50 @@ model = "gemini-test"
     }
 
     #[tokio::test]
+    async fn mixed_oauth_replacement_keeps_numeric_model_options() {
+        let _guard = super::env_test_lock().await;
+        let _mode = EnvVarGuard::set(
+            "ZEROCLAW_providers__connections__gemini__auth__mode",
+            "oauth",
+        );
+        let _client = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__gemini__work__oauth_client_id",
+            "env-client",
+        );
+        let _temperature = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__gemini.work__options__temperature",
+            "0.25",
+        );
+        let mut config: Config = toml::from_str(
+            r#"
+[providers.connections.gemini]
+kind = "gemini"
+auth = {mode = "api_key", api_key = "original-key"}
+[providers.models."gemini.work"]
+capability = "chat"
+provider = "gemini"
+model = "gemini-test"
+"#,
+        )
+        .unwrap();
+        let before = serde_json::to_value(&config.providers).unwrap();
+        let applied = apply_env_overrides(&mut config).unwrap();
+        let document = serde_json::to_value(&config.providers).unwrap();
+        assert_eq!(document["connections"]["gemini"]["auth"]["mode"], "oauth");
+        assert!(
+            document["connections"]["gemini"]["auth"]
+                .get("api_key")
+                .is_none()
+        );
+        assert_eq!(
+            document["models"]["gemini.work"]["options"]["temperature"],
+            serde_json::json!(0.25)
+        );
+        mask_env_overrides_for_save(&mut config, &applied.snapshots).unwrap();
+        assert_eq!(serde_json::to_value(&config.providers).unwrap(), before);
+    }
+
+    #[tokio::test]
     async fn historical_memory_env_overrides_rematerialize_a_loaded_model_without_persisting_it() {
         let _guard = super::env_test_lock().await;
         let _model = EnvVarGuard::set("ZEROCLAW_memory__embedding_model", "env-embedding");
