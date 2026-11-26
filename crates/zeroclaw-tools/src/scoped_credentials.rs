@@ -9,14 +9,6 @@ pub(crate) fn scoped_credential_message(key: &str) -> String {
     crate::i18n::get_required_tool_string(key)
 }
 
-#[cfg(feature = "tools-external")]
-pub(crate) fn load_scoped_credential(
-    path: Option<&Path>,
-    name: &str,
-) -> anyhow::Result<ScopedHttpCredential> {
-    load_scoped_credential_snapshot(path, name).map(|(credential, _)| credential)
-}
-
 pub(crate) fn load_scoped_credential_snapshot(
     path: Option<&Path>,
     name: &str,
