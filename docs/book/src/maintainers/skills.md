@@ -6,16 +6,7 @@ Each skill lives in its own directory with a `SKILL.md` file. Claude Code loads 
 
 ## Available skills
 
-| Skill | Use it when |
-|---|---|
-| `github-pr-review-session` | Reviewing a specific PR or working through the review queue: drafts the review body, cross-checks against source, posts via `gh` under the active account holder's identity |
-| `github-issue-triage` | Running a backlog sweep, closing stale/duplicate issues, applying labels, enforcing the canonical [issue stale policy](./labels.md#issue-stale-policy) |
-| `github-issue` | Filing a structured issue (bug report or feature request) |
-| `github-pr` | Opening or updating a PR with a fully-populated template body |
-| `squash-merge` | Landing an approved PR into `master` with preserved commit history and the purple **Merged** badge |
-| `changelog-generation` | Preparing `CHANGELOG-next.md` for a release: summarises merges since the last tag |
-| `skill-creator` | Creating, editing, or benchmarking the skills themselves |
-| `zeroclaw` | Operating the running ZeroClaw instance (CLI + gateway API) |
+The [`.claude/skills/`](https://github.com/zeroclaw-labs/zeroclaw/tree/master/.claude/skills) directory is the current inventory: each subdirectory is one skill, and its `SKILL.md` explains when to use it. This page does not keep a second catalog. The sections below cover the workflows maintainers use most.
 
 ## PR review workflow
 

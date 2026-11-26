@@ -6,5 +6,5 @@ Start here if you are installing ZeroClaw for the first time or choosing the sim
 - [Quickstart](./quickstart.md) covers installation, onboarding, and the first chat.
 - [YOLO mode](./yolo.md) documents the fastest unsafe local-dev preset.
 - [Multi-model setup](./multi-model-setup.md) explains provider and route basics.
-- [zerocode](./zerocode.md) introduces the terminal UI.
+- [zerocode](../zerocode/overview.md) introduces the terminal UI.
 - [Language & translations](./language.md) covers locale selection.

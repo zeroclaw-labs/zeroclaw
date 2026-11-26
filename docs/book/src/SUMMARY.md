@@ -13,7 +13,6 @@
   - [Quickstart](./getting-started/quickstart.md)
   - [YOLO mode](./getting-started/yolo.md)
   - [Multi-model setup](./getting-started/multi-model-setup.md)
-  - [zerocode](./getting-started/zerocode.md)
   - [Language & translations](./getting-started/language.md)
 - [zerocode](./zerocode/overview.md)
   - [Running zerocode](./zerocode/running.md)

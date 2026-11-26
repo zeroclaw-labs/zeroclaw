@@ -105,6 +105,10 @@ Runs `cargo deny check advisories` and `cargo audit` daily at 09:00 UTC against 
 
 Runs `npm audit --audit-level=high` daily at 09:23 UTC against `web/package-lock.json`. Opens one deduplicated `security` + `dependencies` issue when high-severity npm advisories affect the committed web lockfile.
 
+### npm Dependency Review (`npm-deps-review.yml`)
+
+Runs on pull requests to `master` that change `web/package-lock.json`. It runs `actions/dependency-review-action` with `fail-on-severity: high`, and the action checks runtime dependencies only by default, so the check fails when a lockfile change introduces a runtime dependency with a high or critical advisory. It has `contents: read` permission only and is a separate workflow, outside `CI Required Gate`.
+
 ### Weekly Trivy Image Scan (`trivy-scheduled.yml`)
 
 Scans the published `dist` and `default-features` GHCR images every Saturday and uploads HIGH/CRITICAL findings to the Security tab as SARIF. The scan is report-first (`exit-code: 0` for findings), but a missing expected image fails the job before Trivy setup with the absent tag and the owning publisher workflow named in the error.
@@ -165,6 +169,10 @@ Runs on every PR open/edit/synchronize. Runs the validator unit tests (`scripts/
 ### Deploy mdBook docs to Pages (`docs-deploy.yml`)
 
 Triggered on tag push (and `workflow_dispatch`); builds and publishes versioned docs to the `gh-pages` branch. See [Release Runbook → Versioned documentation deployment](./release-runbook.md#step-7-versioned-documentation-deployment) for the version-floor and bootstrap rules.
+
+### Validate Translations Pin (`validate-translations-pin.yml`)
+
+Runs on pull requests that move the `docs/book/po` submodule gitlink, change `.gitmodules`, or change this workflow. It checks out the catalogues at the pinned submodule commit and fails if that commit holds no `.po` files, if any catalogue fails `msgfmt --check-format`, or if any catalogue's set of source strings (`msgid` entries) differs from the others. `scripts/release/bump-version.sh` leaves the pin alone. After the version bump, `scripts/release/refresh-translations.sh` tags the catalogues and pins the gitlink to that tag (see [Release Runbook → Refresh and pin translations](./release-runbook.md#refresh-and-pin-translations)), and this check validates that pin before it merges.
 
 ### Docker Image PR Check (`docker-image-pr.yml`)
 

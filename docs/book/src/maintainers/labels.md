@@ -125,7 +125,7 @@ Applied automatically by `pr-path-labeler.yml`. Globs live in `.github/labeler.y
 | `integration` | `src/integrations/**`, `crates/zeroclaw-runtime/src/integrations/**` |
 | `memory` | `src/memory/**`, `crates/zeroclaw-memory/src/**` |
 | `security` | `src/security/**`, `crates/zeroclaw-runtime/src/security/**` |
-| `runtime` | `src/runtime/**`, `crates/zeroclaw-runtime/src/**` |
+| `runtime` | `crates/zeroclaw-runtime/src/**` |
 | `quickstart` | `crates/zeroclaw-runtime/src/quickstart/**`, `crates/zeroclaw-gateway/src/api_quickstart.rs`, `apps/zerocode/src/quickstart_pane.rs`, `web/src/pages/quickstart/**` |
 | `desktop` | `apps/tauri/**` |
 | `hardware` | `src/hardware/**`, `src/peripherals/mod.rs`, `crates/zeroclaw-hardware/**`, `crates/zeroclaw-api/src/peripherals_traits.rs`, `firmware/**` |
@@ -211,7 +211,7 @@ Each channel gets a `channel:<name>` label in addition to the base `channel` lab
 | `channel:clawdtalk` | `clawdtalk.rs` |
 | `channel:cli` | `cli.rs` |
 | `channel:dingtalk` | `dingtalk.rs` |
-| `channel:discord` | `discord.rs`, `discord_history.rs` |
+| `channel:discord` | `discord/**`, `discord_slash_state.rs` |
 | `channel:email` | `email_channel.rs`, `gmail_push.rs` |
 | `channel:imessage` | `imessage.rs` |
 | `channel:irc` | `irc.rs` |

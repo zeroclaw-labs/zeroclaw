@@ -155,4 +155,4 @@ Don't mock SQLite for tests that exercise schema or SQL; integration tests must 
 
 ## Manual tests
 
-`tests/manual/` holds scripts for human-driven testing that can't be automated via `cargo test`. Run them directly. Channel-specific manual smoke tests live under `tests/manual/<channel>/`.
+`tests/manual/` holds scripts for human-driven testing that can't be automated via `cargo test`. Run them directly.

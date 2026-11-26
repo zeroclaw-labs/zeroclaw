@@ -28,10 +28,10 @@ files changed.
 > Core architecture is trait-driven and modular. — AGENTS.md
 
 - New functionality that crosses a trait boundary must go through the trait, not around it
-- No hardcoding around trait boundaries (e.g., matching on a specific provider name instead of using the `Provider` trait interface)
+- No hardcoding around trait boundaries (e.g., matching on a specific provider name instead of using the `ModelProvider` trait interface)
 - No type-casting or downcasting to bypass a trait abstraction
 - Extension points are defined in `zeroclaw-api`:
-  - `Provider` (`crates/zeroclaw-api/src/provider.rs`)
+  - `ModelProvider` (`crates/zeroclaw-api/src/model_provider.rs`)
   - `Channel` (`crates/zeroclaw-api/src/channel.rs`)
   - `Tool` (`crates/zeroclaw-api/src/tool.rs`)
   - `Memory` (`crates/zeroclaw-api/src/memory_traits.rs`)
