@@ -345,15 +345,6 @@ from_address = "zeroclaw@example.com"
 enabled = false
 topic = "projects/zeroclaw-fixture/topics/inbox"
 
-[channels_config.irc]
-enabled = false
-server = "irc.example.org"
-port = 6697
-nickname = "zeroclaw"
-username = "zeroclaw"
-channels = ["#zeroclaw"]
-allowed_users = ["operator"]
-
 [channels_config.lark]
 enabled = true
 app_id = "cli_lark_v1"

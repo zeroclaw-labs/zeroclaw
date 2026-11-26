@@ -617,6 +617,18 @@ mod tests {
     }
 
     #[test]
+    fn retired_irc_and_twitch_kinds_are_absent_from_default_trigger_registry() {
+        let registry = registry_from_config(&zeroclaw_config::schema::Config::default());
+        assert!(
+            registry
+                .channels
+                .iter()
+                .all(|row| row.channel != "irc" && row.channel != "twitch"),
+            "the historical IRC and Twitch attribution kinds must not appear as live SOP sources"
+        );
+    }
+
+    #[test]
     fn every_channel_surfaces_enumerated_walkable_fields() {
         // Anti-drift guard: no channel may fall back to a free-typed condition
         // path. Every inbound channel must enumerate a closed field set so the

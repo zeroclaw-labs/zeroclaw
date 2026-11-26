@@ -121,12 +121,6 @@
           - "src/channels/imessage.rs"
           - "crates/zeroclaw-channels/src/imessage.rs"
 
-"channel:irc":
-  - changed-files:
-      - any-glob-to-any-file:
-          - "src/channels/irc.rs"
-          - "crates/zeroclaw-channels/src/irc.rs"
-
 "channel:lark":
   - changed-files:
       - any-glob-to-any-file:

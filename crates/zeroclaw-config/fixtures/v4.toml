@@ -6,7 +6,6 @@ channels = [
     "dingtalk.default",
     "discord.default",
     "imessage.default",
-    "irc.default",
     "lark.default",
     "lark.feishu",
     "linq.default",
@@ -129,14 +128,6 @@ topic = "projects/zeroclaw-fixture/topics/inbox"
 
 [channels.imessage.default]
 enabled = false
-
-[channels.irc.default]
-channels = ["#zeroclaw"]
-enabled = false
-nickname = "zeroclaw"
-port = 6697
-server = "irc.example.org"
-username = "zeroclaw"
 
 [channels.lark.default]
 app_id = "cli_lark_v1"
@@ -560,11 +551,6 @@ external_peers = ["222233334444"]
 agents = ["complex_agent"]
 channel = "imessage"
 external_peers = ["+15551234567"]
-
-[peer_groups.irc_default]
-agents = ["complex_agent"]
-channel = "irc"
-external_peers = ["operator"]
 
 [peer_groups.lark_default]
 agents = ["complex_agent"]

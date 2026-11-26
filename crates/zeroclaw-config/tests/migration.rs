@@ -2472,7 +2472,6 @@ fn generate_v3_channel_breadth_lower_bound() {
         + cfg.channels.linq.len()
         + cfg.channels.nextcloud_talk.len()
         + cfg.channels.mqtt.len()
-        + cfg.channels.irc.len()
         + cfg.channels.lark.len()
         + cfg.channels.line.len()
         + cfg.channels.dingtalk.len()

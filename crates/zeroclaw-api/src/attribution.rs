@@ -99,6 +99,8 @@ pub enum ChannelKind {
     GmailPush,
     #[strum(serialize = "imessage")]
     IMessage,
+    /// Retained after the built-in IRC channel moved to the `irc` plugin so
+    /// historical attribution records that name it still deserialize.
     Irc,
     Lark,
     Line,
@@ -115,6 +117,9 @@ pub enum ChannelKind {
     Signal,
     Slack,
     Telegram,
+    /// Retained after the built-in Twitch channel moved to the `twitch`
+    /// plugin so historical attribution records that name it still
+    /// deserialize.
     Twitch,
     Twitter,
     VoiceCall,
@@ -136,12 +141,15 @@ pub enum ChannelKind {
 impl ChannelKind {
     /// Whether this channel can deliver inbound events that fan into an SOP.
     /// `Cli` is a local interactive session, `Plugin` is a synthetic attribution
-    /// bucket, and `Wati` is retained only for historical attribution records;
-    /// none is a live background event source. Every other kind is a real inbound
-    /// channel a SOP can trigger on.
+    /// bucket, and `Irc`, `Twitch`, and `Wati` are retained only for historical
+    /// attribution records; none is a live background event source. Every other
+    /// kind is a real inbound channel a SOP can trigger on.
     #[must_use]
     pub fn inbound_capable(self) -> bool {
-        !matches!(self, Self::Cli | Self::Plugin | Self::Wati)
+        !matches!(
+            self,
+            Self::Cli | Self::Plugin | Self::Irc | Self::Twitch | Self::Wati
+        )
     }
 
     /// Canonical snake_case wire string, single-sourced from `IntoStaticStr`.
@@ -494,6 +502,23 @@ mod tests {
             .expect("historical WATI attribution must remain readable");
         assert_eq!(stored.channel_type, Some(ChannelKind::Wati));
         assert!(!ChannelKind::Wati.inbound_capable());
+    }
+
+    #[test]
+    fn retired_irc_and_twitch_kinds_still_deserialize_from_historical_attribution() {
+        #[derive(serde::Deserialize)]
+        struct StoredAttribution {
+            #[serde(default, with = "super::channel_kind_opt_serde")]
+            channel_type: Option<ChannelKind>,
+        }
+
+        for (wire, kind) in [("irc", ChannelKind::Irc), ("twitch", ChannelKind::Twitch)] {
+            let stored: StoredAttribution =
+                serde_json::from_str(&format!(r#"{{"channel_type":"{wire}"}}"#))
+                    .expect("historical attribution must remain readable");
+            assert_eq!(stored.channel_type, Some(kind));
+            assert!(!kind.inbound_capable());
+        }
     }
 
     #[test]

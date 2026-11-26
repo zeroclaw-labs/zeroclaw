@@ -36,11 +36,10 @@ Real-time messaging where the agent can hold a conversation, get notified of new
 | LINE | `channel-line` | [LINE](./line.md) |
 | Nextcloud Talk | `channel-nextcloud` | [Nextcloud Talk](./nextcloud-talk.md) |
 | Signal | `channel-signal` | [Signal](./signal.md) |
-| Twitch | `channel-twitch` | [Twitch](./social.md#twitch) |
 | WhatsApp Cloud API | `channel-whatsapp-cloud` | [WhatsApp](./whatsapp.md) |
 | WhatsApp Web | `whatsapp-web` | [WhatsApp](./whatsapp.md) |
 | WeCom (Bot Webhook / AI Bot WS) | `channel-wecom`, `channel-wecom-ws` | [Other chat platforms](./chat-others.md) |
-| iMessage, WeChat personal iLink Bot, DingTalk, Lark, QQ, IRC, Mochat, Notion | per channel | [Other chat platforms](./chat-others.md) |
+| iMessage, WeChat personal iLink Bot, DingTalk, Lark, QQ, Mochat, Notion | per channel | [Other chat platforms](./chat-others.md) |
 
 ### Social & broadcast
 
@@ -105,6 +104,47 @@ Input-only transports that feed events into the agent loop or the SOP engine. Th
 | Filesystem | `channel-filesystem` | Path changes → agent or SOP |
 
 See [MQTT](./mqtt.md), [AMQP](./amqp.md), and [Filesystem](./filesystem.md).
+
+### Plugin channels
+
+Some channels ship as WASM plugins in the plugin registry rather than as
+compiled-in features. Installing one needs no rebuild of ZeroClaw:
+
+| Channel | Plugin | Guide |
+|---|---|---|
+| IRC | `irc` | [`irc` plugin](https://github.com/zeroclaw-labs/zeroclaw-plugins/tree/main/plugins/irc) |
+| Twitch | `twitch` | [`twitch` plugin](https://github.com/zeroclaw-labs/zeroclaw-plugins/tree/main/plugins/twitch) |
+
+Install a plugin channel, bind it to an alias, and route `plugin.<alias>` to
+an agent like any other channel:
+
+```sh
+zeroclaw plugin install twitch
+zeroclaw plugin bind twitch --channel-alias stream --egress declared
+```
+
+See [Activating a channel plugin](../plugins/writing-a-channel-plugin.md#activating-a-channel-plugin)
+for the config the binding writes, and
+[Declaring and granting egress](../plugins/index.md#declaring-and-granting-egress)
+for granting a server the package does not declare, as an IRC server.
+
+#### Moving from the built-in IRC or Twitch channel
+
+Earlier builds compiled IRC and Twitch in. Their `[channels.irc.<alias>]`
+and `[channels.twitch.<alias>]` sections are now retired keys. Each load
+drops them and prints a notice naming the plugin to install. The next save
+removes them from `config.toml`, credentials included, and
+`zeroclaw config migrate` removes them immediately.
+
+That is not the only copy on disk. `zeroclaw config migrate` first copies the
+whole original file to `config.toml.backup`, which keeps the old IRC SASL or
+NickServ password and Twitch OAuth token until a later migration replaces it.
+Any `config.toml.v<version>.backup` an earlier upgrade kept, and any copy you
+made yourself, holds them too (see
+[Config lifecycle](../architecture/config-lifecycle.md)). Treat those files as
+secret material. Delete them once the plugin binding is delivering messages
+and you no longer need to roll back to a build with the built-in channel.
+Rotate the credential if a copy may have been exposed.
 
 ## Configuration
 

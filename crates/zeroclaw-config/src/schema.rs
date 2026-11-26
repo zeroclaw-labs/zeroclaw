@@ -16942,14 +16942,6 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub gmail_push: HashMap<String, crate::scattered_types::GmailPushConfig>,
-    /// IRC channel instances (`[channels.irc.<alias>]`).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    #[nested]
-    pub irc: HashMap<String, IrcConfig>,
-    /// Twitch chat channel instances (`[channels.twitch.<alias>]`).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    #[nested]
-    pub twitch: HashMap<String, TwitchConfig>,
     /// Lark channel instances (`[channels.lark.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -17186,20 +17178,6 @@ impl ChannelsConfig {
                 configured: !self.gmail_push.is_empty(),
             },
             ChannelInfo {
-                kind: "twitch",
-                config_key: "twitch",
-                name: "Twitch",
-                desc: "Twitch chat (IRC)",
-                configured: !self.twitch.is_empty(),
-            },
-            ChannelInfo {
-                kind: "irc",
-                config_key: "irc",
-                name: "IRC",
-                desc: "IRC over TLS",
-                configured: !self.irc.is_empty(),
-            },
-            ChannelInfo {
                 kind: "lark",
                 config_key: "lark",
                 name: "Lark",
@@ -17368,8 +17346,6 @@ impl ChannelsConfig {
             || self.nextcloud_talk.values().any(|c| c.enabled)
             || self.email.values().any(|c| c.enabled)
             || self.gmail_push.values().any(|c| c.enabled)
-            || self.irc.values().any(|c| c.enabled)
-            || self.twitch.values().any(|c| c.enabled)
             || self.lark.values().any(|c| c.enabled)
             || self.line.values().any(|c| c.enabled)
             || self.dingtalk.values().any(|c| c.enabled)
@@ -17400,7 +17376,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 34] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -17415,8 +17391,6 @@ impl ChannelsConfig {
             ("nextcloud_talk", !self.nextcloud_talk.is_empty(), true),
             ("email", !self.email.is_empty(), true),
             ("gmail_push", !self.gmail_push.is_empty(), true),
-            ("irc", !self.irc.is_empty(), true),
-            ("twitch", !self.twitch.is_empty(), true),
             ("lark", !self.lark.is_empty(), true),
             ("line", !self.line.is_empty(), true),
             ("dingtalk", !self.dingtalk.is_empty(), true),
@@ -17501,8 +17475,6 @@ impl Default for ChannelsConfig {
             nextcloud_talk: HashMap::new(),
             email: HashMap::new(),
             gmail_push: HashMap::new(),
-            irc: HashMap::new(),
-            twitch: HashMap::new(),
             lark: HashMap::new(),
             line: HashMap::new(),
             dingtalk: HashMap::new(),
@@ -20295,123 +20267,6 @@ fn default_amqp_sender_label() -> String {
 
 fn default_amqp_durable_ack() -> bool {
     true
-}
-
-/// IRC channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "channels.irc"]
-pub struct IrcConfig {
-    /// Whether this channel is active. The runtime only loads channels whose
-    /// `enabled = true`. Default: `false` so an operator who pastes a partial
-    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
-    /// live before the rest of its config is filled in.
-    #[tab(Behavior)]
-    #[serde(default)]
-    pub enabled: bool,
-    /// IRC server hostname
-    #[tab(Advanced)]
-    pub server: String,
-    /// IRC server port (default: 6697 for TLS)
-    #[tab(Advanced)]
-    #[serde(default = "default_irc_port")]
-    pub port: u16,
-    /// Bot nickname
-    #[tab(Advanced)]
-    pub nickname: String,
-    /// Username (defaults to nickname if not set)
-    #[tab(Connection)]
-    pub username: Option<String>,
-    /// Channels to join on connect
-    #[tab(Advanced)]
-    #[serde(default)]
-    pub channels: Vec<String>,
-    /// Server password (for bouncers like ZNC)
-    #[secret]
-    #[tab(Connection)]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub server_password: Option<String>,
-    /// NickServ IDENTIFY password
-    #[secret]
-    #[tab(Connection)]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub nickserv_password: Option<String>,
-    /// SASL PLAIN password (IRCv3)
-    #[secret]
-    #[tab(Connection)]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub sasl_password: Option<String>,
-    /// Verify TLS certificate (default: true)
-    #[tab(Advanced)]
-    pub verify_tls: Option<bool>,
-    /// When true, only respond to messages that mention the bot.
-    /// Other messages in the channel are silently ignored.
-    #[tab(Behavior)]
-    #[serde(default)]
-    pub mention_only: bool,
-
-    /// Tools excluded from this channel's tool spec. When set, these tools
-    /// are not exposed to the model when responding via this channel.
-    #[tab(Behavior)]
-    #[serde(default)]
-    pub excluded_tools: Vec<String>,
-}
-
-impl ChannelConfig for IrcConfig {
-    fn name() -> &'static str {
-        "IRC"
-    }
-    fn desc() -> &'static str {
-        "IRC over TLS"
-    }
-}
-
-/// Twitch chat channel configuration. A thin adapter over IRC
-/// (`irc.chat.twitch.tv:6697` over TLS); see the `twitch` channel module.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "channels.twitch"]
-pub struct TwitchConfig {
-    /// Whether this channel is active. The runtime only loads channels whose
-    /// `enabled = true`. Default: `false`.
-    #[tab(Behavior)]
-    #[serde(default)]
-    pub enabled: bool,
-    /// Twitch login name of the bot account (case-insensitive — lowercased
-    /// before send).
-    #[tab(Connection)]
-    pub bot_username: String,
-    /// Twitch OAuth user-access token. The `oauth:` prefix is added
-    /// automatically if missing, so both `"oauth:abcdef"` and `"abcdef"`
-    /// work. Mint via <https://twitchapps.com/tmi/> or the Twitch CLI.
-    #[secret]
-    #[tab(Connection)]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub oauth_token: String,
-    /// Twitch channels to join. Each entry receives a `#` prefix if missing
-    /// and is lowercased before send (Twitch channel names are
-    /// case-insensitive). E.g. `["mychannel", "#anotherchannel"]`.
-    #[tab(Advanced)]
-    #[serde(default)]
-    pub channels: Vec<String>,
-    /// When true, only respond to messages that mention the bot's login
-    /// name. Default: `false`.
-    #[tab(Behavior)]
-    #[serde(default)]
-    pub mention_only: bool,
-}
-
-impl ChannelConfig for TwitchConfig {
-    fn name() -> &'static str {
-        "Twitch"
-    }
-    fn desc() -> &'static str {
-        "Twitch chat (IRC)"
-    }
-}
-
-fn default_irc_port() -> u16 {
-    6697
 }
 
 /// How ZeroClaw receives events from Feishu / Lark.
@@ -36009,8 +35864,6 @@ auto_save = true
                 nextcloud_talk: HashMap::new(),
                 email: HashMap::new(),
                 gmail_push: HashMap::new(),
-                irc: HashMap::new(),
-                twitch: HashMap::new(),
                 lark: HashMap::new(),
                 line: HashMap::new(),
                 dingtalk: HashMap::new(),
@@ -38467,8 +38320,6 @@ allowed_users = ["@u:matrix.org"]
             nextcloud_talk: HashMap::new(),
             email: HashMap::new(),
             gmail_push: HashMap::new(),
-            irc: HashMap::new(),
-            twitch: HashMap::new(),
             lark: HashMap::new(),
             line: HashMap::new(),
             dingtalk: HashMap::new(),
@@ -39086,8 +38937,6 @@ allowed_numbers = ["+1", "+2"]
             nextcloud_talk: HashMap::new(),
             email: HashMap::new(),
             gmail_push: HashMap::new(),
-            irc: HashMap::new(),
-            twitch: HashMap::new(),
             lark: HashMap::new(),
             line: HashMap::new(),
             dingtalk: HashMap::new(),
