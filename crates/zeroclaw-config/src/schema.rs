@@ -6858,6 +6858,14 @@ pub struct LocalWhisperTranscriptionProviderConfig {
     /// Optional language hint (passed through to the local endpoint).
     #[serde(default)]
     pub language: Option<String>,
+    /// Optional model identifier sent to the endpoint as the multipart `model`
+    /// form field. Strict OpenAI-compatible servers (e.g. oMLX hosting a Qwen
+    /// ASR model) require it and rarely host a model literally named
+    /// `"whisper"`. Leave unset for servers that choose their model at startup
+    /// (`whisper.cpp`), which take no selector field and rely on the legacy
+    /// wire shape.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Maximum audio file size in bytes accepted by this endpoint.
     /// Defaults to 25 MB to match the cloud cap; raise as needed.
     #[serde(default = "default_local_whisper_max_audio_bytes")]
@@ -6889,6 +6897,7 @@ impl Default for LocalWhisperTranscriptionProviderConfig {
             uri: String::new(),
             bearer_token: None,
             language: None,
+            model: None,
             max_audio_bytes: default_local_whisper_max_audio_bytes(),
             timeout_secs: default_local_whisper_timeout_secs(),
         }
@@ -7029,6 +7038,12 @@ pub struct LocalWhisperConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bearer_token: Option<String>,
+    /// Optional model identifier sent to the endpoint as the multipart `model`
+    /// form field. Strict OpenAI-compatible servers (e.g. oMLX hosting a Qwen
+    /// ASR model) require it; leave unset for servers that choose their model
+    /// at startup (`whisper.cpp`).
+    #[serde(default)]
+    pub model: Option<String>,
     /// Maximum audio file size in bytes accepted by this endpoint.
     /// Defaults to 25 MB — matching the cloud API cap for a safe out-of-the-box
     /// experience. Self-hosted endpoints can accept much larger files; raise this
@@ -7065,6 +7080,7 @@ impl Default for LocalWhisperConfig {
         Self {
             url: String::new(),
             bearer_token: None,
+            model: None,
             max_audio_bytes: default_local_whisper_max_audio_bytes(),
             timeout_secs: default_local_whisper_timeout_secs(),
         }
@@ -13304,6 +13320,9 @@ pub struct MemoryConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_api_key: Option<String>,
+    /// Text prepended to a search query, and only to the query, before it is embedded. Instruction-tuned embedding models are trained to embed a query and a stored passage differently and expect the query side to carry an instruction, for example `Instruct: Given a user message, retrieve memories that help answer it\nQuery:` for Qwen3-Embedding or `query: ` for E5-style models; without it they rank worse than keyword search. Stored memories are always embedded as they are, so setting or changing this needs no re-embedding. Leave unset for models that embed both sides the same way (OpenAI, Gemini).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_query_prefix: Option<String>,
     /// How heavily vector (semantic) similarity counts when `search_mode = hybrid`. Raise toward 1.0 to favor meaning-based matches; lower it to lean on keyword overlap instead.
     #[serde(default = "default_vector_weight")]
     pub vector_weight: f64,
@@ -13913,6 +13932,7 @@ impl Default for MemoryConfig {
             embedding_dimensions: default_embedding_dims(),
             auto_reindex_on_identity_change: false,
             embedding_api_key: None,
+            embedding_query_prefix: None,
             vector_weight: default_vector_weight(),
             keyword_weight: default_keyword_weight(),
             search_mode: SearchMode::default(),
@@ -17834,6 +17854,14 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub unauthorized_message: Option<String>,
+    /// Send replies with Bot API rich messages (native tables, headings, lists, and quotes).
+    ///
+    /// Some Telegram clients still show rich messages as unsupported, so this
+    /// stays off until every client in use can render them. With it off, tables
+    /// are delivered as preformatted text.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub rich_messages: bool,
     /// When `true` (default), group-chat sessions key on the sender, so
     /// distinct members of the same group (or forum topic) each get an
     /// isolated conversation context (matches the existing behavior). When
@@ -17918,6 +17946,7 @@ impl Default for TelegramConfig {
             interrupt_on_new_message: false,
             mention_only: false,
             unauthorized_message: None,
+            rich_messages: false,
             per_user_session: true,
             passive_group_context: false,
             ack_reactions: None,
@@ -36017,6 +36046,8 @@ auto_save = true
                         excluded_tools: vec![],
                         reply_min_interval_secs: 0,
                         reply_queue_depth_max: 0,
+
+                        rich_messages: false,
                     },
                 )]),
                 discord: HashMap::new(),
@@ -38081,6 +38112,8 @@ default_temperature = 0.7
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
             debounce_ms: None,
+
+            rich_messages: false,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -38117,6 +38150,15 @@ stream_mode = "single_message"
     async fn telegram_config_passive_group_context_defaults_off() {
         let parsed: TelegramConfig = serde_json::from_str(r#"{"bot_token":"t"}"#).unwrap();
         assert!(!parsed.passive_group_context);
+    }
+
+    #[test]
+    async fn telegram_config_rich_messages_defaults_off_and_parses_true() {
+        let parsed: TelegramConfig = serde_json::from_str(r#"{"bot_token":"t"}"#).unwrap();
+        assert!(!parsed.rich_messages);
+        let enabled: TelegramConfig =
+            serde_json::from_str(r#"{"bot_token":"t","rich_messages":true}"#).unwrap();
+        assert!(enabled.rich_messages);
     }
 
     #[test]
@@ -45248,6 +45290,8 @@ high_entropy_tokens = false
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+
+                rich_messages: false,
             },
         );
 
