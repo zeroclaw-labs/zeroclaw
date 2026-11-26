@@ -228,13 +228,37 @@ mod allowlist {
         None
     }
 
+    fn room_entry_matches(entry: &str, room_id: &str) -> bool {
+        entry == room_id || entry.eq_ignore_ascii_case(room_id)
+    }
+
     pub(super) fn room_allowed_static(allowed_rooms: &[String], room_id: &str) -> bool {
         if allowed_rooms.is_empty() {
             return true;
         }
         allowed_rooms
             .iter()
-            .any(|r| r == room_id || r.eq_ignore_ascii_case(room_id))
+            .any(|entry| room_entry_matches(entry, room_id))
+    }
+
+    /// `allowed_rooms` entries that match none of the `joined` room IDs.
+    /// A room created through the Admin/Client API with a custom room ID has
+    /// no `:server` suffix, and the inbound gate compares literally (ASCII
+    /// case-insensitive), so an entry written against such a room with a
+    /// suffix — or any typo — silences the channel completely. An empty
+    /// allowlist allows every room, so there is nothing to validate.
+    pub(super) fn unmatched_allowed_rooms(
+        allowed_rooms: &[String],
+        joined: &[String],
+    ) -> Vec<String> {
+        if allowed_rooms.is_empty() {
+            return Vec::new();
+        }
+        allowed_rooms
+            .iter()
+            .filter(|entry| !joined.iter().any(|room| room_entry_matches(entry, room)))
+            .cloned()
+            .collect()
     }
 
     /// The peer list with every `*` grant removed, keeping named grants and
@@ -2250,6 +2274,7 @@ mod inbound {
             )));
         }
         ctx.initial_sync_done.store(true, Ordering::SeqCst);
+        log_effective_gates(&client, &ctx).await;
         client.sync(sync_settings).await.map_err(|e| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -2263,6 +2288,48 @@ mod inbound {
             );
             anyhow::Error::msg(format!("matrix sync loop failed: {e}"))
         })
+    }
+
+    /// Log the isolation gates that will actually run, once, right after the
+    /// initial sync when the joined-room list is known. Everything is
+    /// resolved from the canonical config and client state at this moment
+    /// and nothing is retained. Two lines matter for operations:
+    /// the INFO summary shows what loaded, and one WARN per `allowed_rooms`
+    /// entry that matches no joined room surfaces the class of misconfig
+    /// (suffix, typo, foreign room) that otherwise silences the channel
+    /// with no visible symptom.
+    async fn log_effective_gates(client: &Client, ctx: &HandlerCtx) {
+        let joined: Vec<String> = client
+            .rooms()
+            .into_iter()
+            .filter(|room| room.state() == RoomState::Joined)
+            .map(|room| room.room_id().to_string())
+            .collect();
+        let peers = (ctx.peer_resolver)();
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "alias": &ctx.alias,
+                    "allowed_rooms": &ctx.config.allowed_rooms,
+                    "joined_rooms": joined.len(),
+                    "peers": peers.len(),
+                    "mention_only": ctx.config.mention_only,
+                })
+            ),
+            "matrix: effective gates (allowed_rooms, joined count, peer count, mention_only)"
+        );
+        for entry in allowlist::unmatched_allowed_rooms(&ctx.config.allowed_rooms, &joined) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "allowed_rooms_entry": entry,
+                        "joined_rooms": &joined,
+                    })),
+                "matrix: allowed_rooms entry matches no joined room"
+            );
+        }
     }
 
     /// React ❓ on any inbound event the SDK delivered as still-encrypted
@@ -2285,7 +2352,7 @@ mod inbound {
             return;
         }
         ::zeroclaw_log::record!(
-            DEBUG,
+            INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             &format!(
                 "matrix: reacting ❓ to undecryptable event {} from {}",
@@ -2514,8 +2581,11 @@ mod inbound {
         }
 
         if !sender_allowed {
+            // Isolation-gate drops are security-relevant: they must be
+            // visible at the default log level, or a misconfigured gate is
+            // indistinguishable from a dead channel.
             ::zeroclaw_log::record!(
-                DEBUG,
+                WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(::serde_json::json!({"sender": sender})),
                 "matrix: drop message from non-allowed sender"
@@ -2524,7 +2594,7 @@ mod inbound {
         }
         if !room_allowed {
             ::zeroclaw_log::record!(
-                DEBUG,
+                INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(::serde_json::json!({"room_id": room_id})),
                 "matrix: drop message from non-allowed room"
@@ -2581,7 +2651,7 @@ mod inbound {
             };
             if !mention::admit_group_message(mentioned, reply_to_bot) {
                 ::zeroclaw_log::record!(
-                    DEBUG,
+                    INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_attrs(::serde_json::json!({"sender": sender})),
                     "matrix: drop unmentioned message from"
@@ -8754,7 +8824,7 @@ mod tests {
     }
 
     mod allowlist {
-        use super::super::allowlist::{room_allowed_static, user_allowed};
+        use super::super::allowlist::{room_allowed_static, unmatched_allowed_rooms, user_allowed};
 
         #[test]
         fn empty_user_list_denies_all() {
@@ -8809,6 +8879,52 @@ mod tests {
                 &["!ok:server".to_string()],
                 "!nope:server"
             ));
+        }
+
+        #[test]
+        fn empty_allowed_rooms_nothing_unmatched() {
+            // Empty allowlist admits every room, so startup validation has
+            // nothing to flag.
+            assert!(unmatched_allowed_rooms(&[], &["!a:b".to_string()]).is_empty());
+        }
+
+        #[test]
+        fn all_entries_matched_nothing_unmatched() {
+            let allowed = vec!["!ok:server".to_string(), "!also:server".to_string()];
+            let joined = vec!["!ok:server".to_string(), "!also:server".to_string()];
+            assert!(unmatched_allowed_rooms(&allowed, &joined).is_empty());
+        }
+
+        #[test]
+        fn suffix_entry_against_suffixless_room_is_unmatched() {
+            // Room IDs created through the Admin/Client API with a custom
+            // localpart carry no `:server` part; an entry written with a
+            // suffix is the exact misconfiguration that silenced a channel.
+            let allowed = vec!["!room:server.tld".to_string()];
+            let joined = vec!["!room".to_string()];
+            assert_eq!(
+                unmatched_allowed_rooms(&allowed, &joined),
+                vec!["!room:server.tld".to_string()]
+            );
+        }
+
+        #[test]
+        fn typo_entry_is_unmatched() {
+            let allowed = vec!["!ok:server".to_string(), "!typo:server".to_string()];
+            let joined = vec!["!ok:server".to_string()];
+            assert_eq!(
+                unmatched_allowed_rooms(&allowed, &joined),
+                vec!["!typo:server".to_string()]
+            );
+        }
+
+        #[test]
+        fn unmatched_match_is_case_insensitive() {
+            // Same rule as the inbound gate: ASCII case must not flag a
+            // correctly configured entry.
+            let allowed = vec!["!Room:Server".to_string()];
+            let joined = vec!["!room:server".to_string()];
+            assert!(unmatched_allowed_rooms(&allowed, &joined).is_empty());
         }
     }
 
