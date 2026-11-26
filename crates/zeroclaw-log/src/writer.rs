@@ -2,8 +2,8 @@
 //!
 //! RAM contract: a single event lands in two allocations (the JSON line
 //! that goes to disk + the `serde_json::Value` clone that goes to the
-//! broadcast hook). Rolling rotation streams through `BufReader::lines`
-//! into a temp file rather than slurping the whole file into a `String`.
+//! broadcast hook). Rolling trim streams one line of bytes at a time into a
+//! temp file.
 //!
 //! ## Hot-path write concurrency model
 //!
@@ -737,20 +737,24 @@ fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
 
         let in_file = fs::File::open(&state.policy.path)
             .with_context(|| format!("opening log for trim: {}", state.policy.path.display()))?;
-        let reader = BufReader::new(in_file);
-
-        let mut index: usize = 0;
-        for line in reader.lines() {
-            let line = line.context("reading log line during trim")?;
-            if line.trim().is_empty() {
-                continue;
+        let mut reader = BufReader::new(in_file);
+        let mut line = Vec::new();
+        let mut index = 0;
+        loop {
+            line.clear();
+            if reader
+                .read_until(b'\n', &mut line)
+                .context("reading log line during trim")?
+                == 0
+            {
+                break;
             }
-            if index >= skip {
-                out.write_all(line.as_bytes())
-                    .context("writing trim line")?;
-                out.write_all(b"\n").context("writing trim newline")?;
+            if !is_blank_log_line(&line) {
+                if index >= skip {
+                    out.write_all(&line).context("writing trim line")?;
+                }
+                index += 1;
             }
-            index += 1;
         }
         out.flush().context("flushing trim file")?;
         out.into_inner()
@@ -799,18 +803,30 @@ fn before_trim_rename_hook() -> Result<()> {
     Ok(())
 }
 
+/// Treat undecodable rows as nonblank so they age out with the retained window.
+fn is_blank_log_line(line: &[u8]) -> bool {
+    std::str::from_utf8(line).is_ok_and(|text| text.trim().is_empty())
+}
+
 fn count_nonempty_lines(path: &Path) -> Result<usize> {
     let file = fs::File::open(path)
         .with_context(|| format!("opening log to count lines: {}", path.display()))?;
-    let reader = BufReader::new(file);
-    let mut n = 0usize;
-    for line in reader.lines() {
-        let line = line.context("reading log line for count")?;
-        if !line.trim().is_empty() {
-            n += 1;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut count = 0;
+    loop {
+        line.clear();
+        if reader
+            .read_until(b'\n', &mut line)
+            .context("reading log line for count")?
+            == 0
+        {
+            return Ok(count);
+        }
+        if !is_blank_log_line(&line) {
+            count += 1;
         }
     }
-    Ok(n)
 }
 
 /// Seed the in-memory line counter at worker startup. A missing active file
@@ -1342,6 +1358,62 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
             assert_eq!(v["message"].as_str().unwrap(), format!("event-{}", idx + 7));
         }
+    }
+
+    #[test]
+    fn rolling_trim_keeps_working_with_a_damaged_line() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = LogConfig {
+            log_persistence: "rolling".into(),
+            log_persistence_max_entries: 3,
+            ..LogConfig::default()
+        };
+        let path = ResolvedPolicy::from_config(&cfg, tmp.path()).path;
+        let seeded = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
+        let mut good_line = serde_json::to_vec(&seeded).unwrap();
+        good_line.extend(b"\r\n");
+        let damaged_line = b"\xff\n";
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            [
+                b"{\"old\":true}\n".as_slice(),
+                &good_line,
+                damaged_line,
+                "\u{2003}\r\n".as_bytes(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+
+        init_from_config(&cfg, tmp.path());
+        emit("one");
+        let trace = fs::read(&path).unwrap();
+        let mut lines = trace.split_inclusive(|byte| *byte == b'\n');
+        assert_eq!(lines.next(), Some(good_line.as_slice()));
+        assert_eq!(lines.next(), Some(damaged_line.as_slice()));
+        let newest: LogEvent = serde_json::from_slice(lines.next().unwrap()).unwrap();
+        assert_eq!(newest.message.as_deref(), Some("one"));
+        assert_eq!(lines.next(), None);
+
+        emit("two");
+        emit("three");
+        let page = crate::reader::query_log_page(
+            &path,
+            false,
+            &crate::reader::LogFilter::default(),
+            10,
+            None,
+        )
+        .unwrap();
+        assert!(!page.incomplete);
+        let messages: Vec<_> = page
+            .events
+            .iter()
+            .map(|event| event.message.as_deref())
+            .collect();
+        assert_eq!(messages, [Some("three"), Some("two"), Some("one")]);
     }
 
     /// Names in `dir` that look like a leaked trim temp file
@@ -2555,6 +2627,39 @@ mod tests {
             CAP + 1,
             "seeded rows and the new append must all survive the rotation"
         );
+    }
+
+    #[test]
+    fn entry_count_rotation_seeds_the_cap_with_a_damaged_line() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = LogConfig {
+            log_persistence: "rotating".into(),
+            log_persistence_max_bytes: 0,
+            log_persistence_rotate_daily: false,
+            log_persistence_max_entries_per_segment: 2,
+            ..LogConfig::default()
+        };
+        let path = ResolvedPolicy::from_config(&cfg, tmp.path()).path;
+        let mut seed =
+            serde_json::to_vec(&LogEvent::new(Severity::Info, "test", EventCategory::Agent))
+                .unwrap();
+        seed.extend(b"\n\xff\n");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &seed).unwrap();
+
+        init_from_config(&cfg, tmp.path());
+        emit("first after restart");
+
+        let archives = list_archives(&path).unwrap();
+        assert_eq!(
+            archives.len(),
+            1,
+            "the seeded segment was already at its cap"
+        );
+        assert_eq!(fs::read(&archives[0].0).unwrap(), seed);
+        let active: LogEvent = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(active.message.as_deref(), Some("first after restart"));
     }
 
     #[test]
