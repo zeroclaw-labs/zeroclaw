@@ -176,32 +176,71 @@ pub(crate) fn remap_after_promotion(source: &Config, candidate: &mut Config) -> 
 }
 
 pub(crate) fn set(config: &mut Config, path: &str, value: &str, restore: bool) -> Result<()> {
-    let mut document = serde_json::to_value(&config.providers)?;
     if restore {
+        let mut document = serde_json::to_value(&config.providers)?;
         restore_document(&mut document, path, value)?;
         config.providers = serde_json::from_value(document)?;
         return Ok(());
     }
-    // Let the real schema select the type. String fields must preserve values
-    // such as numeric model IDs and JSON-looking credentials verbatim.
-    let literal = if value.is_empty() {
-        Value::Null
-    } else {
-        Value::String(value.to_owned())
+    set_many(config, &[(path.to_owned(), value.to_owned())])
+}
+
+/// Apply several registry environment edits against one raw document and only
+/// decode the typed provider registry once. This matters for compound auth
+/// overrides such as `auth.mode=oauth` plus `auth.client_secret`: decoding each
+/// leaf separately can reject the intermediate, incomplete auth variant.
+pub(crate) fn set_many(config: &mut Config, edits: &[(String, String)]) -> Result<()> {
+    let mut document = serde_json::to_value(&config.providers)?;
+    let mut parsed_edits = Vec::with_capacity(edits.len());
+    for (path, value) in edits {
+        let literal = if value.is_empty() {
+            Value::Null
+        } else {
+            Value::String(value.clone())
+        };
+        let parsed = serde_json::from_str::<Value>(value)
+            .ok()
+            .filter(|value| !value.is_null() && !value.is_string())
+            .unwrap_or_else(|| literal.clone());
+        set_document(&mut document, path, parsed.clone(), None)?;
+        parsed_edits.push((path.clone(), parsed, literal));
+    }
+
+    for (path, _, _) in &parsed_edits {
+        validate_option_override(&document, path)?;
+    }
+    let candidate = serde_json::from_value(document.clone());
+    let candidate: crate::providers::Providers = match candidate {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            // Preserve the historical fallback for a JSON-looking string that
+            // is actually a typed string. Restore only the parsed leaves one
+            // by one until the candidate decodes, retaining structured option
+            // values when they are required by the schema.
+            let mut fallback = document;
+            let mut last_error = error;
+            let mut candidate = None;
+            for (path, parsed, literal) in &parsed_edits {
+                if parsed == literal {
+                    continue;
+                }
+                set_document(&mut fallback, path, literal.clone(), None)?;
+                match serde_json::from_value(fallback.clone()) {
+                    Ok(value) => {
+                        candidate = Some(value);
+                        break;
+                    }
+                    Err(error) => last_error = error,
+                }
+            }
+            candidate.ok_or(last_error)?
+        }
     };
-    // JSON-valued options need their structured representation. A typed string
-    // field rejects numbers/objects here, then accepts the unchanged literal
-    // below. Keep strings (including quoted credentials) and the clear
-    // sentinel verbatim instead of treating them as JSON string syntax.
-    let parsed = serde_json::from_str::<Value>(value)
-        .ok()
-        .filter(|value| !value.is_null() && !value.is_string())
-        .unwrap_or_else(|| literal.clone());
-    set_document(&mut document, path, parsed.clone(), None)?;
-    // Option patches tolerate unknown keys when loading files (the startup
-    // scanner reports them). Env edits instead fail atomically. Validate
-    // these permissive leaves from the same field declarations; every other
-    // canonical container is checked by its strict typed deserializer.
+    config.providers = candidate;
+    Ok(())
+}
+
+fn validate_option_override(document: &Value, path: &str) -> Result<()> {
     let parts: Vec<_> = path
         .trim_start_matches('/')
         .split('/')
@@ -244,16 +283,6 @@ pub(crate) fn set(config: &mut Config, path: &str, value: &str, restore: bool) -
             );
         }
     }
-    let candidate = serde_json::from_value(document.clone());
-    let candidate: crate::providers::Providers = match candidate {
-        Ok(candidate) => candidate,
-        Err(error) => {
-            ensure!(parsed != literal, "{error}");
-            set_document(&mut document, path, literal, None)?;
-            serde_json::from_value(document)?
-        }
-    };
-    config.providers = candidate;
     Ok(())
 }
 

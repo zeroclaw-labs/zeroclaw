@@ -86,6 +86,7 @@ pub(super) fn migrate(mut document: toml::Value) -> Result<toml::Value> {
             .providers
             .models
             .canonical_model(&ModelRef::from(reference));
+        let canonical_provider = canonical.map(|model| model.provider().to_owned());
         let mut model_ref = reference.to_owned();
         if canonical.is_none() || explicit_model.is_some() || key.is_some() {
             let (mut connection, mut model) = if let Some(model) = canonical {
@@ -153,12 +154,20 @@ pub(super) fn migrate(mut document: toml::Value) -> Result<toml::Value> {
                 name = format!("{base}.{suffix}");
                 suffix += 1;
             }
-            model["provider"] = name.clone().into();
+            // A route without its own credential override must keep the
+            // source connection identity. Environment overrides are applied
+            // to that canonical connection after migration; copying it under
+            // `route.*` would leave the migrated route with stale credentials.
+            let reuse_provider = key.is_none() && canonical_provider.is_some();
+            let provider_name = canonical_provider.as_deref().unwrap_or(&name);
+            model["provider"] = provider_name.to_owned().into();
             // Decode the connection here to avoid producing a document which
             // only fails much later at first use. Values never enter errors.
             serde_json::from_value::<ProviderConnection>(connection.clone())
                 .with_context(|| format!("cannot migrate model_routes[{index}] connection"))?;
-            connections.insert(name.clone(), toml::Value::try_from(connection)?);
+            if !reuse_provider {
+                connections.insert(name.clone(), toml::Value::try_from(connection)?);
+            }
             models.insert(name.clone(), toml::Value::try_from(model)?);
             if let Some(targets) = fallbacks.get(reference) {
                 route_fallbacks.push((name.clone(), targets.clone()));
@@ -683,5 +692,40 @@ model_provider = "ollama.main.fast"
         let migrated = migrate(document).unwrap();
         let named = &migrated["providers"]["models"]["route.fast"]["options"];
         assert!(named.get("extract_text_tool_calls").is_none());
+    }
+
+    #[test]
+    fn route_without_credential_override_reuses_canonical_connection() {
+        let document: toml::Value = toml::from_str(
+            r#"
+schema_version = 4
+
+[providers.connections."gateway.prod"]
+kind = "custom"
+uri = "https://example.test/v1"
+auth = { mode = "api_key", api_key = "from-env" }
+
+[providers.models."chat.main"]
+capability = "chat"
+provider = "gateway.prod"
+model = "primary"
+
+[[model_routes]]
+hint = "fast"
+model_provider = "chat.main"
+model = "route-model"
+"#,
+        )
+        .unwrap();
+        let migrated = migrate(document).unwrap();
+        assert_eq!(
+            migrated["providers"]["models"]["route.fast"]["provider"],
+            "gateway.prod"
+        );
+        assert!(
+            migrated["providers"]["connections"]
+                .get("route.fast")
+                .is_none()
+        );
     }
 }

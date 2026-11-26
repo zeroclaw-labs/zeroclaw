@@ -72,6 +72,7 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
     let registry_before = serde_json::to_value(&config.providers)?;
     let mut paths: HashSet<String> = HashSet::with_capacity(entries.len());
     let mut snapshots: HashMap<String, String> = HashMap::with_capacity(entries.len());
+    let mut registry_edits = Vec::new();
     for (env_name, value, tail) in entries {
         // Recognized legacy `[todotracker]` vars are accepted and ignored so an
         // upgrade cannot turn a previously working deployment into a daemon
@@ -142,7 +143,8 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
         snapshots.entry(path.clone()).or_insert(snapshot);
 
         if path.starts_with("/providers/") {
-            crate::provider_registry::env_input::set(config, &path, &value, false)
+            registry_edits.push((path.clone(), value.clone(), env_name.clone()));
+            Ok(())
         } else {
             config.set_prop(&path, &value)
         }
@@ -164,6 +166,20 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
             );
         }
         paths.insert(path);
+    }
+    if !registry_edits.is_empty() {
+        let edits: Vec<_> = registry_edits
+            .iter()
+            .map(|(path, value, _)| (path.clone(), value.clone()))
+            .collect();
+        crate::provider_registry::env_input::set_many(config, &edits).with_context(|| {
+            let names = registry_edits
+                .iter()
+                .map(|(_, _, name)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("registry environment overrides ({names})")
+        })?;
     }
     if !paths.is_empty() {
         ::zeroclaw_log::record!(
@@ -700,6 +716,30 @@ embedding_model_ref="embedding.main"
 
         assert!(applied.paths.contains("gateway.request_timeout_secs"));
         assert_eq!(config.gateway.request_timeout_secs, 120);
+    }
+
+    #[tokio::test]
+    async fn registry_auth_overrides_are_decoded_after_the_whole_batch() {
+        let _guard = super::env_test_lock().await;
+        let _mode = EnvVarGuard::set(
+            "ZEROCLAW_providers__connections__gemini__auth__mode",
+            "oauth",
+        );
+        let _secret = EnvVarGuard::set(
+            "ZEROCLAW_providers__connections__gemini__auth__client_secret",
+            "client-secret",
+        );
+        let mut config = Config::default();
+        config.providers = serde_json::from_value(serde_json::json!({
+            "connections": {"gemini": {"kind": "gemini"}},
+            "models": {}
+        }))
+        .unwrap();
+
+        apply_env_overrides(&mut config).expect("compound OAuth overrides must be atomic");
+        let connection = serde_json::to_value(&config.providers.connections["gemini"]).unwrap();
+        assert_eq!(connection["auth"]["mode"], "oauth");
+        assert_eq!(connection["auth"]["client_secret"], "client-secret");
     }
 
     #[tokio::test]
