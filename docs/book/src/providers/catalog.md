@@ -44,24 +44,93 @@ remain unsupported.
 
 Google's Gemini API. Supports vision and pre-executed grounded search (see [Streaming](./streaming.md) for `PreExecutedToolCall` events).
 
-### Gemini CLI: slot `gemini_cli`
+### Gemini CLI: slot `gemini_cli` (retired)
 
-Shells out to the `gemini` CLI; uses the CLI's existing auth.
+Retired. Google replaced Gemini CLI with Antigravity CLI, and Gemini CLI stopped
+serving Google AI free, Pro, and Ultra accounts on June 18, 2026. A configured
+`[providers.models.gemini_cli.<alias>]` now fails config validation, and an
+agent that still points at it fails at startup, with a message naming the
+replacement. Move the alias to [`antigravity_cli`](#antigravity-cli-slot-antigravity_cli)
+or to [`gemini`](#gemini-slot-gemini) with an API key, update agent
+`model_provider` references, and remove the `gemini_cli` section.
+
+### Antigravity CLI: slot `antigravity_cli`
+
+Runs Google's Antigravity CLI through its **`agy acp`** Agent Client Protocol
+server. Every request spawns `agy acp`, runs initialize → authenticate →
+session/new → session/set_model → session/prompt over newline-delimited
+JSON-RPC, and tears the child down. The prompt travels on stdin and never
+appears in argv or a prompt file. The system prompt uses Antigravity's
+`_meta.antigravity.systemPrompt.append` session extension, so ZeroClaw requires
+an `agy` build that advertises it (1.5.x does).
+
+ZeroClaw is an outer harness: it supplies its own system prompt and owns the
+conversation. Google's current Antigravity terms permit only API-key, Agent
+Platform, and Gemini Enterprise sign-in for such harnesses, so `auth_method`
+accepts:
+
+| `auth_method` | Credential | Notes |
+| ------------- | ---------- | ----- |
+| `gemini_api_key` (default) | The alias `api_key` secret | Sent only in the ACP `authenticate` `_meta.apiKey` field, never in argv or the child environment |
+| `agent_platform` | Application Default Credentials | Pass `GOOGLE_CLOUD_PROJECT` / `GOOGLE_CLOUD_LOCATION` with `env_passthrough` when your setup needs them |
+| `oauth_business` | Gemini Enterprise sign-in cached in the alias state directory | Explicit opt-in. ZeroClaw refuses the session unless Antigravity reports a business tier |
+| `oauth_personal` | Personal Google sign-in | Refused when the provider is built. Using a personal sign-in from a third-party harness can get the Google account suspended |
+
+Each alias runs `agy` with its own `--gemini-dir`, by default
+`<zeroclaw dir>/antigravity_cli/<alias>`, created with owner-only permissions.
+A personal sign-in cached in `~/.gemini` is therefore never reused, including
+through Antigravity's fallback to a saved login. For `oauth_business`, sign in
+once into that directory:
+
+```bash
+agy acp --login --gemini-dir ~/.zeroclaw/antigravity_cli/work
+```
+
+```toml
+[providers.models.antigravity_cli.home]
+model = "gemini-3.8-flash-high"           # a modelId from the account's model list; "default" keeps Antigravity's choice
+working_directory = "/path/to/agents/default/workspace"
+# api_key is set with `zeroclaw config set providers.models.antigravity_cli.home.api_key`
+# binary_path = "/home/you/.local/bin/agy"
+
+[providers.models.antigravity_cli.work]
+model = "gemini-3.8-flash-high"
+working_directory = "/path/to/agents/work/workspace"
+auth_method = "agent_platform"
+env_passthrough = ["GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION"]
+```
+
+The child environment is cleared before spawn; `env_passthrough` defaults to
+empty and rejects `GEMINI_*`, `GOOGLE_API_KEY`, `GOOGLE_GENAI_*`, `AGY_*`, and
+`ANTIGRAVITY_*`. ACP permission requests are rejected unless `extra_args`
+includes `--dangerously-skip-permissions`, which also makes the headless client
+select `allow_once`. `extra_args` accepts only `--sandbox`,
+`--dangerously-skip-permissions`, `--process-per-session`,
+`--include-default-customizations=<true|false>`, `--add-dir <dir>`, and
+`--agent <name>`; transport, state-directory, login, telemetry, logging, and
+endpoint flags are reserved. The same limits as `grok_cli` apply: one-shot
+sessions, no native ZeroClaw tool calls, no token usage, temperatures `0.7` or
+`1.0` only, and `timeout_secs` clamped to one hour. Alias `vision = true` sends
+ACP image blocks; `agy acp` advertises `promptCapabilities.image = true`.
 
 ### Grok Build CLI: slot `grok_cli`
 
 Shells out to the Grok Build CLI through the documented **`grok agent stdio`**
-ACP surface and uses the CLI's login cache by default. Run `grok login`, or use
-the explicit API-key bridge shown below. The typed alias `api_key` is not used,
-and ambient `XAI_API_KEY` is not inherited unless the alias opts in, so the Grok
-CLI remains the authentication owner. This is the only transport: initialize →
+ACP surface and uses the CLI's login cache by default. Run `grok login`, or opt
+an alias into API-key auth as shown below. Ambient `XAI_API_KEY` is not
+inherited unless the alias opts in, so the Grok CLI login cache remains the
+default authentication owner. This is the only transport: initialize →
 authenticate → session/new → session/prompt over newline-delimited JSON-RPC.
 Small and large prompts both travel on stdin and never appear in argv or a
 prompt file.
 
 The documented ACP integration and default argument profile are validated
-against Grok Build CLI `0.2.118` (ACP advertise/live probes) with earlier baseline `0.2.111`. Treat upgrades of the external CLI as a
-compatibility change and revalidate `grok agent stdio` before deploying them.
+against Grok Build CLI `0.2.118` (ACP advertise/live probes) with earlier baseline `0.2.111`.
+Grok Build `1.0.x` advertises only the `grok.com` auth method (its login cache
+and sign-in flow) while still accepting the unadvertised `xai.api_key` method;
+ZeroClaw selects `xai.api_key` when an API key is configured and `grok.com`
+otherwise. Treat upgrades of the external CLI as a compatibility change and
+revalidate `grok agent stdio` before deploying them.
 
 #### ACP vision / image input (current Grok Build behavior)
 
@@ -154,19 +223,26 @@ bounded budget.
 [providers.models.grok_cli.default]
 model = "grok-4.5"
 working_directory = "/srv/zeroclaw/grok-workspace"
-env_passthrough = ["XAI_API_KEY"]
+# API-key auth, option 1: the typed alias secret, set with
+#   zeroclaw config set providers.models.grok_cli.default.api_key
+# API-key auth, option 2 (instead of option 1): a daemon environment variable
+# env_passthrough = ["XAI_API_KEY"]
 # Optional: 4 MiB by default; accepted range is 1-64 MiB.
 max_acp_stdout_bytes = 8388608
 ```
 
-Export `XAI_API_KEY` into the daemon environment before starting ZeroClaw. The
-ACP client selects `xai.api_key` only when that name is listed in
-`env_passthrough` and a non-empty value is present in the process environment at
-**child spawn** (not snapshotted into the long-lived provider handle). Otherwise
-it falls back to the CLI login cache. Typed alias `api_key` remains rejected:
-this is an intentional process-env bridge rather than a second Config secret
-field. Values are not written to provider TOML; a future typed Config bridge
-may load the same name at config time without changing the operator surface.
+There are two mutually exclusive ways to give an alias an xAI API key:
+
+- **Typed `api_key`**: stored encrypted in config like every other provider
+  key. ZeroClaw places it in the child's `XAI_API_KEY` at spawn, because the
+  Grok CLI reads API keys only from that variable.
+- **`env_passthrough = ["XAI_API_KEY"]`**: export `XAI_API_KEY` into the daemon
+  environment before starting ZeroClaw; the value is read from the process
+  environment at each **child spawn** and never written to config.
+
+Configuring both is rejected. With either, the ACP client selects
+`xai.api_key`; otherwise it falls back to the CLI login cache. The key never
+appears in argv or ACP frames.
 
 An existing absolute `working_directory` is required. It is canonicalized and used for both the child cwd and ACP session boundary, so the provider never falls back to the daemon cwd. Optional `binary_path` accepts an absolute path or a bare executable name (default `grok`); relative paths with separators are rejected. Bare names resolve against absolute host `PATH` directories before the child cwd is set, ignoring empty and relative entries. The selected file is canonicalized and checked for executability before spawn. Alias `timeout_secs` bounds protocol reads and writes (default 600s).
 
@@ -524,6 +600,27 @@ runtime aliases.
 model = "..."
 api_key = "..."
 ```
+
+**Cheaper Inference**: slot `cheaperinference`. An OpenAI-compatible LLM
+gateway with one endpoint for models from several labs. Current models and
+prices are on [cheaperinference.com](https://cheaperinference.com/#models). The
+endpoint is `https://api.cheaperinference.com/v1` with bearer-token auth.
+Model IDs are bare, for example `gpt-5.4-mini`, `gpt-5.4`, `claude-sonnet-5`,
+or `gemini-3.1-pro`.
+The `/v1/models` endpoint requires a key. Key from
+[cheaperinference.com](https://cheaperinference.com/signup). Use the canonical
+`cheaperinference` slot only; `cheaper-inference` and `cheaper_inference` are
+not runtime aliases.
+
+```toml
+[providers.models.cheaperinference.default]
+model = "gpt-5.4-mini"
+api_key = "..."
+```
+
+To bridge an existing `CHEAPER_INFERENCE_API_KEY` shell variable into
+ZeroClaw's schema-mirror env surface, set
+`ZEROCLAW_providers__models__cheaperinference__default__api_key="$CHEAPER_INFERENCE_API_KEY"`.
 
 > Credentials come only from config (`api_key`) or the `--credential` override at run
 > time, these slots do **not** read a per-provider `*_API_KEY` environment variable.
