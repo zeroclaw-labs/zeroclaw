@@ -852,7 +852,7 @@ loaded depends on the build's execution backend:
 Both backend features pull in `plugins-wasmtime`; the load path keys off whether
 the cranelift compiler is in the build, not off pulley.
 
-### Per-call execution limits
+### Execution and allocation limits
 
 Every guest export runs under per-call resource limits the host applies to the
 store. The engine enables fuel metering, and each call is given a fresh fuel
@@ -863,10 +863,14 @@ yields ensure uninterrupted guest computation cannot starve that timer, and
 guest-reachable host imports never block the executor (log records are handed
 to a bounded queue and written by a dedicated host thread), so the deadline
 stays observable while host work runs. A
-`StoreLimits` ceiling bounds linear memory, table elements, and instance count.
-The tool world gets a fresh store per execute; the warm channel and memory
-stores are refueled before each call so a long-lived plugin gets a fresh budget
-rather than draining over its lifetime.
+store-wide limiter bounds the sum of linear memory bytes, the sum of table
+elements, and the instance count. Allocation budgets last for the store's
+lifetime and are shared by all its memories and tables, including initial
+allocations. Reservations remain charged if the allocator subsequently fails.
+These limits do not cover host allocations, Wasmtime bookkeeping, or virtual
+address reservations. The tool world gets a fresh store per execute. Warm
+channel and memory stores receive fresh fuel before each call, while retaining
+their allocation budgets.
 
 The five bounds are operator-tunable and every value is validated as non-zero:
 `plugins.limits.call_fuel` (default 1,000,000,000 instruction units),

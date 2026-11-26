@@ -112,6 +112,10 @@ pub struct AnthropicModelProvider {
     /// paths that rebuild the provider per call (e.g. the per-iteration
     /// vision route) start it empty each time.
     schema_cache: zeroclaw_api::schema::SchemaCleanCache,
+    /// Test-only override of [`AnthropicModelProvider::sends_block_binding`],
+    /// so tests can exercise the field against a local mock endpoint.
+    #[cfg(test)]
+    block_binding_override: Option<bool>,
 }
 
 #[cfg(test)]
@@ -203,6 +207,76 @@ struct NativeThinkingConfig {
     /// of the request body entirely, matching pre-beta requests byte-for-byte.
     #[serde(skip_serializing_if = "Option::is_none")]
     display: Option<ThinkingDisplay>,
+    /// Anthropic's `thinking.block_binding` beta field. A replayed thinking
+    /// block is bound to the conversation that preceded it. Where the API
+    /// checks that binding, any edit to earlier history (trimming old turns,
+    /// collapsing old tool rounds, a changed system prompt) makes it reject
+    /// the request. With `drop_block` it drops the blocks that no longer
+    /// verify, and every later one, instead. Setting the field also opts an
+    /// account the API does not check into the check, so there those blocks
+    /// are dropped rather than passed through. Set only for adaptive thinking
+    /// against Anthropic's own API; `None` leaves the key out of the request
+    /// body entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_binding: Option<NativeBlockBinding>,
+    /// Set when the request asked for no native thinking but the model
+    /// thinks by default: the config then only carries `block_binding`, and
+    /// the request keeps the streaming, fallback and temperature handling of
+    /// a request without native thinking. Never serialized.
+    #[serde(skip)]
+    implicit: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct NativeBlockBinding {
+    prefix_mismatch_behavior: &'static str,
+}
+
+/// Beta feature enabling the `thinking.block_binding` request field. A request
+/// that sends the field without it is rejected.
+const ANTHROPIC_THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+
+/// Record a response's `input_transformations`: replayed thinking blocks the
+/// API dropped (`thinking_dropped`) or let through on an unenforced request
+/// (`thinking_mismatch_allowed`). Counts by type and reason only; the entries'
+/// message paths and the blocks themselves stay out of the log.
+fn record_input_transformations(model: &str, entries: &[serde_json::Value]) {
+    if entries.is_empty() {
+        return;
+    }
+    let mut by_kind: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for entry in entries {
+        let kind = entry
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let reason = entry
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        *by_kind.entry(format!("{kind}:{reason}")).or_default() += 1;
+    }
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_category(::zeroclaw_log::EventCategory::Provider)
+            .with_attrs(::serde_json::json!({
+                "model": model,
+                "entries": entries.len(),
+                "by_kind": by_kind,
+            })),
+        "anthropic dropped or flagged replayed thinking blocks"
+    );
+}
+
+/// `anthropic-beta` values the request's thinking config needs beyond the
+/// display beta. Derived from the body so the field and its beta never diverge.
+fn thinking_binding_betas(thinking: Option<&NativeThinkingConfig>) -> &'static [&'static str] {
+    if thinking.is_some_and(|config| config.block_binding.is_some()) {
+        &[ANTHROPIC_THINKING_BINDING_BETA]
+    } else {
+        &[]
+    }
 }
 
 /// Beta features carried by OAuth (Claude Code setup) tokens.
@@ -307,9 +381,30 @@ pub(crate) fn anthropic_thinking_style(model: &str) -> AnthropicThinkingStyle {
     }
 }
 
+/// Whether `model` runs Anthropic's prefix check on replayed thinking blocks
+/// ("preserved thinking"), the check `thinking.block_binding` controls.
+/// Anthropic lists Fable and Mythos 5.1 and 5.2, and Opus, Sonnet and Haiku
+/// 5.5; later versions in those families are taken to run it too. Opus 4.7
+/// and 4.8 and the 5.0 models (Opus 5, Sonnet 5, Fable 5, Mythos 5) don't,
+/// and neither do IDs with no such version. Every model that runs the check
+/// thinks adaptively when a request omits `thinking`.
+pub(crate) fn anthropic_has_preserved_thinking(model: &str) -> bool {
+    match claude_model_family_version(model) {
+        Some(("fable" | "mythos", version)) => version >= (5, 1),
+        Some(("opus" | "sonnet" | "haiku", version)) => version >= (5, 5),
+        _ => false,
+    }
+}
+
 /// `(major, minor)` of the first `claude-<family>-<major>[-<minor>]` token
 /// in a model ID. A missing minor is `0`.
 fn claude_model_version(model: &str) -> Option<(u32, u32)> {
+    claude_model_family_version(model).map(|(_, version)| version)
+}
+
+/// The family and `(major, minor)` of the first
+/// `claude-<family>-<major>[-<minor>]` token in a model ID.
+fn claude_model_family_version(model: &str) -> Option<(&'static str, (u32, u32))> {
     const FAMILIES: [&str; 5] = ["opus", "sonnet", "haiku", "fable", "mythos"];
     model.match_indices("claude-").find_map(|(at, token)| {
         let rest = &model[at + token.len()..];
@@ -327,7 +422,7 @@ fn claude_model_version(model: &str) -> Option<(u32, u32)> {
             .or_else(|| rest.strip_prefix('.'))
             .and_then(leading_version_number)
             .map_or(0, |(minor, _)| minor);
-        Some((major, minor))
+        Some((family, (major, minor)))
     })
 }
 
@@ -554,18 +649,20 @@ impl CacheControl {
         }
     }
 
-    /// Ephemeral breakpoint carrying the configured cache entry lifetime.
-    /// `FiveMinutes` serializes exactly like [`Self::ephemeral`] — the API
-    /// default needs no explicit `ttl` — so call sites can pass the
-    /// resolved TTL unconditionally without perturbing default-config
-    /// requests.
-    pub(crate) fn ephemeral_with_ttl(ttl: CacheTtl) -> Self {
+    /// Ephemeral breakpoint carrying the configured cache entry lifetime, or
+    /// `None` when caching is disabled (`CacheTtl::Off`) so no breakpoint is
+    /// written at all. `FiveMinutes` serializes exactly like
+    /// [`Self::ephemeral`] — the API default needs no explicit `ttl` — so
+    /// call sites can pass the resolved TTL unconditionally without
+    /// perturbing default-config requests.
+    pub(crate) fn ephemeral_with_ttl(ttl: CacheTtl) -> Option<Self> {
         match ttl {
-            CacheTtl::FiveMinutes => Self::ephemeral(),
-            CacheTtl::OneHour => Self {
+            CacheTtl::FiveMinutes => Some(Self::ephemeral()),
+            CacheTtl::OneHour => Some(Self {
                 cache_type: "ephemeral".to_string(),
                 ttl: Some("1h".to_string()),
-            },
+            }),
+            CacheTtl::Off => None,
         }
     }
 }
@@ -601,6 +698,10 @@ struct NativeChatResponse {
     /// fallback notice and can attribute the returned attempt for accounting.
     #[serde(default)]
     model: Option<String>,
+    /// Replayed thinking blocks the API dropped or let through after a
+    /// history check; present when the request sent the binding beta.
+    #[serde(default)]
+    input_transformations: Vec<serde_json::Value>,
 }
 
 /// `stop_details` on a refusal response. `explanation` is deliberately not
@@ -696,6 +797,8 @@ pub struct AnthropicBuilder {
     server_fallback_models: Vec<String>,
     cache_ttl: Option<CacheTtl>,
     effort: Option<String>,
+    #[cfg(test)]
+    thinking_block_binding: Option<bool>,
 }
 
 impl AnthropicBuilder {
@@ -759,6 +862,14 @@ impl AnthropicBuilder {
         self
     }
 
+    /// Force the `thinking.block_binding` decision, so tests can exercise the
+    /// field against a local mock endpoint.
+    #[cfg(test)]
+    pub(crate) fn thinking_block_binding(mut self, on: bool) -> Self {
+        self.thinking_block_binding = Some(on);
+        self
+    }
+
     pub fn build(self) -> AnthropicModelProvider {
         AnthropicModelProvider {
             alias: self.alias,
@@ -775,6 +886,8 @@ impl AnthropicBuilder {
             cache_ttl: self.cache_ttl.unwrap_or_default(),
             effort: self.effort,
             schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
+            #[cfg(test)]
+            block_binding_override: self.thinking_block_binding,
         }
     }
 }
@@ -793,6 +906,8 @@ impl AnthropicModelProvider {
             server_fallback_models: Vec::new(),
             cache_ttl: None,
             effort: None,
+            #[cfg(test)]
+            thinking_block_binding: None,
         }
     }
 
@@ -855,7 +970,7 @@ impl AnthropicModelProvider {
         model: &str,
         thinking: Option<&NativeThinkingConfig>,
     ) -> Option<Vec<NativeFallbackEntry>> {
-        if thinking.is_some() {
+        if thinking.is_some_and(|config| !config.implicit) {
             return None;
         }
         let filtered: Vec<NativeFallbackEntry> = self
@@ -883,7 +998,7 @@ impl AnthropicModelProvider {
         let prefix = SystemBlock {
             block_type: "text".to_string(),
             text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
-            cache_control: Some(CacheControl::ephemeral_with_ttl(cache_ttl)),
+            cache_control: CacheControl::ephemeral_with_ttl(cache_ttl),
         };
         match system {
             Some(SystemPrompt::Blocks(mut blocks)) => {
@@ -895,7 +1010,7 @@ impl AnthropicModelProvider {
                 SystemBlock {
                     block_type: "text".to_string(),
                     text: s,
-                    cache_control: Some(CacheControl::ephemeral_with_ttl(cache_ttl)),
+                    cache_control: CacheControl::ephemeral_with_ttl(cache_ttl),
                 },
             ])),
             None => Some(SystemPrompt::Blocks(vec![prefix])),
@@ -938,7 +1053,7 @@ impl AnthropicModelProvider {
             match content {
                 NativeContentOut::Text { cache_control, .. }
                 | NativeContentOut::ToolResult { cache_control, .. } => {
-                    *cache_control = Some(CacheControl::ephemeral_with_ttl(cache_ttl));
+                    *cache_control = CacheControl::ephemeral_with_ttl(cache_ttl);
                     return true;
                 }
                 NativeContentOut::ToolUse { .. }
@@ -972,7 +1087,7 @@ impl AnthropicModelProvider {
         // Cache the last tool definition (caches all tools); the tools
         // marker carries the configured cache entry lifetime.
         if let Some(last_tool) = native_tools.last_mut() {
-            last_tool.cache_control = Some(CacheControl::ephemeral_with_ttl(self.cache_ttl));
+            last_tool.cache_control = CacheControl::ephemeral_with_ttl(self.cache_ttl);
         }
 
         Some(native_tools)
@@ -1002,14 +1117,22 @@ impl AnthropicModelProvider {
                         .and_then(|t| t.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let signature = block
+                    // Anthropic accepts only signed thinking: a block whose
+                    // signature never arrived (a stream cut off mid-thinking,
+                    // or reasoning recorded by another provider) would fail
+                    // the whole request with `thinking.signature: Field
+                    // required`, so it is left out.
+                    let Some(signature) = block
                         .get("signature")
                         .and_then(|s| s.as_str())
                         .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string());
+                        .map(|s| s.to_string())
+                    else {
+                        continue;
+                    };
                     blocks.push(NativeContentOut::Thinking {
                         thinking,
-                        signature,
+                        signature: Some(signature),
                     });
                 }
             }
@@ -1752,7 +1875,7 @@ impl AnthropicModelProvider {
             SystemPrompt::Blocks(vec![SystemBlock {
                 block_type: "text".to_string(),
                 text,
-                cache_control: Some(CacheControl::ephemeral_with_ttl(cache_ttl)),
+                cache_control: CacheControl::ephemeral_with_ttl(cache_ttl),
             }])
         });
 
@@ -2465,6 +2588,16 @@ impl AnthropicModelProvider {
         }
     }
 
+    /// Record the response's `input_transformations`. Called where each
+    /// response is read, before the refusal check, so a refused request still
+    /// reports the blocks the API dropped.
+    fn record_response_transformations(response: &NativeChatResponse) {
+        record_input_transformations(
+            response.model.as_deref().unwrap_or("unknown"),
+            &response.input_transformations,
+        );
+    }
+
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
         let stop_reason = response.stop_reason.as_deref().unwrap_or("unknown");
         let content_block_count = response.content.len();
@@ -2722,6 +2855,8 @@ impl AnthropicModelProvider {
                                 kind: "enabled",
                                 budget_tokens: Some(params.budget_tokens),
                                 display: params.display,
+                                block_binding: None,
+                                implicit: false,
                             },
                             self.max_tokens.max(min_required),
                         )
@@ -2731,14 +2866,57 @@ impl AnthropicModelProvider {
                             kind: "adaptive",
                             budget_tokens: None,
                             display: params.display,
+                            block_binding: self.adaptive_block_binding(model),
+                            implicit: false,
                         },
                         self.max_tokens,
                     ),
                 };
                 (Some(1.0), Some(config), max_tokens)
             }
-            None => (temperature, None, self.max_tokens),
+            None => (
+                temperature,
+                self.implicit_thinking_config(model),
+                self.max_tokens,
+            ),
         }
+    }
+
+    /// For a request with no native thinking to a model with preserved
+    /// thinking: an explicit `adaptive` config, which those models treat the
+    /// same as an omitted one, so the signed blocks they return carry
+    /// `block_binding` when replayed. `None` where this provider or model gets
+    /// no binding.
+    fn implicit_thinking_config(&self, model: &str) -> Option<NativeThinkingConfig> {
+        let block_binding = self.adaptive_block_binding(model)?;
+        Some(NativeThinkingConfig {
+            kind: "adaptive",
+            budget_tokens: None,
+            display: None,
+            block_binding: Some(block_binding),
+            implicit: true,
+        })
+    }
+
+    /// The `thinking.block_binding` object for an adaptive-thinking request
+    /// to `model`, or `None` where this provider leaves the field out or the
+    /// model runs no prefix check.
+    fn adaptive_block_binding(&self, model: &str) -> Option<NativeBlockBinding> {
+        (self.sends_block_binding() && anthropic_has_preserved_thinking(model)).then_some(
+            NativeBlockBinding {
+                prefix_mismatch_behavior: "drop_block",
+            },
+        )
+    }
+
+    /// Send `thinking.block_binding` only to Anthropic's own API: an
+    /// Anthropic-compatible proxy behind a custom `uri` may not accept the beta.
+    fn sends_block_binding(&self) -> bool {
+        #[cfg(test)]
+        if let Some(forced) = self.block_binding_override {
+            return forced;
+        }
+        self.base_url.trim_end_matches('/') == BASE_URL
     }
 
     fn http_client(&self) -> Client {
@@ -2889,6 +3067,13 @@ impl AnthropicModelProvider {
                         cache_creation_input_tokens = Some(v);
                     }
                     ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model": model, "input_tokens": observed_input, "cached_input_tokens": observed_cached, "cache_creation_input_tokens": observed_cache_create})), "stream: message_start");
+                    if let Some(entries) = event
+                        .get("message")
+                        .and_then(|m| m.get("input_transformations"))
+                        .and_then(|v| v.as_array())
+                    {
+                        record_input_transformations(model, entries);
+                    }
                 }
                 "content_block_start" => {
                     if let Some(block) = event.get("content_block") {
@@ -3283,6 +3468,7 @@ impl ModelProvider for AnthropicModelProvider {
 
         let chat_response: NativeChatResponse = response.json().await?;
         commit_safeguard_fallback(None);
+        Self::record_response_transformations(&chat_response);
         Self::check_refusal(&chat_response, model)?;
         let safeguard_notice = Self::server_fallback_notice(&chat_response, model);
         let parsed = Self::parse_native_response(chat_response);
@@ -3389,7 +3575,7 @@ impl ModelProvider for AnthropicModelProvider {
                         "max_tokens": effective_max_tokens,
                         "tools_count": tools_count,
                         "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
-                        "thinking_enabled": thinking_config.is_some(),
+                        "thinking_enabled": thinking_config.as_ref().is_some_and(|config| !config.implicit),
                     })),
                 "anthropic provider request prepared"
             );
@@ -3398,11 +3584,17 @@ impl ModelProvider for AnthropicModelProvider {
         // native thinking is active on this request.
         let fallbacks = self.server_fallbacks_for(model, thinking_config.as_ref());
         let fallbacks_sent = fallbacks.is_some();
-        let extra_betas: &[&str] = if fallbacks.is_some() {
-            &[ANTHROPIC_SERVER_FALLBACK_BETA]
+        // A request that opts into server-side fallback keeps its pre-binding
+        // shape: a fallback target need not think by default.
+        let thinking_config = if fallbacks_sent {
+            thinking_config.filter(|config| !config.implicit)
         } else {
-            &[]
+            thinking_config
         };
+        let mut extra_betas: Vec<&str> = thinking_binding_betas(thinking_config.as_ref()).to_vec();
+        if fallbacks_sent {
+            extra_betas.push(ANTHROPIC_SERVER_FALLBACK_BETA);
+        }
         let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: effective_max_tokens,
@@ -3425,7 +3617,7 @@ impl ModelProvider for AnthropicModelProvider {
             .json(&native_request);
 
         let response = self
-            .apply_auth(req, credential, thinking_display_beta, extra_betas)
+            .apply_auth(req, credential, thinking_display_beta, &extra_betas)
             .send()
             .await?;
         if !response.status().is_success() {
@@ -3443,6 +3635,7 @@ impl ModelProvider for AnthropicModelProvider {
             crate::dispatch::accounting::attach_current_attempt_usage_chain(chain);
         }
         commit_safeguard_fallback(None);
+        Self::record_response_transformations(&native_response);
         if let Err(refusal) = Self::check_refusal(&native_response, model) {
             crate::dispatch::accounting::finish_current_attempt_after_completed_response(
                 refusal.usage.as_deref().cloned(),
@@ -3633,8 +3826,12 @@ impl ModelProvider for AnthropicModelProvider {
         let thinking_display_beta = thinking_config
             .as_ref()
             .is_some_and(|config| config.display.is_some());
+        let thinking_betas = thinking_binding_betas(thinking_config.as_ref());
 
-        if thinking_config.is_some() && !thinking_display_beta {
+        let native_thinking = thinking_config
+            .as_ref()
+            .is_some_and(|config| !config.implicit);
+        if native_thinking && !thinking_display_beta {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3689,7 +3886,7 @@ impl ModelProvider for AnthropicModelProvider {
                     req = req.header("x-api-key", &credential);
                 }
                 if let Some(beta_features) =
-                    anthropic_beta_features(is_oauth, thinking_display_beta, &[])
+                    anthropic_beta_features(is_oauth, thinking_display_beta, thinking_betas)
                 {
                     req = req.header("anthropic-beta", beta_features);
                 }
@@ -3720,6 +3917,7 @@ impl ModelProvider for AnthropicModelProvider {
                     .await
                     .map_err(|e| StreamError::ModelProvider(format!("response decode: {e}")))?;
                 commit_safeguard_fallback(None);
+                Self::record_response_transformations(&parsed);
                 Self::check_refusal(&parsed, &requested_model)
                     .map_err(|refusal| StreamError::ModelRefusal(Box::new(refusal)))?;
                 let safeguard_notice = Self::server_fallback_notice(&parsed, &requested_model);
@@ -3776,7 +3974,7 @@ impl ModelProvider for AnthropicModelProvider {
                         "max_tokens": effective_max_tokens,
                         "tools_count": tools_count,
                         "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
-                        "thinking_enabled": thinking_config.is_some(),
+                        "thinking_enabled": thinking_config.as_ref().is_some_and(|config| !config.implicit),
                         "thinking_display_beta": thinking_display_beta,
                     })),
                 "anthropic streaming provider request prepared"
@@ -3847,7 +4045,7 @@ impl ModelProvider for AnthropicModelProvider {
                 req = req.header("x-api-key", &credential);
             }
             if let Some(beta_features) =
-                anthropic_beta_features(is_oauth, thinking_display_beta, &[])
+                anthropic_beta_features(is_oauth, thinking_display_beta, thinking_betas)
             {
                 req = req.header("anthropic-beta", beta_features);
             }
@@ -5057,21 +5255,26 @@ data: {\"type\":\"message_stop\"}\n\n";
             budget_tokens: 10_000,
             display: None,
         };
-        for model in [
-            "claude-opus-5-5",
-            "claude-fable-5-2-fast",
-            "anthropic.claude-opus-4-7-v1:0",
-            "claude-sonnet-5",
-            "claude-sonnet-5-5",
-            "claude-haiku-5-5",
+        let bound = serde_json::json!({
+            "type": "adaptive",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"}
+        });
+        let plain = serde_json::json!({"type": "adaptive"});
+        for (model, expected) in [
+            ("claude-opus-5-5", &bound),
+            ("claude-fable-5-2-fast", &bound),
+            ("anthropic.claude-opus-4-7-v1:0", &plain),
+            ("claude-sonnet-5", &plain),
+            ("claude-sonnet-5-5", &bound),
+            ("claude-haiku-5-5", &bound),
         ] {
             let (temp, config, max_tokens) =
                 provider.resolve_thinking(Some(params), Some(0.7_f64), model);
             let config = config.unwrap_or_else(|| panic!("thinking config for {model}"));
             assert_eq!(
-                serde_json::to_value(&config).unwrap(),
-                serde_json::json!({"type": "adaptive"}),
-                "{model} must emit adaptive with no budget"
+                &serde_json::to_value(&config).unwrap(),
+                expected,
+                "{model} must emit adaptive with no budget, and drop_block only with preserved thinking"
             );
             assert_eq!(temp, Some(1.0), "{model}");
             assert_eq!(max_tokens, provider.max_tokens, "{model}");
@@ -5189,20 +5392,27 @@ data: {\"type\":\"message_stop\"}\n\n";
     }
 
     /// D5 pin: the default (5m) lifetime serializes byte-identically to the
-    /// pre-TTL wire, and only the 1h lifetime adds the `ttl` field.
+    /// pre-TTL wire, only the 1h lifetime adds the `ttl` field, and `off`
+    /// produces no marker at all.
     #[test]
     fn cache_control_ttl_serialization_pinned() {
-        let five_minutes = CacheControl::ephemeral_with_ttl(CacheTtl::FiveMinutes);
+        let five_minutes =
+            CacheControl::ephemeral_with_ttl(CacheTtl::FiveMinutes).expect("5m produces a marker");
         assert_eq!(
             serde_json::to_string(&five_minutes).unwrap(),
             r#"{"type":"ephemeral"}"#,
             "5m must serialize exactly like the pre-TTL default marker"
         );
-        let one_hour = CacheControl::ephemeral_with_ttl(CacheTtl::OneHour);
+        let one_hour =
+            CacheControl::ephemeral_with_ttl(CacheTtl::OneHour).expect("1h produces a marker");
         assert_eq!(
             serde_json::to_string(&one_hour).unwrap(),
             r#"{"type":"ephemeral","ttl":"1h"}"#,
             "1h must emit exactly one added field, in declaration order"
+        );
+        assert!(
+            CacheControl::ephemeral_with_ttl(CacheTtl::Off).is_none(),
+            "off must place no breakpoint at all"
         );
     }
 
@@ -5375,6 +5585,27 @@ data: {\"type\":\"message_stop\"}\n\n";
                 serde_json::to_string(control).unwrap(),
                 r#"{"type":"ephemeral"}"#,
                 "default markers serialize byte-identically to the pre-TTL wire"
+            );
+        }
+
+        // off: no breakpoint anywhere — not the system block, not the last
+        // tool definition, not the rolling last message.
+        let off = run_request(CacheTtl::Off).await;
+        assert!(
+            !off.to_string().contains("cache_control"),
+            "off must emit no cache_control key anywhere: {off}"
+        );
+        let mut controls = Vec::new();
+        collect_cache_controls(&off, &mut controls);
+        assert!(controls.is_empty(), "off must place zero markers: {off}");
+        for site in ["system", "tools", "messages"] {
+            assert!(
+                off.get(site).is_some(),
+                "request body must carry the {site} key: {off}"
+            );
+            assert!(
+                !off[site].to_string().contains("cache_control"),
+                "off must leave the {site} breakpoint site unmarked: {off}"
             );
         }
     }
@@ -6138,6 +6369,56 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert_eq!(native_msgs[0].role, "user");
         assert_eq!(native_msgs[1].role, "assistant");
         assert_eq!(native_msgs[2].role, "user");
+    }
+
+    #[test]
+    fn convert_messages_leaves_out_thinking_that_has_no_signature() {
+        // A stream cut off by max_tokens mid-thinking stores the text with an
+        // empty signature; reasoning from another provider has none at all.
+        let reasoning = [
+            r#"{"thinking":"cut off","signature":""}"#,
+            r#"{"thinking":"from elsewhere"}"#,
+            r#"{"thinking":"kept","signature":"sig_ok"}"#,
+        ]
+        .join("\n");
+        let envelope = serde_json::json!({
+            "content": "",
+            "tool_calls": [{"id": "toolu_1", "name": "shell", "arguments": "{}"}],
+            "reasoning_content": reasoning,
+        })
+        .to_string();
+        let messages = vec![
+            ChatMessage::user("run it"),
+            ChatMessage::assistant(envelope),
+            ChatMessage::tool(
+                serde_json::json!({"content": "done", "tool_call_id": "toolu_1"}).to_string(),
+            ),
+        ];
+        let (_, native_msgs) =
+            AnthropicModelProvider::convert_messages(&messages, CacheTtl::default());
+        let assistant = native_msgs
+            .iter()
+            .find(|m| m.role == "assistant")
+            .expect("assistant message survives conversion");
+        let thinking: Vec<_> = assistant
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                NativeContentOut::Thinking {
+                    thinking,
+                    signature,
+                } => Some((thinking.as_str(), signature.as_deref())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking, [("kept", Some("sig_ok"))]);
+        assert!(
+            assistant
+                .content
+                .iter()
+                .any(|block| matches!(block, NativeContentOut::ToolUse { .. })),
+            "the tool call itself is still replayed"
+        );
     }
 
     // The seam sanitizer rewrites an assistant tool-call envelope
@@ -11646,6 +11927,8 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
                 kind: "enabled",
                 budget_tokens: Some(1_024),
                 display: Some(ThinkingDisplay::Updates),
+                block_binding: None,
+                implicit: false,
             }),
             fallbacks: None,
             output_config: None,
@@ -11659,6 +11942,8 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"},\"usag
                 kind: "enabled",
                 budget_tokens: Some(1_024),
                 display: None,
+                block_binding: None,
+                implicit: false,
             }),
             ..request
         };
@@ -11972,6 +12257,8 @@ data: {\"type\":\"message_stop\"}\n\n";
                 kind: "adaptive",
                 budget_tokens: None,
                 display: Some(ThinkingDisplay::Updates),
+                block_binding: None,
+                implicit: false,
             }),
             fallbacks: None,
             output_config: None,
@@ -12305,5 +12592,517 @@ data: {\"type\":\"message_stop\"}\n\n";
             vec![0, 2, 4],
             "the fifth image must rewrite only the three oldest image messages"
         );
+    }
+
+    // ----- thinking.block_binding (drop_block) -------------------------
+
+    fn adaptive_thinking_params(
+        display: Option<ThinkingDisplay>,
+    ) -> zeroclaw_api::model_provider::NativeThinkingParams {
+        zeroclaw_api::model_provider::NativeThinkingParams {
+            budget_tokens: 1_024,
+            display,
+        }
+    }
+
+    #[test]
+    fn adaptive_thinking_sends_drop_block_to_the_anthropic_api() {
+        let provider = AnthropicModelProvider::builder("test").build();
+        let (_, config, _) = provider.resolve_thinking(
+            Some(adaptive_thinking_params(None)),
+            None,
+            "claude-opus-5-5",
+        );
+        let config = config.expect("adaptive thinking config");
+        assert_eq!(
+            serde_json::to_value(&config).expect("serialize")["block_binding"],
+            serde_json::json!({"prefix_mismatch_behavior": "drop_block"})
+        );
+        assert_eq!(
+            thinking_binding_betas(Some(&config)),
+            &[ANTHROPIC_THINKING_BINDING_BETA]
+        );
+    }
+
+    #[test]
+    fn custom_uri_leaves_block_binding_out() {
+        let provider = AnthropicModelProvider::builder("test")
+            .base_url("https://anthropic-proxy.example")
+            .build();
+        let (_, config, _) = provider.resolve_thinking(
+            Some(adaptive_thinking_params(None)),
+            None,
+            "claude-opus-5-5",
+        );
+        let config = config.expect("adaptive thinking config");
+        assert!(
+            serde_json::to_value(&config)
+                .expect("serialize")
+                .get("block_binding")
+                .is_none(),
+            "a custom uri must keep the pre-beta body"
+        );
+        assert!(thinking_binding_betas(Some(&config)).is_empty());
+    }
+
+    #[test]
+    fn default_base_url_spelled_out_still_counts_as_the_anthropic_api() {
+        let provider = AnthropicModelProvider::builder("test")
+            .base_url("https://api.anthropic.com/")
+            .build();
+        let (_, config, _) = provider.resolve_thinking(
+            Some(adaptive_thinking_params(None)),
+            None,
+            "claude-fable-5-1",
+        );
+        assert!(
+            config
+                .expect("adaptive thinking config")
+                .block_binding
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn budget_thinking_never_sends_block_binding() {
+        // The API accepts `block_binding` only with `thinking.type: "adaptive"`.
+        let provider = AnthropicModelProvider::builder("test").build();
+        let (_, config, _) = provider.resolve_thinking(
+            Some(adaptive_thinking_params(None)),
+            None,
+            "claude-sonnet-4-6",
+        );
+        let config = config.expect("budget thinking config");
+        assert_eq!(config.kind, "enabled");
+        assert!(config.block_binding.is_none());
+        assert!(thinking_binding_betas(Some(&config)).is_empty());
+        assert!(thinking_binding_betas(None).is_empty());
+    }
+
+    type CapturedRequests =
+        std::sync::Arc<std::sync::Mutex<Vec<(Option<String>, serde_json::Value)>>>;
+
+    /// Mock `/v1/messages` that records each request's `anthropic-beta` header
+    /// and body, and answers JSON or SSE depending on the request's `stream`.
+    async fn spawn_capturing_messages_server(
+        json_body: serde_json::Value,
+        sse_body: &'static str,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+        CapturedRequests,
+    ) {
+        use axum::{
+            Json, Router,
+            http::{HeaderMap, header},
+            response::{IntoResponse, Response},
+            routing::post,
+        };
+        use tokio::net::TcpListener;
+
+        let captured: CapturedRequests = std::sync::Arc::default();
+        let sink = captured.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(
+                move |headers: HeaderMap, Json(req): Json<serde_json::Value>| {
+                    let sink = sink.clone();
+                    let json_body = json_body.clone();
+                    async move {
+                        let beta = headers
+                            .get("anthropic-beta")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        let streaming = req.get("stream").and_then(|v| v.as_bool()) == Some(true);
+                        sink.lock().expect("capture lock").push((beta, req));
+                        if streaming {
+                            Response::builder()
+                                .header(header::CONTENT_TYPE, "text/event-stream")
+                                .body(axum::body::Body::from(sse_body))
+                                .expect("sse response")
+                        } else {
+                            Json(json_body).into_response()
+                        }
+                    }
+                },
+            ),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        (addr, handle, captured)
+    }
+
+    fn binding_test_provider(addr: std::net::SocketAddr, binding: bool) -> AnthropicModelProvider {
+        AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .thinking_block_binding(binding)
+            .build()
+    }
+
+    fn json_reply_with_drops() -> serde_json::Value {
+        serde_json::json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "model": "claude-opus-5-5",
+            "usage": {"input_tokens": 10, "output_tokens": 1},
+            "input_transformations": [
+                {"type": "thinking_dropped", "path": "messages.1.content.0", "reason": "prefix_binding_mismatch"},
+                {"type": "some_future_entry", "reason": "unknown_to_us"}
+            ]
+        })
+    }
+
+    const SSE_REPLY_WITH_DROPS: &str = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5-5\",\"usage\":{\"input_tokens\":10},\"input_transformations\":[{\"type\":\"thinking_dropped\",\"path\":\"messages.1.content.0\",\"reason\":\"prefix_binding_mismatch\"}]}}\n\n\
+event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+
+    fn assert_binding_sent(captured: &CapturedRequests) {
+        let requests = captured.lock().expect("capture lock");
+        assert_eq!(requests.len(), 1, "exactly one request expected");
+        let (beta, body) = &requests[0];
+        assert!(
+            beta.as_deref()
+                .is_some_and(|b| b.split(',').any(|v| v == ANTHROPIC_THINKING_BINDING_BETA)),
+            "the binding beta must ride with the field: {beta:?}"
+        );
+        assert_eq!(
+            body["thinking"]["block_binding"]["prefix_mismatch_behavior"],
+            serde_json::json!("drop_block")
+        );
+        assert_eq!(body["thinking"]["type"], serde_json::json!("adaptive"));
+    }
+
+    #[tokio::test]
+    async fn chat_sends_drop_block_with_its_beta_and_reads_drops() {
+        let (addr, server, captured) =
+            spawn_capturing_messages_server(json_reply_with_drops(), SSE_REPLY_WITH_DROPS).await;
+        let provider = binding_test_provider(addr, true);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: Some(adaptive_thinking_params(None)),
+        };
+        let result = provider.chat(request, "claude-opus-5-5", None).await;
+        server.abort();
+        assert_eq!(result.expect("chat succeeds").text.as_deref(), Some("ok"));
+        assert_binding_sent(&captured);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_sends_drop_block_on_both_thinking_paths() {
+        // Without `display` the provider sends thinking non-streaming to keep
+        // signed blocks intact; with it, the request streams. Both carry the field.
+        for display in [None, Some(ThinkingDisplay::Updates)] {
+            let (addr, server, captured) =
+                spawn_capturing_messages_server(json_reply_with_drops(), SSE_REPLY_WITH_DROPS)
+                    .await;
+            let provider = binding_test_provider(addr, true);
+            let messages = vec![ChatMessage::user("hello")];
+            let request = ProviderChatRequest {
+                messages: messages.as_slice(),
+                tools: None,
+                thinking: Some(adaptive_thinking_params(display)),
+            };
+            let events: Vec<_> = provider
+                .stream_chat(
+                    request,
+                    "claude-opus-5-5",
+                    None,
+                    StreamOptions {
+                        enabled: true,
+                        count_tokens: false,
+                    },
+                )
+                .collect()
+                .await;
+            server.abort();
+            assert!(
+                events.iter().all(Result::is_ok),
+                "stream must not error (display {display:?})"
+            );
+            assert_binding_sent(&captured);
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_without_binding_keeps_the_pre_beta_wire_format() {
+        let (addr, server, captured) =
+            spawn_capturing_messages_server(json_reply_with_drops(), SSE_REPLY_WITH_DROPS).await;
+        let provider = binding_test_provider(addr, false);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: Some(adaptive_thinking_params(None)),
+        };
+        provider
+            .chat(request, "claude-opus-5-5", None)
+            .await
+            .expect("chat succeeds");
+        server.abort();
+        let requests = captured.lock().expect("capture lock");
+        let (beta, body) = &requests[0];
+        assert!(beta.is_none(), "no beta header without the field: {beta:?}");
+        assert!(body["thinking"].get("block_binding").is_none());
+    }
+
+    #[test]
+    fn preserved_thinking_covers_the_listed_models_and_no_earlier_ones() {
+        for model in [
+            "claude-fable-5-2",
+            "claude-fable-5-2-fast",
+            "claude-mythos-5-2",
+            "claude-fable-5-1",
+            "claude-mythos-5-1",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "us.anthropic.claude-sonnet-5-5-v1:0",
+        ] {
+            assert!(anthropic_has_preserved_thinking(model), "{model}");
+        }
+        for model in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-mythos-preview",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-haiku-4-5",
+            "some-other-model",
+        ] {
+            assert!(!anthropic_has_preserved_thinking(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn models_with_preserved_thinking_get_drop_block_without_a_thinking_config() {
+        let provider = AnthropicModelProvider::builder("test").build();
+        for model in [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5-1",
+            "claude-fable-5-2-fast",
+            "claude-mythos-5-2",
+        ] {
+            let (temperature, config, _) = provider.resolve_thinking(None, Some(0.7), model);
+            let config = config.unwrap_or_else(|| panic!("{model} has preserved thinking"));
+            assert!(config.implicit, "{model}");
+            assert_eq!(
+                serde_json::to_value(&config).expect("serialize"),
+                serde_json::json!({
+                    "type": "adaptive",
+                    "block_binding": {"prefix_mismatch_behavior": "drop_block"}
+                }),
+                "{model}"
+            );
+            assert_eq!(temperature, Some(0.7), "{model}: no forced temperature");
+        }
+    }
+
+    #[test]
+    fn models_without_preserved_thinking_keep_no_thinking_config() {
+        // The 5.0 models think when `thinking` is omitted but run no prefix
+        // check, so they have nothing to bind and keep the omitted field.
+        let provider = AnthropicModelProvider::builder("test").build();
+        for model in [
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-sonnet-4-6",
+            "claude-mythos-preview",
+            "some-other-model",
+        ] {
+            let (_, config, _) = provider.resolve_thinking(None, Some(0.7), model);
+            assert!(config.is_none(), "{model} must keep its request unchanged");
+        }
+        let proxied = AnthropicModelProvider::builder("test")
+            .base_url("https://anthropic-proxy.example")
+            .build();
+        let (_, config, _) = proxied.resolve_thinking(None, Some(0.7), "claude-opus-5-5");
+        assert!(config.is_none(), "a custom uri keeps the pre-beta body");
+    }
+
+    #[tokio::test]
+    async fn chat_without_thinking_config_still_binds_a_model_with_preserved_thinking() {
+        let (addr, server, captured) =
+            spawn_capturing_messages_server(json_reply_with_drops(), SSE_REPLY_WITH_DROPS).await;
+        let provider = binding_test_provider(addr, true);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        provider
+            .chat(request, "claude-opus-5-5", None)
+            .await
+            .expect("chat succeeds");
+        server.abort();
+        assert_binding_sent(&captured);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_without_thinking_config_still_streams_and_binds() {
+        let (addr, server, captured) =
+            spawn_capturing_messages_server(json_reply_with_drops(), SSE_REPLY_WITH_DROPS).await;
+        let provider = binding_test_provider(addr, true);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let events: Vec<_> = provider
+            .stream_chat(
+                request,
+                "claude-sonnet-5-5",
+                None,
+                StreamOptions {
+                    enabled: true,
+                    count_tokens: false,
+                },
+            )
+            .collect()
+            .await;
+        server.abort();
+        assert!(events.iter().all(Result::is_ok), "stream must not error");
+        assert_binding_sent(&captured);
+        let requests = captured.lock().expect("capture lock");
+        assert_eq!(
+            requests[0].1["stream"],
+            serde_json::json!(true),
+            "no native thinking was asked for, so the request must still stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_to_a_model_without_preserved_thinking_is_unchanged() {
+        for model in ["claude-opus-4-8", "claude-opus-5"] {
+            let (addr, server, captured) =
+                spawn_capturing_messages_server(json_reply_with_drops(), SSE_REPLY_WITH_DROPS)
+                    .await;
+            let provider = binding_test_provider(addr, true);
+            let messages = vec![ChatMessage::user("hello")];
+            let request = ProviderChatRequest {
+                messages: messages.as_slice(),
+                tools: None,
+                thinking: None,
+            };
+            provider
+                .chat(request, model, None)
+                .await
+                .expect("chat succeeds");
+            server.abort();
+            let requests = captured.lock().expect("capture lock");
+            let (beta, body) = &requests[0];
+            assert!(beta.is_none(), "{model}: no beta header: {beta:?}");
+            assert!(
+                body.get("thinking").is_none(),
+                "{model}: no thinking field: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_thinking_to_opus_4_8_keeps_plain_adaptive_and_no_beta() {
+        let (addr, server, captured) =
+            spawn_capturing_messages_server(json_reply_with_drops(), SSE_REPLY_WITH_DROPS).await;
+        let provider = binding_test_provider(addr, true);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: Some(adaptive_thinking_params(None)),
+        };
+        provider
+            .chat(request, "claude-opus-4-8", None)
+            .await
+            .expect("chat succeeds");
+        server.abort();
+        let requests = captured.lock().expect("capture lock");
+        let (beta, body) = &requests[0];
+        assert!(beta.is_none(), "no beta header: {beta:?}");
+        assert_eq!(body["thinking"], serde_json::json!({"type": "adaptive"}));
+    }
+
+    #[tokio::test]
+    async fn server_fallbacks_keep_their_request_shape_without_a_thinking_config() {
+        let (addr, server, captured) =
+            spawn_capturing_messages_server(json_reply_with_drops(), SSE_REPLY_WITH_DROPS).await;
+        let provider = AnthropicModelProvider::builder("test")
+            .credential(Some("test-key"))
+            .base_url(&format!("http://{addr}"))
+            .thinking_block_binding(true)
+            .server_fallback_models(vec!["claude-opus-4-8".to_string()])
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        provider
+            .chat(request, "claude-opus-5-5", None)
+            .await
+            .expect("chat succeeds");
+        server.abort();
+        let requests = captured.lock().expect("capture lock");
+        let (beta, body) = &requests[0];
+        assert_eq!(
+            body["fallbacks"],
+            serde_json::json!([{"model": "claude-opus-4-8"}])
+        );
+        assert!(
+            body.get("thinking").is_none(),
+            "fallback requests stay unbound: {body}"
+        );
+        assert_eq!(beta.as_deref(), Some(ANTHROPIC_SERVER_FALLBACK_BETA));
+    }
+
+    #[tokio::test]
+    async fn refusal_with_dropped_blocks_still_maps_to_the_refusal_error() {
+        let body = serde_json::json!({
+            "content": [],
+            "stop_reason": "refusal",
+            "stop_details": {"type": "refusal", "category": "cyber"},
+            "model": "claude-opus-5-5",
+            "usage": {"input_tokens": 412, "output_tokens": 0},
+            "input_transformations": [
+                {"type": "thinking_dropped", "path": "messages.1.content.0", "reason": "prefix_binding_mismatch"}
+            ]
+        });
+        let (addr, server, _captured) =
+            spawn_capturing_messages_server(body, SSE_REPLY_WITH_DROPS).await;
+        let provider = binding_test_provider(addr, true);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: messages.as_slice(),
+            tools: None,
+            thinking: None,
+        };
+        let result = provider.chat(request, "claude-opus-5-5", None).await;
+        server.abort();
+        let err = result.expect_err("a refusal must surface as an error");
+        assert!(err.downcast_ref::<AnthropicRefusalError>().is_some());
     }
 }

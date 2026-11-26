@@ -1978,6 +1978,38 @@ mod tests {
     }
 
     #[test]
+    fn config_set_value_prompt_formats_in_every_builtin_locale() {
+        let key = "cli-config-value-prompt";
+        let path = "providers.models.openai.example.api_key";
+        let english = format!("Enter value for {path}");
+
+        for locale in available_locales() {
+            let source = if locale.code == "en" {
+                include_str!("../locales/en/cli.ftl")
+            } else {
+                builtin_cli_ftl_source(&locale.code)
+                    .unwrap_or_else(|| panic!("missing built-in CLI catalogue for {}", locale.code))
+            };
+            let prompt = format_ftl_message(source, &locale.code, key, &[("path", path)])
+                .unwrap_or_else(|| panic!("{key} should format in {}", locale.code));
+            assert!(
+                prompt.contains(path),
+                "{} should include the path",
+                locale.code
+            );
+            if locale.code == "en" {
+                assert_eq!(prompt, english);
+            } else {
+                assert_ne!(
+                    prompt, english,
+                    "{} should localize the prompt",
+                    locale.code
+                );
+            }
+        }
+    }
+
+    #[test]
     fn plugin_config_entry_key_formats_in_every_builtin_locale() {
         let args = [("capability", "Tool"), ("key", "zpi1_fixture")];
         for (source, locale) in [
@@ -2643,6 +2675,74 @@ mod tests {
                     assert!(
                         value.contains(expected),
                         "{key} in {locale} should preserve {expected:?}; got: {value:?}"
+                    );
+                }
+                if locale != "en" {
+                    assert_ne!(
+                        value, english,
+                        "{key} in {locale} is the English string verbatim, so that catalogue was never translated"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `zeroclaw estop` refuses to run because nothing enforces it, so every
+    /// catalogue must say so in its own language, name the command in the
+    /// refusal, and carry the `--help` and status wording that matches it. A
+    /// catalogue that copies English fails as untranslated.
+    #[test]
+    fn estop_not_enforced_strings_are_translated_in_every_locale() {
+        let cases: [(&str, &[(&str, &str)]); 5] = [
+            ("cli-estop-not-enforced", &[]),
+            ("cli-estop-about", &[]),
+            ("cli-estop-status-about", &[]),
+            ("cli-estop-resume-about", &[]),
+            ("cli-status-estop", &[("v", "true")]),
+        ];
+
+        // The phrase each locale uses to say the command is not enforced.
+        // Without it a catalogue could go back to describing `estop` as
+        // engaging or resuming a stop and still be a translated string.
+        let not_enforced = |locale: &str, key: &str| -> &'static str {
+            match (locale, key) {
+                ("en", _) => "not enforced",
+                ("es", _) => "no se hace cumplir",
+                ("fr", "cli-estop-not-enforced") => "pas appliqué",
+                ("fr", _) => "non appliqué",
+                ("ja", "cli-estop-not-enforced") => "適用されていません",
+                ("ja", _) => "未適用",
+                ("zh-CN", _) => "未生效",
+                _ => unreachable!("unexpected locale {locale}"),
+            }
+        };
+
+        let english_source = include_str!("../locales/en/cli.ftl");
+        for (key, args) in cases {
+            let english = format_ftl_message(english_source, "en", key, args)
+                .unwrap_or_else(|| panic!("{key} should format in en"));
+
+            for (source, locale) in [
+                (include_str!("../locales/en/cli.ftl"), "en"),
+                (include_str!("../locales/es/cli.ftl"), "es"),
+                (include_str!("../locales/fr/cli.ftl"), "fr"),
+                (include_str!("../locales/ja/cli.ftl"), "ja"),
+                (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+            ] {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                assert!(
+                    !value.trim().is_empty(),
+                    "{key} must not be empty in {locale}"
+                );
+                assert!(
+                    value.to_lowercase().contains(not_enforced(locale, key)),
+                    "{key} in {locale} should say the command is not enforced; got: {value:?}"
+                );
+                if key == "cli-estop-not-enforced" {
+                    assert!(
+                        value.contains("zeroclaw estop"),
+                        "{key} in {locale} should name the command; got: {value:?}"
                     );
                 }
                 if locale != "en" {
