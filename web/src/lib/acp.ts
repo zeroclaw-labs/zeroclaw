@@ -134,14 +134,17 @@ export class AcpWebSocketClient {
 
   constructor(private readonly handlers: AcpClientHandlers = {}) {}
 
-  connect(agentAlias?: string): void {
+  connect(agentAlias?: string, resumeSession?: string): void {
     if (this.ws?.readyState === WebSocket.OPEN || this.ws?.readyState === WebSocket.CONNECTING) {
       return;
     }
 
     const token = getToken();
-    const query = agentAlias ? `?agent=${encodeURIComponent(agentAlias)}` : '';
-    const url = `${acpWebSocketBaseUrl()}${basePath}/acp${query}`;
+    const query = new URLSearchParams();
+    if (agentAlias) query.set('agent', agentAlias);
+    if (resumeSession) query.set('resumeSession', resumeSession);
+    const search = query.toString();
+    const url = `${acpWebSocketBaseUrl()}${basePath}/acp${search ? `?${search}` : ''}`;
     const protocols = token ? [ACP_PROTOCOL, `bearer.${token}`] : [ACP_PROTOCOL];
 
     this.ws = new WebSocket(url, protocols);

@@ -287,7 +287,7 @@ export class AcpChatSocket {
       },
     });
     this.client = client;
-    client.connect(this.agentAlias);
+    client.connect(this.agentAlias, this.sessionId);
   }
 
   disconnect(): void {

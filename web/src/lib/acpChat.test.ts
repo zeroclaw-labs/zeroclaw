@@ -145,7 +145,7 @@ test('ACP reconnect requests the turn cursor and keeps a single tool card', asyn
     onmessage?: (event: { data: string }) => void;
     readonly sent: Array<{ id: string | number; method: string; params: unknown }> = [];
 
-    constructor() { sockets.push(this); }
+    constructor(readonly url: string) { sockets.push(this); }
     open() {
       this.readyState = TestSocket.OPEN;
       this.onopen?.();
@@ -179,6 +179,7 @@ test('ACP reconnect requests the turn cursor and keeps a single tool card', asyn
     chat.connect();
     const socket = sockets[sockets.length - 1];
     assert.ok(socket);
+    assert.equal(new URL(socket.url).searchParams.get('resumeSession'), 'conversation');
     socket.open();
     socket.reply('initialize', { protocolVersion: 1 });
     await Promise.resolve();
