@@ -1091,9 +1091,10 @@ opens inside an allowed root instead.
 
 ### Keycloak access-token client attribution
 
-JWKS verification accepts a signed `azp` as the OAuth client identifier when a
-typed access token has no `client_id` and the configured client declaration or
-`actor_claim` establishes a human actor. The issuer, signature, token purpose,
+With the default claim names, JWKS verification accepts a signed `azp` as the
+OAuth client identifier when a typed access token has no `client_id` and the
+configured client declaration or `actor_claim` establishes a human actor.
+The issuer, signature, token purpose,
 audience, lifetime and actor-classification checks still apply. An `azp`-only
 token cannot authenticate a service, including one classified by `actor_claim`;
 service actors still require `client_id`. A blank `client_id`, contradictory
