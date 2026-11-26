@@ -306,7 +306,7 @@ impl ::zeroclaw_api::attribution::Attributable for Skill {
     }
 }
 
-pub use zeroclaw_skills::{SkillCommand, SkillTool};
+pub use zeroclaw_tools::skill_tool::{SkillCommand, SkillTool};
 
 /// Skill manifest parsed from SKILL.toml
 #[derive(Debug, Clone, Serialize, Deserialize)]

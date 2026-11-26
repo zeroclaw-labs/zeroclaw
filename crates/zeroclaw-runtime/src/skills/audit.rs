@@ -216,7 +216,7 @@ fn audit_manifest_file(root: &Path, path: &Path, report: &mut SkillAuditReport) 
 
     if let Some(tools) = parsed.get("tools").and_then(toml::Value::as_array) {
         for (idx, tool) in tools.iter().enumerate() {
-            if let Err(reason) = zeroclaw_skills::audit_tool(tool) {
+            if let Err(reason) = zeroclaw_tools::skill_tool::audit_tool(tool) {
                 report
                     .findings
                     .push(format!("{rel}: tools[{idx}] {reason}"));

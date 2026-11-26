@@ -1,5 +1,5 @@
 //! Executable skill contracts against the manifest, production binder and tool registry.
-use zeroclaw_skills::argv as binding;
+use zeroclaw_tools::skill_tool::argv as binding;
 
 use serde_json::json;
 use std::collections::HashMap;

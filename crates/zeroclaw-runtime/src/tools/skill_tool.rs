@@ -2,6 +2,7 @@
 
 use crate::platform::{NativeRuntime, RuntimeAdapter};
 use crate::security::SecurityPolicy;
+use crate::skills::SkillCommand;
 use crate::tools::shell_env::SAFE_SHELL_ENV_VARS;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -77,7 +78,7 @@ fn get_session_id() -> Option<String> {
 pub struct SkillShellTool {
     tool_name: String,
     tool_description: String,
-    command_template: zeroclaw_skills::SkillCommand,
+    command_template: SkillCommand,
     sandbox: Option<Arc<dyn crate::security::Sandbox>>,
     args: HashMap<String, String>,
     security: Arc<SecurityPolicy>,
@@ -181,18 +182,27 @@ impl Tool for SkillShellTool {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let template = match &self.command_template {
-            zeroclaw_skills::SkillCommand::Text(text) => text,
-            zeroclaw_skills::SkillCommand::Argv(template) => {
+            SkillCommand::Text(text) => text,
+            SkillCommand::Argv(template) => {
                 let sandbox = self
                     .sandbox
                     .as_ref()
                     .filter(|s| s.name() != "none" || self.security.explicitly_disables_sandbox())
                     .ok_or_else(|| {
-                        anyhow::anyhow!(crate::i18n::get_required_cli_string(
-                            "tool-skill-argv-no-sandbox-context"
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                            "literal skill execution rejected without a sandbox context"
+                        );
+                        anyhow::Error::msg(crate::i18n::get_required_cli_string(
+                            "tool-skill-argv-no-sandbox-context",
                         ))
                     })?;
-                let mut cmd = zeroclaw_skills::argv::prepare(
+                let mut cmd = zeroclaw_tools::skill_tool::argv::prepare(
                     template,
                     &self.args,
                     &args,
