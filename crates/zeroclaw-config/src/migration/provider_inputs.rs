@@ -824,17 +824,15 @@ pub(crate) fn legacy_env_segments_with_staged(
                 .unwrap_or_else(|| model.provider().clone()),
             None,
         )
-    } else if config.providers.models.iter_entries().any(
-        |(candidate_family, candidate_alias, _)| {
-            candidate_family == *family && candidate_alias == *alias
-        },
-    ) {
+    } else {
+        // A historical environment variable may be the first input that
+        // introduces a family/alias. Project it through the same legacy
+        // connection identity; final provider deserialization still validates
+        // the family and rejects unknown kinds.
         (
             ProviderId::from(format!("legacy.{family}.{alias}")),
             Some(*family),
         )
-    } else {
-        return None;
     };
     let kind = staged
         .and_then(|document| document["connections"][provider.as_str()]["kind"].as_str())

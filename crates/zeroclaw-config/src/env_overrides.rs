@@ -153,6 +153,7 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
                 &mut registry_staged,
                 &path,
             )?;
+            crate::provider_registry::env_input::ensure_legacy_model(&mut registry_staged, &path)?;
             crate::provider_registry::env_input::stage(&mut registry_staged, &path, &value)?;
             registry_edits.push((path.clone(), value.clone(), env_name.clone()));
             Ok(())

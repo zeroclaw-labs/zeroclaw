@@ -262,6 +262,60 @@ pub(crate) fn ensure_legacy_connection(document: &mut Value, path: &str) -> Resu
     Ok(())
 }
 
+/// Seed the canonical chat model projected from a historical typed profile.
+///
+/// Legacy environment names can introduce an alias that was not present in
+/// the file at all. The connection seed above gives that alias an owner; this
+/// seed gives model leaves a parent object while retaining the normal tagged
+/// model representation for final deserialization.
+pub(crate) fn ensure_legacy_model(document: &mut Value, path: &str) -> Result<()> {
+    let parts: Vec<_> = path
+        .trim_start_matches('/')
+        .split('/')
+        .map(|part| part.replace("~1", "/").replace("~0", "~"))
+        .collect();
+    let ["providers", "models", model_ref, ..] = parts.as_slice() else {
+        return Ok(());
+    };
+    let root = document
+        .as_object_mut()
+        .ok_or_else(|| anyhow::Error::msg("provider registry must be a table"))?;
+    let connections = root
+        .get("connections")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::Error::msg("provider connections must be a table"))?;
+    let provider = if connections.contains_key(&format!("legacy.{model_ref}")) {
+        Some(format!("legacy.{model_ref}"))
+    } else {
+        let mut segments = model_ref.split('.');
+        let family = segments.next();
+        let alias = segments.next();
+        match (family, alias) {
+            (Some(family), Some(alias)) => {
+                let candidate = format!("legacy.{family}.{alias}");
+                connections.contains_key(&candidate).then_some(candidate)
+            }
+            _ => None,
+        }
+    };
+    let Some(provider) = provider else {
+        return Ok(());
+    };
+    let models = root
+        .entry("models".to_owned())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| anyhow::Error::msg("provider models must be a table"))?;
+    models
+        .entry((*model_ref).to_owned())
+        .or_insert_with(|| serde_json::json!({
+            "capability": "chat",
+            "provider": provider,
+        }));
+    Ok(())
+}
+
+
 fn typed_env_value(
     template: &Value,
     path: &str,
@@ -292,6 +346,15 @@ fn typed_env_value(
 /// Compound auth overrides must not admit an incomplete intermediate variant.
 pub(crate) fn set_many(config: &mut Config, edits: &[(String, String)]) -> Result<()> {
     let mut document = serde_json::to_value(&config.providers)?;
+    // Historical `providers.models.<family>.<alias>.*` variables are admitted
+    // through the canonical registry, but their legacy connection/model
+    // projection may not exist in the raw input document yet. Seed those
+    // parents before the typed transaction so both old credentials and model
+    // options can be applied atomically and then decoded normally.
+    for (path, _) in edits {
+        ensure_legacy_connection(&mut document, path)?;
+        ensure_legacy_model(&mut document, path)?;
+    }
     let mut probe = document.clone();
     let parsed_edits: Vec<_> = edits
         .iter()
