@@ -6,7 +6,7 @@ import test from "node:test";
 const source = readFileSync(new URL("./browser_credential_form.js", import.meta.url), "utf8");
 const origin = "https://login.example.test";
 
-function fixture({ action = origin + "/submit", method = "post", top = true, invalid = false, canceled = false, maskedOtp = false, duplicateOtp = false, frameOrigin = origin, submitOverride } = {}) {
+function fixture({ action = origin + "/submit", method = "post", top = true, invalid = false, canceled = false, maskedOtp = false, duplicateOtp = false, frameOrigin = origin, submitOverride, windowOrigin = origin, target = "", buttonCount = 1, otpType, splitForms = false } = {}) {
   const sent = [];
   class Form {
     addEventListener(type, handler) { this.observeSubmit = handler; }
@@ -25,11 +25,14 @@ function fixture({ action = origin + "/submit", method = "post", top = true, inv
     type: "submit", formAction: submitOverride, getClientRects: () => [1],
     hasAttribute: name => name === "formaction" && !!submitOverride,
   };
-  const form = Object.assign(new Form(), { action, method, target: "", elements: [button] });
+  const form = Object.assign(new Form(), { action, method, target, elements: Array.from({length:buttonCount}, () => button) });
   const fields = ["text", "password", maskedOtp ? "password" : "text"].map(type => Object.assign(new Input(), { form, type }));
   const segments = Array.from({length:6}, () => Object.assign(new Input(), { form, type:"text", maxLength:1 }));
   fields.push(...segments);
-  const window = { location: { origin } };
+  fields.forEach((field, index) => { field.matches = () => index === 2; });
+  if (otpType) fields[2].type = otpType;
+  if (splitForms) fields[0].form = new Form();
+  const window = { location: { origin: windowOrigin } };
   window.top = top ? window : {};
   const document = {
     baseURI: origin,
@@ -37,6 +40,7 @@ function fixture({ action = origin + "/submit", method = "post", top = true, inv
     querySelectorAll(selector) {
       if (selector === "#embedded") return [{tagName:"IFRAME",getClientRects:()=>[1],contentDocument:document}];
       if (selector === ".segment") return segments;
+      if (selector === "#otp") return [fields[2]];
 
       if (selector.startsWith('input[type="password"]')) {
         return maskedOtp && selector.includes(':not([name="otp"])') ? [] : [fields[1]];
@@ -129,3 +133,28 @@ for (const options of [{ invalid: true }, { canceled: true }]) {
     assert.ok(fields.every(field => field.value === ""));
   });
 }
+
+for (const options of [
+  {windowOrigin: "https://elsewhere.example.test"},
+  {target: "other-window"}, {buttonCount: 2}, {splitForms: true},
+]) {
+  test(`refuses before filling a mismatched login boundary: ${JSON.stringify(options)}`, () => {
+    const {run, sent, fields} = fixture(options);
+    assert.equal(run({username: "fixture", password: "sentinel"}), false);
+    assert.deepEqual(sent, []);
+    assert.ok(fields.every(field => field.value === ""));
+  });
+}
+test("rejects a non-text-like OTP field", () => {
+  const {run, sent, fields} = fixture({otpType: "hidden"});
+  assert.equal(run({otp: "123456"}), false);
+  assert.deepEqual(sent, []);
+  assert.ok(fields.every(field => field.value === ""));
+});
+test("a caller selector cannot release an OTP into an ordinary text field", () => {
+  const {run, sent, fields} = fixture();
+  assert.equal(run({otp: "123456"}, {stage: "otp", field: "#search"}), false);
+  assert.deepEqual(sent, []);
+  assert.ok(fields.every(field => field.value === ""));
+  assert.equal(run({otp: "123456"}, {stage: "otp", field: "#otp"}), true);
+});

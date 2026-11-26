@@ -327,6 +327,7 @@ pub fn build_spec() -> serde_json::Value {
                     },
                     "permissions": {
                         "type": "object",
+                        "required": ["expected_revision"],
                         "properties": {
                             "expected_revision": {"type": "string", "description": "Use the permission_revision from GET. Required when replacing http_origins, browser.origins, destinations, or ssh_profiles. A missing required or stale revision returns 409."},
                             "http_allowed": {"type": "boolean"},

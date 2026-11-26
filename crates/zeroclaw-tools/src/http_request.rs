@@ -504,6 +504,11 @@ impl HttpRequestTool {
                 }
             }
             ScopedHttpAuth::UserPassword { username, password } => {
+                anyhow::ensure!(
+                    !username.contains(':'),
+                    "{}",
+                    scoped_credential_message("tool-http-credential-invalid")
+                );
                 let password = resolve_scoped_value(credential.source, password).await?;
                 let pair = format!("{username}:{password}");
                 let encoded = base64::engine::general_purpose::STANDARD.encode(&pair);

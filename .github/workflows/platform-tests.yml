@@ -6,9 +6,6 @@ on:
     paths:
       - ".github/workflows/platform-tests.yml"
       - "crates/zeroclaw-tools/src/coding_cli.rs"
-      - "crates/zeroclaw-tools/src/portable_ssh_auth.rs"
-      - "crates/zeroclaw-tools/tests/portable_ssh_auth.rs"
-      - "crates/zeroclaw-config/src/ssh_auth_sequence.rs"
   workflow_dispatch:
   schedule:
     - cron: "17 3 * * *"
