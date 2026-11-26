@@ -6,7 +6,9 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;

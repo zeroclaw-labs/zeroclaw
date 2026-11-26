@@ -10,7 +10,8 @@ pub trait Sandbox: Send + Sync {
 
     /// Opt in only when this backend preserves literal argument boundaries.
     fn wrap_literal_command(&self, _cmd: &mut Command) -> std::io::Result<()> {
-        Err(std::io::Error::unsupported(
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
             "sandbox does not support direct executable arguments",
         ))
     }
