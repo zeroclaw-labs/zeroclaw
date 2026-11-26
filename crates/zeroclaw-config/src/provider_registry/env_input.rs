@@ -185,58 +185,69 @@ pub(crate) fn set(config: &mut Config, path: &str, value: &str, restore: bool) -
     set_many(config, &[(path.to_owned(), value.to_owned())])
 }
 
-/// Apply several registry environment edits against one raw document and only
-/// decode the typed provider registry once. This matters for compound auth
-/// overrides such as `auth.mode=oauth` plus `auth.client_secret`: decoding each
-/// leaf separately can reject the intermediate, incomplete auth variant.
+fn env_value(value: &str) -> (Value, Value) {
+    let literal = if value.is_empty() {
+        Value::Null
+    } else {
+        Value::String(value.to_owned())
+    };
+    let parsed = serde_json::from_str::<Value>(value)
+        .ok()
+        .filter(|value| !value.is_null() && !value.is_string())
+        .unwrap_or_else(|| literal.clone());
+    (parsed, literal)
+}
+
+/// An untyped transaction view lets historical whole-auth edits compose with
+/// earlier edits before the final registry is admitted.
+pub(crate) fn stage(document: &mut Value, path: &str, value: &str) -> Result<()> {
+    set_document(document, path, env_value(value).0, None)
+}
+
+/// Stage all registry environment edits before decoding the final registry.
+/// Compound auth overrides must not admit an incomplete intermediate variant.
 pub(crate) fn set_many(config: &mut Config, edits: &[(String, String)]) -> Result<()> {
     let mut document = serde_json::to_value(&config.providers)?;
+    let mut type_template = document.clone();
     let mut parsed_edits = Vec::with_capacity(edits.len());
     for (path, value) in edits {
-        let literal = if value.is_empty() {
-            Value::Null
-        } else {
-            Value::String(value.clone())
-        };
-        let parsed = serde_json::from_str::<Value>(value)
-            .ok()
-            .filter(|value| !value.is_null() && !value.is_string())
-            .unwrap_or_else(|| literal.clone());
-        set_document(&mut document, path, parsed.clone(), None)?;
-        parsed_edits.push((path.clone(), parsed, literal));
+        let (parsed, literal) = env_value(value);
+        // Stage unambiguous strings (including enum tags) and removals in
+        // the type probe as well, so OAuth leaves see their final auth mode.
+        if parsed == literal {
+            set_document(&mut type_template, path, literal.clone(), None)?;
+        }
+        parsed_edits.push((path, parsed, literal));
     }
 
-    for (path, _, _) in &parsed_edits {
-        validate_option_override(&document, path)?;
-    }
-    let candidate = serde_json::from_value(document.clone());
-    let candidate: crate::providers::Providers = match candidate {
-        Ok(candidate) => candidate,
-        Err(error) => {
-            // Preserve the historical fallback for a JSON-looking string that
-            // is actually a typed string. Restore only the parsed leaves one
-            // by one until the candidate decodes, retaining structured option
-            // values when they are required by the schema.
-            let mut fallback = document;
-            let mut last_error = error;
-            let mut candidate = None;
-            for (path, parsed, literal) in &parsed_edits {
-                if parsed == literal {
-                    continue;
-                }
-                set_document(&mut fallback, path, literal.clone(), None)?;
-                match serde_json::from_value(fallback.clone()) {
-                    Ok(value) => {
-                        candidate = Some(value);
-                        break;
-                    }
-                    Err(error) => last_error = error,
+    for (path, parsed, literal) in parsed_edits {
+        let value = if parsed == literal {
+            parsed
+        } else {
+            // Ask the real schema to distinguish JSON-valued options from
+            // string fields such as numeric model IDs and credentials. Probe
+            // each ambiguous leaf independently: changing an unrelated numeric
+            // option to a string must not hide a later string-field override.
+            let mut probe = type_template.clone();
+            set_document(&mut probe, path, parsed.clone(), None)?;
+            if serde_json::from_value::<crate::providers::Providers>(probe).is_ok() {
+                parsed
+            } else {
+                let mut probe = type_template.clone();
+                set_document(&mut probe, path, literal.clone(), None)?;
+                if serde_json::from_value::<crate::providers::Providers>(probe).is_ok() {
+                    literal
+                } else {
+                    parsed
                 }
             }
-            candidate.ok_or(last_error)?
-        }
-    };
-    config.providers = candidate;
+        };
+        set_document(&mut document, path, value, None)?;
+    }
+    for (path, _) in edits {
+        validate_option_override(&document, path)?;
+    }
+    config.providers = serde_json::from_value(document)?;
     Ok(())
 }
 
@@ -513,6 +524,36 @@ mod tests {
             );
             set(&mut config, &path, &saved, true).unwrap();
         }
+    }
+
+    #[test]
+    fn batch_keeps_numeric_options_and_json_looking_strings() {
+        let mut config = fixture();
+        set_many(
+            &mut config,
+            &[
+                (
+                    "/providers/models/chat.Fast.v2/options/temperature".into(),
+                    "0.25".into(),
+                ),
+                (
+                    "/providers/connections/gateway.Prod/auth/api_key".into(),
+                    "123".into(),
+                ),
+                ("/providers/models/chat.Fast.v2/model".into(), "456".into()),
+            ],
+        )
+        .unwrap();
+        let document = serde_json::to_value(&config.providers).unwrap();
+        assert_eq!(
+            document["models"]["chat.Fast.v2"]["options"]["temperature"],
+            serde_json::json!(0.25)
+        );
+        assert_eq!(
+            document["connections"]["gateway.Prod"]["auth"]["api_key"],
+            "123"
+        );
+        assert_eq!(document["models"]["chat.Fast.v2"]["model"], "456");
     }
 
     #[test]
