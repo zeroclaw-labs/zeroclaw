@@ -6429,6 +6429,23 @@ pub(crate) fn remap_confirmed_offset(confirmed_prefix: &str, frame: &str) -> usi
 ///
 /// `known_tool_names` comes from the same registry the final sanitizer reads,
 /// so both boundaries judge a protocol payload by the same tool inventory.
+/// The outbound content format for a turn's reply or draft on `channel`.
+///
+/// Read from the config snapshot this runtime context was built from, the same
+/// snapshot that built `channels_by_name`, which is where both the originating
+/// channel and any `send_via` destination are resolved. Live config can
+/// already describe a newer binding for the alias (for example `plugin.libera`
+/// rebound from the plain-text `irc` package to a Markdown one) while this
+/// context's IRC instance still finishes a pending reply; judging that reply by
+/// the newer binding would apply Markdown link-destination protection and let
+/// a high-entropy destination through on a plain-text transport.
+fn turn_outbound_content_format(
+    ctx: &ChannelRuntimeContext,
+    channel: &str,
+) -> OutboundContentFormat {
+    outbound_content_format_for_channel(ctx.prompt_config.as_ref(), channel)
+}
+
 #[cfg(test)]
 async fn run_draft_updater(
     channel: Arc<dyn Channel>,
@@ -10278,10 +10295,7 @@ async fn process_channel_message_body(
                     .collect();
                 let streamed_draft_text = Arc::clone(&streamed_draft_text);
                 let leak_detection = ctx.prompt_config.security.leak_detection.clone();
-                let content_format = outbound_content_format_for_channel(
-                    ctx.live_config.read().as_ref(),
-                    &channel_composite,
-                );
+                let content_format = turn_outbound_content_format(&ctx, &channel_composite);
                 Some(zeroclaw_spawn::spawn!(async move {
                     let _lease = draft_lease;
                     run_draft_updater_with_leak_detection(
@@ -10939,10 +10953,8 @@ async fn process_channel_message_body(
                 .and_then(|r| r.channel.as_deref())
                 .filter(|k| !k.is_empty())
                 .unwrap_or(channel_composite.as_str());
-            let outbound_content_format = outbound_content_format_for_channel(
-                ctx.live_config.read().as_ref(),
-                outbound_format_channel,
-            );
+            let outbound_content_format =
+                turn_outbound_content_format(&ctx, outbound_format_channel);
 
             let sanitized_response = sanitize_channel_response_for_format_with_leak_detection(
                 &outbound_response,
@@ -54981,72 +54993,74 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    /// A model provider that answers every turn with one fixed reply.
+    struct StaticReplyProvider(String);
+    impl ::zeroclaw_api::attribution::Attributable for StaticReplyProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "StaticReplyProvider"
+        }
+    }
+    #[async_trait::async_trait]
+    impl ModelProvider for StaticReplyProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(self.0.clone())
+        }
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// Records outbound replies for the `plugin.libera` binding.
+    struct PluginAliasRecordingChannel {
+        sent: tokio::sync::Mutex<Vec<String>>,
+    }
+    impl ::zeroclaw_api::attribution::Attributable for PluginAliasRecordingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Plugin,
+            )
+        }
+        fn alias(&self) -> &str {
+            "libera"
+        }
+    }
+    #[async_trait::async_trait]
+    impl Channel for PluginAliasRecordingChannel {
+        fn name(&self) -> &str {
+            "plugin"
+        }
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent.lock().await.push(message.content.clone());
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn irc_plugin_outbound_redacts_credentials_in_markdown_link_destinations() {
-        struct StaticReplyProvider(String);
-        impl ::zeroclaw_api::attribution::Attributable for StaticReplyProvider {
-            fn role(&self) -> ::zeroclaw_api::attribution::Role {
-                ::zeroclaw_api::attribution::Role::Provider(
-                    ::zeroclaw_api::attribution::ProviderKind::Model(
-                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
-                    ),
-                )
-            }
-            fn alias(&self) -> &str {
-                "StaticReplyProvider"
-            }
-        }
-        #[async_trait::async_trait]
-        impl ModelProvider for StaticReplyProvider {
-            async fn chat_with_system(
-                &self,
-                _system_prompt: Option<&str>,
-                _message: &str,
-                _model: &str,
-                _temperature: Option<f64>,
-            ) -> anyhow::Result<String> {
-                Ok(self.0.clone())
-            }
-            async fn chat_with_history(
-                &self,
-                _messages: &[ChatMessage],
-                _model: &str,
-                _temperature: Option<f64>,
-            ) -> anyhow::Result<String> {
-                Ok(self.0.clone())
-            }
-        }
-
-        struct PluginAliasRecordingChannel {
-            sent: tokio::sync::Mutex<Vec<String>>,
-        }
-        impl ::zeroclaw_api::attribution::Attributable for PluginAliasRecordingChannel {
-            fn role(&self) -> ::zeroclaw_api::attribution::Role {
-                ::zeroclaw_api::attribution::Role::Channel(
-                    ::zeroclaw_api::attribution::ChannelKind::Plugin,
-                )
-            }
-            fn alias(&self) -> &str {
-                "libera"
-            }
-        }
-        #[async_trait::async_trait]
-        impl Channel for PluginAliasRecordingChannel {
-            fn name(&self) -> &str {
-                "plugin"
-            }
-            async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-                self.sent.lock().await.push(message.content.clone());
-                Ok(())
-            }
-            async fn listen(
-                &self,
-                _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-            ) -> anyhow::Result<()> {
-                Ok(())
-            }
-        }
-
         let secret = "aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
         let secret_two = "zC9vN4mK8pQ2rL7xT5yU1hD6jF0gB3wE";
 
@@ -55182,6 +55196,155 @@ This is an example JSON object for profile settings."#;
                 && announced[0].contains("[REDACTED_HIGH_ENTROPY_TOKEN]"),
             "announcement to `plugin.libera` must skip Markdown link protection: {}",
             announced[0]
+        );
+    }
+
+    /// Holds the first `on_message_sending` call until the test releases it,
+    /// so a test can publish config while a reply waits in its outbound hook.
+    /// Later calls pass straight through.
+    struct HeldSendHook {
+        held: std::sync::atomic::AtomicBool,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl zeroclaw_runtime::hooks::HookHandler for HeldSendHook {
+        fn name(&self) -> &str {
+            "held-send"
+        }
+
+        async fn on_message_sending(
+            &self,
+            channel: String,
+            recipient: String,
+            content: String,
+        ) -> zeroclaw_runtime::hooks::HookResult<(String, String, String)> {
+            if !self.held.swap(true, Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            zeroclaw_runtime::hooks::HookResult::Continue((channel, recipient, content))
+        }
+    }
+
+    /// A config binding `plugin.libera` to `package`.
+    fn libera_bound_to(package: &str) -> zeroclaw_config::schema::Config {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.plugin.insert(
+            "libera".to_string(),
+            zeroclaw_config::schema::PluginChannelConfig {
+                package: package.to_string(),
+                enabled: true,
+            },
+        );
+        config
+    }
+
+    /// A reply already in flight on an IRC binding must be scanned as plain
+    /// text even if the operator rebinds the alias to a Markdown package while
+    /// the reply waits in its outbound hook. The sending channel is still the
+    /// IRC instance this context was built with, so the newer binding's
+    /// Markdown check must not shield a high-entropy relative link destination.
+    #[tokio::test]
+    async fn binding_change_while_reply_waits_in_outbound_hook_keeps_plain_text_scan() {
+        let secret = "zC9vN4mK8pQ2rL7xT5yU1hD6jF0gB3wE";
+        let reply = format!("report at [y](/download/{secret})");
+
+        let snapshot = libera_bound_to("irc");
+        let live = zeroclaw_config::live::LiveConfig::new(snapshot.clone());
+        let channel_impl = Arc::new(PluginAliasRecordingChannel {
+            sent: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut ctx = test_runtime_ctx_with_observer(
+            Arc::clone(&channel),
+            Arc::new(StaticReplyProvider(reply)),
+            snapshot,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut hook_runner = zeroclaw_runtime::hooks::HookRunner::new();
+        hook_runner.register(Box::new(HeldSendHook {
+            held: std::sync::atomic::AtomicBool::new(false),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }));
+        {
+            let ctx = Arc::get_mut(&mut ctx).expect("fresh test context is unshared");
+            ctx.channels_by_name =
+                Arc::new(HashMap::from([("plugin.libera".to_string(), channel)]));
+            ctx.live_config = live.handle();
+            ctx.hooks = Some(Arc::new(hook_runner));
+        }
+
+        let rebind_while_held = async {
+            tokio::time::timeout(Duration::from_secs(10), entered.notified())
+                .await
+                .expect("the reply reaches its outbound hook");
+            let revision = live.next_revision().expect("revision available");
+            live.publish(revision, libera_bound_to("matrix"))
+                .expect("publication accepted");
+            release.notify_one();
+        };
+        let turn = process_channel_message(
+            ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-irc-rebind-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "#ops".to_string(),
+                content: "send report".to_string(),
+                channel: "plugin".to_string(),
+                channel_alias: Some("libera".to_string()),
+                timestamp: 1,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        );
+        tokio::join!(turn, rebind_while_held);
+
+        let sent = channel_impl.sent.lock().await;
+        assert_eq!(sent.len(), 1, "expected one outbound reply, got {sent:?}");
+        assert!(
+            !sent[0].contains(secret) && sent[0].contains("[REDACTED_HIGH_ENTROPY_TOKEN]"),
+            "a reply sent through the IRC instance must keep plain-text scanning after a rebind: {}",
+            sent[0]
+        );
+    }
+
+    /// Draft streaming and the final reply share one format source: the
+    /// context's own snapshot, not live config that may describe a newer
+    /// binding than the channels this context holds.
+    #[tokio::test]
+    async fn turn_outbound_content_format_reads_the_contexts_snapshot() {
+        let channel: Arc<dyn Channel> = Arc::new(PluginAliasRecordingChannel {
+            sent: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let mut ctx = test_runtime_ctx_with_observer(
+            channel,
+            Arc::new(StaticReplyProvider(String::new())),
+            libera_bound_to("irc"),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+        );
+        Arc::get_mut(&mut ctx)
+            .expect("fresh test context is unshared")
+            .live_config =
+            zeroclaw_config::live::LiveConfig::new(libera_bound_to("matrix")).handle();
+
+        assert_eq!(
+            turn_outbound_content_format(&ctx, "plugin.libera"),
+            OutboundContentFormat::PlainText
+        );
+        assert_eq!(
+            turn_outbound_content_format(&ctx, "telegram.default"),
+            OutboundContentFormat::Markdown
         );
     }
 
