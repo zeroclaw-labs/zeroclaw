@@ -6,8 +6,8 @@ each run against declarative expectations. It is how ZeroClaw guards agent-loop
 behavior (tool dispatch, multi-turn ordering, response formatting, refusals)
 against regression.
 
-It is distinct from `[agent.eval]`, the in-loop response-quality scorer. The
-harness is configured under `[eval]` and invoked as a CLI subcommand.
+Set the default suite directory and execution mode in the top-level `[eval]`
+table in `config.toml`.
 
 ## Modes
 

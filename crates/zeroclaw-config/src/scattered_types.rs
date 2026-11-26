@@ -288,9 +288,7 @@ fn default_eval_mode() -> String {
     "replay".to_string()
 }
 
-/// Configuration for the agent evaluation harness (`[eval]`), surfaced via the
-/// `zeroclaw eval` command. Distinct from `[agent.eval]`, which is the in-loop
-/// response-quality scorer.
+/// Suite and mode defaults for `zeroclaw eval run`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "eval"]
