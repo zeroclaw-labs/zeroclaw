@@ -13285,7 +13285,8 @@ fn build_channel_by_id(
                 .with_tts(&config)
                 .with_workspace_dir(workspace_dir)
                 .with_per_user_session(tg.per_user_session)
-                .with_approval_timeout_secs(tg.approval_timeout_secs),
+                .with_approval_timeout_secs(tg.approval_timeout_secs)
+                .with_rich_messages(tg.rich_messages),
             ))
         }
         #[cfg(not(feature = "channel-telegram"))]
@@ -14896,7 +14897,8 @@ fn collect_configured_channels_with_authority(
                     .with_proxy_url(tg.proxy_url.clone())
                     .with_tool_command_specs(tool_specs.to_vec())
                     .with_per_user_session(tg.per_user_session)
-                    .with_approval_timeout_secs(tg.approval_timeout_secs),
+                    .with_approval_timeout_secs(tg.approval_timeout_secs)
+                    .with_rich_messages(tg.rich_messages),
                 ),
                 tg,
             ),
@@ -18089,7 +18091,8 @@ pub async fn deliver_announcement(
                 Arc::new(move || peers.clone());
             let ch =
                 TelegramChannel::new(tg.bot_token.clone(), alias, peer_resolver, tg.mention_only)
-                    .with_api_base(tg.api_base_url.clone());
+                    .with_api_base(tg.api_base_url.clone())
+                    .with_rich_messages(tg.rich_messages);
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "channel-telegram"))]
@@ -47844,7 +47847,16 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
-        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        let install = tempfile::TempDir::new().expect("isolated peer-tool install");
+        let mut prompt_config = zeroclaw_config::schema::Config {
+            data_dir: install.path().join("data"),
+            config_path: install.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        prompt_config.risk_profiles.insert(
+            "default".into(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
         prompt_config.agents.insert(
             "test-agent".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
@@ -47852,6 +47864,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     "test-channel.default".into(),
                     "other-channel.default".into(),
                 ],
+                risk_profile: "default".into(),
                 ..zeroclaw_config::schema::AliasedAgentConfig::default()
             },
         );
@@ -47898,7 +47911,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 zeroclaw_runtime::tools::SendMessageToPeerTool::new(
                     Arc::clone(&prompt_config),
                     "test-agent",
-                ),
+                )
+                .expect("sender policy"),
             )]),
         );
         let runtime_ctx = peer_prompt_test_context(
@@ -54065,6 +54079,8 @@ This is an example JSON object for profile settings."#;
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+
+                rich_messages: false,
             },
         );
         let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
@@ -54098,6 +54114,8 @@ This is an example JSON object for profile settings."#;
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+
+                rich_messages: false,
             },
         );
         config
