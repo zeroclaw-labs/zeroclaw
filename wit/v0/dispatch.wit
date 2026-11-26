@@ -22,6 +22,8 @@ interface dispatch {
 
     /// Enqueue an asynchronous wake turn for `target-agent` with a bounded
     /// notification `prompt`. Returns once admitted; never awaits the turn.
+    /// Success is in-process acceptance: a wake still pending when the host
+    /// process exits is not replayed.
     @unstable(feature = plugins-wit-v0-dispatch)
     wake: func(target-agent: string, prompt: string) -> result<_, dispatch-error>;
 }

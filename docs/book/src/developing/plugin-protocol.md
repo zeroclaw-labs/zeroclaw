@@ -505,20 +505,34 @@ Every call passes five host-owned checks before spawning a turn:
    that claim to settle, re-resolves the live grant and target (so an operator
    edit made while it waited applies), then coalesces or claims the pair
    itself, so a failed claim never drops a wake that already returned success. The follow-up
-   re-checks live grants and target availability before running; a follow-up
-   the operator no longer permits (target revoked, disabled or removed, or
-   re-admission refused) is cancelled and the next pending wake is drained,
-   rather than releasing the pair with accepted wakes still queued. A follow-up
+   is admitted at the target's lifecycle generation from when the wake was
+   accepted, then the live grant and the target's enabled flag are re-checked
+   on the config it was admitted with; an idle wake applies the same check to
+   its admitted config before registering a task. A follow-up the operator no
+   longer permits (target revoked, disabled, removed, or deleted and replaced
+   under the same alias, or re-admission refused) is cancelled and the next
+   pending wake is drained, rather than releasing the pair with accepted wakes
+   still queued. A follow-up
    whose durable `TaskRecord` registration fails transiently is not dropped: it
    returns to the pending slot (unless a newer wake has already replaced it)
    and is retried with capped exponential backoff, re-checking the live grant
-   and target before each attempt, so an accepted wake runs exactly once or is
-   cancelled by an operator edit. The finished turn's lifecycle lease is
-   released before the worker drains or retries, so an idle target stays
-   deletable while a follow-up waits for the store.
+   and target before each attempt. While the process keeps running, an accepted
+   wake therefore runs once or is cancelled by an operator edit. The finished
+   turn's lifecycle lease is released as soon as the turn returns, before its
+   terminal write or any follow-up registration is retried, so an idle target
+   stays deletable while the worker waits for the store.
    Idle pairs also spend from the per-instance continuous token bucket, admit
    against `AgentExecutionCapability`, record a durable `TaskRecord`, and run
    under `InternalPrincipal::PluginTool`.
+
+**Success means in-process acceptance, not durable delivery.** `wake` returning
+`ok` means this process accepted the wake. A wake that claims an idle pair has
+a durable `TaskRecord` before it returns, but a wake coalesced onto a running
+turn exists only in memory until its follow-up registers. If the process exits
+first, that prompt is lost and the per-instance rate bucket starts fresh on the
+next boot. Boot recovery marks a registered task abandoned by the previous
+process `Lost`, but it cannot replay its prompt. A plugin that needs delivery
+across restarts must keep its own record and wake again.
 
 **Woken turns keep the caller's headless SOP step scope.** A wake issued from
 inside a headless SOP step carries that step's tool scope into the woken turn,
