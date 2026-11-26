@@ -307,15 +307,14 @@ pub(crate) fn ensure_legacy_model(document: &mut Value, path: &str) -> Result<()
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
         .ok_or_else(|| anyhow::Error::msg("provider models must be a table"))?;
-    models
-        .entry((*model_ref).to_owned())
-        .or_insert_with(|| serde_json::json!({
+    models.entry((*model_ref).to_owned()).or_insert_with(|| {
+        serde_json::json!({
             "capability": "chat",
             "provider": provider,
-        }));
+        })
+    });
     Ok(())
 }
-
 
 fn typed_env_value(
     template: &Value,
