@@ -962,6 +962,18 @@ impl ConnectionSettings for FixedChatConnection {
     fn chat_api(&self) -> Option<&ChatApiConfig> {
         self.api.chat.as_ref()
     }
+    fn tts_defaults(&self) -> Option<(Option<&PresetId>, &TtsOptionsPatch)> {
+        self.api
+            .tts
+            .as_ref()
+            .map(|api| (api.preset.as_ref(), &api.options))
+    }
+    fn asr_defaults(&self) -> Option<(Option<&PresetId>, &AsrOptionsPatch)> {
+        self.api
+            .asr
+            .as_ref()
+            .map(|api| (api.preset.as_ref(), &api.options))
+    }
     fn decision_api(&self) -> Option<&DecisionApiConfig> {
         self.api.decision.as_ref()
     }
@@ -969,6 +981,12 @@ impl ConnectionSettings for FixedChatConnection {
         let mut out = Vec::new();
         if self.api.chat.is_some() {
             out.push(Capability::Chat);
+        }
+        if self.api.tts.is_some() {
+            out.push(Capability::Tts);
+        }
+        if self.api.asr.is_some() {
+            out.push(Capability::Asr);
         }
         if self.api.decision.is_some() {
             out.push(Capability::Decision);

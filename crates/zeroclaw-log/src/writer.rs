@@ -41,6 +41,7 @@ use crate::event::LogEvent;
 use crate::migrate;
 use crate::observer_bridge;
 use crate::reader::{ArchiveOrder, SEQ_WIDTH, list_archives, split_base_ext};
+use crate::temp_guard::create_exclusive_temp;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
@@ -119,10 +120,12 @@ struct WorkerState {
     /// Sequence number for the next archive this writer creates.
     ///
     /// Stamped into the archive name so segment order is fixed at write time
-    /// rather than inferred by a reader from mtimes. Seeded at startup from
-    /// the highest number already on disk and the best-effort high-water
-    /// sidecar, so the series normally keeps increasing across restarts and
-    /// reloads even after retention removes older archives.
+    /// rather than inferred by a reader from mtimes. Under a policy that owns
+    /// archives it is seeded at startup from the highest number already on
+    /// disk and the best-effort high-water sidecar, so the series normally
+    /// keeps increasing across restarts and reloads even after retention
+    /// removes older archives. Under any other policy nothing reads it and it
+    /// holds a placeholder (see `initial_archive_seq`).
     next_archive_seq: AtomicU64,
 }
 
@@ -209,7 +212,7 @@ fn init_from_config_with_migration_and_shutdown_warning<F>(
             policy: policy.clone(),
             worker_dead: Arc::clone(&worker_dead),
             line_count: AtomicU64::new(initial_line_count),
-            next_archive_seq: AtomicU64::new(seed_archive_seq(&policy.path)),
+            next_archive_seq: AtomicU64::new(initial_archive_seq(&policy)),
         });
         spawn_worker(rx, worker_state);
     } else {
@@ -725,17 +728,11 @@ fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
     ));
 
+    // The guard lives outside the inner block and the file is moved into the
+    // `BufWriter` inside it, so the handle is closed before the guard can
+    // remove the temp file.
+    let (out_file, mut temp_cleanup) = create_exclusive_temp(&tmp, "trim")?;
     {
-        let mut opts = OpenOptions::new();
-        opts.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let out_file = opts
-            .open(&tmp)
-            .with_context(|| format!("creating trim temp file {}", tmp.display()))?;
         let mut out = BufWriter::new(out_file);
 
         let in_file = fs::File::open(&state.policy.path)
@@ -767,6 +764,7 @@ fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
     }
+    before_trim_rename_hook()?;
     fs::rename(&tmp, &state.policy.path).with_context(|| {
         format!(
             "renaming trim temp {} → {}",
@@ -774,7 +772,30 @@ fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
             state.policy.path.display()
         )
     })?;
+    temp_cleanup.disarm();
 
+    Ok(())
+}
+
+// Test seam: fails the trim after the temp file is fully written and before
+// the rename, the window in which every earlier error path leaked the file.
+// Thread-local, so a test must call `trim_to_last_entries` from its own
+// thread rather than through the worker.
+#[cfg(test)]
+thread_local! {
+    static FAIL_BEFORE_TRIM_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn before_trim_rename_hook() -> Result<()> {
+    if FAIL_BEFORE_TRIM_RENAME.with(std::cell::Cell::get) {
+        anyhow::bail!("injected failure before trim rename");
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn before_trim_rename_hook() -> Result<()> {
     Ok(())
 }
 
@@ -904,6 +925,12 @@ fn maybe_rotate_for_entry_count(state: &Arc<WorkerState>) -> Result<bool> {
 }
 
 fn rotate_active(state: &Arc<WorkerState>, when: DateTime<Utc>) -> Result<()> {
+    // The sequence is only seeded from disk when the policy owns archives, so a
+    // rotation under any other policy would stamp a meaningless number.
+    debug_assert!(
+        state.policy.storage.reads_archives(),
+        "rotate_active reached under a policy that does not own archives"
+    );
     let path = &state.policy.path;
     // Claim the next number before renaming so the archive name records where
     // this segment falls in the series.
@@ -967,6 +994,21 @@ fn read_seq_watermark(active: &Path) -> u64 {
         .ok()
         .and_then(|raw| raw.trim().parse().ok())
         .unwrap_or(0)
+}
+
+/// The value `WorkerState::next_archive_seq` starts from.
+///
+/// Only a policy that owns archives reads the disk. Listing the log directory
+/// costs time proportional to its entry count and runs while the daemon holds
+/// config ownership, so the other policies skip it: they never create archives
+/// and never read this number. `1` is what `seed_archive_seq` returns for a
+/// directory with no archives and no sidecar.
+fn initial_archive_seq(policy: &ResolvedPolicy) -> u64 {
+    if policy.storage.reads_archives() {
+        seed_archive_seq(&policy.path)
+    } else {
+        1
+    }
 }
 
 /// The next archive sequence number to issue.
@@ -1300,6 +1342,118 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
             assert_eq!(v["message"].as_str().unwrap(), format!("event-{}", idx + 7));
         }
+    }
+
+    /// Names in `dir` that look like a leaked trim temp file
+    /// (`runtime-trace.tmp.<pid>.<nanos>`).
+    fn trim_temp_names(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp."))
+            .collect()
+    }
+
+    /// Worker state over a fresh log in `dir`, for calling the trim directly
+    /// from the test thread (the failure seam is thread-local).
+    fn trim_state(dir: &Path, max_entries: usize) -> Arc<WorkerState> {
+        let mut policy = detached_enabled_policy(dir);
+        policy.max_entries = max_entries;
+        // The default log path sits in a `state/` subdirectory, which the
+        // detached policy has not necessarily created.
+        fs::create_dir_all(policy.path.parent().unwrap()).unwrap();
+        Arc::new(WorkerState {
+            policy,
+            worker_dead: Arc::new(AtomicBool::new(false)),
+            line_count: AtomicU64::new(0),
+            next_archive_seq: AtomicU64::new(1),
+        })
+    }
+
+    fn write_numbered_lines(path: &Path, count: usize) {
+        let body: String = (0..count).map(|i| format!("{{\"n\":{i}}}\n")).collect();
+        fs::write(path, body).unwrap();
+    }
+
+    /// Arms the failure seam for the current thread and disarms it on drop, so
+    /// a failing assertion cannot leak the armed state into a later test.
+    struct FailTrimRename;
+
+    impl FailTrimRename {
+        fn arm() -> Self {
+            FAIL_BEFORE_TRIM_RENAME.with(|flag| flag.set(true));
+            Self
+        }
+    }
+
+    impl Drop for FailTrimRename {
+        fn drop(&mut self) {
+            FAIL_BEFORE_TRIM_RENAME.with(|flag| flag.set(false));
+        }
+    }
+
+    #[test]
+    fn failed_trim_removes_its_temp_file_and_keeps_the_log() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = trim_state(tmp.path(), 2);
+        write_numbered_lines(&state.policy.path, 5);
+        let before = fs::read(&state.policy.path).unwrap();
+
+        {
+            let _armed = FailTrimRename::arm();
+            assert!(trim_to_last_entries(&state).is_err());
+        }
+
+        assert_eq!(
+            trim_temp_names(state.policy.path.parent().unwrap()),
+            Vec::<String>::new(),
+            "a trim that fails after writing its temp file must remove it"
+        );
+        assert_eq!(
+            fs::read(&state.policy.path).unwrap(),
+            before,
+            "a failed trim must leave the active log untouched"
+        );
+    }
+
+    #[test]
+    fn successful_trim_leaves_no_temp_file() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let state = trim_state(tmp.path(), 2);
+        write_numbered_lines(&state.policy.path, 5);
+
+        trim_to_last_entries(&state).unwrap();
+
+        assert_eq!(
+            trim_temp_names(state.policy.path.parent().unwrap()),
+            Vec::<String>::new()
+        );
+        assert_eq!(count_lines(&state.policy.path), 2);
+        let kept = fs::read_to_string(&state.policy.path).unwrap();
+        assert_eq!(kept, "{\"n\":3}\n{\"n\":4}\n");
+    }
+
+    #[test]
+    fn rolling_writer_leaves_no_temp_file_behind() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 3);
+
+        for i in 0..10 {
+            let mut ev = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
+            ev.message = Some(format!("event-{i}"));
+            record_event(ev);
+        }
+        flush_for_test().unwrap();
+
+        let dir = runtime_trace_path()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        assert_eq!(trim_temp_names(&dir), Vec::<String>::new());
     }
 
     #[test]
@@ -2023,6 +2177,96 @@ mod tests {
             seed_archive_seq(&active),
             8,
             "the series must resume above the highest number already on disk"
+        );
+    }
+
+    #[test]
+    fn only_a_policy_that_owns_archives_reads_the_directory_for_the_sequence() {
+        // Archive 7 and a watermark of 30 are on disk. `rotating` must resume
+        // past both; every other policy never reads the number, so it must not
+        // pay for a directory listing and starts from the empty-directory value.
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut policy = detached_enabled_policy(tmp.path());
+        // The default log path sits in a `state/` subdirectory, and archives
+        // are discovered next to the active file.
+        let dir = policy.path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&policy.path, "").unwrap();
+        fs::write(
+            dir.join("runtime-trace.0000000007-20260624-031500.jsonl"),
+            "x\n",
+        )
+        .unwrap();
+        record_seq_watermark(&policy.path, 30);
+        assert!(
+            list_archives(&policy.path)
+                .unwrap()
+                .iter()
+                .any(|(_, order)| matches!(order, ArchiveOrder::Seq(7))),
+            "test setup: archive 7 must be discoverable next to the active file"
+        );
+
+        for (storage, expected) in [
+            (StoragePolicy::Rotating, 31),
+            (StoragePolicy::Rolling, 1),
+            (StoragePolicy::Full, 1),
+            (StoragePolicy::None, 1),
+        ] {
+            policy.storage = storage;
+            assert_eq!(
+                initial_archive_seq(&policy),
+                expected,
+                "unexpected initial sequence for {storage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_from_rolling_to_rotating_resumes_past_existing_archives() {
+        // A reload from `rolling` to `rotating` builds a new worker, and that
+        // worker must seed its sequence from the disk even though the previous
+        // one did not.
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        install_writer(tmp.path(), 10);
+        let dir = runtime_trace_path()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("runtime-trace.0000000007-20260624-031500.jsonl"),
+            "x\n",
+        )
+        .unwrap();
+
+        let cfg = LogConfig {
+            log_persistence: "rotating".into(),
+            log_persistence_max_bytes: 0,
+            log_persistence_rotate_daily: false,
+            log_persistence_retention_max_files: 0,
+            log_persistence_max_entries_per_segment: 2,
+            ..LogConfig::default()
+        };
+        init_from_config(&cfg, tmp.path());
+        let path = runtime_trace_path().unwrap();
+        emit("event-1");
+        emit("event-2");
+
+        let highest = list_archives(&path)
+            .unwrap()
+            .into_iter()
+            .filter_map(|(_, order)| match order {
+                ArchiveOrder::Seq(n) => Some(n),
+                ArchiveOrder::Legacy(_) => None,
+            })
+            .max();
+        assert_eq!(
+            highest,
+            Some(8),
+            "the first rotation after the reload must take the next number"
         );
     }
 
