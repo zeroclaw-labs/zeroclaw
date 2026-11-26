@@ -2590,15 +2590,11 @@ mod tests {
         cookie: &str,
         agent: Option<&str>,
     ) -> Result<ChatSocket, tokio_tungstenite::tungstenite::Error> {
-        let mut url = format!("ws://{addr}/acp");
-        if let Some(agent) = agent {
-            url.push_str(&format!("?agent={agent}"));
-        }
-        let mut request = url.into_client_request().unwrap();
-        let headers = request.headers_mut();
-        headers.insert("cookie", format!("zc_session={cookie}").parse().unwrap());
-        headers.insert("origin", format!("http://{addr}").parse().unwrap());
-        headers.insert("sec-websocket-protocol", "zeroclaw.acp.v1".parse().unwrap());
+        let path = agent.map_or_else(|| "/acp".to_owned(), |agent| format!("/acp?agent={agent}"));
+        let mut request = dashboard_ws_request(addr, cookie, &path);
+        request
+            .headers_mut()
+            .insert("sec-websocket-protocol", "zeroclaw.acp.v1".parse().unwrap());
         connect_async(request).await.map(|(socket, _)| socket)
     }
 
@@ -2840,7 +2836,28 @@ mod tests {
         agent: &str,
         session_id: &str,
     ) -> tokio_tungstenite::tungstenite::handshake::client::Request {
-        let mut request = format!("ws://{addr}/ws/chat?agent={agent}&session_id={session_id}")
+        dashboard_ws_request(
+            addr,
+            cookie,
+            &format!("/ws/chat?agent={agent}&session_id={session_id}"),
+        )
+    }
+
+    fn dashboard_ws_request(
+        addr: SocketAddr,
+        cookie: &str,
+        path: &str,
+    ) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+        assert!(
+            addr.ip().is_loopback(),
+            "the test fixture serves only loopback"
+        );
+        let mut request = axum::http::Uri::builder()
+            .scheme("ws")
+            .authority(addr.to_string())
+            .path_and_query(path)
+            .build()
+            .unwrap()
             .into_client_request()
             .unwrap();
         let headers = request.headers_mut();
