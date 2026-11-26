@@ -16,6 +16,7 @@ pub mod cost;
 pub mod domain_matcher;
 pub mod env_overrides;
 pub mod field_visibility;
+pub mod goal;
 pub mod helpers;
 pub mod live;
 pub mod migration;
