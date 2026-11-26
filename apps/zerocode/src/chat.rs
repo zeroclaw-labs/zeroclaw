@@ -13680,7 +13680,12 @@ impl ChatState {
             self.mark_dirty_full();
         }
         if self.transcript_layout.view().cached_render_width != 0 {
-            self.rebuild_lines(self.transcript_layout.view().cached_render_width);
+            // Rebuild under the link policy of the last draw. A different
+            // policy forces a full restyled rebuild, and the next draw would
+            // switch back and drop the selection this refresh just remapped.
+            let view = self.transcript_layout.view();
+            let (width, path_links) = (view.cached_render_width, view.cached_path_links);
+            self.rebuild_lines_with_path_links(width, path_links);
             self.last_total_rows = self.transcript_layout.view().cached_total_rows;
             let ranges = &self.transcript_layout.view().cached_screen_ranges;
             let new_row = |index: usize, intra: u16| {
