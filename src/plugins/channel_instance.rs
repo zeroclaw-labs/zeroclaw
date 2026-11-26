@@ -1031,10 +1031,12 @@ mod tests {
             .expect("admitted object schema");
         let mut entry = PluginEntryConfig::default();
         assert!(config_verdict(&manifest, "operations", Some(&entry)).is_ok());
-        assert!(required_keys(&manifest, Some(&entry)).is_empty());
+        let missing_keys = required_keys(&manifest, Some(&entry));
+        assert!(missing_keys.is_empty(), "{missing_keys:?}");
         entry.config.insert("connection".into(), "{}".into());
         assert!(config_verdict(&manifest, "operations", Some(&entry)).is_err());
-        assert!(required_keys(&manifest, Some(&entry)).is_empty());
+        let missing_keys = required_keys(&manifest, Some(&entry));
+        assert!(missing_keys.is_empty(), "{missing_keys:?}");
         entry
             .config
             .insert("connection".into(), r#"{"token":"configured"}"#.into());
@@ -1081,7 +1083,8 @@ mod tests {
                 .expect("admitted alternative schema");
             let mut entry = PluginEntryConfig::default();
             assert!(config_verdict(&manifest, "operations", Some(&entry)).is_err());
-            assert!(required_keys(&manifest, Some(&entry)).is_empty());
+            let missing_keys = required_keys(&manifest, Some(&entry));
+            assert!(missing_keys.is_empty(), "{missing_keys:?}");
             entry.config.insert("left".into(), "configured".into());
             assert!(config_verdict(&manifest, "operations", Some(&entry)).is_ok());
         }
@@ -1096,10 +1099,12 @@ mod tests {
             .expect("admitted conditional schema");
         let mut entry = PluginEntryConfig::default();
         assert!(config_verdict(&manifest, "operations", Some(&entry)).is_ok());
-        assert!(required_keys(&manifest, Some(&entry)).is_empty());
+        let missing_keys = required_keys(&manifest, Some(&entry));
+        assert!(missing_keys.is_empty(), "{missing_keys:?}");
         entry.config.insert("trigger".into(), "true".into());
         assert!(config_verdict(&manifest, "operations", Some(&entry)).is_err());
-        assert!(required_keys(&manifest, Some(&entry)).is_empty());
+        let missing_keys = required_keys(&manifest, Some(&entry));
+        assert!(missing_keys.is_empty(), "{missing_keys:?}");
     }
 
     #[test]
