@@ -817,16 +817,16 @@ pub(crate) fn legacy_env_segments_with_staged(
     if crate::helpers::validate_alias_key(alias).is_err() {
         return None;
     }
-    let (provider, legacy_kind) = if let Some(model) =
-        config.providers.models.canonical_model(&reference)
-    {
-        (
-            staged
-                .and_then(|document| document["models"][reference.as_str()]["provider"].as_str())
-                .map(ProviderId::from)
-                .unwrap_or_else(|| model.provider().clone()),
-            None,
-        )
+    let staged_provider = staged
+        .and_then(|document| document["models"][reference.as_str()]["provider"].as_str())
+        .map(ProviderId::from);
+    let (provider, legacy_kind) = if let Some(provider) = staged_provider {
+        // The staged document is authoritative even when the source model is
+        // still a legacy typed profile. This keeps later old-style env names
+        // on the provider selected by an earlier provider override.
+        (provider, None)
+    } else if let Some(model) = config.providers.models.canonical_model(&reference) {
+        (model.provider().clone(), None)
     } else {
         // A historical environment variable may be the first input that
         // introduces a family/alias. Project it through the same legacy
@@ -978,14 +978,17 @@ pub(crate) fn legacy_env_value(
         return Ok(value.into());
     };
     let reference = ModelRef::from(format!("{family}.{alias}"));
-    let Some(model) = config.providers.models.canonical_model(&reference) else {
-        return Ok(value.into());
-    };
-    let provider = staged["models"][reference.as_str()]
+    let staged_provider = staged["models"][reference.as_str()]
         .get("provider")
         .and_then(serde_json::Value::as_str)
-        .map(ProviderId::from)
-        .unwrap_or_else(|| model.provider().clone());
+        .map(ProviderId::from);
+    let provider = if let Some(provider) = staged_provider {
+        provider
+    } else if let Some(model) = config.providers.models.canonical_model(&reference) {
+        model.provider().clone()
+    } else {
+        return Ok(value.into());
+    };
     let raw = staged["connections"]
         .get(provider.as_str())
         .context("historical env target has no connection")?;
