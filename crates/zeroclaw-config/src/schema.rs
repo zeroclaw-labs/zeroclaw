@@ -3137,7 +3137,18 @@ pub struct GeminiModelProviderConfig {
     pub oauth_project: Option<String>,
 }
 
-// ── Gemini CLI (subprocess wrapper) ──
+// ── Gemini CLI (subprocess wrapper, retired) ──
+
+/// Why a `[providers.models.gemini_cli.<alias>]` entry is refused, and what to
+/// use instead. Shared by config validation and the provider factory so both
+/// surfaces tell the operator the same migration path.
+pub const GEMINI_CLI_PROVIDER_RETIRED: &str = "the `gemini_cli` model provider is retired: \
+     Google replaced Gemini CLI with Antigravity CLI, and Gemini CLI stopped serving Google AI \
+     free, Pro, and Ultra accounts on June 18, 2026. Move this alias to \
+     `[providers.models.antigravity_cli.<alias>]` (Antigravity CLI over `agy acp`, with a Gemini \
+     API key, Agent Platform, or Gemini Enterprise) or to `[providers.models.gemini.<alias>]` \
+     with an API key, point agent `model_provider` references at the new alias, then remove \
+     the `gemini_cli` section";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -3155,6 +3166,9 @@ impl ModelEndpoint for GeminiCliEndpoint {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers.models.gemini_cli"]
+/// Retired. Kept so existing configs still parse and fail validation with
+/// [`GEMINI_CLI_PROVIDER_RETIRED`] instead of being dropped silently. Use
+/// `[providers.models.antigravity_cli.<alias>]` instead.
 pub struct GeminiCliModelProviderConfig {
     #[nested]
     #[serde(flatten)]
@@ -3187,7 +3201,9 @@ pub struct GrokCliModelProviderConfig {
     /// at spawn time. The default is empty so unrelated daemon secrets remain
     /// blocked. `XAI_API_KEY` is the sole supported provider-owned name and
     /// enables API-key authentication when explicitly listed and non-empty;
-    /// other `XAI_*` and all `GROK_*` names are rejected.
+    /// other `XAI_*` and all `GROK_*` names are rejected. The typed alias
+    /// `api_key` is the alternative to listing `XAI_API_KEY`; setting both is
+    /// rejected.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[credential_class = "legacy_env_path"]
     pub env_passthrough: Vec<String>,
@@ -3205,6 +3221,88 @@ pub struct GrokCliModelProviderConfig {
     /// one ACP request. When unset, ZeroClaw uses 4 MiB. Values must be
     /// between 1 MiB and 64 MiB; the provider rejects invalid values when it
     /// is constructed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_acp_stdout_bytes: Option<usize>,
+}
+
+// ── Antigravity CLI (ACP subprocess) ──
+
+/// How the `agy acp` child authenticates for an `antigravity_cli` alias.
+///
+/// ZeroClaw is an outer harness that injects its own system prompt, so
+/// Google's current Antigravity terms permit only API-key, Agent Platform,
+/// and Gemini Enterprise sign-in for it. Personal Google sign-in is accepted
+/// by the schema but refused when the provider is built.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AntigravityCliAuthMethod {
+    /// Gemini Developer API key from this alias's `api_key` secret. The key
+    /// is sent to the child over ACP stdin, never in argv or the environment.
+    #[default]
+    GeminiApiKey,
+    /// Gemini Enterprise Agent Platform (formerly Vertex AI) with Application
+    /// Default Credentials.
+    AgentPlatform,
+    /// Gemini Enterprise sign-in cached in this alias's isolated Antigravity
+    /// state directory. Explicit opt-in; the provider refuses sessions whose
+    /// reported tier is not a business tier.
+    OauthBusiness,
+    /// Personal Google sign-in. Refused: Google's Antigravity terms do not
+    /// currently permit consumer sign-in inside third-party harnesses.
+    OauthPersonal,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.antigravity_cli"]
+pub struct AntigravityCliModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// Absolute path or bare executable name for the Antigravity CLI
+    /// (default: `agy`). Bare names resolve only from absolute PATH
+    /// directories; empty and relative PATH entries are ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<String>,
+    /// Required absolute working directory for the `agy acp` subprocess and
+    /// ACP session boundary. The directory must exist when the provider is
+    /// built.
+    pub working_directory: String,
+    /// Authentication method for the child. Defaults to `gemini_api_key`,
+    /// which requires this alias's `api_key`. `oauth_personal` is refused.
+    #[serde(default)]
+    pub auth_method: AntigravityCliAuthMethod,
+    /// Absolute directory for this alias's Antigravity state (`agy
+    /// --gemini-dir`). Defaults to `<zeroclaw dir>/antigravity_cli/<alias>`
+    /// so a personal sign-in cached in `~/.gemini` is never reused. It must
+    /// be a real directory (not a link) owned by the user running ZeroClaw;
+    /// it is created, or tightened, to owner-only access. For
+    /// `oauth_business`, sign in once with `agy acp --login --gemini-dir
+    /// <this directory>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_directory: Option<String>,
+    /// Extra environment variable names inherited by the `agy` subprocess,
+    /// resolved from the ZeroClaw process environment at spawn time (for
+    /// example `GOOGLE_CLOUD_PROJECT` for `agent_platform`). Gemini API key
+    /// variables are rejected; use the typed `api_key` instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[credential_class = "legacy_env_path"]
+    pub env_passthrough: Vec<String>,
+    /// Extra `agy acp` flags. Only known flags are accepted:
+    /// `--sandbox`, `--dangerously-skip-permissions`,
+    /// `--process-per-session`, `--include-default-customizations=<bool>`,
+    /// `--add-dir <dir>`, and `--agent <name>`. Transport, state, login,
+    /// telemetry, logging, and endpoint flags are reserved.
+    /// `--dangerously-skip-permissions` also authorizes ZeroClaw to approve
+    /// the child's permission requests for this alias.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
+    /// Maximum cumulative stdout bytes accepted from `agy acp` for one ACP
+    /// request. When unset, ZeroClaw uses 4 MiB. Values must be between
+    /// 1 MiB and 64 MiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_acp_stdout_bytes: Option<usize>,
 }
@@ -3889,6 +3987,7 @@ impl_default_family_endpoint! {
     GeminiModelProviderConfig,
     GeminiCliModelProviderConfig,
     GrokCliModelProviderConfig,
+    AntigravityCliModelProviderConfig,
     LmstudioModelProviderConfig,
     LlamacppModelProviderConfig,
     SglangModelProviderConfig,
@@ -6730,6 +6829,14 @@ pub struct LocalWhisperTranscriptionProviderConfig {
     /// Optional language hint (passed through to the local endpoint).
     #[serde(default)]
     pub language: Option<String>,
+    /// Optional model identifier sent to the endpoint as the multipart `model`
+    /// form field. Strict OpenAI-compatible servers (e.g. oMLX hosting a Qwen
+    /// ASR model) require it and rarely host a model literally named
+    /// `"whisper"`. Leave unset for servers that choose their model at startup
+    /// (`whisper.cpp`), which take no selector field and rely on the legacy
+    /// wire shape.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Maximum audio file size in bytes accepted by this endpoint.
     /// Defaults to 25 MB to match the cloud cap; raise as needed.
     #[serde(default = "default_local_whisper_max_audio_bytes")]
@@ -6761,6 +6868,7 @@ impl Default for LocalWhisperTranscriptionProviderConfig {
             uri: String::new(),
             bearer_token: None,
             language: None,
+            model: None,
             max_audio_bytes: default_local_whisper_max_audio_bytes(),
             timeout_secs: default_local_whisper_timeout_secs(),
         }
@@ -6901,6 +7009,12 @@ pub struct LocalWhisperConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bearer_token: Option<String>,
+    /// Optional model identifier sent to the endpoint as the multipart `model`
+    /// form field. Strict OpenAI-compatible servers (e.g. oMLX hosting a Qwen
+    /// ASR model) require it; leave unset for servers that choose their model
+    /// at startup (`whisper.cpp`).
+    #[serde(default)]
+    pub model: Option<String>,
     /// Maximum audio file size in bytes accepted by this endpoint.
     /// Defaults to 25 MB — matching the cloud API cap for a safe out-of-the-box
     /// experience. Self-hosted endpoints can accept much larger files; raise this
@@ -6937,6 +7051,7 @@ impl Default for LocalWhisperConfig {
         Self {
             url: String::new(),
             bearer_token: None,
+            model: None,
             max_audio_bytes: default_local_whisper_max_audio_bytes(),
             timeout_secs: default_local_whisper_timeout_secs(),
         }
@@ -8155,13 +8270,15 @@ pub struct GatewayConfig {
     #[nested]
     pub tls: Option<GatewayTlsConfig>,
 
-    /// HTTP request timeout (seconds) for gateway routes other than the
-    /// long-running cron-trigger endpoint. Default: 30s.
+    /// HTTP request timeout (seconds) for ordinary gateway routes. Webhook,
+    /// manual cron and A2A task routes use `long_running_request_timeout_secs`.
+    /// Default: 30s.
     #[serde(default = "default_gateway_request_timeout_secs")]
     pub request_timeout_secs: u64,
 
-    /// HTTP request timeout (seconds) for `POST /api/cron/{id}/run`, which
-    /// runs jobs synchronously and routinely exceeds the 30s default.
+    /// HTTP request timeout (seconds) for `POST /webhook`, manual cron runs
+    /// and A2A task routes. Includes request-body extraction and response
+    /// creation, but not the lifetime of an SSE response body.
     /// Default: 600s (10 minutes).
     #[serde(default = "default_gateway_long_running_request_timeout_secs")]
     pub long_running_request_timeout_secs: u64,
@@ -9522,7 +9639,7 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), "bocha" (requires API key), "anysearch" (optional API key; anonymous requests use a lower quota), "serply" (Google web results, requires API key), or "keenable" (works without a key; a key only lifts rate limits, <https://keenable.ai>)
+    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "tavily" (requires API key), "searxng" (self-hosted), "jina" (requires API key), "bocha" (requires API key), "anysearch" (optional API key; anonymous requests use a lower quota), "serply" (Google web results, requires API key), "keenable" (works without a key; a key only lifts rate limits, <https://keenable.ai>), or "firecrawl" (requires API key)
     #[serde(default = "default_web_search_provider")]
     pub search_provider: String,
     /// Brave Search API key (required if search_provider is "brave")
@@ -9567,6 +9684,12 @@ pub struct WebSearchConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub keenable_api_key: Option<String>,
+    /// Firecrawl API key (required if search_provider is `"firecrawl"`). Obtain at <https://www.firecrawl.dev/app/api-keys?utm_source=zeroclaw&utm_medium=integration>.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub firecrawl_api_key: Option<String>,
     /// SearXNG instance URL (required if search_provider is `"searxng"`), e.g. `"https://searx.example.com"`.
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
@@ -9602,6 +9725,7 @@ impl Default for WebSearchConfig {
             anysearch_api_key: None,
             serply_api_key: None,
             keenable_api_key: None,
+            firecrawl_api_key: None,
             searxng_instance_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
@@ -13143,6 +13267,9 @@ pub struct MemoryConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_api_key: Option<String>,
+    /// Text prepended to a search query, and only to the query, before it is embedded. Instruction-tuned embedding models are trained to embed a query and a stored passage differently and expect the query side to carry an instruction, for example `Instruct: Given a user message, retrieve memories that help answer it\nQuery:` for Qwen3-Embedding or `query: ` for E5-style models; without it they rank worse than keyword search. Stored memories are always embedded as they are, so setting or changing this needs no re-embedding. Leave unset for models that embed both sides the same way (OpenAI, Gemini).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_query_prefix: Option<String>,
     /// How heavily vector (semantic) similarity counts when `search_mode = hybrid`. Raise toward 1.0 to favor meaning-based matches; lower it to lean on keyword overlap instead.
     #[serde(default = "default_vector_weight")]
     pub vector_weight: f64,
@@ -13752,6 +13879,7 @@ impl Default for MemoryConfig {
             embedding_dimensions: default_embedding_dims(),
             auto_reindex_on_identity_change: false,
             embedding_api_key: None,
+            embedding_query_prefix: None,
             vector_weight: default_vector_weight(),
             keyword_weight: default_keyword_weight(),
             search_mode: SearchMode::default(),
@@ -14497,10 +14625,10 @@ pub struct OidcConfig {
     pub service_scopes: Vec<String>,
     /// Client identities whose tokens are ALWAYS service principals
     /// (`client_credentials` callers), matched against the token's
-    /// verified `client_id` claim. Service tokens always need `client_id`:
-    /// in JWKS mode a token with no `client_id` whose signed `azp` names one
-    /// of these clients is refused, never treated as a service. Service
-    /// principals are keyed by issuer + client identity and never inherit
+    /// verified client claim. With default claim names an `azp` fallback
+    /// cannot establish a service. An untyped JWKS token or a custom client
+    /// claim also requires an explicit service value in `actor_claim_values`.
+    /// Service principals are keyed by issuer + client identity and never inherit
     /// human-user assumptions, whatever provider-specific shape their
     /// `sub` takes (`<client>@clients`, a service-account user id, or the
     /// client id itself).
@@ -14508,7 +14636,8 @@ pub struct OidcConfig {
     /// Actor classification is declarative, never inferred from the
     /// `sub`/`client_id` relationship: a token is a service because its
     /// client is listed here, a human because its client is listed in
-    /// `interactive_clients`, or classified by `actor_claim`. A token whose
+    /// `interactive_clients`, or classified by `actor_claim`. When evidence
+    /// is required it must agree with any client declaration. A token whose
     /// client is declared nowhere and carries no configured actor claim
     /// evidence is denied. A client may appear in only one of the two lists.
     pub service_clients: Vec<String>,
@@ -14519,20 +14648,55 @@ pub struct OidcConfig {
     /// and resolve through `profile_map`. A client may appear in only one of
     /// `service_clients` and `interactive_clients`.
     pub interactive_clients: Vec<String>,
-    /// Dotted path to a claim the issuer stamps on exactly ONE actor kind's
-    /// tokens (present, non-null), e.g. Auth0's `gty` on client-credentials
+    /// Dotted path to an issuer-controlled actor claim. With an empty
+    /// `actor_claim_values`, the issuer must stamp it on exactly ONE actor
+    /// kind's tokens (present, non-null), e.g. Auth0's `gty` on client-credentials
     /// tokens or Okta's `uid` on user tokens. `actor_claim_marks` names the
     /// kind its presence proves; absence proves the other kind. Required
     /// for a client that issues both human and machine tokens (declared in
     /// neither client list); also checked against declared clients, where
     /// contradicting evidence denies. Empty = no claim-based classification,
-    /// so every accepted client must be declared.
+    /// so every accepted client must be declared on the standard path.
+    /// In presence mode, untyped JWKS tokens and custom client claims
+    /// require a nonblank string issued only to people and
+    /// `actor_claim_marks = "human"` (Entra's delegated `scp` or Okta's `uid`).
     pub actor_claim: String,
-    /// Which actor kind the presence of `actor_claim` proves.
+    /// Which actor kind the presence of `actor_claim` proves in presence mode.
     pub actor_claim_marks: OidcActorKind,
+    /// Map exact, case-sensitive signed string values at `actor_claim` to
+    /// `human` or `service` (JWKS only). A nonempty map requires a match
+    /// on every token, including tokens from declared clients. Entra can
+    /// issue `idtyp` with values `app` and `user`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub actor_claim_values: HashMap<String, OidcActorKind>,
     /// Require the RFC 9068 typed JWT profile for JWKS validation. Opaque
     /// tokens remain valid only through configured introspection.
+    ///
+    /// Typing is how the verifier tells an access token from an ID token.
+    /// For issuers that don't type their access tokens (Okta: no `typ`;
+    /// Entra ID: `typ: JWT`), set `false` and prove the difference by
+    /// audience instead. An ID token's `aud` must contain the client it was
+    /// issued to and may list other audiences, so an untyped token must
+    /// carry exactly `audience` as its only `aud` value, and `audience`
+    /// must be an API identifier that is not `client_id` and not any client
+    /// declared here or by another entry for the same issuer. Untyped tokens
+    /// are then accepted with no header `typ` or `typ: JWT`; any other type
+    /// is still refused, as are `nonce` and non-access purpose markers. The
+    /// IdP must also never sign anyone in AS the API registration itself,
+    /// which ZeroClaw cannot check.
     pub require_at_jwt: bool,
+    /// Top-level claim naming the OAuth client in JWKS-validated access
+    /// tokens. Default `client_id` (RFC 9068), where a person's token may
+    /// name its client in `azp` instead. Set it where the issuer uses another
+    /// claim: `cid` for Okta, `azp` for Entra ID v2.0 tokens. A declared
+    /// client claim identifies the application. It has no fallback, and
+    /// a token whose `client_id` contradicts it is refused. JWKS only:
+    /// introspection answers always use `client_id`.
+    pub client_id_claim: String,
+    /// Top-level claim holding the access token's unique identifier in
+    /// JWKS-validated tokens. Default `jti` (RFC 9068). Entra ID uses `uti`.
+    /// JWKS only.
+    pub token_id_claim: String,
     /// Maximum authentication lifetime (seconds) for offline-validated
     /// (JWKS) tokens. Offline validation cannot see revocation, so the
     /// identity expires at the EARLIER of the token `exp` and `iat` + this
@@ -14571,12 +14735,20 @@ impl std::fmt::Debug for OidcConfig {
             .field("interactive_clients", &self.interactive_clients)
             .field("actor_claim", &self.actor_claim)
             .field("actor_claim_marks", &self.actor_claim_marks)
+            .field("actor_claim_values", &self.actor_claim_values)
             .field("require_at_jwt", &self.require_at_jwt)
+            .field("client_id_claim", &self.client_id_claim)
+            .field("token_id_claim", &self.token_id_claim)
             .field("max_auth_lifetime_secs", &self.max_auth_lifetime_secs)
             .field("revalidation_secs", &self.revalidation_secs)
             .finish()
     }
 }
+
+/// RFC 9068 claim naming the OAuth client; the `client_id_claim` default.
+pub const DEFAULT_OIDC_CLIENT_ID_CLAIM: &str = "client_id";
+/// RFC 9068 claim holding the token identifier; the `token_id_claim` default.
+pub const DEFAULT_OIDC_TOKEN_ID_CLAIM: &str = "jti";
 
 fn default_oidc_max_auth_lifetime_secs() -> u64 {
     86_400
@@ -14606,7 +14778,10 @@ impl Default for OidcConfig {
             interactive_clients: Vec::new(),
             actor_claim: String::new(),
             actor_claim_marks: OidcActorKind::default(),
+            actor_claim_values: HashMap::new(),
             require_at_jwt: true,
+            client_id_claim: DEFAULT_OIDC_CLIENT_ID_CLAIM.to_string(),
+            token_id_claim: DEFAULT_OIDC_TOKEN_ID_CLAIM.to_string(),
             max_auth_lifetime_secs: default_oidc_max_auth_lifetime_secs(),
             revalidation_secs: default_oidc_revalidation_secs(),
         }
@@ -14644,19 +14819,17 @@ pub enum OidcValidation {
     Introspection,
 }
 
-/// The actor kind an OIDC `actor_claim`'s presence proves.
+/// The kind of identity established by the provider's actor claim.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
 )]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum OidcActorKind {
-    /// The claim is present only on `client_credentials` (machine) tokens;
-    /// a token without it is a human's.
+    /// A service acting on its own.
     #[default]
     Service,
-    /// The claim is present only on interactive (human) tokens; a token
-    /// without it is a machine's.
+    /// An application acting on behalf of a person.
     Human,
 }
 
@@ -14680,6 +14853,31 @@ impl Config {
         for alias in oidc_aliases {
             let oidc = &self.oidc[alias];
             oidc.validate(alias)?;
+            // An entry that accepts untyped access tokens relies on no client
+            // signing in with its audience. Clients of other entries for the
+            // same issuer are clients of that issuer too.
+            if oidc.validation == OidcValidation::Jwks && !oidc.require_at_jwt {
+                let mut siblings: Vec<&String> = self
+                    .oidc
+                    .iter()
+                    .filter(|(other, entry)| *other != alias && entry.issuer == oidc.issuer)
+                    .map(|(other, _)| other)
+                    .collect();
+                siblings.sort();
+                for sibling in siblings {
+                    if let Some(field) = self.oidc[sibling].field_naming_client(&oidc.audience) {
+                        validation_bail!(
+                            ValidationFailed,
+                            format!("oidc.{alias}.audience"),
+                            "oidc.{alias}.require_at_jwt = false needs an audience no client \
+                             signs in as, but oidc.{sibling}.{field} names {:?} as a client of \
+                             the same issuer: an ID token issued to it would pass as an access \
+                             token for oidc.{alias}",
+                            oidc.audience
+                        );
+                    }
+                }
+            }
             let mut claim_values: Vec<&String> = oidc.profile_map.keys().collect();
             claim_values.sort();
             for claim_value in claim_values {
@@ -14988,11 +15186,50 @@ impl OidcConfig {
                  tokens need a bounded authentication lifetime"
             );
         }
-        if self.validation == OidcValidation::Jwks && !self.require_at_jwt {
+        if self.validation == OidcValidation::Jwks
+            && !self.require_at_jwt
+            && let Some(field) = self.audience_shared_with_a_client()
+        {
             anyhow::bail!(
-                "oidc.{alias}.require_at_jwt must be true: bearer authentication accepts only \
-                 RFC 9068 typed access tokens"
+                "oidc.{alias}.require_at_jwt = false needs an audience no client signs in as, \
+                 but `audience` {:?} is also named by `{field}`: an ID token issued to that \
+                 client would carry the same audience and pass as an access token. Use a \
+                 separate API identifier for `audience`, or keep require_at_jwt = true",
+                self.audience
             );
+        }
+        for (field, name) in [
+            ("client_id_claim", &self.client_id_claim),
+            ("token_id_claim", &self.token_id_claim),
+        ] {
+            if name.is_empty() || name.contains('.') || !name.bytes().all(|b| b.is_ascii_graphic())
+            {
+                anyhow::bail!(
+                    "oidc.{alias}.{field} = {name:?} must be one top-level claim name: \
+                     nonblank, without spaces or dots"
+                );
+            }
+        }
+        if self.validation == OidcValidation::Introspection {
+            for (field, name, default) in [
+                (
+                    "client_id_claim",
+                    &self.client_id_claim,
+                    DEFAULT_OIDC_CLIENT_ID_CLAIM,
+                ),
+                (
+                    "token_id_claim",
+                    &self.token_id_claim,
+                    DEFAULT_OIDC_TOKEN_ID_CLAIM,
+                ),
+            ] {
+                if name != default {
+                    anyhow::bail!(
+                        "oidc.{alias}.{field} applies to validation = \"jwks\" only: \
+                         introspection answers follow RFC 7662, so leave it at {default:?}"
+                    );
+                }
+            }
         }
         for (field, clients) in [
             ("service_clients", &self.service_clients),
@@ -15037,8 +15274,47 @@ impl OidcConfig {
                  in neither and classified by actor_claim"
             );
         }
-        if self.actor_claim != self.actor_claim.trim() {
+        self.validate_actor_claim(alias)
+    }
+
+    /// Validate the actor evidence used by the verifier, including when a
+    /// provider is built directly without validating the whole configuration.
+    pub fn validate_actor_claim(&self, alias: &str) -> Result<()> {
+        let path = self.actor_claim.as_str();
+        if path != path.trim() {
             anyhow::bail!("oidc.{alias}.actor_claim must not have surrounding whitespace");
+        }
+        let exact = !self.actor_claim_values.is_empty();
+        let custom_jwks = self.validation == OidcValidation::Jwks
+            && (!self.require_at_jwt || self.client_id_claim != DEFAULT_OIDC_CLIENT_ID_CLAIM);
+        if (exact || custom_jwks)
+            && !path.is_empty()
+            && (matches!(path, "client_id" | "azp") || path == self.client_id_claim)
+        {
+            anyhow::bail!("oidc.{alias}.actor_claim must be independent of the client ID");
+        }
+        if !exact {
+            return Ok(());
+        }
+        if self.validation != OidcValidation::Jwks {
+            anyhow::bail!("oidc.{alias}.actor_claim_values requires signed JWKS tokens");
+        }
+        if path
+            .split('.')
+            .any(|part| part.is_empty() || part != part.trim())
+        {
+            anyhow::bail!(
+                "oidc.{alias}.actor_claim_values requires a nonblank actor_claim path with nonempty segments"
+            );
+        }
+        if self
+            .actor_claim_values
+            .keys()
+            .any(|value| value.is_empty() || value != value.trim())
+        {
+            anyhow::bail!(
+                "oidc.{alias}.actor_claim_values requires nonblank keys without surrounding whitespace"
+            );
         }
         Ok(())
     }
@@ -15066,6 +15342,44 @@ impl OidcConfig {
     #[must_use]
     pub fn effective_service_scope(&self) -> String {
         join_scopes(&self.service_scopes)
+    }
+
+    /// The field that names `audience` as one of this entry's own clients,
+    /// or `None` when the audience is separate from all of them.
+    ///
+    /// Every ID token's `aud` is the client it was issued to (OIDC Core), so
+    /// an audience no client signs in as is what lets the verifier tell an
+    /// untyped access token from an ID token. Shared by config validation
+    /// and the verifier so the rule has one definition; clients of OTHER
+    /// entries for the same issuer are checked by [`Config::validate_auth`].
+    #[must_use]
+    pub fn audience_shared_with_a_client(&self) -> Option<&'static str> {
+        self.field_naming_client(&self.audience)
+    }
+
+    /// The first field of this entry that names `client` as an OAuth client
+    /// it signs in as or accepts tokens from, if any.
+    #[must_use]
+    pub fn field_naming_client(&self, client: &str) -> Option<&'static str> {
+        if self.effective_client_id() == client {
+            return Some("client_id");
+        }
+        [
+            ("interactive_clients", &self.interactive_clients),
+            ("service_clients", &self.service_clients),
+            (
+                "allowed_authorized_parties",
+                &self.allowed_authorized_parties,
+            ),
+        ]
+        .into_iter()
+        .find(|(_, clients)| clients.iter().any(|named| named == client))
+        .map(|(field, _)| field)
+        .or_else(|| {
+            self.service_profile_map
+                .contains_key(client)
+                .then_some("service_profile_map")
+        })
     }
 }
 
@@ -17494,6 +17808,14 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub unauthorized_message: Option<String>,
+    /// Send replies with Bot API rich messages (native tables, headings, lists, and quotes).
+    ///
+    /// Some Telegram clients still show rich messages as unsupported, so this
+    /// stays off until every client in use can render them. With it off, tables
+    /// are delivered as preformatted text.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub rich_messages: bool,
     /// When `true` (default), group-chat sessions key on the sender, so
     /// distinct members of the same group (or forum topic) each get an
     /// isolated conversation context (matches the existing behavior). When
@@ -17578,6 +17900,7 @@ impl Default for TelegramConfig {
             interrupt_on_new_message: false,
             mention_only: false,
             unauthorized_message: None,
+            rich_messages: false,
             per_user_session: true,
             passive_group_context: false,
             ack_reactions: None,
@@ -24929,6 +25252,18 @@ impl Config {
         }
     }
 
+    /// Refuse the retired `gemini_cli` model provider with its migration path.
+    fn validate_retired_gemini_cli(&self) -> Result<()> {
+        if let Some(alias) = self.providers.models.gemini_cli.keys().min() {
+            validation_bail!(
+                ValidationFailed,
+                format!("providers.models.gemini_cli.{alias}"),
+                "providers.models.gemini_cli.{alias}: {GEMINI_CLI_PROVIDER_RETIRED}"
+            );
+        }
+        Ok(())
+    }
+
     /// Validate configuration values that would cause runtime failures.
     ///
     /// Called after TOML deserialization and env-override application to catch
@@ -24936,6 +25271,7 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
         self.cost.rates.validate()?;
+        self.validate_retired_gemini_cli()?;
 
         for (profile_alias, profile) in &self.runtime_profiles {
             if profile.max_execution_tree_iterations == Some(0) {
@@ -31651,6 +31987,53 @@ zeroclaw-operators = "operator"
     }
 
     #[::core::prelude::v1::test]
+    fn oidc_actor_claim_values_require_an_independent_signed_claim() {
+        let mut oidc = auth_config().oidc.remove("corp").unwrap();
+        oidc.client_id_claim = "cid".into();
+        oidc.actor_claim = "idtyp".into();
+        oidc.actor_claim_values = HashMap::from([
+            ("app".into(), OidcActorKind::Service),
+            ("user".into(), OidcActorKind::Human),
+        ]);
+        let encoded = toml::to_string(&oidc).unwrap();
+        let decoded: OidcConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.actor_claim_values, oidc.actor_claim_values);
+        decoded.validate("corp").expect("valid exact actor values");
+        for (path, error) in [
+            ("", "nonblank actor_claim path"),
+            ("claims..kind", "nonblank actor_claim path"),
+            ("azp", "independent of the client ID"),
+            ("client_id", "independent of the client ID"),
+            ("cid", "independent of the client ID"),
+        ] {
+            let mut bad = oidc.clone();
+            bad.actor_claim = path.into();
+            let message = bad.validate("corp").unwrap_err().to_string();
+            assert!(message.contains(error), "{path:?}: {message}");
+        }
+        for value in ["", " app"] {
+            let mut bad = oidc.clone();
+            bad.actor_claim_values
+                .insert(value.into(), OidcActorKind::Service);
+            assert!(
+                bad.validate("corp")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("actor_claim_values")
+            );
+        }
+        oidc.validation = OidcValidation::Introspection;
+        oidc.client_id_claim = DEFAULT_OIDC_CLIENT_ID_CLAIM.into();
+        oidc.client_secret = Some("test-secret".into());
+        assert!(
+            oidc.validate("corp")
+                .unwrap_err()
+                .to_string()
+                .contains("actor_claim_values")
+        );
+    }
+
+    #[::core::prelude::v1::test]
     fn oidc_actor_claim_settings_roundtrip_from_toml() {
         let toml_src = r#"
 [permission_profiles.operator]
@@ -31681,6 +32064,163 @@ zeroclaw-operators = "operator"
         config.oidc.get_mut("corp").unwrap().require_at_jwt = false;
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("require_at_jwt"), "got: {err}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_claim_name_defaults_are_the_rfc_9068_claims() {
+        let defaults = OidcConfig::default();
+        assert_eq!(defaults.client_id_claim, "client_id");
+        assert_eq!(defaults.token_id_claim, "jti");
+    }
+
+    /// An entry that may waive RFC 9068 typing: its daemon client differs from
+    /// its API audience, so no ID token it receives can carry that audience.
+    fn untyped_jwks_config() -> Config {
+        let mut config = auth_config();
+        {
+            let oidc = config.oidc.get_mut("corp").unwrap();
+            oidc.require_at_jwt = false;
+            oidc.client_id = "zeroclaw-daemon".to_string();
+            oidc.interactive_clients = vec!["zerocode-cli".to_string()];
+        }
+        config
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_untyped_tokens_are_allowed_when_audience_is_no_client() {
+        untyped_jwks_config()
+            .validate()
+            .expect("audience separated from every configured client");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_untyped_tokens_require_the_audience_to_differ_from_every_client() {
+        // Defaulted client_id (falls back to audience), an explicit equal
+        // client_id, and the audience declared as an interactive or service
+        // client: each would let an ID token issued to that client pass.
+        type Case = (&'static str, fn(&mut OidcConfig));
+        let cases: [Case; 5] = [
+            ("client_id", |oidc| oidc.client_id = String::new()),
+            ("client_id", |oidc| oidc.client_id = "zeroclaw".to_string()),
+            ("interactive_clients", |oidc| {
+                oidc.interactive_clients = vec!["zeroclaw".to_string()];
+            }),
+            ("service_clients", |oidc| {
+                oidc.service_clients = vec!["zeroclaw".to_string()];
+            }),
+            ("allowed_authorized_parties", |oidc| {
+                oidc.allowed_authorized_parties = vec!["zeroclaw".to_string()];
+            }),
+        ];
+        for (field, mutate) in cases {
+            let mut config = untyped_jwks_config();
+            mutate(config.oidc.get_mut("corp").unwrap());
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("require_at_jwt") && err.contains(field),
+                "{field}: got: {err}"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_untyped_tokens_refuse_an_audience_another_entry_signs_in_as() {
+        // A second entry for the SAME issuer whose client is this entry's
+        // audience would receive ID tokens carrying that audience.
+        let mut config = untyped_jwks_config();
+        let mut sibling = config.oidc["corp"].clone();
+        sibling.require_at_jwt = true;
+        sibling.audience = "dashboard".to_string();
+        sibling.client_id = "zeroclaw".to_string();
+        sibling.interactive_clients = Vec::new();
+        config
+            .oidc
+            .insert("corp-dashboard".to_string(), sibling.clone());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("oidc.corp") && err.contains("oidc.corp-dashboard"),
+            "got: {err}"
+        );
+
+        // The same client id at a DIFFERENT issuer names a different client.
+        sibling.issuer = "https://other.example.com".to_string();
+        config.oidc.insert("corp-dashboard".to_string(), sibling);
+        config
+            .validate()
+            .expect("client ids are scoped to their issuer");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_claim_names_roundtrip_from_toml() {
+        // Okta custom authorization server shape.
+        let toml_src = r#"
+[permission_profiles.operator]
+allowed_agents = ["*"]
+
+[oidc.okta]
+issuer = "https://example.okta.com/oauth2/default"
+audience = "api://zeroclaw"
+client_id = "0oaexampleclient"
+claim_path = "groups"
+require_at_jwt = false
+client_id_claim = "cid"
+interactive_clients = ["0oaexampleclient"]
+
+[oidc.okta.profile_map]
+zeroclaw-operators = "operator"
+"#;
+        let config: Config = toml::from_str(toml_src).expect("claim names parse");
+        config.validate().expect("okta shape validates");
+        assert_eq!(config.oidc["okta"].client_id_claim, "cid");
+        assert_eq!(config.oidc["okta"].token_id_claim, "jti");
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_claim_names_must_be_single_nonblank_claims() {
+        // Top-level names only: these are read from the verified payload,
+        // never by dotted path.
+        for bad in ["", " ", "client id", "a.b", " cid"] {
+            for field in ["client_id_claim", "token_id_claim"] {
+                let mut config = auth_config();
+                {
+                    let oidc = config.oidc.get_mut("corp").unwrap();
+                    if field == "client_id_claim" {
+                        oidc.client_id_claim = bad.to_string();
+                    } else {
+                        oidc.token_id_claim = bad.to_string();
+                    }
+                }
+                let err = config.validate().unwrap_err().to_string();
+                assert!(
+                    err.contains(&format!("oidc.corp.{field}")),
+                    "{field} = {bad:?}: got: {err}"
+                );
+            }
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn oidc_claim_names_apply_to_jwks_only() {
+        // RFC 7662 answers name the client in `client_id`; a renamed claim
+        // there would silently do nothing, so it is refused instead.
+        for field in ["client_id_claim", "token_id_claim"] {
+            let mut config = auth_config();
+            {
+                let oidc = config.oidc.get_mut("corp").unwrap();
+                oidc.validation = OidcValidation::Introspection;
+                oidc.client_secret = Some("s3cret".to_string());
+                if field == "client_id_claim" {
+                    oidc.client_id_claim = "cid".to_string();
+                } else {
+                    oidc.token_id_claim = "uti".to_string();
+                }
+            }
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("oidc.corp.{field}")) && err.contains("jwks"),
+                "{field}: got: {err}"
+            );
+        }
     }
 
     #[::core::prelude::v1::test]
@@ -35189,6 +35729,63 @@ auto_save = true
     }
 
     #[test]
+    async fn retired_gemini_cli_provider_fails_validation_with_migration_path() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .gemini_cli
+            .insert("home".to_string(), GeminiCliModelProviderConfig::default());
+        let error = config
+            .validate()
+            .expect_err("a gemini_cli alias must fail validation")
+            .to_string();
+        assert!(
+            error.contains("providers.models.gemini_cli.home"),
+            "{error}"
+        );
+        assert!(error.contains("retired"), "{error}");
+        assert!(error.contains("antigravity_cli"), "{error}");
+
+        config.providers.models.gemini_cli.clear();
+        config
+            .validate()
+            .expect("removing the gemini_cli alias clears the error");
+    }
+
+    #[test]
+    async fn antigravity_cli_alias_requires_working_directory_and_defaults_to_api_key() {
+        let error = toml::from_str::<AntigravityCliModelProviderConfig>(
+            "model = \"gemini-3.8-flash-high\"",
+        )
+        .expect_err("working_directory is required");
+        assert!(error.to_string().contains("working_directory"));
+
+        let parsed: AntigravityCliModelProviderConfig = toml::from_str(
+            r#"
+                model = "gemini-3.8-flash-high"
+                working_directory = "/srv/zeroclaw/workspace"
+            "#,
+        )
+        .expect("minimal Antigravity alias");
+        assert_eq!(parsed.auth_method, AntigravityCliAuthMethod::GeminiApiKey);
+        assert_eq!(parsed.state_directory, None);
+
+        for (raw, expected) in [
+            ("gemini_api_key", AntigravityCliAuthMethod::GeminiApiKey),
+            ("agent_platform", AntigravityCliAuthMethod::AgentPlatform),
+            ("oauth_business", AntigravityCliAuthMethod::OauthBusiness),
+            ("oauth_personal", AntigravityCliAuthMethod::OauthPersonal),
+        ] {
+            let parsed: AntigravityCliModelProviderConfig = toml::from_str(&format!(
+                "working_directory = \"/srv/w\"\nauth_method = \"{raw}\""
+            ))
+            .expect("auth method parses");
+            assert_eq!(parsed.auth_method, expected);
+        }
+    }
+
+    #[test]
     async fn channels_default() {
         let c = ChannelsConfig::default();
         assert!(c.cli);
@@ -35403,6 +36000,8 @@ auto_save = true
                         excluded_tools: vec![],
                         reply_min_interval_secs: 0,
                         reply_queue_depth_max: 0,
+
+                        rich_messages: false,
                     },
                 )]),
                 discord: HashMap::new(),
@@ -37468,6 +38067,8 @@ default_temperature = 0.7
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
             debounce_ms: None,
+
+            rich_messages: false,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -37504,6 +38105,15 @@ stream_mode = "single_message"
     async fn telegram_config_passive_group_context_defaults_off() {
         let parsed: TelegramConfig = serde_json::from_str(r#"{"bot_token":"t"}"#).unwrap();
         assert!(!parsed.passive_group_context);
+    }
+
+    #[test]
+    async fn telegram_config_rich_messages_defaults_off_and_parses_true() {
+        let parsed: TelegramConfig = serde_json::from_str(r#"{"bot_token":"t"}"#).unwrap();
+        assert!(!parsed.rich_messages);
+        let enabled: TelegramConfig =
+            serde_json::from_str(r#"{"bot_token":"t","rich_messages":true}"#).unwrap();
+        assert!(enabled.rich_messages);
     }
 
     #[test]
@@ -44607,6 +45217,8 @@ high_entropy_tokens = false
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+
+                rich_messages: false,
             },
         );
 
