@@ -95,3 +95,5 @@ owner live outside the transitional runtime crate. The small turn-entry and
 shell-environment wiring requires maintainer ownership review, including any
 bounded holding-crate exception required before merge. This proposal does not
 grant itself such an exception or introduce a second task scheduler.
+
+The shared runtime sandbox boundary refuses subprocess launches while a task SSH broker owns the turn. This covers shell, coding CLI and Git executors: hiding broker variables alone does not isolate a host broker in a shared temporary directory. Unsandboxed commands retain their documented same-UID authority. The refusal is evaluated at each launch against the current task owner.
