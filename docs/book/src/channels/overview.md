@@ -128,6 +128,24 @@ for the config the binding writes, and
 [Declaring and granting egress](../plugins/index.md#declaring-and-granting-egress)
 for granting a server the package does not declare, as an IRC server.
 
+#### Moving from the built-in IRC or Twitch channel
+
+Earlier builds compiled IRC and Twitch in. Their `[channels.irc.<alias>]`
+and `[channels.twitch.<alias>]` sections are now retired keys. Each load
+drops them and prints a notice naming the plugin to install. The next save
+removes them from `config.toml`, credentials included, and
+`zeroclaw config migrate` removes them immediately.
+
+That is not the only copy on disk. `zeroclaw config migrate` first copies the
+whole original file to `config.toml.backup`, which keeps the old IRC SASL or
+NickServ password and Twitch OAuth token until a later migration replaces it.
+Any `config.toml.v<version>.backup` an earlier upgrade kept, and any copy you
+made yourself, holds them too (see
+[Config lifecycle](../architecture/config-lifecycle.md)). Treat those files as
+secret material. Delete them once the plugin binding is delivering messages
+and you no longer need to roll back to a build with the built-in channel.
+Rotate the credential if a copy may have been exposed.
+
 ## Configuration
 
 Modern channel instances are configured under `[channels.<type>.<alias>]`, with `default` as the common first alias. Set them through any config surface:
