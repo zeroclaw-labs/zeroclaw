@@ -45172,11 +45172,13 @@ model = "before"
                 let body: Value = serde_json::from_slice(&new_requests[0].body).unwrap();
                 assert_eq!(body["model"], "beta-model");
             } else {
-                assert_eq!(
-                    old_requests.len(),
-                    1,
-                    "unchanged alpha still serves its endpoint"
-                );
+                // Prompt streaming can recover once after the mock's 500.
+                // Every attempt must retain alpha's model and endpoint.
+                assert!(!old_requests.is_empty(), "unchanged alpha must be called");
+                for request in old_requests {
+                    let body: Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(body["model"], "alpha-model");
+                }
                 assert!(new_requests.is_empty());
             }
         }
