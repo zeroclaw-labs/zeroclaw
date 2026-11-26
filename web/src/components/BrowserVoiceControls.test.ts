@@ -981,4 +981,14 @@ test('narration removes the answer signature before appending referenced footnot
   assert.equal(speechText('Answer[^a]. 🦀\n\n[^a]: Details.'), 'Answer.\n\nDetails.');
   assert.equal(speechText('Answer[^a]. 🦀️ 🦀\n\n[^a]: Details.'), 'Answer.\n\nDetails.');
   assert.match(speechText('The 🦀 is content[^a].\n\n[^a]: Details.'), /The 🦀 is content/);
+  const renderer = await mount();
+  try {
+    await act(async () => { renderer.update(createElement(Controls, { messages: [reply('footnote-signature', 'Answer[^a]. 🦀\n\n[^a]: Details.')], hydrated: true, typing: false, onTranscript() {} })); });
+    await act(async () => { renderer.root.findAllByType('button')[1]!.props.onClick(); });
+    assert.equal(spoken.length, 1);
+    assert.equal(spoken[0], 'Answer.\n\nDetails.');
+  } finally {
+    await act(async () => { renderer.unmount(); });
+  }
+
 });
