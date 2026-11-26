@@ -169,9 +169,9 @@ struct TuiIdentity {
 /// leaves the place taken while the creation is still under way. A creation
 /// the chat stopped waiting for lets go of the session's place but keeps the
 /// account's share until the core's answer settles it.
-type Place = Arc<PlaceGuard>;
+pub(crate) type Place = Arc<PlaceGuard>;
 
-struct PlaceGuard {
+pub(crate) struct PlaceGuard {
     binding: Arc<CoreBinding>,
     core_id: parking_lot::Mutex<Option<String>>,
     account: parking_lot::Mutex<Option<AccountPlace>>,
@@ -1275,6 +1275,15 @@ pub(crate) fn core_caller(
     })
 }
 
+/// Share the sign-in and account conversation budgets across dashboard transports.
+pub(crate) fn take_conversation_place(
+    core: &CoreRpc,
+    binding: &Arc<CoreBinding>,
+    principal: &str,
+) -> Result<Place, CoreFailure> {
+    binding.take_place(core.accounts.take(principal)?)
+}
+
 impl CoreCaller {
     /// A connection of its own presenting `credential`, and `identity` when
     /// there is one. A refusal ends the session, without asking the identity
@@ -1328,11 +1337,11 @@ impl CoreCaller {
         if self.session.ended.is_cancelled() {
             return Err(CoreFailure::SessionEnded);
         }
-        let account = self
-            .core
-            .accounts
-            .take(self.session.principal().id.as_str())?;
-        let place = self.binding.take_place(account)?;
+        let place = take_conversation_place(
+            &self.core,
+            &self.binding,
+            self.session.principal().id.as_str(),
+        )?;
         let credential = self
             .auth
             .core_credential(&self.session)
@@ -2485,6 +2494,12 @@ mod tests {
                 .route("/api/sessions/{id}/abort", post(session_abort))
                 .route("/api/status", get(status))
                 .route("/api/agents/available", get(agents_available))
+                .route(
+                    "/acp",
+                    get(crate::acp::handle_ws_acp).layer(Extension(Arc::new(
+                        crate::acp::AcpTurnHub::new(Arc::clone(&self.state.session_queue)),
+                    ))),
+                )
                 .route("/ws/chat", get(crate::ws::handle_ws_chat))
                 .with_state(self.state.clone())
                 .layer(Extension(self.core.clone()))
@@ -2568,6 +2583,225 @@ mod tests {
             .unwrap();
         });
         addr
+    }
+
+    async fn open_scoped_acp(
+        addr: SocketAddr,
+        cookie: &str,
+        agent: Option<&str>,
+    ) -> Result<ChatSocket, tokio_tungstenite::tungstenite::Error> {
+        let mut url = format!("ws://{addr}/acp");
+        if let Some(agent) = agent {
+            url.push_str(&format!("?agent={agent}"));
+        }
+        let mut request = url.into_client_request().unwrap();
+        let headers = request.headers_mut();
+        headers.insert("cookie", format!("zc_session={cookie}").parse().unwrap());
+        headers.insert("origin", format!("http://{addr}").parse().unwrap());
+        headers.insert("sec-websocket-protocol", "zeroclaw.acp.v1".parse().unwrap());
+        connect_async(request).await.map(|(socket, _)| socket)
+    }
+
+    async fn send_acp(socket: &mut ChatSocket, id: u64, method: &str, params: Value) {
+        socket
+            .send(ClientMessage::Text(
+                json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn receive_acp(socket: &mut ChatSocket, id: u64) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let message = socket.next().await.unwrap().unwrap();
+                let frame: Value = serde_json::from_str(&message.into_text().unwrap()).unwrap();
+                if frame["id"] == id {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("ACP response")
+    }
+
+    async fn call_acp(socket: &mut ChatSocket, id: u64, method: &str, params: Value) -> Value {
+        send_acp(socket, id, method, params).await;
+        receive_acp(socket, id).await
+    }
+
+    #[tokio::test]
+    async fn scoped_acp_preserves_owner_and_tool_grants_and_closes_when_grants_narrow() {
+        let fixture = Fixture::new().await;
+        let addr = serve(fixture.router()).await;
+        let (alice, _) = fixture.sign_in("alice").await;
+        let (bob, _) = fixture.sign_in("bob").await;
+        let mut alice = open_scoped_acp(addr, &alice, Some("support"))
+            .await
+            .unwrap();
+        let mut bob = open_scoped_acp(addr, &bob, Some("support")).await.unwrap();
+        let created = call_acp(
+            &mut alice,
+            1,
+            "session/new",
+            json!({
+                "interactionSurface": "webchat",
+            }),
+        )
+        .await;
+        let sid = created["result"]["sessionId"].as_str().unwrap();
+        let restore = call_acp(&mut bob, 1, "session/resume", json!({"sessionId":sid})).await;
+        assert_eq!(restore["error"]["code"], FORBIDDEN, "{restore}");
+
+        let marker = "scoped-acp-tool-ceiling";
+        let prompt = call_acp(
+            &mut alice,
+            2,
+            "session/prompt",
+            json!({
+                "sessionId":sid,"prompt":[{"type":"text","text":marker}],
+            }),
+        )
+        .await;
+        assert_eq!(prompt["result"]["stopReason"], "end_turn", "{prompt}");
+        assert!(prompt.get("_meta").is_none(), "{prompt}");
+        assert_eq!(prompt["result"]["_meta"]["zeroclawTurn"]["sessionId"], sid);
+        assert!(model_requests_with(&fixture._model, marker).await > 0);
+        assert!(offered_tools(&fixture._model, marker).await.is_empty());
+
+        fixture.narrow_profile("chat-user", |profile| {
+            profile
+                .grants
+                .get_mut(&Resource::Sessions)
+                .unwrap()
+                .retain(|verb| *verb != Verb::Delete);
+        });
+        send_acp(&mut alice, 3, "session/list", json!({})).await;
+        let (frames, code) = read_to_close(&mut alice).await;
+        assert!(frames.is_empty(), "{frames:?}");
+        assert_eq!(code, Some(crate::dashboard_session::WS_CLOSE_ACCESS_LOST));
+    }
+
+    #[tokio::test]
+    async fn scoped_acp_shares_the_sign_in_budget_and_denies_steering() {
+        use zeroclaw_api::jsonrpc::error_codes::{SESSION_BUSY, SESSION_LIMIT_REACHED};
+
+        let fixture = Fixture::new().await;
+        let addr = serve(fixture.router()).await;
+        let (cookie, _) = fixture.sign_in("alice").await;
+        let mut legacy = open_chat(addr, &cookie, "support", "web-1").await.unwrap();
+        let _ = legacy.next().await.unwrap().unwrap();
+        let mut sockets = Vec::new();
+        for _ in 1..MAX_LIVE_CONVERSATIONS {
+            sockets.push(
+                open_scoped_acp(addr, &cookie, Some("support"))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut over_budget = open_scoped_acp(addr, &cookie, Some("support"))
+            .await
+            .unwrap();
+        let (_, code) = read_to_close(&mut over_budget).await;
+        assert_eq!(code, Some(WS_CLOSE_CONVERSATION_LIMIT));
+
+        let socket = sockets.first_mut().unwrap();
+        let missing = call_acp(
+            socket,
+            1,
+            "session/prompt",
+            json!({
+                "sessionId":"missing","prompt":[{"type":"text","text":"hello"}],
+            }),
+        )
+        .await;
+        assert_eq!(missing["error"]["code"], SESSION_NOT_FOUND, "{missing}");
+        let created = call_acp(socket, 2, "session/new", json!({})).await;
+        let sid = created["result"]["sessionId"].as_str().unwrap();
+        let over_limit = call_acp(socket, 3, "session/new", json!({})).await;
+        assert_eq!(
+            over_limit["error"]["code"], SESSION_LIMIT_REACHED,
+            "{over_limit}"
+        );
+
+        send_acp(
+            socket,
+            4,
+            "session/prompt",
+            json!({
+                "sessionId":sid,"prompt":[{"type":"text","text":"slow please"}],
+            }),
+        )
+        .await;
+        let busy = call_acp(
+            socket,
+            5,
+            "session/prompt",
+            json!({
+                "sessionId":sid,"prompt":[{"type":"text","text":"second prompt"}],
+            }),
+        )
+        .await;
+        assert_eq!(busy["error"]["code"], SESSION_BUSY, "{busy}");
+        let denied = call_acp(
+            socket,
+            6,
+            "_zeroclaw/session/steer",
+            json!({
+                "sessionId":sid,"content":"another step",
+            }),
+        )
+        .await;
+        assert_eq!(denied["error"]["code"], FORBIDDEN, "{denied}");
+        assert_eq!(
+            receive_acp(socket, 4).await["result"]["stopReason"],
+            "end_turn"
+        );
+        assert_eq!(
+            model_requests_with(&fixture._model, "second prompt").await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_acp_limits_the_websocket_message_before_decoding() {
+        let fixture = Fixture::new().await;
+        let addr = serve(fixture.router()).await;
+        let (cookie, _) = fixture.sign_in("alice").await;
+        for (agent, status) in [(None, 400), (Some("forbidden"), 403)] {
+            let refused = open_scoped_acp(addr, &cookie, agent).await.unwrap_err();
+            assert!(matches!(
+                refused,
+                tokio_tungstenite::tungstenite::Error::Http(response)
+                    if response.status().as_u16() == status
+            ));
+        }
+        let mut socket = open_scoped_acp(addr, &cookie, Some("support"))
+            .await
+            .unwrap();
+        assert_eq!(
+            call_acp(&mut socket, 1, "initialize", json!({"protocolVersion":1})).await["result"]["protocolVersion"],
+            1
+        );
+        let oversized = json!({
+            "jsonrpc":"2.0","id":2,"method":"initialize",
+            "params":{"protocolVersion":1,"padding":"x".repeat(MAX_FRAME_BYTES as usize)},
+        });
+        if let Err(error) = socket
+            .send(ClientMessage::Text(oversized.to_string().into()))
+            .await
+        {
+            assert!(matches!(
+                error,
+                tokio_tungstenite::tungstenite::Error::Io(error)
+                    if matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe)
+            ));
+            return;
+        }
+        let (frames, _) = read_to_close(&mut socket).await;
+        assert!(frames.is_empty(), "{frames:?}");
     }
 
     /// Drive `open` until the core has started creating its session behind

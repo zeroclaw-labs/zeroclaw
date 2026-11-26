@@ -539,7 +539,7 @@ impl AcpServer {
             agent_alias,
             workspace_dir,
             memory,
-            policy.resolved_enable_mcp(config, agent_alias),
+            self.principal_id.is_none() && policy.resolved_enable_mcp(config, agent_alias),
             policy.exclude_memory,
             &capabilities,
             posture.as_ref().and_then(|p| p.tool_ceiling.clone()),
@@ -581,7 +581,7 @@ impl AcpServer {
                 session_id,
             )));
         }
-        if policy.seed_external_channels {
+        if self.principal_id.is_none() && policy.seed_external_channels {
             let ch = agent.channel_handles();
             let published = super::CRON_CHANNEL_REGISTRY
                 .read()
