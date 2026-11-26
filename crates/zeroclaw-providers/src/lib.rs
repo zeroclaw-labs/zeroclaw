@@ -1,7 +1,9 @@
 #![allow(clippy::to_string_in_format_args)]
 //! ModelProvider subsystem for model inference backends.
 
+pub(crate) mod acp_cli;
 pub mod anthropic;
+pub mod antigravity_cli;
 pub mod auth;
 pub mod azure_openai;
 pub mod bedrock;
@@ -11,7 +13,6 @@ pub mod copilot;
 pub mod dispatch;
 pub mod factory;
 pub mod gemini;
-pub mod gemini_cli;
 pub mod grok_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod hailo_ollama;
@@ -1118,11 +1119,11 @@ fn mentions_tools_token(message: &str) -> bool {
         let preceded_by_word_char = message[..start]
             .chars()
             .next_back()
-            .is_some_and(&is_word_char);
+            .is_some_and(is_word_char);
         let followed_by_word_char = bytes
             .get(end)
             .map(|byte| *byte as char)
-            .is_some_and(&is_word_char);
+            .is_some_and(is_word_char);
 
         if !preceded_by_word_char && !followed_by_word_char {
             return true;
@@ -1518,6 +1519,8 @@ pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
         "gemini-cli" => "gemini_cli",
         // Grok Build CLI is its own typed slot (subprocess runtime).
         "grok-cli" | "grokcli" => "grok_cli",
+        // Antigravity CLI is its own typed slot (ACP subprocess runtime).
+        "antigravity-cli" | "agy" => "antigravity_cli",
         // Stepfun-intl folds with a different uri at the schema layer.
         "stepfun-intl" | "step-intl" => "stepfun",
         // Anthropic special folds.
@@ -2356,8 +2359,9 @@ pub fn recommended_runtime_profile(name: &str) -> Option<&'static str> {
 /// `zeroclaw-config` are a dual-maintenance surface: the macro carries the
 /// canonical slot set, this list adds display-only fields (`display_name`,
 /// `local`). The `listed_model_providers_match_canonical_slots` test enforces
-/// that the two cover exactly the same slots, so a provider added to the macro
-/// without a display entry here (or vice versa) fails `cargo test`.
+/// that the two cover exactly the same slots, except
+/// [`RETIRED_MODEL_PROVIDER_SLOTS`], so a provider added to the macro without a
+/// display entry here (or vice versa) fails `cargo test`.
 pub fn list_model_providers() -> Vec<ModelProviderInfo> {
     let mut out: Vec<ModelProviderInfo> = Vec::new();
     push_family(
@@ -2383,6 +2387,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("vercel", "Vercel AI Gateway", false),
             ("cloudflare", "Cloudflare AI", false),
             ("atlascloud", "Atlas Cloud", false),
+            ("cheaperinference", "Cheaper Inference", false),
             ("moonshot", "Moonshot", false),
             ("synthetic", "Synthetic", false),
             ("opencode", "OpenCode", false),
@@ -2404,8 +2409,8 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("perplexity", "Perplexity", false),
             ("cohere", "Cohere", false),
             ("copilot", "GitHub Copilot", false),
-            ("gemini_cli", "Gemini CLI", true),
             ("grok_cli", "Grok Build CLI", true),
+            ("antigravity_cli", "Antigravity CLI", true),
             ("kilocli", "KiloCLI", true),
             ("kilo", "Kilo", false),
             ("zerorouter", "ZeroRouter", false),
@@ -2481,12 +2486,18 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             .collect::<std::collections::BTreeSet<_>>(),
         canonical_model_provider_slots()
             .into_iter()
+            .filter(|slot| !RETIRED_MODEL_PROVIDER_SLOTS.contains(slot))
             .collect::<std::collections::BTreeSet<_>>(),
         "list_model_providers() drifted from for_each_model_provider_slot!: \
          every canonical slot needs exactly one display entry and vice versa"
     );
     out
 }
+
+/// Config slots kept only so existing configs parse and fail validation with
+/// a migration message. They are not offered in provider listings and their
+/// factories always refuse.
+pub const RETIRED_MODEL_PROVIDER_SLOTS: &[&str] = &["gemini_cli"];
 
 #[must_use]
 pub fn canonical_model_provider_slots() -> Vec<&'static str> {
@@ -2655,6 +2666,43 @@ mod tests {
     }
 
     #[test]
+    fn resolve_cheaperinference_credential_stays_on_typed_alias_boundary() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("CHEAPER_INFERENCE_API_KEY", Some("  cheaper-env-key  "));
+        assert!(resolve_model_provider_credential("cheaperinference", None).is_none());
+        assert_eq!(
+            resolve_model_provider_credential("cheaperinference", Some("  explicit-key  "))
+                .as_deref(),
+            Some("explicit-key")
+        );
+    }
+
+    #[test]
+    fn cheaperinference_uses_canonical_provider_id_only() {
+        assert_eq!(
+            canonicalize_v2_model_provider_name("cheaperinference"),
+            "cheaperinference"
+        );
+        for alias in ["cheaper-inference", "cheaper_inference"] {
+            assert_eq!(canonicalize_v2_model_provider_name(alias), alias);
+        }
+    }
+
+    #[test]
+    fn cheaperinference_provider_is_listed_and_constructible() {
+        let providers = list_model_providers();
+        let cheaperinference = providers
+            .iter()
+            .find(|provider| provider.name == "cheaperinference")
+            .expect("Cheaper Inference provider should be listed");
+        assert_eq!(cheaperinference.display_name, "Cheaper Inference");
+        assert!(
+            create_model_provider("cheaperinference", Some("provider-test-credential")).is_ok(),
+            "Cheaper Inference should construct through the OpenAI-compatible family factory"
+        );
+    }
+
+    #[test]
     fn resolve_qwen_oauth_context_prefers_explicit_override() {
         let _env_lock = env_lock();
         let context = resolve_qwen_oauth_context(Some("  explicit-qwen-token  "));
@@ -2665,8 +2713,8 @@ mod tests {
     #[test]
     fn resolve_qwen_oauth_context_reads_cached_credentials_file() {
         let _env_lock = env_lock();
-        let fake_home = format!("/tmp/zeroclaw-qwen-oauth-home-{}-file", std::process::id());
-        let creds_dir = PathBuf::from(&fake_home).join(".qwen");
+        let fake_home = tempfile::tempdir().unwrap();
+        let creds_dir = fake_home.path().join(".qwen");
         std::fs::create_dir_all(&creds_dir).unwrap();
         let creds_path = creds_dir.join("oauth_creds.json");
         std::fs::write(
@@ -2675,7 +2723,10 @@ mod tests {
         )
         .unwrap();
 
-        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
+        let _home_guard = EnvGuard::set(
+            "HOME",
+            Some(fake_home.path().to_str().expect("UTF-8 test path")),
+        );
 
         let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER));
 
@@ -2689,8 +2740,11 @@ mod tests {
     #[test]
     fn resolve_qwen_oauth_context_returns_none_without_cache() {
         let _env_lock = env_lock();
-        let fake_home = format!("/tmp/zeroclaw-qwen-oauth-home-{}-empty", std::process::id());
-        let _home_guard = EnvGuard::set("HOME", Some(fake_home.as_str()));
+        let fake_home = tempfile::tempdir().unwrap();
+        let _home_guard = EnvGuard::set(
+            "HOME",
+            Some(fake_home.path().to_str().expect("UTF-8 test path")),
+        );
 
         let context = resolve_qwen_oauth_context(Some(QWEN_OAUTH_PLACEHOLDER));
         assert!(context.credential.is_none());
@@ -3860,12 +3914,28 @@ mod tests {
     }
 
     #[test]
-    fn factory_gemini_cli() {}
+    fn factory_gemini_cli_is_retired_with_migration_guidance() {
+        let error = match create_model_provider("gemini_cli", None) {
+            Ok(_) => panic!("retired gemini_cli provider must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("retired"), "{error}");
+        assert!(error.contains("antigravity_cli"), "{error}");
+    }
 
     #[test]
     fn factory_grok_cli() {
         let error = match create_model_provider("grok_cli", None) {
             Ok(_) => panic!("unscoped grok_cli provider must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("working_directory"));
+    }
+
+    #[test]
+    fn factory_antigravity_cli() {
+        let error = match create_model_provider("antigravity_cli", Some("test-key")) {
+            Ok(_) => panic!("unscoped antigravity_cli provider must fail"),
             Err(error) => error,
         };
         assert!(error.to_string().contains("working_directory"));
@@ -4009,6 +4079,10 @@ mod tests {
         assert_eq!(
             default_model_provider_url("crusoe"),
             Some("https://api.inference.crusoecloud.com/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("cheaperinference"),
+            Some("https://api.cheaperinference.com/v1")
         );
     }
 
@@ -4427,9 +4501,9 @@ mod tests {
         // `normalize_model_provider_type` in `schema/v2.rs` and never reach
         // the runtime. `azure` is excluded (typed-config required, see
         // `listed_model_providers_are_constructible` skip list); `custom` is
-        // excluded (URI required); `grok_cli` is excluded because ACP requires
-        // an explicit absolute working_directory. Dedicated factory tests cover
-        // each required-config family.
+        // excluded (URI required); `grok_cli` and `antigravity_cli` are
+        // excluded because ACP requires an explicit absolute working_directory.
+        // Dedicated factory tests cover each required-config family.
         let canonical = [
             "openrouter",
             "anthropic",
@@ -4466,7 +4540,6 @@ mod tests {
             "perplexity",
             "cohere",
             "copilot",
-            "gemini_cli",
             "kilocli",
             "nvidia",
             "astrai",
@@ -4499,8 +4572,10 @@ mod tests {
     fn listed_model_providers_match_canonical_slots() {
         let listed: std::collections::BTreeSet<&str> =
             list_model_providers().iter().map(|p| p.name).collect();
-        let canonical: std::collections::BTreeSet<&str> =
-            canonical_model_provider_slots().into_iter().collect();
+        let canonical: std::collections::BTreeSet<&str> = canonical_model_provider_slots()
+            .into_iter()
+            .filter(|slot| !RETIRED_MODEL_PROVIDER_SLOTS.contains(slot))
+            .collect();
         let missing: Vec<&&str> = canonical.difference(&listed).collect();
         let phantom: Vec<&&str> = listed.difference(&canonical).collect();
         assert!(
@@ -4521,9 +4596,10 @@ mod tests {
             if model_provider.name == "custom" {
                 continue;
             }
-            // Grok ACP deliberately refuses the daemon cwd as an implicit
-            // trust boundary; a typed alias must provide working_directory.
-            if model_provider.name == "grok_cli" {
+            // ACP CLI providers deliberately refuse the daemon cwd as an
+            // implicit trust boundary; a typed alias must provide
+            // working_directory.
+            if matches!(model_provider.name, "grok_cli" | "antigravity_cli") {
                 continue;
             }
             let api_key = if model_provider.name == "hailo_ollama" {
@@ -5710,6 +5786,52 @@ mod tests {
         assert!(
             message.contains("uri"),
             "factory error must preserve the missing field detail: {message}"
+        );
+    }
+
+    #[test]
+    fn resilient_alias_fallback_to_retired_gemini_cli_reports_retirement() {
+        use zeroclaw_config::schema::{Config, GeminiCliModelProviderConfig, ModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "primary".to_string(),
+            zeroclaw_config::schema::OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("primary-key".to_string()),
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "gemini_cli.old",
+                    )],
+                    ..Default::default()
+                },
+            },
+        );
+        config
+            .providers
+            .models
+            .gemini_cli
+            .insert("old".to_string(), GeminiCliModelProviderConfig::default());
+
+        let message = match create_resilient_model_provider_for_alias(
+            &config,
+            "openai",
+            "primary",
+            Some("primary-key"),
+            None,
+            &zeroclaw_config::schema::ReliabilityConfig::default(),
+            &ModelProviderRuntimeOptions::default(),
+        ) {
+            Ok(_) => panic!("a retired gemini_cli fallback must abort the build"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            message.contains(zeroclaw_config::schema::GEMINI_CLI_PROVIDER_RETIRED),
+            "error must carry the retirement migration message: {message}"
+        );
+        assert!(
+            !message.contains("profile-resolved credential"),
+            "a retired provider must not ask for credentials: {message}"
         );
     }
 

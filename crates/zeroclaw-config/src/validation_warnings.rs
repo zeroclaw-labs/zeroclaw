@@ -37,6 +37,16 @@ pub const SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD: &str =
 /// are not checked; see [`crate::opt_in_tools`].
 pub const TOOL_COMPILED_OUT: &str = "tool_compiled_out";
 
+/// Stable code for an enabled section of a tool that has been removed from
+/// ZeroClaw. `Config::validate()` refuses the same condition as an error; this
+/// is the non-fatal copy for surfaces that read only the warning list, such as
+/// `zeroclaw doctor` and the dashboard, so they can say why the tool is gone.
+pub const TOOL_REMOVED: &str = "tool_removed";
+
+/// Stable code for delegate grants the agent's risk profile can never fire:
+/// its delegation_policy forbids delegation or its tool policy blocks `delegate`.
+pub const DEAD_DELEGATE_GRANTS: &str = "dead_delegate_grants";
+
 /// Stable code for a half-configured email outbound pair: the channel loads and
 /// stays inbound-only even though the operator configured sending.
 pub const EMAIL_SMTP_PARTIALLY_CONFIGURED: &str = "email_smtp_partially_configured";
@@ -106,6 +116,11 @@ pub const EMAIL_SMTP_PARTIALLY_CONFIGURED: &str = "email_smtp_partially_configur
 /// - `tool_compiled_out`: a `[<tool>]` section is enabled, but this build was
 ///   compiled without the tool's `tool-*` feature, so the section has no
 ///   effect and its settings are not validated.
+/// - `tool_removed`: a `[<tool>]` section is enabled for a tool ZeroClaw no
+///   longer ships (currently `[gemini_cli]`). `Config::validate()` refuses
+///   this condition; the warning carries the same removal notice and
+///   migration path to surfaces that do not run validation, such as
+///   `zeroclaw doctor`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {

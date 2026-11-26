@@ -1327,6 +1327,28 @@ impl AuthProviderFlow for OpenaiCodexFlow {
 
 // ── Gemini impl ────────────────────────────────────────────────────────
 
+/// English fallback for `cli-auth-gemini-personal-account-warning`, printed
+/// before every Gemini OAuth login. Consumer Code Assist is retired and a
+/// personal Google login from a third-party tool risks account suspension.
+const GEMINI_PERSONAL_ACCOUNT_WARNING: &str = concat!(
+    "================================================================================\n",
+    "WARNING: PERSONAL GOOGLE ACCOUNTS DO NOT WORK WITH THIS LOGIN\n",
+    "================================================================================\n",
+    "Google stopped serving Gemini Code Assist to Google AI free, Pro, and Ultra\n",
+    "accounts on June 18, 2026, and suspends accounts that use a consumer Google\n",
+    "login from third-party tools such as ZeroClaw. Do not sign in with a personal\n",
+    "Google account here.\n",
+    "\n",
+    "Continue only with your own Google Cloud OAuth client and an account licensed\n",
+    "for Gemini Code Assist Standard or Enterprise.\n",
+    "\n",
+    "For everything else, use one of:\n",
+    "  - providers.models.gemini.<alias> with an API key\n",
+    "  - providers.models.antigravity_cli.<alias> with a Gemini API key, Agent\n",
+    "    Platform, or Gemini Enterprise\n",
+    "================================================================================",
+);
+
 pub struct GeminiFlow;
 
 impl GeminiFlow {
@@ -1408,6 +1430,14 @@ impl AuthProviderFlow for GeminiFlow {
         device_code: bool,
         import: Option<&std::path::Path>,
     ) -> Result<()> {
+        eprintln!(
+            "{}",
+            ctx.cli_text(
+                "cli-auth-gemini-personal-account-warning",
+                &[],
+                GEMINI_PERSONAL_ACCOUNT_WARNING
+            )
+        );
         if import.is_some() {
             anyhow::bail!(
                 "`auth login --import` currently supports only --model-provider openai-codex and xai.",
