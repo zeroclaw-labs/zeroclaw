@@ -149,6 +149,10 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
         snapshots.entry(path.clone()).or_insert(snapshot);
 
         if path.starts_with("/providers/") {
+            crate::provider_registry::env_input::ensure_legacy_connection(
+                &mut registry_staged,
+                &path,
+            )?;
             crate::provider_registry::env_input::stage(&mut registry_staged, &path, &value)?;
             registry_edits.push((path.clone(), value.clone(), env_name.clone()));
             Ok(())

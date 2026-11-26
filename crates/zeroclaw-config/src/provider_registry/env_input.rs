@@ -229,6 +229,34 @@ pub(crate) fn stage(document: &mut Value, path: &str, value: &str) -> Result<()>
     set_document(document, path, value, None)
 }
 
+/// Legacy typed profiles are projected to `legacy.<family>.<alias>` only at
+/// the end of input admission. Seed that connection in the raw transaction so
+/// an environment edit can be staged before the typed projection runs.
+pub(crate) fn ensure_legacy_connection(document: &mut Value, path: &str) -> Result<()> {
+    let parts: Vec<_> = path
+        .trim_start_matches('/')
+        .split('/')
+        .map(|part| part.replace("~1", "/").replace("~0", "~"))
+        .collect();
+    let ["providers", "connections", key, ..] = parts.as_slice() else {
+        return Ok(());
+    };
+    let Some(rest) = key.strip_prefix("legacy.") else {
+        return Ok(());
+    };
+    let Some((kind, _alias)) = rest.split_once('.') else {
+        return Ok(());
+    };
+    let connections = document
+        .get_mut("connections")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| anyhow::Error::msg("provider connections must be a table"))?;
+    connections
+        .entry((*key).to_owned())
+        .or_insert_with(|| serde_json::json!({"kind": kind}));
+    Ok(())
+}
+
 fn typed_env_value(
     template: &Value,
     path: &str,
