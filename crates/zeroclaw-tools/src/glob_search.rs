@@ -431,7 +431,11 @@ mod tests {
         });
         let tool = GlobSearchTool::new(security);
 
-        let pattern = format!("{}/docs/*.md", project_canon.display());
+        let pattern = project_canon
+            .join("docs")
+            .join("*.md")
+            .display()
+            .to_string();
         let result = tool.execute(json!({ "pattern": pattern })).await.unwrap();
 
         assert!(result.success, "{:?}", result.error);
@@ -459,7 +463,7 @@ mod tests {
         });
         let tool = GlobSearchTool::new(security);
 
-        let pattern = format!("{}/*.md", shared_canon.display());
+        let pattern = shared_canon.join("*.md").display().to_string();
         let result = tool.execute(json!({ "pattern": pattern })).await.unwrap();
 
         assert!(result.success, "{:?}", result.error);
@@ -488,7 +492,7 @@ mod tests {
         });
         let tool = GlobSearchTool::new(security);
 
-        let pattern = format!("{}/*", drop_canon.display());
+        let pattern = drop_canon.join("*").display().to_string();
         let result = tool.execute(json!({ "pattern": pattern })).await.unwrap();
 
         assert!(

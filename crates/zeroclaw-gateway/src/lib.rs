@@ -186,15 +186,13 @@ pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 
 pub const LONG_RUNNING_REQUEST_TIMEOUT_SECS: u64 = 600;
 
-/// Gateway request timeout (seconds) for routes other than the long-running
-/// cron-trigger endpoint. Reads from typed config.
+/// Gateway request timeout (seconds) for ordinary routes. Reads from typed config.
 pub fn gateway_request_timeout_secs(cfg: &zeroclaw_config::schema::GatewayConfig) -> u64 {
     cfg.request_timeout_secs
 }
 
-/// Manual cron-trigger request timeout (seconds), exempt from the
-/// gateway-wide [`gateway_request_timeout_secs`] limit so synchronous agent
-/// jobs can run to completion. Reads from typed config.
+/// Request timeout (seconds) for webhook, manual cron and A2A task routes,
+/// exempt from [`gateway_request_timeout_secs`]. Reads from typed config.
 pub fn gateway_long_running_request_timeout_secs(
     cfg: &zeroclaw_config::schema::GatewayConfig,
 ) -> u64 {
@@ -1036,6 +1034,21 @@ fn config_admin_router(route_auth: principal_gate::ConfigRouteAuth) -> Router<Ap
 /// flight. With [`RETIRE_JOIN`] it stays inside the daemon's 500 ms grace for
 /// the gateway, so what is left is cancelled before that grace runs out.
 const CONNECTION_DRAIN: Duration = Duration::from_millis(300);
+
+#[cfg(test)]
+tokio::task_local! {
+    static LISTENER_RELEASED: std::cell::RefCell<Option<tokio::sync::oneshot::Sender<()>>>;
+}
+
+fn release_listener(listener: tokio::net::TcpListener) {
+    drop(listener);
+    #[cfg(test)]
+    let _ = LISTENER_RELEASED.try_with(|released| {
+        if let Some(released) = released.borrow_mut().take() {
+            let _ = released.send(());
+        }
+    });
+}
 
 /// How long retirement waits for the tasks it cancelled to end. Cancelling
 /// only asks: a task ends, and drops what it owns, when it is next polled.
@@ -2589,7 +2602,6 @@ pub async fn run_gateway_with_plugin_webhooks(
             post(handle_pair).layer(no_relayed_pairing.clone()),
         )
         .route("/pair/code", get(handle_pair_code))
-        .route("/webhook", post(handle_webhook))
         .merge(sop_webhook_routes())
         .merge(optional_channel_routes())
         .merge(optional_tool_routes())
@@ -2886,12 +2898,13 @@ pub async fn run_gateway_with_plugin_webhooks(
         ));
     let inner = inner.merge(upload_router);
 
-    // Manual cron-trigger and A2A task routes live on their own sub-router so
-    // they can opt out of the 30s gateway-wide TimeoutLayer. Both run a
-    // synchronous agent turn inline. Layers attached here travel with the
-    // route through `merge`, so only these endpoints see the longer timeout.
-    let long_running_router: Router<AppState> =
-        Router::new().route("/api/cron/{id}/run", post(api::handle_api_cron_run));
+    // These routes can wait for a complete agent turn. Keep their timeout and
+    // body limit on the sub-router so both survive `merge`. For `/webhook`,
+    // this also bounds body extraction and SOP/SSE response creation; the SSE
+    // body and its cancellation remain owned by the streaming path.
+    let long_running_router: Router<AppState> = Router::new()
+        .route("/webhook", post(handle_webhook))
+        .route("/api/cron/{id}/run", post(api::handle_api_cron_run));
     #[cfg(feature = "a2a")]
     let long_running_router = long_running_router.merge(a2a::a2a_task_route());
     let long_running_router: Router = long_running_router
@@ -3137,7 +3150,7 @@ pub async fn run_gateway_with_plugin_webhooks(
     }
     // Let go of the port at once, as `axum::serve` does: a connection made
     // from here on is refused, not accepted into a backlog nothing serves.
-    drop(listener);
+    release_listener(listener);
     // And stop taking relay-forwarded dashboard connections: the bridge
     // refuses them until the next generation attaches.
     drop(dashboard_feed);
@@ -7805,6 +7818,20 @@ path = "{trigger_path}"
         tls: Option<(&std::path::Path, &std::path::Path)>,
         event_bus: Option<zeroclaw_runtime::observability::EventBus>,
     ) -> (
+        std::net::SocketAddr,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        start_drain_test_gateway_with_release(data, port, tls, event_bus, None).await
+    }
+
+    async fn start_drain_test_gateway_with_release(
+        data: &std::path::Path,
+        port: u16,
+        tls: Option<(&std::path::Path, &std::path::Path)>,
+        event_bus: Option<zeroclaw_runtime::observability::EventBus>,
+        released: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> (
         SocketAddr,
         tokio::sync::watch::Sender<bool>,
         tokio::task::JoinHandle<Result<()>>,
@@ -7839,21 +7866,25 @@ path = "{trigger_path}"
             reload_tx,
         );
         let server = zeroclaw_spawn::spawn!(async move {
-            run_gateway(
-                "127.0.0.1",
-                port,
-                config,
-                event_bus,
-                Some(controls),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(readiness),
-            )
-            .await
+            LISTENER_RELEASED
+                .scope(std::cell::RefCell::new(released), async move {
+                    run_gateway(
+                        "127.0.0.1",
+                        port,
+                        config,
+                        event_bus,
+                        Some(controls),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(readiness),
+                    )
+                    .await
+                })
+                .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             ready_rx.wait_for(Option::is_some).await.unwrap();
@@ -9092,10 +9123,11 @@ path = "{trigger_path}"
     }
 
     /// A stopped gateway lets go of its port as soon as it stops accepting,
-    /// as `axum::serve` does, so a fresh connection is refused rather than
-    /// left in a backlog nothing serves, even while the drain still holds a
-    /// response in flight. The next gateway then takes the port. Over plain
-    /// HTTP and TLS.
+    /// as `axum::serve` does, even while the drain still holds a response in
+    /// flight: the listener is dropped within the drain, and the next
+    /// gateway then takes the port. Off Windows, a fresh connection made
+    /// during the drain is also seen to be refused rather than left in a
+    /// backlog nothing serves. Over plain HTTP and TLS.
     #[tokio::test]
     async fn a_stopped_gateway_releases_its_port_before_its_drain_ends() {
         let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
@@ -9105,11 +9137,13 @@ path = "{trigger_path}"
             let certs = over_tls.then_some((cert_path.as_path(), key_path.as_path()));
             let tls = over_tls.then_some(&connector);
             let label = if over_tls { "tls" } else { "plain" };
-            let (addr, shutdown_tx, server) = start_drain_test_gateway_with(
+            let (released_tx, released_rx) = tokio::sync::oneshot::channel();
+            let (addr, shutdown_tx, server) = start_drain_test_gateway_with_release(
                 &tmp.path().join(format!("{label}-first")),
                 0,
                 certs,
                 None,
+                Some(released_tx),
             )
             .await;
             let mut streaming = drain_test_connect(addr, tls).await;
@@ -9117,19 +9151,31 @@ path = "{trigger_path}"
             assert!(head.starts_with("HTTP/1.1 200"), "{label}: {head}");
 
             shutdown_tx.send(true).unwrap();
-            let released = tokio::time::timeout(std::time::Duration::from_millis(150), async {
-                loop {
-                    match tokio::net::TcpStream::connect(addr).await {
-                        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break,
-                        _ => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+            // Observe the owned listener's release, not the peer's retry
+            // timer: Windows may defer a refused TCP connect beyond the whole
+            // drain. The signal is in-process, so the drain bounds it.
+            tokio::time::timeout(CONNECTION_DRAIN, released_rx)
+                .await
+                .expect("the listener is released before the drain ends")
+                .expect("the listener release is reported");
+            // Where a refused connect is reported promptly, also see the
+            // release from the client side.
+            #[cfg(not(windows))]
+            {
+                let refused = tokio::time::timeout(std::time::Duration::from_millis(150), async {
+                    loop {
+                        match tokio::net::TcpStream::connect(addr).await {
+                            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break,
+                            _ => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                        }
                     }
-                }
-            })
-            .await;
-            assert!(
-                released.is_ok(),
-                "{label}: the stopped gateway still held its port while it drained"
-            );
+                })
+                .await;
+                assert!(
+                    refused.is_ok(),
+                    "{label}: the stopped gateway still held its port while it drained"
+                );
+            }
             assert!(
                 !server.is_finished(),
                 "{label}: the drain still holds the event stream"
