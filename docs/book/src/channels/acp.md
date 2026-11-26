@@ -199,7 +199,7 @@ When a tool requires user approval (via `always_ask` in the autonomy config, or 
   }}
 ```
 
-The server-issued id (`"zc-out-N"`) is always a string prefixed `zc-out-`.
+The server-issued id is an opaque string prefixed `zc-out-`. Echo the entire id on the response. Gateway ids also distinguish requests from different turns so a reattached socket can answer a pending request.
 Correlation is directional: each peer matches responses only against its own
 pending-request map, so the same textual id may be in flight independently in
 both directions.
@@ -407,6 +407,23 @@ zeroclaw-acp-bridge --config-dir=/tmp/zeroclaw
 </div>
 
 You can also supply the bearer token directly via `ZEROCLAW_ACP_BRIDGE_TOKEN` if you prefer not to rely on the cached token file.
+
+### Dashboard sign-in and turn reattachment
+
+When pairing is required, `/acp` also accepts same-origin dashboard sign-in cookies. An explicit pairing token takes precedence. Administrators have operator access. A scoped account must set `?agent=<alias>` and have permission to chat with that agent. It can open one live ACP session per socket, with a shared limit of four conversations across ACP and `/ws/chat` per sign-in, and an 8 MiB frame and message limit. Detached turns keep their conversation slots until they finish.
+
+Scoped ACP sessions use the signed-in principal's tool grants. The WebChat surface enables the principal's own memory plane. MCP bundles, external channel handles, and turn steering are reserved for operator access. A sign-out, expiry, or grant change closes the connection and cancels its running turns.
+
+After reconnecting, first restore the session with `session/resume`, then call `_zeroclaw/session/reattach` with `sessionId` and, if known, the last `turnId` and `afterSeq`. A cursor applies only to the turn that issued it. Set `activeOnly` to omit a completed turn or `acceptPartial` to accept the remaining events after older events have been discarded. The result reports `inFlight`, `replayed`, and, when a turn is found, `turnId` and `truncated`.
+
+Turn notifications and successful prompt results carry `_meta.zeroclawTurn` in their `params` and `result`, respectively. Use its `sessionId`, `turnId`, and `seq` to track replay. A reattached socket receives `_zeroclaw/turn_complete` with the terminal result or error. The gateway sends `_zeroclaw/replay_gap` when a live replay reader falls behind. Reattach with the latest cursor to recover buffered events.
+
+| WebSocket close code | Meaning |
+|---|---|
+| `4401` | Dashboard sign-in ended |
+| `4403` | Dashboard grants or agent access changed |
+| `4409` | Dashboard conversation budget exhausted |
+| `1012` | Gateway stopped or reloaded |
 
 ## Version compatibility
 
