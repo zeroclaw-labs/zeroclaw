@@ -794,10 +794,6 @@ fn speech_reference(
 
 /// Redirect historical env names after file input has already been admitted.
 /// Protocol/extra field maps are shared with the file migration decoder.
-pub(crate) fn legacy_env_segments(config: &Config, parts: &[&str]) -> Option<Vec<String>> {
-    legacy_env_segments_with_staged(config, parts, None)
-}
-
 pub(crate) fn legacy_env_segments_with_staged(
     config: &Config,
     parts: &[&str],

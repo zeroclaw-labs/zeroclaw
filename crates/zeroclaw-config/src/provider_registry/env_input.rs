@@ -4,6 +4,7 @@ use crate::schema::Config;
 use anyhow::{Result, ensure};
 use serde_json::Value;
 
+#[cfg(test)]
 pub(crate) fn path(config: &Config, tail: &str) -> Option<String> {
     path_with_staged(config, tail, None)
 }

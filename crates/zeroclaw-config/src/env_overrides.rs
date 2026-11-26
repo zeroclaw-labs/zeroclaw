@@ -742,10 +742,8 @@ model = "gemini-test"
     #[tokio::test]
     async fn legacy_model_credentials_follow_a_staged_provider_switch() {
         let _guard = super::env_test_lock().await;
-        let _provider = EnvVarGuard::set(
-            "ZEROCLAW_providers__models__openai.main__provider",
-            "new",
-        );
+        let _provider =
+            EnvVarGuard::set("ZEROCLAW_providers__models__openai.main__provider", "new");
         let _key = EnvVarGuard::set(
             "ZEROCLAW_providers__models__openai__main__api_key",
             "new-key",
