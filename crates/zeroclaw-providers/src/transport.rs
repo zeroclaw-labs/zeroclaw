@@ -134,6 +134,19 @@ impl HttpTransportConfig {
     }
 
     pub fn client(&self, default_timeout: Duration, service_key: &str) -> Result<Client> {
+        self.client_with_connect_timeout(default_timeout, None, service_key)
+    }
+
+    /// Build a client with an optional capability-specific connection
+    /// deadline. The request timeout remains the shared policy; callers that
+    /// historically bounded connection establishment can opt into that
+    /// narrower limit without changing other capability adapters.
+    pub fn client_with_connect_timeout(
+        &self,
+        default_timeout: Duration,
+        connect_timeout: Option<Duration>,
+        service_key: &str,
+    ) -> Result<Client> {
         // The shared cache owns proxy-generation invalidation. The profile
         // fingerprint only identifies this adapter's resolved transport policy.
         let timeout = match &self.request_timeout_secs {
@@ -147,6 +160,7 @@ impl HttpTransportConfig {
             .map(|path| std::fs::read(path).context("reading provider TLS CA certificate"))
             .transpose()?;
         let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
+        connect_timeout.hash(&mut fingerprint);
         timeout.hash(&mut fingerprint);
         self.extra_headers.hash(&mut fingerprint);
         certificate.hash(&mut fingerprint);
@@ -157,6 +171,9 @@ impl HttpTransportConfig {
             &profile,
             |builder| {
                 let mut builder = builder.default_headers(self.headers()?);
+                if let Some(timeout) = connect_timeout {
+                    builder = builder.connect_timeout(timeout);
+                }
                 if !self.follow_redirects {
                     builder = builder.redirect(reqwest::redirect::Policy::none());
                 }
