@@ -50,11 +50,12 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 hyper = { version = "1", features = ["http1", "server"] }
 tempfile = "3.26"
 scopeguard = "1.2"
+toml = "1.0"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-nix = { version = "0.30", default-features = false, features = ["process", "signal"] }
+nix = { version = "0.30", default-features = false, features = ["process", "signal", "user"] }
 
 [target.'cfg(windows)'.dependencies]
 process-wrap = { version = "=9.0.0", default-features = false, features = ["job-object", "kill-on-drop", "tokio1"] }
