@@ -117,9 +117,11 @@ impl EmbeddingProvider for OpenAiEmbedding {
             input: texts,
         };
 
-        let client = self
-            .transport
-            .client(EMBEDDING_HTTP_TIMEOUT, "memory.embeddings")?;
+        let client = self.transport.client_with_connect_timeout(
+            EMBEDDING_HTTP_TIMEOUT,
+            Some(std::time::Duration::from_secs(10)),
+            "memory.embeddings",
+        )?;
         let resp = self
             .transport
             .bearer(client.post(self.embeddings_url()?))
