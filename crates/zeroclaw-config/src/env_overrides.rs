@@ -87,6 +87,7 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
     let mut registry_staged = registry_before.clone();
     let mut paths: HashSet<String> = HashSet::with_capacity(entries.len());
     let mut snapshots: HashMap<String, String> = HashMap::with_capacity(entries.len());
+    let mut canonical_registry_before = None;
     let mut registry_edits = Vec::new();
     let mut deferred_registry_edits = Vec::new();
     for (env_name, value, tail) in entries {
@@ -157,7 +158,19 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
         // `config` carry plaintext (post-`decrypt_secrets`), so the snapshot
         // captures the real value that should be restored at save time.
         let snapshot = if path.starts_with("/providers/") {
-            crate::provider_registry::env_input::snapshot_document(&registry_before, &path)?
+            let source = if is_legacy_model_env_for_loaded_profile(config, &tail) {
+                if canonical_registry_before.is_none() {
+                    let mut projected = config.clone();
+                    crate::migration::provider_inputs::normalize(&mut projected)?;
+                    canonical_registry_before = Some(serde_json::to_value(&projected.providers)?);
+                }
+                canonical_registry_before.as_ref().ok_or_else(|| {
+                    anyhow::Error::msg("canonical env snapshot was not initialized")
+                })?
+            } else {
+                &registry_before
+            };
+            crate::provider_registry::env_input::snapshot_document(source, &path)?
         } else {
             raw_value_for_path(config, &path).unwrap_or_default()
         };
