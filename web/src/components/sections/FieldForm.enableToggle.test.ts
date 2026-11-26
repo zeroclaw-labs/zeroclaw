@@ -88,6 +88,9 @@ for (const concurrentSave of [false, true]) {
           entries: Object.entries(values).map(([path, value]) => ({
             path,
             value,
+            description: path.endsWith("timeout_ms")
+              ? "Time to wait for the browser."
+              : undefined,
             populated: true,
             is_secret: false,
             kind: path.endsWith("enabled") ? "bool" : "integer",
@@ -136,6 +139,8 @@ for (const concurrentSave of [false, true]) {
         );
         await flushEffects();
       });
+      // The schema fixture has no description. The list entry still supplies help.
+      assert.match(container.textContent ?? "", /Time to wait for the browser\./);
       const button = (text: string) => {
         const result = Array.from(container.querySelectorAll("button")).find(
           (b) => b.textContent?.trim() === text,

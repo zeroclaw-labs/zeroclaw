@@ -599,6 +599,8 @@ export interface PropResponse {
 
 export interface ListResponseEntry {
   path: string;
+  /** English field help from the gateway. Older gateways omit it. */
+  description?: string;
   category: string;
   /**
    * Stable kind tag from the gateway: 'string' | 'bool' | 'integer' | 'float'
@@ -1111,10 +1113,9 @@ export function deleteSkill(
 //
 // `OPTIONS /api/config` returns the schemars-derived JSON Schema for the
 // whole `Config` type, with every `///` doc comment surfaced as a
-// `description` property. We fetch it once per session, walk it for any
-// dotted path (kebab segments, snake-cased to match Rust field names),
-// and surface the description as form helper text — no widening of the
-// per-field list endpoint, no per-field round trips.
+// `description` property. For field help, the form tries this cached schema
+// first. When a runtime property path does not resolve, it uses the English
+// description returned with that list entry.
 
 type JsonSchema = Record<string, unknown> | undefined;
 

@@ -16220,20 +16220,15 @@ impl Default for SchedulerConfig {
 #[prefix = "model_routes"]
 #[application = "model_provider_refresh"]
 pub struct ModelRouteConfig {
-    /// Task hint name (e.g. "reasoning", "fast", "code", "summarize")
-    /// `#[serde(default)]` lets the `create_map_key` macro default-construct
-    /// from `{}` before the hint gets injected via `set_prop`. Empty strings
-    /// are rejected by `Config::validate()`.
+    // create_map_key constructs a route from {} before set_prop fills the hint.
+    // Validation rejects empty hints, provider references and model identifiers.
+    /// Task hint name (e.g. "reasoning", "fast", "code", "summarize").
     #[serde(default)]
     pub hint: String,
-    /// Dotted provider profile ref to route to (must resolve to `providers.models.<type>.<alias>`)
-    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
-    /// Empty strings are rejected by `Config::validate()`.
+    /// Provider profile for this route. Use a reference that resolves under `providers.models.<type>.<alias>`.
     #[serde(default)]
     pub model_provider: String,
-    /// Provider-local model identifier to use with that provider profile
-    /// `#[serde(default)]` is required for `Default` + `create_map_key` construction.
-    /// Empty strings are rejected by `Config::validate()`.
+    /// Model identifier used by this route's provider profile.
     #[serde(default)]
     pub model: String,
     /// Optional API key override for this route's model provider
