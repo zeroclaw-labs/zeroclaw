@@ -11,6 +11,7 @@ pub mod migrate;
 pub mod observer_bridge;
 pub mod reader;
 mod subscriber;
+mod temp_guard;
 pub mod tool_io;
 pub mod writer;
 

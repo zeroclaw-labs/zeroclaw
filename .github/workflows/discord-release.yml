@@ -189,7 +189,13 @@ jobs:
           print(json.dumps(payload))
           ")
 
-          HTTP_CODE=$(curl -s -o /tmp/discord_response.txt -w "%{http_code}" \
+          # Retry what Discord reports as transient (408, 429, 500, 502, 503, 504),
+          # honouring Retry-After. A 5xx can arrive after the message was posted,
+          # so a retry may post it twice; that is the cheaper failure than a
+          # release with no announcement. Other errors, a bad webhook URL
+          # among them, fail at once.
+          HTTP_CODE=$(curl --no-progress-meter -o /tmp/discord_response.txt -w "%{http_code}" \
+            --retry 4 --retry-max-time 120 \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" \
             "$DISCORD_WEBHOOK_URL")
