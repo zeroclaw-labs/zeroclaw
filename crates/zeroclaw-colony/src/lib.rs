@@ -6,8 +6,6 @@ mod approval_channel;
 pub mod context_sources;
 pub mod room_tool;
 mod store;
-#[cfg(test)]
-mod tests;
 mod types;
 pub use types::*;
 
@@ -2165,3 +2163,8 @@ fn parse_proposal(raw: &str) -> Result<QueenProposal> {
 fn user_text(key: &str) -> String {
     zeroclaw_runtime::i18n::get_required_cli_string(key)
 }
+
+// Declared last: the config-save isolation gate treats everything after the
+// first `#[cfg(test)]` in a source file as test code.
+#[cfg(test)]
+mod tests;
