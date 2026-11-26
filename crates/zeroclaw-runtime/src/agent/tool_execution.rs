@@ -2921,7 +2921,7 @@ mod tests {
             name: "child".into(),
             description: "Context child".into(),
             kind: "builtin".into(),
-            command: String::new(),
+            command: String::new().into(),
             args: Default::default(),
             target: Some("context_child_probe".into()),
             locked_args: Default::default(),

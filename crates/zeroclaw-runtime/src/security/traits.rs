@@ -8,6 +8,13 @@ use std::process::Command;
 pub trait Sandbox: Send + Sync {
     fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()>;
 
+    /// Opt in only when this backend preserves literal argument boundaries.
+    fn wrap_literal_command(&self, _cmd: &mut Command) -> std::io::Result<()> {
+        Err(std::io::Error::unsupported(
+            "sandbox does not support direct executable arguments",
+        ))
+    }
+
     /// Wrap a runtime-built shell command with its pre-resolution identity.
     ///
     /// Host sandboxes retain the resolved program in `cmd`. A container
@@ -54,6 +61,10 @@ pub trait Sandbox: Send + Sync {
 pub struct NoopSandbox;
 
 impl Sandbox for NoopSandbox {
+    fn wrap_literal_command(&self, cmd: &mut Command) -> std::io::Result<()> {
+        self.wrap_command(cmd)
+    }
+
     fn wrap_command(&self, _cmd: &mut Command) -> std::io::Result<()> {
         // Pass through unchanged
         Ok(())

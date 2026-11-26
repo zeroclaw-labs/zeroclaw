@@ -780,6 +780,7 @@ impl ScopedToolRegistry {
         tools::late_tool_search_observer::record("phase", "factory", 1, 0);
         let AllToolsResult {
             mut native_memory,
+            skill_sandbox,
             tools: tools_registry,
             reserved_host_names: mut host_tool_names,
             delegate_handle,
@@ -1358,6 +1359,7 @@ impl ScopedToolRegistry {
                 skills,
                 Arc::clone(security),
                 runtime,
+                skill_sandbox,
                 nat64_prefixes.as_deref(),
                 PreparedSkill::Ready,
                 |skill_name, tool, kind_label| {
@@ -1686,6 +1688,7 @@ mod tests {
     fn built_with(tools: Vec<Box<dyn Tool>>) -> AllToolsResult {
         AllToolsResult {
             native_memory: Default::default(),
+            skill_sandbox: None,
             tools,
             reserved_host_names: HashSet::new(),
             delegate_handle: None,
@@ -1721,6 +1724,7 @@ mod tests {
             .collect();
         AllToolsResult {
             native_memory: Default::default(),
+            skill_sandbox: None,
             tools,
             reserved_host_names: HashSet::new(),
             delegate_handle: None,
@@ -1829,7 +1833,7 @@ mod tests {
                 name: "chain".to_string(),
                 description: "run a pipeline".to_string(),
                 kind: "builtin".to_string(),
-                command: String::new(),
+                command: String::new().into(),
                 args: Default::default(),
                 target: Some(tools::PipelineTool::NAME.to_string()),
                 locked_args: Default::default(),
@@ -2046,7 +2050,7 @@ mod tests {
                 name: "restricted".to_string(),
                 description: "wrap a context-restricted builtin".to_string(),
                 kind: "builtin".to_string(),
-                command: String::new(),
+                command: String::new().into(),
                 args: Default::default(),
                 target: Some(child_name.to_string()),
                 locked_args: Default::default(),
@@ -2685,7 +2689,7 @@ mod tests {
                 name: "store".into(),
                 description: "write".into(),
                 kind: "builtin".into(),
-                command: String::new(),
+                command: String::new().into(),
                 args: Default::default(),
                 target: Some("memory_store".into()),
                 locked_args: Default::default(),
@@ -2881,7 +2885,7 @@ mod tests {
                 name: "fetch".to_string(),
                 description: "fetch".to_string(),
                 kind: "http".to_string(),
-                command: "https://[2001:4860:4860::a00:1]/".to_string(),
+                command: "https://[2001:4860:4860::a00:1]/".to_string().into(),
                 args: Default::default(),
                 target: None,
                 locked_args: Default::default(),

@@ -263,6 +263,17 @@ pub trait RuntimeAdapter: Send + Sync {
         None
     }
 
+    /// Build a direct process in this runtime, without executing it. Adapters
+    /// must opt in: shell access does not imply native executable access.
+    fn build_literal_command(
+        &self,
+        _program: &str,
+        _args: &[String],
+        _workspace: &Path,
+    ) -> anyhow::Result<tokio::process::Command> {
+        anyhow::bail!("runtime does not support direct executable arguments")
+    }
+
     /// Build a shell command process configured for this runtime.
     ///
     /// Constructs a [`tokio::process::Command`] that will execute `command`

@@ -418,6 +418,26 @@ impl RuntimeAdapter for NativeRuntime {
         Some(OsStr::new(&self.shell))
     }
 
+    #[cfg(unix)]
+    fn build_literal_command(
+        &self,
+        program: &str,
+        args: &[String],
+        workspace: &Path,
+    ) -> anyhow::Result<tokio::process::Command> {
+        let resolved = crate::platform::resolve_executable(OsStr::new(program))?;
+        // A symlink can name a different program with different argument rules.
+        // Do not authorize one tool identity and run another, or change applet mode.
+        anyhow::ensure!(
+            resolved.file_name() == Path::new(program).file_name()
+                && (!Path::new(program).is_absolute() || resolved == Path::new(program)),
+            "direct executable identity differs after resolution"
+        );
+        let mut cmd = tokio::process::Command::new(resolved);
+        cmd.args(args).current_dir(workspace);
+        Ok(cmd)
+    }
+
     fn build_shell_command(
         &self,
         command: &str,

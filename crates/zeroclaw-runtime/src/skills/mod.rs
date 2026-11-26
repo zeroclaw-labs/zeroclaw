@@ -304,32 +304,7 @@ impl ::zeroclaw_api::attribution::Attributable for Skill {
     }
 }
 
-/// A tool defined by a skill (shell command, HTTP call, etc.)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillTool {
-    pub name: String,
-    pub description: String,
-    /// "shell", "http", "script", "builtin", "mcp"
-    pub kind: String,
-    /// The command/URL/script to execute (unused for builtin/mcp kinds)
-    #[serde(default)]
-    pub command: String,
-    #[serde(default)]
-    pub args: HashMap<String, String>,
-    /// For `kind = "builtin"`: the name of the built-in tool to delegate to.
-    /// For `kind = "mcp"`: the prefixed MCP tool name `{server}__{tool}`
-    /// (e.g. `images__generate`).
-    #[serde(default)]
-    pub target: Option<String>,
-    #[serde(default, alias = "default_args")]
-    pub locked_args: HashMap<String, String>,
-    /// For `kind = "shell"` / `kind = "script"`: maximum execution time in
-    /// seconds before the command is killed. Unset falls back to the built-in
-    /// `SKILL_SHELL_TIMEOUT_SECS` (60s) default; long-running skills (e.g. a
-    /// build pipeline) raise it via `timeout_secs` in SKILL.toml.
-    #[serde(default)]
-    pub timeout_secs: Option<u64>,
-}
+pub use zeroclaw_skills::{SkillCommand, SkillTool};
 
 /// Skill manifest parsed from SKILL.toml
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1355,6 +1330,9 @@ fn mark_open_skills_synced(repo_dir: &Path) -> Result<()> {
 fn load_skill_toml(path: &Path) -> Result<Skill> {
     let content = std::fs::read_to_string(path)?;
     let manifest: SkillManifest = toml::from_str(&content)?;
+    for tool in &manifest.tools {
+        tool.validate_literal_argv().map_err(anyhow::Error::msg)?;
+    }
 
     // Merge prompts from both locations: inside the [skill] table (natural
     // location for per-skill prompts) and at the manifest root (historical
@@ -2020,10 +1998,12 @@ pub(crate) fn skills_to_tools_with_context_and_runtime_optional_nat64(
     runtime: std::sync::Arc<dyn crate::platform::RuntimeAdapter>,
     nat64_prefixes: Option<&[zeroclaw_infra::net_guard::Nat64Prefix]>,
 ) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
+    let sandbox = explicit_unsandboxed_skill_context(&security);
     prepare_skill_tools_with_runtime(
         skills,
         security,
         runtime,
+        sandbox,
         nat64_prefixes,
         |tool| tool,
         |skill_name, tool, kind_label| {
@@ -2032,12 +2012,23 @@ pub(crate) fn skills_to_tools_with_context_and_runtime_optional_nat64(
     )
 }
 
+/// Stand-alone builders have no registry-selected sandbox. Never infer no
+/// sandbox from missing settings or from a runtime's shell capability.
+pub(crate) fn explicit_unsandboxed_skill_context(
+    policy: &crate::security::SecurityPolicy,
+) -> Option<std::sync::Arc<dyn crate::security::Sandbox>> {
+    policy
+        .explicitly_disables_sandbox()
+        .then(|| std::sync::Arc::new(crate::security::NoopSandbox) as _)
+}
+
 /// Prepare a whole batch in the original constructor order. Scoped assembly can
 /// defer binding an elevation without substituting an executable placeholder.
 pub(crate) fn prepare_skill_tools_with_runtime<T>(
     skills: &[Skill],
     security: std::sync::Arc<crate::security::SecurityPolicy>,
     runtime: std::sync::Arc<dyn crate::platform::RuntimeAdapter>,
+    sandbox: Option<std::sync::Arc<dyn crate::security::Sandbox>>,
     nat64_prefixes: Option<&[zeroclaw_infra::net_guard::Nat64Prefix]>,
     mut ready: impl FnMut(Box<dyn zeroclaw_api::tool::Tool>) -> T,
     mut resolve: impl FnMut(&str, &SkillTool, &str) -> Option<T>,
@@ -2066,11 +2057,12 @@ pub(crate) fn prepare_skill_tools_with_runtime<T>(
             }
             match tool.kind.as_str() {
                 "shell" | "script" => {
-                    let inner = crate::skills::skill_tool::SkillShellTool::new_with_runtime(
+                    let inner = crate::skills::skill_tool::SkillShellTool::with_execution_context(
                         &skill.name,
                         tool,
                         security.clone(),
                         runtime.clone(),
+                        sandbox.clone(),
                     );
                     let wrapped =
                         zeroclaw_tools::wrappers::RateLimitedTool::new(inner, security.clone());
@@ -5079,7 +5071,7 @@ mod prompt_callable_name_tests {
             name: name.to_string(),
             description: "desc".to_string(),
             kind: kind.to_string(),
-            command: "echo hi".to_string(),
+            command: "echo hi".to_string().into(),
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),

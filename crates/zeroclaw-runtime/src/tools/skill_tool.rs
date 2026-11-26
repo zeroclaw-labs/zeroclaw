@@ -77,7 +77,8 @@ fn get_session_id() -> Option<String> {
 pub struct SkillShellTool {
     tool_name: String,
     tool_description: String,
-    command_template: String,
+    command_template: zeroclaw_skills::SkillCommand,
+    sandbox: Option<Arc<dyn crate::security::Sandbox>>,
     args: HashMap<String, String>,
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
@@ -104,10 +105,22 @@ impl SkillShellTool {
         security: Arc<SecurityPolicy>,
         runtime: Arc<dyn RuntimeAdapter>,
     ) -> Self {
+        let sandbox = crate::skills::explicit_unsandboxed_skill_context(&security);
+        Self::with_execution_context(skill_name, tool, security, runtime, sandbox)
+    }
+
+    pub(crate) fn with_execution_context(
+        skill_name: &str,
+        tool: &crate::skills::SkillTool,
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        sandbox: Option<Arc<dyn crate::security::Sandbox>>,
+    ) -> Self {
         Self {
             tool_name: composed_tool_name(skill_name, &tool.name),
             tool_description: tool.description.clone(),
             command_template: tool.command.clone(),
+            sandbox,
             args: tool.args.clone(),
             security,
             runtime,
@@ -139,8 +152,8 @@ impl SkillShellTool {
 
     /// Substitute `{{arg_name}}` placeholders in the command template with
     /// the provided argument values. Unknown placeholders are left as-is.
-    fn substitute_args(&self, args: &serde_json::Value) -> String {
-        let mut command = self.command_template.clone();
+    fn substitute_args(&self, template: &str, args: &serde_json::Value) -> String {
+        let mut command = template.to_owned();
         if let Some(obj) = args.as_object() {
             for (key, value) in obj {
                 let placeholder = format!("{{{{{}}}}}", key);
@@ -167,7 +180,32 @@ impl Tool for SkillShellTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let command = self.substitute_args(&args);
+        let template = match &self.command_template {
+            zeroclaw_skills::SkillCommand::Text(text) => text,
+            zeroclaw_skills::SkillCommand::Argv(template) => {
+                let sandbox = self
+                    .sandbox
+                    .as_ref()
+                    .filter(|s| s.name() != "none" || self.security.explicitly_disables_sandbox())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(crate::i18n::get_required_cli_string(
+                            "tool-skill-argv-no-sandbox-context"
+                        ))
+                    })?;
+                let mut cmd = zeroclaw_skills::argv::prepare(
+                    template,
+                    &self.args,
+                    &args,
+                    &self.security,
+                    self.runtime.as_ref(),
+                )?;
+                sandbox.check_initialization()?;
+                sandbox.wrap_literal_command(cmd.as_std_mut())?;
+                configure_skill_env(&mut cmd);
+                return super::shell::run_bounded_process(cmd, self.timeout_secs).await;
+            }
+        };
+        let command = self.substitute_args(template, &args);
 
         // The runtime resolves the shell on the daemon's own `PATH`. The
         // policy reads the command in that program's grammar, and nothing is
@@ -228,19 +266,7 @@ impl Tool for SkillShellTool {
                 error: Some(reason),
             });
         }
-        cmd.env_clear();
-
-        // Only pass safe environment variables
-        for var in SAFE_SHELL_ENV_VARS {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
-            }
-        }
-
-        // Injected after env_clear so it survives; absent when the turn is unscoped.
-        if let Some(session_id) = get_session_id() {
-            cmd.env(SESSION_ID_ENV_VAR, session_id);
-        }
+        configure_skill_env(&mut cmd);
 
         let result =
             tokio::time::timeout(Duration::from_secs(self.timeout_secs), cmd.output()).await;
@@ -291,6 +317,22 @@ impl Tool for SkillShellTool {
                 )),
             }),
         }
+    }
+}
+
+fn configure_skill_env(cmd: &mut tokio::process::Command) {
+    cmd.env_clear();
+
+    // Only pass safe environment variables
+    for var in SAFE_SHELL_ENV_VARS {
+        if let Ok(val) = std::env::var(var) {
+            cmd.env(var, val);
+        }
+    }
+
+    // Injected after env_clear so it survives; absent when the turn is unscoped.
+    if let Some(session_id) = get_session_id() {
+        cmd.env(SESSION_ID_ENV_VAR, session_id);
     }
 }
 
@@ -567,7 +609,9 @@ mod tests {
             name: "run_lint".to_string(),
             description: "Run the linter on a file".to_string(),
             kind: "shell".to_string(),
-            command: "lint --file {{file}} --format {{format}}".to_string(),
+            command: "lint --file {{file}} --format {{format}}"
+                .to_string()
+                .into(),
             args,
             target: None,
             locked_args: HashMap::new(),
@@ -679,17 +723,23 @@ mod tests {
     #[test]
     fn skill_shell_tool_substitute_args() {
         let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
-        let result = tool.substitute_args(&serde_json::json!({
-            "file": "src/main.rs",
-            "format": "json"
-        }));
+        let result = tool.substitute_args(
+            tool.command_template.text().unwrap(),
+            &serde_json::json!({
+                "file": "src/main.rs",
+                "format": "json"
+            }),
+        );
         assert_eq!(result, "lint --file src/main.rs --format json");
     }
 
     #[test]
     fn skill_shell_tool_substitute_missing_arg() {
         let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
-        let result = tool.substitute_args(&serde_json::json!({"file": "test.rs"}));
+        let result = tool.substitute_args(
+            tool.command_template.text().unwrap(),
+            &serde_json::json!({"file": "test.rs"}),
+        );
         // Missing {{format}} placeholder stays in the command
         assert!(result.contains("{{format}}"));
         assert!(result.contains("test.rs"));
@@ -701,7 +751,7 @@ mod tests {
             name: "simple".to_string(),
             description: "Simple tool".to_string(),
             kind: "shell".to_string(),
-            command: "echo hello".to_string(),
+            command: "echo hello".to_string().into(),
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),
@@ -720,7 +770,7 @@ mod tests {
             name: "hello".to_string(),
             description: "Say hello".to_string(),
             kind: "shell".to_string(),
-            command: "echo hello-skill".to_string(),
+            command: "echo hello-skill".to_string().into(),
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),
@@ -757,7 +807,7 @@ mod tests {
                 name: "cache_probe".into(),
                 description: "Read the inherited cache variable".into(),
                 kind: "shell".into(),
-                command: format!("set {KEY}"),
+                command: format!("set {KEY}").into(),
                 args: HashMap::new(),
                 target: None,
                 locked_args: HashMap::new(),
@@ -821,7 +871,9 @@ mod tests {
             name: "safe_pipeline".to_string(),
             description: "Run a safe PowerShell pipeline".to_string(),
             kind: "shell".to_string(),
-            command: "Write-Output \"quoted safe value\" | Select-Object -First 1".to_string(),
+            command: "Write-Output \"quoted safe value\" | Select-Object -First 1"
+                .to_string()
+                .into(),
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),
@@ -995,7 +1047,7 @@ mod tests {
             name: "use_shell".to_string(),
             description: "Elevated shell access via skill".to_string(),
             kind: "builtin".to_string(),
-            command: String::new(),
+            command: String::new().into(),
             args: HashMap::new(),
             target: Some("shell".to_string()),
             locked_args: HashMap::new(),
@@ -1243,7 +1295,7 @@ mod tests {
             name: "gen_pdf".to_string(),
             description: "Generate PDF".to_string(),
             kind: "builtin".to_string(),
-            command: String::new(),
+            command: String::new().into(),
             args: HashMap::new(),
             target: Some("composio".to_string()),
             locked_args: locked.clone(),
@@ -1309,7 +1361,7 @@ mod tests {
             name: "delegate".to_string(),
             description: "d".to_string(),
             kind: kind.to_string(),
-            command: String::new(),
+            command: String::new().into(),
             args: HashMap::new(),
             target: Some(target.to_string()),
             locked_args: locked,
@@ -1472,7 +1524,7 @@ mod tests {
                 name: "use_shell".to_string(),
                 description: "scoped shell".to_string(),
                 kind: "builtin".to_string(),
-                command: String::new(),
+                command: String::new().into(),
                 args: HashMap::new(),
                 target: Some("shell".to_string()),
                 locked_args: HashMap::new(),
@@ -1514,7 +1566,7 @@ mod shell_grammar_tests {
             name: "heredoc".to_string(),
             description: "Print a heredoc".to_string(),
             kind: "shell".to_string(),
-            command: command.to_string(),
+            command: command.to_string().into(),
             args: HashMap::new(),
             target: None,
             locked_args: HashMap::new(),

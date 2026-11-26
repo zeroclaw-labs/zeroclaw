@@ -14655,6 +14655,7 @@ dependencies = [
  "zeroclaw-providers",
  "zeroclaw-relay-proto",
  "zeroclaw-rpc-proto",
+ "zeroclaw-skills",
  "zeroclaw-sop-graph",
  "zeroclaw-spawn",
  "zeroclaw-tls",
@@ -14662,6 +14663,19 @@ dependencies = [
  "zeroclaw-tools",
  "zeroize",
  "zerorelay",
+]
+
+[[package]]
+name = "zeroclaw-skills"
+version = "0.9.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml 1.1.2+spec-1.1.0",
+ "zeroclaw-api",
+ "zeroclaw-config",
 ]
 
 [[package]]

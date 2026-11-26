@@ -1,3 +1,5 @@
+mod literal_argv;
+
 use anyhow::Context as _;
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
@@ -4659,10 +4661,19 @@ impl SecurityPolicy {
 
         let risk = self.command_risk_level_for_grammar(command, shell);
 
+        self.authorize_command_risk(risk, approved, || {
+            self.is_command_explicitly_allowed_for_shell(command, shell)
+        })
+    }
+
+    fn authorize_command_risk(
+        &self,
+        risk: CommandRiskLevel,
+        approved: bool,
+        explicitly_allowed: impl FnOnce() -> bool,
+    ) -> Result<CommandRiskLevel, String> {
         if risk == CommandRiskLevel::High {
-            if self.block_high_risk_commands
-                && !self.is_command_explicitly_allowed_for_shell(command, shell)
-            {
+            if self.block_high_risk_commands && !explicitly_allowed() {
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
             }
             if self.autonomy == AutonomyLevel::Supervised && !approved {
@@ -5100,6 +5111,51 @@ impl SecurityPolicy {
         )
     }
 
+    fn forbidden_path_candidate(
+        &self,
+        candidate: &str,
+        dialect: ShellDialect,
+        resolve_workspace: bool,
+    ) -> Option<String> {
+        if !looks_like_path_for_shell(candidate, dialect) {
+            return None;
+        }
+        // String-level policy: absolute paths outside the workspace, `..`
+        // traversal, `~user` forms, and forbidden prefixes.
+        if !self.is_path_allowed_for_shell(candidate, dialect) {
+            return Some(candidate.to_string());
+        }
+        // A workspace-relative argument can still escape the boundary via a
+        // symlink whose target is outside the workspace: the string check
+        // above passes because the literal path has no `..` and is not
+        // absolute, yet the real target is elsewhere. The file tools already
+        // block this by canonicalizing before checking; mirror that here for
+        // the path-shaped argument forms this static scan can see (a full
+        // boundary needs the execution-time sandbox). Resolve the deepest
+        // existing ancestor (the leaf may be about to be created, e.g.
+        // `touch link/new.txt`) and re-check the resolved target with the
+        // symlink-aware policy.
+        // For a command that runs IN the workspace, also resolve symlinks and
+        // re-check: a workspace-relative arg can point outside via an
+        // in-workspace symlink, which the string check above misses. A
+        // command argument may be read OR written, so accept the resolved
+        // target if it is allowed for EITHER (mirrors the string
+        // `is_path_allowed`, which honors both read-only and write-only
+        // roots). Fail closed otherwise: a target outside every allowed root
+        // is blocked, and so is one that cannot be resolved at all (a symlink
+        // cycle exhausting the hop budget) - `None` means "unresolvable", not
+        // "allowed" - so a crafted chain cannot dodge the check.
+        if resolve_workspace {
+            match self.resolve_command_path_argument(candidate, dialect) {
+                Some(resolved)
+                    if self.is_resolved_path_allowed(&resolved)
+                        || self.is_resolved_path_readable(&resolved) => {}
+                _ => return Some(candidate.to_string()),
+            }
+        }
+        None
+    }
+
     fn forbidden_path_argument_impl(
         &self,
         command: &str,
@@ -5117,43 +5173,7 @@ impl SecurityPolicy {
             if candidate.is_empty() || candidate.contains("://") {
                 return None;
             }
-            if !looks_like_path_for_shell(candidate, dialect) {
-                return None;
-            }
-            // String-level policy: absolute paths outside the workspace, `..`
-            // traversal, `~user` forms, and forbidden prefixes.
-            if !self.is_path_allowed_for_shell(candidate, dialect) {
-                return Some(candidate.to_string());
-            }
-            // A workspace-relative argument can still escape the boundary via a
-            // symlink whose target is outside the workspace: the string check
-            // above passes because the literal path has no `..` and is not
-            // absolute, yet the real target is elsewhere. The file tools already
-            // block this by canonicalizing before checking; mirror that here for
-            // the path-shaped argument forms this static scan can see (a full
-            // boundary needs the execution-time sandbox). Resolve the deepest
-            // existing ancestor (the leaf may be about to be created, e.g.
-            // `touch link/new.txt`) and re-check the resolved target with the
-            // symlink-aware policy.
-            // For a command that runs IN the workspace, also resolve symlinks and
-            // re-check: a workspace-relative arg can point outside via an
-            // in-workspace symlink, which the string check above misses. A
-            // command argument may be read OR written, so accept the resolved
-            // target if it is allowed for EITHER (mirrors the string
-            // `is_path_allowed`, which honors both read-only and write-only
-            // roots). Fail closed otherwise: a target outside every allowed root
-            // is blocked, and so is one that cannot be resolved at all (a symlink
-            // cycle exhausting the hop budget) - `None` means "unresolvable", not
-            // "allowed" - so a crafted chain cannot dodge the check.
-            if resolve_workspace {
-                match self.resolve_command_path_argument(candidate, dialect) {
-                    Some(resolved)
-                        if self.is_resolved_path_allowed(&resolved)
-                            || self.is_resolved_path_readable(&resolved) => {}
-                    _ => return Some(candidate.to_string()),
-                }
-            }
-            None
+            self.forbidden_path_candidate(candidate, dialect, resolve_workspace)
         };
         let forbidden_non_redirect_candidate = |raw: &str| {
             let candidate = strip_wrapping_quotes(raw).trim();

@@ -740,7 +740,7 @@ mod tests {
                 name: "open".to_string(),
                 description: "Open a browser page through a skill".to_string(),
                 kind: "builtin".to_string(),
-                command: String::new(),
+                command: String::new().into(),
                 args: HashMap::new(),
                 target: Some("browser".to_string()),
                 locked_args: HashMap::new(),

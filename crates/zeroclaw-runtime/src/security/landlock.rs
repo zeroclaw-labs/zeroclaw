@@ -569,6 +569,10 @@ impl LandlockSandbox {
 
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
 impl Sandbox for LandlockSandbox {
+    fn wrap_literal_command(&self, cmd: &mut std::process::Command) -> std::io::Result<()> {
+        self.wrap_command(cmd)
+    }
+
     fn wrap_command(&self, cmd: &mut std::process::Command) -> std::io::Result<()> {
         // Build the ruleset in the parent process where allocation is safe.
         // `RulesetCreated` is `Send + Sync + 'static`, which is necessary

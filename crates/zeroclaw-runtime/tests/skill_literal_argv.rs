@@ -1,8 +1,5 @@
-//! Offline draft contracts. Only the `prototype_*` tests use the candidate binder;
-//! the other tests exercise the actual manifest audit, loader and tool factory.
-
-#[path = "skill_literal_argv/binding.rs"]
-mod binding;
+//! Executable skill contracts against the manifest, production binder and tool registry.
+use zeroclaw_skills::argv as binding;
 
 use serde_json::json;
 use std::collections::HashMap;
@@ -23,7 +20,7 @@ fn write_manifest(root: &Path, kind: &str, declaration: &str) {
 }
 
 #[test]
-fn prototype_rejects_invalid_templates_and_non_string_input() {
+fn binder_rejects_invalid_templates_and_non_string_input() {
     let declared = HashMap::from([("text".into(), "Text".into())]);
     let bad_input = "expected one string per declared argument";
     for (raw, input, reason) in [
@@ -149,7 +146,7 @@ mod unix {
     }
 
     #[test]
-    fn prototype_transports_each_element_to_the_disposable_cli() {
+    fn binder_transports_each_element_to_the_disposable_cli() {
         let root = tempfile::tempdir().unwrap();
         let executable = recorder(root.path(), "recorder");
         let template = template(&executable);
@@ -187,6 +184,9 @@ mod unix {
         assert!(dropped.is_empty(), "load: {dropped:?}");
         let policy = Arc::new(SecurityPolicy {
             workspace_dir: root.to_owned(),
+            // The standalone factory has no OS sandbox handle; explicitly select
+            // the native process fixture, keeping every command policy check.
+            sandbox_enabled: Some(false),
             allowed_commands: vec![allowed_program.to_owned()],
             ..SecurityPolicy::default()
         });

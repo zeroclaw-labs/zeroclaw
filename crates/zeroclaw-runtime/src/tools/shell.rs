@@ -357,116 +357,7 @@ impl Tool for ShellTool {
             cmd.env("PATH", android_child_path(tui_path, &ambient));
         }
 
-        let timeout_secs = self.timeout_secs;
-        // A process group alone still inherits the daemon's controlling terminal.
-        // A new session detaches it and gives ChildGroupGuard the same child-owned PGID.
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-
-            // SAFETY: setsid is async-signal-safe; the post-fork hook takes no
-            // locks and allocates nothing before exec.
-            unsafe {
-                cmd.as_std_mut().pre_exec(|| {
-                    if libc::setsid() == -1 {
-                        Err(std::io::Error::last_os_error())
-                    } else {
-                        Ok(())
-                    }
-                });
-            }
-        }
-        cmd.kill_on_drop(true);
-        // `output()` pipes stdio implicitly; `spawn()` does not.
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        cmd.stdin(std::process::Stdio::null());
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!("Failed to spawn command: {e}")),
-                });
-            }
-        };
-
-        #[cfg(unix)]
-        let group_guard = ChildGroupGuard::new(child.id());
-
-        let stdout_handle = child.stdout.take();
-        let stderr_handle = child.stderr.take();
-
-        let stdout_drain = spawn_drain(stdout_handle, MAX_OUTPUT_BYTES);
-        let stderr_drain = spawn_drain(stderr_handle, MAX_OUTPUT_BYTES);
-
-        let mut result =
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-                Ok(Ok(status)) => {
-                    #[cfg(unix)]
-                    group_guard.disarm();
-                    let (stdout_capture, stderr_capture) =
-                        tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
-
-                    let mut stdout = decode_capture(&stdout_capture);
-                    let mut stderr = decode_capture(&stderr_capture);
-
-                    if stdout_capture.truncated || stdout.len() > MAX_OUTPUT_BYTES {
-                        append_truncation_marker(&mut stdout, "\n... [output truncated at 1MB]");
-                    }
-                    if stderr_capture.truncated || stderr.len() > MAX_OUTPUT_BYTES {
-                        append_truncation_marker(&mut stderr, "\n... [stderr truncated at 1MB]");
-                    }
-
-                    let success = status.success();
-                    // On failure, put the exit status plus stderr (or stdout if
-                    // stderr is empty) into `error`. Leaving `error` empty made
-                    // run logs show `"error":""` and hid the command's diagnostic
-                    // from the model. When stdout is used as the failure detail,
-                    // clear `output` so the dispatcher does not fold a duplicate
-                    // copy into the model-visible text.
-                    let used_stdout_as_error =
-                        !success && stderr.trim_end().is_empty() && !stdout.trim_end().is_empty();
-                    ToolResult {
-                        success,
-                        output: if used_stdout_as_error {
-                            ToolOutput::default()
-                        } else {
-                            stdout.clone().into()
-                        },
-                        error: if success {
-                            if stderr.is_empty() {
-                                None
-                            } else {
-                                Some(stderr)
-                            }
-                        } else {
-                            Some(format_shell_failure_error(status, &stderr, &stdout))
-                        },
-                    }
-                }
-                Ok(Err(e)) => {
-                    tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
-                    ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(format!("Failed to execute command: {e}")),
-                    }
-                }
-                Err(_) => {
-                    let _ = child.start_kill();
-                    tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
-                    ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(format!(
-                            "Command timed out after {timeout_secs}s and was killed"
-                        )),
-                    }
-                }
-            };
+        let mut result = run_bounded_process(cmd, self.timeout_secs).await?;
 
         // The command ran inside an ephemeral workspace: any files it wrote are
         // invisible on the host and discarded at session end
@@ -481,6 +372,123 @@ impl Tool for ShellTool {
 
         Ok(result)
     }
+}
+
+/// Shared child lifecycle for a process already admitted and prepared by its tool.
+pub(super) async fn run_bounded_process(
+    mut cmd: tokio::process::Command,
+    timeout_secs: u64,
+) -> anyhow::Result<ToolResult> {
+    // A process group alone still inherits the daemon's controlling terminal.
+    // A new session detaches it and gives ChildGroupGuard the same child-owned PGID.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        // SAFETY: setsid is async-signal-safe; the post-fork hook takes no
+        // locks and allocates nothing before exec.
+        unsafe {
+            cmd.as_std_mut().pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+    }
+    cmd.kill_on_drop(true);
+    // `output()` pipes stdio implicitly; `spawn()` does not.
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.stdin(std::process::Stdio::null());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("Failed to spawn command: {e}")),
+            });
+        }
+    };
+
+    #[cfg(unix)]
+    let group_guard = ChildGroupGuard::new(child.id());
+
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+
+    let stdout_drain = spawn_drain(stdout_handle, MAX_OUTPUT_BYTES);
+    let stderr_drain = spawn_drain(stderr_handle, MAX_OUTPUT_BYTES);
+
+    let result = match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+        Ok(Ok(status)) => {
+            #[cfg(unix)]
+            group_guard.disarm();
+            let (stdout_capture, stderr_capture) =
+                tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
+
+            let mut stdout = decode_capture(&stdout_capture);
+            let mut stderr = decode_capture(&stderr_capture);
+
+            if stdout_capture.truncated || stdout.len() > MAX_OUTPUT_BYTES {
+                append_truncation_marker(&mut stdout, "\n... [output truncated at 1MB]");
+            }
+            if stderr_capture.truncated || stderr.len() > MAX_OUTPUT_BYTES {
+                append_truncation_marker(&mut stderr, "\n... [stderr truncated at 1MB]");
+            }
+
+            let success = status.success();
+            // On failure, put the exit status plus stderr (or stdout if
+            // stderr is empty) into `error`. Leaving `error` empty made
+            // run logs show `"error":""` and hid the command's diagnostic
+            // from the model. When stdout is used as the failure detail,
+            // clear `output` so the dispatcher does not fold a duplicate
+            // copy into the model-visible text.
+            let used_stdout_as_error =
+                !success && stderr.trim_end().is_empty() && !stdout.trim_end().is_empty();
+            ToolResult {
+                success,
+                output: if used_stdout_as_error {
+                    ToolOutput::default()
+                } else {
+                    stdout.clone().into()
+                },
+                error: if success {
+                    if stderr.is_empty() {
+                        None
+                    } else {
+                        Some(stderr)
+                    }
+                } else {
+                    Some(format_shell_failure_error(status, &stderr, &stdout))
+                },
+            }
+        }
+        Ok(Err(e)) => {
+            tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
+            ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("Failed to execute command: {e}")),
+            }
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
+            ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Command timed out after {timeout_secs}s and was killed"
+                )),
+            }
+        }
+    };
+
+    Ok(result)
 }
 
 struct DrainHandle {
