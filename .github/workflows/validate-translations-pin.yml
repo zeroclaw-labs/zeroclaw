@@ -1,9 +1,8 @@
 name: Validate Translations Pin
 
-# Gates the docs/book/po submodule at the exact commit a PR pins it to. The
-# pin only advances through scripts/release/bump-version.sh on a release PR, so
-# this runs whenever a PR moves the gitlink or .gitmodules and validates the
-# pinned catalogues in the main repo's own CI, before the bad SHA can merge.
+# Validates the catalogues at the exact docs/book/po commit a PR pins.
+# The release runbook uses scripts/release/refresh-translations.sh to stage
+# the updated gitlink after scripts/release/bump-version.sh sets the version.
 on:
   pull_request:
     paths:
