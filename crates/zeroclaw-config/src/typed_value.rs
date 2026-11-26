@@ -143,7 +143,9 @@ pub fn coerce_for_set_prop(
         (Some(PropKind::Float), serde_json::Value::Number(n)) => Ok(n.to_string()),
         (Some(PropKind::Float), serde_json::Value::String(s)) => {
             let trimmed = s.trim();
-            if trimmed.parse::<f64>().is_ok() {
+            // `str::parse` also reads `inf`, `NaN` and out-of-range text such
+            // as `1e999` (as infinity); none is a value a float setting holds.
+            if trimmed.parse::<f64>().is_ok_and(f64::is_finite) {
                 Ok(trimmed.to_string())
             } else {
                 Err(ConfigApiError::new(
@@ -296,6 +298,51 @@ mod tests {
             .unwrap(),
             "2.5"
         );
+    }
+
+    /// Text that `str::parse` reads as infinity or NaN is refused for a float
+    /// field the same way text that is not a number is.
+    #[test]
+    fn float_string_refuses_non_finite_text() {
+        for text in [
+            "inf", "+inf", "-inf", "Infinity", "infinity", "NaN", "nan", "1e999", "-1e999",
+        ] {
+            let err = coerce_for_set_prop(
+                &serde_json::Value::String(text.into()),
+                Some(PropKind::Float),
+            )
+            .expect_err(text);
+            assert_eq!(err.code, ConfigApiCode::ValueTypeMismatch, "{text}");
+            assert!(
+                err.message.contains("float field requires a number"),
+                "{text}: {}",
+                err.message
+            );
+        }
+    }
+
+    /// Finite text is accepted as before, at both ends of the range, as a
+    /// negative zero, and as a whole number written for a float field.
+    #[test]
+    fn float_string_keeps_finite_edge_values() {
+        for text in [
+            "-0.0",
+            "5e-324",
+            "1.7976931348623157e308",
+            "-1.7976931348623157e308",
+            "5",
+            "0",
+            "2.5e3",
+        ] {
+            assert_eq!(
+                coerce_for_set_prop(
+                    &serde_json::Value::String(text.into()),
+                    Some(PropKind::Float)
+                )
+                .unwrap(),
+                text
+            );
+        }
     }
 
     #[test]

@@ -63,6 +63,7 @@ async function mountMeter() {
   const runtime: AgentSessionRuntime = {
     createSocket: () => socket,
     getMessages: async (sessionId) => ({ session_id: sessionId, session_persistence: true, messages: [] }),
+    getState: async (sessionId) => ({ session_id: sessionId, state: 'idle' }),
     delete: async () => ({ deleted: true }),
     rename: async (sessionId, name) => ({ session_id: sessionId, name }),
     mintId: () => 'meter-session',

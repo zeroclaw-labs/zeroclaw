@@ -106,7 +106,7 @@ class GitHubClient:
             connection.request(method, request_path, body=body, headers=headers)
             response = connection.getresponse()
             data = response.read()
-            response_headers = {key: value for key, value in response.getheaders()}
+            response_headers = {key.lower(): value for key, value in response.getheaders()}
             return response.status, response_headers, data
         finally:
             connection.close()
@@ -129,7 +129,7 @@ class GitHubClient:
             if not isinstance(page, list):
                 raise ValueError(f"expected list response from {url}")
             yield from page
-            url = next_link(headers.get("Link"))
+            url = next_link(headers.get("link"))
 
 
 class GitHubHTTPError(RuntimeError):

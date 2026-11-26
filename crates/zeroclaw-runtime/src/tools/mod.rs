@@ -324,7 +324,8 @@ pub fn composio_tool_available(config: &Config) -> bool {
     feature = "tool-claude-code-runner",
     feature = "tool-codex-cli",
     feature = "tool-gemini-cli",
-    feature = "tool-opencode-cli"
+    feature = "tool-opencode-cli",
+    feature = "tools-external"
 )))]
 fn warn_tool_compiled_out(root_config: &Config, tool: zeroclaw_config::opt_in_tools::OptInTool) {
     if tool.enabled_in(root_config) {
@@ -2542,10 +2543,11 @@ fn all_tools_with_runtime_on_thread(
         Arc::new(tool)
     });
     register_tool!("send_message_to_peer", {
-        let tool = SendMessageToPeerTool::new_with_live_config_and_capability(
+        let tool = SendMessageToPeerTool::new_with_live_config_security_and_capability(
             Arc::clone(&root_config_shared),
             agent_alias,
             live_config.clone(),
+            security.clone(),
             execution_capability.clone(),
         );
         capability_slots.push(tool.capabilities_slot());
@@ -2948,6 +2950,11 @@ fn all_tools_with_runtime_on_thread(
     }
 
     // Web search requires explicit selection and provider configuration
+    #[cfg(not(feature = "tools-external"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::WebSearch,
+    );
     #[cfg(feature = "tools-external")]
     if root_config.web_search.enabled && select_tool!("web_search_tool") {
         // Rate-limited like every other outbound-network tool (see web_fetch
@@ -2979,6 +2986,9 @@ fn all_tools_with_runtime_on_thread(
             // `config.toml` and miss an env-only key, or send a stored key
             // that a blank override was meant to suppress.
             .with_keenable_api_key_override(WebSearchTool::keenable_api_key_override(
+                root_config,
+            ))
+            .with_firecrawl_api_key_override(WebSearchTool::firecrawl_api_key_override(
                 root_config,
             )),
                 security.clone(),

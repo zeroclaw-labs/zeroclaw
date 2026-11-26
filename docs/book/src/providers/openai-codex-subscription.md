@@ -128,6 +128,37 @@ To avoid editing config on every model bump, resolve roles to current served
 IDs dynamically (enumerate `codex/models`, pick the newest match per role)
 rather than pinning a version.
 
+### System prompt placement on GPT-6.2 and newer
+
+For OpenAI `gpt-6.2` and newer (`gpt-6.2-sol`, `gpt-6.2-astra`, `gpt-6.10`,
+`gpt-7`), the Responses request omits the top-level `instructions` key. This
+also applies with an exact `openai/`, `openai.` or `<region>.openai.` qualifier;
+other prefixes keep the legacy shape. The same nonempty system prompt (or the
+Codex fallback identity when there is no system message) is sent once, as the
+first `input` item: a typed `message` with `role: "developer"` and one
+`input_text` part. An explicitly empty system prompt adds no developer item.
+`gpt-6.1` and older keep their previous `instructions` behavior. The same rule
+applies to the API-key `openai` Responses provider, streaming and non-streaming.
+
+OpenAI's [GPT-6.2 migration guide](https://developers.openai.com/api/docs/guides/latest-model#gpt-6.2-astra-update-api-and-model-parameters)
+recommends putting reusable instructions in a `developer` message at the start
+of `input`. Starting with GPT-6.2, the Responses API appends top-level
+`instructions` after `input`, beyond eligible cache breakpoints. Earlier input
+can still hit the cache even when those trailing instructions do not. See
+[OpenAI's prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching#how-prefix-matching-works)
+for how prefix matching works.
+
+[Hermes's Codex OAuth tests](https://github.com/NousResearch/hermes-agent/pull/157705)
+provide separate evidence for the subscription endpoint. ZeroClaw's automated
+request tests verify the wire format, not cache-hit rates, latency, or
+subscription allowance.
+
+Scope: the rule keys on the model ID only, so a custom or compatible Responses
+endpoint serving such an ID also receives the developer-message shape. Replayed
+history here contains only message, reasoning, function-call and
+function-call-output items (no compaction checkpoint items), so the developer
+item is always first.
+
 ## Cost and routing
 
 How OpenAI bills this path (follow OpenAI's current Codex / ChatGPT-plan billing

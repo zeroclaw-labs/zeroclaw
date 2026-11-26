@@ -186,6 +186,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn export_preserves_unicode_json_payload_with_combined_filters() {
+        let (_tmp, mem) = test_mem();
+        let content = "  中文 e\u{301}\n{\"key\":\"fake\"}\r\n\"quoted\"\\tail\t🦀  ";
+        mem.store("条目🦀", content, MemoryCategory::Core, Some("scope-one"))
+            .await
+            .unwrap();
+        mem.store(
+            "other-session",
+            "control",
+            MemoryCategory::Core,
+            Some("scope-two"),
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "other-category",
+            "daily control",
+            MemoryCategory::Daily,
+            Some("scope-one"),
+        )
+        .await
+        .unwrap();
+        let tool = MemoryExportTool::new(mem);
+
+        let result = tool
+            .execute(json!({"category": "core", "session_id": "scope-one"}))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        let parsed: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        let rows = parsed.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["key"], "条目🦀");
+        assert_eq!(rows[0]["content"], content);
+        assert_eq!(rows[0]["category"], "core");
+        assert_eq!(rows[0]["session_id"], "scope-one");
+
+        let control = tool.execute(json!({})).await.unwrap();
+        assert!(control.success, "{:?}", control.error);
+        let all: serde_json::Value = serde_json::from_str(&control.output).unwrap();
+        assert_eq!(all.as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
     async fn export_with_category_filter() {
         let (_tmp, mem) = test_mem();
         mem.store("k1", "core data", MemoryCategory::Core, None)
