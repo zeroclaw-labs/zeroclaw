@@ -113,8 +113,11 @@ done
 echo "Tauri config..."
 TAURI_CONF="$REPO_ROOT/apps/tauri/tauri.conf.json"
 if [[ -f "$TAURI_CONF" ]]; then
+  tauri_updated=true
   if command -v jq >/dev/null 2>&1; then
     if ! jq --arg v "$VERSION" '.version = $v' "$TAURI_CONF" > "$TAURI_CONF.tmp"; then
+      rm -f -- "$TAURI_CONF.tmp" || echo "  warn: could not remove the temporary Tauri config" >&2
+      tauri_updated=false
       generation_failure "Tauri version update failed"
     else
       mv "$TAURI_CONF.tmp" "$TAURI_CONF"
@@ -123,8 +126,10 @@ if [[ -f "$TAURI_CONF" ]]; then
     sed -i '' -E "s|\"version\": \"[^\"]+\"|\"version\": \"$VERSION\"|" "$TAURI_CONF" 2>/dev/null \
       || sed -i -E "s|\"version\": \"[^\"]+\"|\"version\": \"$VERSION\"|" "$TAURI_CONF"
   fi
-  echo "  updated: apps/tauri/tauri.conf.json"
-  changed=$((changed + 1))
+  if [[ "$tauri_updated" == true ]]; then
+    echo "  updated: apps/tauri/tauri.conf.json"
+    changed=$((changed + 1))
+  fi
 fi
 
 # ── Windows installer (setup.bat) ──────────────────────────────────
