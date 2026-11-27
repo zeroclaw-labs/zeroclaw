@@ -19,6 +19,8 @@
 
 pub mod backend;
 pub mod keys;
+#[cfg(any(target_os = "macos", test))]
+mod macos;
 pub mod scale;
 #[cfg(not(target_os = "macos"))]
 pub mod stub;
@@ -103,6 +105,16 @@ fn classify_action(action: &str) -> Option<ActionClass> {
 pub fn default_backend(action_timeout_secs: u64) -> Arc<dyn ComputerUseBackend> {
     let _ = action_timeout_secs;
     Arc::new(UnsupportedBackend::new())
+}
+
+/// The backend this build and host can actually run.
+///
+/// `action_timeout_secs` bounds one capture or input action: a capture is
+/// bounded by the `screencapture` deadline and input by the task that posts
+/// it.
+#[cfg(target_os = "macos")]
+pub fn default_backend(action_timeout_secs: u64) -> Arc<dyn ComputerUseBackend> {
+    Arc::new(macos::MacOsBackend::new(action_timeout_secs))
 }
 
 /// The model-facing `computer_use` tool.
