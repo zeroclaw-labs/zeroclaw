@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 
 
-def registry_visible(package, dependency):
+def registry_visible(package, dependency, metadata):
     if dependency["kind"] != "dev" or dependency["req"] != "*":
         return True
 
@@ -22,7 +22,7 @@ def registry_visible(package, dependency):
     key = dependency["rename"] or dependency["name"]
     spec = table["dev-dependencies"][key]
     if isinstance(spec, dict) and spec.get("workspace") is True:
-        with Path("Cargo.toml").open("rb") as source:
+        with (Path(metadata["workspace_root"]) / "Cargo.toml").open("rb") as source:
             spec = tomllib.load(source)["workspace"]["dependencies"][key]
     return isinstance(spec, str) or "version" in spec
 
@@ -43,7 +43,7 @@ def publish_order(meta, version):
             kind, requirement = dependency["kind"], dependency["req"]
             if kind not in (None, "build", "dev") or not isinstance(requirement, str):
                 raise ValueError(f"invalid dependency metadata: {name} -> {target}")
-            if target not in packages or not registry_visible(packages[name], dependency):
+            if target not in packages or not registry_visible(packages[name], dependency, meta):
                 continue
             if packages[target]["publish"] is not None:
                 raise ValueError(f"unpublishable workspace dependency: {name} -> {target}")
