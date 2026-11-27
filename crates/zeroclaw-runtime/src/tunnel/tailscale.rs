@@ -1364,12 +1364,6 @@ mod tests {
         spawn_stand_in(&format!("printf '%s' '{stderr}' >&2; exit 1"))
     }
 
-    fn exit_with_stderr_after(delay_secs: &str, stderr: &str) -> Child {
-        spawn_stand_in(&format!(
-            "sleep {delay_secs}; printf '%s' '{stderr}' >&2; exit 1"
-        ))
-    }
-
     #[test]
     fn serve_config_conflict_is_recognised() {
         assert!(is_serve_config_conflict(CONFLICT_STDERR));
