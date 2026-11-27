@@ -54,6 +54,16 @@ impl ComputerUseBackend for UnsupportedBackend {
         Err(Self::unsupported())
     }
 
+    async fn drag(
+        &self,
+        _from: LogicalPoint,
+        _to: LogicalPoint,
+        _button: MouseButton,
+        _steps: u32,
+    ) -> Result<(), BackendError> {
+        Err(Self::unsupported())
+    }
+
     async fn scroll(
         &self,
         _point: LogicalPoint,
@@ -106,6 +116,16 @@ mod tests {
         assert_unsupported(
             backend
                 .click(LogicalPoint { x: 1.0, y: 2.0 }, MouseButton::Left, 1)
+                .await,
+        );
+        assert_unsupported(
+            backend
+                .drag(
+                    LogicalPoint { x: 1.0, y: 2.0 },
+                    LogicalPoint { x: 10.0, y: 20.0 },
+                    MouseButton::Left,
+                    5,
+                )
                 .await,
         );
         assert_unsupported(backend.scroll(LogicalPoint { x: 1.0, y: 2.0 }, 0, 1).await);

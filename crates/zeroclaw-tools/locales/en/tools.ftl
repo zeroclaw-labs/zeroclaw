@@ -48,10 +48,10 @@ tool-cloud-patterns = Cloud pattern library. Given a workload description, sugge
 
 tool-composio = Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to see available actions (includes parameter names). action='execute' with action_name/tool_slug and params to run an action. If you are unsure of the exact params, pass 'text' instead with a natural-language description of what you want (Composio will resolve the correct parameters via NLP). action='list_accounts' or action='connected_accounts' to list OAuth-connected accounts. action='connect' with app/auth_config_id to get OAuth URL. connected_account_id is auto-resolved when omitted.
 
-tool-computer-use = Observe and control the local desktop GUI. Supports screenshot, click, move, scroll, type, key, and wait. Coordinates are in the pixel space of the downscaled screenshot returned by action="screenshot".
+tool-computer-use = Observe and control the local desktop GUI. Supports screenshot, click, drag, move, scroll, type, key, and wait. Coordinates are in the pixel space of the downscaled screenshot returned by action="screenshot".
 tool-computer-use-error-read-only = Action '{ $action }' blocked: autonomy is read-only (only 'screenshot' and 'wait' are permitted in read-only mode)
 tool-computer-use-error-missing-action = Missing required 'action' parameter
-tool-computer-use-error-unknown-action = Unknown computer_use action '{ $action }'. Supported actions: screenshot, click, move, scroll, type, key, wait
+tool-computer-use-error-unknown-action = Unknown computer_use action '{ $action }'. Supported actions: screenshot, click, drag, move, scroll, type, key, wait
 tool-computer-use-error-secondary-display-blocked = Secondary display { $display } is blocked by policy. Set [risk_profiles.<alias>.computer_use].allow_secondary_displays = true in config.toml to enable secondary displays
 tool-computer-use-error-display-out-of-range = Display index { $display } is out of range (active displays: { $count })
 tool-computer-use-error-no-displays = No active displays detected
@@ -65,6 +65,7 @@ tool-computer-use-error-display-must-be-u32 = Invalid 'display' parameter: must 
 tool-computer-use-error-display-u32-overflow = Invalid 'display' parameter: must be a non-negative integer that fits in 32 bits
 tool-computer-use-error-button-invalid = Invalid 'button' parameter: must be 'left', 'right', or 'middle'
 tool-computer-use-error-clicks-invalid = Invalid 'clicks' parameter: must be the integer 1 or 2
+tool-computer-use-error-steps-invalid = Invalid 'steps' parameter: must be an integer between 1 and { $max }
 tool-computer-use-error-key-empty = Invalid 'key' parameter: must not be empty
 tool-computer-use-error-key-missing-key = Invalid 'key' parameter: key specification names only modifiers; add the key to press
 tool-computer-use-error-key-unknown = Invalid 'key' parameter: unknown key '{ $key }'

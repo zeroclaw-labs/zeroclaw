@@ -148,6 +148,16 @@ pub trait ComputerUseBackend: Send + Sync {
         clicks: u8,
     ) -> Result<(), BackendError>;
 
+    /// Drag from `from` to `to` while holding `button`, moving through `steps`
+    /// interpolated increments.
+    async fn drag(
+        &self,
+        from: LogicalPoint,
+        to: LogicalPoint,
+        button: MouseButton,
+        steps: u32,
+    ) -> Result<(), BackendError>;
+
     /// Scroll by wheel deltas at a global logical point.
     async fn scroll(
         &self,

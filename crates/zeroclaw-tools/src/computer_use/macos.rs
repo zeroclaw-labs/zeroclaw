@@ -15,10 +15,10 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use super::backend::{DisplayInfo, KeyCode, Modifiers};
+use super::backend::{DisplayInfo, KeyCode, LogicalPoint, Modifiers};
 
 #[cfg(target_os = "macos")]
-use super::backend::{BackendError, ComputerUseBackend, KeyChord, LogicalPoint, MouseButton};
+use super::backend::{BackendError, ComputerUseBackend, KeyChord, MouseButton};
 #[cfg(target_os = "macos")]
 use core::ffi::c_void;
 #[cfg(target_os = "macos")]
@@ -38,11 +38,20 @@ const KCG_EVENT_FLAG_MASK_ALTERNATE: u64 = 0x0008_0000;
 /// `kCGEventFlagMaskCommand`.
 const KCG_EVENT_FLAG_MASK_COMMAND: u64 = 0x0010_0000;
 
-/// Longest run of text posted in one keyboard event, in UTF-16 code units.
+/// Longest run of non-ASCII text posted in one keyboard event, in UTF-16 code units.
 ///
-/// A long run in one event is cheaper, but CoreGraphics drops text past a
-/// moderate length, so the text is posted in bounded chunks instead.
+/// CoreGraphics drops text past a moderate length, so non-ASCII runs are posted
+/// in bounded chunks while ASCII characters use real ANSI virtual keycodes.
 const MAX_UNICODE_CHUNK: usize = 20;
+
+/// The virtual keycode of Return.
+const KCG_VK_RETURN: u16 = 0x24;
+
+/// The virtual keycode of Tab.
+const KCG_VK_TAB: u16 = 0x30;
+
+/// The virtual keycode of Space.
+const KCG_VK_SPACE: u16 = 0x31;
 
 /// The macOS virtual keycode and whether the key needs Shift held.
 ///
@@ -267,20 +276,26 @@ pub(crate) fn order_displays(
 /// One piece of a typed text run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TypeSegment {
-    /// A Return key press.
-    Return,
-    /// A Tab key press.
-    Tab,
-    /// A run of UTF-16 code units to post as one keyboard event.
+    /// A hardware ANSI virtual keycode press with optional Shift flag.
+    ///
+    /// Used for all printable ASCII characters, space, Return, and Tab so
+    /// non-AppKit/canvas apps (Skia, games, Electron/custom widgets) that read
+    /// hardware virtual keycodes instead of synthetic Unicode strings receive
+    /// genuine key events.
+    KeyStroke { virtual_key: u16, shift: bool },
+    /// A run of non-ASCII UTF-16 code units to post via
+    /// `CGEventKeyboardSetUnicodeString` on key-down.
     UnicodeChunk(Vec<u16>),
 }
 
 /// Split typed text into the events that reproduce it.
 ///
-/// Line endings are normalized so a carriage-return/line-feed pair produces
-/// one Return press rather than two, and each chunk holds at most
-/// [`MAX_UNICODE_CHUNK`] UTF-16 code units. Chunks are cut between
-/// characters, so a surrogate pair is never split across two events.
+/// Line endings are normalized so `\r\n` produces one Return press rather than
+/// two. Every character with a macOS ANSI virtual keycode (letters, digits,
+/// punctuation, space, Return, Tab) becomes a [`TypeSegment::KeyStroke`]. Any
+/// remaining non-ASCII character is grouped into [`TypeSegment::UnicodeChunk`]
+/// runs of at most [`MAX_UNICODE_CHUNK`] UTF-16 code units, cut only between
+/// characters so a surrogate pair is never split across two events.
 pub(crate) fn segment_text_for_typing(text: &str) -> Vec<TypeSegment> {
     let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut segments = Vec::new();
@@ -288,22 +303,21 @@ pub(crate) fn segment_text_for_typing(text: &str) -> Vec<TypeSegment> {
     let mut buffer = [0u16; 2];
 
     for ch in normalized.chars() {
-        match ch {
-            '\n' => {
+        let hardware_key = match ch {
+            '\n' => Some((KCG_VK_RETURN, false)),
+            '\t' => Some((KCG_VK_TAB, false)),
+            ' ' => Some((KCG_VK_SPACE, false)),
+            other => char_to_macos_vk(other),
+        };
+        if let Some((virtual_key, shift)) = hardware_key {
+            flush_chunk(&mut chunk, &mut segments);
+            segments.push(TypeSegment::KeyStroke { virtual_key, shift });
+        } else {
+            let encoded = ch.encode_utf16(&mut buffer);
+            if chunk.len() + encoded.len() > MAX_UNICODE_CHUNK {
                 flush_chunk(&mut chunk, &mut segments);
-                segments.push(TypeSegment::Return);
             }
-            '\t' => {
-                flush_chunk(&mut chunk, &mut segments);
-                segments.push(TypeSegment::Tab);
-            }
-            other => {
-                let encoded = other.encode_utf16(&mut buffer);
-                if chunk.len() + encoded.len() > MAX_UNICODE_CHUNK {
-                    flush_chunk(&mut chunk, &mut segments);
-                }
-                chunk.extend_from_slice(encoded);
-            }
+            chunk.extend_from_slice(encoded);
         }
     }
     flush_chunk(&mut chunk, &mut segments);
@@ -315,6 +329,30 @@ fn flush_chunk(chunk: &mut Vec<u16>, segments: &mut Vec<TypeSegment>) {
     if !chunk.is_empty() {
         segments.push(TypeSegment::UnicodeChunk(std::mem::take(chunk)));
     }
+}
+
+/// Interpolate the intermediate drag points from `from` to `to` across `steps`
+/// increments (inclusive of `to`, exclusive of `from` since mouse-down already
+/// occurred at `from`). `steps` is clamped to at least 1.
+pub(crate) fn interpolate_drag_points(
+    from: LogicalPoint,
+    to: LogicalPoint,
+    steps: u32,
+) -> Vec<LogicalPoint> {
+    let count = steps.max(1);
+    let mut points = Vec::with_capacity(count as usize);
+    for step in 1..=count {
+        if step == count {
+            points.push(to);
+        } else {
+            let t = f64::from(step) / f64::from(count);
+            points.push(LogicalPoint {
+                x: from.x + (to.x - from.x) * t,
+                y: from.y + (to.y - from.y) * t,
+            });
+        }
+    }
+    points
 }
 
 // ── macOS platform backend ─────────────────────────────────────────────────
@@ -446,6 +484,14 @@ const KCG_EVENT_RIGHT_MOUSE_UP: u32 = 4;
 #[cfg(target_os = "macos")]
 const KCG_EVENT_MOUSE_MOVED: u32 = 5;
 
+/// `kCGEventLeftMouseDragged`.
+#[cfg(target_os = "macos")]
+const KCG_EVENT_LEFT_MOUSE_DRAGGED: u32 = 6;
+
+/// `kCGEventRightMouseDragged`.
+#[cfg(target_os = "macos")]
+const KCG_EVENT_RIGHT_MOUSE_DRAGGED: u32 = 7;
+
 /// `kCGEventOtherMouseDown`.
 #[cfg(target_os = "macos")]
 const KCG_EVENT_OTHER_MOUSE_DOWN: u32 = 25;
@@ -453,6 +499,10 @@ const KCG_EVENT_OTHER_MOUSE_DOWN: u32 = 25;
 /// `kCGEventOtherMouseUp`.
 #[cfg(target_os = "macos")]
 const KCG_EVENT_OTHER_MOUSE_UP: u32 = 26;
+
+/// `kCGEventOtherMouseDragged`.
+#[cfg(target_os = "macos")]
+const KCG_EVENT_OTHER_MOUSE_DRAGGED: u32 = 27;
 
 /// `kCGMouseButtonLeft`.
 #[cfg(target_os = "macos")]
@@ -474,14 +524,6 @@ const KCG_MOUSE_EVENT_CLICK_STATE: u32 = 1;
 #[cfg(target_os = "macos")]
 const KCG_SCROLL_EVENT_UNIT_LINE: u32 = 1;
 
-/// The virtual keycode of Return.
-#[cfg(target_os = "macos")]
-const KCG_VK_RETURN: u16 = 0x24;
-
-/// The virtual keycode of Tab.
-#[cfg(target_os = "macos")]
-const KCG_VK_TAB: u16 = 0x30;
-
 /// The largest number of displays a single query asks CoreGraphics for.
 #[cfg(target_os = "macos")]
 const MAX_ACTIVE_DISPLAYS: usize = 16;
@@ -494,11 +536,15 @@ const SCREENCAPTURE_PATH: &str = "/usr/sbin/screencapture";
 #[cfg(target_os = "macos")]
 const MULTI_CLICK_INTERVAL: Duration = Duration::from_millis(25);
 
+/// The pause between interpolated steps of a mouse drag.
+#[cfg(target_os = "macos")]
+const DRAG_STEP_INTERVAL: Duration = Duration::from_millis(10);
+
 /// The pause between the key-down and key-up of one key press.
 #[cfg(target_os = "macos")]
 const KEY_PRESS_INTERVAL: Duration = Duration::from_millis(10);
 
-/// The pause between two chunks of typed text.
+/// The pause between typed keystrokes or Unicode chunks.
 #[cfg(target_os = "macos")]
 const TYPE_CHUNK_INTERVAL: Duration = Duration::from_millis(2);
 
@@ -654,6 +700,73 @@ impl MacOsBackend {
         Ok(())
     }
 
+    /// Drag from `from` to `to` while holding `button`, moving across `steps`
+    /// interpolated drag events so apps that track drag deltas (vector editors,
+    /// sliders, window frames) receive smooth motion.
+    fn drag_between(
+        from: LogicalPoint,
+        to: LogicalPoint,
+        button: MouseButton,
+        steps: u32,
+    ) -> Result<(), BackendError> {
+        let (down_type, drag_type, up_type, cg_button) = match button {
+            MouseButton::Left => (
+                KCG_EVENT_LEFT_MOUSE_DOWN,
+                KCG_EVENT_LEFT_MOUSE_DRAGGED,
+                KCG_EVENT_LEFT_MOUSE_UP,
+                KCG_MOUSE_BUTTON_LEFT,
+            ),
+            MouseButton::Right => (
+                KCG_EVENT_RIGHT_MOUSE_DOWN,
+                KCG_EVENT_RIGHT_MOUSE_DRAGGED,
+                KCG_EVENT_RIGHT_MOUSE_UP,
+                KCG_MOUSE_BUTTON_RIGHT,
+            ),
+            MouseButton::Middle => (
+                KCG_EVENT_OTHER_MOUSE_DOWN,
+                KCG_EVENT_OTHER_MOUSE_DRAGGED,
+                KCG_EVENT_OTHER_MOUSE_UP,
+                KCG_MOUSE_BUTTON_CENTER,
+            ),
+        };
+
+        Self::move_cursor_to(from)?;
+
+        let start = ffi::CGPoint {
+            x: from.x,
+            y: from.y,
+        };
+        let down = CgEventGuard::new(
+            unsafe { ffi::CGEventCreateMouseEvent(std::ptr::null(), down_type, start, cg_button) },
+            "a drag mouse-down event",
+        )?;
+        Self::post_event(&down);
+
+        for point in interpolate_drag_points(from, to, steps) {
+            std::thread::sleep(DRAG_STEP_INTERVAL);
+            let step_pt = ffi::CGPoint {
+                x: point.x,
+                y: point.y,
+            };
+            let dragged = CgEventGuard::new(
+                unsafe {
+                    ffi::CGEventCreateMouseEvent(std::ptr::null(), drag_type, step_pt, cg_button)
+                },
+                "a mouse-dragged event",
+            )?;
+            Self::post_event(&dragged);
+        }
+
+        std::thread::sleep(DRAG_STEP_INTERVAL);
+        let end = ffi::CGPoint { x: to.x, y: to.y };
+        let up = CgEventGuard::new(
+            unsafe { ffi::CGEventCreateMouseEvent(std::ptr::null(), up_type, end, cg_button) },
+            "a drag mouse-up event",
+        )?;
+        Self::post_event(&up);
+        Ok(())
+    }
+
     /// Scroll the wheel by a line delta at a global logical point.
     fn scroll_at(point: LogicalPoint, delta_x: i32, delta_y: i32) -> Result<(), BackendError> {
         Self::move_cursor_to(point)?;
@@ -691,7 +804,11 @@ impl MacOsBackend {
         Ok(())
     }
 
-    /// Post one run of text as a keyboard event.
+    /// Post one run of non-ASCII text as a keyboard event.
+    ///
+    /// The Unicode payload is attached ONLY to the key-down event; attaching it
+    /// to key-up as well causes terminals such as Ghostty to insert the string
+    /// twice.
     fn post_unicode_chunk(units: &[u16]) -> Result<(), BackendError> {
         let length = c_ulong::try_from(units.len())
             .map_err(|_| BackendError::InputFailed("typed text is too long to post".into()))?;
@@ -707,7 +824,6 @@ impl MacOsBackend {
             unsafe { ffi::CGEventCreateKeyboardEvent(std::ptr::null(), 0, false) },
             "a text event",
         )?;
-        unsafe { ffi::CGEventKeyboardSetUnicodeString(up.0, length, units.as_ptr()) };
         Self::post_event(&up);
         Ok(())
     }
@@ -716,8 +832,11 @@ impl MacOsBackend {
     fn type_text_into(text: &str) -> Result<(), BackendError> {
         for segment in segment_text_for_typing(text) {
             match segment {
-                TypeSegment::Return => Self::post_key_stroke(KCG_VK_RETURN, 0)?,
-                TypeSegment::Tab => Self::post_key_stroke(KCG_VK_TAB, 0)?,
+                TypeSegment::KeyStroke { virtual_key, shift } => {
+                    let flags = if shift { KCG_EVENT_FLAG_MASK_SHIFT } else { 0 };
+                    Self::post_key_stroke(virtual_key, flags)?;
+                    std::thread::sleep(TYPE_CHUNK_INTERVAL);
+                }
                 TypeSegment::UnicodeChunk(units) => {
                     Self::post_unicode_chunk(&units)?;
                     std::thread::sleep(TYPE_CHUNK_INTERVAL);
@@ -863,6 +982,17 @@ impl ComputerUseBackend for MacOsBackend {
     ) -> Result<(), BackendError> {
         MacOsBackend::ensure_accessibility_trusted()?;
         run_input(move || MacOsBackend::click_at(point, button, clicks)).await
+    }
+
+    async fn drag(
+        &self,
+        from: LogicalPoint,
+        to: LogicalPoint,
+        button: MouseButton,
+        steps: u32,
+    ) -> Result<(), BackendError> {
+        MacOsBackend::ensure_accessibility_trusted()?;
+        run_input(move || MacOsBackend::drag_between(from, to, button, steps)).await
     }
 
     async fn scroll(
@@ -1127,50 +1257,104 @@ mod tests {
     }
 
     #[test]
-    fn segment_text_for_typing_normalizes_newlines_tabs_and_preserves_surrogate_pairs() {
+    fn segment_text_for_typing_uses_hardware_keycodes_for_ascii_and_chunks_unicode() {
+        // Printable ASCII, uppercase, shifted punctuation, space, Return, and
+        // Tab all compile to real ANSI virtual keystrokes so non-AppKit apps
+        // (Skia/canvas text inputs) accept them.
+        assert_eq!(
+            segment_text_for_typing("170"),
+            vec![
+                TypeSegment::KeyStroke {
+                    virtual_key: 0x12,
+                    shift: false,
+                },
+                TypeSegment::KeyStroke {
+                    virtual_key: 0x1A,
+                    shift: false,
+                },
+                TypeSegment::KeyStroke {
+                    virtual_key: 0x1D,
+                    shift: false,
+                },
+            ]
+        );
+
+        // Uppercase letters and shifted symbols carry `shift = true`.
+        assert_eq!(
+            segment_text_for_typing("A! "),
+            vec![
+                TypeSegment::KeyStroke {
+                    virtual_key: 0x00,
+                    shift: true,
+                },
+                TypeSegment::KeyStroke {
+                    virtual_key: 0x12,
+                    shift: true,
+                },
+                TypeSegment::KeyStroke {
+                    virtual_key: KCG_VK_SPACE,
+                    shift: false,
+                },
+            ]
+        );
+
         // A carriage-return/line-feed pair is one Return, not two.
-        let segments = segment_text_for_typing("a\r\nb");
         assert_eq!(
-            segments,
+            segment_text_for_typing("a\r\nb"),
             vec![
-                TypeSegment::UnicodeChunk(vec![b'a' as u16]),
-                TypeSegment::Return,
-                TypeSegment::UnicodeChunk(vec![b'b' as u16]),
+                TypeSegment::KeyStroke {
+                    virtual_key: 0x00,
+                    shift: false,
+                },
+                TypeSegment::KeyStroke {
+                    virtual_key: KCG_VK_RETURN,
+                    shift: false,
+                },
+                TypeSegment::KeyStroke {
+                    virtual_key: 0x0B,
+                    shift: false,
+                },
             ]
         );
 
-        // A standalone carriage return is a Return as well.
-        let segments = segment_text_for_typing("a\rb");
+        // A standalone carriage return is a Return as well, and Tab uses vk 0x30.
         assert_eq!(
-            segments,
+            segment_text_for_typing("a\rb\tc"),
             vec![
-                TypeSegment::UnicodeChunk(vec![b'a' as u16]),
-                TypeSegment::Return,
-                TypeSegment::UnicodeChunk(vec![b'b' as u16]),
+                TypeSegment::KeyStroke {
+                    virtual_key: 0x00,
+                    shift: false,
+                },
+                TypeSegment::KeyStroke {
+                    virtual_key: KCG_VK_RETURN,
+                    shift: false,
+                },
+                TypeSegment::KeyStroke {
+                    virtual_key: 0x0B,
+                    shift: false,
+                },
+                TypeSegment::KeyStroke {
+                    virtual_key: KCG_VK_TAB,
+                    shift: false,
+                },
+                TypeSegment::KeyStroke {
+                    virtual_key: 0x08,
+                    shift: false,
+                },
             ]
         );
 
-        // A tab is its own segment.
-        let segments = segment_text_for_typing("a\tb");
-        assert_eq!(
-            segments,
-            vec![
-                TypeSegment::UnicodeChunk(vec![b'a' as u16]),
-                TypeSegment::Tab,
-                TypeSegment::UnicodeChunk(vec![b'b' as u16]),
-            ]
-        );
-
-        // Long ASCII runs are split into bounded chunks.
-        let long = "a".repeat(45);
-        let segments = segment_text_for_typing(&long);
+        // Non-ASCII runs fall back to bounded UTF-16 Unicode chunks without
+        // ever splitting a surrogate pair across chunks.
+        let long_unicode = "é".repeat(45);
+        let segments = segment_text_for_typing(&long_unicode);
         assert_eq!(segments.len(), 3);
         for segment in &segments {
             match segment {
                 TypeSegment::UnicodeChunk(units) => {
                     assert!(units.len() <= MAX_UNICODE_CHUNK, "chunk stays bounded");
                 }
-                other => panic!("expected a text chunk, got {other:?}"),
+                other => panic!("expected a Unicode chunk, got {other:?}"),
             }
         }
         let rebuilt: String = segments
@@ -1180,37 +1364,57 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(rebuilt, long);
+        assert_eq!(rebuilt, long_unicode);
 
-        // An emoji that would cross the chunk boundary starts a new chunk
-        // instead of splitting its surrogate pair.
+        // An emoji (2 UTF-16 code units) after 19 BMP non-ASCII code units
+        // starts a new chunk instead of splitting its surrogate pair.
         let emoji = "\u{1F980}";
-        let segments = segment_text_for_typing(&format!("{}{emoji}", "a".repeat(19)));
+        let segments = segment_text_for_typing(&format!("{}{emoji}", "é".repeat(19)));
         assert_eq!(segments.len(), 2);
         match &segments[0] {
             TypeSegment::UnicodeChunk(units) => assert_eq!(units.len(), 19),
-            other => panic!("expected a text chunk, got {other:?}"),
+            other => panic!("expected a Unicode chunk, got {other:?}"),
         }
         match &segments[1] {
             TypeSegment::UnicodeChunk(units) => {
                 assert_eq!(units.len(), 2, "the emoji keeps both code units");
                 assert_eq!(String::from_utf16_lossy(units), emoji);
             }
-            other => panic!("expected a text chunk, got {other:?}"),
+            other => panic!("expected a Unicode chunk, got {other:?}"),
         }
 
-        // No chunk ever exceeds the bound and none splits a surrogate pair.
-        let mixed = format!("{}{emoji}{}", "x".repeat(19), "y".repeat(19));
-        for segment in segment_text_for_typing(&mixed) {
-            if let TypeSegment::UnicodeChunk(units) = segment {
-                assert!(units.len() <= MAX_UNICODE_CHUNK);
-                assert!(
-                    !units
-                        .last()
-                        .is_some_and(|unit| (0xD800..0xDC00).contains(unit))
-                );
-            }
-        }
+        // Mixed ASCII and non-ASCII flushes cleanly in exact order.
+        let mixed = format!("a{emoji}b");
+        assert_eq!(
+            segment_text_for_typing(&mixed),
+            vec![
+                TypeSegment::KeyStroke {
+                    virtual_key: 0x00,
+                    shift: false,
+                },
+                TypeSegment::UnicodeChunk(emoji.encode_utf16().collect()),
+                TypeSegment::KeyStroke {
+                    virtual_key: 0x0B,
+                    shift: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn interpolate_drag_points_reaches_target_in_requested_steps() {
+        let from = LogicalPoint { x: 100.0, y: 200.0 };
+        let to = LogicalPoint { x: 300.0, y: 100.0 };
+        let points = interpolate_drag_points(from, to, 4);
+        assert_eq!(points.len(), 4);
+        assert_eq!(points[0], LogicalPoint { x: 150.0, y: 175.0 });
+        assert_eq!(points[1], LogicalPoint { x: 200.0, y: 150.0 });
+        assert_eq!(points[2], LogicalPoint { x: 250.0, y: 125.0 });
+        assert_eq!(points[3], to);
+
+        // Zero steps clamps to 1 direct drag step ending at `to`.
+        let single = interpolate_drag_points(from, to, 0);
+        assert_eq!(single, vec![to]);
     }
 
     #[cfg(target_os = "macos")]

@@ -58,6 +58,12 @@ const TOOL_DESCRIPTION_KEY: &str = "tool-computer-use";
 /// Longest `text` payload the `type` action accepts, in characters.
 const MAX_TEXT_CHARS: usize = 4096;
 
+/// Default number of interpolated drag steps.
+const DEFAULT_DRAG_STEPS: u32 = 10;
+
+/// Maximum number of interpolated drag steps accepted by `drag`.
+const MAX_DRAG_STEPS: u32 = 100;
+
 /// Subdirectory of the agent workspace that receives screenshot files.
 const SCREENSHOT_SUBDIR: &str = "computer_use";
 
@@ -65,9 +71,10 @@ const SCREENSHOT_SUBDIR: &str = "computer_use";
 const SCREENSHOT_PREFIX: &str = "screenshot";
 
 /// Every action the tool accepts, in schema order.
-const ACTIONS: [&str; 7] = [
+const ACTIONS: [&str; 8] = [
     "screenshot",
     "click",
+    "drag",
     "move",
     "scroll",
     "type",
@@ -91,7 +98,7 @@ enum ActionClass {
 fn classify_action(action: &str) -> Option<ActionClass> {
     match action {
         "screenshot" | "wait" => Some(ActionClass::Observe),
-        "click" | "move" | "scroll" | "type" | "key" => Some(ActionClass::Mutate),
+        "click" | "drag" | "move" | "scroll" | "type" | "key" => Some(ActionClass::Mutate),
         _ => None,
     }
 }
@@ -353,6 +360,60 @@ impl ComputerUseTool {
         })))
     }
 
+    async fn drag_action(&self, args: &Value) -> ToolResult {
+        let from_x = match required_coordinate(args, "from_x") {
+            Ok(v) => v,
+            Err(result) => return result,
+        };
+        let from_y = match required_coordinate(args, "from_y") {
+            Ok(v) => v,
+            Err(result) => return result,
+        };
+        let to_x = match required_coordinate(args, "to_x") {
+            Ok(v) => v,
+            Err(result) => return result,
+        };
+        let to_y = match required_coordinate(args, "to_y") {
+            Ok(v) => v,
+            Err(result) => return result,
+        };
+        let button = match optional_button(args) {
+            Ok(button) => button,
+            Err(result) => return result,
+        };
+        let steps = match optional_drag_steps(args) {
+            Ok(steps) => steps,
+            Err(result) => return result,
+        };
+        let (display, _) = match self.resolve_display(args).await {
+            Ok(resolved) => resolved,
+            Err(result) => return result,
+        };
+        let from = match self.to_logical(&display, from_x, from_y) {
+            Ok(point) => point,
+            Err(result) => return result,
+        };
+        let to = match self.to_logical(&display, to_x, to_y) {
+            Ok(point) => point,
+            Err(result) => return result,
+        };
+
+        if let Err(error) = self.backend.drag(from, to, button, steps).await {
+            return backend_error(&error);
+        }
+
+        ToolResult::ok(ToolOutput::json(json!({
+            "action": "drag",
+            "display": display.index,
+            "from_x": from_x,
+            "from_y": from_y,
+            "to_x": to_x,
+            "to_y": to_y,
+            "button": button_label(button),
+            "steps": steps,
+        })))
+    }
+
     async fn move_action(&self, args: &Value) -> ToolResult {
         let (x, y) = match self.required_point(args) {
             Ok(point) => point,
@@ -523,7 +584,7 @@ impl Tool for ComputerUseTool {
                 "action": {
                     "type": "string",
                     "enum": ACTIONS,
-                    "description": "Action to perform. 'screenshot' captures the display, attaches the downscaled PNG image directly to the tool result for vision inspection (do not call file_read on the saved path), and returns image dimensions; coordinates for click, move, and scroll are pixels in that image."
+                    "description": "Action to perform. 'screenshot' captures the display, attaches the downscaled PNG image directly to the tool result for vision inspection (do not call file_read on the saved path), and returns image dimensions; coordinates for click, drag, move, and scroll are pixels in that image."
                 },
                 "display": {
                     "type": "integer",
@@ -539,17 +600,40 @@ impl Tool for ComputerUseTool {
                     "type": "number",
                     "description": "Screenshot pixel Y for click, move, and scroll."
                 },
+                "from_x": {
+                    "type": "number",
+                    "description": "Start screenshot pixel X for drag."
+                },
+                "from_y": {
+                    "type": "number",
+                    "description": "Start screenshot pixel Y for drag."
+                },
+                "to_x": {
+                    "type": "number",
+                    "description": "End screenshot pixel X for drag."
+                },
+                "to_y": {
+                    "type": "number",
+                    "description": "End screenshot pixel Y for drag."
+                },
                 "button": {
                     "type": "string",
                     "enum": ["left", "right", "middle"],
                     "default": "left",
-                    "description": "Mouse button for click."
+                    "description": "Mouse button for click and drag."
                 },
                 "clicks": {
                     "type": "integer",
                     "enum": [1, 2],
                     "default": 1,
                     "description": "Click count for click: 1 for a single click, 2 for a double click."
+                },
+                "steps": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_DRAG_STEPS,
+                    "default": DEFAULT_DRAG_STEPS,
+                    "description": "Number of interpolated drag steps for drag (default: 10)."
                 },
                 "delta_x": {
                     "type": "integer",
@@ -612,6 +696,7 @@ impl Tool for ComputerUseTool {
         let result = match action {
             "screenshot" => self.screenshot_action(&args).await,
             "click" => self.click_action(&args).await,
+            "drag" => self.drag_action(&args).await,
             "move" => self.move_action(&args).await,
             "scroll" => self.scroll_action(&args).await,
             "type" => self.type_action(&args).await,
@@ -764,6 +849,23 @@ fn optional_clicks(args: &Value) -> Result<u8, ToolResult> {
     }
 }
 
+/// Read the optional `steps` for a drag action, defaulting to [`DEFAULT_DRAG_STEPS`].
+fn optional_drag_steps(args: &Value) -> Result<u32, ToolResult> {
+    match args.get("steps") {
+        None | Some(Value::Null) => Ok(DEFAULT_DRAG_STEPS),
+        Some(value) => match value.as_u64().and_then(|raw| u32::try_from(raw).ok()) {
+            Some(steps) if (1..=MAX_DRAG_STEPS).contains(&steps) => Ok(steps),
+            _ => {
+                let max = MAX_DRAG_STEPS.to_string();
+                Err(tool_error_with_args(
+                    "tool-computer-use-error-steps-invalid",
+                    &[("max", &max)],
+                ))
+            }
+        },
+    }
+}
+
 /// Read an optional signed 32-bit integer, defaulting to 0.
 fn optional_i32(args: &Value, param: &str) -> Result<i32, ToolResult> {
     match args.get(param) {
@@ -885,6 +987,7 @@ mod tests {
         list_displays_calls: AtomicUsize,
         capture_calls: AtomicUsize,
         clicks: Mutex<Vec<(LogicalPoint, MouseButton, u8)>>,
+        drags: Mutex<Vec<(LogicalPoint, LogicalPoint, MouseButton, u32)>>,
         moves: Mutex<Vec<LogicalPoint>>,
         scrolls: Mutex<Vec<(LogicalPoint, i32, i32)>>,
         typed: Mutex<Vec<String>>,
@@ -900,6 +1003,7 @@ mod tests {
                 list_displays_calls: AtomicUsize::new(0),
                 capture_calls: AtomicUsize::new(0),
                 clicks: Mutex::new(Vec::new()),
+                drags: Mutex::new(Vec::new()),
                 moves: Mutex::new(Vec::new()),
                 scrolls: Mutex::new(Vec::new()),
                 typed: Mutex::new(Vec::new()),
@@ -937,6 +1041,10 @@ mod tests {
 
         fn clicks(&self) -> Vec<(LogicalPoint, MouseButton, u8)> {
             self.clicks.lock().map(|v| v.clone()).unwrap_or_default()
+        }
+
+        fn drags(&self) -> Vec<(LogicalPoint, LogicalPoint, MouseButton, u32)> {
+            self.drags.lock().map(|v| v.clone()).unwrap_or_default()
         }
 
         fn moves(&self) -> Vec<LogicalPoint> {
@@ -995,6 +1103,22 @@ mod tests {
             }
             if let Ok(mut recorded) = self.clicks.lock() {
                 recorded.push((point, button, clicks));
+            }
+            Ok(())
+        }
+
+        async fn drag(
+            &self,
+            from: LogicalPoint,
+            to: LogicalPoint,
+            button: MouseButton,
+            steps: u32,
+        ) -> Result<(), BackendError> {
+            if let Some(error) = self.denied() {
+                return Err(error);
+            }
+            if let Ok(mut recorded) = self.drags.lock() {
+                recorded.push((from, to, button, steps));
             }
             Ok(())
         }
@@ -1216,6 +1340,7 @@ mod tests {
         // Every state-changing action is refused before touching the backend.
         for args in [
             json!({"action": "click", "x": 10, "y": 10}),
+            json!({"action": "drag", "from_x": 10, "from_y": 10, "to_x": 50, "to_y": 50}),
             json!({"action": "move", "x": 10, "y": 10}),
             json!({"action": "scroll", "x": 10, "y": 10, "delta_y": 1}),
             json!({"action": "type", "text": "hello"}),
@@ -1238,6 +1363,7 @@ mod tests {
             backend.clicks().is_empty(),
             "no click may reach the backend"
         );
+        assert!(backend.drags().is_empty(), "no drag may reach the backend");
         assert!(backend.moves().is_empty(), "no move may reach the backend");
         assert!(
             backend.scrolls().is_empty(),
@@ -1445,6 +1571,27 @@ mod tests {
                 "button wrong type",
                 json!({"action": "click", "x": 1, "y": 1, "button": 2}),
             ),
+            // Drag shape.
+            (
+                "drag missing to_x",
+                json!({"action": "drag", "from_x": 1, "from_y": 1, "to_y": 10}),
+            ),
+            (
+                "drag out of bounds to_x",
+                json!({"action": "drag", "from_x": 1, "from_y": 1, "to_x": 200, "to_y": 10}),
+            ),
+            (
+                "drag steps 0",
+                json!({"action": "drag", "from_x": 1, "from_y": 1, "to_x": 10, "to_y": 10, "steps": 0}),
+            ),
+            (
+                "drag steps too high",
+                json!({"action": "drag", "from_x": 1, "from_y": 1, "to_x": 10, "to_y": 10, "steps": 101}),
+            ),
+            (
+                "drag steps float",
+                json!({"action": "drag", "from_x": 1, "from_y": 1, "to_x": 10, "to_y": 10, "steps": 2.5}),
+            ),
             // Scroll needs a non-zero delta.
             (
                 "zero scroll",
@@ -1515,6 +1662,7 @@ mod tests {
 
         // Nothing invalid reached the backend.
         assert!(backend.clicks().is_empty(), "no invalid click dispatched");
+        assert!(backend.drags().is_empty(), "no invalid drag dispatched");
         assert!(backend.moves().is_empty(), "no invalid move dispatched");
         assert!(backend.scrolls().is_empty(), "no invalid scroll dispatched");
         assert!(backend.typed().is_empty(), "no invalid text dispatched");
@@ -1665,6 +1813,29 @@ mod tests {
         assert_eq!(button, MouseButton::Right);
         assert_eq!(count, 2);
 
+        // drag
+        let result = tool
+            .execute(json!({
+                "action": "drag",
+                "from_x": 20,
+                "from_y": 30,
+                "to_x": 100,
+                "to_y": 75,
+                "steps": 12
+            }))
+            .await
+            .expect("drag runs");
+        assert!(result.success, "drag failed: {:?}", result.error);
+        let drags = backend.drags();
+        assert_eq!(drags.len(), 1);
+        let (from, to, drag_button, steps) = drags[0];
+        assert!((from.x - 40.0).abs() < 0.5, "from.x was {}", from.x);
+        assert!((from.y - 60.0).abs() < 0.5, "from.y was {}", from.y);
+        assert!((to.x - 200.0).abs() < 0.5, "to.x was {}", to.x);
+        assert!((to.y - 150.0).abs() < 0.5, "to.y was {}", to.y);
+        assert_eq!(drag_button, MouseButton::Left);
+        assert_eq!(steps, 12);
+
         // move
         let result = tool
             .execute(json!({"action": "move", "x": 0, "y": 0}))
@@ -1780,8 +1951,8 @@ mod tests {
             .collect();
         assert_eq!(actions, ACTIONS.to_vec());
         for property in [
-            "action", "display", "x", "y", "button", "clicks", "delta_x", "delta_y", "text", "key",
-            "seconds",
+            "action", "display", "x", "y", "from_x", "from_y", "to_x", "to_y", "button", "clicks",
+            "steps", "delta_x", "delta_y", "text", "key", "seconds",
         ] {
             assert!(
                 schema["properties"][property].is_object(),
