@@ -27,6 +27,7 @@ pub enum OptInTool {
     CodexCli,
     GeminiCli,
     OpenCodeCli,
+    ComputerUse,
     /// Web search (`[web_search]`, behind `tools-external`). Deliberately not
     /// part of [`OptInTool::ALL`]: the tool inventory files `web_search_tool`
     /// under its `External` compilation group, and `ALL` must stay in lockstep
@@ -36,7 +37,7 @@ pub enum OptInTool {
 }
 
 impl OptInTool {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Jira,
         Self::Notion,
         Self::LinkedIn,
@@ -49,6 +50,7 @@ impl OptInTool {
         Self::CodexCli,
         Self::GeminiCli,
         Self::OpenCodeCli,
+        Self::ComputerUse,
     ];
 
     /// The top-level config section that enables the tool.
@@ -66,6 +68,7 @@ impl OptInTool {
             Self::CodexCli => "codex_cli",
             Self::GeminiCli => "gemini_cli",
             Self::OpenCodeCli => "opencode_cli",
+            Self::ComputerUse => "computer_use",
             Self::WebSearch => "web_search",
         }
     }
@@ -85,6 +88,7 @@ impl OptInTool {
             Self::CodexCli => "tool-codex-cli",
             Self::GeminiCli => "tool-gemini-cli",
             Self::OpenCodeCli => "tool-opencode-cli",
+            Self::ComputerUse => "tool-computer-use",
             Self::WebSearch => "tools-external",
         }
     }
@@ -104,6 +108,7 @@ impl OptInTool {
             Self::CodexCli => cfg!(feature = "tool-codex-cli"),
             Self::GeminiCli => cfg!(feature = "tool-gemini-cli"),
             Self::OpenCodeCli => cfg!(feature = "tool-opencode-cli"),
+            Self::ComputerUse => cfg!(feature = "tool-computer-use"),
             Self::WebSearch => cfg!(feature = "tools-external"),
         }
     }
@@ -123,6 +128,7 @@ impl OptInTool {
             Self::CodexCli => config.codex_cli.enabled,
             Self::GeminiCli => config.gemini_cli.enabled,
             Self::OpenCodeCli => config.opencode_cli.enabled,
+            Self::ComputerUse => config.computer_use.enabled,
             Self::WebSearch => config.web_search.enabled,
         }
     }

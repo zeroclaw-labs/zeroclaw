@@ -776,6 +776,12 @@ pub struct Config {
     #[group = "Integrations"]
     pub opencode_cli: OpenCodeCliConfig,
 
+    /// Native desktop computer-use tool configuration (`[computer_use]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Tools"]
+    pub computer_use: ComputerUseToolConfig,
+
     /// Standard Operating Procedures engine configuration (`[sop]`).
     #[serde(default)]
     #[nested]
@@ -11524,6 +11530,57 @@ impl Default for OpenCodeCliConfig {
             timeout_secs: default_opencode_cli_timeout_secs(),
             max_output_bytes: default_opencode_cli_max_output_bytes(),
             env_passthrough: Vec::new(),
+        }
+    }
+}
+
+// ── Computer Use ───────────────────────────────────────────────
+
+/// Native desktop computer-use tool configuration (`[computer_use]` section).
+///
+/// Defaults closed (`enabled = false`) and restricts capture/input to the
+/// primary display unless `allow_secondary_displays = true` is set.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "computer_use"]
+pub struct ComputerUseToolConfig {
+    /// Enable the `computer_use` tool (default: false)
+    #[serde(default)]
+    pub enabled: bool,
+    /// Allow targeting secondary displays (`display > 0`) (default: false)
+    #[serde(default)]
+    pub allow_secondary_displays: bool,
+    /// Maximum long-edge pixel dimension for downscaled screenshots (320..=3840)
+    #[serde(default = "default_computer_use_max_dimension")]
+    pub max_dimension: u32,
+    /// Per-action capture timeout in seconds (1..=120)
+    #[serde(default = "default_computer_use_action_timeout_secs")]
+    pub action_timeout_secs: u64,
+    /// Maximum duration in seconds accepted by the `wait` action (1..=300)
+    #[serde(default = "default_computer_use_max_wait_secs")]
+    pub max_wait_secs: u64,
+}
+
+fn default_computer_use_max_dimension() -> u32 {
+    1280
+}
+
+fn default_computer_use_action_timeout_secs() -> u64 {
+    15
+}
+
+fn default_computer_use_max_wait_secs() -> u64 {
+    30
+}
+
+impl Default for ComputerUseToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_secondary_displays: false,
+            max_dimension: default_computer_use_max_dimension(),
+            action_timeout_secs: default_computer_use_action_timeout_secs(),
+            max_wait_secs: default_computer_use_max_wait_secs(),
         }
     }
 }
@@ -22396,6 +22453,7 @@ impl Default for Config {
             codex_cli: CodexCliConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
+            computer_use: ComputerUseToolConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
@@ -26562,6 +26620,31 @@ impl Config {
                         action
                     );
                 }
+            }
+        }
+
+        // Computer use
+        if crate::opt_in_tools::OptInTool::ComputerUse.runs_in(self) {
+            if !(320..=3840).contains(&self.computer_use.max_dimension) {
+                validation_bail!(
+                    InvalidNumericRange,
+                    "computer_use.max_dimension",
+                    "computer_use.max_dimension must be between 320 and 3840"
+                );
+            }
+            if !(1..=120).contains(&self.computer_use.action_timeout_secs) {
+                validation_bail!(
+                    InvalidNumericRange,
+                    "computer_use.action_timeout_secs",
+                    "computer_use.action_timeout_secs must be between 1 and 120"
+                );
+            }
+            if !(1..=300).contains(&self.computer_use.max_wait_secs) {
+                validation_bail!(
+                    InvalidNumericRange,
+                    "computer_use.max_wait_secs",
+                    "computer_use.max_wait_secs must be between 1 and 300"
+                );
             }
         }
 
@@ -36066,6 +36149,7 @@ auto_save = true
             codex_cli: CodexCliConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
+            computer_use: ComputerUseToolConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
@@ -37531,6 +37615,7 @@ default_temperature = 0.7
             codex_cli: CodexCliConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
+            computer_use: ComputerUseToolConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
@@ -41591,6 +41676,108 @@ runtime_profile = "default"
             assert!(compiled_out.is_empty(), "{compiled_out:?}");
         } else {
             assert_eq!(compiled_out, ["web_search.enabled"]);
+        }
+    }
+
+    #[test]
+    async fn computer_use_config_defaults_and_serde_roundtrip() {
+        let config = ComputerUseToolConfig::default();
+        assert!(!config.enabled, "computer_use must default to disabled");
+        assert!(
+            !config.allow_secondary_displays,
+            "secondary displays must default to disallowed"
+        );
+        assert_eq!(config.max_dimension, 1280);
+        assert_eq!(config.action_timeout_secs, 15);
+        assert_eq!(config.max_wait_secs, 30);
+
+        // An empty table must round-trip to the same defaults, so a saved
+        // config that omits the section reloads identically.
+        let empty: ComputerUseToolConfig = toml::from_str("").expect("empty section parses");
+        assert_eq!(empty.enabled, config.enabled);
+        assert_eq!(
+            empty.allow_secondary_displays,
+            config.allow_secondary_displays
+        );
+        assert_eq!(empty.max_dimension, config.max_dimension);
+        assert_eq!(empty.action_timeout_secs, config.action_timeout_secs);
+        assert_eq!(empty.max_wait_secs, config.max_wait_secs);
+
+        let custom = ComputerUseToolConfig {
+            enabled: true,
+            allow_secondary_displays: true,
+            max_dimension: 2560,
+            action_timeout_secs: 45,
+            max_wait_secs: 120,
+        };
+        let toml_str = toml::to_string(&custom).expect("computer_use serializes");
+        let parsed: ComputerUseToolConfig =
+            toml::from_str(&toml_str).expect("computer_use deserializes");
+        assert!(parsed.enabled);
+        assert!(parsed.allow_secondary_displays);
+        assert_eq!(parsed.max_dimension, 2560);
+        assert_eq!(parsed.action_timeout_secs, 45);
+        assert_eq!(parsed.max_wait_secs, 120);
+    }
+
+    #[test]
+    async fn computer_use_config_validation_and_compiled_out_warning() {
+        use crate::opt_in_tools::OptInTool;
+
+        let computer_use_compiled_out = |config: &Config| -> Vec<String> {
+            config
+                .collect_warnings()
+                .into_iter()
+                .filter(|warning| {
+                    warning.code == crate::validation_warnings::TOOL_COMPILED_OUT
+                        && warning.path == "computer_use.enabled"
+                })
+                .map(|warning| warning.path)
+                .collect()
+        };
+
+        type Break = fn(&mut ComputerUseToolConfig);
+        let cases: [(&str, Break); 6] = [
+            ("computer_use.max_dimension", |c| c.max_dimension = 100),
+            ("computer_use.max_dimension", |c| c.max_dimension = 5000),
+            ("computer_use.action_timeout_secs", |c| {
+                c.action_timeout_secs = 0;
+            }),
+            ("computer_use.action_timeout_secs", |c| {
+                c.action_timeout_secs = 121;
+            }),
+            ("computer_use.max_wait_secs", |c| c.max_wait_secs = 0),
+            ("computer_use.max_wait_secs", |c| c.max_wait_secs = 301),
+        ];
+
+        for (field, break_field) in cases {
+            let mut config = Config::default();
+            config.computer_use.enabled = true;
+            break_field(&mut config.computer_use);
+
+            if OptInTool::ComputerUse.compiled() {
+                let err = config
+                    .validate()
+                    .expect_err("a build with the tool checks its settings")
+                    .to_string();
+                assert!(
+                    err.contains(field),
+                    "expected an error on {field}, got: {err}"
+                );
+                assert!(
+                    computer_use_compiled_out(&config).is_empty(),
+                    "{field}: a compiled-in tool is not reported as compiled out"
+                );
+            } else {
+                config
+                    .validate()
+                    .expect("a build without the tool does not check its settings");
+                assert_eq!(
+                    computer_use_compiled_out(&config),
+                    ["computer_use.enabled"],
+                    "{field}: the enabled section is reported as compiled out"
+                );
+            }
         }
     }
 
