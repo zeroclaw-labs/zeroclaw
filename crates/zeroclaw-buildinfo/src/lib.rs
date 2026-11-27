@@ -151,6 +151,7 @@ mod git_layout_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git_layout_tests::Repository;
 
     #[test]
     fn renders_describe_id_with_the_package_version() {
@@ -167,7 +168,8 @@ mod tests {
 
     #[test]
     fn instructions_publish_one_key_and_invalidate_on_every_input() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repository = Repository::new();
+        let dir = &repository.checkout;
         let id = build_id(dir);
         let lines = instructions(dir, "0.8.5", &id);
         assert!(
@@ -200,7 +202,8 @@ mod tests {
 
     #[test]
     fn external_build_id_beats_git_and_blanks_do_not_count() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repository = Repository::new();
+        let dir = &repository.checkout;
         assert_eq!(
             resolve_build_id(dir, Some("24e7324dc6".to_string())),
             "24e7324dc6"
@@ -211,10 +214,10 @@ mod tests {
 
     #[test]
     fn watched_refs_include_the_file_a_commit_rewrites() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let Some(branch) = git(dir, &["symbolic-ref", "--quiet", "HEAD"]) else {
-            return; // detached HEAD: no branch ref advances on commit
-        };
+        let repository = Repository::new();
+        let dir = &repository.checkout;
+        let branch =
+            git(dir, &["symbolic-ref", "--quiet", "HEAD"]).expect("the fixture has a branch");
         let expected = git_path(dir, &branch).expect("branch ref resolves to a path");
         assert!(
             watched_refs(dir).contains(&expected),
@@ -224,9 +227,10 @@ mod tests {
 
     #[test]
     fn build_id_resolves_inside_a_real_checkout() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repository = Repository::new();
+        let dir = &repository.checkout;
         let id = build_id(dir);
-        assert_ne!(id, UNKNOWN, "tests run inside the repository");
+        assert_ne!(id, UNKNOWN, "the fixture is a Git checkout");
         assert!(
             id.contains('g') || id.chars().all(|c| c.is_ascii_hexdigit()),
             "unexpected build id: {id}"

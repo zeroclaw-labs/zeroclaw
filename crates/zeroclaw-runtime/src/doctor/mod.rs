@@ -3767,6 +3767,31 @@ mod tests {
     }
 
     #[test]
+    fn diagnose_reports_an_enabled_removed_gemini_cli_section() {
+        let mut config = Config::default();
+        config.gemini_cli.enabled = true;
+
+        let results = diagnose(&config);
+        let hit = results.iter().find(|item| {
+            item.category == "config"
+                && item.message.contains("(at gemini_cli.enabled)")
+                && item.message.contains("the `gemini_cli` tool is removed")
+        });
+        assert!(
+            hit.is_some(),
+            "doctor must explain why an enabled [gemini_cli] tool is gone; got: {results:?}"
+        );
+
+        config.gemini_cli.enabled = false;
+        assert!(
+            !diagnose(&config)
+                .iter()
+                .any(|item| item.message.contains("gemini_cli.enabled")),
+            "a disabled [gemini_cli] section is not reported"
+        );
+    }
+
+    #[test]
     fn diagnose_flags_web_dist_dir_with_tilde() {
         // Asserts the localized Fluent message resolves and inlines the path +
         // the tilde reason — the diagnostic now goes through Fluent per
