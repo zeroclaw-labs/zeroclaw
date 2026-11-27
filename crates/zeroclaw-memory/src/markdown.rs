@@ -22,7 +22,10 @@ fn entry_in_window(
         }
         return true;
     }
-    if let Ok(date) = NaiveDate::parse_from_str(timestamp, "%Y-%m-%d") {
+    // Daily logs can have a suffix, such as `2026-01-02-0800` or `2026-01-02_notes`.
+    if let Ok((date, suffix)) = NaiveDate::parse_and_remainder(timestamp, "%Y-%m-%d")
+        && (suffix.is_empty() || suffix.starts_with(['-', '_']))
+    {
         if let Some(s) = since
             && date < s.date_naive()
         {
