@@ -47117,8 +47117,9 @@ mod tests {
         for (original_mode, target_mode) in [("chat", "acp"), ("acp", "chat")] {
             let tmp = tempfile::TempDir::new().unwrap();
             let config = make_acp_test_config(&tmp);
-            let (dispatcher, sessions, chat_backend, acp_store) =
+            let (mut dispatcher, sessions, chat_backend, acp_store) =
                 make_persistence_test_dispatcher(config, tmp.path());
+            dispatcher.register_tui_for_test("failed-mode-replacement-tui");
             let sid = "failed-mode-replacement";
             let original_params = json!({
                 "agent_alias": "test-agent", "chat_mode": original_mode,
@@ -47861,8 +47862,9 @@ mod tests {
     async fn rtg_10197_live_acp_reattach_validates_interaction_surface() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
-        let (dispatcher, sessions, _chat_backend, _acp_store) =
+        let (mut dispatcher, sessions, _chat_backend, _acp_store) =
             make_persistence_test_dispatcher(config, tmp.path());
+        dispatcher.register_tui_for_test("acp-reattach-tui");
 
         dispatcher
             .handle_session_new_for_test(&json!({
@@ -47895,6 +47897,7 @@ mod tests {
                 "agent_alias": "test-agent",
                 "chat_mode": "acp",
                 "session_id": "live-generic-acp",
+                "keep_siblings": true,
             }))
             .await
             .expect("initial generic ACP session must succeed");
@@ -47936,8 +47939,9 @@ mod tests {
     async fn concurrent_same_target_replacements_keep_first_admitted_incarnation() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
-        let (dispatcher, sessions, _chat_backend, _acp_store) =
+        let (mut dispatcher, sessions, _chat_backend, _acp_store) =
             make_persistence_test_dispatcher(config, tmp.path());
+        dispatcher.register_tui_for_test("concurrent-replacement-tui");
         let session_id = "concurrent-chat-to-acp-replacement";
         dispatcher
             .handle_session_new_for_test(&json!({
@@ -50908,8 +50912,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
         let data_dir = config.data_dir.clone();
-        let (dispatcher, sessions, _chat_backend, acp_store) =
+        let (mut dispatcher, sessions, _chat_backend, acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
+        dispatcher.register_tui_for_test("acp-reattach-tui");
         let sid = "acp-live-checkpoint-001";
         let params = json!({
             "agent_alias": "test-agent",
@@ -50994,8 +50999,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
         let data_dir = config.data_dir.clone();
-        let (dispatcher, sessions, _chat_backend, _acp_store) =
+        let (mut dispatcher, sessions, _chat_backend, _acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
+        dispatcher.register_tui_for_test("acp-reattach-tui");
         let sid = "acp-inflight-resume-001";
         let params = json!({
             "agent_alias": "test-agent",
@@ -52303,7 +52309,7 @@ mod tests {
         let (tx, mut replies) = tokio::sync::mpsc::channel(64);
         let mut owner = RpcDispatcher::new(Arc::clone(&context), tx, "unix:fixture".into());
         owner.set_authenticated_for_test();
-        owner.set_tui_id_for_test(Some("jsonl-delete-fixture".into()));
+        owner.register_tui_for_test("jsonl-delete-fixture");
         assert_eq!(owner.access_policy, RpcAccessPolicy::TrustedLocal);
         let created = request(
             &mut owner,
@@ -52936,8 +52942,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
         let data_dir = config.data_dir.clone();
-        let (dispatcher, _sessions, _chat_backend, acp_store) =
+        let (mut dispatcher, _sessions, _chat_backend, acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
+        dispatcher.register_tui_for_test("acp-reattach-tui");
 
         let sid = "acp-cwd-resume-001";
         let original_cwd = tmp.path().join("project-dir").to_string_lossy().to_string();
