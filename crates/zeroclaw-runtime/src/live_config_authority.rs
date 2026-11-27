@@ -384,6 +384,22 @@ impl AgentExecutionSelection {
         })??;
         self.capability.admit_at(&canonical, generation)
     }
+
+    /// The generation this selection witnessed for the canonical `alias`,
+    /// without admitting it. For work that is accepted now and admitted later
+    /// at exactly this generation: the lifecycle state was captured before
+    /// config, so a target present in a config read taken after this
+    /// selection was live at the returned generation.
+    pub fn generation(&self, alias: &str) -> Result<u64, AgentExecutionError> {
+        if self.closing {
+            return Err(AgentAdmissionError::GenerationClosing.into());
+        }
+        Ok(self.generations.get(alias).cloned().ok_or_else(|| {
+            AgentExecutionError::UnknownAlias {
+                alias: alias.to_string(),
+            }
+        })??)
+    }
 }
 
 impl AgentExecutionCapability {

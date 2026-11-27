@@ -100,6 +100,11 @@ struct PendingWake {
     /// the wake instead of handing its prompt to the replacement. `None` when
     /// there is no execution capability, and so no lifecycle to pin.
     target_generation: Option<u64>,
+    /// The live config this wake's caller resolved policy from. The follow-up
+    /// turn reads tool and egress policy through it, never through the handle
+    /// of whichever caller started the worker: that worker can outlive a
+    /// reload, and its handle then describes a retired generation.
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     /// The headless SOP step this wake's caller ran under, restored around the
     /// turn it queues so the target cannot escape that step's tool scope.
     step_scope: Option<crate::sop::active_scope::HeadlessStepScope>,
@@ -339,17 +344,34 @@ impl RuntimeAgentWakeBackend {
     /// Read from canonical config on every call, and again after a wake waits
     /// for another claim to settle, so an operator edit made in between
     /// applies before the wake is admitted.
+    ///
+    /// The target's lifecycle generation is captured *before* the config read
+    /// that selects it. Delete publishes the removal before it advances the
+    /// generation, so a target this read still sees was live at the captured
+    /// generation, and a target deleted since is refused when the wake is
+    /// admitted at it. Reading the generation after the grant instead could
+    /// pair a since-deleted target with the next generation, which a
+    /// replacement under the same alias would then match.
     fn resolve_wake_grant(
         &self,
         instance_key: &str,
         target_agent: &str,
     ) -> Result<WakeGrant, AgentWakeError> {
+        let selection = self
+            .execution_capability
+            .as_ref()
+            .map(AgentExecutionCapability::capture_selection);
         let config_snapshot = self.config_snapshot()?;
         let (canonical, rate_limit) = wake_target_in(&config_snapshot, instance_key, target_agent)?;
+        let generation = selection
+            .map(|selection| selection.generation(&canonical))
+            .transpose()
+            .map_err(|error| map_execution_error(&error))?;
         Ok(WakeGrant {
             config_snapshot,
             canonical,
             rate_limit,
+            generation,
         })
     }
 }
@@ -423,6 +445,9 @@ struct WakeGrant {
     config_snapshot: Arc<Config>,
     canonical: String,
     rate_limit: u32,
+    /// The target's lifecycle generation, captured before `config_snapshot`
+    /// was read. `None` without an execution capability.
+    generation: Option<u64>,
 }
 
 #[async_trait]
@@ -458,6 +483,7 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
             caller_alias: caller_alias.map(str::to_string),
             capabilities: self.capabilities.get().cloned(),
             execution_capability: self.execution_capability.clone(),
+            live_config: self.live_config.clone(),
             // Stamped when the wake is actually accepted onto a running slot.
             target_generation: None,
             step_scope: step_scope.clone(),
@@ -481,15 +507,11 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                         {
                             return Err(AgentWakeError::RateLimited);
                         }
-                        // Pin the generation this wake is accepted against,
-                        // read from the same canonical alias the slot is keyed
-                        // by. A later delete advances it, so the retry cannot
+                        // Pin the generation the grant was resolved against. A
+                        // later delete advances it, so the follow-up cannot
                         // reach a replacement that reuses the alias.
                         if let Some(wake) = pending.as_mut() {
-                            wake.target_generation =
-                                self.execution_capability.as_ref().map(|capability| {
-                                    capability.agent_lifecycle_generation(&grant.canonical)
-                                });
+                            wake.target_generation = grant.generation;
                         }
                         *existing = pending.take();
                         ::zeroclaw_log::record!(
@@ -536,6 +558,7 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
         let WakeGrant {
             config_snapshot,
             canonical,
+            generation,
             ..
         } = grant;
         // From here every early return releases the slot again.
@@ -544,7 +567,10 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
         let admission = match self
             .execution_capability
             .as_ref()
-            .map(|capability| capability.resolve_and_admit(&canonical))
+            .zip(generation)
+            // Admit at the generation the grant was resolved against: a
+            // delete that committed since refuses this wake here.
+            .map(|(capability, generation)| capability.admit_at(&canonical, generation))
             .transpose()
         {
             Ok(admission) => admission,
@@ -650,7 +676,6 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
             "plugin wake accepted for in-process delivery"
         );
 
-        let live_config = self.live_config.clone();
         let coordinator = Arc::clone(&self.coordinator);
         let spawn_key = slot_key.clone();
         let spawn_canonical = canonical.clone();
@@ -661,6 +686,7 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
             depth: next_depth,
             caller_alias: caller_alias.map(str::to_string),
             capabilities: self.capabilities.get().cloned(),
+            live_config: self.live_config.clone(),
             step_scope,
             task,
         };
@@ -697,7 +723,7 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                         Some(bound) => {
                             Box::pin(crate::agent::loop_::process_message_shared_with_capabilities(
                                 Arc::clone(&plan.cfg),
-                                live_config.clone(),
+                                plan.live_config.clone(),
                                 bound.capabilities,
                                 bound.principal,
                                 &turn_alias,
@@ -711,7 +737,7 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                         None => Box::pin(
                             crate::agent::loop_::process_message_shared_with_live_config_and_admission_and_principal(
                                 Arc::clone(&plan.cfg),
-                                live_config.clone(),
+                                plan.live_config.clone(),
                                 &turn_alias,
                                 &turn_prompt,
                                 None,
@@ -811,7 +837,7 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                     };
                     let cfg = match admission.as_ref() {
                         Some(admission) => admission.config(),
-                        None => match live_config.as_ref() {
+                        None => match next.live_config.as_ref() {
                             Some(handle) => Arc::new(handle.read().clone()),
                             None => Arc::clone(&plan.cfg),
                         },
@@ -893,6 +919,7 @@ impl AgentWakeBackend for RuntimeAgentWakeBackend {
                         depth: next_depth,
                         caller_alias: next.caller_alias,
                         capabilities: next.capabilities,
+                        live_config: next.live_config,
                         step_scope: next.step_scope,
                         task,
                     };
@@ -913,6 +940,8 @@ struct WakeTurnPlan {
     depth: u32,
     caller_alias: Option<String>,
     capabilities: Option<crate::composition::BoundCapabilities>,
+    /// This turn's caller's live config; see [`PendingWake::live_config`].
+    live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
     step_scope: Option<crate::sop::active_scope::HeadlessStepScope>,
     task: WakeTask,
 }
@@ -3460,6 +3489,289 @@ mod tests {
         assert_eq!(tasks[0].principal_id.as_deref(), Some("sender-1"));
         assert_eq!(*request_count.lock(), 1, "the revoked follow-up never runs");
         server.abort();
+    }
+
+    /// A wake must pair its grant with the target generation that grant saw.
+    /// Here the target is deleted between the two reads: the backend's config
+    /// view still lists it, while the authority has committed the deletion.
+    /// The wake must be refused outright. If it were queued against the
+    /// advanced generation, a replacement published under the same alias
+    /// before the worker drains would match that pin and run the old prompt.
+    #[tokio::test]
+    async fn wake_refuses_a_target_deleted_between_its_grant_and_generation_reads() {
+        let provider_entered = Arc::new(tokio::sync::Notify::new());
+        let provider_release = Arc::new(tokio::sync::Notify::new());
+        let (server, mock_addr, request_count) =
+            gated_mock_provider(&provider_entered, &provider_release).await;
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut config = mock_provider_config(workspace.path(), mock_addr);
+        config.plugins.entries = vec![entry(&instance_key(), &["*"], None)];
+        let authority = crate::LiveConfigAuthority::new(config.clone());
+        let lifecycle = authority.agent_lifecycle();
+        // The view the grant is read from. It never sees the deletion, which
+        // is what a grant read taken just before the deletion observes.
+        let earlier_view = zeroclaw_config::live::LiveConfig::new(config.clone());
+
+        let settle_failing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let settle_failed = Arc::new(tokio::sync::Notify::new());
+        let (control_plane, store) =
+            failing_settlement_control_plane(workspace.path(), &settle_failing, &settle_failed);
+        let coordinator = Arc::new(SharedWakeCoordinator::new());
+        let backend = RuntimeAgentWakeBackend::for_tests(
+            Arc::new(config.clone()),
+            Some(earlier_view.handle()),
+            Some(authority.execution_capability()),
+            Some(control_plane),
+            Arc::clone(&coordinator),
+        );
+
+        assert_eq!(
+            backend
+                .wake(&scope(), Some("sender-1"), "recipient", "first")
+                .await,
+            Ok(())
+        );
+        tokio::time::timeout(Duration::from_secs(10), provider_entered.notified())
+            .await
+            .expect("first turn reaches mock provider");
+
+        // The turn ends and its settlement keeps failing: the slot stays
+        // occupied with no target lease, so the target can be deleted.
+        settle_failing.store(true, std::sync::atomic::Ordering::SeqCst);
+        provider_release.notify_one();
+        for attempt in 1..=2 {
+            tokio::time::timeout(Duration::from_secs(10), settle_failed.notified())
+                .await
+                .unwrap_or_else(|_| panic!("terminal write attempt {attempt} must fail"));
+        }
+        let mut delete = lifecycle
+            .begin_delete("recipient")
+            .expect("an idle agent can be deleted during settlement backoff");
+        let mut removed = authority.snapshot_config();
+        removed.agents.remove("recipient");
+        authority.publish_for_test(removed);
+        delete.commit_destructive_mutation();
+        drop(delete);
+
+        assert_eq!(
+            backend
+                .wake(&scope(), Some("sender-2"), "recipient", "stale")
+                .await,
+            Err(AgentWakeError::UnknownAgent),
+            "a target already deleted at its generation read is refused"
+        );
+
+        // A replacement under the same alias appears before the worker drains.
+        authority.publish_for_test(config);
+        settle_failing.store(false, std::sync::atomic::Ordering::SeqCst);
+        await_slots_released(&coordinator).await;
+
+        assert_eq!(
+            *request_count.lock(),
+            1,
+            "the refused wake must never reach the replacement"
+        );
+        let tasks = tasks_for(store.as_ref(), "recipient").await;
+        assert_eq!(tasks.len(), 1, "{tasks:?}");
+        assert_eq!(tasks[0].principal_id.as_deref(), Some("sender-1"));
+        server.abort();
+    }
+
+    /// A worker can outlive a reload: its first turn's settlement retry keeps
+    /// the process-wide slot after the old authority drained. A fresh caller on
+    /// the new authority then joins that slot, and its follow-up must read tool
+    /// policy through its own live config, not the handle the first caller
+    /// passed. Here the reload withdrew `file_download`'s loopback allowance;
+    /// the follow-up's download must be refused rather than reach the server.
+    #[tokio::test]
+    async fn followup_after_reload_reads_policy_through_its_own_callers_live_config() {
+        use axum::{Json, Router, extract::State, routing::get, routing::post};
+        use zeroclaw_config::policy::AutonomyLevel;
+        use zeroclaw_config::schema::{FileDownloadConfig, OpenAIModelProviderConfig, WireApi};
+
+        #[derive(Clone)]
+        struct Script {
+            requests: Arc<Mutex<u32>>,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+            tool_results: Arc<Mutex<Vec<String>>>,
+        }
+        async fn scripted(
+            State(state): State<Script>,
+            Json(body): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            let messages = body["messages"].as_array().cloned().unwrap_or_default();
+            if let Some(tool) = messages.iter().rev().find(|m| m["role"] == "tool") {
+                state
+                    .tool_results
+                    .lock()
+                    .push(tool["content"].as_str().unwrap_or_default().to_string());
+                return Json(serde_json::json!({
+                    "choices": [{"message": {"content": "follow-up done"}}]
+                }));
+            }
+            let request = {
+                let mut requests = state.requests.lock();
+                *requests += 1;
+                *requests
+            };
+            if request == 1 {
+                // The first caller's turn: held so the second wake coalesces.
+                state.entered.notify_one();
+                state.release.notified().await;
+                return Json(serde_json::json!({
+                    "choices": [{"message": {"content": "first done"}}]
+                }));
+            }
+            Json(serde_json::json!({
+                "choices": [{"message": {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "download-1",
+                        "type": "function",
+                        "function": {
+                            "name": "file_download",
+                            "arguments": serde_json::json!({
+                                "document_id": "doc-1",
+                                "dest_path": "out.bin"
+                            }).to_string()
+                        }
+                    }]
+                }}]
+            }))
+        }
+        async fn serve_download(State(hits): State<Arc<Mutex<u32>>>) -> &'static str {
+            *hits.lock() += 1;
+            "document"
+        }
+
+        let script = Script {
+            requests: Arc::new(Mutex::new(0)),
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            tool_results: Arc::new(Mutex::new(Vec::new())),
+        };
+        let provider_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("provider listener");
+        let provider_addr = provider_listener.local_addr().expect("provider addr");
+        let provider_app = Router::new()
+            .route("/chat/completions", post(scripted))
+            .with_state(script.clone());
+        let provider = zeroclaw_spawn::spawn!(async move {
+            axum::serve(provider_listener, provider_app)
+                .await
+                .expect("provider mock");
+        });
+        let download_hits = Arc::new(Mutex::new(0_u32));
+        let download_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("download listener");
+        let download_addr = download_listener.local_addr().expect("download addr");
+        let download_app = Router::new()
+            .route("/download", get(serve_download))
+            .with_state(Arc::clone(&download_hits));
+        let download = zeroclaw_spawn::spawn!(async move {
+            axum::serve(download_listener, download_app)
+                .await
+                .expect("download mock");
+        });
+
+        let workspace = tempfile::TempDir::new().expect("temp data dir");
+        let mut retired = base_config(workspace.path());
+        retired.reliability.provider_retries = 0;
+        retired.plugins.entries = vec![entry(&instance_key(), &["recipient"], None)];
+        retired.risk_profiles.insert(
+            "full".to_string(),
+            RiskProfileConfig {
+                level: AutonomyLevel::Full,
+                ..RiskProfileConfig::default()
+            },
+        );
+        retired.providers.models.openai.insert(
+            "scripted".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("mock-model".to_string()),
+                    uri: Some(format!("http://{provider_addr}")),
+                    api_key: Some("fixture-key".to_string()),
+                    wire_api: Some(WireApi::ChatCompletions),
+                    timeout_secs: Some(10),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        retired.agents.insert(
+            "recipient".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.scripted".into(),
+                risk_profile: "full".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        retired.file_download = FileDownloadConfig {
+            url: Some(format!("http://{download_addr}/download")),
+            allowed_private_hosts: vec!["127.0.0.1".into()],
+            ..FileDownloadConfig::default()
+        };
+        let mut reloaded = retired.clone();
+        reloaded.file_download.allowed_private_hosts.clear();
+
+        let old_authority = crate::LiveConfigAuthority::new(retired.clone());
+        let new_authority = crate::LiveConfigAuthority::new(reloaded.clone());
+        let control_plane =
+            ControlPlaneHandle::open(workspace.path()).expect("isolated control plane");
+        let store = Arc::clone(&control_plane.store);
+        let coordinator = Arc::new(SharedWakeCoordinator::new());
+        let old_backend = RuntimeAgentWakeBackend::for_tests(
+            Arc::new(retired),
+            Some(old_authority.live_handle()),
+            Some(old_authority.execution_capability()),
+            Some(control_plane.clone()),
+            Arc::clone(&coordinator),
+        );
+        let new_backend = RuntimeAgentWakeBackend::for_tests(
+            Arc::new(reloaded),
+            Some(new_authority.live_handle()),
+            Some(new_authority.execution_capability()),
+            Some(control_plane),
+            Arc::clone(&coordinator),
+        );
+
+        assert_eq!(
+            old_backend
+                .wake(&scope(), Some("sender-1"), "recipient", "first")
+                .await,
+            Ok(())
+        );
+        tokio::time::timeout(Duration::from_secs(10), script.entered.notified())
+            .await
+            .expect("first turn reaches the provider");
+        assert_eq!(
+            new_backend
+                .wake(&scope(), Some("sender-2"), "recipient", "second")
+                .await,
+            Ok(()),
+            "the fresh caller joins the worker's slot"
+        );
+        script.release.notify_one();
+
+        await_slots_released(&coordinator).await;
+        let results = script.tool_results.lock().clone();
+        assert_eq!(results.len(), 1, "the follow-up calls file_download once");
+        assert_eq!(
+            *download_hits.lock(),
+            0,
+            "the follow-up must not use the retired loopback allowance: {results:?}"
+        );
+        assert!(
+            results[0].contains("file_download.allowed_private_hosts"),
+            "the download is refused by the reloaded policy: {results:?}"
+        );
+        assert_eq!(tasks_for(store.as_ref(), "recipient").await.len(), 2);
+        provider.abort();
+        download.abort();
     }
 
     /// A headless SOP step that runs a dispatch-capable plugin must keep the
