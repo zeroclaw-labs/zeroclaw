@@ -519,6 +519,239 @@ async fn goal_damaged_snapshot_is_best_effort_without_promoting() {
     case.finish(QUESTION).await;
 }
 
+#[tokio::test]
+async fn goal_unreadable_metadata_does_not_promote_an_empty_response() {
+    assert_unlocated_goal_history_keeps_recipient(None, false).await;
+}
+
+#[tokio::test]
+async fn goal_unreadable_metadata_does_not_promote_an_alternate_transcript() {
+    assert_unlocated_goal_history_keeps_recipient(Some(&format!("gw_{REATTACH_SID}")), false).await;
+    assert_unlocated_goal_history_keeps_recipient(Some(REATTACH_SID), false).await;
+}
+
+#[tokio::test]
+async fn goal_unlocated_and_unreadable_native_transcript_does_not_promote() {
+    assert_unlocated_goal_history_keeps_recipient(None, true).await;
+}
+
+async fn assert_unlocated_goal_history_keeps_recipient(
+    alternate_key: Option<&str>,
+    damage_history: bool,
+) {
+    use zeroclaw_api::model_provider::ChatMessage;
+    use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
+
+    const ALTERNATE: &str = "Ordinary history under the alternate key.";
+    let mut case = HistoryCase::new(NativeBurstMode::SplitFinal).await;
+    case.goal.parent.turn.release.notify_one();
+    case.a.original_candidate(QUESTION).await;
+    case.verifier_started().await;
+    case.offer().await;
+
+    let backend = case.ctx.session_backend.as_ref().unwrap();
+    let key = format!("rpc_{REATTACH_SID}");
+    let metadata = backend.get_session_metadata(&key).unwrap();
+    if let Some(alternate_key) = alternate_key {
+        backend
+            .append(alternate_key, &ChatMessage::user(ALTERNATE))
+            .unwrap();
+        if let Some(owner) = metadata.principal_id.as_deref() {
+            backend.set_session_principal(alternate_key, owner).unwrap();
+        }
+    }
+    let connection =
+        rusqlite::Connection::open(SqliteSessionBackend::db_path(case.directory.path())).unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE session_metadata SET name = X'00' WHERE session_key = ?1",
+                [&key]
+            )
+            .unwrap(),
+        1
+    );
+    assert!(backend.get_session_metadata(&key).is_none());
+    assert_eq!(
+        backend
+            .try_load(&key)
+            .unwrap()
+            .iter()
+            .map(|message| (message.role.as_str(), message.content.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("user", "Choose a bounded repair."),
+            ("assistant", QUESTION)
+        ]
+    );
+
+    if damage_history {
+        assert_eq!(connection.execute(
+            "UPDATE sessions SET content = CAST(content AS BLOB) WHERE session_key = ?1 AND role = 'assistant'",
+            [&key],
+        ).unwrap(), 1);
+        assert!(backend.try_load(&key).is_err());
+    }
+
+    let read = case.b.start_history();
+    let snapshot = case.b.history_snapshot().await;
+    assert_eq!(snapshot.start, 0);
+    let expected = alternate_key
+        .map(|_| ("user", ALTERNATE))
+        .into_iter()
+        .collect::<Vec<_>>();
+    assert_eq!(snapshot.total, expected.len());
+    assert_eq!(
+        snapshot
+            .messages
+            .iter()
+            .map(|message| (message.role.as_str(), message.content.as_str()))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    join_history(read).await;
+    case.assert_original_recipient().await;
+    case.goal.verifier.turn.release.notify_one();
+    case.a.notice(true).await;
+    case.b.result(Method::Status, json!({}), 7).await;
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE session_metadata SET name = ?1 WHERE session_key = ?2",
+                rusqlite::params![metadata.name, key],
+            )
+            .unwrap(),
+        1
+    );
+    if damage_history {
+        assert_eq!(connection.execute(
+            "UPDATE sessions SET content = CAST(content AS TEXT) WHERE session_key = ?1 AND role = 'assistant'",
+            [&key],
+        ).unwrap(), 1);
+    }
+    case.finish(QUESTION).await;
+}
+
+#[tokio::test]
+async fn goal_verified_empty_native_history_allows_promotion() {
+    use super::{HeldOrdinaryProvider, insert_session_with_owner};
+    use zeroclaw_api::model_provider::ChatMessage;
+    use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
+
+    for alternate in [None, Some("A legacy history message.")] {
+        let directory = tempfile::tempdir().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: directory.path().to_owned(),
+            config_path: directory.path().join("config.toml"),
+            ..Default::default()
+        };
+        let mut ctx = RpcContext::minimal(
+            config,
+            Arc::new(SessionStore::new(
+                64,
+                Arc::new(SessionActorQueue::new(4, 30, 60)),
+            )),
+        );
+        Arc::get_mut(&mut ctx).unwrap().session_backend = Some(Arc::new(
+            SqliteSessionBackend::new(directory.path()).unwrap(),
+        ));
+        insert_session_with_owner(
+            &ctx,
+            directory.path(),
+            REATTACH_SID,
+            Box::new(HeldOrdinaryProvider(Default::default())),
+            Some(REATTACH_OWNER),
+        )
+        .await;
+        let backend = ctx.session_backend.as_ref().unwrap();
+        if let Some(text) = alternate {
+            backend
+                .append(&format!("gw_{REATTACH_SID}"), &ChatMessage::user(text))
+                .unwrap();
+        }
+        let mut peer = Peer::connect(&ctx, "goal-history-reader").await;
+        peer.result(
+            Method::SessionNew,
+            json!({"session_id": REATTACH_SID, "agent_alias": "test-agent", "chat_mode": "chat"}),
+            3,
+        )
+        .await;
+        let key = format!("rpc_{REATTACH_SID}");
+        assert!(backend.get_session_metadata(&key).is_none());
+        assert!(backend.try_load(&key).unwrap().is_empty());
+        let read = peer.start_history();
+        let snapshot = peer.history_snapshot().await;
+        assert_eq!(snapshot.start, 0);
+        assert_eq!(snapshot.total, usize::from(alternate.is_some()));
+        assert_eq!(
+            snapshot
+                .messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            alternate.into_iter().collect::<Vec<_>>()
+        );
+        join_history(read).await;
+        let recipient = ctx
+            .sessions
+            .goal_session_snapshot(REATTACH_SID)
+            .await
+            .unwrap()
+            .goal_recipient;
+        let (active, pending) = recipient.destinations_for_test();
+        assert!(
+            active
+                .and_then(|connection| connection.upgrade())
+                .is_some_and(|connection| connection.matches(&peer.dispatcher.rpc))
+        );
+        assert!(pending.is_none());
+    }
+}
+
+#[tokio::test]
+async fn goal_checked_history_does_not_override_durable_owner_at_send() {
+    use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
+
+    let mut case = HistoryCase::new(NativeBurstMode::SplitFinal).await;
+    case.goal.parent.turn.release.notify_one();
+    case.a.original_candidate(QUESTION).await;
+    case.verifier_started().await;
+    case.offer().await;
+
+    let (arrived_at_frame, send) = case.ctx.sessions.set_test_effect_pause(HISTORY_FRAME);
+    let read = case.b.start_history();
+    arrived(&arrived_at_frame, HISTORY_FRAME).await;
+    let backend = case.ctx.session_backend.as_ref().unwrap();
+    let key = format!("rpc_{REATTACH_SID}");
+    let owner = backend.get_session_metadata(&key).unwrap().principal_id;
+    backend
+        .set_session_principal(&key, "fixture-other-principal")
+        .unwrap();
+    send.notify_one();
+    let frame = case.b.next_frame().await;
+    assert_eq!(frame["id"], HISTORY_ID);
+    assert_eq!(frame["error"]["code"], super::super::FORBIDDEN);
+    assert!(frame.get("result").is_none());
+    join_history(read).await;
+    case.assert_original_recipient().await;
+
+    let connection =
+        rusqlite::Connection::open(SqliteSessionBackend::db_path(case.directory.path())).unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE session_metadata SET principal_id = ?1 WHERE session_key = ?2",
+                rusqlite::params![owner, key],
+            )
+            .unwrap(),
+        1
+    );
+    case.goal.verifier.turn.release.notify_one();
+    case.a.notice(true).await;
+    case.b.result(Method::Status, json!({}), 7).await;
+    case.finish(QUESTION).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn goal_sqlite_append_keeps_the_only_runtime_worker_responsive() {
     use zeroclaw_infra::session_sqlite::SqliteSessionBackend;

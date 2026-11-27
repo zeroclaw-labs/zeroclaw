@@ -10833,6 +10833,31 @@ impl RpcDispatcher {
         }
     }
 
+    fn verified_empty_native_goal_history(&self, session_id: &str, native_key: &str) -> bool {
+        let (reason, error_kind) = match self
+            .ctx
+            .session_backend
+            .as_ref()
+            .map(|backend| backend.try_load(native_key))
+        {
+            Some(Ok(history)) if history.is_empty() => return true,
+            Some(Ok(_)) => ("native_history_not_in_response", None),
+            Some(Err(error)) => (
+                "native_history_read_failed",
+                Some(format!("{:?}", error.kind())),
+            ),
+            None => ("native_history_backend_unavailable", None),
+        };
+        zeroclaw_log::record!(
+            WARN,
+            zeroclaw_log::Event::new(module_path!(), zeroclaw_log::Action::Fail)
+                .with_outcome(zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(serde_json::json!({"session_id": session_id, "reason": reason, "error_kind": error_kind})),
+            "ZeroCode Goal history is incomplete; live delivery did not move"
+        );
+        false
+    }
+
     async fn handle_session_messages_record(
         &self,
         params: &Value,
@@ -10893,7 +10918,7 @@ impl RpcDispatcher {
         let durable = record.as_ref().and_then(|record| record.durable.clone());
         let expected_owner = record.as_ref().and_then(|record| record.owner.clone());
         let mut cursor_result = None;
-        let mut checked = true;
+        let mut checked = false;
         let messages = match durable {
             Some(DurableSession::Acp) => {
                 let store =
@@ -11008,9 +11033,18 @@ impl RpcDispatcher {
                     })?;
                 let history = if checked_chat_snapshot {
                     match backend.try_load(&key) {
-                        Ok(history) => history,
+                        Ok(history) => {
+                            // Goal writes use the native RPC key. An alternate browse key
+                            // covers the Goal only if there is no native history to omit.
+                            let native_key = format!("rpc_{}", req.session_id);
+                            checked = key == native_key
+                                || self.verified_empty_native_goal_history(
+                                    &req.session_id,
+                                    &native_key,
+                                );
+                            history
+                        }
                         Err(error) => {
-                            checked = false;
                             zeroclaw_log::record!(
                                 WARN,
                                 zeroclaw_log::Event::new(
@@ -11052,6 +11086,10 @@ impl RpcDispatcher {
                 }
                 if self.ctx.session_backend.is_none() && self.ctx.acp_session_store.is_none() {
                     return Err(rpc_err(INTERNAL_ERROR, "Session persistence is disabled"));
+                }
+                if checked_chat_snapshot {
+                    let native_key = format!("rpc_{}", req.session_id);
+                    checked = self.verified_empty_native_goal_history(&req.session_id, &native_key);
                 }
                 Vec::new()
             }
