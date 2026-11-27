@@ -1584,20 +1584,73 @@ mod tests {
 
     #[tokio::test]
     async fn start_forwarder_rechecks_the_process_after_the_probe() {
-        // The process is alive when polled, then exits while the status probe
-        // is in flight. A forward seen by that probe is not proof the process
-        // still holds it.
+        // Keep the child alive until the post-spawn probe, then observe its
+        // exit without reaping it. Fixed sleeps race shell startup on macOS.
         let probes = std::sync::atomic::AtomicUsize::new(0);
+        #[cfg(unix)]
+        let pid = std::cell::Cell::new(0);
+        let release = std::cell::RefCell::new(None);
+        #[cfg(windows)]
+        let handle = std::cell::Cell::new(0usize);
         let err = start_forwarder(
             quick_startup(),
-            || Ok(exit_with_stderr_after("0.05", "rejected")),
+            || {
+                let mut child = Command::new("sh")
+                    .args(["-c", "read release; echo rejected >&2; exit 1"])
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()?;
+                #[cfg(unix)]
+                pid.set(child.id().expect("live stand-in child"));
+                #[cfg(windows)]
+                handle.set(child.raw_handle().expect("child process handle") as usize);
+                *release.borrow_mut() = child.stdin.take();
+                Ok(child)
+            },
             || {
                 let first = probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                #[cfg(unix)]
+                let pid = pid.get();
+                let release = release.borrow_mut().take();
+                #[cfg(windows)]
+                let handle = handle.get();
                 async move {
                     if first {
                         return Some(sessions(&[]));
                     }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    drop(release); // EOF releases the shell's read.
+                    wait_until(async || {
+                        #[cfg(unix)]
+                        {
+                            // SAFETY: the initialized output is writable; this
+                            // observes only our child and leaves it waitable.
+                            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                            let result = unsafe {
+                                libc::waitid(
+                                    libc::P_PID,
+                                    pid as libc::id_t,
+                                    &mut info,
+                                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                                )
+                            };
+                            assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+                            // SAFETY: waitid initialized info on success.
+                            unsafe { info.si_pid() == pid as libc::pid_t }
+                        }
+                        #[cfg(windows)]
+                        {
+                            use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+                            use windows::Win32::System::Threading::WaitForSingleObject;
+                            // SAFETY: start_forwarder still owns the live
+                            // process handle while this probe is in flight.
+                            let state = unsafe { WaitForSingleObject(HANDLE(handle as _), 0) };
+                            assert!(state == WAIT_OBJECT_0 || state == WAIT_TIMEOUT);
+                            state == WAIT_OBJECT_0
+                        }
+                    })
+                    .await;
                     Some(sessions(&["mine"]))
                 }
             },
