@@ -156,27 +156,54 @@ impl Snapshot {
     }
 }
 
+/// Total time startup may spend pruning the saved list, across the ACP list
+/// and every Chat probe. One RPC's own timeout, so a daemon that accepts the
+/// connection but never answers delays the first draw by at most this much.
+const STARTUP_PRUNE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Prune Code sessions using the ACP list and Chat sessions using stored
 /// history. Chat listing is not an existence check: JSONL sessions lack the
 /// alias/channel metadata required by `session/list`. Keep entries on probe
 /// errors except the daemon's specific missing-or-unowned session refusal.
-async fn prune_missing(rpc: &RpcClient, mut saved: Snapshot) -> (Snapshot, usize) {
+async fn prune_missing(rpc: &RpcClient, saved: Snapshot) -> (Snapshot, usize) {
+    prune_missing_within(rpc, saved, STARTUP_PRUNE_BUDGET).await
+}
+
+/// [`prune_missing`] under one shared deadline. When it expires, the entry
+/// being checked and every entry not yet checked are kept unverified, in
+/// saved order with their focus flags; only confirmed-missing sessions drop.
+async fn prune_missing_within(
+    rpc: &RpcClient,
+    mut saved: Snapshot,
+    budget: std::time::Duration,
+) -> (Snapshot, usize) {
+    let deadline = tokio::time::Instant::now() + budget;
     let wants = |pane| saved.sessions.iter().any(|s| s.pane == pane);
     let code = if wants(SavedPane::Code) {
-        rpc.acp_session_list().await.ok().map(|list| list.sessions)
+        tokio::time::timeout_at(deadline, rpc.acp_session_list())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|list| list.sessions)
     } else {
         None
     };
     let mut dropped = saved.retain_known(code.as_deref());
     let mut kept = Vec::with_capacity(saved.sessions.len());
+    let mut expired = false;
     for session in saved.sessions {
-        let missing = if session.pane == SavedPane::Chat {
-            match rpc
-                .session_messages_page(&session.session_id, Some(1), None)
-                .await
-            {
-                Ok(page) => page.total == 0,
-                Err(error) => error.downcast_ref::<JsonRpcError>().is_some_and(|error| {
+        // `timeout_at` polls its future once even past the deadline, which
+        // would still send the probe, so check the clock first.
+        expired = expired || tokio::time::Instant::now() >= deadline;
+        let missing = if session.pane == SavedPane::Chat && !expired {
+            let probe = rpc.session_messages_page(&session.session_id, Some(1), None);
+            match tokio::time::timeout_at(deadline, probe).await {
+                Err(_) => {
+                    expired = true;
+                    false
+                }
+                Ok(Ok(page)) => page.total == 0,
+                Ok(Err(error)) => error.downcast_ref::<JsonRpcError>().is_some_and(|error| {
                     error.code == -32012
                         && error
                             .message
@@ -942,6 +969,84 @@ mod tests {
         assert!(restored.sessions[1].focused);
         assert!(restored.sessions[2].focused);
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A daemon that accepts the connection but never answers history
+    /// probes costs startup one shared budget, not one timeout per Chat.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_chat_probes_share_one_startup_deadline() {
+        let (out, client, mut rx) = rpc_on(Transport::Local);
+        let saved = Snapshot::from_rows(
+            &[
+                row(PaneKind::Chat, "chat-gone", "alpha", false),
+                row(PaneKind::Chat, "chat-stalled", "alpha", false),
+                row(PaneKind::Chat, "chat-focused", "alpha", true),
+                row(PaneKind::Chat, "chat-last", "alpha", false),
+            ],
+            Some(PaneKind::Chat),
+        );
+        let expected: Vec<_> = saved.sessions[1..].to_vec();
+        let budget = std::time::Duration::from_secs(5);
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move { prune_missing_within(&client, saved, budget).await });
+
+        let line = rx.recv().await.expect("first Chat probe");
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["params"]["session_id"], "chat-gone");
+        out.dispatch_response(
+            request["id"].as_str().unwrap(),
+            Some(serde_json::json!({ "messages": [], "total": 0, "start": 0 })),
+            None,
+        );
+        // The next probe is never answered.
+        let line = rx.recv().await.expect("second Chat probe");
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["params"]["session_id"], "chat-stalled");
+
+        let (restored, dropped) = task.await.unwrap();
+        assert!(
+            started.elapsed() <= budget,
+            "startup pruning took {:?}, over its {budget:?} budget",
+            started.elapsed()
+        );
+        assert_eq!(dropped, 1, "only the confirmed-missing session drops");
+        assert_eq!(
+            restored.sessions, expected,
+            "unverified entries keep order and focus"
+        );
+        assert!(restored.sessions[1].focused);
+        assert_eq!(restored.start_pane(), Some(PaneKind::Chat));
+        assert!(
+            rx.try_recv().is_err(),
+            "no further Chat is probed after the deadline"
+        );
+    }
+
+    /// The ACP list shares the same deadline: if it stalls, Code entries are
+    /// kept and no Chat probe waits on a spent budget.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_code_list_spends_the_whole_budget() {
+        let (_out, client, mut rx) = rpc_on(Transport::Local);
+        let saved = Snapshot::from_rows(
+            &[
+                row(PaneKind::Acp, "code", "alpha", true),
+                row(PaneKind::Chat, "chat", "alpha", true),
+            ],
+            Some(PaneKind::Acp),
+        );
+        let original = saved.clone();
+        let budget = std::time::Duration::from_secs(5);
+        let started = tokio::time::Instant::now();
+        let task = tokio::spawn(async move { prune_missing_within(&client, saved, budget).await });
+        let line = rx.recv().await.expect("ACP list request");
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], crate::client::method::SESSION_LIST_ACP);
+
+        let (restored, dropped) = task.await.unwrap();
+        assert!(started.elapsed() <= budget, "took {:?}", started.elapsed());
+        assert_eq!(dropped, 0);
+        assert_eq!(restored, original);
+        assert!(rx.try_recv().is_err(), "no Chat probe after the deadline");
     }
 
     #[test]
