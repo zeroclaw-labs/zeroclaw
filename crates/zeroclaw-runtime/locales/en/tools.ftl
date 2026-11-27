@@ -286,6 +286,7 @@ tool-a2a-cancel-desc-peer = Configured peer name hosting the task.
 tool-a2a-cancel-desc-task-id = The task id to cancel.
 tool-a2a-cancel-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the cancel to the correct interface when discovery is re-run (the cached route is used first).
 
+# Task-owned SSH transport lifecycle
 tool-ssh-task-start-failed = Cannot start the task SSH owner
 tool-ssh-task-readiness-pipe = Task SSH owner has no readiness pipe
 tool-ssh-task-readiness-timeout = Task SSH owner readiness timed out
