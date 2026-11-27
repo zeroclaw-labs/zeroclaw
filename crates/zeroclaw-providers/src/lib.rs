@@ -28,6 +28,8 @@ pub mod opencode_session;
 pub mod openrouter;
 pub mod openrouter_catalog;
 pub mod pricing;
+mod qwen_video;
+pub use qwen_video::with_video_read_policy;
 pub mod reliable;
 pub mod router;
 pub mod safeguard_notice;
