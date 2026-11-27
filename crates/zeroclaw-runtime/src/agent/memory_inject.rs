@@ -15,7 +15,7 @@
 //! rerank stage (`rerank_enabled`: over-fetched candidate pool, then
 //! recency/importance blend + duplicate collapse + optional MMR + trim,
 //! replacing decay on that arm) -> relevance filter -> skip set (autosave
-//! keys/content, `*_history` keys, `[IMAGE:` markers, `<tool_result`
+//! keys/content, `*_history` keys, image/video markers, `<tool_result`
 //! blocks, optional Conversation-category exclusion) -> budget caps (entry
 //! count, per-entry chars, total chars) -> `[Memory context]` wrapper.
 //! Exactly one `MemoryRecall` observer event is emitted per render,
@@ -241,8 +241,9 @@ fn should_skip_entry(key: &str, content: &str) -> bool {
     if key.trim().to_ascii_lowercase().ends_with("_history") {
         return true;
     }
-    // Image markers would duplicate the image block already in the request.
-    if content.contains("[IMAGE:") {
+    // Image-bearing notes duplicate images. Both fields are rendered into
+    // the user message, so either field could otherwise select a video.
+    if content.contains("[IMAGE:") || content.contains("[VIDEO:") || key.contains("[VIDEO:") {
         return true;
     }
     // Orphan tool_result blocks recalled into a fresh session present the
@@ -987,6 +988,8 @@ mod tests {
                 MemoryCategory::Core,
                 None,
             ),
+            entry("clip", "see [VIDEO:fixture]", MemoryCategory::Core, None),
+            entry("[VIDEO:fixture]", "clip label", MemoryCategory::Core, None),
             entry("keeper", "real knowledge", MemoryCategory::Core, None),
         ]);
         let observer = RecordingObserver::default();
@@ -1009,6 +1012,7 @@ mod tests {
 
         assert!(!context.contains("transcript blob"));
         assert!(!context.contains("[IMAGE:"));
+        assert!(!context.contains("[VIDEO:"));
         assert!(!context.contains("<tool_result"));
         assert!(context.contains("keeper: real knowledge"));
     }
