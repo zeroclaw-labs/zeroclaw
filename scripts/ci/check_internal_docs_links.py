@@ -13,7 +13,7 @@ from urllib.parse import unquote
 
 
 INLINE_LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
-REFERENCE_LINK_RE = re.compile(r"^\s*\[[^\]]+\]:\s*(\S+)")
+REFERENCE_LINK_RE = re.compile(r"^\s*\[[^\]]+\]:\s*(<[^>]*>|\S+)")
 FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
 QUOTE_PREFIX_RE = re.compile(r"^[ \t]{0,3}>[ \t]?(?:>[ \t]?)*")
 ATX_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}(?:[ \t]+|$)")
@@ -35,11 +35,11 @@ ANCHOR_END_RE = re.compile(r"^[ \t]*<!--\s*ANCHOR_END:\s*([^\s]+)\s*-->[ \t]*$")
 
 def _strip_target(raw: str) -> str:
     target = raw.strip()
-    if target.startswith("<") and target.endswith(">"):
-        target = target[1:-1].strip()
-    if " " in target:
-        target = target.split(" ", 1)[0]
-    return target
+    if target.startswith("<"):
+        closing = target.find(">", 1)
+        if closing != -1:
+            return target[1:closing]
+    return target.split(None, 1)[0] if target else ""
 
 
 def _local_target(raw: str, source: Path) -> str | None:
