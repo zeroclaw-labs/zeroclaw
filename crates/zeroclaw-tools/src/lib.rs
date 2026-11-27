@@ -47,8 +47,6 @@ pub mod file_edit;
 pub mod file_upload;
 pub mod file_upload_bundle;
 pub mod file_write;
-#[cfg(feature = "tool-gemini-cli")]
-pub mod gemini_cli;
 pub mod git_forge;
 pub mod git_operations;
 pub mod glob_search;
@@ -125,7 +123,6 @@ pub mod wrappers;
     feature = "tool-claude-code",
     feature = "tool-claude-code-runner",
     feature = "tool-codex-cli",
-    feature = "tool-gemini-cli",
     feature = "tool-opencode-cli"
 ))]
 mod coding_agent_budget_tests;
