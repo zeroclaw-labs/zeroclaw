@@ -101,7 +101,7 @@ pub use zeroclaw_tools::knowledge_tool::KnowledgeTool;
 #[cfg(feature = "tool-linkedin")]
 pub use zeroclaw_tools::linkedin::LinkedInTool;
 pub use zeroclaw_tools::llm_task::LlmTaskTool;
-pub use zeroclaw_tools::mcp_client::{McpRegistry, McpServer};
+pub use zeroclaw_tools::mcp_client::{ConnectRetryPolicy, McpRegistry, McpServer};
 pub use zeroclaw_tools::mcp_context;
 pub use zeroclaw_tools::mcp_deferred::{
     ActivatedToolSet, DeferredMcpToolSet, build_deferred_tools_section,

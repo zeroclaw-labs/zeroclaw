@@ -18,8 +18,8 @@ use crate::mcp_prompt::{McpGetPromptResult, McpPromptsListResult};
 use crate::mcp_protocol::{JsonRpcRequest, MCP_PROTOCOL_VERSION, McpToolDef, McpToolsListResult};
 use crate::mcp_resource::{McpResourceContents, McpResourcesListResult};
 use crate::mcp_transport::{
-    McpRecoveryGate, McpRequestLifecycle, McpTransportError, SharedMcpTransportConn,
-    create_shared_transport,
+    McpHttpStatusError, McpRecoveryGate, McpRequestLifecycle, McpTransportError,
+    SharedMcpTransportConn, create_shared_transport,
 };
 use zeroclaw_config::schema::{McpServerConfig, McpTransport};
 
@@ -37,6 +37,150 @@ const MAX_TOOL_TIMEOUT_SECS: u64 = 600;
 /// been written or not to have been executed (a Streamable HTTP stale-session
 /// rejection). Outcome-unknown requests are never replayed.
 const MAX_RECONNECT_ATTEMPTS: u32 = 2;
+
+/// Opt-in connect-time retry policy for [`McpRegistry::connect_all_with_retry`].
+///
+/// Many agents restarting at once can trip an MCP gateway's rate limiter, and
+/// an MCP gateway that is itself restarting refuses connections for a while. Without
+/// a retry the server is skipped for the whole process lifetime of a caller
+/// that assembles its tools once (the channel listeners), and the agent runs
+/// with no MCP tools. Only a connect retries: nothing has been established
+/// yet, so replaying `initialize` / `tools/list` is safe.
+///
+/// [`McpRegistry::connect_all`] stays single-shot on purpose: it also runs on
+/// paths that block `/health` (gateway startup) or a user's turn, where minutes
+/// of retrying would be worse than proceeding without the server.
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectRetryPolicy {
+    /// Total attempts including the first one.
+    pub max_attempts: u32,
+    /// Backoff before retry `n` (1-based) is `base * 2^(n-1)`, capped.
+    pub base_delay: Duration,
+    pub max_delay: Duration,
+    /// Upper bound applied to a server-supplied `Retry-After`.
+    pub max_retry_after: Duration,
+    /// Wall-clock budget for the whole `connect_all_with_retry` call, shared
+    /// by all of its servers and measured from the call's start. No retry is
+    /// scheduled whose sleep would end past it. A server reached after the
+    /// budget is spent still gets exactly one attempt, so a server early in
+    /// the list that used the budget can leave later servers a single try.
+    pub total_budget: Duration,
+    /// Hard cap on one connect attempt (initialize, the initialized
+    /// notification and tools/list together). Without it a single attempt
+    /// can take ~30s + the HTTP request timeout + 30s.
+    pub attempt_timeout: Duration,
+}
+
+impl ConnectRetryPolicy {
+    /// The channel listeners' startup policy: up to 10 attempts per server
+    /// within a 3-minute budget shared by all servers of the call, each
+    /// attempt capped at 45s. Worst case for the call: 180s + 45s per server
+    /// (the attempt that may straddle the deadline, plus the single attempt
+    /// each later server gets once the budget is spent).
+    pub const CHANNEL_STARTUP: Self = Self {
+        max_attempts: 10,
+        base_delay: Duration::from_secs(2),
+        max_delay: Duration::from_secs(30),
+        max_retry_after: Duration::from_secs(60),
+        total_budget: Duration::from_secs(180),
+        attempt_timeout: Duration::from_secs(45),
+    };
+
+    /// Delay before retry number `retry` (1-based), given `jitter_unit` in
+    /// `[0, 1)`.
+    ///
+    /// Without a hint: capped exponential backoff `b` with jitter in
+    /// `[b/2, b]`. With a `Retry-After` hint `h` (capped at
+    /// `max_retry_after`): `d = max(h, b)` stretched by jitter into
+    /// `[d, 1.5d]` — never earlier than the server asked, never a zero-delay
+    /// spin on `Retry-After: 0`, and not in lockstep with every other client
+    /// that got the same fixed-window hint.
+    pub fn delay(&self, retry: u32, retry_after: Option<Duration>, jitter_unit: f64) -> Duration {
+        let exp = self
+            .base_delay
+            .saturating_mul(1u32 << retry.saturating_sub(1).min(16));
+        let backoff = exp.min(self.max_delay);
+        let jitter = jitter_unit.clamp(0.0, 1.0);
+        match retry_after {
+            Some(hint) => hint
+                .min(self.max_retry_after)
+                .max(backoff)
+                .mul_f64(1.0 + 0.5 * jitter),
+            None => backoff.mul_f64(0.5 + 0.5 * jitter),
+        }
+    }
+}
+
+/// A process-local pseudo-random value in `[0, 1)`, good enough to spread
+/// retries (not for anything security-relevant). `RandomState` is seeded
+/// per instance by std, so no extra dependency is needed.
+fn jitter_unit() -> f64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    (hasher.finish() >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Why a failed connect may succeed later, if it may.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryableConnectFailure {
+    /// HTTP 429/502/503/504, with the server's `Retry-After` if any.
+    HttpStatus(u16, Option<Duration>),
+    /// TCP connect failed (refused, no route, DNS), e.g. the MCP server is
+    /// restarting and nothing listens behind its address yet.
+    Unreachable,
+    /// The server accepted the connection but did not answer `initialize`
+    /// or `tools/list` within `RECV_TIMEOUT_SECS`.
+    TimedOut,
+}
+
+impl RetryableConnectFailure {
+    fn label(self) -> String {
+        match self {
+            Self::HttpStatus(status, _) => format!("HTTP {status}"),
+            Self::Unreachable => "connection failure".to_string(),
+            Self::TimedOut => "timeout".to_string(),
+        }
+    }
+
+    fn retry_after(self) -> Option<Duration> {
+        match self {
+            Self::HttpStatus(_, hint) => hint,
+            Self::Unreachable | Self::TimedOut => None,
+        }
+    }
+}
+
+/// Classify a failed [`McpServer::connect`]. `None` means "not worth
+/// retrying" (auth failure, bad config, protocol error, ...).
+fn retryable_connect_failure(err: &anyhow::Error) -> Option<RetryableConnectFailure> {
+    for cause in err.chain() {
+        if let Some(e) = cause.downcast_ref::<McpHttpStatusError>() {
+            return e
+                .is_transient()
+                .then(|| RetryableConnectFailure::HttpStatus(e.status.as_u16(), e.retry_after));
+        }
+        if let Some(e) = cause.downcast_ref::<reqwest::Error>() {
+            if e.is_connect() {
+                return Some(RetryableConnectFailure::Unreachable);
+            }
+            if e.is_timeout() {
+                return Some(RetryableConnectFailure::TimedOut);
+            }
+        }
+        if cause
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
+        {
+            return Some(RetryableConnectFailure::TimedOut);
+        }
+    }
+    None
+}
 
 /// Perform the MCP `initialize` + `notifications/initialized` handshake on a
 /// transport. Shared by the initial [`McpServer::connect`] and the
@@ -893,14 +1037,97 @@ pub struct McpRegistry {
 }
 
 impl McpRegistry {
-    /// Connect to all configured servers. Non-fatal: failures are logged and skipped.
+    /// Connect to all configured servers, one attempt each. Non-fatal:
+    /// failures are logged and skipped. Callers that hold the registry for the
+    /// process lifetime and do not block health or a user's turn should use
+    /// [`Self::connect_all_with_retry`] instead.
     pub async fn connect_all(configs: &[McpServerConfig]) -> Result<Self> {
+        Self::connect_all_inner(configs, None).await
+    }
+
+    /// Like [`Self::connect_all`], but retries a retryable connect failure
+    /// (HTTP 429/502/503/504, connection failure, timeout) per `policy`. The
+    /// policy's `total_budget` is shared by all servers in `configs`; every
+    /// attempt is capped at `attempt_timeout`, and a server reached after the
+    /// budget is spent gets one attempt. The call therefore returns within
+    /// `total_budget + attempt_timeout * configs.len()`.
+    pub async fn connect_all_with_retry(
+        configs: &[McpServerConfig],
+        policy: &ConnectRetryPolicy,
+    ) -> Result<Self> {
+        let deadline = Instant::now() + policy.total_budget;
+        Self::connect_all_inner(configs, Some((policy, deadline))).await
+    }
+
+    /// Connect one server, retrying per `policy` until `deadline`. Any
+    /// non-retryable error is returned immediately.
+    async fn connect_with_retry(
+        config: &McpServerConfig,
+        policy: &ConnectRetryPolicy,
+        deadline: Instant,
+    ) -> Result<McpServer> {
+        let mut attempt: u32 = 1;
+        loop {
+            let err =
+                match timeout(policy.attempt_timeout, McpServer::connect(config.clone())).await {
+                    Ok(Ok(server)) => return Ok(server),
+                    Ok(Err(err)) => err,
+                    Err(elapsed) => anyhow::Error::from(elapsed).context(format!(
+                        "MCP server `{}` connect attempt exceeded {:?}",
+                        config.name, policy.attempt_timeout
+                    )),
+                };
+            let Some(failure) = retryable_connect_failure(&err) else {
+                return Err(err);
+            };
+            let delay = policy.delay(attempt, failure.retry_after(), jitter_unit());
+            if attempt >= policy.max_attempts || Instant::now() + delay > deadline {
+                return Err(err.context(format!(
+                    "giving up after {attempt} attempt(s) on {}",
+                    failure.label()
+                )));
+            }
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "mcp_server": &config.name,
+                        "failure": failure.label(),
+                        "attempt": attempt,
+                        "max_attempts": policy.max_attempts,
+                        "retry_in_ms": u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                    })),
+                &format!(
+                    "MCP server `{}` connect failed ({}); retrying in {:?} (attempt {}/{})",
+                    config.name,
+                    failure.label(),
+                    delay,
+                    attempt,
+                    policy.max_attempts
+                )
+            );
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+        }
+    }
+
+    async fn connect_all_inner(
+        configs: &[McpServerConfig],
+        retry: Option<(&ConnectRetryPolicy, Instant)>,
+    ) -> Result<Self> {
         let mut servers = Vec::new();
         let mut tool_index = HashMap::new();
         let mut server_index = HashMap::new();
 
         for config in configs {
-            match McpServer::connect(config.clone()).await {
+            let connected = match retry {
+                Some((policy, deadline)) => {
+                    Self::connect_with_retry(config, policy, deadline).await
+                }
+                None => McpServer::connect(config.clone()).await,
+            };
+            match connected {
                 Ok(server) => {
                     let server_idx = servers.len();
                     server_index.insert(config.name.clone(), server_idx);
@@ -1710,6 +1937,361 @@ mod tests {
             .expect("connect_all should not fail");
         assert!(registry.is_empty());
         assert_eq!(registry.tool_count(), 0);
+    }
+
+    const FAST_RETRY_POLICY: ConnectRetryPolicy = ConnectRetryPolicy {
+        max_attempts: 3,
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+        max_retry_after: Duration::from_millis(5),
+        total_budget: Duration::from_secs(10),
+        attempt_timeout: Duration::from_secs(5),
+    };
+
+    #[tokio::test]
+    async fn connect_all_with_retry_caps_each_attempt() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let policy = ConnectRetryPolicy {
+            attempt_timeout: Duration::from_millis(100),
+            ..FAST_RETRY_POLICY
+        };
+        let server = MockServer::start().await;
+        // initialize hangs far longer than the per-attempt cap.
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(20)))
+            .expect(u64::from(policy.max_attempts))
+            .mount(&server)
+            .await;
+
+        let started = std::time::Instant::now();
+        let registry =
+            McpRegistry::connect_all_with_retry(&[http_server_config(server.uri())], &policy)
+                .await
+                .expect("connect_all stays non-fatal");
+
+        assert_eq!(registry.server_count(), 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "attempt cap not honoured: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn spent_budget_leaves_later_servers_one_attempt() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let policy = ConnectRetryPolicy {
+            max_attempts: 50,
+            total_budget: Duration::ZERO,
+            ..FAST_RETRY_POLICY
+        };
+        let mut configs = Vec::new();
+        let mut servers = Vec::new();
+        for name in ["first", "second"] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({"method": "initialize"})))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(1)
+                .mount(&server)
+                .await;
+            configs.push(McpServerConfig {
+                name: name.into(),
+                ..http_server_config(server.uri())
+            });
+            servers.push(server);
+        }
+
+        let registry = McpRegistry::connect_all_with_retry(&configs, &policy)
+            .await
+            .expect("connect_all stays non-fatal");
+        assert_eq!(registry.server_count(), 0);
+        // Each MockServer verifies exactly one initialize on drop.
+    }
+
+    /// Mount a healthy initialize/initialized/tools-list responder exposing
+    /// one tool. Callers mount higher-priority failure mocks in front of it.
+    async fn mount_healthy_mcp(server: &wiremock::MockServer) {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Mcp-Session-Id", "s")
+                    .set_body_json(json!({"jsonrpc":"2.0","id":1,"result":{"capabilities":{}}})),
+            )
+            .with_priority(5)
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                json!({"method":"notifications/initialized"}),
+            ))
+            .respond_with(ResponseTemplate::new(202))
+            .with_priority(5)
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method":"tools/list"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "jsonrpc":"2.0","id":2,
+                "result":{"tools":[{"name":"ping","inputSchema":{"type":"object"}}]}
+            })))
+            .with_priority(5)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn connect_all_retries_http_429_then_connects() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // The first two initialize attempts are rate limited.
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+            .up_to_n_times(2)
+            .expect(2)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_healthy_mcp(&server).await;
+
+        let registry = McpRegistry::connect_all_with_retry(
+            &[http_server_config(server.uri())],
+            &FAST_RETRY_POLICY,
+        )
+        .await
+        .expect("connect_all");
+
+        assert_eq!(registry.server_count(), 1, "429 must be retried, not fatal");
+        assert_eq!(registry.tool_names(), vec!["remote__ping".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn connect_all_gives_up_after_max_attempts_on_persistent_503() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(u64::from(FAST_RETRY_POLICY.max_attempts))
+            .mount(&server)
+            .await;
+
+        let registry = McpRegistry::connect_all_with_retry(
+            &[http_server_config(server.uri())],
+            &FAST_RETRY_POLICY,
+        )
+        .await
+        .expect("connect_all stays non-fatal");
+
+        assert_eq!(registry.server_count(), 0);
+        // server.verify() on drop pins exactly max_attempts initialize calls.
+    }
+
+    #[tokio::test]
+    async fn plain_connect_all_is_single_shot_on_429() {
+        // The default path (gateway startup listing, per-turn assembly) must
+        // never retry: it blocks /health or a user's turn.
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+            .expect(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        mount_healthy_mcp(&server).await;
+
+        let registry = McpRegistry::connect_all(&[http_server_config(server.uri())])
+            .await
+            .expect("connect_all stays non-fatal");
+
+        assert_eq!(registry.server_count(), 0, "connect_all must not retry");
+    }
+
+    #[tokio::test]
+    async fn connect_all_with_retry_stops_at_total_budget() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Many attempts allowed, but the budget only fits a couple of 40ms+
+        // sleeps (jitter puts each in [40ms, 60ms] because Retry-After is
+        // floored at the backoff).
+        let policy = ConnectRetryPolicy {
+            max_attempts: 50,
+            base_delay: Duration::from_millis(40),
+            max_delay: Duration::from_millis(40),
+            max_retry_after: Duration::from_millis(40),
+            total_budget: Duration::from_millis(150),
+            attempt_timeout: Duration::from_secs(5),
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+            .expect(2..=4)
+            .mount(&server)
+            .await;
+
+        let started = std::time::Instant::now();
+        let registry =
+            McpRegistry::connect_all_with_retry(&[http_server_config(server.uri())], &policy)
+                .await
+                .expect("connect_all stays non-fatal");
+
+        assert_eq!(registry.server_count(), 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "budget not honoured: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_all_with_retry_retries_connection_refused() {
+        // Grab a free port, then close it so connects are refused.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr").port()
+        };
+        let config = http_server_config(format!("http://127.0.0.1:{port}/mcp"));
+
+        let err = McpServer::connect(config.clone())
+            .await
+            .err()
+            .expect("refused connect must fail");
+        assert_eq!(
+            retryable_connect_failure(&err),
+            Some(RetryableConnectFailure::Unreachable),
+            "connection refused must be retryable: {err:#}"
+        );
+
+        // And through the registry: all attempts made, server skipped.
+        let started = std::time::Instant::now();
+        let registry = McpRegistry::connect_all_with_retry(&[config], &FAST_RETRY_POLICY)
+            .await
+            .expect("connect_all stays non-fatal");
+        assert_eq!(registry.server_count(), 0);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn initialize_timeout_is_retryable() {
+        let elapsed = tokio::time::timeout(
+            Duration::from_millis(1),
+            std::future::pending::<Result<()>>(),
+        )
+        .await
+        .expect_err("pending future must time out");
+        let err: anyhow::Error = Err::<(), _>(elapsed)
+            .context("MCP server `x` timed out after 30s waiting for initialize response")
+            .unwrap_err();
+        assert_eq!(
+            retryable_connect_failure(&err),
+            Some(RetryableConnectFailure::TimedOut)
+        );
+
+        let protocol: anyhow::Error = anyhow::Error::msg("MCP server `x` rejected initialize");
+        assert_eq!(retryable_connect_failure(&protocol), None);
+    }
+
+    #[tokio::test]
+    async fn connect_all_does_not_retry_non_transient_status() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(json!({"method": "initialize"})))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let registry = McpRegistry::connect_all_with_retry(
+            &[http_server_config(server.uri())],
+            &FAST_RETRY_POLICY,
+        )
+        .await
+        .expect("connect_all stays non-fatal");
+
+        assert_eq!(registry.server_count(), 0);
+    }
+
+    #[test]
+    fn connect_retry_delay_is_capped_exponential_with_jitter() {
+        let p = ConnectRetryPolicy::CHANNEL_STARTUP;
+        // No hint: jitter 1.0 gives the full backoff, 0.0 gives half of it.
+        assert_eq!(p.delay(1, None, 1.0), Duration::from_secs(2));
+        assert_eq!(p.delay(2, None, 1.0), Duration::from_secs(4));
+        assert_eq!(p.delay(4, None, 1.0), Duration::from_secs(16));
+        assert_eq!(p.delay(5, None, 1.0), Duration::from_secs(30));
+        assert_eq!(p.delay(40, None, 1.0), Duration::from_secs(30));
+        assert_eq!(p.delay(1, None, 0.0), Duration::from_secs(1));
+        // Retry-After is a floor: never earlier than asked, jitter on top.
+        assert_eq!(
+            p.delay(1, Some(Duration::from_secs(7)), 0.0),
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            p.delay(1, Some(Duration::from_secs(7)), 1.0),
+            Duration::from_millis(10_500)
+        );
+        // ...capped at max_retry_after...
+        assert_eq!(
+            p.delay(1, Some(Duration::from_secs(3600)), 0.0),
+            Duration::from_secs(60)
+        );
+        // ...and never below the backoff, so `Retry-After: 0` cannot spin.
+        assert_eq!(
+            p.delay(3, Some(Duration::ZERO), 0.0),
+            Duration::from_secs(8)
+        );
+        let j = jitter_unit();
+        assert!((0.0..1.0).contains(&j), "jitter out of range: {j}");
+    }
+
+    #[test]
+    fn http_status_error_parses_retry_after_seconds_only() {
+        use reqwest::StatusCode;
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static(" 12 "));
+        let e = McpHttpStatusError::from_response_parts(StatusCode::TOO_MANY_REQUESTS, &headers);
+        assert_eq!(e.retry_after, Some(Duration::from_secs(12)));
+        assert!(e.is_transient());
+        assert_eq!(
+            e.to_string(),
+            "MCP server returned HTTP 429 Too Many Requests"
+        );
+
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        let e = McpHttpStatusError::from_response_parts(StatusCode::SERVICE_UNAVAILABLE, &headers);
+        assert_eq!(e.retry_after, None);
+        assert!(e.is_transient());
+
+        let e =
+            McpHttpStatusError::from_response_parts(StatusCode::UNAUTHORIZED, &HeaderMap::new());
+        assert!(!e.is_transient());
     }
 
     #[test]

@@ -236,6 +236,55 @@ fn build_remote_http_client(
 
 // ── Transport Errors ───────────────────────────────────────────────────────
 
+/// A non-success HTTP status returned by an MCP server, with the server's
+/// `Retry-After` hint when it sent one in delta-seconds form.
+///
+/// Kept separate from [`McpTransportError`] (which means "reconnect and
+/// re-handshake"): this is surfaced as-is from a request, and only the opt-in
+/// retrying connect ([`crate::mcp_client::McpRegistry::connect_all_with_retry`],
+/// used by the channel listeners at startup) inspects it to retry a transient
+/// rejection such as HTTP 429. The plain `connect_all` never retries. The `Display`
+/// text is unchanged from the previous `bail!` so existing log matchers keep
+/// working.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("MCP server returned HTTP {status}")]
+pub struct McpHttpStatusError {
+    pub status: reqwest::StatusCode,
+    pub retry_after: Option<std::time::Duration>,
+}
+
+impl McpHttpStatusError {
+    /// Build from a response's status and headers. Only the delta-seconds
+    /// form of `Retry-After` is parsed; an HTTP-date is ignored (the caller
+    /// then falls back to its own backoff).
+    pub fn from_response_parts(
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+    ) -> Self {
+        let retry_after = headers
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(std::time::Duration::from_secs);
+        Self {
+            status,
+            retry_after,
+        }
+    }
+
+    /// Statuses that signal a transient overload/unavailability where a later
+    /// attempt of a not-yet-established connection can succeed.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self.status,
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+                | reqwest::StatusCode::BAD_GATEWAY
+                | reqwest::StatusCode::SERVICE_UNAVAILABLE
+                | reqwest::StatusCode::GATEWAY_TIMEOUT
+        )
+    }
+}
+
 /// Transport-level failures that require reconnecting and re-running the MCP
 /// handshake. The client may retry only when the request is known not to have
 /// been written or not to have been executed (a Streamable HTTP stale-session
@@ -1302,7 +1351,7 @@ impl SharedMcpTransportConn for HttpTransport {
                 .into());
             }
             lifecycle.mark_completed();
-            bail!("MCP server returned HTTP {}", status);
+            return Err(McpHttpStatusError::from_response_parts(status, resp.headers()).into());
         }
 
         self.update_session_id_from_headers(resp.headers());

@@ -645,9 +645,60 @@ pub struct ScopedAssembled {
     /// The same search instance exposed in the registry, for session narrowing.
     pub tool_search_handle: Option<Arc<tools::ToolSearchTool>>,
     pub mcp_tool_names: HashSet<String>,
+    /// How many granted MCP servers this assembly actually reached. `None`
+    /// when no MCP server is granted to this agent (or MCP is not connected
+    /// on this path). See [`Self::mcp_connect_status`].
+    mcp_connect_status: Option<McpConnectStatus>,
+}
+
+/// Granted vs connected MCP servers for one assembly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpConnectStatus {
+    pub granted: usize,
+    pub connected: usize,
+}
+
+impl McpConnectStatus {
+    /// Every granted server connected.
+    pub fn is_complete(&self) -> bool {
+        self.connected >= self.granted
+    }
+}
+
+/// Publish an assembly's MCP connect result as the health component
+/// `mcp:<agent_alias>` (served on the gateway's public `/health`). `None`
+/// (nothing granted) publishes nothing.
+///
+/// Callers whose assembled tools live for the whole process (the channel
+/// listeners) call this, so a toolless boot is visible to an external
+/// monitor instead of only in a log line that rotates away. Per-turn paths
+/// must not: a later per-turn success would mask a listener that is still
+/// toolless.
+pub fn publish_mcp_connect_health(agent_alias: &str, status: Option<McpConnectStatus>) {
+    let Some(status) = status else {
+        return;
+    };
+    let component = format!("mcp:{agent_alias}");
+    if status.is_complete() {
+        crate::health::mark_component_ok(&component);
+    } else {
+        crate::health::mark_component_error(
+            &component,
+            format!(
+                "{} of {} granted MCP server(s) connected",
+                status.connected, status.granted
+            ),
+        );
+    }
 }
 
 impl ScopedAssembled {
+    /// Granted vs connected MCP servers for this assembly (`None` when no MCP
+    /// server is granted). See [`publish_mcp_connect_health`].
+    pub fn mcp_connect_status(&self) -> Option<McpConnectStatus> {
+        self.mcp_connect_status
+    }
+
     /// The deferred-MCP tool-search listing and the pinned-MCP-resources section,
     /// composed into ONE prompt block. For callers that inject a single combined MCP
     /// prompt section: `run`, `process_message`, and independent delegation.
@@ -754,6 +805,7 @@ impl ScopedToolRegistry {
                 activated_handle: None,
                 tool_search_handle: None,
                 mcp_tool_names: HashSet::new(),
+                mcp_connect_status: None,
                 deferred_section: String::new(),
                 pinned_section: String::new(),
                 pinned_blocks: Vec::new(),
@@ -1024,6 +1076,11 @@ impl ScopedToolRegistry {
         } else {
             Vec::new()
         };
+        // Starts at "none connected"; overwritten below once a registry exists.
+        let mut mcp_connect_status = (!agent_mcp_servers.is_empty()).then_some(McpConnectStatus {
+            granted: agent_mcp_servers.len(),
+            connected: 0,
+        });
         if !agent_mcp_servers.is_empty() {
             if emit_assembly_logs {
                 ::zeroclaw_log::record!(
@@ -1091,6 +1148,10 @@ impl ScopedToolRegistry {
                     tools::late_tool_search_observer::arc_id(&registry),
                     registry.server_count(),
                 );
+                mcp_connect_status = Some(McpConnectStatus {
+                    granted: agent_mcp_servers.len(),
+                    connected: registry.server_count(),
+                });
                 // Origin set: every `<server>__<tool>` name the registry knows.
                 // Deferred stubs derive from the same `tool_names()` call, so
                 // one extension covers eager, deferred, and later activations.
@@ -1609,6 +1670,7 @@ impl ScopedToolRegistry {
             activated_handle,
             tool_search_handle,
             mcp_tool_names,
+            mcp_connect_status,
         }
     }
 }
@@ -3647,7 +3709,41 @@ mod tests {
             activated_handle: None,
             tool_search_handle: None,
             mcp_tool_names: HashSet::new(),
+            mcp_connect_status: None,
         }
+    }
+
+    #[test]
+    fn publish_mcp_connect_health_marks_component_by_completeness() {
+        let alias = "mcp-health-probe";
+        let component = format!("mcp:{alias}");
+        let status_of = || {
+            crate::health::snapshot()
+                .components
+                .get(&component)
+                .map(|c| c.status.clone())
+        };
+
+        publish_mcp_connect_health(alias, None);
+        assert_eq!(status_of(), None, "nothing granted publishes nothing");
+
+        publish_mcp_connect_health(
+            alias,
+            Some(McpConnectStatus {
+                granted: 2,
+                connected: 0,
+            }),
+        );
+        assert_eq!(status_of().as_deref(), Some("error"));
+
+        publish_mcp_connect_health(
+            alias,
+            Some(McpConnectStatus {
+                granted: 2,
+                connected: 2,
+            }),
+        );
+        assert_eq!(status_of().as_deref(), Some("ok"));
     }
 
     #[test]
