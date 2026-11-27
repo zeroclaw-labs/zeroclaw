@@ -497,7 +497,7 @@ Every call passes five host-owned checks before spawning a turn:
    it is.
 5. **Coalescing and rate limit:** wakes for an `(instance, target)` pair already
    running a plugin wake turn coalesce into at most one pending follow-up turn
-   (retaining the latest prompt and caller attribution). The first pending
+   (retaining the latest prompt, caller attribution and the caller's live config, so a follow-up queued after a reload reads the new policy). The first pending
    wake reserves one token before returning success; later overwrites share
    that reservation. An exhausted bucket returns `rate-limited` immediately.
    A wake is accepted onto a pair only once a worker owns it: a wake that
@@ -506,7 +506,8 @@ Every call passes five host-owned checks before spawning a turn:
    edit made while it waited applies), then coalesces or claims the pair
    itself, so a failed claim never drops a wake that already returned success. The follow-up
    is admitted at the target's lifecycle generation from when the wake was
-   accepted, then the live grant and the target's enabled flag are re-checked
+   accepted (read before the grant, so a target deleted between the two reads
+   is refused rather than paired with the next generation), then the live grant and the target's enabled flag are re-checked
    on the config it was admitted with; an idle wake applies the same check to
    its admitted config before registering a task. A follow-up the operator no
    longer permits (target revoked, disabled, removed, or deleted and replaced
@@ -516,9 +517,10 @@ Every call passes five host-owned checks before spawning a turn:
    whose durable `TaskRecord` registration fails transiently is not dropped: it
    returns to the pending slot (unless a newer wake has already replaced it)
    and is retried with capped exponential backoff, re-checking the live grant
-   and target before each attempt. While the process keeps running, an accepted
-   wake therefore runs once or is cancelled by an operator edit. The finished
-   turn's lifecycle lease is released as soon as the turn returns, before its
+   and target before each attempt. Coalescing still keeps only the latest
+   pending prompt: an accepted wake that a newer wake replaces before its
+   follow-up starts never runs on its own, so `ok` does not promise a turn per
+   call. The finished turn's lifecycle lease is released as soon as the turn returns, before its
    terminal write or any follow-up registration is retried, so an idle target
    stays deletable while the worker waits for the store.
    Idle pairs also spend from the per-instance continuous token bucket, admit
