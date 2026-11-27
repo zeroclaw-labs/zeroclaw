@@ -327,6 +327,9 @@ def shell_comments(path: str, lines: list[str]) -> list[Comment]:
                 i += 1
                 continue
 
+            if ch == "\\":
+                i += 2
+                continue
             if ch == "'":
                 quote = "single"
                 i += 1
