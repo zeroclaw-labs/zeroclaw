@@ -7862,6 +7862,14 @@ fn is_non_retryable_channel_listener_error(channel_name: &str, error: &anyhow::E
             {
                 return true;
             }
+            // Network failures reaching the gateway (DNS, TCP connect, TLS,
+            // socket I/O) clear up on their own. Their context names the
+            // endpoint, for example `TCP connect to gateway.discord.gg:443`,
+            // and the provider heuristic below reads that port as an HTTP
+            // 4xx status, which would park the listener until a restart.
+            if error.chain().any(|cause| cause.is::<std::io::Error>()) {
+                return false;
+            }
             zeroclaw_providers::reliable::is_non_retryable(error)
         }
         _ => false,
@@ -46958,6 +46966,45 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn discord_listener_retries_network_failures_that_name_a_port() {
+        let refused = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let connect =
+            anyhow::Error::new(refused).context("TCP connect to gateway-us-east1-b.discord.gg:443");
+        assert!(
+            !is_non_retryable_channel_listener_error("discord", &connect),
+            "a failed gateway connect must be retried, not parked"
+        );
+        assert!(
+            !is_non_retryable_channel_listener_error("discord-alt", &connect),
+            "aliased Discord channels follow the same rule"
+        );
+
+        let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset by peer");
+        let io_only = anyhow::Error::new(reset);
+        assert!(!is_non_retryable_channel_listener_error(
+            "discord", &io_only
+        ));
+    }
+
+    #[test]
+    fn discord_listener_still_parks_on_a_text_only_client_error() {
+        // No transport error in the chain: the provider heuristic still applies.
+        let rejected = anyhow::Error::msg("gateway preflight failed: HTTP 401 Unauthorized");
+        assert!(is_non_retryable_channel_listener_error(
+            "discord", &rejected
+        ));
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn discord_listener_fatal_error_stays_non_retryable() {
+        let fatal = anyhow::Error::new(crate::discord::DiscordListenerFatalError::new(
+            "gateway closed with an authentication failure",
+        ));
+        assert!(is_non_retryable_channel_listener_error("discord", &fatal));
+    }
+
+    #[test]
     fn reply_intent_precheck_uses_structured_addressing_signal() {
         let marker_only = zeroclaw_api::channel::ChannelMessage {
             content: "[WeCom group message addressed to this bot via @danya]\n@danya say hi".into(),
@@ -51992,6 +52039,48 @@ This is an example JSON object for profile settings."#;
         assert!(
             component["restart_count"].as_u64().unwrap_or(0) >= 1,
             "Discord gateway 429 should back off through the retry path instead of parking"
+        );
+
+        drop(rx);
+        cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(join.is_ok(), "listener should stop on cancel");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[tokio::test]
+    async fn supervised_listener_enters_retry_path_on_discord_gateway_connect_failure() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let channel_name = format!("discord-{}", uuid::Uuid::new_v4());
+        let refused = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let channel: Arc<dyn Channel> = Arc::new(FailOnceChannel {
+            name: channel_name,
+            calls: Arc::clone(&calls),
+            err: Mutex::new(Some(
+                anyhow::Error::new(refused).context("TCP connect to gateway.discord.gg:443"),
+            )),
+        });
+
+        let component_name = format!("channel:{}", channel.name());
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener(channel, None, tx, 1, 1, cancel.clone());
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let snapshot = zeroclaw_runtime::health::snapshot_json();
+        let component = &snapshot["components"][&component_name];
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(component["status"], "error");
+        assert!(
+            component["last_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("TCP connect to gateway.discord.gg:443")
+        );
+        assert!(
+            component["restart_count"].as_u64().unwrap_or(0) >= 1,
+            "a failed gateway connect must back off and retry instead of parking"
         );
 
         drop(rx);
