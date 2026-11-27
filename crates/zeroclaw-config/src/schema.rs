@@ -764,7 +764,8 @@ pub struct Config {
     #[group = "Integrations"]
     pub codex_cli: CodexCliConfig,
 
-    /// Gemini CLI tool configuration (`[gemini_cli]`).
+    /// Gemini CLI tool configuration (`[gemini_cli]`). Removed; enabling it
+    /// fails validation.
     #[serde(default)]
     #[nested]
     #[group = "Integrations"]
@@ -3149,6 +3150,15 @@ pub const GEMINI_CLI_PROVIDER_RETIRED: &str = "the `gemini_cli` model provider i
      API key, Agent Platform, or Gemini Enterprise) or to `[providers.models.gemini.<alias>]` \
      with an API key, point agent `model_provider` references at the new alias, then remove \
      the `gemini_cli` section";
+
+/// Why an enabled `[gemini_cli]` tool section is refused, and what to use
+/// instead. The tool implementation is removed; the section still parses so
+/// existing configs load and are told what changed.
+pub const GEMINI_CLI_TOOL_RETIRED: &str = "the `gemini_cli` tool is removed: Google replaced \
+     Gemini CLI with Antigravity CLI, and Gemini CLI stopped serving Google AI free, Pro, and \
+     Ultra accounts on June 18, 2026. Set `[gemini_cli] enabled = false` (or delete the \
+     section) and delegate coding tasks to `claude_code`, `codex_cli`, or `opencode_cli`; an \
+     Antigravity CLI coding tool is tracked in zeroclaw-labs/zeroclaw#11075";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -6829,6 +6839,14 @@ pub struct LocalWhisperTranscriptionProviderConfig {
     /// Optional language hint (passed through to the local endpoint).
     #[serde(default)]
     pub language: Option<String>,
+    /// Optional model identifier sent to the endpoint as the multipart `model`
+    /// form field. Strict OpenAI-compatible servers (e.g. oMLX hosting a Qwen
+    /// ASR model) require it and rarely host a model literally named
+    /// `"whisper"`. Leave unset for servers that choose their model at startup
+    /// (`whisper.cpp`), which take no selector field and rely on the legacy
+    /// wire shape.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Maximum audio file size in bytes accepted by this endpoint.
     /// Defaults to 25 MB to match the cloud cap; raise as needed.
     #[serde(default = "default_local_whisper_max_audio_bytes")]
@@ -6860,6 +6878,7 @@ impl Default for LocalWhisperTranscriptionProviderConfig {
             uri: String::new(),
             bearer_token: None,
             language: None,
+            model: None,
             max_audio_bytes: default_local_whisper_max_audio_bytes(),
             timeout_secs: default_local_whisper_timeout_secs(),
         }
@@ -7000,6 +7019,12 @@ pub struct LocalWhisperConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub bearer_token: Option<String>,
+    /// Optional model identifier sent to the endpoint as the multipart `model`
+    /// form field. Strict OpenAI-compatible servers (e.g. oMLX hosting a Qwen
+    /// ASR model) require it; leave unset for servers that choose their model
+    /// at startup (`whisper.cpp`).
+    #[serde(default)]
+    pub model: Option<String>,
     /// Maximum audio file size in bytes accepted by this endpoint.
     /// Defaults to 25 MB — matching the cloud API cap for a safe out-of-the-box
     /// experience. Self-hosted endpoints can accept much larger files; raise this
@@ -7036,6 +7061,7 @@ impl Default for LocalWhisperConfig {
         Self {
             url: String::new(),
             bearer_token: None,
+            model: None,
             max_audio_bytes: default_local_whisper_max_audio_bytes(),
             timeout_secs: default_local_whisper_timeout_secs(),
         }
@@ -8254,13 +8280,15 @@ pub struct GatewayConfig {
     #[nested]
     pub tls: Option<GatewayTlsConfig>,
 
-    /// HTTP request timeout (seconds) for gateway routes other than the
-    /// long-running cron-trigger endpoint. Default: 30s.
+    /// HTTP request timeout (seconds) for ordinary gateway routes. Webhook,
+    /// manual cron and A2A task routes use `long_running_request_timeout_secs`.
+    /// Default: 30s.
     #[serde(default = "default_gateway_request_timeout_secs")]
     pub request_timeout_secs: u64,
 
-    /// HTTP request timeout (seconds) for `POST /api/cron/{id}/run`, which
-    /// runs jobs synchronously and routinely exceeds the 30s default.
+    /// HTTP request timeout (seconds) for `POST /webhook`, manual cron runs
+    /// and A2A task routes. Includes request-body extraction and response
+    /// creation, but not the lifetime of an SSE response body.
     /// Default: 600s (10 minutes).
     #[serde(default = "default_gateway_long_running_request_timeout_secs")]
     pub long_running_request_timeout_secs: u64,
@@ -11442,9 +11470,9 @@ impl Default for CodexCliConfig {
 
 /// Gemini CLI tool configuration (`[gemini_cli]` section).
 ///
-/// Delegates coding tasks to the `gemini -p` CLI. Authentication uses the
-/// binary's own session by default — no API key needed unless
-/// `env_passthrough` includes `GOOGLE_API_KEY`.
+/// Removed: the tool no longer exists. The section still parses so existing
+/// configs keep loading; `enabled = true` fails validation with
+/// [`GEMINI_CLI_TOOL_RETIRED`].
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "gemini_cli"]
@@ -13300,6 +13328,9 @@ pub struct MemoryConfig {
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_api_key: Option<String>,
+    /// Text prepended to a search query, and only to the query, before it is embedded. Instruction-tuned embedding models are trained to embed a query and a stored passage differently and expect the query side to carry an instruction, for example `Instruct: Given a user message, retrieve memories that help answer it\nQuery:` for Qwen3-Embedding or `query: ` for E5-style models; without it they rank worse than keyword search. Stored memories are always embedded as they are, so setting or changing this needs no re-embedding. Leave unset for models that embed both sides the same way (OpenAI, Gemini).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding_query_prefix: Option<String>,
     /// How heavily vector (semantic) similarity counts when `search_mode = hybrid`. Raise toward 1.0 to favor meaning-based matches; lower it to lean on keyword overlap instead.
     #[serde(default = "default_vector_weight")]
     pub vector_weight: f64,
@@ -13909,6 +13940,7 @@ impl Default for MemoryConfig {
             embedding_dimensions: default_embedding_dims(),
             auto_reindex_on_identity_change: false,
             embedding_api_key: None,
+            embedding_query_prefix: None,
             vector_weight: default_vector_weight(),
             keyword_weight: default_keyword_weight(),
             search_mode: SearchMode::default(),
@@ -17839,6 +17871,14 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub unauthorized_message: Option<String>,
+    /// Send replies with Bot API rich messages (native tables, headings, lists, and quotes).
+    ///
+    /// Some Telegram clients still show rich messages as unsupported, so this
+    /// stays off until every client in use can render them. With it off, tables
+    /// are delivered as preformatted text.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub rich_messages: bool,
     /// When `true` (default), group-chat sessions key on the sender, so
     /// distinct members of the same group (or forum topic) each get an
     /// isolated conversation context (matches the existing behavior). When
@@ -17923,6 +17963,7 @@ impl Default for TelegramConfig {
             interrupt_on_new_message: false,
             mention_only: false,
             unauthorized_message: None,
+            rich_messages: false,
             per_user_session: true,
             passive_group_context: false,
             ack_reactions: None,
@@ -24569,6 +24610,7 @@ impl Config {
         self.collect_verifiable_intent_warnings(&mut warnings);
         self.collect_cron_claim_warnings(&mut warnings);
         self.collect_compiled_out_tool_warnings(&mut warnings);
+        self.collect_removed_tool_warnings(&mut warnings);
         self.collect_dead_delegate_grant_warnings(&mut warnings);
         warnings.extend(validate_memory_semantics(&self.memory));
         for (alias, wa) in &self.channels.whatsapp {
@@ -25297,13 +25339,40 @@ impl Config {
         }
     }
 
-    /// Refuse the retired `gemini_cli` model provider with its migration path.
+    /// Report an enabled section for a tool ZeroClaw no longer ships.
+    ///
+    /// `validate_retired_gemini_cli` refuses the same condition, but
+    /// `zeroclaw doctor` and the dashboard read only this list. Without this
+    /// entry they would say nothing, and the tool would vanish from an agent
+    /// without explanation.
+    fn collect_removed_tool_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        if self.gemini_cli.enabled {
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                crate::validation_warnings::TOOL_REMOVED,
+                GEMINI_CLI_TOOL_RETIRED.to_string(),
+                "gemini_cli.enabled".to_string(),
+            ));
+        }
+    }
+
+    /// Refuse the retired `gemini_cli` model provider and tool with their
+    /// migration paths.
     fn validate_retired_gemini_cli(&self) -> Result<()> {
         if let Some(alias) = self.providers.models.gemini_cli.keys().min() {
             validation_bail!(
                 ValidationFailed,
                 format!("providers.models.gemini_cli.{alias}"),
                 "providers.models.gemini_cli.{alias}: {GEMINI_CLI_PROVIDER_RETIRED}"
+            );
+        }
+        if self.gemini_cli.enabled {
+            validation_bail!(
+                ValidationFailed,
+                "gemini_cli.enabled".to_string(),
+                "gemini_cli.enabled: {GEMINI_CLI_TOOL_RETIRED}"
             );
         }
         Ok(())
@@ -25316,7 +25385,6 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
         self.cost.rates.validate()?;
-        self.validate_retired_gemini_cli()?;
 
         for (profile_alias, profile) in &self.runtime_profiles {
             if profile.max_execution_tree_iterations == Some(0) {
@@ -26238,9 +26306,16 @@ impl Config {
         // on stderr) and via Config::collect_warnings (gateway HTTP returns
         // structured to dashboard callers). Single source of truth lives in
         // collect_warnings; emit them to tracing here so the existing log
-        // behavior is preserved, with the single documented exception below.
+        // behavior is preserved, with the documented exceptions below.
         for w in self.collect_warnings() {
-            // One code is held back from this loop on purpose. The runtime
+            // A removed tool's warning mirrors the error
+            // `validate_retired_gemini_cli` returns at the end of this
+            // function, with the same text. Tracing it here as well would put
+            // two copies of the notice next to each other.
+            if w.code == crate::validation_warnings::TOOL_REMOVED {
+                continue;
+            }
+            // The withheld-capability code is held back on purpose too. The runtime
             // already records the withheld-capability notice itself, with an
             // explicit `System` category and the same code and path, once at
             // every config application. Records emitted here carry no category
@@ -27326,6 +27401,11 @@ impl Config {
                 }
             }
         }
+
+        // Retired sections are checked last. Validation stops at the first
+        // error, so checking them earlier would hide every problem in the
+        // checks above, which guard live behavior, behind a removal notice.
+        self.validate_retired_gemini_cli()?;
 
         Ok(())
     }
@@ -35824,6 +35904,81 @@ auto_save = true
     }
 
     #[test]
+    async fn removed_gemini_cli_tool_fails_validation_only_when_enabled() {
+        let mut config = Config::default();
+        config
+            .validate()
+            .expect("a disabled [gemini_cli] section still loads");
+        config.gemini_cli.enabled = true;
+        let error = config
+            .validate()
+            .expect_err("an enabled [gemini_cli] tool must fail validation")
+            .to_string();
+        assert!(error.contains("gemini_cli.enabled"), "{error}");
+        assert!(error.contains("removed"), "{error}");
+    }
+
+    #[test]
+    async fn enabled_gemini_cli_section_is_reported_by_collect_warnings() {
+        let removed = |config: &Config| -> Vec<crate::validation_warnings::ValidationWarning> {
+            config
+                .collect_warnings()
+                .into_iter()
+                .filter(|w| w.code == crate::validation_warnings::TOOL_REMOVED)
+                .collect()
+        };
+
+        let mut config = Config::default();
+        assert!(
+            removed(&config).is_empty(),
+            "a disabled [gemini_cli] section is not reported"
+        );
+
+        config.gemini_cli.enabled = true;
+        let warnings = removed(&config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].path, "gemini_cli.enabled");
+        assert_eq!(warnings[0].message, GEMINI_CLI_TOOL_RETIRED);
+    }
+
+    #[test]
+    async fn retired_gemini_cli_sections_do_not_hide_other_validation_errors() {
+        let with_other_error = || {
+            let mut config = Config::default();
+            config.runtime_profiles.insert(
+                "default".to_string(),
+                RuntimeProfileConfig {
+                    max_execution_tree_iterations: Some(0),
+                    ..RuntimeProfileConfig::default()
+                },
+            );
+            config
+        };
+
+        // Each retired trigger on its own still refuses the config, and an
+        // unrelated error elsewhere is the one reported first.
+        let mut tool = with_other_error();
+        tool.gemini_cli.enabled = true;
+        let mut provider = with_other_error();
+        provider
+            .providers
+            .models
+            .gemini_cli
+            .insert("home".to_string(), GeminiCliModelProviderConfig::default());
+
+        for (label, config) in [("tool", tool), ("provider", provider)] {
+            let error = config
+                .validate()
+                .expect_err("the config has an unrelated error")
+                .to_string();
+            assert!(
+                error.contains("max_execution_tree_iterations"),
+                "{label}: the unrelated error must not be hidden by the retired section: {error}"
+            );
+        }
+    }
+
+    #[test]
     async fn antigravity_cli_alias_requires_working_directory_and_defaults_to_api_key() {
         let error = toml::from_str::<AntigravityCliModelProviderConfig>(
             "model = \"gemini-3.8-flash-high\"",
@@ -36070,6 +36225,8 @@ auto_save = true
                         excluded_tools: vec![],
                         reply_min_interval_secs: 0,
                         reply_queue_depth_max: 0,
+
+                        rich_messages: false,
                     },
                 )]),
                 discord: HashMap::new(),
@@ -38134,6 +38291,8 @@ default_temperature = 0.7
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
             debounce_ms: None,
+
+            rich_messages: false,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -38170,6 +38329,15 @@ stream_mode = "single_message"
     async fn telegram_config_passive_group_context_defaults_off() {
         let parsed: TelegramConfig = serde_json::from_str(r#"{"bot_token":"t"}"#).unwrap();
         assert!(!parsed.passive_group_context);
+    }
+
+    #[test]
+    async fn telegram_config_rich_messages_defaults_off_and_parses_true() {
+        let parsed: TelegramConfig = serde_json::from_str(r#"{"bot_token":"t"}"#).unwrap();
+        assert!(!parsed.rich_messages);
+        let enabled: TelegramConfig =
+            serde_json::from_str(r#"{"bot_token":"t","rich_messages":true}"#).unwrap();
+        assert!(enabled.rich_messages);
     }
 
     #[test]
@@ -45389,6 +45557,8 @@ high_entropy_tokens = false
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+
+                rich_messages: false,
             },
         );
 

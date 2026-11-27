@@ -93,7 +93,6 @@ tool-project-intel = ["zeroclaw-config/tool-project-intel"]
 tool-claude-code = ["zeroclaw-config/tool-claude-code"]
 tool-claude-code-runner = ["zeroclaw-config/tool-claude-code-runner"]
 tool-codex-cli = ["zeroclaw-config/tool-codex-cli"]
-tool-gemini-cli = ["zeroclaw-config/tool-gemini-cli"]
 tool-opencode-cli = ["zeroclaw-config/tool-opencode-cli"]
 # Native desktop capture and input injection. Compiled only where the platform
 # implementation exists; other targets get the stub backend.

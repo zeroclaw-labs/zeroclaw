@@ -12,6 +12,7 @@ homepage = "https://www.zeroclaw.com"
 rust-version = "1.96.0"
 
 [workspace.dependencies]
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
 zeroclaw-api = { path = "crates/zeroclaw-api", version = "0.9.0" }
 zeroclaw-buildinfo = { path = "crates/zeroclaw-buildinfo", version = "0.9.0" }
 zeroclaw-infra = { path = "crates/zeroclaw-infra", version = "0.9.0" }
@@ -231,6 +232,8 @@ non_row_features = [
     "landlock",
     "metrics",
     "embedded-web",
+    # Deprecated no-op kept for build-command compatibility; never a row.
+    "tool-gemini-cli",
 ]
 # Features intentionally added to the lean Cargo defaults for standard
 # distribution artifacts. This list is the complete positive policy beyond
@@ -352,7 +355,6 @@ tools-coding-cli = [
     "tool-claude-code",
     "tool-claude-code-runner",
     "tool-codex-cli",
-    "tool-gemini-cli",
     "tool-opencode-cli",
 ]
 
@@ -367,7 +369,11 @@ tool-project-intel = ["zeroclaw-runtime/tool-project-intel"]
 tool-claude-code = ["zeroclaw-runtime/tool-claude-code"]
 tool-claude-code-runner = ["zeroclaw-runtime/tool-claude-code-runner", "zeroclaw-gateway?/tool-claude-code-runner"]
 tool-codex-cli = ["zeroclaw-runtime/tool-codex-cli"]
-tool-gemini-cli = ["zeroclaw-runtime/tool-gemini-cli"]
+# Deprecated: the `gemini_cli` tool was removed because Google retired Gemini
+# CLI for consumer accounts. The feature is kept, empty, so existing build
+# commands still work; build.rs warns when it is enabled. Remove it after one
+# release.
+tool-gemini-cli = []
 tool-opencode-cli = ["zeroclaw-runtime/tool-opencode-cli"]
 # Native desktop capture and input injection. Composed into `tools-compat`
 # rather than a SaaS/coding-CLI group of its own: the standard distribution and
