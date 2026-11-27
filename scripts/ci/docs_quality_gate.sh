@@ -183,7 +183,7 @@ if [ -z "$BASE_SHA" ]; then
 fi
 
 CHANGED_LINES_JSON_FILE="$(mktemp)"
-python3 - "$BASE_SHA" "${EXISTING_FILES[@]}" >"$CHANGED_LINES_JSON_FILE" <<'PY'
+if ! python3 - "$BASE_SHA" "${EXISTING_FILES[@]}" >"$CHANGED_LINES_JSON_FILE" <<'PY'
 import json
 import re
 import subprocess
@@ -198,10 +198,11 @@ hunk = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 for path in files:
     proc = subprocess.run(
         ["git", "diff", "--unified=0", base, "HEAD", "--", path],
-        check=False,
-        capture_output=True,
+        stdout=subprocess.PIPE,
         text=True,
     )
+    if proc.returncode:
+        sys.exit(f"Unable to read changed lines for {path}: git diff exited {proc.returncode}")
     ranges = []
     for line in proc.stdout.splitlines():
         m = hunk.match(line)
@@ -215,6 +216,10 @@ for path in files:
 
 print(json.dumps(changed))
 PY
+then
+    rm -f "$LINT_OUTPUT_FILE" "$CHANGED_LINES_JSON_FILE"
+    exit 1
+fi
 
 FILTERED_OUTPUT_FILE="$(mktemp)"
 set +e
