@@ -523,7 +523,7 @@ impl Tool for ComputerUseTool {
                 "action": {
                     "type": "string",
                     "enum": ACTIONS,
-                    "description": "Action to perform. 'screenshot' captures the display and returns a downscaled PNG path; coordinates for the other actions are pixels in that image."
+                    "description": "Action to perform. 'screenshot' captures the display, attaches the downscaled PNG image directly to the tool result for vision inspection (do not call file_read on the saved path), and returns image dimensions; coordinates for click, move, and scroll are pixels in that image."
                 },
                 "display": {
                     "type": "integer",
