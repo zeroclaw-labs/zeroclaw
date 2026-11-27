@@ -203,12 +203,16 @@ pub(crate) fn screencapture_args(display: &DisplayInfo, output_path: &Path) -> V
         OsString::from("-x"),
         OsString::from("-t"),
         OsString::from("png"),
+        // `screencapture` is only invoked with a display that survived
+        // `order_displays` (positive finite dimensions), and clamping to at
+        // least 1 point prevents a sub-0.5pt display from emitting a 0-size
+        // capture rectangle.
         OsString::from(format!(
             "-R{},{},{},{}",
             display.origin_x.round() as i64,
             display.origin_y.round() as i64,
-            display.logical_w.round() as i64,
-            display.logical_h.round() as i64,
+            (display.logical_w.round() as i64).max(1),
+            (display.logical_h.round() as i64).max(1),
         )),
         output_path.as_os_str().to_owned(),
     ]
@@ -318,13 +322,13 @@ fn flush_chunk(chunk: &mut Vec<u16>, segments: &mut Vec<TypeSegment>) {
 /// The macOS capture and input backend.
 #[cfg(target_os = "macos")]
 pub struct MacOsBackend {
-    /// Deadline for one capture or input action, in seconds.
+    /// Deadline for one `screencapture` invocation, in seconds.
     action_timeout_secs: u64,
 }
 
 #[cfg(target_os = "macos")]
 impl MacOsBackend {
-    /// A backend whose actions are bounded by `action_timeout_secs`.
+    /// A backend whose screenshot captures are bounded by `action_timeout_secs`.
     pub fn new(action_timeout_secs: u64) -> Self {
         Self {
             action_timeout_secs,

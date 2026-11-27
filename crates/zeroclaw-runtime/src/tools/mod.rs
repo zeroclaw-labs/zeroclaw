@@ -3309,8 +3309,8 @@ fn all_tools_with_runtime_on_thread(
     #[cfg(feature = "tool-computer-use")]
     if root_config.computer_use.enabled && select_tool!("computer_use") {
         // Screenshots land in the canonical per-agent workspace, not the
-        // session's `security.workspace_dir`, so one agent's captures never
-        // appear in another's file tools.
+        // session's `security.workspace_dir`, so ACP/Code sessions never
+        // litter git repositories with untracked screenshot directories.
         let agent_workspace_dir = root_config.agent_workspace_dir(agent_alias);
         register_tool!(
             "computer_use",

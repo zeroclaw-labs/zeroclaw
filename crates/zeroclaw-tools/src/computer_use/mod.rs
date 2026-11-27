@@ -260,7 +260,11 @@ impl ComputerUseTool {
         let stamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
         let file_name = format!("{SCREENSHOT_PREFIX}_{stamp}_{seq:04}.png");
         let final_path = dir.join(&file_name);
-        let temp_path = dir.join(format!("{file_name}.tmp"));
+        let temp_path = dir.join(format!(
+            "{file_name}.{}.{}.tmp",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple(),
+        ));
 
         if let Err(error) = write_new_file(&temp_path, png).await {
             remove_if_present(&temp_path).await;

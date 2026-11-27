@@ -41,6 +41,9 @@ pub fn parse_key_chord(input: &str) -> Result<KeyChord, KeyParseError> {
     let mut modifiers = Modifiers::default();
     let mut key: Option<KeyCode> = None;
     for token in tokenize(trimmed) {
+        if token.is_empty() {
+            return Err(KeyParseError::MissingKey);
+        }
         let lowered = token.to_ascii_lowercase();
         if apply_modifier(&lowered, &mut modifiers) {
             continue;
@@ -68,23 +71,34 @@ pub fn parse_key_chord(input: &str) -> Result<KeyChord, KeyParseError> {
 fn tokenize(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
+    let mut trailing_plus = false;
     for c in input.chars() {
         if c == '+' {
             let token = current.trim();
             if token.is_empty() {
                 // Nothing buffered, so this separator stands for the key itself.
                 tokens.push("+".to_string());
+                trailing_plus = false;
             } else {
                 tokens.push(token.to_string());
+                trailing_plus = true;
             }
             current.clear();
         } else {
             current.push(c);
+            if !c.is_whitespace() {
+                trailing_plus = false;
+            }
         }
     }
     let tail = current.trim();
     if !tail.is_empty() {
         tokens.push(tail.to_string());
+    } else if trailing_plus {
+        // A trailing separator after a non-empty token (e.g. `s+` or `cmd+`)
+        // cannot be silently dropped: emit an empty token so the parser rejects
+        // it with `MissingKey` instead of pressing a different chord.
+        tokens.push(String::new());
     }
     tokens
 }
@@ -502,6 +516,17 @@ mod tests {
         assert_eq!(parse_key_chord(""), Err(KeyParseError::Empty));
         assert_eq!(parse_key_chord("   "), Err(KeyParseError::Empty));
         assert_eq!(parse_key_chord("\t\n"), Err(KeyParseError::Empty));
+    }
+
+    #[test]
+    fn rejects_trailing_separator_after_key() {
+        for input in ["s+", "a +", "cmd+s+"] {
+            assert_eq!(
+                parse_key_chord(input),
+                Err(KeyParseError::MissingKey),
+                "`{input}` must fail closed instead of silently dropping the trailing `+`"
+            );
+        }
     }
 
     #[test]
