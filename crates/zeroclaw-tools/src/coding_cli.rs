@@ -17,7 +17,6 @@ use tokio::process::Command;
     test,
     feature = "tool-claude-code",
     feature = "tool-codex-cli",
-    feature = "tool-gemini-cli",
     feature = "tool-opencode-cli"
 ))]
 const SAFE_ENV_VARS: &[&str] = &[
@@ -31,7 +30,6 @@ const SAFE_ENV_VARS: &[&str] = &[
     test,
     feature = "tool-claude-code",
     feature = "tool-codex-cli",
-    feature = "tool-gemini-cli",
     feature = "tool-opencode-cli"
 ))]
 const SAFE_ENV_VARS: &[&str] = &[
@@ -229,7 +227,6 @@ where
 {
     Ok(match program.to_str() {
         Some("codex") => OsString::from("codex.cmd"),
-        Some("gemini") => OsString::from("gemini.cmd"),
         Some("claude") => find_claude().unwrap_or_else(|| OsString::from("claude.cmd")),
         _ => program.to_os_string(),
     })
@@ -257,7 +254,6 @@ pub fn add_safe_env(command: &mut CodingCliCommand, safe_vars: &[&str], passthro
 #[cfg(any(
     feature = "tool-claude-code",
     feature = "tool-codex-cli",
-    feature = "tool-gemini-cli",
     feature = "tool-opencode-cli"
 ))]
 pub(crate) fn add_coding_cli_env(command: &mut CodingCliCommand, passthrough: &[String]) {
@@ -273,10 +269,6 @@ mod tests {
         assert_eq!(
             host_native_windows_program_with(OsStr::new("codex"), || None).unwrap(),
             OsString::from("codex.cmd")
-        );
-        assert_eq!(
-            host_native_windows_program_with(OsStr::new("gemini"), || None).unwrap(),
-            OsString::from("gemini.cmd")
         );
         assert_eq!(
             host_native_windows_program_with(OsStr::new("claude"), || None).unwrap(),
@@ -373,7 +365,6 @@ mod tests {
     #[cfg(any(
         feature = "tool-claude-code",
         feature = "tool-codex-cli",
-        feature = "tool-gemini-cli",
         feature = "tool-opencode-cli"
     ))]
     #[cfg(target_os = "windows")]
@@ -484,26 +475,22 @@ mod tests {
         );
     }
 
-    /// The adapter tests need all four coding-CLI tools compiled in.
+    /// The adapter tests need all three coding-CLI tools compiled in.
     #[cfg(all(
         feature = "tool-claude-code",
         feature = "tool-codex-cli",
-        feature = "tool-gemini-cli",
         feature = "tool-opencode-cli"
     ))]
     mod adapters {
         use super::*;
         use crate::claude_code::ClaudeCodeTool;
         use crate::codex_cli::CodexCliTool;
-        use crate::gemini_cli::GeminiCliTool;
         use crate::opencode_cli::OpenCodeCliTool;
         use std::sync::Mutex;
         use zeroclaw_api::tool::Tool;
         use zeroclaw_config::autonomy::AutonomyLevel;
         use zeroclaw_config::policy::SecurityPolicy;
-        use zeroclaw_config::schema::{
-            ClaudeCodeConfig, CodexCliConfig, GeminiCliConfig, OpenCodeCliConfig,
-        };
+        use zeroclaw_config::schema::{ClaudeCodeConfig, CodexCliConfig, OpenCodeCliConfig};
 
         #[derive(Default)]
         struct RecordingExecutor {
@@ -560,14 +547,6 @@ mod tests {
                     },
                     recorder.clone(),
                 )),
-                Box::new(GeminiCliTool::new_with_executor(
-                    security.clone(),
-                    GeminiCliConfig {
-                        env_passthrough: passthrough.clone(),
-                        ..GeminiCliConfig::default()
-                    },
-                    recorder.clone(),
-                )),
                 Box::new(OpenCodeCliTool::new_with_executor(
                     security,
                     OpenCodeCliConfig {
@@ -594,9 +573,7 @@ mod tests {
                     .iter()
                     .map(|command| command.program.clone())
                     .collect::<Vec<_>>(),
-                ["claude", "codex", "gemini", "opencode"]
-                    .map(OsString::from)
-                    .to_vec()
+                ["claude", "codex", "opencode"].map(OsString::from).to_vec()
             );
 
             // Compare names only so assertion failures cannot expose host paths.
