@@ -508,7 +508,7 @@ fn is_encrypted_ca_key(bytes: &[u8]) -> bool {
 
 fn encrypt_ca_key_pem(pem: &str, passphrase: &str) -> Result<Vec<u8>> {
     use chacha20poly1305::aead::Aead;
-    use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
+    use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 
     let mut salt = [0u8; CA_KEY_SALT_LEN];
     let mut nonce_bytes = [0u8; CA_KEY_NONCE_LEN];
@@ -517,10 +517,11 @@ fn encrypt_ca_key_pem(pem: &str, passphrase: &str) -> Result<Vec<u8>> {
         .map_err(|e| anyhow::Error::msg(format!("nonce rng: {e}")))?;
 
     let key = derive_ca_key(passphrase, &salt)?;
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key[..]));
-    let nonce = XNonce::from_slice(&nonce_bytes);
+    let cipher =
+        XChaCha20Poly1305::new_from_slice(&key[..]).context("Invalid CA encryption key length")?;
+    let nonce = XNonce::from(nonce_bytes);
     let ciphertext = cipher
-        .encrypt(nonce, pem.as_bytes())
+        .encrypt(&nonce, pem.as_bytes())
         .map_err(|e| anyhow::Error::msg(format!("CA key encrypt: {e}")))?;
 
     let mut out = Vec::with_capacity(
@@ -535,7 +536,7 @@ fn encrypt_ca_key_pem(pem: &str, passphrase: &str) -> Result<Vec<u8>> {
 
 fn decrypt_ca_key_pem(bytes: &[u8], passphrase: &str) -> Result<Zeroizing<String>> {
     use chacha20poly1305::aead::Aead;
-    use chacha20poly1305::{Key, KeyInit, XChaCha20Poly1305, XNonce};
+    use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 
     let header = CA_KEY_ENC_MAGIC.len() + CA_KEY_SALT_LEN + CA_KEY_NONCE_LEN;
     if !is_encrypted_ca_key(bytes) || bytes.len() < header {
@@ -546,9 +547,10 @@ fn decrypt_ca_key_pem(bytes: &[u8], passphrase: &str) -> Result<Zeroizing<String
     let ciphertext = &bytes[header..];
 
     let key = derive_ca_key(passphrase, salt)?;
-    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key[..]));
-    let nonce = XNonce::from_slice(nonce_bytes);
-    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|_| {
+    let cipher =
+        XChaCha20Poly1305::new_from_slice(&key[..]).context("Invalid CA encryption key length")?;
+    let nonce = XNonce::try_from(nonce_bytes).context("Invalid CA nonce length")?;
+    let plaintext = cipher.decrypt(&nonce, ciphertext).map_err(|_| {
         anyhow::Error::msg("CA key decrypt failed (wrong passphrase or corrupt file)")
     })?;
     let s = String::from_utf8(plaintext).context("decrypted CA key is not valid UTF-8")?;
@@ -875,6 +877,46 @@ mod tests {
             .as_ref()
             .to_vec()
     }
+    #[test]
+    fn ca_key_envelope_from_chacha20poly1305_010_remains_compatible() {
+        // Synthetic 0.10.1 fixture: fixed salt/nonce, no real key material.
+        let hex = concat!(
+            "5a4343414b45310a11111111111111111111111111111111",
+            "222222222222222222222222222222222222222222222222",
+            "a4da0a89ee6bb717cd250fbdfc9f68892fd136cd1f9db88719e4739a020959e46cc7b12d2be3da295076"
+        );
+        let envelope: Vec<u8> = hex
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        let plaintext = "synthetic-ca-key-material\n";
+        assert_eq!(
+            &*decrypt_ca_key_pem(&envelope, "fixture-passphrase").unwrap(),
+            plaintext
+        );
+
+        // The new library emits the exact old ciphertext, allowing rollback
+        // with the unchanged envelope, passphrase KDF and authentication tag.
+        use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
+        let key = derive_ca_key("fixture-passphrase", &[0x11; CA_KEY_SALT_LEN]).unwrap();
+        let cipher = XChaCha20Poly1305::new_from_slice(&key[..]).unwrap();
+        let ciphertext = cipher
+            .encrypt(
+                &XNonce::from([0x22; CA_KEY_NONCE_LEN]),
+                plaintext.as_bytes(),
+            )
+            .unwrap();
+        let header = CA_KEY_ENC_MAGIC.len() + CA_KEY_SALT_LEN + CA_KEY_NONCE_LEN;
+        assert_eq!(ciphertext, envelope[header..]);
+        let mut tampered = envelope.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(decrypt_ca_key_pem(&tampered, "fixture-passphrase").is_err());
+        assert!(decrypt_ca_key_pem(&envelope[..envelope.len() - 1], "fixture-passphrase").is_err());
+    }
+
     fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
     }

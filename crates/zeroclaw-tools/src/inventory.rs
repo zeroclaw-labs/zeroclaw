@@ -82,7 +82,6 @@ impl BuiltinToolCompilation {
                     OptInTool::ClaudeCode => cfg!(feature = "tool-claude-code"),
                     OptInTool::ClaudeCodeRunner => cfg!(feature = "tool-claude-code-runner"),
                     OptInTool::CodexCli => cfg!(feature = "tool-codex-cli"),
-                    OptInTool::GeminiCli => cfg!(feature = "tool-gemini-cli"),
                     OptInTool::OpenCodeCli => cfg!(feature = "tool-opencode-cli"),
                     // Web search has no owner feature beyond its own: `compiled()`
                     // already carries `tools-external`.
@@ -374,11 +373,6 @@ pub const BUILTIN_TOOLS: &[BuiltinToolSpec] = &[
         name: "codex_cli",
         tier: ToolTier::Host,
         compilation: BuiltinToolCompilation::OptIn(OptInTool::CodexCli),
-    },
-    BuiltinToolSpec {
-        name: "gemini_cli",
-        tier: ToolTier::Host,
-        compilation: BuiltinToolCompilation::OptIn(OptInTool::GeminiCli),
     },
     BuiltinToolSpec {
         name: "opencode_cli",
