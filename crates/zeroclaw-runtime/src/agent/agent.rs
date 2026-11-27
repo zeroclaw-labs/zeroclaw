@@ -22380,7 +22380,12 @@ model_provider = "custom.only"
         // without a request or a Codex account lookup.
         assert_eq!(
             agent
-                .try_apply_model_switch("fixture-model", "ollama".into(), "fixture-local".into())
+                .try_apply_model_switch(
+                    "fixture-model",
+                    None,
+                    "ollama".into(),
+                    "fixture-local".into(),
+                )
                 .as_deref(),
             Some("fixture-local")
         );
