@@ -36,8 +36,6 @@ use crate::file_edit::FileEditTool;
 use crate::file_upload::FileUploadTool;
 use crate::file_upload_bundle::FileUploadBundleTool;
 use crate::file_write::FileWriteTool;
-#[cfg(feature = "tool-gemini-cli")]
-use crate::gemini_cli::GeminiCliTool;
 use crate::git_forge::GitForgeTool;
 use crate::git_operations::GitOperationsTool;
 use crate::glob_search::GlobSearchTool;
@@ -125,8 +123,6 @@ tool_attribution!(FileEditTool, ToolKind::Plugin);
 tool_attribution!(FileUploadTool, ToolKind::Plugin);
 tool_attribution!(FileUploadBundleTool, ToolKind::Plugin);
 tool_attribution!(FileWriteTool, ToolKind::Plugin);
-#[cfg(feature = "tool-gemini-cli")]
-tool_attribution!(GeminiCliTool, ToolKind::Plugin);
 tool_attribution!(GitOperationsTool, ToolKind::Shell);
 tool_attribution!(GitForgeTool, ToolKind::Plugin);
 tool_attribution!(GlobSearchTool, ToolKind::Search);

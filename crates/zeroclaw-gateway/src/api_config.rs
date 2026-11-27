@@ -351,6 +351,8 @@ fn lookup_prop_field(
 
 /// Validate a scoped edit while retaining unrelated pre-existing diagnostics.
 /// Goal failures are checked against all inputs before generic validation.
+/// If a retained Goal error stopped validation, check the retired Gemini
+/// settings that follow Goal before accepting the edit.
 /// Other failures keep the existing reported-path policy: pathless errors and
 /// errors overlapping changed paths reject the write.
 fn scoped_validate(
@@ -360,32 +362,43 @@ fn scoped_validate(
     // edited. Compare its declared inputs before the general first-error pass,
     // so an earlier unrelated validation error cannot mask introduced Goal
     // invalidity.
-    if let Err(error) = working.validate_goal_config() {
-        let goal_inputs_changed = working.goal_validation_input_paths().iter().any(|input| {
-            working
-                .dirty_paths
-                .iter()
-                .any(|dirty| paths_overlap(input, dirty))
-        });
-        if goal_inputs_changed {
-            return Err(ConfigApiError::from_validation(error));
+    let retained_goal_error = match working.validate_goal_config() {
+        Ok(()) => None,
+        Err(error) => {
+            let error = ConfigApiError::from_validation(error);
+            let goal_inputs_changed = working.goal_validation_input_paths().iter().any(|input| {
+                working
+                    .dirty_paths
+                    .iter()
+                    .any(|dirty| paths_overlap(input, dirty))
+            });
+            if goal_inputs_changed {
+                return Err(error);
+            }
+            Some(error)
         }
-    }
+    };
 
     if let Err(e) = working.validate() {
         let api_err = ConfigApiError::from_validation(e);
-        let err_path = api_err.path.as_deref().unwrap_or("");
         // This inherited generic classification still compares only the
         // reported error path; it is not a general proof about other
         // validators' inputs.
-        let touches_dirty = !err_path.is_empty()
-            && working
-                .dirty_paths
-                .iter()
-                .any(|dirty| paths_overlap(err_path, dirty));
-        if touches_dirty || err_path.is_empty() {
+        if reported_error_rejects(working, &api_err) {
             return Err(api_err);
         }
+        if retained_goal_error
+            .as_ref()
+            .is_some_and(|goal_error| same_reported_error(goal_error, &api_err))
+            && let Err(error) = working.validate_retired_gemini_cli()
+        {
+            let error = ConfigApiError::from_validation(error);
+            if reported_error_rejects(working, &error) {
+                return Err(error);
+            }
+        }
+
+        let err_path = api_err.path.as_deref().unwrap_or("");
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -406,6 +419,23 @@ fn scoped_validate(
         ]);
     }
     Ok(Vec::new())
+}
+
+fn reported_error_rejects(
+    working: &zeroclaw_config::schema::Config,
+    error: &ConfigApiError,
+) -> bool {
+    error.path.as_deref().is_none_or(|path| {
+        path.is_empty()
+            || working
+                .dirty_paths
+                .iter()
+                .any(|dirty| paths_overlap(path, dirty))
+    })
+}
+
+fn same_reported_error(left: &ConfigApiError, right: &ConfigApiError) -> bool {
+    left.code == right.code && left.path == right.path && left.message == right.message
 }
 
 /// Return whether two dotted config paths are equal or one is an ancestor of
@@ -4849,6 +4879,304 @@ mod tests {
             .openai
             .insert("default".to_string(), Default::default());
         config.goal.verifier.model_provider = "openai.default".into();
+    }
+
+    fn goal_configure_dangling_test_verifier(config: &mut zeroclaw_config::schema::Config) {
+        goal_configure_test_verifier(config);
+        config.goal.enabled = true;
+        config.goal.verifier.model_provider = "openai.missing".into();
+    }
+
+    fn goal_add_retired_gemini_alias(config: &mut zeroclaw_config::schema::Config) {
+        let mut alias = zeroclaw_config::schema::GeminiCliModelProviderConfig::default();
+        alias.base.model = Some("legacy-model".into());
+        config
+            .providers
+            .models
+            .gemini_cli
+            .insert("home".into(), alias);
+    }
+
+    fn goal_read_saved_config(path: &std::path::Path) -> zeroclaw_config::schema::Config {
+        toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct GoalConfigWriteSnapshot {
+        disk: Vec<u8>,
+        live: serde_json::Value,
+        revision: zeroclaw_config::live::ConfigRevision,
+        pending_reload: bool,
+    }
+
+    fn goal_config_write_snapshot(state: &AppState) -> GoalConfigWriteSnapshot {
+        let (path, live, revision) = {
+            let guard = state.config.read();
+            (
+                guard.config_path.clone(),
+                serde_json::to_value(&*guard).unwrap(),
+                guard.revision(),
+            )
+        };
+        GoalConfigWriteSnapshot {
+            disk: std::fs::read(path).unwrap(),
+            live,
+            revision,
+            pending_reload: state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    async fn goal_test_patch(
+        state: &AppState,
+        operations: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        response_json(
+            handle_patch(
+                State(state.clone()),
+                None,
+                HeaderMap::new(),
+                axum::Json(operations),
+            )
+            .await,
+        )
+        .await
+    }
+
+    fn goal_assert_saved_warnings(
+        status: StatusCode,
+        json: &serde_json::Value,
+        existing_error_path: &str,
+        removed_tool_paths: &[&str],
+    ) {
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["saved"], true, "{json}");
+        let warnings = json["warnings"].as_array().expect("warnings is an array");
+        let paths_for = |code: &str| -> Vec<&str> {
+            warnings
+                .iter()
+                .filter(|warning| warning["code"] == code)
+                .map(|warning| warning["path"].as_str().expect("warning path"))
+                .collect()
+        };
+        assert_eq!(
+            paths_for("pre_existing_validation_error"),
+            [existing_error_path],
+            "{json}"
+        );
+        assert_eq!(
+            paths_for(zeroclaw_config::validation_warnings::TOOL_REMOVED),
+            removed_tool_paths,
+            "{json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_patch_rejects_retired_gemini_tool_with_existing_goal_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        goal_configure_dangling_test_verifier(&mut config);
+        config.save().await.unwrap();
+        let state = test_state(config);
+        let before = goal_config_write_snapshot(&state);
+
+        let (status, json) = goal_test_patch(
+            &state,
+            serde_json::json!([
+                {"op": "replace", "path": "/providers/models/openai/default/model", "value": "test-model"},
+                {"op": "replace", "path": "/gemini_cli/enabled", "value": true}
+            ]),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["code"], "validation_failed", "{json}");
+        assert_eq!(json["path"], "gemini_cli.enabled", "{json}");
+        assert!(
+            json["message"].as_str().is_some_and(
+                |message| message.contains(zeroclaw_config::schema::GEMINI_CLI_TOOL_RETIRED)
+            ),
+            "{json}"
+        );
+        assert_eq!(goal_config_write_snapshot(&state), before);
+        assert!(
+            state.config.read().providers.models.openai["default"]
+                .base
+                .model
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_put_rejects_retired_gemini_alias_edit_with_existing_goal_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        goal_configure_dangling_test_verifier(&mut config);
+        goal_add_retired_gemini_alias(&mut config);
+        config.save().await.unwrap();
+        assert!(
+            goal_read_saved_config(&config.config_path)
+                .providers
+                .models
+                .gemini_cli
+                .contains_key("home")
+        );
+        let state = test_state(config);
+        let before = goal_config_write_snapshot(&state);
+
+        let (status, json) = response_json(
+            handle_prop_put(
+                State(state.clone()),
+                None,
+                axum::Json(PropPutBody {
+                    path: "providers.models.gemini_cli.home.model".into(),
+                    value: serde_json::json!("different-legacy-model"),
+                    comment: None,
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["code"], "validation_failed", "{json}");
+        assert_eq!(json["path"], "providers.models.gemini_cli.home", "{json}");
+        assert!(
+            json["message"]
+                .as_str()
+                .is_some_and(|message| message
+                    .contains(zeroclaw_config::schema::GEMINI_CLI_PROVIDER_RETIRED)),
+            "{json}"
+        );
+        assert_eq!(goal_config_write_snapshot(&state), before);
+    }
+
+    #[tokio::test]
+    async fn goal_patch_rejects_enabling_goal_with_existing_retired_gemini() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        goal_add_retired_gemini_alias(&mut config);
+        config.gemini_cli.enabled = true;
+        config.save().await.unwrap();
+        let state = test_state(config);
+        let before = goal_config_write_snapshot(&state);
+
+        let (status, json) = goal_test_patch(
+            &state,
+            serde_json::json!([{"op": "replace", "path": "/goal/enabled", "value": true}]),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["code"], "required_field_empty", "{json}");
+        assert_eq!(json["path"], "goal.verifier.model_provider", "{json}");
+        assert_eq!(goal_config_write_snapshot(&state), before);
+    }
+
+    #[tokio::test]
+    async fn goal_patch_repairs_verifier_and_preserves_retired_gemini() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        goal_configure_dangling_test_verifier(&mut config);
+        goal_add_retired_gemini_alias(&mut config);
+        config.gemini_cli.enabled = true;
+        config.save().await.unwrap();
+        let path = config.config_path.clone();
+        let state = test_state(config);
+        let revision = state.config.revision();
+
+        let (status, json) = goal_test_patch(
+            &state,
+            serde_json::json!([{
+                "op": "replace",
+                "path": "/goal/verifier/model_provider",
+                "value": "openai.default"
+            }]),
+        )
+        .await;
+
+        goal_assert_saved_warnings(
+            status,
+            &json,
+            "providers.models.gemini_cli.home",
+            &["gemini_cli.enabled"],
+        );
+        assert!(
+            json["warnings"].as_array().unwrap().iter().all(|warning| {
+                !warning["path"]
+                    .as_str()
+                    .is_some_and(|path| path.starts_with("goal."))
+            }),
+            "{json}"
+        );
+        assert!(state.config.revision().succeeds_within_epoch(&revision));
+        let saved = goal_read_saved_config(&path);
+        for config in [&*state.config.read(), &saved] {
+            assert_eq!(
+                config.goal.verifier.model_provider.as_str(),
+                "openai.default"
+            );
+            assert_eq!(
+                config.providers.models.gemini_cli["home"]
+                    .base
+                    .model
+                    .as_deref(),
+                Some("legacy-model")
+            );
+            assert!(config.gemini_cli.enabled);
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_patch_disables_retired_gemini_and_preserves_goal_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        goal_configure_dangling_test_verifier(&mut config);
+        config.gemini_cli.enabled = true;
+        config.save().await.unwrap();
+        let path = config.config_path.clone();
+        assert!(goal_read_saved_config(&path).gemini_cli.enabled);
+        let state = test_state(config);
+
+        let (status, json) = goal_test_patch(
+            &state,
+            serde_json::json!([{"op": "replace", "path": "/gemini_cli/enabled", "value": false}]),
+        )
+        .await;
+
+        goal_assert_saved_warnings(status, &json, "goal.verifier.model_provider", &[]);
+        let saved = goal_read_saved_config(&path);
+        // A default-valued false can be omitted on disk; the typed reload
+        // must still be disabled and preserve the unrelated verifier.
+        assert!(!saved.gemini_cli.enabled);
+        assert_eq!(
+            saved.goal.verifier.model_provider.as_str(),
+            "openai.missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_patch_edits_disabled_legacy_gemini_section_and_preserves_goal_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        goal_configure_dangling_test_verifier(&mut config);
+        config.gemini_cli.timeout_secs = 90;
+        config.save().await.unwrap();
+        let path = config.config_path.clone();
+        assert_eq!(goal_read_saved_config(&path).gemini_cli.timeout_secs, 90);
+        let state = test_state(config);
+
+        let (status, json) = goal_test_patch(
+            &state,
+            serde_json::json!([{"op": "replace", "path": "/gemini_cli/timeout_secs", "value": 120}]),
+        )
+        .await;
+
+        goal_assert_saved_warnings(status, &json, "goal.verifier.model_provider", &[]);
+        let saved = goal_read_saved_config(&path);
+        assert_eq!(saved.gemini_cli.timeout_secs, 120);
+        assert!(!saved.gemini_cli.enabled);
     }
 
     #[tokio::test]

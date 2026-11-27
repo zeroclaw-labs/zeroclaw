@@ -1,14 +1,15 @@
 //! One-shot, streaming, in-place migration from schema_version 1 rows
 //! to schema_version 2.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::event::LogEvent;
+use crate::temp_guard::create_exclusive_temp;
 
 /// Detect-and-migrate. No-op when the file contains no recognized legacy rows.
 pub fn migrate_legacy_jsonl_in_place(path: &Path) -> Result<()> {
@@ -24,7 +25,7 @@ pub fn migrate_legacy_jsonl_in_place(path: &Path) -> Result<()> {
         std::process::id(),
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
     ));
-    let (out_file, mut temp_cleanup) = create_migration_temp(&tmp)?;
+    let (out_file, mut temp_cleanup) = create_exclusive_temp(&tmp, "migration")?;
     let mut out = BufWriter::new(out_file);
 
     let in_file =
@@ -118,43 +119,6 @@ pub fn migrate_legacy_jsonl_in_place(path: &Path) -> Result<()> {
         );
     }
     Ok(())
-}
-
-struct MigrationTempCleanup {
-    path: PathBuf,
-    armed: bool,
-}
-
-fn create_migration_temp(path: &Path) -> Result<(File, MigrationTempCleanup)> {
-    let mut opts = OpenOptions::new();
-    opts.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let file = opts
-        .open(path)
-        .with_context(|| format!("creating migration temp {}", path.display()))?;
-    Ok((file, MigrationTempCleanup::new(path.to_path_buf())))
-}
-
-impl MigrationTempCleanup {
-    fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for MigrationTempCleanup {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
 }
 
 fn file_needs_migration(path: &Path) -> Result<bool> {
@@ -513,34 +477,6 @@ mod tests {
         let migrated: Value = serde_json::from_str(&lines[1]).unwrap();
         assert_eq!(migrated["id"], "legacy");
         assert_eq!(migrated["schema_version"], LogEvent::SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn temp_cleanup_removes_only_uncommitted_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("migration.tmp");
-        fs::write(&path, "pending").unwrap();
-        {
-            let _cleanup = MigrationTempCleanup::new(path.clone());
-        }
-        assert!(!path.exists(), "uncommitted temp file must be removed");
-
-        fs::write(&path, "committed").unwrap();
-        {
-            let mut cleanup = MigrationTempCleanup::new(path.clone());
-            cleanup.disarm();
-        }
-        assert_eq!(fs::read_to_string(&path).unwrap(), "committed");
-    }
-
-    #[test]
-    fn temp_creation_collision_preserves_existing_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("migration.tmp");
-        fs::write(&path, "owned elsewhere").unwrap();
-
-        assert!(create_migration_temp(&path).is_err());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "owned elsewhere");
     }
 
     #[test]
