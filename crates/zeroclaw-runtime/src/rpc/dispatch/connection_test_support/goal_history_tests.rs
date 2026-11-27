@@ -22,6 +22,534 @@ const BEFORE_RESERVE: &str = "goal-before-candidate-reserve";
 const HISTORY_FRAME: &str = "messages-frame";
 const FILLER: &str = "occupied";
 
+// Issue through native command admission and finish on its actual dispatcher.
+// Holding the bounded writer lets policy and connection changes occur before
+// the first acknowledgement or a deferred notification is committed.
+mod goal_issuer_tests {
+    use super::super::{GoalParentAdmissionCase, HeldGoalParent, prepare_held_goal_parent_fixture};
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use zeroclaw_goal::control::{GoalQueuedControl, GoalResponse, GoalSessionKey};
+
+    const ID: u64 = 152;
+    type Command = (Value, crate::rpc::goal::RpcGoalCommandSubmission);
+
+    struct Case {
+        peer: Peer,
+        ctx: Arc<RpcContext>,
+        parent: HeldGoalParent,
+        registry: Arc<dyn zeroclaw_goal::GoalTaskRegistry>,
+        dir: tempfile::TempDir,
+    }
+
+    impl Case {
+        async fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let mut ctx = RpcContext::minimal(
+                zeroclaw_config::schema::Config {
+                    config_path: dir.path().join("config.toml"),
+                    data_dir: dir.path().to_owned(),
+                    ..Default::default()
+                },
+                Arc::new(SessionStore::new(
+                    64,
+                    Arc::new(SessionActorQueue::new(4, 30, 60)),
+                )),
+            );
+            let (registry, parent) = prepare_held_goal_parent_fixture(
+                &mut ctx,
+                dir.path(),
+                REATTACH_SID,
+                REATTACH_OWNER,
+                GoalParentAdmissionCase::DirectResume,
+            )
+            .await;
+            let peer = Peer::connect(&ctx, REATTACH_OWNER).await;
+            Self {
+                peer,
+                ctx,
+                parent,
+                registry,
+                dir,
+            }
+        }
+
+        async fn admit(&self, command: &str) -> Command {
+            self.peer
+                .dispatcher
+                .handle_session_goal(&json!({
+                    "session_id": REATTACH_SID, "command": command,
+                }))
+                .await
+                .unwrap()
+        }
+
+        fn finish(&self, command: Command) -> JoinHandle<()> {
+            let dispatcher = self.peer.dispatcher.spawn_handle();
+            zeroclaw_spawn::spawn!(async move {
+                dispatcher
+                    .finish_session_goal_command(json!(ID), false, Ok(command))
+                    .await;
+            })
+        }
+
+        async fn park(&self, command: Command) -> JoinHandle<()> {
+            self.peer.occupy_writer();
+            let writers = self.peer.writer.strong_count();
+            let finish = self.finish(command);
+            self.peer.wait_for_reservation(writers).await;
+            finish
+        }
+
+        fn drain_fillers(&mut self) {
+            for _ in 0..self.peer.writer.max_capacity() {
+                assert_eq!(self.peer.frames.try_recv().unwrap(), FILLER);
+            }
+        }
+
+        fn change_durable_owner(&self) {
+            self.ctx
+                .session_backend
+                .as_ref()
+                .unwrap()
+                .set_session_principal(&format!("rpc_{REATTACH_SID}"), "fixture-second-owner")
+                .unwrap();
+        }
+
+        fn assert_no_parent(&self) {
+            assert_eq!(self.parent.turn.calls.load(Ordering::SeqCst), 0);
+        }
+
+        fn key(&self) -> String {
+            GoalSessionKey::zero_code(REATTACH_SID)
+                .unwrap()
+                .durable_id()
+        }
+
+        async fn assert_paused(&self, reason: zeroclaw_goal::GoalPauseReason) {
+            let task = self
+                .registry
+                .current_goal_for_session(&self.key())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(task.status, zeroclaw_api::task::TaskStatus::Paused);
+            assert_eq!(
+                self.registry
+                    .get_goal_task(&task.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .pause_reason,
+                Some(reason)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_reader_receives_command_notices_without_moving_the_active_stream() {
+        for still_owned in [true, false] {
+            let mut case = Case::new().await;
+            let resumed = case
+                .peer
+                .result(
+                    Method::SessionGoal,
+                    json!({
+                        "session_id":REATTACH_SID, "command":"/goal resume",
+                    }),
+                    ID,
+                )
+                .await;
+            assert!(matches!(
+                serde_json::from_value::<crate::rpc::types::SessionGoalResult>(resumed)
+                    .unwrap()
+                    .response,
+                crate::rpc::types::GoalResponseWire::Resumed(_)
+            ));
+            arrived(&case.parent.turn.started, "held original parent").await;
+            let mut issuer = Peer::connect(&case.ctx, REATTACH_OWNER).await;
+            issuer
+                .result(
+                    Method::SessionNew,
+                    json!({
+                        "session_id":REATTACH_SID,"agent_alias":"test-agent","chat_mode":"chat",
+                    }),
+                    20,
+                )
+                .await;
+            let recipient = case
+                .ctx
+                .sessions
+                .goal_session_snapshot(REATTACH_SID)
+                .await
+                .unwrap()
+                .goal_recipient;
+            let (active, pending) = recipient.destinations_for_test();
+            assert!(
+                active
+                    .and_then(|d| d.upgrade())
+                    .is_some_and(|d| d.matches(&case.peer.dispatcher.rpc))
+            );
+            assert!(
+                pending
+                    .and_then(|d| d.upgrade())
+                    .is_some_and(|d| d.matches(&issuer.dispatcher.rpc))
+            );
+            let status = issuer
+                .result(
+                    Method::SessionGoal,
+                    json!({"session_id":REATTACH_SID,"command":"/goal status"}),
+                    21,
+                )
+                .await;
+            assert!(matches!(
+                serde_json::from_value::<crate::rpc::types::SessionGoalResult>(status)
+                    .unwrap()
+                    .response,
+                crate::rpc::types::GoalResponseWire::Status(_)
+            ));
+            let (expected, control) = issuer
+                .dispatcher
+                .handle_session_goal(&json!({
+                    "session_id":REATTACH_SID, "command":"/goal pause now",
+                }))
+                .await
+                .unwrap();
+            assert!(matches!(
+                control.response(),
+                GoalResponse::TransitionPending(_)
+            ));
+            let dispatcher = issuer.dispatcher.spawn_handle();
+            let initial = expected.clone();
+            let delivery = zeroclaw_spawn::spawn!(async move {
+                dispatcher
+                    .finish_session_goal_command(json!(22), false, Ok((initial, control)))
+                    .await;
+            });
+            assert_eq!(
+                issuer.next_frame().await,
+                json!({"jsonrpc":"2.0","id":22,"result":expected})
+            );
+            issuer.occupy_writer();
+            let writers = issuer.writer.strong_count();
+            case.parent.turn.release.notify_one();
+            issuer.wait_for_reservation(writers).await;
+            if !still_owned {
+                case.change_durable_owner();
+            }
+            for _ in 0..issuer.writer.max_capacity() {
+                assert_eq!(issuer.frames.try_recv().unwrap(), FILLER);
+            }
+            join_history(delivery).await;
+            if still_owned {
+                let frame = issuer.next_frame().await;
+                assert!(frame.get("id").is_none());
+                assert_eq!(frame["method"], "session/goal_update");
+                assert!(
+                    matches!(serde_json::from_value::<SessionGoalUpdate>(frame["params"].clone()).unwrap(),
+                    SessionGoalUpdate::Lifecycle { response: crate::rpc::types::GoalResponseWire::Paused(_), session_id } if session_id == REATTACH_SID)
+                );
+            }
+            assert!(issuer.frames.try_recv().is_err());
+            while let Ok(raw) = case.peer.frames.try_recv() {
+                let frame: Value = serde_json::from_str(&raw).unwrap();
+                assert!(frame.get("id").is_none());
+                assert!(
+                    frame["params"].get("lifecycle").is_none(),
+                    "command notice moved to the stream"
+                );
+            }
+            case.assert_paused(zeroclaw_goal::GoalPauseReason::OperatorPaused)
+                .await;
+            assert_eq!(case.parent.turn.calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn authorized_session_without_goal_receives_no_current_goal() {
+        let mut case = Case::new().await;
+        case.ctx
+            .goal_runtime
+            .dispose_session(REATTACH_SID)
+            .await
+            .unwrap();
+        let result = case
+            .peer
+            .result(
+                Method::SessionGoal,
+                json!({"session_id":REATTACH_SID, "command":"/goal status"}),
+                ID,
+            )
+            .await;
+        assert_eq!(
+            serde_json::from_value::<crate::rpc::types::SessionGoalResult>(result)
+                .unwrap()
+                .response,
+            crate::rpc::types::GoalResponseWire::NoCurrentGoal
+        );
+        case.assert_no_parent();
+    }
+
+    #[tokio::test]
+    async fn only_current_incarnation_can_commit_prepared_projection() {
+        let mut case = Case::new().await;
+        let command = case.admit("/goal budget").await;
+        assert!(matches!(command.1.response(), GoalResponse::Budget(_)));
+        let delivery = case.park(command).await;
+        assert!(case.ctx.sessions.remove(REATTACH_SID).await);
+        super::super::insert_session_with_owner(
+            &case.ctx,
+            case.dir.path(),
+            REATTACH_SID,
+            Box::new(super::super::HeldOrdinaryProvider(Default::default())),
+            Some(REATTACH_OWNER),
+        )
+        .await;
+        case.drain_fillers();
+        join_history(delivery).await;
+        let frame = case.peer.next_frame().await;
+        assert_eq!(frame["id"], ID);
+        assert_eq!(frame["error"]["code"], super::super::super::FORBIDDEN);
+        assert!(frame.get("result").is_none());
+        case.assert_no_parent();
+    }
+
+    #[tokio::test]
+    async fn fenced_closure_sends_its_projection_only_while_original_owner_is_current() {
+        for still_owned in [true, false] {
+            let mut case = Case::new().await;
+            let ordinary = case
+                .ctx
+                .sessions
+                .session_queue
+                .acquire(REATTACH_SID)
+                .await
+                .unwrap();
+            let command = case.admit("/goal resume").await;
+            assert_eq!(
+                command.1.response(),
+                &GoalResponse::Queued(GoalQueuedControl::Resume)
+            );
+            let expected = command.0.clone();
+            let delivery = case.finish(command);
+            assert_eq!(
+                case.peer.next_frame().await,
+                json!({"jsonrpc":"2.0","id":ID,"result":expected})
+            );
+            let generation = case
+                .ctx
+                .sessions
+                .get_generation(REATTACH_SID)
+                .await
+                .unwrap();
+            let fence = case
+                .ctx
+                .sessions
+                .lock_goal_lifecycle(REATTACH_SID, generation)
+                .await
+                .unwrap()
+                .fence_for_binding(true);
+            let resident = case
+                .ctx
+                .goal_runtime
+                .supervisor(REATTACH_SID)
+                .await
+                .unwrap();
+            case.peer.occupy_writer();
+            let writers = case.peer.writer.strong_count();
+            assert!(
+                resident
+                    .quiesce_session_worker(&case.key())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            case.peer.wait_for_reservation(writers).await;
+            if !still_owned {
+                case.change_durable_owner();
+            }
+            case.drain_fillers();
+            join_history(delivery).await;
+            if still_owned {
+                let frame = case.peer.next_frame().await;
+                assert!(frame.get("id").is_none());
+                assert_eq!(frame["method"], "session/goal_update");
+                let update: SessionGoalUpdate =
+                    serde_json::from_value(frame["params"].clone()).unwrap();
+                assert!(
+                    matches!(update, SessionGoalUpdate::Lifecycle {session_id, response:crate::rpc::types::GoalResponseWire::AlreadyPaused(status)}
+                    if session_id == REATTACH_SID && status.task_id == case.registry.current_goal_for_session(&case.key()).await.unwrap().unwrap().id)
+                );
+            }
+            assert!(case.peer.frames.try_recv().is_err());
+            drop(fence);
+            drop(ordinary);
+            case.assert_paused(zeroclaw_goal::GoalPauseReason::OperatorPaused)
+                .await;
+            case.assert_no_parent();
+        }
+    }
+
+    #[tokio::test]
+    async fn command_failure_is_not_published_after_original_owner_changes() {
+        let mut case = Case::new().await;
+        let ordinary = case
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(REATTACH_SID)
+            .await
+            .unwrap();
+        let command = case.admit("/goal resume").await;
+        let expected = command.0.clone();
+        let delivery = case.finish(command);
+        assert_eq!(
+            case.peer.next_frame().await,
+            json!({"jsonrpc":"2.0","id":ID,"result":expected})
+        );
+        let entered = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        *case
+            .ctx
+            .goal_runtime
+            .test_deferred_commit_pause
+            .lock()
+            .unwrap() = Some(crate::rpc::goal::GoalTestDeferredCommitPause {
+            session_id: REATTACH_SID.into(),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&resume),
+        });
+        drop(ordinary);
+        arrived(&entered, "deferred command admission").await;
+        case.parent.restart.quiesce_for_restart().await.unwrap();
+        case.peer.occupy_writer();
+        let writers = case.peer.writer.strong_count();
+        resume.notify_one();
+        case.peer.wait_for_reservation(writers).await;
+        case.change_durable_owner();
+        case.drain_fillers();
+        join_history(delivery).await;
+        assert!(case.peer.frames.try_recv().is_err());
+        case.assert_paused(zeroclaw_goal::GoalPauseReason::OperatorPaused)
+            .await;
+        case.assert_no_parent();
+    }
+
+    #[tokio::test]
+    async fn original_registration_receives_exact_status_despite_later_same_tui() {
+        let mut case = Case::new().await;
+        let command = case.admit("/goal status").await;
+        assert!(matches!(command.1.response(), GoalResponse::Status(_)));
+        let expected = command.0.clone();
+        let delivery = case.park(command).await;
+        let mut other = Peer::connect(&case.ctx, REATTACH_OWNER).await;
+        case.drain_fillers();
+        join_history(delivery).await;
+        let frame = case.peer.next_frame().await;
+        assert_eq!(frame, json!({"jsonrpc":"2.0", "id":ID, "result":expected}));
+        assert!(other.frames.try_recv().is_err());
+        case.assert_no_parent();
+    }
+
+    #[tokio::test]
+    async fn replaced_registration_drops_pending_result_without_waiting_for_writer_capacity() {
+        let mut case = Case::new().await;
+        let command = case.admit("/goal status").await;
+        let delivery = case.park(command).await;
+        let replacement = "fixture-new-binding";
+        let initialized = case.peer.dispatcher.handle_initialize(&json!({
+            "protocol_version":1, "tui_id":replacement, "tui_sig":case.ctx.tui_registry.sign(replacement)
+        })).await.unwrap();
+        assert_eq!(initialized["tui_id"], replacement);
+        join_history(delivery).await;
+        case.drain_fillers();
+        assert!(case.peer.frames.try_recv().is_err());
+        case.assert_no_parent();
+    }
+
+    #[tokio::test]
+    async fn changed_selected_owner_refuses_queued_ack_and_withdraws_work() {
+        let mut case = Case::new().await;
+        let ordinary = case
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(REATTACH_SID)
+            .await
+            .unwrap();
+        let command = case.admit("/goal resume").await;
+        assert_eq!(
+            command.1.response(),
+            &GoalResponse::Queued(GoalQueuedControl::Resume)
+        );
+        let delivery = case.park(command).await;
+        case.change_durable_owner();
+        case.drain_fillers();
+        join_history(delivery).await;
+        drop(ordinary);
+        let frame = case.peer.next_frame().await;
+        assert_eq!(frame["id"], ID);
+        assert_eq!(frame["error"]["code"], super::super::super::FORBIDDEN);
+        assert!(frame.get("result").is_none());
+        assert!(case.peer.frames.try_recv().is_err());
+        case.assert_paused(zeroclaw_goal::GoalPauseReason::OperatorPaused)
+            .await;
+        let conn = rusqlite::Connection::open(case.dir.path().join("control_plane.db")).unwrap();
+        let disposition: (String, String) = conn
+            .query_row(
+                "SELECT state, outcome_reason FROM goal_control_intents WHERE session_id = ?1",
+                [case.key()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(disposition, ("abandoned".into(), "delivery_failed".into()));
+        case.assert_no_parent();
+    }
+
+    #[tokio::test]
+    async fn refused_deferred_prelaunch_notice_pauses_before_first_parent() {
+        let mut case = Case::new().await;
+        let ordinary = case
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(REATTACH_SID)
+            .await
+            .unwrap();
+        let command = case.admit("/goal resume").await;
+        assert_eq!(
+            command.1.response(),
+            &GoalResponse::Queued(GoalQueuedControl::Resume)
+        );
+        let expected = command.0.clone();
+        let delivery = case.finish(command);
+        assert_eq!(
+            case.peer.next_frame().await,
+            json!({"jsonrpc":"2.0","id":ID,"result":expected})
+        );
+        case.peer.occupy_writer();
+        let writers = case.peer.writer.strong_count();
+        drop(ordinary);
+        case.peer.wait_for_reservation(writers).await;
+        assert_eq!(
+            case.registry
+                .current_goal_for_session(&case.key())
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            zeroclaw_api::task::TaskStatus::Running
+        );
+        case.change_durable_owner();
+        case.drain_fillers();
+        join_history(delivery).await;
+        assert!(case.peer.frames.try_recv().is_err());
+        case.assert_paused(zeroclaw_goal::GoalPauseReason::ExternalDependency)
+            .await;
+        case.assert_no_parent();
+    }
+}
+
 // The frames still come from the production RPC paths. Owning a bounded
 // receiver here lets us stop draining it at an exact boundary.
 struct Peer {

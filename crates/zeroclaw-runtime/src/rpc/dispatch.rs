@@ -1244,14 +1244,21 @@ impl RpcDispatcher {
     fn ensure_session_channel_access(
         channels: &crate::tools::PerToolChannelHandle,
     ) -> Result<(), JsonRpcError> {
-        let has_local_session_channels = channels.read().keys().any(|name| name != "rpc");
-        if has_local_session_channels {
+        Self::with_session_channel_access(channels, || ())
+    }
+
+    fn with_session_channel_access<R>(
+        channels: &crate::tools::PerToolChannelHandle,
+        effect: impl FnOnce() -> R,
+    ) -> Result<R, JsonRpcError> {
+        let channels = channels.read();
+        if channels.keys().any(|name| name != "rpc") {
             return Err(rpc_err(
                 SESSION_NOT_OWNED,
                 "Remote caller cannot use this session's local capabilities",
             ));
         }
-        Ok(())
+        Ok(effect())
     }
 
     /// Per-operation authorization: credential expiry, revalidation
@@ -1501,6 +1508,10 @@ impl GoalFrameDestination {
         &self.0.connection_cancel
     }
 
+    pub(super) fn with_live_tui_registration<R>(&self, effect: impl FnOnce() -> R) -> Option<R> {
+        self.0.with_live_tui_registration(effect)
+    }
+
     pub(super) fn register(&self, recipient: &Arc<super::session::GoalRecipient>) -> bool {
         self.0.goal_destinations.lock().register(recipient)
     }
@@ -1521,6 +1532,151 @@ impl GoalFrameDestination {
             RpcDispatcher::ensure_session_channel_access(live.goal_reaction_channels())?;
         }
         Ok(authority)
+    }
+}
+
+impl GoalSessionAuthorization {
+    pub(super) async fn send_goal_command_result(
+        &self,
+        generation: u64,
+        response: &zeroclaw_goal::control::GoalResponse,
+        id: Value,
+        result: Value,
+    ) -> bool {
+        use zeroclaw_goal::control::GoalResponse;
+        let Ok(frame) = serde_json::to_string(&JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION,
+            id: id.clone(),
+            result: Some(result),
+            error: None,
+        }) else {
+            return false;
+        };
+        let non_disclosing = matches!(
+            response,
+            GoalResponse::Help | GoalResponse::Disabled | GoalResponse::SessionUnavailable
+        );
+        self.commit_issuer_frame(generation, frame, Some(id), non_disclosing)
+            .await
+    }
+
+    pub(super) async fn send_goal_command_notification(
+        &self,
+        generation: u64,
+        frame: String,
+    ) -> bool {
+        self.commit_issuer_frame(generation, frame, None, false)
+            .await
+    }
+
+    async fn commit_issuer_frame(
+        &self,
+        generation: u64,
+        frame: String,
+        request_id: Option<Value>,
+        non_disclosing: bool,
+    ) -> bool {
+        let dispatcher = &self.dispatcher;
+        let retired = dispatcher.goal_registration_retired();
+        let permit = tokio::select! {
+            biased;
+            _ = dispatcher.connection_cancel.cancelled() => return false,
+            _ = retired.cancelled() => return false,
+            permit = dispatcher.rpc.reserve_frame() => permit,
+        };
+        let Some(permit) = permit else { return false };
+        let mut permit = Some(permit);
+        let send = || {
+            dispatcher.with_live_tui_registration(|| {
+                if let Some(permit) = permit.take() {
+                    permit.send(frame);
+                }
+            });
+        };
+        if non_disclosing {
+            // These original results carry no session or Goal state. They do
+            // not require a resident task or a readable durable transcript.
+            let owner = self.authorized.as_ref().and_then(|r| r.owner.as_deref());
+            if let Ok(_authority) = dispatcher.session_effect_lease(Method::SessionGoal, owner) {
+                send();
+            }
+        } else if let Some(record) = &self.authorized {
+            dispatcher
+                .ctx
+                .sessions
+                .with_session_effect(&self.session_id, |live| {
+                    let Some(live) = live else { return };
+                    if record.live_generation != Some(generation)
+                        || live.generation != generation
+                        || live.owner_principal_id != record.owner
+                        || !matches!(live.chat_mode, ChatMode::Chat)
+                        || dispatcher.tui_id.is_none()
+                        || live.owner_tui_id() != dispatcher.tui_id.as_deref()
+                    {
+                        return;
+                    }
+                    let mut send = Some(send);
+                    let mut commit = |actual: Option<&str>| -> std::io::Result<()> {
+                        if actual == record.owner.as_deref()
+                            && let Some(send) = send.take()
+                        {
+                            self.with_issuer_authority(live, send);
+                        }
+                        Ok(())
+                    };
+                    match &record.durable {
+                        Some(DurableSession::Chat { key }) => {
+                            if let Some(backend) = &dispatcher.ctx.session_backend {
+                                // An unsupported or unreadable owner cannot authorize delivery.
+                                let _ = backend.with_session_owner(key, &mut commit);
+                            }
+                        }
+                        None => {
+                            let _ = commit(record.owner.as_deref());
+                        }
+                        Some(DurableSession::Acp) => {}
+                    }
+                })
+                .await;
+        }
+
+        let Some(permit) = permit else { return true };
+        if let Some(id) = request_id {
+            let refusal = JsonRpcResponse {
+                jsonrpc: JSONRPC_VERSION,
+                id,
+                result: None,
+                error: Some(rpc_err(
+                    FORBIDDEN,
+                    "Session not found or not owned by this principal",
+                )),
+            };
+            if let Ok(frame) = serde_json::to_string(&refusal) {
+                dispatcher.with_live_tui_registration(|| permit.send(frame));
+            }
+        }
+        false
+    }
+
+    fn with_issuer_authority(&self, live: &super::session::RpcSession, send: impl FnOnce()) {
+        let dispatcher = &self.dispatcher;
+        if self.purpose == GoalCommandPurpose::Execution {
+            if let Ok(_authority) = dispatcher.live_effect_lease(Method::SessionGoal, live) {
+                if dispatcher.access_policy == RpcAccessPolicy::RemoteSessionOwner {
+                    // A refusal leaves the reserved permit for the non-disclosing reply.
+                    let _ = RpcDispatcher::with_session_channel_access(
+                        live.goal_reaction_channels(),
+                        send,
+                    );
+                } else {
+                    send();
+                }
+            }
+        } else if let Ok(_authority) =
+            dispatcher.session_effect_lease(Method::SessionGoal, live.owner_principal_id.as_deref())
+        {
+            send();
+        }
     }
 }
 
@@ -2996,6 +3152,37 @@ impl RpcDispatcher {
         Some((self.tui_id.as_deref()?, self.tui_epoch?))
     }
 
+    fn goal_registration_retired(&self) -> CancellationToken {
+        self.goal_destinations.lock().retired()
+    }
+
+    /// A new socket using the same TUI can coexist with this registration.
+    /// Reinitializing this socket, in contrast, retires its old handles.
+    fn with_live_tui_registration<R>(&self, effect: impl FnOnce() -> R) -> Option<R> {
+        self.tui_registration()?;
+        let registration = self.goal_destinations.lock();
+        if registration.is_closed() || self.connection_cancel.is_cancelled() {
+            return None;
+        }
+        Some(effect())
+    }
+
+    fn bind_tui_registration(&mut self, tui_id: &str, env: HashMap<String, String>) {
+        if let Some((previous_id, previous_epoch)) = self.tui_registration() {
+            self.retire_goal_destinations();
+            self.ctx
+                .tui_registry
+                .unregister(previous_id, previous_epoch);
+            self.goal_destinations = Arc::default();
+        }
+        let epoch = self
+            .ctx
+            .tui_registry
+            .register(self.tui_entry(tui_id.to_owned(), env));
+        self.tui_id = Some(tui_id.to_owned());
+        self.tui_epoch = Some(epoch);
+    }
+
     /// The registry entry `initialize` records for this connection.
     fn tui_entry(
         &self,
@@ -3024,12 +3211,7 @@ impl RpcDispatcher {
     /// Register `tui_id` for this connection as `initialize` does.
     #[cfg(test)]
     pub fn register_tui_for_test(&mut self, tui_id: &str) {
-        let epoch = self
-            .ctx
-            .tui_registry
-            .register(self.tui_entry(tui_id.to_string(), Default::default()));
-        self.tui_id = Some(tui_id.to_string());
-        self.tui_epoch = Some(epoch);
+        self.bind_tui_registration(tui_id, HashMap::new());
     }
 
     #[cfg(test)]
@@ -4810,22 +4992,7 @@ impl RpcDispatcher {
 
         let env = self.retained_tui_env(&connection_auth, req.env);
         let tui_sig = self.ctx.tui_registry.sign(&tui_id);
-        // A connection holds one registration. Initializing again (to
-        // revalidate, say) replaces this connection's earlier registration
-        // instead of leaving it live beside the new one, so the identity is
-        // still seen to leave when the connection ends.
-        if let Some((previous_id, previous_epoch)) = self.tui_registration() {
-            let previous_id = previous_id.to_string();
-            self.ctx
-                .tui_registry
-                .unregister(&previous_id, previous_epoch);
-        }
-        let tui_epoch = self
-            .ctx
-            .tui_registry
-            .register(self.tui_entry(tui_id.clone(), env));
-        self.tui_id = Some(tui_id.clone());
-        self.tui_epoch = Some(tui_epoch);
+        self.bind_tui_registration(&tui_id, env);
 
         // Bind the session's tui_id to the presenting client cert fingerprint
         // (mTLS peers only). The cert is the transport identity; the renew RPC
@@ -5315,10 +5482,16 @@ impl RpcDispatcher {
 
     async fn rebind_rpc_approval_channel(
         &self,
-        agent: Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
+        existing: &crate::rpc::session::ResumedRpcSession,
         session_id: String,
         defer_when_busy: bool,
     ) -> Result<(), JsonRpcError> {
+        let rebind = existing
+            .approval_rebind
+            .clone()
+            .ok_or_else(|| self.stale_session_incarnation_error())?;
+        let agent = Arc::clone(&existing.agent);
+        let generation = existing.generation;
         let approval_channel = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
             "rpc",
             session_id.clone(),
@@ -5327,6 +5500,8 @@ impl RpcDispatcher {
             self.client_elicitation_caps,
         ));
         let current = self.spawn_handle();
+        let connection_cancel = current.connection_cancel.clone();
+        let registration_retired = current.goal_registration_retired();
         let expected_agent = Arc::clone(&agent);
         let remote = self.access_policy == RpcAccessPolicy::RemoteSessionOwner;
         let install = move |mut guard: tokio::sync::OwnedMutexGuard<crate::agent::agent::Agent>| async move {
@@ -5340,55 +5515,73 @@ impl RpcDispatcher {
                 .sessions
                 .with_session_effect(&session_id, |session| {
                     let session = session
-                        .filter(|s| Arc::ptr_eq(&s.agent, &expected_agent))
+                        .filter(|s| {
+                            s.generation == generation
+                                && Arc::ptr_eq(&s.agent, &expected_agent)
+                                && s.has_approval_rebind(&rebind)
+                        })
                         .ok_or_else(|| current.stale_session_incarnation_error())?;
                     if remote && session.owner_tui_id() != current.tui_id.as_deref() {
                         return Err(current.stale_session_incarnation_error());
                     }
-                    // Channel refresh uses the Agent mutex. Keep transport eligibility,
-                    // current authority and registration inside this same effect.
                     if remote {
                         current.ensure_session_agent_channel_access(&guard)?;
                     }
-                    current.with_live_effect(Method::SessionNew, session, |_| {
-                        guard.set_channel_name("rpc".to_string());
-                        guard
-                            .channel_handles()
-                            .register_channel("rpc", approval_channel);
-                    })
+                    // Resolve retained environment before taking the final
+                    // registration guard: its resolver reads the TUI registry.
+                    let _authority = current.live_effect_lease(Method::SessionNew, session)?;
+                    current
+                        .with_live_tui_registration(|| {
+                            guard.set_channel_name("rpc".to_string());
+                            guard
+                                .channel_handles()
+                                .register_channel("rpc", approval_channel);
+                        })
+                        .ok_or_else(|| current.stale_session_incarnation_error())
                 })
                 .await
         };
-        if remote && !defer_when_busy {
+        let inline = remote && !defer_when_busy;
+        // Trusted-local and active-Goal reattach do not wait for an active turn.
+        if !inline && let Ok(guard) = Arc::clone(&agent).try_lock_owned() {
+            return install(guard).await;
+        }
+        #[cfg(test)]
+        let sessions = Arc::clone(&self.ctx.sessions);
+        let wait_for_install = |agent: Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>| async move {
+            tokio::select! {
+                biased;
+                () = connection_cancel.cancelled() => None,
+                () = registration_retired.cancelled() => None,
+                outcome = async {
+                    #[cfg(test)]
+                    sessions.wait_test_effect_pause("approval-agent-wait").await;
+                    install(agent.lock_owned().await).await
+                } => Some(outcome),
+            }
+        };
+        if inline {
             self.ctx
                 .sessions
                 .wait_test_effect_pause("remote-approval-agent")
                 .await;
-            return install(agent.lock_owned().await).await;
+            return wait_for_install(agent)
+                .await
+                .ok_or_else(|| self.stale_session_incarnation_error())?;
         }
-        // Trusted-local reconnect must not wait for an active turn. A deferred
-        // installation still checks the original Agent and current authority.
-        match Arc::clone(&agent).try_lock_owned() {
-            Ok(guard) => install(guard).await,
-            Err(_) => {
-                zeroclaw_spawn::spawn!(async move {
-                    if let Err(error) = install(agent.lock_owned().await).await {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Reject
-                            )
-                            .with_category(::zeroclaw_log::EventCategory::Session)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(serde_json::json!({ "code": error.code })),
-                            "Deferred RPC approval-channel installation refused"
-                        );
-                    }
-                });
-                Ok(())
+        zeroclaw_spawn::spawn!(async move {
+            if let Some(Err(error)) = wait_for_install(agent).await {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_category(::zeroclaw_log::EventCategory::Session)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(serde_json::json!({ "code": error.code })),
+                    "Deferred RPC approval-channel installation refused"
+                );
             }
-        }
+        });
+        Ok(())
     }
 
     async fn session_generation_for_agent(
@@ -5476,12 +5669,8 @@ impl RpcDispatcher {
         defer_approval_when_busy: bool,
         attach_intent: &mut Option<GoalAttachIntent>,
     ) -> RpcResult {
-        self.rebind_rpc_approval_channel(
-            Arc::clone(&existing.agent),
-            session_id.clone(),
-            defer_approval_when_busy,
-        )
-        .await?;
+        self.rebind_rpc_approval_channel(&existing, session_id.clone(), defer_approval_when_busy)
+            .await?;
         // Do not retain remote admission across outbound capacity or hooks.
         drop(admission);
         if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
@@ -5576,6 +5765,7 @@ impl RpcDispatcher {
                 self.tui_id.clone(),
                 expected_principal.as_deref(),
                 self.resume_access_fence(expected_generation),
+                true,
                 |alias, workspace, retained_environment, owner| {
                     let authority = self.authorize_resumed_incarnation(
                         alias,
@@ -9370,7 +9560,6 @@ impl RpcDispatcher {
         let driver = Arc::new(
             crate::rpc::goal::ZeroCodeGoalSessionDriver::new(
                 Arc::clone(&self.ctx),
-                Arc::clone(&self.rpc),
                 self.connection_activity.clone(),
                 req.session_id.clone(),
                 tui_id,
@@ -9472,7 +9661,7 @@ impl RpcDispatcher {
             return;
         }
 
-        if self.send_result(id, value).await {
+        if submission.send_issuer_result(id, value).await {
             if let Err(error) = submission.after_response().await {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -20200,7 +20389,7 @@ mod tests {
             .extend(["ask_user", "channel_room", "poll", "escalate_to_human"].map(str::to_string));
         let (mut dispatcher, sessions) = make_acp_test_dispatcher(config);
         dispatcher.local_session_channel_factory = Some(session_factory_stub());
-        dispatcher.set_tui_id_for_test(Some("tui-local".into()));
+        dispatcher.register_tui_for_test("tui-local");
 
         let request = serde_json::json!({
             "agent_alias": "test-agent",
@@ -20454,7 +20643,7 @@ mod tests {
             let admission = sessions.session_queue.acquire("remote-wait").await.unwrap();
             let (mut remote, mut frames) = roster_peer(&ctx, 4242).await;
             remote.access_policy = RpcAccessPolicy::RemoteSessionOwner;
-            remote.set_tui_id_for_test(Some("shared-tui".into()));
+            remote.register_tui_for_test("shared-tui");
             let request = zeroclaw_spawn::spawn!(async move {
                 remote.process_line(&json!({"jsonrpc":"2.0", "id":97, "method":"session/new", "params":{"agent_alias":"test-agent", "session_id":"remote-wait", "chat_mode":"acp"}}).to_string()).await;
                 remote
@@ -30500,9 +30689,15 @@ mod tests {
             alice.client_elicitation_caps.form = true;
             let (arrived, release) = sessions.set_test_effect_pause("approval-install");
             let mut logs = zeroclaw_log::subscribe_or_install();
+            let existing = alice
+                .resume_existing_session("victim", "test-agent", &ChatMode::Acp, None, None)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
             // This is the production nonblocking continuation used by resume.
             alice
-                .rebind_rpc_approval_channel(Arc::clone(&agent), "victim".into(), false)
+                .rebind_rpc_approval_channel(&existing, "victim".into(), false)
                 .await
                 .unwrap();
             assert!(Arc::ptr_eq(&original, &handles.get_channel("rpc").unwrap()));
@@ -31849,6 +32044,7 @@ mod tests {
                 None,
                 Some("user:alice"),
                 None,
+                false,
                 |_, _, _, _| Ok::<(), JsonRpcError>(()),
             )
             .await;
@@ -31869,6 +32065,7 @@ mod tests {
                     None,
                     Some("user:bob"),
                     None,
+                    false,
                     |_, _, _, _| Ok::<(), JsonRpcError>(()),
                 )
                 .await
@@ -31886,6 +32083,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    false,
                     |_, _, _, _| Ok::<(), JsonRpcError>(()),
                 )
                 .await
@@ -37206,7 +37404,7 @@ mod tests {
                 None,
             );
             dispatcher.set_authenticated_for_test();
-            dispatcher.set_tui_id_for_test(Some(Self::OWNER.into()));
+            dispatcher.register_tui_for_test(Self::OWNER);
             Self {
                 _directory: directory,
                 dispatcher,
@@ -37253,7 +37451,7 @@ mod tests {
             )
             .await;
             let (mut dispatcher, receiver) = roster_peer(&ctx, 4242).await;
-            dispatcher.set_tui_id_for_test(Some(Self::OWNER.into()));
+            dispatcher.register_tui_for_test(Self::OWNER);
             Self {
                 _directory: directory,
                 dispatcher,
@@ -37459,7 +37657,6 @@ mod tests {
         let command = zeroclaw_commands::goal::parse_goal_command(command).unwrap();
         crate::rpc::goal::ZeroCodeGoalSessionDriver::new(
             Arc::clone(&dispatcher.ctx),
-            Arc::clone(&dispatcher.rpc),
             None,
             session_id.into(),
             dispatcher.tui_id.clone().unwrap(),
@@ -37473,6 +37670,71 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn goal_issuer_scoped_results_recheck_execute_but_control_does_not_require_launch_or_read()
+     {
+        use zeroclaw_api::grants::{Resource, Verb};
+        for (command, retain_execute) in [
+            ("/goal status", true),
+            ("/goal pause now", true),
+            ("/goal resume", true),
+            ("/goal status", false),
+        ] {
+            let mut fixture = GoalAdmissionFixture::scoped().await;
+            let ctx = Arc::clone(&fixture.dispatcher.ctx);
+            let data_dir = ctx.config.snapshot().data_dir.clone();
+            let _registry = connection_test_support::install_paused_goal_control_fixture(
+                &ctx,
+                &data_dir,
+                GoalAdmissionFixture::SESSION,
+            )
+            .await;
+            let (expected, submission) = fixture
+                .dispatcher
+                .handle_session_goal(&json!({
+                    "session_id":GoalAdmissionFixture::SESSION,"command":command,
+                }))
+                .await
+                .unwrap();
+            assert!(!matches!(
+                submission.response(),
+                zeroclaw_goal::control::GoalResponse::SessionUnavailable
+                    | zeroclaw_goal::control::GoalResponse::Disabled
+            ));
+            let mut config = ctx.config.snapshot();
+            let profile = config
+                .permission_profiles
+                .get_mut("session-scoped")
+                .unwrap();
+            profile.allowed_agents.clear();
+            profile.grants.insert(
+                Resource::Sessions,
+                if retain_execute {
+                    vec![Verb::Execute]
+                } else {
+                    vec![Verb::Read]
+                },
+            );
+            ctx.config_authority.publish_for_test(config.clone());
+            ctx.auth.refresh_from_config(&config).unwrap();
+            fixture
+                .dispatcher
+                .finish_session_goal_command(json!(512), false, Ok((expected.clone(), submission)))
+                .await;
+            let frame: Value = serde_json::from_str(&fixture.receiver.try_recv().unwrap()).unwrap();
+            assert_eq!(frame["id"], 512);
+            if retain_execute && command != "/goal resume" {
+                assert_eq!(frame["result"], expected);
+                assert!(frame.get("error").is_none());
+            } else {
+                assert!(frame.get("result").is_none());
+                assert_eq!(frame["error"]["code"], FORBIDDEN);
+            }
+            assert!(fixture.receiver.is_empty());
+            fixture.assert_no_provider_call();
+        }
     }
 
     #[tokio::test]
@@ -41254,7 +41516,6 @@ mod tests {
         let fixture = GoalAdmissionFixture::new(RpcAccessPolicy::TrustedLocal).await;
         let driver = crate::rpc::goal::ZeroCodeGoalSessionDriver::new(
             Arc::clone(&fixture.dispatcher.ctx),
-            Arc::clone(&fixture.dispatcher.rpc),
             None,
             GoalAdmissionFixture::SESSION.into(),
             GoalAdmissionFixture::OWNER.into(),
@@ -44717,7 +44978,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let (mut dispatcher, sessions, receiver) =
                 make_acp_test_dispatcher_with_receiver(make_acp_test_config(&dir));
-            dispatcher.set_tui_id_for_test(Some(TUI.into()));
+            dispatcher.register_tui_for_test(TUI);
             dispatcher
                 .handle_session_new_for_test(&json!({
                     "agent_alias": "test-agent",
@@ -44868,7 +45129,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let (mut existing, sessions, _existing_rx) =
                 make_acp_test_dispatcher_with_receiver(make_acp_test_config(&tmp));
-            existing.set_tui_id_for_test(Some(TUI.into()));
+            existing.register_tui_for_test(TUI);
             new_chat_session_for_eviction_test(&existing, SID, None).await;
             let snapshot = sessions.goal_session_snapshot(SID).await.unwrap();
             let recipient = snapshot.goal_recipient;
@@ -44876,7 +45137,7 @@ mod tests {
             let (sender, _issuer_rx) = tokio::sync::mpsc::channel(4);
             let mut issuer = RpcDispatcher::new(Arc::clone(&existing.ctx), sender, "issuer".into());
             issuer.set_authenticated_for_test();
-            issuer.set_tui_id_for_test(Some(TUI.into()));
+            issuer.register_tui_for_test(TUI);
             let old = GoalFrameDestination::new(&existing);
             let target = GoalFrameDestination::new(&issuer);
             match case {
@@ -44941,6 +45202,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn goal_effects_follow_the_socket_registration_not_the_latest_tui() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut first, _, _first_rx) =
+            make_acp_test_dispatcher_with_receiver(make_acp_test_config(&temp));
+        let (tx, _other_rx) = tokio::sync::mpsc::channel(4);
+        let mut other = RpcDispatcher::new(Arc::clone(&first.ctx), tx, "other".into());
+        assert_eq!(first.with_live_tui_registration(|| ()), None);
+
+        first.register_tui_for_test("shared-tui");
+        let old = first.spawn_handle();
+        let old_retired = old.goal_registration_retired();
+        other.register_tui_for_test("shared-tui");
+        assert_eq!(old.with_live_tui_registration(|| 1), Some(1));
+        assert!(!old_retired.is_cancelled());
+
+        first.register_tui_for_test("reinitialized-tui");
+        assert!(old_retired.is_cancelled());
+        assert_eq!(old.with_live_tui_registration(|| ()), None);
+        assert_eq!(first.with_live_tui_registration(|| 2), Some(2));
+        first.shutdown().await;
+        assert_eq!(first.with_live_tui_registration(|| ()), None);
+        assert_eq!(other.with_live_tui_registration(|| 3), Some(3));
+    }
+
+    #[tokio::test]
     async fn goal_recipient_teardown_preserves_the_successor_and_prunes_retired_bindings() {
         use crate::rpc::session::{GoalFrameClass, GoalFrameDelivery};
 
@@ -44953,13 +45239,13 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let (mut old, sessions, _old_receiver) =
                 make_acp_test_dispatcher_with_receiver(make_acp_test_config(&tmp));
-            old.set_tui_id_for_test(Some(TUI.into()));
+            old.register_tui_for_test(TUI);
             new_chat_session_for_eviction_test(&old, SESSION, None).await;
             let generation = sessions.get_generation(SESSION).await.unwrap();
             let (tx, mut receiver) = tokio::sync::mpsc::channel(64);
             let mut successor = RpcDispatcher::new(Arc::clone(&old.ctx), tx, "successor".into());
             successor.set_authenticated_for_test();
-            successor.set_tui_id_for_test(Some(TUI.into()));
+            successor.register_tui_for_test(TUI);
 
             // Launch from a spawned authorization handle, not from the root.
             let spawned = old.spawn_handle();
@@ -58628,7 +58914,7 @@ mod tests {
             None,
         );
         dispatcher.set_authenticated_for_test();
-        dispatcher.set_tui_id_for_test(Some(tui_id.to_string()));
+        dispatcher.register_tui_for_test(tui_id);
         (dispatcher, rx)
     }
 

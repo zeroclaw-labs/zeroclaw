@@ -17,7 +17,7 @@ use anyhow::{Context as _, Result, bail, ensure};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 use zeroclaw_api::{
-    jsonrpc::{JsonRpcNotification, RpcOutbound},
+    jsonrpc::JsonRpcNotification,
     model_provider::{ChatMessage, ChatRequest, TokenUsage},
 };
 
@@ -92,7 +92,16 @@ async fn acquire_zero_code_goal_session_guard(
 /// queued ahead of any ordinary parent-turn events.
 pub(super) struct RpcGoalCommandSubmission {
     response: GoalResponse,
+    issuer: GoalCommandIssuer,
     post_response: Option<RpcGoalPostResponse>,
+}
+
+/// A command belongs to its original connection, even if another connection
+/// later becomes the observer of the ongoing Goal execution.
+#[derive(Clone)]
+struct GoalCommandIssuer {
+    authorization: Arc<super::dispatch::GoalSessionAuthorization>,
+    generation: u64,
 }
 
 impl std::fmt::Debug for RpcGoalCommandSubmission {
@@ -112,16 +121,16 @@ struct RpcGoalPostResponse {
     supervisor: Arc<GoalExecutionSupervisor>,
     settings_source: GoalHostSettingsSource,
     admission: GoalControlAdmission,
-    outbound: Arc<RpcOutbound>,
+    issuer: GoalCommandIssuer,
 }
 
 async fn publish_goal_lifecycle(
-    outbound: &RpcOutbound,
+    issuer: &GoalCommandIssuer,
     session_id: &str,
     response: &GoalResponse,
 ) -> Result<()> {
     publish_goal_update(
-        outbound,
+        issuer,
         crate::rpc::types::SessionGoalUpdate::Lifecycle {
             session_id: session_id.to_owned(),
             response: crate::rpc::types::goal_response_wire(response),
@@ -131,12 +140,15 @@ async fn publish_goal_lifecycle(
 }
 
 async fn publish_goal_update(
-    outbound: &RpcOutbound,
+    issuer: &GoalCommandIssuer,
     update: crate::rpc::types::SessionGoalUpdate,
 ) -> Result<()> {
     let notification = encode_goal_update(update)?;
     ensure!(
-        outbound.send_raw(notification).await,
+        issuer
+            .authorization
+            .send_goal_command_notification(issuer.generation, notification)
+            .await,
         "ZeroCode Goal lifecycle response could not be queued"
     );
     Ok(())
@@ -151,12 +163,12 @@ fn encode_goal_update(update: crate::rpc::types::SessionGoalUpdate) -> Result<St
 }
 
 async fn report_goal_command_failure(
-    outbound: &RpcOutbound,
+    issuer: &GoalCommandIssuer,
     session_id: &str,
     error: anyhow::Error,
 ) -> anyhow::Error {
     match publish_goal_update(
-        outbound,
+        issuer,
         crate::rpc::types::SessionGoalUpdate::CommandFailed {
             session_id: session_id.to_owned(),
         },
@@ -171,6 +183,17 @@ async fn report_goal_command_failure(
 impl RpcGoalCommandSubmission {
     pub(super) fn response(&self) -> &GoalResponse {
         &self.response
+    }
+
+    pub(super) async fn send_issuer_result(
+        &self,
+        id: serde_json::Value,
+        value: serde_json::Value,
+    ) -> bool {
+        self.issuer
+            .authorization
+            .send_goal_command_result(self.issuer.generation, &self.response, id, value)
+            .await
     }
 
     /// Launch only after the response is in the shared outbound queue. The
@@ -221,7 +244,7 @@ impl RpcGoalPostResponse {
             supervisor,
             settings_source,
             admission,
-            outbound,
+            issuer,
             ..
         } = self;
         let (mut submission, publish_initial) = match admission {
@@ -230,8 +253,13 @@ impl RpcGoalPostResponse {
                 let ready = match deferred.wait().await {
                     Ok(ready) => ready,
                     Err(closed) => {
-                        publish_goal_lifecycle(&outbound, &session_id, closed.response()).await?;
-                        return Err(closed.into());
+                        let delivery =
+                            publish_goal_lifecycle(&issuer, &session_id, closed.response()).await;
+                        let error = anyhow::Error::from(closed);
+                        return Err(match delivery {
+                            Ok(()) => error,
+                            Err(delivery) => error.context(delivery),
+                        });
                     }
                 };
                 let ready = ready.with_abandon_reason(GoalControlAbandonReason::ControlDropped);
@@ -247,18 +275,14 @@ impl RpcGoalPostResponse {
                 ) {
                     Ok(settings) => settings,
                     Err(error) => {
-                        return Err(
-                            report_goal_command_failure(&outbound, &session_id, error).await
-                        );
+                        return Err(report_goal_command_failure(&issuer, &session_id, error).await);
                     }
                 };
                 let commit = match ready.commit(&settings).await {
                     Ok(commit) => commit,
                     Err(error) if error.is::<GoalLaunchFailureReported>() => return Err(error),
                     Err(error) => {
-                        return Err(
-                            report_goal_command_failure(&outbound, &session_id, error).await
-                        );
+                        return Err(report_goal_command_failure(&issuer, &session_id, error).await);
                     }
                 };
                 let before_release = matches!(
@@ -267,7 +291,7 @@ impl RpcGoalPostResponse {
                 );
                 if before_release {
                     let delivery =
-                        publish_goal_lifecycle(&outbound, &session_id, commit.response()).await;
+                        publish_goal_lifecycle(&issuer, &session_id, commit.response()).await;
                     let mut submission = commit.release();
                     if let Err(error) = delivery {
                         supervisor
@@ -294,14 +318,14 @@ impl RpcGoalPostResponse {
             Ok(response) => response,
             Err(error) if error.is::<GoalLaunchFailureReported>() => return Err(error),
             Err(error) => {
-                return Err(report_goal_command_failure(&outbound, &session_id, error).await);
+                return Err(report_goal_command_failure(&issuer, &session_id, error).await);
             }
         };
         if let Some(response) = late_response
             .as_ref()
             .or_else(|| publish_initial.then_some(&initial_response))
         {
-            publish_goal_lifecycle(&outbound, &session_id, response).await?;
+            publish_goal_lifecycle(&issuer, &session_id, response).await?;
         }
         Ok(())
     }
@@ -337,7 +361,6 @@ pub struct ZeroCodeGoalSessionDriver {
     context: Arc<RpcContext>,
     control_plane: Option<ControlPlaneHandle>,
     authorization: Arc<super::dispatch::GoalSessionAuthorization>,
-    outbound: Arc<RpcOutbound>,
     // Held until launch transfers it into the worker future.
     connection_activity: std::sync::Mutex<Option<crate::rpc::ConnectionActivity>>,
     // Once launch has selected its presentation path, a later failure must never reattach the issuer.
@@ -361,7 +384,6 @@ impl ZeroCodeGoalSessionDriver {
     /// Capture the live session facts that command text cannot control.
     pub(super) async fn new(
         context: Arc<RpcContext>,
-        outbound: Arc<RpcOutbound>,
         connection_activity: Option<crate::rpc::ConnectionActivity>,
         session_id: String,
         tui_id: String,
@@ -391,7 +413,6 @@ impl ZeroCodeGoalSessionDriver {
             context,
             control_plane,
             authorization: Arc::new(authorization),
-            outbound,
             connection_activity: std::sync::Mutex::new(connection_activity),
             launch_attach_reached: AtomicBool::new(false),
             session_key,
@@ -1568,9 +1589,14 @@ impl RpcGoalRuntime {
         command: GoalCommand,
     ) -> Result<RpcGoalCommandSubmission> {
         let config = context.config.read().clone();
+        let issuer = GoalCommandIssuer {
+            authorization: Arc::clone(&driver.authorization),
+            generation: driver.session_generation,
+        };
         if !config.goal.enabled {
             return Ok(RpcGoalCommandSubmission {
                 response: GoalResponse::Disabled,
+                issuer,
                 post_response: None,
             });
         }
@@ -1586,7 +1612,6 @@ impl RpcGoalRuntime {
             control_plane.boot_id.clone(),
         )?;
         let session_id = driver.raw_session_id().to_owned();
-        let outbound = Arc::clone(&driver.outbound);
         let ingress = GoalIngressContext::trusted(
             driver.session_key().clone(),
             driver.agent_alias().to_owned(),
@@ -1682,6 +1707,7 @@ impl RpcGoalRuntime {
         };
         Ok(RpcGoalCommandSubmission {
             response,
+            issuer: issuer.clone(),
             post_response: Some(RpcGoalPostResponse {
                 runtime: Arc::clone(self),
                 context,
@@ -1690,7 +1716,7 @@ impl RpcGoalRuntime {
                 supervisor,
                 settings_source,
                 admission,
-                outbound,
+                issuer,
             }),
         })
     }

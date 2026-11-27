@@ -155,13 +155,13 @@ enum GoalDestinationInstall {
 /// Weak recipient registrations shared by one connection and its handles.
 #[derive(Default)]
 pub(super) struct GoalDestinationRegistry {
-    closed: bool,
+    retired: tokio_util::sync::CancellationToken,
     recipients: Vec<Weak<GoalRecipient>>,
 }
 
 impl GoalDestinationRegistry {
     pub(super) fn register(&mut self, recipient: &Arc<GoalRecipient>) -> bool {
-        if self.closed {
+        if self.is_closed() {
             return false;
         }
         self.recipients
@@ -178,8 +178,16 @@ impl GoalDestinationRegistry {
     }
 
     pub(super) fn retire(&mut self) -> Vec<Weak<GoalRecipient>> {
-        self.closed = true;
+        self.retired.cancel();
         std::mem::take(&mut self.recipients)
+    }
+
+    pub(super) fn is_closed(&self) -> bool {
+        self.retired.is_cancelled()
+    }
+
+    pub(super) fn retired(&self) -> tokio_util::sync::CancellationToken {
+        self.retired.clone()
     }
 
     #[cfg(test)]
@@ -189,7 +197,7 @@ impl GoalDestinationRegistry {
 
     #[cfg(test)]
     pub(super) fn is_closed_for_test(&self) -> bool {
-        self.closed
+        self.is_closed()
     }
 }
 
@@ -406,6 +414,8 @@ pub struct RpcSession {
     pub chat_mode: crate::rpc::types::ChatMode,
     pub interaction_surface: Option<crate::agent::prompt::InteractionSurface>,
     owner_binding: SessionOwnerBinding,
+    // The latest accepted RPC handoff may still be waiting to install its route.
+    approval_rebind: Option<ApprovalRebindTicket>,
     /// Monotonic generation counter stamped by `SessionStore::insert`.
     /// Provider-refresh callers capture this before building a provider box
     /// and pass it to `SessionStore::apply_model_provider` so stale work
@@ -472,7 +482,12 @@ pub struct ResumedRpcSession {
     pub agent_alias: String,
     pub workspace_dir: String,
     pub message_count: usize,
+    pub(super) approval_rebind: Option<ApprovalRebindTicket>,
 }
+
+/// Process-local identity of an accepted approval-channel handoff.
+#[derive(Clone)]
+pub(super) struct ApprovalRebindTicket(Arc<()>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResumeExistingError {
@@ -568,6 +583,12 @@ impl Drop for GoalLifecycleFence {
 }
 
 impl RpcSession {
+    pub(super) fn has_approval_rebind(&self, expected: &ApprovalRebindTicket) -> bool {
+        self.approval_rebind
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.0, &expected.0))
+    }
+
     pub(crate) fn retained_environment(&self) -> Option<&crate::tools::ForwardedEnvironment> {
         self.forwarded_environment.as_ref()
     }
@@ -596,6 +617,7 @@ impl RpcSession {
             chat_mode,
             interaction_surface: None,
             owner_binding: SessionOwnerBinding::default(),
+            approval_rebind: None,
             generation: 0,
             pending_generation: None,
             owner_principal_id: None,
@@ -1205,6 +1227,7 @@ impl SessionStore {
                 owner_tui_id,
                 None,
                 expected_access,
+                false,
                 |_, _, _, _| Ok::<(), std::convert::Infallible>(()),
             )
             .await?;
@@ -1234,6 +1257,9 @@ impl SessionStore {
     /// the caller may still run it. Receiving the owner lets a caller that
     /// resolves its authority inside `authorize` judge ownership by that same
     /// resolution, not only by an `expected_owner` computed before the lock.
+    ///
+    /// An accepted resume taking responsibility for the RPC approval channel
+    /// claims a new ticket here, even if the steering owner is unchanged.
     pub(crate) async fn resume_existing_authorized<E, G>(
         &self,
         id: &str,
@@ -1243,6 +1269,7 @@ impl SessionStore {
         owner_tui_id: Option<String>,
         expected_principal: Option<&str>,
         expected_access: Option<(u64, Option<&str>)>,
+        rebind_approval: bool,
         authorize: impl FnOnce(
             &str,
             &str,
@@ -1299,6 +1326,10 @@ impl SessionStore {
         if owner_tui_id.is_some() {
             session.owner_binding.rebind(owner_tui_id);
         }
+        let approval_rebind = rebind_approval.then(|| ApprovalRebindTicket(Arc::new(())));
+        if let Some(ticket) = &approval_rebind {
+            session.approval_rebind = Some(ticket.clone());
+        }
         session.last_active = Instant::now();
         let message_count = session
             .agent
@@ -1311,6 +1342,7 @@ impl SessionStore {
             agent_alias: session.agent_alias.clone(),
             workspace_dir: session.workspace_dir.clone(),
             message_count,
+            approval_rebind,
         })))
     }
 
@@ -1792,29 +1824,30 @@ impl SessionStore {
                     {
                         return None;
                     }
-                    let outcome = match (permit, authority.as_ref()) {
-                        (Some(permit), Ok(_)) => {
-                            permit.send(std::mem::take(&mut frame));
-                            GoalFrameDelivery::Delivered
+                    let sent = permit.filter(|_| authority.is_ok()).is_some_and(|permit| {
+                        target
+                            .with_live_tui_registration(|| permit.send(std::mem::take(&mut frame)))
+                            .is_some()
+                    });
+                    let outcome = if sent {
+                        GoalFrameDelivery::Delivered
+                    } else {
+                        if let Err(error) = &authority {
+                            ::zeroclaw_log::record!(
+                                DEBUG,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Reject
+                                )
+                                .with_category(::zeroclaw_log::EventCategory::Session)
+                                .with_attrs(
+                                    serde_json::json!({"session_id":id, "code":error.code})
+                                ),
+                                "Goal frame recipient is no longer available"
+                            );
                         }
-                        _ => {
-                            if let Err(error) = &authority {
-                                ::zeroclaw_log::record!(
-                                    DEBUG,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Reject
-                                    )
-                                    .with_category(::zeroclaw_log::EventCategory::Session)
-                                    .with_attrs(
-                                        serde_json::json!({"session_id":id, "code":error.code})
-                                    ),
-                                    "Goal frame recipient is no longer available"
-                                );
-                            }
-                            state.replace_target(None);
-                            GoalFrameDelivery::NotDelivered
-                        }
+                        state.replace_target(None);
+                        GoalFrameDelivery::NotDelivered
                     };
                     state.finish_frame(class);
                     recipient.changed.notify_waiters();
@@ -3570,6 +3603,69 @@ mod tests {
 
     fn make_store(max: usize) -> SessionStore {
         SessionStore::new(max, Arc::new(SessionActorQueue::new(4, 10, 60)))
+    }
+
+    #[tokio::test]
+    async fn approval_rebind_claim_changes_only_on_accepted_rpc_handoffs() {
+        use crate::rpc::types::ChatMode;
+
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "test", ".", ChatMode::Chat)
+                    .with_owner(Some("same-tui".into())),
+            )
+            .await
+            .unwrap();
+        let resume = |rebind_approval, authorized| {
+            store.resume_existing_authorized(
+                "s",
+                "test",
+                &ChatMode::Chat,
+                None,
+                Some("same-tui".into()),
+                None,
+                None,
+                rebind_approval,
+                move |_, _, _, _| {
+                    if authorized { Ok(()) } else { Err("refused") }
+                },
+            )
+        };
+        let first = resume(true, true).await.unwrap().unwrap().unwrap();
+        let first_ticket = first.approval_rebind.unwrap();
+        let steering = store
+            .with_session_effect("s", |session| {
+                session.unwrap().owner_binding.revoked.clone()
+            })
+            .await;
+        assert!(matches!(
+            resume(true, false).await,
+            Ok(Some(Err("refused")))
+        ));
+        let non_rpc = resume(false, true).await.unwrap().unwrap().unwrap();
+        assert!(non_rpc.approval_rebind.is_none());
+        store
+            .with_session_effect("s", |session| {
+                assert!(session.unwrap().has_approval_rebind(&first_ticket));
+            })
+            .await;
+
+        let second = resume(true, true).await.unwrap().unwrap().unwrap();
+        assert_eq!(first.generation, second.generation);
+        let second_ticket = second.approval_rebind.unwrap();
+        store
+            .with_session_effect("s", |session| {
+                let session = session.unwrap();
+                assert!(!session.has_approval_rebind(&first_ticket));
+                assert!(session.has_approval_rebind(&second_ticket));
+                assert!(
+                    !steering.is_cancelled(),
+                    "same-TUI handoff changes approval custody, not steering ownership"
+                );
+            })
+            .await;
     }
 
     #[tokio::test]

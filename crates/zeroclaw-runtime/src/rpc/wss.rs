@@ -5516,6 +5516,9 @@ mod accept_error_tests {
 }
 
 #[cfg(test)]
+mod goal_approval_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::rpc::dispatch::{
