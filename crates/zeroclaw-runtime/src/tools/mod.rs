@@ -4,7 +4,6 @@ pub mod attribution;
 #[cfg(any(
     feature = "tool-claude-code",
     feature = "tool-codex-cli",
-    feature = "tool-gemini-cli",
     feature = "tool-opencode-cli"
 ))]
 pub(crate) mod coding_cli_executor;
@@ -85,8 +84,6 @@ pub use zeroclaw_tools::file_edit::FileEditTool;
 pub use zeroclaw_tools::file_upload::FileUploadTool;
 pub use zeroclaw_tools::file_upload_bundle::FileUploadBundleTool;
 pub use zeroclaw_tools::file_write::FileWriteTool;
-#[cfg(feature = "tool-gemini-cli")]
-pub use zeroclaw_tools::gemini_cli::GeminiCliTool;
 pub use zeroclaw_tools::git_forge::GitForgeTool;
 pub use zeroclaw_tools::git_operations::{GitCommandBoundary, GitOperationsTool};
 pub use zeroclaw_tools::glob_search::GlobSearchTool;
@@ -296,7 +293,6 @@ fn serply_api_key_override(root_config: &Config) -> Option<Option<String>> {
 fn any_coding_cli_tool_enabled(root_config: &Config) -> bool {
     (cfg!(feature = "tool-claude-code") && root_config.claude_code.enabled)
         || (cfg!(feature = "tool-codex-cli") && root_config.codex_cli.enabled)
-        || (cfg!(feature = "tool-gemini-cli") && root_config.gemini_cli.enabled)
         || (cfg!(feature = "tool-opencode-cli") && root_config.opencode_cli.enabled)
 }
 
@@ -324,7 +320,6 @@ pub fn composio_tool_available(config: &Config) -> bool {
     feature = "tool-claude-code",
     feature = "tool-claude-code-runner",
     feature = "tool-codex-cli",
-    feature = "tool-gemini-cli",
     feature = "tool-opencode-cli",
     feature = "tools-external"
 )))]
@@ -2347,7 +2342,6 @@ fn all_tools_with_runtime_on_thread(
     #[cfg(any(
         feature = "tool-claude-code",
         feature = "tool-codex-cli",
-        feature = "tool-gemini-cli",
         feature = "tool-opencode-cli"
     ))]
     let coding_cli_executor = coding_cli_executor::RuntimeCodingCliExecutor::shared(
@@ -3250,27 +3244,6 @@ fn all_tools_with_runtime_on_thread(
                 CodexCliTool::new_with_executor(
                     security.clone(),
                     root_config.codex_cli.clone(),
-                    coding_cli_executor.clone(),
-                ),
-                security.clone(),
-            ))
-        );
-    }
-
-    // Gemini CLI delegation tool
-    #[cfg(not(feature = "tool-gemini-cli"))]
-    warn_tool_compiled_out(
-        root_config,
-        zeroclaw_config::opt_in_tools::OptInTool::GeminiCli,
-    );
-    #[cfg(feature = "tool-gemini-cli")]
-    if root_config.gemini_cli.enabled && register_coding_cli_tools && select_tool!("gemini_cli") {
-        register_tool!(
-            "gemini_cli",
-            Arc::new(RateLimitedTool::new(
-                GeminiCliTool::new_with_executor(
-                    security.clone(),
-                    root_config.gemini_cli.clone(),
                     coding_cli_executor.clone(),
                 ),
                 security.clone(),
@@ -6226,7 +6199,6 @@ permissions = ["http_client"]
     #[cfg(all(
         feature = "tool-claude-code",
         feature = "tool-codex-cli",
-        feature = "tool-gemini-cli",
         feature = "tool-opencode-cli"
     ))]
     struct CapturingRuntime {
@@ -6237,7 +6209,6 @@ permissions = ["http_client"]
     #[cfg(all(
         feature = "tool-claude-code",
         feature = "tool-codex-cli",
-        feature = "tool-gemini-cli",
         feature = "tool-opencode-cli"
     ))]
     impl RuntimeAdapter for CapturingRuntime {
@@ -6283,14 +6254,13 @@ permissions = ["http_client"]
     #[cfg(all(
         feature = "tool-claude-code",
         feature = "tool-codex-cli",
-        feature = "tool-gemini-cli",
         feature = "tool-opencode-cli"
     ))]
     #[tokio::test]
     async fn registered_coding_cli_tools_use_configured_runtime_executor() {
         type EnableCodingCli = fn(&mut Config);
 
-        let cases: [(&str, &str, EnableCodingCli); 4] = [
+        let cases: [(&str, &str, EnableCodingCli); 3] = [
             ("claude_code", "claude -p", |cfg: &mut Config| {
                 cfg.claude_code.enabled = true;
                 cfg.claude_code.timeout_secs = 5;
@@ -6298,10 +6268,6 @@ permissions = ["http_client"]
             ("codex_cli", "codex exec", |cfg: &mut Config| {
                 cfg.codex_cli.enabled = true;
                 cfg.codex_cli.timeout_secs = 5;
-            }),
-            ("gemini_cli", "gemini -p", |cfg: &mut Config| {
-                cfg.gemini_cli.enabled = true;
-                cfg.gemini_cli.timeout_secs = 5;
             }),
             ("opencode_cli", "opencode run", |cfg: &mut Config| {
                 cfg.opencode_cli.enabled = true;
@@ -6330,7 +6296,6 @@ permissions = ["http_client"]
             cfg.runtime.kind = zeroclaw_config::schema::RuntimeKind::Docker;
             cfg.claude_code.enabled = false;
             cfg.codex_cli.enabled = false;
-            cfg.gemini_cli.enabled = false;
             cfg.opencode_cli.enabled = false;
             enable(&mut cfg);
             let risk = zeroclaw_config::schema::RiskProfileConfig {
@@ -6403,7 +6368,6 @@ permissions = ["http_client"]
     #[cfg(all(
         feature = "tool-claude-code",
         feature = "tool-codex-cli",
-        feature = "tool-gemini-cli",
         feature = "tool-opencode-cli"
     ))]
     #[tokio::test]
@@ -6429,7 +6393,6 @@ permissions = ["http_client"]
         cfg.runtime.docker.mount_workspace = false;
         cfg.claude_code.enabled = true;
         cfg.codex_cli.enabled = true;
-        cfg.gemini_cli.enabled = true;
         cfg.opencode_cli.enabled = true;
         let risk = zeroclaw_config::schema::RiskProfileConfig {
             sandbox_enabled: Some(false),
@@ -6466,7 +6429,7 @@ permissions = ["http_client"]
         .tools;
         let names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
 
-        for tool_name in ["claude_code", "codex_cli", "gemini_cli", "opencode_cli"] {
+        for tool_name in ["claude_code", "codex_cli", "opencode_cli"] {
             assert!(
                 !names.contains(&tool_name),
                 "{tool_name} must not register without runtime filesystem access"
@@ -8486,7 +8449,6 @@ permissions = ["http_client"]
         cfg.google_workspace.enabled = true;
         cfg.claude_code.enabled = true;
         cfg.codex_cli.enabled = true;
-        cfg.gemini_cli.enabled = true;
         cfg.opencode_cli.enabled = true;
         cfg.claude_code_runner.enabled = true;
         cfg.linkedin.enabled = true;
