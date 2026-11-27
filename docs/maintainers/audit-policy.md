@@ -35,7 +35,7 @@ tool blocks the PR. What actually fails each tool differs by category:
 - **`cargo audit`** (bare, no `--deny warnings`): vulnerability
   advisories are errors (exit 1); informational and unmaintained
   advisories are reported as allowed warnings and exit 0.
-- **`cargo deny check advisories`**: vulnerability *and* unmaintained advisories for crates in the resolved graph are errors (exit 1). That is why the live unmaintained exceptions for `rustls-pemfile`, `anymap2`, `pin-utils`, `chrono` and `chrono-tz` remain in `deny.toml`. A stale graph-ignore instead emits `advisory-not-detected`, which is a warning (exit 0); it is never triggered by removing an entry from `.cargo/audit.toml`.
+- **`cargo deny check advisories`**: vulnerability *and* unmaintained advisories for crates in the resolved graph are errors (exit 1). That is why the live unmaintained exceptions for `rustls-pemfile`, `pin-utils`, `chrono` and `chrono-tz` remain in `deny.toml`. A stale graph-ignore instead emits `advisory-not-detected`, which is a warning (exit 0); it is never triggered by removing an entry from `.cargo/audit.toml`.
 
 An audit-only ignore is needed by `cargo audit` but not by `cargo deny`
 under its configured graph. That describes tool scope, not advisory
@@ -129,7 +129,6 @@ any more, so the visible `bitmaps` unsoundness warning
 
 Live, deny-only:
 
-- **`anymap2` (`RUSTSEC-2026-0319`)**: unmaintained; `matrix-sdk 0.19.1` still depends on it, with no replacement SDK release available. The advisory recommends `anymap3`. Only `deny.toml` needs an exception because the configured `cargo audit` invocation treats this maintenance advisory as an allowed warning. Remove the exception once the resolved dependency graph no longer includes an affected `anymap2`. Tracking #11429.
 - **`pin-utils` (`RUSTSEC-2026-0441`)**: unmaintained; its only path is `async-imap` 0.11.3, used by `zeroclaw-channels` and `zeroclaw-tools`, and the latest release, `async-imap` 0.12.0, still depends on it, so no upgrade removes it today. Only `deny.toml` needs an exception because the configured `cargo audit` invocation treats this maintenance advisory as an allowed warning. Remove the exception once the resolved dependency graph no longer includes `pin-utils`, through an `async-imap` release without it or a move off `async-imap`. Tracking #12252.
 - **`chrono` (`RUSTSEC-2026-0543`)**: unmaintained; all versions are affected and the advisory lists no patched release, so no version satisfies `cargo deny`. `chrono` 0.4.45 is a direct dependency of 11 workspace crates and also comes in through `async-imap` 0.11.3, `cron` 0.15.0, `oauth2` 5.0.0 and `chrono-tz`. The advisory recommends `jiff` or `time`. Only `deny.toml` needs an exception because the configured `cargo audit` invocation treats this maintenance advisory as an allowed warning. This is a temporary waiver, not a fix: remove it when the replacement lands. Where a third-party crate still brings `chrono` in after the workspace moves off it, the exception stays until that path is gone too. Tracking #12505.
 - **`chrono-tz` (`RUSTSEC-2026-0555`)**: unmaintained; all versions are affected and the advisory lists no patched release. `chrono-tz` 0.10.4 is used only by `zeroclaw-runtime`. Only `deny.toml` needs an exception, for the same reason as `chrono`. Remove it with the `chrono` exception, when the replacement lands. Tracking #12505.
@@ -224,7 +223,7 @@ unaffected by the advisory):
   `RUSTSEC-2026-0247`, `RUSTSEC-2026-0292`, and the separate visible
   `RUSTSEC-2025-0167` warning are all gone, and the waiver text is out of
   both tool files and this document.
-- **#11429**: *Remove the `anymap2` maintenance exception after Matrix migrates.* The RUSTSEC-2026-0319 exception is present only in `deny.toml`. Keep this issue open until the Matrix dependency update removes the affected crate from the resolved graph, then remove the exception and update this inventory.
+- **#11429**: *Remove the `anymap2` maintenance exception after Matrix migrates.* Matrix SDK 0.20.0 removes `anymap2` from the locked graph, so #12322 removes the obsolete `RUSTSEC-2026-0319` exception from `deny.toml`. Close the tracking issue after that change merges.
 - **#12252**: *Accept the `pin-utils` maintenance advisory (RUSTSEC-2026-0441) until `async-imap` moves off it.* The RUSTSEC-2026-0441 exception is present only in `deny.toml`. Keep this issue open until the email dependency update removes `pin-utils` from the resolved graph, then remove the exception and update this inventory.
 - **#12320**: *Security job fails on every build: RUSTSEC-2026-0459.* Owns
   the bundled SQLite advisory. The patched graph uses `rusqlite` 0.41.1
@@ -268,8 +267,10 @@ two tools have drifted again. Open or update the tracking issue.
 
 - Pending merge (#12322): remove `RUSTSEC-2026-0459` from both tool files
   with the patched SQLite 3.54.1 upgrade and published Matrix SDK 0.20.0.
-  The temporary Matrix vendor directory and path patch are removed. Record
-  the merge date here when this change lands.
+  The temporary Matrix vendor directory and path patch are removed. The
+  Matrix update also removes `anymap2` from `Cargo.lock`, so its obsolete
+  `RUSTSEC-2026-0319` deny-only exception is removed (#11429). Record the
+  merge date here when this change lands.
 - 2026-11-23: Updated `cookie` 0.18.1 to 0.18.3 and added `RUSTSEC-2026-0594`
   (`cookie` 0.16.2) to `.cargo/audit.toml` only, with its category 1 entry
   above.
