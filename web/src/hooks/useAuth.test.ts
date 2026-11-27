@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test, { afterEach, beforeEach } from "node:test";
-import { createElement } from "react";
+import React, { createElement } from "react";
 import { act, create, type ReactTestRenderer } from "react-test-renderer";
 import type { OidcSession } from "../lib/auth.ts";
 import type { AuthState } from "./useAuth.ts";
@@ -21,6 +21,7 @@ class MemoryStorage implements Storage {
 }
 
 const storage = new MemoryStorage();
+const tabStorage = new MemoryStorage();
 let reloads = 0;
 let assigned: string[] = [];
 let opened: string[] = [];
@@ -33,6 +34,7 @@ const fakeWindow = Object.assign(new EventTarget(), {
     port: "",
     pathname: "/agent/main",
     search: "",
+    hash: "",
     reload: () => {
       reloads += 1;
     },
@@ -43,6 +45,17 @@ const fakeWindow = Object.assign(new EventTarget(), {
   open: (url: string) => {
     opened.push(url);
     return popupBlocked ? null : {};
+  },
+});
+const replacedUrls: string[] = [];
+Object.assign(fakeWindow, {
+  history: {
+    state: { route: "test" },
+    replaceState(state: unknown, _title: string, url: string) {
+      assert.deepEqual(state, { route: "test" });
+      replacedUrls.push(url);
+      fakeWindow.location.hash = new URL(url, "https://zc.example").hash;
+    },
   },
 });
 const fakeDocument = Object.assign(new EventTarget(), { visibilityState: "visible" });
@@ -73,6 +86,7 @@ Object.assign(globalThis, {
   window: fakeWindow,
   document: fakeDocument,
   localStorage: storage,
+  sessionStorage: tabStorage,
   WebSocket: FakeWebSocket,
 });
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT =
@@ -86,6 +100,9 @@ interface Recorded {
 let requests: Recorded[] = [];
 let health = { require_pairing: true, paired: true };
 let providers: string[] = [];
+let viaRelay = false;
+// How `/api/auth/methods` fails, when a test makes it fail.
+let methodsFailure: null | "network" | number = null;
 let sessionResponse: () => Response = () => new Response("", { status: 401 });
 // Paths whose next request meets a gateway generation that is stopping for a reload.
 let restartingOnce = new Set<string>();
@@ -110,9 +127,12 @@ globalThis.fetch = async (input, init) => {
   }
   if (url.endsWith("/health")) return json(200, health);
   if (url.endsWith("/api/auth/methods")) {
+    if (methodsFailure === "network") throw new TypeError("Failed to fetch");
+    if (methodsFailure !== null) return json(methodsFailure, { error: "unavailable" });
     return json(200, {
       pairing_required: true,
       oidc: providers.map((alias) => ({ alias, provider: `oidc.${alias}` })),
+      ...(viaRelay ? { via_relay: true } : {}),
     });
   }
   if (url.endsWith("/api/auth/session")) return sessionResponse();
@@ -123,8 +143,12 @@ globalThis.fetch = async (input, init) => {
   return json(404, {});
 };
 
+// The jiti CLI compiles JSX with the classic runtime, which needs React in scope.
+Object.assign(globalThis, { React });
+
 const auth = await import("../lib/auth.ts");
 const { AuthProvider, useAuth } = await import("./useAuth.ts");
+const { SignInScreen } = await import("../components/auth/SignInScreen.tsx");
 const { WebSocketClient } = await import("../lib/ws.ts");
 const api = await import("../lib/api.ts");
 
@@ -162,6 +186,56 @@ async function mount(): Promise<void> {
   await act(settle);
 }
 
+/** The provider with what App shows a browser that isn't signed in. */
+function Screen() {
+  const s = useAuth();
+  latest = s;
+  if (s.loading || s.isAuthenticated || !s.requiresPairing) return null;
+  return createElement(SignInScreen, {
+    onPair: s.pair,
+    providers: s.providers,
+    onSignIn: s.signIn,
+    notice: s.signOutNotice,
+    viaRelay: s.viaRelay,
+    methods: s.signInMethods,
+    onRetryMethods: s.retrySignInMethods,
+  });
+}
+
+async function mountScreen(): Promise<void> {
+  await act(async () => {
+    renderer = create(createElement(AuthProvider, null, createElement(Screen)));
+  });
+  await act(settle);
+}
+
+const rendered = (attr: string) =>
+  renderer?.root.findAll((node) => typeof node.type === "string" && node.props[attr] !== undefined)
+    .length ?? 0;
+const inputs = () => renderer?.root.findAll((node) => node.type === "input").length ?? 0;
+/** Requests that read or redeem a pairing code. */
+const pairingRequests = () =>
+  requests.filter((r) => /\/(api\/)?pair(\/|\?|$)/.test(new URL(r.url, "https://zc.example").pathname))
+    .length;
+
+async function retryMethods(): Promise<void> {
+  const button = renderer?.root.find(
+    (node) => typeof node.type === "string" && node.props["data-methods-retry"] !== undefined,
+  );
+  assert.ok(button, "a retry button");
+  await act(async () => {
+    button.props.onClick();
+  });
+  await act(settle);
+}
+
+async function unmount(): Promise<void> {
+  await act(async () => {
+    renderer?.unmount();
+  });
+  renderer = null;
+}
+
 async function fire(name: keyof typeof auth.AUTH_EVENTS): Promise<void> {
   await act(async () => {
     fakeWindow.dispatchEvent(new Event(auth.AUTH_EVENTS[name]));
@@ -180,6 +254,10 @@ async function broadcast(message: { type: string }): Promise<void> {
 beforeEach(() => {
   FakeWebSocket.instances = [];
   storage.clear();
+  tabStorage.clear();
+  replacedUrls.length = 0;
+  fakeWindow.location.hash = "";
+  fakeWindow.location.search = "";
   auth.setOidcSession(null);
   requests = [];
   reloads = 0;
@@ -188,6 +266,8 @@ beforeEach(() => {
   popupBlocked = false;
   health = { require_pairing: true, paired: true };
   providers = [];
+  viaRelay = false;
+  methodsFailure = null;
   sessionResponse = () => new Response("", { status: 401 });
   restartingOnce = new Set();
   routes = new Map();
@@ -205,6 +285,67 @@ afterEach(async () => {
 // Unchanged paths
 // ---------------------------------------------------------------------------
 
+test("a failed sign-in methods request shows no pairing form, and a retry shows the right screen", async () => {
+  // Whether pairing is allowed is in that answer: a relay-served page must
+  // not offer it, and without the answer the page can't tell.
+  for (const failure of ["network", 429, 500, 503] as const) {
+    methodsFailure = failure;
+    requests = [];
+    await mountScreen();
+    assert.equal(state().isAuthenticated, false, `${failure}`);
+    assert.equal(inputs(), 0, `${failure}: no pairing input`);
+    assert.equal(pairingRequests(), 0, `${failure}: no pairing request`);
+    assert.equal(rendered("data-methods-retry"), 1, `${failure}: a retry`);
+    // The retry is answered: through a relay, with a provider.
+    methodsFailure = null;
+    viaRelay = true;
+    providers = ["corp"];
+    await retryMethods();
+    assert.equal(inputs(), 0, `${failure}: still no pairing input`);
+    assert.equal(rendered("data-signin-provider"), 1, `${failure}: the provider`);
+    assert.equal(rendered("data-relay-notice"), 1, `${failure}: the relay notice`);
+    assert.equal(pairingRequests(), 0, `${failure}: still no pairing request`);
+    await unmount();
+    viaRelay = false;
+    providers = [];
+  }
+  // A retry answered directly, with sign-in off: the pairing form, which
+  // then asks for its code as it always has.
+  methodsFailure = 503;
+  requests = [];
+  await mountScreen();
+  assert.equal(inputs(), 0);
+  assert.equal(pairingRequests(), 0);
+  methodsFailure = null;
+  await retryMethods();
+  assert.equal(inputs(), 1, "the pairing form once the gateway says pairing is how to sign in");
+  assert.ok(pairingRequests() > 0, "the pairing form's own request, as a positive control");
+  await unmount();
+  // Answered first time: the pairing form, exactly as before.
+  await mountScreen();
+  assert.equal(inputs(), 1);
+  assert.equal(rendered("data-methods-retry"), 0);
+});
+
+test("a paired browser whose token is refused while the methods request fails shows no pairing form", async () => {
+  storage.setItem("zeroclaw_token", "tok");
+  await mountScreen();
+  assert.equal(state().isAuthenticated, true);
+  methodsFailure = 429;
+  requests = [];
+  await fire("unauthorized");
+  assert.equal(state().isAuthenticated, false);
+  assert.equal(inputs(), 0);
+  assert.equal(pairingRequests(), 0);
+  assert.equal(rendered("data-methods-retry"), 1);
+  methodsFailure = null;
+  viaRelay = true;
+  providers = ["corp"];
+  await retryMethods();
+  assert.equal(inputs(), 0);
+  assert.equal(rendered("data-signin-provider"), 1);
+});
+
 test("sign-in off: the pairing screen, no provider, no session lookup", async () => {
   await mount();
   const s = state();
@@ -217,12 +358,27 @@ test("sign-in off: the pairing screen, no provider, no session lookup", async ()
   assert.ok(!requests.some((r) => r.url.endsWith("/api/auth/session")));
 });
 
-test("a paired browser starts authenticated without asking the gateway", async () => {
+test("a paired browser starts authenticated, asking the gateway only whether a relay carries it", async () => {
   storage.setItem("zeroclaw_token", "tok");
   await mount();
   assert.equal(state().isAuthenticated, true);
   assert.equal(state().mode, "pairing");
-  assert.equal(requests.length, 0);
+  assert.equal(state().viaRelay, false);
+  assert.deepEqual(
+    requests.map((r) => r.url.replace(/^https?:\/\/[^/]+/, "")),
+    ["/api/auth/methods"],
+  );
+  const [methods] = requests;
+  assert.ok(methods);
+  assert.equal(methods.headers.get("Authorization"), null);
+});
+
+test("a paired browser that reloads through a relay keeps the relay notice", async () => {
+  storage.setItem("zeroclaw_token", "tok");
+  viaRelay = true;
+  await mount();
+  assert.equal(state().isAuthenticated, true);
+  assert.equal(state().viaRelay, true);
 });
 
 test("a paired browser whose token is refused offers the sign-in providers", async () => {
@@ -534,16 +690,150 @@ test("re-auth opens the provider's popup; a blocked popup can continue in the ta
   await act(async () => {
     state().continueReauthHere();
   });
-  assert.deepEqual(assigned, ["/auth/sign-in/corp?return=%2Fagent%2Fmain"]);
+  const start = new URL(assigned[0]!, "https://zc.example");
+  assert.equal(start.pathname, "/auth/sign-in/corp");
+  assert.equal(start.searchParams.get("return"), "/agent/main");
+  assert.match(start.searchParams.get("notice") ?? "", /^[a-f0-9-]{36}$/);
 });
 
-test("sign-in from the screen returns to the current page", async () => {
+test("a full-page sign-in tells other tabs once and restores the exact return URL", async () => {
   providers = ["corp"];
-  await mount();
-  await act(async () => {
-    state().signIn("corp");
-  });
-  assert.deepEqual(assigned, ["/auth/sign-in/corp?return=%2Fagent%2Fmain"]);
+  fakeWindow.location.search = "?sort=new";
+  fakeWindow.location.hash = "#turn";
+  await mountScreen();
+
+  const heard: unknown[] = [];
+  const otherTab = new BroadcastChannel("zeroclaw-auth");
+  otherTab.onmessage = (event: MessageEvent) => heard.push(event.data);
+  try {
+    await act(async () => { state().signIn("corp"); });
+    const start = new URL(assigned[0]!, "https://zc.example");
+    assert.equal(start.searchParams.get("return"), "/agent/main?sort=new#turn");
+    const notice = start.searchParams.get("notice");
+    assert.ok(notice);
+    await unmount();
+
+    // The successful gateway callback redirects to this location with its session cookie.
+    const completed = `#turn#zeroclaw-signed-in=${notice}`;
+    fakeWindow.location.hash = completed;
+    sessionResponse = () => json(200, session());
+    await mount();
+    assert.equal(state().isAuthenticated, true);
+    assert.deepEqual(heard, [{ type: "signed-in" }]);
+    assert.deepEqual(replacedUrls, ["/agent/main?sort=new#turn"]);
+
+    await unmount();
+    await mount();
+    assert.deepEqual(heard, [{ type: "signed-in" }]);
+
+    // Loading a bookmark of the completed callback also stays quiet.
+    await unmount();
+    fakeWindow.location.hash = completed;
+    await mount();
+    assert.deepEqual(heard, [{ type: "signed-in" }]);
+  } finally {
+    otherTab.close();
+  }
+});
+
+async function returnFromFullPageSignIn(): Promise<void> {
+  providers = ["corp"];
+  await mountScreen();
+  await act(async () => { state().signIn("corp"); });
+  const notice = new URL(assigned[0]!, "https://zc.example").searchParams.get("notice");
+  assert.ok(notice);
+  await unmount();
+  fakeWindow.location.hash += `#zeroclaw-signed-in=${notice}`;
+}
+
+test("a completed sign-in announces once when a reload recovers the cookie session", async () => {
+  await returnFromFullPageSignIn();
+  const heard: unknown[] = [];
+  const otherTab = new BroadcastChannel("zeroclaw-auth");
+  otherTab.onmessage = (event: MessageEvent) => heard.push(event.data);
+  try {
+    sessionResponse = () => json(503, { error: "unavailable" });
+    await mountScreen();
+    assert.equal(state().isAuthenticated, false);
+    assert.equal(rendered("data-signin-provider"), 1);
+    assert.deepEqual(heard, []);
+
+    await unmount();
+    sessionResponse = () => json(200, session());
+    await mountScreen();
+    assert.equal(state().isAuthenticated, true);
+    assert.deepEqual(heard, [{ type: "signed-in" }]);
+    assert.deepEqual(replacedUrls, ["/agent/main"]);
+
+    await unmount();
+    await mountScreen();
+    assert.deepEqual(heard, [{ type: "signed-in" }]);
+  } finally {
+    otherTab.close();
+  }
+});
+
+test("a sign-out cancels a completion notice waiting for the gateway", async () => {
+  await returnFromFullPageSignIn();
+  sessionResponse = () => json(503, { error: "unavailable" });
+  await mountScreen();
+  await broadcast({ type: "signed-out" });
+  await unmount();
+
+  const heard: unknown[] = [];
+  const otherTab = new BroadcastChannel("zeroclaw-auth");
+  otherTab.onmessage = (event: MessageEvent) => heard.push(event.data);
+  try {
+    sessionResponse = () => json(200, session({ display_name: "Later session" }));
+    await mountScreen();
+    assert.equal(state().session?.display_name, "Later session");
+    assert.deepEqual(heard, []);
+  } finally {
+    otherTab.close();
+  }
+});
+
+test("starting sign-in again after a failed check returns to the original fragment", async () => {
+  fakeWindow.location.hash = "#turn";
+  await returnFromFullPageSignIn();
+  sessionResponse = () => json(503, { error: "unavailable" });
+  await mountScreen();
+
+  await act(async () => { state().signIn("corp"); });
+  const next = new URL(assigned[1]!, "https://zc.example");
+  assert.equal(next.searchParams.get("return"), "/agent/main#turn");
+  // An unrelated session event during navigation must not discard the new attempt.
+  await broadcast({ type: "signed-out" });
+  await unmount();
+  fakeWindow.location.hash = `#turn#zeroclaw-signed-in=${next.searchParams.get("notice")}`;
+  sessionResponse = () => json(200, session());
+  await mountScreen();
+  assert.equal(fakeWindow.location.hash, "#turn");
+});
+
+test("returning from an abandoned sign-in ignores a lookalike fragment", async () => {
+  await mountSignedIn();
+  const heard: unknown[] = [];
+  const otherTab = new BroadcastChannel("zeroclaw-auth");
+  otherTab.onmessage = (event: MessageEvent) => heard.push(event.data);
+  try {
+    await act(async () => { state().continueReauthHere(); });
+    const notice = new URL(assigned[0]!, "https://zc.example").searchParams.get("notice");
+    assert.ok(notice);
+    await unmount();
+    fakeWindow.location.hash = "#zeroclaw-signed-in=some-other-attempt";
+    await mount();
+    assert.equal(state().isAuthenticated, true);
+    assert.deepEqual(heard, []);
+    assert.deepEqual(replacedUrls, []);
+
+    await unmount();
+    fakeWindow.location.hash = `#zeroclaw-signed-in=${notice}`;
+    await mount();
+    assert.deepEqual(heard, []);
+  } finally {
+    otherTab.close();
+  }
 });
 
 // ---------------------------------------------------------------------------

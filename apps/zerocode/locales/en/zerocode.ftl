@@ -47,6 +47,7 @@ zc-app-help-filter-label = Filter
 zc-app-help-filter-placeholder = type a key or action…
 zc-app-help-no-matches = No matching keybindings
 zc-config-filter-sections = Filter sections
+zc-config-refused = This account can't read the daemon's config: { $reason }
 zc-config-filter-list = Filter list
 zc-config-filter-options = Filter options
 zc-config-filter-no-matches = No matches
@@ -223,6 +224,7 @@ zc-logs-preview-only = Full payload unavailable — showing preview fields only.
 zc-logs-persisted-path = Persisted log: { $path }
 zc-logs-no-event-selected = No event selected
 zc-logs-loading = Loading…
+zc-logs-refused = This account can't read the daemon's log: { $reason }
 zc-logs-search-action-apply = apply
 zc-logs-search-action-cancel = cancel
 zc-logs-run-filter-label = run
@@ -545,6 +547,16 @@ zc-chat-resume-dropped = { $count } prior session(s) could not be re-attached an
 zc-chat-reconnect-interrupted = The connection was rebuilt and queued messages were preserved. Waiting for the prior turn to stop before reloading the durable transcript.
 zc-chat-resyncing = Some live updates were missed. Reloading this session before sending queued messages…
 zc-chat-resynced = Live updates were missed, so the durable transcript was reloaded. Any in-progress approval or question was cancelled.
+zc-chat-refresh-started = Refreshing this session...
+zc-chat-refresh-busy = This session is busy. Nothing was cancelled. Refresh again when the turn finishes.
+zc-chat-refresh-recovery-required = This session needs recovery before it can be refreshed. Your view was kept.
+zc-chat-refresh-stale = Session activity changed during refresh. Your view was kept; refresh again.
+zc-chat-refresh-failed = Session refresh failed: { $error }. Your view was kept; refresh again to retry.
+zc-chat-refresh-timeout = the session read timed out
+zc-chat-refresh-incomplete = the daemon returned an incomplete transcript
+zc-chat-refresh-anchor = the selected content or reading position is no longer in the durable transcript
+zc-chat-refreshed = Session refreshed. Local draft and queued messages were kept.
+zc-chat-help-refresh-session = Refresh this session without cancelling a turn
 zc-chat-resynced-turn-running = Live updates were missed. The in-progress turn is still running; output shown above was kept, and the durable transcript will be reloaded when the turn finishes.
 zc-chat-resynced-turn-finished = The in-progress turn finished, so the durable transcript was reloaded once more.
 zc-chat-resync-failed = Live updates were missed and the session could not be reloaded: { $error }
@@ -624,6 +636,9 @@ zc-chat-approval-action-edit = Edit
 zc-chat-clipboard-you = You: { $text }
 zc-chat-clipboard-agent = Agent: { $text }
 zc-chat-copied-clipboard = Copied to clipboard
+zc-clipboard-requested = Copy requested through terminal; delivery is unconfirmed
+zc-clipboard-requested-label = [Requested]
+zc-clipboard-copy-failed = Could not copy: { $error }
 zc-chat-copy-message = [Copy]
 zc-chat-copy-message-copied = [Copied]
 zc-chat-context-menu-copy = Copy
@@ -900,3 +915,28 @@ zc-config-setup-required-missing = missing
 zc-config-setup-no-filter-matches = No matches. Clear filter.
 
 zc-chat-tool-question = question
+
+# URL-scoped remote OIDC login
+zc-login-invalid-target = Expected a WSS URL without credentials, query, or fragment, or a hostname (default port 9781).
+zc-login-invalid-provider = Expected an OIDC alias of 1–64 letters, digits, underscores or hyphens, starting with a letter or digit.
+zc-login-tls-aborted = Login aborted: unverified TLS was not accepted. No login was saved.
+zc-login-connect-timeout = The remote connection did not complete within 30 seconds.
+zc-login-untrusted = Certificate verification failed for { $url }. Provide --tls-ca-cert to verify it, or explicitly accept an unverified connection below.
+zc-login-rejected = The daemon did not accept this OIDC login; the previous saved login was not replaced.
+zc-login-saved = Signed in to { $url }. Saved the login in { $path }. Run zerocode to connect; no auth token flags are needed.
+zc-login-env-shadow = ZEROCLAW_AUTH_TOKEN is set and will override this saved login. Unset it to use the saved token.
+zc-login-expired = Your saved OIDC login needs renewal. Sign in again to continue; the replacement credentials will be saved automatically.
+zc-login-conflicting-route = Login takes its destination as a positional URL; do not combine it with --connect or --relay.
+zc-login-device-bootstrap-failed = OIDC device bootstrap failed
+zc-login-invalid-certificate-bootstrap-response = invalid certificate bootstrap response
+zc-login-pkce-randomness-unavailable = system randomness unavailable for PKCE
+
+zc-login-no-pairing-endpoint = OIDC login bootstraps the device through the gateway after sign-in; --enroll-host and --enroll-port are not used. No pairing code or SAS is needed.
+
+zc-login-stage-credentials = Could not stage replacement device credentials; the previous saved login was not replaced.
+
+# apps/zerocode/src/config/mod.rs. Shared by login, startup renewal, and every other config save.
+zc-config-save-lock-timeout = Another process is saving { $config } and still holds { $lock } after { $seconds }s. Let the other zerocode finish saving, then try again.
+zc-config-invalid-saved-login = Saved login configuration is invalid. Zerocode will not use a different login's credentials.
+zc-config-migration-lock-skipped = Could not lock { $path } to update saved keybindings ({ $error }). The loaded configuration was kept and the file was not changed. Zerocode will try the update again the next time it can lock the file.
+zc-config-lock-not-regular = { $path } is not a regular file, so it cannot be used as the config lock.

@@ -48,7 +48,7 @@
         # Default feature sets: zeroclaw uses canonical Dist,
         # zerocode uses its own package features (currently empty).
         # Override per-package, e.g. `packages.zeroclaw.override { features = [ ... ]; }`.
-        zeroclawDefaultFeatures = [ "acp-bridge" "agent-runtime" "channel-acp-server" "channel-discord" "channel-email" "channel-filesystem" "channel-git" "channel-lark" "channel-matrix" "channel-telegram" "channel-webhook" "gateway" "observability-prometheus" "plugins-wasm-cranelift" "schema-export" "tool-claude-code" "tool-claude-code-runner" "tool-codex-cli" "tool-composio" "tool-gemini-cli" "tool-google-workspace" "tool-jira" "tool-linkedin" "tool-microsoft365" "tool-notion" "tool-opencode-cli" "tool-project-intel" "tools-external" "whatsapp-web" ];
+        zeroclawDefaultFeatures = [ "acp-bridge" "agent-runtime" "channel-acp-server" "channel-discord" "channel-email" "channel-filesystem" "channel-git" "channel-lark" "channel-matrix" "channel-telegram" "channel-webhook" "gateway" "observability-prometheus" "plugins-wasm-cranelift" "schema-export" "tool-claude-code" "tool-claude-code-runner" "tool-codex-cli" "tool-composio" "tool-google-workspace" "tool-jira" "tool-linkedin" "tool-microsoft365" "tool-notion" "tool-opencode-cli" "tool-project-intel" "tools-external" "whatsapp-web" ];
         zerocodeDefaultFeatures = [  ];
         buildZeroclaw = { pname, cargoPkg, features }:
           (pkgs.makeRustPlatform {
@@ -56,7 +56,7 @@
             rustc = rustToolchain;
           }).buildRustPackage {
             inherit pname;
-            version = "0.8.7";
+            version = "0.9.0";
             src = ./.;
             cargoLock = {
               lockFile = ./Cargo.lock;

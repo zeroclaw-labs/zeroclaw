@@ -4,6 +4,7 @@ import Sidebar from '@/components/layout/Sidebar';
 import Header from '@/components/layout/Header';
 import ReloadBanner from '@/components/layout/ReloadBanner';
 import UnsavedChangesBanner from '@/components/layout/UnsavedChangesBanner';
+import { MainColumn } from '@/components/layout/MainColumn';
 import CommandPalette, { useCommandPalette } from '@/components/CommandPalette';
 import { NotAvailable } from '@/components/auth/NotAvailable';
 import { ErrorBoundary } from '@/App';
@@ -37,7 +38,7 @@ export default function Layout() {
   // A signed-in account without the operator dashboard lands on chat or
   // config, and a deep link to another page says it isn't available. An
   // account with neither sees that at `/` too.
-  const { session } = useAuth();
+  const { session, viaRelay } = useAuth();
   const access = navAccessFor(session);
   const routeAccess = pathAccess(pathname, access);
   const home = homePathFor(access);
@@ -70,7 +71,7 @@ export default function Layout() {
 
       {/* Main area — offset by the fixed 56px rail on desktop, full-width on
           mobile. The rail is always slim, so the offset is constant. */}
-      <div className="flex flex-col flex-1 min-w-0 h-screen md:ml-14 ml-0">
+      <MainColumn viaRelay={viaRelay}>
         <Header
           onMenuToggle={() => setSidebarOpen((v) => !v)}
           onOpenPalette={openPalette}
@@ -95,7 +96,7 @@ export default function Layout() {
             )}
           </ErrorBoundary>
         </main>
-      </div>
+      </MainColumn>
 
       {/* Command palette — mounted once for the whole app. Toggled globally
           via ⌘K / Ctrl+K and from the Header search trigger. */}

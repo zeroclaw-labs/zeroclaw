@@ -13,6 +13,7 @@ pub mod api_browse;
 pub mod api_config;
 pub mod api_logs;
 pub mod api_oidc;
+mod api_oidc_enroll;
 pub mod api_pairing;
 pub mod api_personality;
 pub mod api_plugins;
@@ -33,6 +34,9 @@ pub mod api_webauthn;
 pub mod api_webhook;
 pub mod auth_rate_limit;
 pub mod canvas;
+mod chat_core;
+pub mod core_rpc;
+pub mod dashboard_core;
 pub mod dashboard_session;
 pub mod node_tool;
 pub mod nodes;
@@ -40,6 +44,7 @@ pub mod openapi;
 #[cfg(feature = "plugins-wasm")]
 mod plugin_webhook;
 pub mod principal_gate;
+mod relay_ingress;
 pub mod security_headers;
 pub mod session_queue;
 pub mod sse;
@@ -181,15 +186,13 @@ pub const REQUEST_TIMEOUT_SECS: u64 = 30;
 
 pub const LONG_RUNNING_REQUEST_TIMEOUT_SECS: u64 = 600;
 
-/// Gateway request timeout (seconds) for routes other than the long-running
-/// cron-trigger endpoint. Reads from typed config.
+/// Gateway request timeout (seconds) for ordinary routes. Reads from typed config.
 pub fn gateway_request_timeout_secs(cfg: &zeroclaw_config::schema::GatewayConfig) -> u64 {
     cfg.request_timeout_secs
 }
 
-/// Manual cron-trigger request timeout (seconds), exempt from the
-/// gateway-wide [`gateway_request_timeout_secs`] limit so synchronous agent
-/// jobs can run to completion. Reads from typed config.
+/// Request timeout (seconds) for webhook, manual cron and A2A task routes,
+/// exempt from [`gateway_request_timeout_secs`]. Reads from typed config.
 pub fn gateway_long_running_request_timeout_secs(
     cfg: &zeroclaw_config::schema::GatewayConfig,
 ) -> u64 {
@@ -624,11 +627,32 @@ fn auto_detect_web_dist_dir() -> Option<std::path::PathBuf> {
 }
 
 fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
-    if let Some(xff) = headers.get("X-Forwarded-For").and_then(|v| v.to_str().ok()) {
-        for candidate in xff.split(',') {
-            if let Some(ip) = parse_client_ip(candidate) {
+    // Appending proxies add the connecting peer at the right-hand end. Prefer
+    // that hop so a client-supplied leading entry cannot pick the rate-limit key.
+    // Skip loopback hops: a real client never arrives as loopback through a
+    // proxy, and a same-host proxy chain can append 127.0.0.1 while the real
+    // caller sits further left.
+    if let Some(xff) = headers.get("X-Forwarded-For") {
+        let mut rightmost_loopback = None;
+        // A proxy can append a valid address to a caller's opaque header
+        // bytes. Decode each hop separately so that prefix cannot hide the
+        // proxy's suffix and restore the loopback peer's limiter exemption.
+        for candidate in xff.as_bytes().rsplit(|byte| *byte == b',') {
+            if let Some(ip) = std::str::from_utf8(candidate)
+                .ok()
+                .and_then(parse_client_ip)
+            {
+                if ip.is_loopback() {
+                    if rightmost_loopback.is_none() {
+                        rightmost_loopback = Some(ip);
+                    }
+                    continue;
+                }
                 return Some(ip);
             }
+        }
+        if rightmost_loopback.is_some() {
+            return rightmost_loopback;
         }
     }
 
@@ -644,12 +668,43 @@ pub(crate) fn client_key_from_request(
     trust_forwarded_headers: bool,
 ) -> String {
     if trust_forwarded_headers && let Some(ip) = forwarded_client_ip(headers) {
-        return ip.to_string();
+        // A real loopback caller never arrives through a proxy with a
+        // forwarded header. Treat a loopback-only forwarded value as spoofed.
+        if !ip.is_loopback() {
+            return ip.to_string();
+        }
+        // Do not inherit a loopback peer exemption from a proxied path — that
+        // would let a remote caller behind a same-host proxy skip per-client
+        // limits. Prefer a non-loopback peer; otherwise a non-exempt sentinel.
+        if let Some(addr) = peer_addr {
+            if !addr.ip().is_loopback() {
+                return addr.ip().to_string();
+            }
+        }
+        return "unknown".to_string();
     }
 
     peer_addr
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Whether this request counts as a local (loopback) caller for locality guards.
+///
+/// Defined as the rate-limit key being a loopback address, so
+/// [`client_key_from_request`] and SOP-cancel locality cannot drift apart: a
+/// forwarded loopback address is never local, and a direct loopback peer with
+/// no trusted forwarded header still is.
+pub(crate) fn request_is_local(
+    peer_addr: Option<SocketAddr>,
+    headers: &HeaderMap,
+    trust_forwarded_headers: bool,
+) -> bool {
+    auth_rate_limit::is_loopback_key(&client_key_from_request(
+        peer_addr,
+        headers,
+        trust_forwarded_headers,
+    ))
 }
 
 fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
@@ -825,6 +880,9 @@ pub struct GatewaySupervision {
     /// register resumed headless drivers here so a reload drains them with the
     /// generation that owns them. `None` standalone, where no generation exists.
     sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
+    /// Where the relay bridge hands over the browser connections of a
+    /// relay-served dashboard (`[relay.dashboard]`). `None` serves none.
+    dashboard_ingress: Option<zeroclaw_runtime::relay_dashboard::DashboardIngress>,
 }
 
 impl GatewaySupervision {
@@ -841,6 +899,37 @@ impl GatewaySupervision {
             plugin_webhooks,
             authority,
             sop_driver_handles,
+            dashboard_ingress: None,
+        }
+    }
+
+    /// Serve the dashboard connections the relay bridge delivers to
+    /// `ingress` as well as this gateway's own listener.
+    #[must_use]
+    pub fn with_dashboard_ingress(
+        mut self,
+        ingress: zeroclaw_runtime::relay_dashboard::DashboardIngress,
+    ) -> Self {
+        self.dashboard_ingress = Some(ingress);
+        self
+    }
+}
+
+/// The relay-forwarded dashboard connections one gateway generation
+/// serves. Waits forever when it has none attached, or once a later
+/// generation has taken over and every connection queued here is served.
+struct DashboardFeed(Option<zeroclaw_runtime::relay_dashboard::DashboardIngressReceiver>);
+
+impl DashboardFeed {
+    async fn next(&mut self) -> zeroclaw_runtime::relay_dashboard::DashboardConn {
+        loop {
+            match &mut self.0 {
+                Some(receiver) => match receiver.recv().await {
+                    Some(conn) => return conn,
+                    None => self.0 = None,
+                },
+                None => std::future::pending::<()>().await,
+            }
         }
     }
 }
@@ -850,7 +939,7 @@ impl GatewaySupervision {
 /// never per handler: every route whose handler lives in `api_config`,
 /// `api_quickstart`, or `api_sections` MUST be registered on THIS router,
 /// whatever its URL prefix.
-fn config_admin_router(inbound_auth: &Arc<principal_gate::GatewayInboundAuth>) -> Router<AppState> {
+fn config_admin_router(route_auth: principal_gate::ConfigRouteAuth) -> Router<AppState> {
     Router::new()
         .route(
             "/api/config",
@@ -936,7 +1025,7 @@ fn config_admin_router(inbound_auth: &Arc<principal_gate::GatewayInboundAuth>) -
             post(api_config::handle_api_channel_bind),
         )
         .route_layer(axum::middleware::from_fn_with_state(
-            Arc::clone(inbound_auth),
+            route_auth,
             principal_gate::config_route_auth,
         ))
 }
@@ -945,6 +1034,21 @@ fn config_admin_router(inbound_auth: &Arc<principal_gate::GatewayInboundAuth>) -
 /// flight. With [`RETIRE_JOIN`] it stays inside the daemon's 500 ms grace for
 /// the gateway, so what is left is cancelled before that grace runs out.
 const CONNECTION_DRAIN: Duration = Duration::from_millis(300);
+
+#[cfg(test)]
+tokio::task_local! {
+    static LISTENER_RELEASED: std::cell::RefCell<Option<tokio::sync::oneshot::Sender<()>>>;
+}
+
+fn release_listener(listener: tokio::net::TcpListener) {
+    drop(listener);
+    #[cfg(test)]
+    let _ = LISTENER_RELEASED.try_with(|released| {
+        if let Some(released) = released.borrow_mut().take() {
+            let _ = released.send(());
+        }
+    });
+}
 
 /// How long retirement waits for the tasks it cancelled to end. Cancelling
 /// only asks: a task ends, and drops what it owns, when it is next polled.
@@ -1003,7 +1107,10 @@ impl ServeTasks {
         let cancelled = self.0.cancelled.clone();
         // No lock is held here: spawning can drop the task at once (a runtime
         // that has shut down does), and that only updates the count.
-        zeroclaw_spawn::spawn!(async move {
+        // Every connection and HTTP/2 stream is one of these tasks, so their
+        // lifecycle is recorded at DEBUG: at INFO it would fill the runtime
+        // trace with routine traffic.
+        zeroclaw_spawn::spawn!(level = DEBUG, async move {
             // Moves the whole task in. Naming only `task.future` below would
             // capture just that field, and `_done` would take the task off the
             // count as soon as `spawn` returned.
@@ -1332,15 +1439,32 @@ pub async fn run_gateway_with_plugin_webhooks(
         plugin_webhooks,
         authority,
         sop_driver_handles,
+        dashboard_ingress,
     } = supervision;
-    let (shared_pairing, shared_inbound_auth, shared_config) = match daemon_authority {
-        Some(authority) => (
-            Some(authority.pairing),
-            Some(authority.inbound_auth),
-            Some(authority.config),
-        ),
-        None => (None, None, None),
-    };
+    let (shared_pairing, shared_inbound_auth, shared_config, shared_cert_audit) =
+        match daemon_authority {
+            Some(authority) => (
+                Some(authority.pairing),
+                Some(authority.inbound_auth),
+                Some(authority.config),
+                authority.cert_audit,
+            ),
+            None => (None, None, None, None),
+        };
+
+    // The in-process RPC seam: dial the daemon's dispatcher when a
+    // supervised run provides its connector, and hand the handle to every
+    // request as an extension so routes can migrate onto RPC one at a time.
+    // The gateway has no credential of its own yet, so the dial is refused
+    // and the seam stays idle until that credential exists; it never rides
+    // the daemon's anonymous compatibility path.
+    let core_rpc = core_rpc::CoreRpc::default();
+    if let Some(connector) = reload_controls
+        .as_ref()
+        .and_then(|controls| controls.inproc.clone())
+    {
+        core_rpc.attach_inproc(connector, zeroclaw_rpc_client::ConnectOptions::default());
+    }
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
         && config.tunnel.tunnel_provider == "none"
@@ -2331,7 +2455,10 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     // Device registry and pairing store (only when pairing is required)
     let device_registry = if config.gateway.require_pairing {
-        let registry = Arc::new(api_pairing::DeviceRegistry::new(&config.data_dir));
+        let registry = Arc::new(
+            api_pairing::DeviceRegistry::new(&config.data_dir)
+                .context("Initialize paired-device registry")?,
+        );
         // Reconcile the registry against the canonical paired-token set so that
         // tokens paired via the legacy `/pair` route (and any other historical
         // orphans) become visible and revocable in the management UI. The token
@@ -2446,11 +2573,18 @@ pub async fn run_gateway_with_plugin_webhooks(
     };
 
     let dashboard_layer_state = state.clone();
+    // On every route that issues or redeems a pairing code: refused through a
+    // relay-served dashboard, where the relay would see the code.
+    let no_relayed_pairing = axum::middleware::from_fn(relay_ingress::no_pairing_through_a_relay);
 
     // Build router with middleware
     let inner = Router::new()
-        .merge(config_admin_router(&inbound_auth))
+        .merge(config_admin_router(principal_gate::ConfigRouteAuth::new(
+            &inbound_auth,
+            &state.config,
+        )))
         .merge(api_oidc::routes())
+        .merge(api_oidc_enroll::routes(Arc::clone(&inbound_auth), shared_cert_audit))
         // ── Admin routes (for CLI management) ──
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/reload", post(handle_admin_reload))
@@ -2463,14 +2597,16 @@ pub async fn run_gateway_with_plugin_webhooks(
         // ── Existing routes ──
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
-        .route("/pair", post(handle_pair))
+        .route(
+            "/pair",
+            post(handle_pair).layer(no_relayed_pairing.clone()),
+        )
         .route("/pair/code", get(handle_pair_code))
-        .route("/webhook", post(handle_webhook))
         .merge(sop_webhook_routes())
         .merge(optional_channel_routes())
         .merge(optional_tool_routes())
         // ── Web Dashboard API routes ──
-        .route("/api/status", get(api::handle_api_status))
+        .route("/api/status", get(dashboard_core::status))
         .route("/api/version/check", get(version::handle_version_check))
         .route("/api/version/upgrade", post(version::handle_version_upgrade))
         .route(
@@ -2628,19 +2764,28 @@ pub async fn run_gateway_with_plugin_webhooks(
         )
         .route("/api/health", get(api::handle_api_health))
         .route("/api/tuis", get(api::handle_api_tuis))
-        .route("/api/sessions", get(api::handle_api_sessions_list))
+        .route("/api/sessions", get(dashboard_core::sessions_list))
         .route("/api/sessions/running", get(api::handle_api_sessions_running))
         .route(
             "/api/sessions/{id}/messages",
-            get(api::handle_api_session_messages).post(api::handle_api_session_message_post),
+            get(dashboard_core::session_messages).post(api::handle_api_session_message_post),
         )
-        .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
+        .route("/api/sessions/{id}", delete(dashboard_core::session_delete).put(dashboard_core::session_rename))
         .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
-        .route("/api/sessions/{id}/abort", post(api::handle_api_session_abort))
+        .route("/api/sessions/{id}/abort", post(dashboard_core::session_abort))
+        .route("/api/agents/available", get(dashboard_core::agents_available))
         // ── Pairing + Device management API ──
-        .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
-        .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
+        .route(
+            "/api/pairing/initiate",
+            post(api_pairing::initiate_pairing).layer(no_relayed_pairing.clone()),
+        )
+        .route(
+            "/api/pair",
+            post(api_pairing::submit_pairing_enhanced).layer(no_relayed_pairing.clone()),
+        )
         .route("/api/devices", get(api_pairing::list_devices))
+        .route("/api/devices/{id}/voice", get(api_pairing::get_device_voice_preferences).put(api_pairing::put_device_voice_preferences))
+        .route("/api/devices/me/voice", get(api_pairing::get_my_voice_preferences).put(api_pairing::put_my_voice_preferences))
         .route(
             "/api/devices/me/capabilities",
             post(api_pairing::update_my_capabilities),
@@ -2648,7 +2793,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/api/devices/{id}", delete(api_pairing::revoke_device))
         .route(
             "/api/devices/{id}/token/rotate",
-            post(api_pairing::rotate_token),
+            post(api_pairing::rotate_token).layer(no_relayed_pairing),
         )
         // ── Live Canvas (A2UI) routes ──
         .route("/api/canvas", get(canvas::handle_canvas_list))
@@ -2753,12 +2898,13 @@ pub async fn run_gateway_with_plugin_webhooks(
         ));
     let inner = inner.merge(upload_router);
 
-    // Manual cron-trigger and A2A task routes live on their own sub-router so
-    // they can opt out of the 30s gateway-wide TimeoutLayer. Both run a
-    // synchronous agent turn inline. Layers attached here travel with the
-    // route through `merge`, so only these endpoints see the longer timeout.
-    let long_running_router: Router<AppState> =
-        Router::new().route("/api/cron/{id}/run", post(api::handle_api_cron_run));
+    // These routes can wait for a complete agent turn. Keep their timeout and
+    // body limit on the sub-router so both survive `merge`. For `/webhook`,
+    // this also bounds body extraction and SOP/SSE response creation; the SSE
+    // body and its cancellation remain owned by the streaming path.
+    let long_running_router: Router<AppState> = Router::new()
+        .route("/webhook", post(handle_webhook))
+        .route("/api/cron/{id}/run", post(api::handle_api_cron_run));
     #[cfg(feature = "a2a")]
     let long_running_router = long_running_router.merge(a2a::a2a_task_route());
     let long_running_router: Router = long_running_router
@@ -2769,7 +2915,9 @@ pub async fn run_gateway_with_plugin_webhooks(
             Duration::from_secs(gateway_long_running_request_timeout_secs(&config.gateway)),
         ));
 
-    let inner = inner.merge(long_running_router);
+    let inner = inner
+        .merge(long_running_router)
+        .layer(axum::Extension(core_rpc));
 
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"
@@ -2846,6 +2994,14 @@ pub async fn run_gateway_with_plugin_webhooks(
     // the stop no request reaches this gateway's router. Its tasks are in
     // `tasks`, so the stop also cancels whatever outlasts the drain.
     let mut app = app.into_make_service_with_connect_info::<SocketAddr>();
+    // Attached once this generation is about to serve, and detached when
+    // it returns, so the bridge never hands a connection to a gateway that
+    // can't serve it.
+    let mut dashboard_feed = DashboardFeed(
+        dashboard_ingress
+            .as_ref()
+            .map(zeroclaw_runtime::relay_dashboard::DashboardIngress::attach),
+    );
     let tasks = ServeTasks::default();
     let _cancel_on_drop = ServeTasksGuard::new(tasks.clone());
     let admission = Admission {
@@ -2938,6 +3094,54 @@ pub async fn run_gateway_with_plugin_webhooks(
                     }
                 });
             }
+            conn = dashboard_feed.next() => {
+                // A browser connection a relay-served dashboard forwarded.
+                // Served like an accepted socket - same router, admission
+                // and drain - with the browser's address as the peer (never
+                // loopback) and each request admitted for that dashboard's
+                // origin alone. No TLS here: the browser's ended at the
+                // relay, and the bridge carries the stream inside the
+                // daemon's own TLS link to it.
+                let (stream, client_addr, origin) = conn.into_parts();
+                let relay = relay_ingress::RelayConnection::new(origin);
+                let svc = tower::MakeService::<
+                    SocketAddr,
+                    hyper::Request<hyper::body::Incoming>,
+                >::make_service(&mut app, client_addr)
+                .await
+                .expect("infallible make_service");
+                let mut stopping = shutdown_rx.clone();
+                let admission = admission.clone();
+                tasks.spawn(async move {
+                    let hyper_svc = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+                        let svc = svc.clone();
+                        let admission = admission.clone();
+                        let admitted = relay.admit(&mut req);
+                        async move {
+                            match admitted {
+                                Ok(()) => serve_while_current(svc, &admission, req).await,
+                                Err(refusal) => Ok(*refusal),
+                            }
+                        }
+                    });
+                    // HTTP/1.1 only, which is all the relay offers browsers:
+                    // one connection then carries requests for one host.
+                    let connection = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), hyper_svc)
+                        .with_upgrades();
+                    tokio::pin!(connection);
+                    let served = tokio::select! {
+                        served = connection.as_mut() => served,
+                        () = gateway_stop_requested(&mut stopping) => {
+                            connection.as_mut().graceful_shutdown();
+                            connection.as_mut().await
+                        }
+                    };
+                    if let Err(e) = served {
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "remote_addr": client_addr})), "relay dashboard connection error from");
+                    }
+                });
+            }
             _ = shutdown_rx.changed() => {
                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), "ZeroClaw Gateway shutting down");
                 break;
@@ -2946,7 +3150,10 @@ pub async fn run_gateway_with_plugin_webhooks(
     }
     // Let go of the port at once, as `axum::serve` does: a connection made
     // from here on is refused, not accepted into a backlog nothing serves.
-    drop(listener);
+    release_listener(listener);
+    // And stop taking relay-forwarded dashboard connections: the bridge
+    // refuses them until the next generation attaches.
+    drop(dashboard_feed);
     // Every connection finishes the request in flight and closes; whatever
     // is still open after the drain (an event stream, a connection that
     // ignored the shutdown) is cancelled. Nothing waits on it beyond that:
@@ -3293,12 +3500,26 @@ async fn handle_pair(
 
 pub(crate) async fn persist_pairing_tokens(state: &AppState) -> Result<()> {
     // Self-contained: no caller pre-reads config for modify, so this
-    // admits its own commit rather than taking one as a param. The
-    // admitted commit (writer guard + config-work lease) is held across
-    // the whole read-modify-save-publish below and runs the irreversible
-    // phase retained, so a cancelled request cannot strand a committed
-    // token write without its publication.
+    // admits its own commit rather than taking one as a param.
     let commit = state.begin_config_commit().await?;
+    persist_pairing_tokens_under(state, commit).await.map(drop)
+}
+
+/// [`persist_pairing_tokens`] for a caller that already holds an admitted
+/// commit: a revocation that removed a live token under it, through
+/// [`PairingGuard::revoke_under_config_write_lock`], persists under the same
+/// commit.
+///
+/// The commit (writer guard + config-work lease) is held across the whole
+/// read-modify-save-publish below and runs the irreversible phase retained,
+/// so a cancelled request cannot strand a committed token write without its
+/// publication. It is handed back once the publication lands, so a caller
+/// that must stay serialized past the persist (a rotation issuing its new
+/// pairing code) keeps the writer gate until it is done.
+pub(crate) async fn persist_pairing_tokens_under(
+    state: &AppState,
+    commit: ConfigWriteGuard,
+) -> Result<ConfigWriteGuard> {
     let paired_tokens = state.pairing.tokens();
     let mut updated_cfg = commit.current_config();
     updated_cfg.gateway.paired_tokens = paired_tokens;
@@ -3318,11 +3539,9 @@ pub(crate) async fn persist_pairing_tokens(state: &AppState) -> Result<()> {
             commit
                 .publish(revision, config)
                 .context("Failed to publish paired tokens to the live config")?;
-            Ok::<(), anyhow::Error>(())
+            Ok::<ConfigWriteGuard, anyhow::Error>(commit)
         }));
-    task.await
-        .context("Paired-token persistence task failed")??;
-    Ok(())
+    task.await.context("Paired-token persistence task failed")?
 }
 
 /// Result of a gateway chat turn.
@@ -3403,6 +3622,34 @@ struct GatewayChatDispatchCapture {
 #[cfg(test)]
 static GATEWAY_CHAT_DISPATCH_CAPTURES: std::sync::Mutex<Vec<GatewayChatDispatchCapture>> =
     std::sync::Mutex::new(Vec::new());
+
+/// Events the test-only streamed dispatch delivered into the relay, per
+/// session id, so a test can tell a relay that drained everything from one
+/// that closed its receiver early.
+#[cfg(test)]
+static SSE_TEST_EVENTS_DELIVERED: std::sync::Mutex<Vec<(String, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn sse_test_record_event_delivered(session_id: &str) {
+    let mut delivered = SSE_TEST_EVENTS_DELIVERED
+        .lock()
+        .expect("sse delivery counter mutex poisoned");
+    match delivered.iter_mut().find(|(key, _)| key == session_id) {
+        Some((_, count)) => *count += 1,
+        None => delivered.push((session_id.to_owned(), 1)),
+    }
+}
+
+#[cfg(test)]
+fn sse_test_events_delivered(session_id: &str) -> usize {
+    SSE_TEST_EVENTS_DELIVERED
+        .lock()
+        .expect("sse delivery counter mutex poisoned")
+        .iter()
+        .find(|(key, _)| key == session_id)
+        .map_or(0, |(_, count)| *count)
+}
 
 // Tests that read or clear the shared capture buffer hold this lock so
 // parallel webhook tests cannot invalidate one another's evidence.
@@ -3606,6 +3853,14 @@ pub struct WebhookBody {
     /// send an `Accept: text/event-stream` header.
     #[serde(default)]
     pub stream: bool,
+    /// Keep a streamed turn running after this response body is dropped,
+    /// instead of cancelling it. Requires `X-Session-Id`, so the turn stays
+    /// addressable through `POST /api/sessions/{id}/abort`. The webhook keeps
+    /// no transcript, so a detached turn's text has no reader: what it
+    /// leaves behind is its memory writes, tool effects and usage records.
+    /// Only meaningful with `stream: true`.
+    #[serde(default)]
+    pub continue_on_disconnect: bool,
 }
 
 /// Webhook query parameters
@@ -3965,6 +4220,22 @@ async fn handle_webhook(
         }
     }
 
+    // A streamed turn may only outlive its body when it stays abortable, so
+    // `continue_on_disconnect` needs an `X-Session-Id`. Refused here, before
+    // idempotency and autosave, so the rejected attempt neither consumes the
+    // caller's idempotency key (a corrected retry must run) nor saves its
+    // message.
+    if webhook_body.stream
+        && webhook_body.continue_on_disconnect
+        && accepts_sse(&headers)
+        && webhook_session_id(&headers).is_none()
+    {
+        let err = serde_json::json!({
+            "error": "continue_on_disconnect requires an X-Session-Id header"
+        });
+        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+    }
+
     if !has_matching_sop && let Some(response) = check_webhook_idempotency(&state, &headers, None) {
         return response.into_response();
     }
@@ -4021,6 +4292,7 @@ async fn handle_webhook(
             message,
             session_id.as_deref(),
             agent_override,
+            webhook_body.continue_on_disconnect,
             started_at,
         )
         .await;
@@ -4130,14 +4402,27 @@ fn reconcile_sse_final_response(cumulative: &mut String, final_response: &str) -
 
 type SseFrame = Result<SseWireEvent, std::convert::Infallible>;
 
-async fn send_sse_frame_or_cancel(
+/// Why a frame did not reach the SSE body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SseSend {
+    Sent,
+    /// The turn was cancelled while the frame waited for queue space.
+    Cancelled,
+    /// The client dropped the response body: there is no viewer any more.
+    ViewerGone,
+}
+
+async fn send_sse_frame(
     frame_tx: &tokio::sync::mpsc::Sender<SseFrame>,
     frame: SseFrame,
     cancel_token: &tokio_util::sync::CancellationToken,
-) -> bool {
+) -> SseSend {
     tokio::select! {
-        result = frame_tx.send(frame) => result.is_ok(),
-        _ = cancel_token.cancelled() => false,
+        result = frame_tx.send(frame) => match result {
+            Ok(()) => SseSend::Sent,
+            Err(_) => SseSend::ViewerGone,
+        },
+        _ = cancel_token.cancelled() => SseSend::Cancelled,
     }
 }
 
@@ -4183,10 +4468,10 @@ pub(crate) fn remove_cancel_token_if_current(
     }
 }
 
-struct SseClientStream {
-    receiver: tokio::sync::mpsc::Receiver<SseFrame>,
-    terminal_receiver: Option<tokio::sync::oneshot::Receiver<SseFrame>>,
-    terminal_delivered: bool,
+/// The cancellation a body holds when it owns its turn, which is every
+/// streamed turn that did not opt into `continue_on_disconnect`: leaving
+/// cancels it at once rather than at the next chunk.
+struct OwnedTurnCancel {
     cancel_token: Arc<tokio_util::sync::CancellationToken>,
     cancel_tokens: Arc<
         std::sync::Mutex<
@@ -4194,6 +4479,31 @@ struct SseClientStream {
         >,
     >,
     cancel_key: String,
+}
+
+/// The streamed response body. By default it owns its turn and cancels it
+/// when dropped. A turn that opted into `continue_on_disconnect` (with an
+/// `X-Session-Id`) is only viewed by its body: dropping it closes the frame
+/// queue, which the relay task reads as the viewer leaving, and the turn
+/// runs on until it ends or `POST /api/sessions/{id}/abort` cancels it.
+struct SseClientStream {
+    receiver: tokio::sync::mpsc::Receiver<SseFrame>,
+    terminal_receiver: Option<tokio::sync::oneshot::Receiver<SseFrame>>,
+    terminal_delivered: bool,
+    owned_turn: Option<OwnedTurnCancel>,
+}
+
+impl Drop for SseClientStream {
+    fn drop(&mut self) {
+        if let Some(owned) = &self.owned_turn {
+            owned.cancel_token.cancel();
+            remove_cancel_token_if_current(
+                &owned.cancel_tokens,
+                &owned.cancel_key,
+                &owned.cancel_token,
+            );
+        }
+    }
 }
 
 impl futures_util::Stream for SseClientStream {
@@ -4234,13 +4544,6 @@ impl futures_util::Stream for SseClientStream {
     }
 }
 
-impl Drop for SseClientStream {
-    fn drop(&mut self) {
-        self.cancel_token.cancel();
-        remove_cancel_token_if_current(&self.cancel_tokens, &self.cancel_key, &self.cancel_token);
-    }
-}
-
 /// Stream one gateway chat turn over Server-Sent Events.
 ///
 /// Drives the turn with the same streamed agent API the `/ws/chat` path uses
@@ -4248,12 +4551,20 @@ impl Drop for SseClientStream {
 /// `TurnEvent::Chunk` text as `event: token` frames. The turn's cancellation
 /// token is registered under the same `gw_{session}` key the abort endpoint
 /// uses, so an in-flight streamed turn is cancellable exactly like a
-/// WebSocket turn; a client disconnect cancels the token too.
+/// WebSocket turn. By default the stream owns its turn and dropping it
+/// cancels, the contract streamed webhook callers have always had. A caller
+/// that sends `continue_on_disconnect: true` with its `X-Session-Id` makes
+/// the stream a viewer instead, like a WebSocket: a disconnect mid-turn
+/// detaches, the turn runs to completion unattended and the token stays
+/// registered until it ends, so only `POST /api/sessions/{id}/abort`, or a
+/// newer turn on the same session, cancels it. The handler refuses the opt-in
+/// without a session, since nobody could abort such a turn.
 async fn run_gateway_chat_streaming_response(
     state: &AppState,
     message: &str,
     session_id: Option<&str>,
     agent_override: Option<&str>,
+    continue_on_disconnect: bool,
     started_at: Instant,
 ) -> Response {
     if let Some(err) = needs_quickstart_for(&state.model) {
@@ -4313,38 +4624,71 @@ async fn run_gateway_chat_streaming_response(
 
     let state_for_frames = state.clone();
     let cancel_key_for_frames = cancel_key.clone();
-    let token_for_stream = Arc::clone(&cancel_token);
+    let session_key_for_frames = session_key.clone();
+    // Only an opted-in turn with a session outlives its body: it stays
+    // abortable through the registered token. Every other stream owns its
+    // turn, so dropping it cancels.
+    let viewer_owns_turn = session_id.is_none() || !continue_on_disconnect;
+    let token_for_body = Arc::clone(&cancel_token);
     zeroclaw_spawn::spawn!(async move {
         let mut terminal_tx = Some(terminal_tx);
         let mut cumulative = String::new();
+        // An opted-in body is a viewer of the turn, not its owner. Once the
+        // client is gone (the frame queue's receiver dropped) this task stops
+        // sending frames but keeps draining `event_rx`, so the agent runs to
+        // completion: its memory writes, tool effects and usage records
+        // happen, although the webhook keeps no transcript of its text. Only
+        // the explicit abort path (`cancel_token`, reached through
+        // `POST /api/sessions/{id}/abort`) or a newer turn on the session
+        // cancels it. Any other body owns its turn: its leaving cancels.
+        let mut viewer_attached = true;
+        let interrupted = || {
+            zeroclaw_providers::sanitize_api_error(
+                &zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user"),
+            )
+        };
+        let detach = |viewer_attached: &mut bool| {
+            if *viewer_attached {
+                *viewer_attached = false;
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "session_key": session_key_for_frames,
+                            "transport": "sse",
+                        })),
+                    "SSE client detached mid-turn; turn continues unattended"
+                );
+            }
+        };
         loop {
             tokio::select! {
                 maybe = event_rx.recv() => match maybe {
                     Some(zeroclaw_api::agent::TurnEvent::Chunk { delta }) => {
                         cumulative.push_str(&delta);
-                        if !send_sse_frame_or_cancel(
-                            &frame_tx,
-                            sse_token_frame(&cumulative),
-                            &cancel_token,
-                        )
-                        .await
+                        if !viewer_attached {
+                            continue;
+                        }
+                        match send_sse_frame(&frame_tx, sse_token_frame(&cumulative), &cancel_token)
+                            .await
                         {
-                            // The bounded token queue may be full, so a
-                            // cancellation-aware send can return without
-                            // delivering the terminal frame through it.
-                            cancel_token.cancel();
-                            let message = zeroclaw_providers::sanitize_api_error(
-                                &zeroclaw_runtime::i18n::get_required_cli_string(
-                                    "turn-interrupted-by-user",
-                                ),
-                            );
-                            send_sse_terminal_error(&mut terminal_tx, &message);
-                            remove_cancel_token_if_current(
-                                &state_for_frames.cancel_tokens,
-                                &cancel_key_for_frames,
-                                &cancel_token,
-                            );
-                            return;
+                            SseSend::Sent => {}
+                            SseSend::ViewerGone if !viewer_owns_turn => detach(&mut viewer_attached),
+                            SseSend::ViewerGone | SseSend::Cancelled => {
+                                if viewer_owns_turn {
+                                    cancel_token.cancel();
+                                }
+                                // The bounded token queue may be full, so a
+                                // cancellation-aware send can return without
+                                // delivering the terminal frame through it.
+                                send_sse_terminal_error(&mut terminal_tx, &interrupted());
+                                remove_cancel_token_if_current(
+                                    &state_for_frames.cancel_tokens,
+                                    &cancel_key_for_frames,
+                                    &cancel_token,
+                                );
+                                return;
+                            }
                         }
                     }
                     Some(_) => {}
@@ -4353,14 +4697,9 @@ async fn run_gateway_chat_streaming_response(
                 _ = cancel_token.cancelled() => {
                     // A server-side abort can leave the HTTP connection open.
                     // Emit one sanitized terminal frame before ending the
-                    // stream; a disconnected client makes this send fail and
-                    // is handled by the same path without additional work.
-                    let message = zeroclaw_providers::sanitize_api_error(
-                        &zeroclaw_runtime::i18n::get_required_cli_string(
-                            "turn-interrupted-by-user",
-                        ),
-                    );
-                    send_sse_terminal_error(&mut terminal_tx, &message);
+                    // stream; a client that is already gone makes this send
+                    // fail and is handled by the same path without more work.
+                    send_sse_terminal_error(&mut terminal_tx, &interrupted());
                     remove_cancel_token_if_current(
                         &state_for_frames.cancel_tokens,
                         &cancel_key_for_frames,
@@ -4383,74 +4722,59 @@ async fn run_gateway_chat_streaming_response(
                 started_at.elapsed(),
             ),
         );
+        if !viewer_attached {
+            // Nobody is listening and there is no body to finish. The turn's
+            // memory writes, tool effects and usage records are done; the
+            // webhook path keeps no transcript, so its text has no reader.
+            return;
+        }
         match result {
             Ok(final_response) => {
                 if let Some(frame) = reconcile_sse_final_response(&mut cumulative, &final_response)
+                    && send_sse_frame(&frame_tx, frame, &cancel_token).await != SseSend::Sent
                 {
-                    if !send_sse_frame_or_cancel(&frame_tx, frame, &cancel_token).await {
-                        cancel_token.cancel();
-                        let message = zeroclaw_providers::sanitize_api_error(
-                            &zeroclaw_runtime::i18n::get_required_cli_string(
-                                "turn-interrupted-by-user",
-                            ),
-                        );
-                        send_sse_terminal_error(&mut terminal_tx, &message);
-                        return;
-                    }
+                    // Cancelled or gone during the final frame: the turn is
+                    // over either way, so a terminal frame is all that is
+                    // left to offer, and a gone client simply never reads it.
+                    send_sse_terminal_error(&mut terminal_tx, &interrupted());
+                    return;
                 }
-                if !send_sse_frame_or_cancel(
+                if send_sse_frame(
                     &frame_tx,
                     Ok(SseWireEvent::default().event("done").data("{}")),
                     &cancel_token,
                 )
                 .await
+                    != SseSend::Sent
                 {
-                    cancel_token.cancel();
-                    let message = zeroclaw_providers::sanitize_api_error(
-                        &zeroclaw_runtime::i18n::get_required_cli_string(
-                            "turn-interrupted-by-user",
-                        ),
-                    );
-                    send_sse_terminal_error(&mut terminal_tx, &message);
+                    send_sse_terminal_error(&mut terminal_tx, &interrupted());
                 }
             }
             Err(e) => {
                 if cancel_token.is_cancelled() {
-                    let message = zeroclaw_providers::sanitize_api_error(
-                        &zeroclaw_runtime::i18n::get_required_cli_string(
-                            "turn-interrupted-by-user",
-                        ),
-                    );
-                    send_sse_terminal_error(&mut terminal_tx, &message);
+                    send_sse_terminal_error(&mut terminal_tx, &interrupted());
                 } else {
                     let sanitized = zeroclaw_providers::sanitize_api_error(&e.to_string());
-                    if !send_sse_frame_or_cancel(
-                        &frame_tx,
-                        sse_error_frame(&sanitized),
-                        &cancel_token,
-                    )
-                    .await
+                    if send_sse_frame(&frame_tx, sse_error_frame(&sanitized), &cancel_token).await
+                        != SseSend::Sent
                     {
-                        cancel_token.cancel();
-                        let message = zeroclaw_providers::sanitize_api_error(
-                            &zeroclaw_runtime::i18n::get_required_cli_string(
-                                "turn-interrupted-by-user",
-                            ),
-                        );
-                        send_sse_terminal_error(&mut terminal_tx, &message);
+                        send_sse_terminal_error(&mut terminal_tx, &interrupted());
                     }
                 }
             }
         }
     });
 
+    let owned_turn = viewer_owns_turn.then(|| OwnedTurnCancel {
+        cancel_token: token_for_body,
+        cancel_tokens: Arc::clone(&state.cancel_tokens),
+        cancel_key: cancel_key.clone(),
+    });
     let body = SseBody::new(SseClientStream {
         receiver: frame_rx,
         terminal_receiver: Some(terminal_rx),
         terminal_delivered: false,
-        cancel_token: token_for_stream,
-        cancel_tokens: Arc::clone(&state.cancel_tokens),
-        cancel_key,
+        owned_turn,
     })
     .keep_alive(SseKeepAlive::default());
     (
@@ -4508,9 +4832,20 @@ async fn dispatch_gateway_turn_streaming(
         tokio::select! {
             result = call => {
                 let response = result?;
-                let _ = event_tx
-                    .send(zeroclaw_api::agent::TurnEvent::Chunk { delta: response.clone() })
-                    .await;
+                // One chunk per line, so a fixture can emit more events than
+                // the relay's queue holds and prove the relay keeps reading.
+                // Delivered events are counted per session, so a test can
+                // tell a relay that closed its receiver early from one that
+                // drained everything.
+                for delta in response.split_inclusive('\n') {
+                    if event_tx
+                        .send(zeroclaw_api::agent::TurnEvent::Chunk { delta: delta.to_owned() })
+                        .await
+                        .is_ok()
+                    {
+                        sse_test_record_event_delivered(session_id.unwrap_or("anonymous"));
+                    }
+                }
                 Ok(response)
             }
             _ = cancel_token.cancelled() => Err(anyhow::Error::msg(
@@ -5412,6 +5747,20 @@ pub(crate) fn live_pairing_code_policy(state: &AppState) -> PairingCodePolicy {
     state.config.read().gateway.pairing_code
 }
 
+/// The admin rotate response when its config commit is refused before
+/// anything changed: the daemon generation is closing.
+fn admin_revocation_not_admitted(
+    error: zeroclaw_runtime::live_config_authority::ConfigCommitError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let body = serde_json::json!({
+        "success": false,
+        "pairing_required": true,
+        "pairing_code": null,
+        "message": format!("Revocation refused without any change: {error}"),
+    });
+    (StatusCode::SERVICE_UNAVAILABLE, Json(body))
+}
+
 #[derive(Debug, serde::Deserialize, Default)]
 pub struct AdminPaircodeQuery {
     #[serde(default)]
@@ -5445,19 +5794,33 @@ async fn handle_admin_paircode_new(
 
     let revocation_message = match rotate {
         Some("all") => {
-            let revoked = state.pairing.revoke_all_tokens();
-            if let Some(registry) = state.device_registry.as_ref() {
-                if let Err(e) = registry.clear() {
-                    let body = serde_json::json!({
-                        "success": false,
-                        "pairing_required": true,
-                        "pairing_code": null,
-                        "message": format!("Tokens revoked in memory but device registry clear failed: {e}"),
-                    });
-                    return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
-                }
+            // Every live token and every device row go in one step under
+            // the lock, so a dropped request leaves neither half behind.
+            let ((revoked, cleared), config_write_guard) = match state
+                .pairing
+                .revoke_under_config_write_lock(state.begin_config_commit(), |pairing| {
+                    let revoked = pairing.revoke_all_tokens();
+                    let cleared = state
+                        .device_registry
+                        .as_ref()
+                        .map(|registry| registry.clear());
+                    (revoked, cleared)
+                })
+                .await
+            {
+                Ok(revoked) => revoked,
+                Err(e) => return Ok(admin_revocation_not_admitted(e)),
+            };
+            if let Some(Err(e)) = cleared {
+                let body = serde_json::json!({
+                    "success": false,
+                    "pairing_required": true,
+                    "pairing_code": null,
+                    "message": format!("Tokens revoked in memory but device registry clear failed: {e}"),
+                });
+                return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
             }
-            if let Err(e) = persist_pairing_tokens(&state).await {
+            if let Err(e) = persist_pairing_tokens_under(&state, config_write_guard).await {
                 let body = serde_json::json!({
                     "success": false,
                     "pairing_required": true,
@@ -5486,9 +5849,20 @@ async fn handle_admin_paircode_new(
                 });
                 return Ok((StatusCode::SERVICE_UNAVAILABLE, Json(body)));
             };
-            let token_hash = match registry.revoke(device_id) {
-                Ok(Some(hash)) => hash,
-                Ok(None) => {
+            let config_write_guard = match state.begin_config_commit().await {
+                Ok(commit) => commit,
+                Err(e) => return Ok(admin_revocation_not_admitted(e)),
+            };
+            let revoked = api_pairing::revoke_device_credential(
+                &state,
+                registry,
+                device_id,
+                &config_write_guard,
+                || require_gateway_admin_token(&state, &headers),
+            )?;
+            match revoked {
+                Ok(true) => {}
+                Ok(false) => {
                     let body = serde_json::json!({
                         "success": false,
                         "pairing_required": true,
@@ -5506,9 +5880,8 @@ async fn handle_admin_paircode_new(
                     });
                     return Ok((StatusCode::INTERNAL_SERVER_ERROR, Json(body)));
                 }
-            };
-            state.pairing.revoke_token_hash(&token_hash);
-            if let Err(e) = persist_pairing_tokens(&state).await {
+            }
+            if let Err(e) = persist_pairing_tokens_under(&state, config_write_guard).await {
                 let body = serde_json::json!({
                     "success": false,
                     "pairing_required": true,
@@ -6070,7 +6443,8 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        let registry = with_registry.then(|| Arc::new(api_pairing::DeviceRegistry::new(&data_dir)));
+        let registry =
+            with_registry.then(|| Arc::new(api_pairing::DeviceRegistry::new(&data_dir).unwrap()));
         let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         AppState {
             config: state_authority.live_handle(),
@@ -6539,6 +6913,67 @@ path = "{trigger_path}"
                 .is_empty(),
             "rotate=all must clear the device registry"
         );
+    }
+
+    /// The admin rotate paths dropped while they wait for the config write
+    /// lock, as the gateway's request timeout drops them, must leave every
+    /// device row and token in place, and the retried request revokes them.
+    #[tokio::test]
+    async fn admin_paircode_rotate_dropped_while_waiting_can_be_retried() {
+        for target in ["dev-a", "all"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let state = admin_paircode_state(&tmp, true, true);
+            let token_a = pair_device(&state, "dev-a").await;
+            let token_b = pair_device(&state, "dev-b").await;
+            let listed = |state: &AppState| -> Vec<String> {
+                let mut ids: Vec<String> = state
+                    .device_registry
+                    .as_ref()
+                    .unwrap()
+                    .list()
+                    .expect("test device registry list")
+                    .into_iter()
+                    .map(|device| device.id)
+                    .collect();
+                ids.sort();
+                ids
+            };
+            let call = |state: AppState| {
+                handle_admin_paircode_new(
+                    State(state.clone()),
+                    test_connect_info(),
+                    admin_headers(&state),
+                    Query(AdminPaircodeQuery {
+                        rotate: Some(target.into()),
+                    }),
+                )
+            };
+
+            let in_flight = state.config_authority.lock_config_writer().await;
+            let mut waiting = Box::pin(call(state.clone()));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(
+                std::future::Future::poll(waiting.as_mut(), &mut cx).is_pending(),
+                "{target}: the rotation must wait for the config write lock"
+            );
+            drop(waiting);
+            drop(in_flight);
+
+            assert_eq!(listed(&state), vec!["dev-a", "dev-b"], "{target}");
+            assert!(state.pairing.is_authenticated(&token_a), "{target}");
+            assert!(state.pairing.is_authenticated(&token_b), "{target}");
+
+            let (status, _) = admin_paircode_response_json(call(state.clone()).await).await;
+            assert_eq!(status, StatusCode::OK, "{target}: the retry");
+            assert!(!state.pairing.is_authenticated(&token_a), "{target}");
+            if target == "all" {
+                assert!(listed(&state).is_empty());
+                assert!(!state.pairing.is_authenticated(&token_b));
+            } else {
+                assert_eq!(listed(&state), vec!["dev-b"]);
+                assert!(state.pairing.is_authenticated(&token_b));
+            }
+        }
     }
 
     #[tokio::test]
@@ -7383,6 +7818,20 @@ path = "{trigger_path}"
         tls: Option<(&std::path::Path, &std::path::Path)>,
         event_bus: Option<zeroclaw_runtime::observability::EventBus>,
     ) -> (
+        std::net::SocketAddr,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        start_drain_test_gateway_with_release(data, port, tls, event_bus, None).await
+    }
+
+    async fn start_drain_test_gateway_with_release(
+        data: &std::path::Path,
+        port: u16,
+        tls: Option<(&std::path::Path, &std::path::Path)>,
+        event_bus: Option<zeroclaw_runtime::observability::EventBus>,
+        released: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> (
         SocketAddr,
         tokio::sync::watch::Sender<bool>,
         tokio::task::JoinHandle<Result<()>>,
@@ -7417,21 +7866,25 @@ path = "{trigger_path}"
             reload_tx,
         );
         let server = zeroclaw_spawn::spawn!(async move {
-            run_gateway(
-                "127.0.0.1",
-                port,
-                config,
-                event_bus,
-                Some(controls),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(readiness),
-            )
-            .await
+            LISTENER_RELEASED
+                .scope(std::cell::RefCell::new(released), async move {
+                    run_gateway(
+                        "127.0.0.1",
+                        port,
+                        config,
+                        event_bus,
+                        Some(controls),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(readiness),
+                    )
+                    .await
+                })
+                .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             ready_rx.wait_for(Option::is_some).await.unwrap();
@@ -7658,6 +8111,66 @@ path = "{trigger_path}"
             Arc::strong_count(&owned),
             1,
             "a stream task outlived its gateway's retirement"
+        );
+    }
+
+    /// Each connection, and each stream hyper hands to the executor, is a task
+    /// of the set. Their spawn and completion are recorded at DEBUG, so the
+    /// runtime trace, recorded at INFO by default, does not get a pair of
+    /// records for every connection.
+    #[test]
+    fn serve_tasks_record_their_lifecycle_below_info() {
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+        let test_case = "serve-tasks-lifecycle-level";
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(::zeroclaw_log::scope!(test_case: test_case, => async {
+            let tasks = ServeTasks::default();
+            tasks.spawn(async {});
+            hyper::rt::Executor::execute(&tasks, async {});
+            tasks.idle().await;
+        }));
+        drop(runtime);
+
+        let mut records = Vec::new();
+        loop {
+            let event = match receiver.try_recv() {
+                Ok(event) => event,
+                // Other tests log into the same capture; a lagged receiver
+                // has only dropped older events, so keep reading.
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            };
+            if event
+                .pointer("/attributes/test_case")
+                .and_then(|v| v.as_str())
+                == Some(test_case)
+                && event.pointer("/attributes/task_site").is_some()
+            {
+                records.push(format!(
+                    "{} {}",
+                    event["severity_text"].as_str().unwrap_or_default(),
+                    event["message"].as_str().unwrap_or_default()
+                ));
+            }
+        }
+        zeroclaw_log::clear_broadcast_hook();
+
+        records.sort();
+        assert_eq!(
+            records,
+            [
+                "DEBUG task complete",
+                "DEBUG task complete",
+                "DEBUG task spawned",
+                "DEBUG task spawned",
+            ],
+            "a connection's or stream's task lifecycle must stay out of the INFO trace"
         );
     }
 
@@ -8610,10 +9123,11 @@ path = "{trigger_path}"
     }
 
     /// A stopped gateway lets go of its port as soon as it stops accepting,
-    /// as `axum::serve` does, so a fresh connection is refused rather than
-    /// left in a backlog nothing serves, even while the drain still holds a
-    /// response in flight. The next gateway then takes the port. Over plain
-    /// HTTP and TLS.
+    /// as `axum::serve` does, even while the drain still holds a response in
+    /// flight: the listener is dropped within the drain, and the next
+    /// gateway then takes the port. Off Windows, a fresh connection made
+    /// during the drain is also seen to be refused rather than left in a
+    /// backlog nothing serves. Over plain HTTP and TLS.
     #[tokio::test]
     async fn a_stopped_gateway_releases_its_port_before_its_drain_ends() {
         let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
@@ -8623,11 +9137,13 @@ path = "{trigger_path}"
             let certs = over_tls.then_some((cert_path.as_path(), key_path.as_path()));
             let tls = over_tls.then_some(&connector);
             let label = if over_tls { "tls" } else { "plain" };
-            let (addr, shutdown_tx, server) = start_drain_test_gateway_with(
+            let (released_tx, released_rx) = tokio::sync::oneshot::channel();
+            let (addr, shutdown_tx, server) = start_drain_test_gateway_with_release(
                 &tmp.path().join(format!("{label}-first")),
                 0,
                 certs,
                 None,
+                Some(released_tx),
             )
             .await;
             let mut streaming = drain_test_connect(addr, tls).await;
@@ -8635,19 +9151,31 @@ path = "{trigger_path}"
             assert!(head.starts_with("HTTP/1.1 200"), "{label}: {head}");
 
             shutdown_tx.send(true).unwrap();
-            let released = tokio::time::timeout(std::time::Duration::from_millis(150), async {
-                loop {
-                    match tokio::net::TcpStream::connect(addr).await {
-                        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break,
-                        _ => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+            // Observe the owned listener's release, not the peer's retry
+            // timer: Windows may defer a refused TCP connect beyond the whole
+            // drain. The signal is in-process, so the drain bounds it.
+            tokio::time::timeout(CONNECTION_DRAIN, released_rx)
+                .await
+                .expect("the listener is released before the drain ends")
+                .expect("the listener release is reported");
+            // Where a refused connect is reported promptly, also see the
+            // release from the client side.
+            #[cfg(not(windows))]
+            {
+                let refused = tokio::time::timeout(std::time::Duration::from_millis(150), async {
+                    loop {
+                        match tokio::net::TcpStream::connect(addr).await {
+                            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => break,
+                            _ => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                        }
                     }
-                }
-            })
-            .await;
-            assert!(
-                released.is_ok(),
-                "{label}: the stopped gateway still held its port while it drained"
-            );
+                })
+                .await;
+                assert!(
+                    refused.is_ok(),
+                    "{label}: the stopped gateway still held its port while it drained"
+                );
+            }
             assert!(
                 !server.is_finished(),
                 "{label}: the drain still holds the event stream"
@@ -9384,11 +9912,83 @@ path = "{trigger_path}"
         let mut headers = HeaderMap::new();
         headers.insert(
             "X-Forwarded-For",
+            // Client-supplied leftmost entry, then the address the immediate
+            // proxy appended (rightmost).
             HeaderValue::from_static("198.51.100.10, 203.0.113.11"),
         );
 
         let key = client_key_from_request(Some(peer), &headers, true);
+        assert_eq!(key, "203.0.113.11");
+    }
+
+    #[test]
+    fn client_key_preserves_proxy_suffix_after_opaque_xff_prefix() {
+        let peer = SocketAddr::from(([127, 0, 0, 1], 42617));
+        for value in [
+            &b"\x80, 198.51.100.10"[..],
+            &b"\x80, 198.51.100.10, 127.0.0.1"[..],
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("X-Forwarded-For", HeaderValue::from_bytes(value).unwrap());
+            assert_eq!(
+                client_key_from_request(Some(peer), &headers, true),
+                "198.51.100.10"
+            );
+            assert_eq!(
+                client_key_from_request(Some(peer), &headers, false),
+                "127.0.0.1"
+            );
+        }
+    }
+
+    #[test]
+    fn client_key_ignores_spoofed_loopback_forwarded_header() {
+        let peer = SocketAddr::from(([203, 0, 113, 50], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-For", HeaderValue::from_static("127.0.0.1"));
+
+        let key = client_key_from_request(Some(peer), &headers, true);
+        assert_eq!(key, "203.0.113.50");
+    }
+
+    #[test]
+    fn client_key_skips_rightmost_loopback_for_earlier_xff_hop() {
+        // Same-host proxy chain: immediate hop appended loopback; the real
+        // caller remains further left. Must not fall back to a loopback peer
+        // (that would grant the local-only limiter exemption).
+        let peer = SocketAddr::from(([127, 0, 0, 1], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Forwarded-For",
+            HeaderValue::from_static("198.51.100.10, 127.0.0.1"),
+        );
+
+        let key = client_key_from_request(Some(peer), &headers, true);
         assert_eq!(key, "198.51.100.10");
+    }
+
+    #[test]
+    fn client_key_loopback_only_xff_with_loopback_peer_is_non_exempt() {
+        let peer = SocketAddr::from(([127, 0, 0, 1], 42617));
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Forwarded-For", HeaderValue::from_static("127.0.0.1"));
+
+        let key = client_key_from_request(Some(peer), &headers, true);
+        assert_eq!(key, "unknown");
+    }
+
+    #[test]
+    fn request_is_local_matches_rate_limit_loopback_exemption() {
+        let loopback = SocketAddr::from(([127, 0, 0, 1], 42617));
+        let remote = SocketAddr::from(([203, 0, 113, 50], 42617));
+        let mut forwarded_loopback = HeaderMap::new();
+        forwarded_loopback.insert("X-Forwarded-For", HeaderValue::from_static("127.0.0.1"));
+
+        assert!(request_is_local(Some(loopback), &HeaderMap::new(), true));
+        assert!(request_is_local(Some(loopback), &HeaderMap::new(), false));
+        assert!(!request_is_local(Some(loopback), &forwarded_loopback, true));
+        assert!(!request_is_local(Some(remote), &forwarded_loopback, true));
+        assert!(!request_is_local(Some(remote), &HeaderMap::new(), true));
     }
 
     #[test]
@@ -10333,6 +10933,7 @@ path = "{trigger_path}"
             Ok(Json(WebhookBody {
                 message: "transport overlap".to_string(),
                 stream: true,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -10448,6 +11049,7 @@ path = "{trigger_path}"
             Ok(Json(WebhookBody {
                 message: message.to_string(),
                 stream: true,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -10473,6 +11075,44 @@ data: [DONE]\n\n";
     const PRODUCTION_FIXTURE_FINAL_STREAM: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"final answer\"}}]}\n\n\
 data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
 data: [DONE]\n\n";
+
+    /// Answers once the test releases it, and records that it did: a turn
+    /// that outlives its viewer can be shown to run to completion.
+    struct GatedProvider {
+        release: Arc<tokio::sync::Notify>,
+        completed: Arc<std::sync::atomic::AtomicUsize>,
+        reply: String,
+    }
+
+    #[async_trait]
+    impl ModelProvider for GatedProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.release.notified().await;
+            self.completed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.reply.clone())
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for GatedProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "GatedProvider"
+        }
+    }
 
     struct HangingProvider;
 
@@ -10691,6 +11331,7 @@ data: [DONE]\n\n";
         let body = Ok(Json(WebhookBody {
             message: "sse cumulative hello".into(),
             stream: true,
+            continue_on_disconnect: false,
         }));
 
         let response = handle_webhook(
@@ -10740,6 +11381,7 @@ data: [DONE]\n\n";
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
             stream: true,
+            continue_on_disconnect: false,
         }));
 
         let response = handle_webhook(
@@ -10770,6 +11412,7 @@ data: [DONE]\n\n";
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
             stream: true,
+            continue_on_disconnect: false,
         }));
 
         let state_for_task = state.clone();
@@ -10866,8 +11509,185 @@ data: [DONE]\n\n";
     }
 
     #[tokio::test]
-    async fn webhook_sse_body_drop_cancels_turn() {
+    async fn webhook_sse_anonymous_body_drop_cancels_turn() {
+        // Without `X-Session-Id` the turn runs under a key the client never
+        // learns and sets no memory session, so nobody could abort it or read
+        // its result: the body owns it, and dropping the body cancels at once.
         let state = sse_test_state(Arc::new(HangingProvider));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+                stream: true,
+                continue_on_disconnect: false,
+            })),
+        )
+        .await;
+        let token = {
+            let tokens = state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock poisoned");
+            assert_eq!(tokens.len(), 1, "one generated key: {:?}", tokens.keys());
+            tokens.values().next().cloned().expect("registered token")
+        };
+
+        drop(response);
+
+        tokio::time::timeout(Duration::from_secs(1), token.cancelled())
+            .await
+            .expect("dropping an anonymous SSE body must cancel its turn");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .is_empty()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the cancelled anonymous turn must release its token"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_body_drop_cancels_turn() {
+        // The contract streamed webhook callers have always had: a named
+        // session alone does not opt into unattended execution, so dropping
+        // the body cancels the turn and releases its token.
+        let state = sse_test_state(Arc::new(HangingProvider));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert("X-Session-Id", HeaderValue::from_static("sse-drop-default"));
+
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+                stream: true,
+                continue_on_disconnect: false,
+            })),
+        )
+        .await;
+        let token = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .get("gw_sse-drop-default")
+            .cloned()
+            .expect("streamed turn must register its cancellation token");
+
+        drop(response);
+
+        tokio::time::timeout(Duration::from_secs(1), token.cancelled())
+            .await
+            .expect("dropping the SSE body must cancel the in-flight turn");
+        assert!(
+            !state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock poisoned")
+                .contains_key("gw_sse-drop-default"),
+            "dropping the SSE body must remove its cancellation token"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_continue_on_disconnect_requires_session_id() {
+        // Nobody could abort a detached turn without a session, so the opt-in
+        // is refused up front instead of being silently ignored.
+        let state = sse_test_state(Arc::new(HangingProvider));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("retry-key"));
+
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+                stream: true,
+                continue_on_disconnect: true,
+            })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock poisoned")
+                .is_empty(),
+            "a refused request must not start a turn"
+        );
+
+        // The refusal happens before the idempotency key is reserved, so a
+        // corrected retry under the same key runs instead of being answered
+        // as a duplicate.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("retry-key"));
+        headers.insert("X-Session-Id", HeaderValue::from_static("sse-retry"));
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+                stream: true,
+                continue_on_disconnect: true,
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            state
+                .cancel_tokens
+                .lock()
+                .expect("cancel_tokens lock poisoned")
+                .contains_key("gw_sse-retry"),
+            "the corrected retry must start a streamed turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_body_drop_detaches_turn_which_runs_to_completion() {
+        // The body is a viewer of the turn, not its owner: dropping it must
+        // not cancel the turn, and the token must stay registered so the
+        // abort endpoint still reaches the detached turn until it ends.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = sse_test_state(Arc::new(GatedProvider {
+            release: Arc::clone(&release),
+            completed: Arc::clone(&completed),
+            reply: "gated ok".into(),
+        }));
         let mut headers = HeaderMap::new();
         headers.insert(
             header::ACCEPT,
@@ -10883,6 +11703,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "hello".into(),
                 stream: true,
+                continue_on_disconnect: true,
             })),
         )
         .await;
@@ -10896,17 +11717,158 @@ data: [DONE]\n\n";
 
         drop(response);
 
-        tokio::time::timeout(Duration::from_secs(1), token.cancelled())
-            .await
-            .expect("dropping the SSE body must cancel the in-flight turn");
         assert!(
-            !state
+            tokio::time::timeout(Duration::from_millis(300), token.cancelled())
+                .await
+                .is_err(),
+            "dropping the SSE body must not cancel the in-flight turn"
+        );
+        assert!(
+            state
                 .cancel_tokens
                 .lock()
                 .expect("cancel_tokens lock poisoned")
                 .contains_key("gw_sse-drop"),
-            "dropping the SSE body must remove its cancellation token"
+            "the detached turn stays abortable while it runs"
         );
+        assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        release.notify_one();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .contains_key("gw_sse-drop")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the detached turn must finish and release its token"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the turn ran to completion with nobody listening"
+        );
+        assert!(!token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_detached_turn_drains_events_past_the_queue() {
+        // Once the viewer is gone the relay must keep reading the turn's
+        // events: the event queue holds 64, so a turn that emits more than
+        // that would block on a relay that stopped after the first failed
+        // frame, and never finish.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = sse_test_state(Arc::new(GatedProvider {
+            release: Arc::clone(&release),
+            completed: Arc::clone(&completed),
+            reply: "line\n".repeat(200),
+        }));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert("X-Session-Id", HeaderValue::from_static("sse-flood"));
+
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+                stream: true,
+                continue_on_disconnect: true,
+            })),
+        )
+        .await;
+        let token = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .get("gw_sse-flood")
+            .cloned()
+            .expect("streamed turn must register its cancellation token");
+
+        drop(response);
+        release.notify_one();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .contains_key("gw_sse-flood")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "a detached turn emitting more events than the queue holds must still finish"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(completed.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!token.is_cancelled());
+        assert_eq!(
+            sse_test_events_delivered("sse-flood"),
+            200,
+            "every event must reach the relay: a receiver closed early fails sends"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_detached_turn_still_stops_on_abort() {
+        // After the viewer is gone, the explicit abort path is the one way
+        // to end the turn, exactly as for a detached WebSocket.
+        let state = sse_test_state(Arc::new(HangingProvider));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert("X-Session-Id", HeaderValue::from_static("sse-abort"));
+
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+                stream: true,
+                continue_on_disconnect: true,
+            })),
+        )
+        .await;
+        let token = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .get("gw_sse-abort")
+            .cloned()
+            .expect("streamed turn must register its cancellation token");
+        drop(response);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!token.is_cancelled(), "a dropped body does not cancel");
+
+        token.cancel();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .contains_key("gw_sse-abort")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "an aborted detached turn must release its token"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]
@@ -10924,6 +11886,7 @@ data: [DONE]\n\n";
                 Ok(Json(WebhookBody {
                     message: "hello".into(),
                     stream: true,
+                    continue_on_disconnect: false,
                 })),
             )
         };
@@ -11542,6 +12505,7 @@ data: [DONE]\n\n";
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
             stream: false,
+            continue_on_disconnect: false,
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -11557,6 +12521,7 @@ data: [DONE]\n\n";
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
             stream: false,
+            continue_on_disconnect: false,
         }));
         let second = handle_webhook(
             State(state),
@@ -11754,6 +12719,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "deploy".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -11774,6 +12740,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "chat instead".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -11808,6 +12775,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "chat".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -12021,6 +12989,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "deploy".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -12165,6 +13134,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "hello".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -12311,6 +13281,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "deploy".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -12373,6 +13344,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "deploy".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -12471,6 +13443,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "hello".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -12590,6 +13563,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "hello".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -12687,6 +13661,7 @@ data: [DONE]\n\n";
         let body1 = Ok(Json(WebhookBody {
             message: "hello one".into(),
             stream: false,
+            continue_on_disconnect: false,
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -12702,6 +13677,7 @@ data: [DONE]\n\n";
         let body2 = Ok(Json(WebhookBody {
             message: "hello two".into(),
             stream: false,
+            continue_on_disconnect: false,
         }));
         let second = handle_webhook(
             State(state),
@@ -12898,6 +13874,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "hello".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -12993,6 +13970,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "hello".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await
@@ -13084,6 +14062,7 @@ data: [DONE]\n\n";
             Ok(Json(WebhookBody {
                 message: "hello".into(),
                 stream: false,
+                continue_on_disconnect: false,
             })),
         )
         .await

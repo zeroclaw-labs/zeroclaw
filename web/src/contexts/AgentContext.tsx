@@ -3,10 +3,19 @@ import type {
   ApprovalDecision,
   PendingApproval,
   SessionMessagesResponse,
+  SessionStateResponse,
   WsMessage,
 } from '@/types/api';
-import { WS_CLOSE_ACCESS_LOST, WS_CLOSE_SESSION_ENDED, WebSocketClient } from '@/lib/ws';
+import {
+  WS_CLOSE_ACCESS_LOST,
+  WS_CLOSE_CONVERSATION_CLOSED,
+  WS_CLOSE_CONVERSATION_LIMIT,
+  WS_CLOSE_SESSION_ENDED,
+  WebSocketClient,
+} from '@/lib/ws';
 import { getActiveSessionId, newSessionId, setActiveSessionId } from '@/lib/chatSessions';
+import { getOidcSession } from '@/lib/auth';
+import { navAccessFor } from '@/lib/navAccess';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
 import {
@@ -18,6 +27,7 @@ import {
   listProps,
   getStatus,
   getSessionMessages,
+  getSessionState,
   abortSession,
   deleteSession,
   renameSession,
@@ -27,6 +37,7 @@ import { resolveAvailableModels } from './modelPicker.logic';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import { resolveToolResultIndex } from '@/lib/toolCardMatch';
 import {
+  errorEndsTurn,
   initialTurnStreamState,
   reduceTurnFrame,
   type TurnStreamFrame,
@@ -36,7 +47,10 @@ import { buildHistoryTrimmedNotice } from '@/contexts/historyTrimNotices.logic';
 import { uncommittedLocalTail } from '@/contexts/chatHydration.logic';
 import {
   EMPTY_CONTEXT_LIMITS,
+  EMPTY_CONTEXT_INPUT,
+  applyHistoryTrimToDisplayedBudget,
   contextLimitsFromDoneFrame,
+  contextInputFromDoneFrame,
 } from '@/contexts/contextLimits.logic';
 import {
   loadChatHistory,
@@ -48,6 +62,8 @@ import {
 } from '@/lib/chatHistoryStorage';
 
 export interface ChatMessage {
+  /** Materialized from persisted history; not a newly completed live reply. */
+  fromHistory?: boolean;
   id: string;
   role: 'user' | 'agent';
   content: string;
@@ -75,7 +91,21 @@ export interface ChatMessage {
 export interface AgentContextValue {
   messages: ChatMessage[];
   sendMessage: (content: string) => void;
+  /** Ready to send; a per-socket conversation first waits for `session_start`. */
   connected: boolean;
+  /** The gateway refused this conversation at the account's conversation limit;
+   * the socket stays closed until `retryConnection`. */
+  conversationLimited: boolean;
+  retryConnection: () => void;
+  /** Each socket is a conversation of its own (see `conversationPerSocket`):
+   * no history to load, no conversation list, nothing to resume. */
+  conversationPerSocket: boolean;
+  /** No conversation is open: the next message starts one on a new socket. */
+  startsConversationOnSend: boolean;
+  /** A message whose socket closed before its conversation started, so it
+   * never left the page: the composer takes it back (`takeUnsentMessage`). */
+  unsentMessage: string | null;
+  takeUnsentMessage: () => void;
   error: string | null;
   typing: boolean;
   streamingContent: string;
@@ -131,6 +161,7 @@ export interface AgentContextValue {
   contextMaxTokens: number | null;
   contextModelWindow: number | null;
   contextInputTokens: number | null;
+  contextInputTokensSource: string | null;
 }
 
 const AgentContext = createContext<AgentContextValue | null>(null);
@@ -156,6 +187,29 @@ function friendlyAgentError(message?: string): string {
     return `${displayProvider} is unreachable at ${url}. Start the local provider service, confirm it serves ${model}, then try again.`;
   }
   return raw;
+}
+
+/**
+ * Whether this browser may keep and show its own copy of transcripts. An
+ * account without the operator dashboard chats through the core, which keeps
+ * its conversations only while its sign-in lasts and shows them to it alone:
+ * a local copy would outlive them, and another account on this browser could
+ * read it. The server is that account's only history.
+ */
+function keepsLocalTranscripts(): boolean {
+  return navAccessFor(getOidcSession()).operatorPages && !conversationPerSocket();
+}
+
+/**
+ * Whether each chat socket is one conversation. A signed-in session whose chat
+ * goes through the core (every account without the operator dashboard) gets a
+ * new, empty conversation from each socket, and it ends when the socket
+ * closes: the core keeps nothing this page can load, list or reopen.
+ */
+function conversationPerSocket(): boolean {
+  const session = getOidcSession();
+  return session !== null
+    && (session.features.core_sessions === true || !navAccessFor(session).operatorPages);
 }
 
 export interface AgentProviderProps {
@@ -196,8 +250,14 @@ export interface SessionSocket {
 }
 
 export interface AgentSessionRuntime {
-  createSocket(options: { agentAlias: string; sessionId: string }): SessionSocket;
+  createSocket(options: {
+    agentAlias: string;
+    sessionId: string;
+    autoReconnect?: boolean;
+  }): SessionSocket;
   getMessages(sessionId: string): Promise<SessionMessagesResponse>;
+  /** Whether the session's turn is still running on the gateway. */
+  getState(sessionId: string, signal?: AbortSignal): Promise<SessionStateResponse>;
   delete(sessionId: string): Promise<{ deleted: boolean }>;
   rename(sessionId: string, name: string): Promise<{ session_id: string; name: string }>;
   mintId(): string;
@@ -206,10 +266,37 @@ export interface AgentSessionRuntime {
 const defaultSessionRuntime: AgentSessionRuntime = {
   createSocket: (options) => new WebSocketClient(options),
   getMessages: getSessionMessages,
+  getState: getSessionState,
   delete: deleteSession,
   rename: renameSession,
   mintId: newSessionId,
 };
+
+/** How often a page that shows a turn running on the gateway, but not on its
+ * own socket, asks whether that turn has ended. */
+export const DETACHED_TURN_POLL_MS = 2_000;
+
+/** How long one such check may take. A check without an answer by then reads
+ * as "not running", like a failed one, so a stuck request cannot keep the page
+ * waiting on it. */
+export const STATE_CHECK_TIMEOUT_MS = 10_000;
+
+/** Resolves after `ms`, or as soon as `signal` aborts. */
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener('abort', done, { once: true });
+  });
+}
 
 /** Shared empty array so panes with no siblings keep a stable context value. */
 const NO_RESERVED_SESSIONS: readonly string[] = [];
@@ -229,6 +316,7 @@ export function AgentProvider({
     () => initialSessionId ?? getActiveSessionId(agentAlias),
   );
   const [messages, setMessages] = useState<ChatMessage[]>(() => {
+    if (!keepsLocalTranscripts()) return [];
     const persisted = loadChatHistory(sessionId);
     return persisted.length > 0 ? persistedToUiMessages(persisted) : [];
   });
@@ -243,6 +331,21 @@ export function AgentProvider({
   // to withhold the controls that would do that.
   const [sessionPersistence, setSessionPersistence] = useState<boolean | null>(null);
   const [connected, setConnected] = useState(false);
+  const [conversationLimited, setConversationLimited] = useState(false);
+  // Fixed for the provider's life: a re-auth as another account reloads.
+  const [perSocket] = useState(conversationPerSocket);
+  // With one conversation per socket, none is open until a message starts
+  // one, and each start opens a new socket (this counter re-runs the socket
+  // effect). Until then the socket effect opens nothing.
+  const [startsConversationOnSend, setStartsConversationOnSend] = useState(perSocket);
+  const [socketGeneration, setSocketGeneration] = useState(0);
+  // The gateway's id for the open conversation (from `session_start`): what
+  // the stop button aborts. The page's own `sessionId` names nothing there.
+  const conversationIdRef = useRef<string | null>(null);
+  // A message that starts a conversation, shown at once and sent once the
+  // conversation exists, so a refusal at the limit can't lose it.
+  const pendingSendRef = useRef<string | null>(null);
+  const [unsentMessage, setUnsentMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [typing, setTyping] = useState(false);
   const [streamingContent, setStreamingContent] = useState('');
@@ -255,10 +358,67 @@ export function AgentProvider({
   // again: the turn may have finished on the server while no socket listened.
   const [transcriptVersion, setTranscriptVersion] = useState(0);
   const resyncOnOpenRef = useRef(false);
+  // Set while the page shows a turn that runs on the gateway but streams to
+  // no socket of this page (its socket closed mid-turn, or the page loaded
+  // while it ran). Aborting it ends the watch without a reload: the next
+  // hydration, a conversation switch or clear, a model switch, unmount and
+  // the close of the socket do that (the reopen reloads and asks again).
+  const detachedTurnWatchRef = useRef<AbortController | null>(null);
+  // The turn the current watch shows, so Stop can tell which turn the gateway
+  // disowned. Set only while `detachedTurnWatchRef` holds the same watch.
+  const watchedTurnRef = useRef<{ watch: AbortController; sid: string; turnId: string } | null>(null);
+  // The watched turn Stop got `no_active_response` for. The gateway also says
+  // that in the moment between a turn's end and its `idle` write, so this is
+  // only a suspicion until two checks that both started after the refusal
+  // still read the same turn running. Only the in-process route can refuse
+  // here: the core's abort, which also says it for a turn it will not stop,
+  // serves scoped accounts only, and their pages are `perSocket` and never
+  // watch a turn.
+  const stopRefusedRef = useRef<
+    { watch: AbortController; turnId: string; confirmations: number } | null
+  >(null);
+  // Turns whose stored state still read `running` after the gateway said it
+  // was not running them (a state write that failed): per conversation, that
+  // turn id. A later load does not lock the composer on that turn again; a
+  // turn with another id still does. Dropped once the conversation reads
+  // anything else.
+  const disownedTurnsRef = useRef(new Map<string, string>());
+  // Set while a hydration may still start such a watch: from its first state
+  // check until it has loaded the transcript. A clear or model switch in that
+  // window aborts it, so a late `running` answer cannot start a watch the
+  // page no longer wants. Kept apart from `detachedTurnWatchRef` because a
+  // conversation switch leaves only a watched turn running.
+  const pendingTurnCheckRef = useRef<AbortController | null>(null);
+  // What the current reload's first state check has said: `pending` until it
+  // answers. During a conversation's first turn the gateway has stored
+  // nothing yet, so a `session_start` reporting no stored messages means the
+  // conversation started over only when no turn is running there.
+  const reloadTurnCheckRef = useRef<
+    { watch: AbortController; state: 'pending' | 'running' | 'idle' } | null
+  >(null);
+  // Set from a reopen until its reload has started that check: a
+  // `session_start` can arrive before the reload has begun.
+  const reloadDueRef = useRef(false);
+  // Conversation whose started-over notice waits for the reload to settle.
+  // A `session_start` reporting no stored messages while the reload's state
+  // check is out, or while a failed load waits for its retry, defers the
+  // decision; that load applies it once the gateway's answer is known.
+  const pendingStartedOverRef = useRef<string | null>(null);
+  // The last definite answer on whether the gateway stores transcripts.
+  // `sessionPersistence` is null again while each reload is in flight, and a
+  // `session_start` arriving then still needs to know.
+  const serverKeepsTranscriptsRef = useRef<boolean | null>(null);
+  // `session_start` frames seen, so a transcript request can tell whether a
+  // socket opened its conversation while the request was out.
+  const sessionStartsRef = useRef(0);
+  // Conversation whose transcript failed to load; its next `session_start`
+  // loads it again.
+  const hydrationFailedRef = useRef<string | null>(null);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   // Context window tracking (from "done" WS frames). See #7311.
   const [contextLimits, setContextLimits] = useState(EMPTY_CONTEXT_LIMITS);
-  const [contextInputTokens, setContextInputTokens] = useState<number | null>(null);
+  // Count and provenance move together, including batched socket frames.
+  const [contextInput, setContextInput] = useState(EMPTY_CONTEXT_INPUT);
 
   const wsRef = useRef<WebSocketClient | null>(null);
   // Canonical per-turn stream state. Every production transition that mutates
@@ -287,9 +447,11 @@ export function AgentProvider({
   const sessionPersistenceRef = useRef(sessionPersistence);
   const typingRef = useRef(typing);
   const sessionRuntimeRef = useRef(sessionRuntime);
+  const messagesRef = useRef(messages);
   activeSessionIdRef.current = sessionId;
   sessionPersistenceRef.current = sessionPersistence;
   typingRef.current = typing;
+  messagesRef.current = messages;
   sessionRuntimeRef.current = sessionRuntime;
 
   // Prime the model-provider catalog once so error formatting can resolve
@@ -298,12 +460,85 @@ export function AgentProvider({
     void primeModelProviderCatalog();
   }, []);
 
+  // The server holds nothing for this page's conversation, yet the transcript
+  // shows messages: the server started it over (it was closed to make room for
+  // another, or a restart ended it). Those messages are no longer its context,
+  // so they must not look like it.
+  const showStartedOver = useCallback(() => {
+    localMessageMutationVersionRef.current += 1;
+    setMessages([
+      {
+        id: generateUUID(),
+        role: 'agent',
+        content: t('agent.conversation_started_over'),
+        timestamp: new Date(),
+        ephemeral: true,
+        notice: true,
+      },
+    ]);
+    setContextInput(EMPTY_CONTEXT_INPUT);
+  }, []);
+
+  // A `session_start` reporting no stored messages cannot tell, on its own,
+  // between a conversation the gateway started over and its first turn still
+  // running (nothing is stored until a turn ends). While the reload is
+  // mid-flight its load makes that call; defer the decision here. Never
+  // defer for a check that already saw a running turn: that conversation is
+  // known to exist and its watch shows the turn.
+  const deferStartedOverDecision = (
+    sid: string | null,
+    reloadDue = false,
+  ): 'deferred' | 'running' | 'now' => {
+    // A check that already confirmed a running turn: the conversation is
+    // known to exist, its watch shows the turn. No notice.
+    if (reloadTurnCheckRef.current?.state === 'running') return 'running';
+    if (
+      sid !== null
+      && (
+        reloadDue
+        || reloadTurnCheckRef.current?.state === 'pending'
+        || hydrationFailedRef.current === sid
+      )
+    ) {
+      pendingStartedOverRef.current = sid;
+      return 'deferred';
+    }
+    // No reload in flight: nothing will answer later, decide now.
+    return 'now';
+  };
+
+  // Apply a deferred notice decision once the load has settled. Whether the
+  // conversation exists is judged from what the load itself saw, so a stale
+  // flag can never invent a notice. True means the notice was shown.
+  const runStartedOverDecision = (
+    sid: string | null,
+    sawStore: boolean,
+    sawMessages: boolean,
+  ): boolean => {
+    const fire = pendingStartedOverRef.current === sid;
+    pendingStartedOverRef.current = null;
+    if (
+      fire
+      && sid !== null
+      && sid === activeSessionIdRef.current
+      && sawStore
+      && !sawMessages
+      && !typingRef.current
+      && messagesRef.current.some((m) => !m.ephemeral)
+    ) {
+      showStartedOver();
+      return true;
+    }
+    return false;
+  };
+
   // Hydrate chat from server (preferred) or localStorage fallback. Re-runs on
   // every session switch, which is what rehydrates the transcript of the
   // conversation the operator just selected.
   useEffect(() => {
     const sid = sessionId;
     const hydrationStartedAtMutationVersion = localMessageMutationVersionRef.current;
+    const sessionStartsAtRequest = sessionStartsRef.current;
     let cancelled = false;
     // This conversation's browser copy, read before the mirror effect can
     // overwrite it: the mirror stays idle until `hydratedSessionId` matches
@@ -311,16 +546,94 @@ export function AgentProvider({
     // still holds a prompt the gateway has not committed yet.
     const browserCopy = persistedToUiMessages(loadChatHistory(sid));
 
+    // Nothing to load: the conversation lives only as long as its socket.
+    if (perSocket) {
+      setSessionPersistence(false);
+      setHydratedSessionId(sid);
+      return;
+    }
+
     // Session management is a capability, not an optimistic default. Every
     // hydration starts unknown and only an affirmative gateway response opens
     // the transition actions.
     setSessionPersistence(null);
     setHydratedSessionId(null);
+    hydrationFailedRef.current = null;
+    if (pendingStartedOverRef.current !== sid) pendingStartedOverRef.current = null;
+    const watch = new AbortController();
+    // Whether the gateway is still running this conversation's turn. Any
+    // failure, including the 404 of a gateway without session persistence,
+    // reads as no: the page then keeps its single transcript load. So does a
+    // check without an answer by its deadline, or one the watch ends: each
+    // check is cancelled and stops being awaited, whatever its request does.
+    let runningTurnId = '';
+    const turnStillRunning = async (): Promise<boolean> => {
+      if (watch.signal.aborted) return false;
+      // Only a check that starts after Stop's refusal may confirm it: one
+      // already out may carry an answer the gateway gave before the turn ended.
+      const refusedAtStart = stopRefusedRef.current;
+      const check = new AbortController();
+      const end = () => check.abort();
+      const deadline = setTimeout(end, STATE_CHECK_TIMEOUT_MS);
+      watch.signal.addEventListener('abort', end);
+      try {
+        const ended = new Promise<never>((_, reject) => {
+          check.signal.addEventListener('abort', () => reject(new Error('state check ended')));
+        });
+        const res = await Promise.race([sessionRuntime.getState(sid, check.signal), ended]);
+        const turnId = res.state === 'running' ? res.turn_id ?? '' : null;
+        const disowned = disownedTurnsRef.current.get(sid);
+        if (disowned !== undefined && disowned !== turnId) disownedTurnsRef.current.delete(sid);
+        if (turnId === null) return false;
+        if (disowned === turnId) return false;
+        if (
+          refusedAtStart
+          && refusedAtStart === stopRefusedRef.current
+          && refusedAtStart.watch === watch
+        ) {
+          if (refusedAtStart.turnId !== turnId) {
+            // Another turn runs now: the refusal was about the one that ended.
+            stopRefusedRef.current = null;
+          } else if (++refusedAtStart.confirmations >= 2) {
+            // Still `running`, twice, after the gateway said it runs no turn
+            // here: the stored state is stale. End the watch like a finished turn.
+            stopRefusedRef.current = null;
+            disownedTurnsRef.current.set(sid, turnId);
+            return false;
+          }
+        }
+        runningTurnId = turnId;
+        if (watchedTurnRef.current?.watch === watch) {
+          watchedTurnRef.current = { watch, sid, turnId };
+        }
+        return true;
+      } catch {
+        return false;
+      } finally {
+        clearTimeout(deadline);
+        watch.signal.removeEventListener('abort', end);
+      }
+    };
 
     (async () => {
+      let watching = false;
+      pendingTurnCheckRef.current = watch;
+      reloadTurnCheckRef.current = { watch, state: 'pending' };
+      reloadDueRef.current = false;
       try {
+        // Ask before loading the transcript. The gateway stores a turn before
+        // it leaves `running`, so a turn that ends after this answer is either
+        // in the transcript or caught by the watch; asked afterwards, a turn
+        // ending between the two reads would leave its answer unloaded.
+        const runningBeforeLoad = await turnStillRunning();
+        if (cancelled) return;
+        reloadTurnCheckRef.current = { watch, state: runningBeforeLoad ? 'running' : 'idle' };
+        // A running turn means the gateway still has the conversation: a
+        // notice deferred before the check answered was about a live turn.
+        if (runningBeforeLoad) pendingStartedOverRef.current = null;
         const res = await sessionRuntime.getMessages(sid);
         if (cancelled) return;
+        serverKeepsTranscriptsRef.current = res.session_persistence;
         setSessionPersistence(res.session_persistence);
         if (res.session_persistence) {
           if (localMessageMutationVersionRef.current === hydrationStartedAtMutationVersion) {
@@ -334,35 +647,98 @@ export function AgentProvider({
             // Keep that uncommitted tail instead of replacing it.
             setMessages([...hydrated, ...uncommittedLocalTail(snapshotUsers, browserCopy)]);
           }
+          // A turn running on the gateway may not be in this snapshot, and its
+          // answer will not reach this page's socket. Show it as running before
+          // the composer unlocks, instead of offering to send into it, unless
+          // a clear or model switch has ended the watch since.
+          if (runningBeforeLoad && !watch.signal.aborted && !typingRef.current) {
+            watching = true;
+            detachedTurnWatchRef.current = watch;
+            watchedTurnRef.current = { watch, sid, turnId: runningTurnId };
+            typingRef.current = true;
+            setTyping(true);
+          }
         } else if (!res.session_persistence) {
           setMessages((prev) => {
-            if (prev.length > 0) return prev;
+            if (prev.length > 0 || !keepsLocalTranscripts()) return prev;
             const ls = loadChatHistory(sid);
             return ls.length ? persistedToUiMessages(ls) : prev;
           });
         }
+        // The notice a `session_start` deferred is judged here, from what
+        // this load itself saw: a store still empty at the end of a check
+        // that found no running turn means the gateway did start over; a
+        // turn that ended during the check is stored by now and loads, no
+        // notice.
+        runStartedOverDecision(
+          sid,
+          res.session_persistence === true,
+          res.messages.length > 0,
+        );
       } catch {
         if (!cancelled) {
+          hydrationFailedRef.current = sid;
           setSessionPersistence(null);
           setMessages((prev) => {
-            if (prev.length > 0) return prev;
+            if (prev.length > 0 || !keepsLocalTranscripts()) return prev;
             const ls = loadChatHistory(sid);
             return ls.length ? persistedToUiMessages(ls) : prev;
           });
+          // A conversation the socket creates isn't on the server until the
+          // socket opens it. If that happened while this request was out, the
+          // refusal may predate it: ask again.
+          if (sessionStartsRef.current !== sessionStartsAtRequest) {
+            // That retry decides a notice deferred to this load.
+            setTranscriptVersion((v) => v + 1);
+          } else {
+            // Nothing retries now, so nothing would decide: drop the deferred
+            // notice rather than let a later load fire it without a fresh
+            // `session_start`. The next `session_start` decides again.
+            pendingStartedOverRef.current = null;
+          }
         }
       } finally {
+        if (pendingTurnCheckRef.current === watch) pendingTurnCheckRef.current = null;
+        if (reloadTurnCheckRef.current?.watch === watch) reloadTurnCheckRef.current = null;
         if (!cancelled) setHydratedSessionId(sid);
       }
+
+      if (!watching) return;
+      // Ask until the turn leaves `running`. The watch ends without a reload
+      // when it is aborted: by the next hydration, a conversation switch or
+      // clear, unmount, or a close of the socket (whose reopen reloads).
+      do {
+        await delay(DETACHED_TURN_POLL_MS, watch.signal);
+        // A check once the watch has ended answers no, without a request.
+      } while (await turnStillRunning());
+      // Aborted while the last check was out: whatever it said is not ours.
+      if (watch.signal.aborted) return;
+      // The gateway leaves `running` only after it has stored the turn, so
+      // this load has the answer.
+      detachedTurnWatchRef.current = null;
+      typingRef.current = false;
+      setTyping(false);
+      setTranscriptVersion((v) => v + 1);
     })();
 
     return () => {
       cancelled = true;
+      watch.abort();
+      // Every path that re-runs this effect mid-watch has already ended the
+      // watch; should one not have, its lock must not outlive it.
+      if (detachedTurnWatchRef.current === watch) {
+        detachedTurnWatchRef.current = null;
+        typingRef.current = false;
+        setTyping(false);
+      }
+      if (watchedTurnRef.current?.watch === watch) watchedTurnRef.current = null;
+      if (stopRefusedRef.current?.watch === watch) stopRefusedRef.current = null;
     };
-  }, [sessionId, sessionRuntime, transcriptVersion]);
+  }, [sessionId, sessionRuntime, transcriptVersion, perSocket, showStartedOver]);
 
   // Mirror transcript to localStorage (bounded); server remains source of truth when persistence is on
   useEffect(() => {
-    if (hydratedSessionId !== sessionId) return;
+    if (hydratedSessionId !== sessionId || !keepsLocalTranscripts()) return;
     saveChatHistory(sessionId, uiMessagesToPersisted(messages));
   }, [messages, hydratedSessionId, sessionId]);
 
@@ -395,7 +771,55 @@ export function AgentProvider({
   // Centralised WebSocket message handler — reused across initial connect and reconnects.
   const handleWsMessage = useCallback((msg: WsMessage) => {
     switch (msg.type) {
-      case 'session_start':
+      case 'session_start': {
+        if (perSocket) {
+          conversationIdRef.current = msg.session_id ?? null;
+          setConnected(true);
+          const pending = pendingSendRef.current;
+          if (pending !== null) {
+            try {
+              wsRef.current?.sendMessage(pending);
+            } catch {
+              // The socket started closing before this start was handled, so
+              // the message never went out. It stays pending: the close that
+              // follows gives it back to the composer, with its notice.
+              break;
+            }
+            pendingSendRef.current = null;
+            setTyping(true);
+            foldTurnStream({ type: 'turn_start' });
+          }
+          break;
+        }
+        sessionStartsRef.current += 1;
+        // The server holds nothing for this socket's conversation, yet the
+        // transcript shows messages: the server started it over (it was
+        // closed to make room for another, or a restart ended it). Those
+        // messages are no longer its context, so they must not look like it.
+        if (
+          serverKeepsTranscriptsRef.current === true
+          && msg.message_count === 0
+          && !typingRef.current
+          && messagesRef.current.some((m) => !m.ephemeral)
+        ) {
+          // A reload whose state check is still out, or a failed load about
+          // to retry, decides once the gateway's answer is known. A check
+          // that already saw a running turn confirms the conversation.
+          if (
+            deferStartedOverDecision(activeSessionIdRef.current, reloadDueRef.current)
+            === 'now'
+          ) {
+            showStartedOver();
+          }
+        }
+        // A transcript that failed to load, typically because the
+        // conversation didn't exist until this socket opened it, loads now.
+        if (hydrationFailedRef.current === activeSessionIdRef.current) {
+          setTranscriptVersion((v) => v + 1);
+        }
+        break;
+      }
+
       case 'connected':
         break;
 
@@ -462,18 +886,7 @@ export function AgentProvider({
         // Extract context window info from "done" frame (sent by gateway).
         if (msg.type === 'done') {
           setContextLimits(contextLimitsFromDoneFrame(msg));
-          // Prefer last_input_tokens (accurate per-turn prompt size) over
-          // accumulated input_tokens for context-bar rendering.
-          // When last_input_tokens is explicitly null, the accepted route has no
-          // usage data; clear the input state and do NOT fall back to the
-          // accumulated input_tokens (which would be stale from a previous route).
-          if (msg.last_input_tokens === null) {
-            setContextInputTokens(null);
-          } else if (typeof msg.last_input_tokens === 'number') {
-            setContextInputTokens(msg.last_input_tokens);
-          } else if (typeof msg.input_tokens === 'number') {
-            setContextInputTokens(msg.input_tokens);
-          }
+          setContextInput((current) => contextInputFromDoneFrame(current, msg));
         }
         setStreamingContent('');
         setStreamingThinking('');
@@ -583,6 +996,10 @@ export function AgentProvider({
 
       case 'history_trimmed': {
         const content = buildHistoryTrimmedNotice(msg, t);
+        // The trim lands after the usage sample the meter last rendered, and
+        // the next refresh is the terminal `done` frame. Adopt the post-trim
+        // count now so the bar does not keep the pre-trim snapshot.
+        setContextInput((current) => applyHistoryTrimToDisplayedBudget(current, msg));
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
           ...prev,
@@ -658,7 +1075,12 @@ export function AgentProvider({
       }
 
       case 'error':
-        const friendlyMessage = friendlyAgentError(msg.message);
+        // The limit line says it, and its Retry sends the waiting message; a
+        // chat bubble would say it twice.
+        if (perSocket && msg.code === 'CONVERSATION_LIMIT') break;
+        const friendlyMessage = msg.code === 'TURN_RESULT_LOST'
+          ? t('agent.turn_result_lost')
+          : friendlyAgentError(msg.message);
         localMessageMutationVersionRef.current += 1;
         setMessages((prev) => [
           ...prev,
@@ -674,6 +1096,8 @@ export function AgentProvider({
         } else if (msg.code === 'INVALID_JSON' || msg.code === 'UNKNOWN_MESSAGE_TYPE' || msg.code === 'EMPTY_CONTENT') {
           setError(`${t('agent.message_error')}: ${msg.message}`);
         }
+        // The refusal is shown above; the turn itself is still running.
+        if (!errorEndsTurn(msg.code)) break;
         setTyping(false);
         foldTurnStream({ type: 'error' });
         setStreamingContent('');
@@ -681,7 +1105,7 @@ export function AgentProvider({
         setPendingApproval(null);
         break;
     }
-  }, [foldTurnStream]);
+  }, [foldTurnStream, perSocket, showStartedOver]);
 
   // Wire up a WebSocketClient instance with version-guarded callbacks.
   const attachSocketCallbacks = useCallback((ws: SessionSocket) => {
@@ -689,10 +1113,13 @@ export function AgentProvider({
 
     ws.onOpen = () => {
       if (version !== wsVersionRef.current) return;
-      setConnected(true);
+      // The transport alone cannot send ahead of a queued first message.
+      setConnected(!perSocket);
+      setConversationLimited(false);
       setError(null);
       if (resyncOnOpenRef.current) {
         resyncOnOpenRef.current = false;
+        reloadDueRef.current = true;
         setTranscriptVersion((v) => v + 1);
       }
 
@@ -742,7 +1169,13 @@ export function AgentProvider({
         setStreamingContent('');
         setStreamingThinking('');
         foldTurnStream({ type: 'reset' });
-        resyncOnOpenRef.current = true;
+        // A turn this page was watching on the gateway: the reopen below
+        // reloads and asks again.
+        detachedTurnWatchRef.current?.abort();
+        detachedTurnWatchRef.current = null;
+        // A socket that is one conversation reopens onto a new one: there is
+        // nothing to catch up on.
+        if (!perSocket) resyncOnOpenRef.current = true;
       }
 
       if (
@@ -765,12 +1198,69 @@ export function AgentProvider({
         return;
       }
 
-      // A signed-in session's close codes are the auth layer's to explain.
+      if (ev.code === WS_CLOSE_CONVERSATION_LIMIT) setConversationLimited(true);
+
+      if (perSocket) {
+        conversationIdRef.current = null;
+        // Refused at the limit, no conversation was created: the waiting
+        // message goes out after Retry.
+        if (ev.code === WS_CLOSE_CONVERSATION_LIMIT) return;
+        const unsent = pendingSendRef.current;
+        pendingSendRef.current = null;
+        setStartsConversationOnSend(true);
+        localMessageMutationVersionRef.current += 1;
+        if (unsent !== null) {
+          // Closed before its conversation started (a restart, the network):
+          // the message never left the page. It goes back to the composer
+          // instead of staying on screen as if it had been sent.
+          setMessages((prev) => {
+            for (let i = prev.length - 1; i >= 0; i -= 1) {
+              const m = prev[i]!;
+              if (m.local && m.role === 'user' && m.content === unsent) {
+                return [...prev.slice(0, i), ...prev.slice(i + 1)];
+              }
+            }
+            return prev;
+          });
+          setUnsentMessage(unsent);
+          // A signed-in session's end is the auth layer's to explain.
+          if (ev.code !== WS_CLOSE_SESSION_ENDED && ev.code !== WS_CLOSE_ACCESS_LOST) {
+            setError(t('agent.send_error'));
+          }
+          return;
+        }
+        // Whatever closed it (a reload, the session ending, the network), the
+        // conversation is over. Its messages stay, marked; the next message
+        // starts a new one.
+        setMessages((prev) => {
+          const last = prev[prev.length - 1];
+          if (!prev.some((m) => !m.ephemeral) || (last?.notice && last.content === t('agent.conversation_ended'))) {
+            return prev;
+          }
+          return [
+            ...prev,
+            {
+              id: generateUUID(),
+              role: 'agent',
+              content: t('agent.conversation_ended'),
+              timestamp: new Date(),
+              ephemeral: true,
+              notice: true,
+            },
+          ];
+        });
+        return;
+      }
+
+      // A signed-in session's close codes are the auth layer's to explain, and
+      // the conversation codes arrive after an error frame that already did.
       if (
         ev.code !== 1000 &&
         ev.code !== 1001 &&
         ev.code !== WS_CLOSE_SESSION_ENDED &&
-        ev.code !== WS_CLOSE_ACCESS_LOST
+        ev.code !== WS_CLOSE_ACCESS_LOST &&
+        ev.code !== WS_CLOSE_CONVERSATION_LIMIT &&
+        ev.code !== WS_CLOSE_CONVERSATION_CLOSED
       ) {
         setError(`${t('agent.connection_closed')} (code: ${ev.code}). ${t('agent.check_configuration')}.`);
       }
@@ -797,14 +1287,16 @@ export function AgentProvider({
       }
       handleWsMessage(msg);
     };
-  }, [handleWsMessage, foldTurnStream]);
+  }, [handleWsMessage, foldTurnStream, perSocket]);
 
   // WebSocket bound to the configured agent and the active conversation.
   // Re-keys (via the outer <AgentProvider key={alias}>) when the alias changes,
   // and re-runs on a session switch so the gateway seeds a fresh Agent from the
   // selected session's persisted history.
   useEffect(() => {
-    const ws = sessionRuntime.createSocket({ agentAlias, sessionId });
+    // One conversation per socket: none opens until a message starts one.
+    if (perSocket && socketGeneration === 0) return;
+    const ws = sessionRuntime.createSocket({ agentAlias, sessionId, autoReconnect: !perSocket });
     // A navigation after the config write creates an equally valid replacement
     // to the one switchModel would build directly. Mark only sockets created
     // after commit; a socket merely opening after commit may still have been
@@ -828,7 +1320,7 @@ export function AgentProvider({
         wsRef.current.disconnect();
       }
     };
-  }, [attachSocketCallbacks, agentAlias, sessionId, sessionRuntime]);
+  }, [attachSocketCallbacks, agentAlias, sessionId, sessionRuntime, perSocket, socketGeneration]);
 
   // Fetch current model and available models from config.
   useEffect(() => {
@@ -845,6 +1337,15 @@ export function AgentProvider({
         if (cancelled) return;
 
         let activeModel = status.model;
+
+        // An account without the operator dashboard can't switch models (the
+        // switch rewrites the agent's config) and may not read the provider
+        // config: show the model the status reports and offer no others.
+        if (!navAccessFor(getOidcSession()).operatorPages) {
+          setCurrentModel(activeModel);
+          setAvailableModels([]);
+          return;
+        }
 
         // Per-agent model (multi-agent / schema V3). The old global `model` /
         // `default_model` keys were removed in V3, so the source of truth is THIS
@@ -906,6 +1407,27 @@ export function AgentProvider({
   }, [modelInfoVersion, agentAlias]);
 
   const sendMessage = useCallback((content: string) => {
+    if (perSocket && pendingSendRef.current !== null) return;
+    if (perSocket && !wsRef.current?.connected) {
+      // No conversation is open: this message starts one on a new socket.
+      pendingSendRef.current = content;
+      setError(null);
+      setConversationLimited(false);
+      setStartsConversationOnSend(false);
+      localMessageMutationVersionRef.current += 1;
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: generateUUID(),
+          role: 'user',
+          content,
+          timestamp: new Date(),
+          local: true,
+        },
+      ]);
+      setSocketGeneration((g) => g + 1);
+      return;
+    }
     if (!wsRef.current?.connected) return;
     try {
       wsRef.current.sendMessage(content);
@@ -926,7 +1448,7 @@ export function AgentProvider({
     } catch {
       setError(t('agent.send_error'));
     }
-  }, [foldTurnStream]);
+  }, [foldTurnStream, perSocket]);
 
   const switchModel = useCallback(async (model: string) => {
     if (modelLoading) return; // debounce
@@ -978,10 +1500,10 @@ export function AgentProvider({
       // down the socket. This prevents the old model from continuing to execute
       // tools or persisting its response into the session after we switch.
       if (typingRef.current) {
-        const sessionToAbort = activeSessionIdRef.current;
+        const sessionToAbort = perSocket ? conversationIdRef.current : activeSessionIdRef.current;
         try {
           await Promise.race([
-            abortSession(sessionToAbort),
+            sessionToAbort ? abortSession(sessionToAbort) : Promise.resolve(),
             new Promise((_, reject) =>
               setTimeout(() => reject(new Error('abort-timeout')), 1_500),
             ),
@@ -999,6 +1521,10 @@ export function AgentProvider({
       setStreamingThinking('');
       setTyping(false);
       typingRef.current = false;
+      detachedTurnWatchRef.current?.abort();
+      detachedTurnWatchRef.current = null;
+      pendingTurnCheckRef.current?.abort();
+      pendingTurnCheckRef.current = null;
       // The old socket's request_id no longer maps to anything on the server
       // after we tear it down. Clear here explicitly because we null out the
       // old socket's callbacks below, so its onClose will not fire to do it.
@@ -1025,6 +1551,7 @@ export function AgentProvider({
       const ws = sessionRuntimeRef.current.createSocket({
         agentAlias,
         sessionId: activeSessionIdRef.current,
+        autoReconnect: !perSocket,
       });
       // Point wsRef at the NEW client before connect(), so a synchronous
       // connect() throw (e.g. an invalid WebSocket URL/protocol token) still
@@ -1051,7 +1578,7 @@ export function AgentProvider({
       setModelLoading(false);
       setError(err instanceof Error ? err.message : t('agent.failed_switch_model'));
     }
-  }, [attachSocketCallbacks, modelLoading, typing, agentAlias, foldTurnStream]);
+  }, [attachSocketCallbacks, modelLoading, typing, agentAlias, foldTurnStream, perSocket]);
 
   const deleteMessage = useCallback((id: string) => {
     localMessageMutationVersionRef.current += 1;
@@ -1066,6 +1593,10 @@ export function AgentProvider({
    */
   const resetTranscriptState = useCallback(() => {
     localMessageMutationVersionRef.current += 1;
+    detachedTurnWatchRef.current?.abort();
+    detachedTurnWatchRef.current = null;
+    pendingTurnCheckRef.current?.abort();
+    pendingTurnCheckRef.current = null;
     setMessages([]);
     foldTurnStream({ type: 'reset' });
     setStreamingContent('');
@@ -1075,11 +1606,33 @@ export function AgentProvider({
     // Context-window figures describe the transcript we just dropped; leaving
     // them would show the outgoing conversation's token usage against an empty
     // one until the next `done` frame refreshes them.
-    setContextInputTokens(null);
+    setContextInput(EMPTY_CONTEXT_INPUT);
   }, [foldTurnStream]);
 
   const clearAllMessages = useCallback(() => {
     resetTranscriptState();
+
+    if (perSocket) {
+      // A new conversation: close this one (the gateway closes it with its
+      // socket) and wait for the message that starts the next. Nothing is
+      // deleted.
+      pendingSendRef.current = null;
+      conversationIdRef.current = null;
+      setConversationLimited(false);
+      setError(null);
+      const oldWs = wsRef.current;
+      if (oldWs) {
+        oldWs.onOpen = null;
+        oldWs.onClose = null;
+        oldWs.onError = null;
+        oldWs.onMessage = null;
+        oldWs.disconnect();
+      }
+      wsRef.current = null;
+      setConnected(false);
+      setStartsConversationOnSend(true);
+      return;
+    }
 
     const sid = activeSessionIdRef.current;
     // Socket identity at the moment of the clear. If it changes while the
@@ -1124,6 +1677,7 @@ export function AgentProvider({
         const ws = sessionRuntimeRef.current.createSocket({
           agentAlias,
           sessionId: activeSessionIdRef.current,
+          autoReconnect: !perSocket,
         });
         // Assign wsRef before connect() so a synchronous throw can't strand the
         // page on the old intentionally-closed socket (see switchModel).
@@ -1132,7 +1686,7 @@ export function AgentProvider({
         ws.connect();
       }
     })();
-  }, [agentAlias, attachSocketCallbacks, foldTurnStream]);
+  }, [agentAlias, attachSocketCallbacks, foldTurnStream, perSocket]);
 
   const addLocalMessage = useCallback((content: string) => {
     localMessageMutationVersionRef.current += 1;
@@ -1167,7 +1721,10 @@ export function AgentProvider({
     // conversation no longer exists, so staying put is not a valid fallback.
     if (!force && sessionPersistenceRef.current !== true) return false;
 
-    if (typingRef.current) {
+    // A turn streaming on this page's socket is aborted. A detached turn the
+    // page only watches was never this page's to stop: it kept running when
+    // its socket went, and keeps running when the page moves on.
+    if (typingRef.current && !detachedTurnWatchRef.current) {
       void abortSession(currentSessionId).catch(() => {
         // Best-effort: never block the switch on a failed abort.
       });
@@ -1203,11 +1760,16 @@ export function AgentProvider({
 
   /** Start an additional conversation, leaving the current one intact. */
   const startNewSession = useCallback((): boolean => {
+    // One conversation per socket: a new one is the next socket.
+    if (perSocket) {
+      clearAllMessages();
+      return true;
+    }
     // Do not even mint an unreachable id until the shared transition gate is
     // open. goToSession rechecks the capability before mutating state.
     if (sessionPersistenceRef.current !== true) return false;
     return transitionToSession(sessionRuntimeRef.current.mintId());
-  }, [transitionToSession]);
+  }, [transitionToSession, perSocket, clearAllMessages]);
 
   /**
    * Drop a stored conversation. Deleting the one on screen leaves nothing to
@@ -1263,10 +1825,23 @@ export function AgentProvider({
     });
   }, []);
 
+  const takeUnsentMessage = useCallback(() => setUnsentMessage(null), []);
+
+  const retryConnection = useCallback(() => {
+    setConversationLimited(false);
+    wsRef.current?.connect();
+  }, []);
+
   const value: AgentContextValue = {
     messages,
     sendMessage,
     connected,
+    conversationLimited,
+    retryConnection,
+    conversationPerSocket: perSocket,
+    startsConversationOnSend,
+    unsentMessage,
+    takeUnsentMessage,
     error,
     typing,
     streamingContent,
@@ -1293,10 +1868,28 @@ export function AgentProvider({
       // backend on a late click anyway. Don't wait for the `aborted` frame
       // to round-trip; the user clicked Stop and expects the UI to follow.
       setPendingApproval(null);
+      const target = perSocket ? conversationIdRef.current : sessionId;
+      if (!target) return;
+      const watched = watchedTurnRef.current;
+      let status: string | undefined;
       try {
-        await abortSession(sessionId);
+        status = (await abortSession(target))?.status;
       } catch {
         // Best-effort abort
+      }
+      // The gateway runs no turn for a page that only watches one. Either the
+      // turn has just ended, and the watch's next check sees it leave
+      // `running`, or its stored state is stale, and that check ends the watch.
+      // A turn without an id cannot be told apart from the next one, so it
+      // is never suspected.
+      if (
+        status === 'no_active_response'
+        && watched
+        && watched.turnId !== ''
+        && detachedTurnWatchRef.current === watched.watch
+        && stopRefusedRef.current?.watch !== watched.watch
+      ) {
+        stopRefusedRef.current = { watch: watched.watch, turnId: watched.turnId, confirmations: 0 };
       }
     },
     pendingApproval,
@@ -1304,7 +1897,8 @@ export function AgentProvider({
     // Context window tracking (from "done" WS frames). See #7311.
     contextMaxTokens: contextLimits.maxTokens,
     contextModelWindow: contextLimits.modelWindow,
-    contextInputTokens,
+    contextInputTokens: contextInput.inputTokens,
+    contextInputTokensSource: contextInput.source,
   };
 
   return <AgentContext.Provider value={value}>{children}</AgentContext.Provider>;

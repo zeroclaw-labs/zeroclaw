@@ -506,6 +506,30 @@ pub fn invocation_trigger_matches(haystack_lower: &str, trigger_lower: &str) -> 
     false
 }
 
+/// Whether `tool_name` takes an `approved` argument that only the runtime
+/// may set, from the operator's approval decision for that call. A value the
+/// model supplies is never an approval.
+pub fn takes_runtime_approval(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "shell" | "schedule" | "cron_add" | "cron_update" | "cron_run"
+    )
+}
+
+/// Clear the approval on a call a wrapper makes to `tool_name` directly.
+///
+/// The runtime writes `approved` only on the call it dispatched, under the
+/// outer tool's name. A wrapper that invokes a child tool itself, such as a
+/// pipeline step or a skill alias, has no approval decision for the child,
+/// so the child runs unapproved whatever its arguments say.
+pub fn clear_runtime_approval(tool_name: &str, args: &mut serde_json::Value) {
+    if takes_runtime_approval(tool_name)
+        && let Some(args) = args.as_object_mut()
+    {
+        args.insert("approved".to_string(), serde_json::Value::Bool(false));
+    }
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync + crate::attribution::Attributable {
     /// True when this tool does work that does not carry the RPC principal's
