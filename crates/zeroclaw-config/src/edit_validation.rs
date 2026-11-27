@@ -326,6 +326,77 @@ mod tests {
         error
     }
 
+    #[test]
+    fn retired_gemini_edit_diagnostics_are_independent() {
+        const PROVIDER_PATH: &str = "providers.models.gemini_cli.home";
+        const TOOL_PATH: &str = "gemini_cli.enabled";
+
+        let mut provider_only = Config::default();
+        provider_only.providers.models.gemini_cli.insert(
+            "home".to_string(),
+            crate::schema::GeminiCliModelProviderConfig::default(),
+        );
+        let mut tool_only = Config::default();
+        tool_only.gemini_cli.enabled = true;
+
+        let mut add_tool = provider_only.clone();
+        add_tool.gemini_cli.enabled = true;
+        add_tool.mark_dirty(TOOL_PATH);
+        assert_error(
+            validate_without_mutation(&add_tool, &provider_only),
+            ConfigApiCode::ValidationFailed,
+            Some(TOOL_PATH),
+        );
+
+        let mut add_provider = tool_only.clone();
+        add_provider.providers.models.gemini_cli =
+            provider_only.providers.models.gemini_cli.clone();
+        add_provider.mark_dirty(PROVIDER_PATH);
+        assert_error(
+            validate_without_mutation(&add_provider, &tool_only),
+            ConfigApiCode::ValidationFailed,
+            Some(PROVIDER_PATH),
+        );
+
+        let mut both = provider_only.clone();
+        both.gemini_cli.enabled = true;
+        let mut unrelated_edit = both.clone();
+        unrelated_edit.gateway.port = 17777;
+        unrelated_edit.mark_dirty("gateway.port");
+        let warnings = validate_without_mutation(&unrelated_edit, &both)
+            .expect("unrelated edit retains both pre-existing diagnostics");
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert_eq!(warnings[0].path, PROVIDER_PATH);
+        assert_eq!(warnings[1].path, TOOL_PATH);
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.code == PRE_EXISTING_VALIDATION_ERROR)
+        );
+
+        provider_only.mark_dirty(TOOL_PATH);
+        let warnings = validate_without_mutation(&provider_only, &both)
+            .expect("disabling the retired tool can repair its own diagnostic");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].path, PROVIDER_PATH);
+    }
+
+    #[test]
+    fn strict_goal_error_precedes_retired_gemini_diagnostics() {
+        let mut config = config_with_valid_goal_verifier();
+        config.goal.enabled = true;
+        config.goal.verifier.model_provider = ModelProviderRef::from("openai.missing");
+        config.gemini_cli.enabled = true;
+        let goal_error = config
+            .validate_goal_config()
+            .expect_err("Goal verifier is dangling");
+        let strict_error = config.validate().expect_err("both inputs are invalid");
+        assert_eq!(
+            ConfigApiError::from_validation(strict_error).path,
+            ConfigApiError::from_validation(goal_error).path
+        );
+    }
+
     fn isolate_config_path(config: &mut Config) -> tempfile::TempDir {
         let tempdir = tempfile::tempdir().expect("temporary config directory");
         config.config_path = tempdir.path().join("config.toml");
