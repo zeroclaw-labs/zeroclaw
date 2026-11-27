@@ -70,8 +70,14 @@ cat > "${stub_dir}/cargo" <<'STUB'
 #!/usr/bin/env bash
 case "$*" in
   run\ *) echo "agent-runtime,schema-export" ;;
-  *" -i axum "*) printf '%s\n' 'axum v0.8.9' 'zeroclaw-channels v0.8.6 (/repo/crates/zeroclaw-channels)' ;;
   tree\ *)
+    if [[ -n "${RATCHET_REAL_CARGO:-}" ]]; then
+      exec "$RATCHET_REAL_CARGO" "$@"
+    fi
+    if [[ "$*" == *" -i "* ]]; then
+      printf '%s\n' 'axum v0.8.9' 'zeroclaw-channels v0.8.6 (/repo/crates/zeroclaw-channels)'
+      exit 0
+    fi
     printf '%s\n' 'axum v0.8.9' 'zeroclaw v0.8.6 (/repo)' 'zeroclaw-channels v0.8.6 (/repo/crates/zeroclaw-channels)'
     if [ -n "${RATCHET_STUB_GATEWAY:-}" ]; then
       echo 'zeroclaw-gateway v0.8.6 (/repo/crates/zeroclaw-gateway)'
@@ -94,5 +100,53 @@ if RATCHET_STUB_GATEWAY=1 PATH="${stub_dir}:${PATH}" bash "$ratchet" run x86_64-
   echo "expected run mode to fail: the gateway crate is linked" >&2
   exit 1
 fi
+
+multi_version_dir="$fixture_dir/multi-version"
+mkdir -p "$multi_version_dir"/{src,channels/src,axum-older/src,axum-current/src}
+for package_path in . channels axum-older axum-current; do
+  : > "$multi_version_dir/$package_path/src/lib.rs"
+done
+cat > "$multi_version_dir/Cargo.toml" <<'TOML'
+[package]
+name = "zeroclaw"
+version = "0.1.0"
+edition = "2021"
+[workspace]
+exclude = ["axum-older", "axum-current"]
+[features]
+agent-runtime = []
+schema-export = []
+[dependencies]
+zeroclaw-channels = { path = "channels" }
+TOML
+cat > "$multi_version_dir/channels/Cargo.toml" <<'TOML'
+[package]
+name = "zeroclaw-channels"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+axum_older = { package = "axum", path = "../axum-older" }
+axum_current = { package = "axum", path = "../axum-current" }
+TOML
+for versioned_dir in axum-older:0.7.9 axum-current:0.8.9; do
+  printf '[package]\nname = "axum"\nversion = "%s"\nedition = "2021"\n' \
+    "${versioned_dir#*:}" > "$multi_version_dir/${versioned_dir%:*}/Cargo.toml"
+done
+real_cargo="$(command -v cargo)"
+(
+  cd "$multi_version_dir"
+  "$real_cargo" generate-lockfile --offline 2>/dev/null
+  RATCHET_REAL_CARGO="$real_cargo" PATH="${stub_dir}:${PATH}" \
+    bash "$ratchet" run x86_64-unknown-linux-gnu /dev/null
+  printf '%s\n' 'axum_older = { package = "axum", path = "axum-older" }' >> Cargo.toml
+  "$real_cargo" generate-lockfile --offline 2>/dev/null
+  if output="$(RATCHET_REAL_CARGO="$real_cargo" PATH="${stub_dir}:${PATH}" \
+    bash "$ratchet" run x86_64-unknown-linux-gnu /dev/null 2>&1)"; then
+    echo "expected run mode to reject axum outside the channel listeners" >&2
+    exit 1
+  fi
+  printf '%s\n' "$output"
+  [[ "$output" == *'axum is linked through zeroclaw, which is not a documented listener exception'* ]]
+)
 
 echo "cli_only_ratchet tests passed."

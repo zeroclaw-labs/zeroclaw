@@ -53,18 +53,19 @@ check() {
 }
 
 run() {
-  local target="$1" binary="$2" features
+  local target="$1" binary="$2" features version versions
   features="$(cargo run --quiet --locked -p xtask --bin generate -- features --selection cli-only --target "$target")"
   work="$(mktemp -d)"
   cargo tree --locked --target "$target" -e normal --prefix none -p zeroclaw \
     --no-default-features --features "$features" | sort -u > "$work/tree.txt"
-  if grep -q '^axum ' "$work/tree.txt"; then
+  # An unqualified inverse query fails if the graph contains multiple versions.
+  versions="$(awk '$1 == "axum" {print substr($2, 2)}' "$work/tree.txt" | sort -u)"
+  while read -r version; do
+    [ -n "$version" ] || continue
     cargo tree --locked --target "$target" -e normal --prefix none -p zeroclaw \
-      --no-default-features --features "$features" -i axum --depth 1 \
-      | tail -n +2 | sort -u > "$work/axum-dependents.txt"
-  else
-    : > "$work/axum-dependents.txt"
-  fi
+      --no-default-features --features "$features" -i "axum@${version}" --depth 1 \
+      | tail -n +2
+  done <<< "$versions" | sort -u > "$work/axum-dependents.txt"
   nm -C --defined-only "$binary" > "$work/symbols.txt" 2>/dev/null || true
   check "$work/tree.txt" "$work/axum-dependents.txt" "$work/symbols.txt"
 }
