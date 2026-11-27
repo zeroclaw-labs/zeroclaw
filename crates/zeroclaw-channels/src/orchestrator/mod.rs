@@ -9038,7 +9038,6 @@ const MATRIX_OPTIONAL_SAFE_TOOL_ARGUMENTS: &[(&[&str], &[&str])] = &[
             "claude_code",
             "claude_code_runner",
             "codex_cli",
-            "gemini_cli",
             "opencode_cli",
         ],
         &[],

@@ -25,8 +25,8 @@ GENERATED_DOC_TARGETS = {
 MDBOOK_SOURCE_ROOT = Path("docs/book/src")
 
 
-def run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", *args], check=False, capture_output=True, text=True)
+def run_git(args: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", *args], check=check, capture_output=True, text=True)
 
 
 def commit_exists(rev: str) -> bool:
@@ -61,7 +61,7 @@ def infer_docs_files(base_sha: str, provided: list[str]) -> list[str]:
         return provided
     if not base_sha:
         return []
-    diff = run_git(["diff", "--name-only", "-z", base_sha, "HEAD"])
+    diff = run_git(["diff", "--name-only", "-z", base_sha, "HEAD"], check=True)
     files: list[str] = []
     for path in diff.stdout.split("\0"):
         if not path:
@@ -224,7 +224,7 @@ def extract_links(text: str, source_path: str) -> list[str]:
 
 def added_lines_for_file(base_sha: str, path: str) -> list[str]:
     if base_sha:
-        diff = run_git(["diff", "--unified=0", base_sha, "HEAD", "--", path])
+        diff = run_git(["diff", "--unified=0", base_sha, "HEAD", "--", path], check=True)
         lines: list[str] = []
         for raw_line in diff.stdout.splitlines():
             if raw_line.startswith("+++"):
@@ -316,4 +316,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except subprocess.CalledProcessError as error:
+        sys.exit(f"Unable to collect changed docs links: {error.stderr.strip() or error}")
