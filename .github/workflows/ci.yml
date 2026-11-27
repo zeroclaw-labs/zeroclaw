@@ -2049,7 +2049,7 @@ jobs:
 
           # Any change to this workflow re-runs all gated families.
           wf='^\.github/workflows/ci\.yml$'
-          emit docs     "\.mdx?$|^docs/|^\.markdownlint-cli2\.yaml$|^scripts/ci/(check_internal_docs_links(_test)?\.py|docs_(quality_gate|links_gate)\.sh)$|${wf}"
+          emit docs     "\.mdx?$|^docs/|^\.markdownlint-cli2\.yaml$|^scripts/ci/((check_internal_docs_links|collect_changed_links)(_test)?\.py|docs_diff_gate_test\.py|docs_(quality_gate|links_gate)\.sh)$|${wf}"
           emit nix      "\.nix$|^flake\.(nix|lock)$|^nix/|${wf}"
           emit nix_hash "(^|/)Cargo\.(toml|lock)$|^nix/hashes\.json$|^scripts/ci/list_git_dep_keys(_test)?\.py$|${wf}"
           # The generated dashboard contract includes schemas owned by the
@@ -2103,6 +2103,8 @@ jobs:
       - name: Resolve base SHA
         id: base
         run: echo "sha=$(git merge-base origin/master HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Docs gate Git diff regression tests
+        run: python3 scripts/ci/docs_diff_gate_test.py
       - name: Docs quality gate (markdown lint + em-dash prose check)
         env:
           BASE_SHA: ${{ steps.base.outputs.sha }}

@@ -64,7 +64,7 @@ feature_members() {
 # Aggregate/meta features and deprecated aliases: internal groupings, not
 # individual picker rows. The single source of truth for what to skip when
 # rendering rows and what to expand when resolving `default`.
-NON_ROW_FEATURES="default default-channels channels-full ci-all fantoccini landlock metrics embedded-web"
+NON_ROW_FEATURES="default default-channels channels-full ci-all fantoccini landlock metrics embedded-web tool-gemini-cli"
 
 is_aggregate() {
   case " $NON_ROW_FEATURES " in *" $1 "*) return 0 ;; *) return 1 ;; esac
