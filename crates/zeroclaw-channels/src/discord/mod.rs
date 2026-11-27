@@ -1105,6 +1105,44 @@ const fn is_thread_channel_type(channel_type: u64) -> bool {
 /// is a safety bound so a hung request cannot stall the listener.
 const THREAD_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// `ChannelMessage::id` prefix for messages that came from an interaction
+/// (slash command or component) rather than a Discord message.
+const INTERACTION_MESSAGE_ID_PREFIX: &str = "discord_interaction_";
+
+/// The message a built-in slash command stands for: the typed command, from
+/// the invoker, routed to the channel or thread it was invoked in, exactly as
+/// the message path routes a typed command. Its reply therefore lands in that
+/// conversation, and session controls act on that conversation's session.
+fn builtin_command_message(
+    interaction_id: &str,
+    user_id: String,
+    channel_id: String,
+    in_thread: bool,
+    command_line: String,
+    alias: String,
+) -> ChannelMessage {
+    let thread_ts = (in_thread && !channel_id.is_empty()).then(|| channel_id.clone());
+    ChannelMessage {
+        id: format!("{INTERACTION_MESSAGE_ID_PREFIX}{interaction_id}"),
+        reply_target: if channel_id.is_empty() {
+            user_id.clone()
+        } else {
+            channel_id
+        },
+        sender: user_id,
+        content: command_line,
+        channel: "discord".to_string(),
+        channel_alias: Some(alias),
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        interruption_scope_id: thread_ts.clone(),
+        thread_ts,
+        ..Default::default()
+    }
+}
+
 fn prepare_outgoing_embeds(
     raw_content: &str,
     workspace_dir: Option<&Path>,
@@ -2455,6 +2493,7 @@ impl Channel for DiscordChannel {
                                 // routing happens in the spawned task.
                                 let prompt = interaction_string_option(d, "prompt");
                                 let input = interaction_string_option(d, "input");
+                                let args = interaction_string_option(d, BUILTIN_ARGS_OPTION);
                                 // Extract typed-option values here (owned) so the
                                 // spawned 'static task doesn't borrow `event`.
                                 let submitted = slash_options::extract_submitted_options(d);
@@ -2543,6 +2582,44 @@ impl Channel for DiscordChannel {
                                             return;
                                         }
 
+                                        // A built-in command runs in the
+                                        // conversation it was invoked from, as
+                                        // if typed there: same sender, same
+                                        // channel or thread, so `/new`,
+                                        // `/model` and `/stop` act on the live
+                                        // session instead of a one-shot
+                                        // interaction session.
+                                        if let Some(command_line) = builtin_command_line(&command, &args) {
+                                            let ack = i18n::get_required_cli_string_with_args(
+                                                "channel-discord-command-sent",
+                                                &[("command", command_line.as_str())],
+                                            );
+                                            if let Err(e) = discord_ephemeral_interaction_reply(&client, &interaction_id, &interaction_token, &ack).await {
+                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": e.to_string()})), "discord command acknowledgement failed");
+                                            }
+                                            let in_thread = !interaction_channel.is_empty()
+                                                && discord_thread_parent(
+                                                    &client,
+                                                    &bot_token,
+                                                    &thread_channels,
+                                                    &interaction_channel,
+                                                )
+                                                .await
+                                                .is_some();
+                                            let channel_msg = builtin_command_message(
+                                                &interaction_id,
+                                                user_id,
+                                                interaction_channel,
+                                                in_thread,
+                                                command_line,
+                                                alias,
+                                            );
+                                            if tx.send(channel_msg).await.is_err() {
+                                                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), "orchestrator channel closed; dropping slash command");
+                                            }
+                                            return;
+                                        }
+
                                         // Stash credentials before the defer so
                                         // a fast reply can never race an absent
                                         // entry; sweep expired entries while
@@ -2607,7 +2684,7 @@ impl Channel for DiscordChannel {
                                         };
 
                                         let channel_msg = ChannelMessage {
-                                            id: format!("discord_interaction_{interaction_id}"),
+                                            id: format!("{INTERACTION_MESSAGE_ID_PREFIX}{interaction_id}"),
                                             sender: user_id,
                                             reply_target: discord_interaction_reply_target(&interaction_id),
                                             content,
@@ -3029,7 +3106,7 @@ impl Channel for DiscordChannel {
                                         // intent drives an agent turn, answered
                                         // through the interaction followup.
                                         let channel_msg = ChannelMessage {
-                                            id: format!("discord_interaction_{interaction_id}"),
+                                            id: format!("{INTERACTION_MESSAGE_ID_PREFIX}{interaction_id}"),
                                             sender: user_id,
                                             reply_target: discord_interaction_reply_target(&interaction_id),
                                             content,
@@ -3946,6 +4023,11 @@ impl Channel for DiscordChannel {
         if parse_discord_interaction_target(channel_id).is_some() {
             return Ok(());
         }
+        // A message that came from a slash command has no Discord message
+        // to react to.
+        if message_id.starts_with(INTERACTION_MESSAGE_ID_PREFIX) {
+            return Ok(());
+        }
         let url = discord_reaction_url(channel_id, message_id, emoji);
 
         let resp = self
@@ -3976,6 +4058,11 @@ impl Channel for DiscordChannel {
     ) -> anyhow::Result<()> {
         // Interaction sentinels are not channel ids (see add_reaction).
         if parse_discord_interaction_target(channel_id).is_some() {
+            return Ok(());
+        }
+        // A message that came from a slash command has no Discord message
+        // to react to.
+        if message_id.starts_with(INTERACTION_MESSAGE_ID_PREFIX) {
             return Ok(());
         }
         let url = discord_reaction_url(channel_id, message_id, emoji);
@@ -5014,15 +5101,17 @@ mod tests {
         }];
         let body = slash_command_registration_body(&specs);
         let commands = body.as_array().unwrap();
-        assert_eq!(commands.len(), 2);
+        assert_eq!(commands.len(), 2 + builtin_slash_commands().count());
         assert_eq!(commands[0]["name"], "ask");
         assert_eq!(commands[1]["name"], "deploy-status");
         assert_eq!(commands[1]["options"][0]["name"], "input");
         assert_eq!(commands[1]["options"][0]["required"], true);
-        // Every desired command matches the ownership fingerprint except
-        // /ask (whose option is `prompt`) — exactly the reaping contract.
+        // Skill commands match the shape-based ownership fingerprint; /ask
+        // (whose option is `prompt`) and the built-ins do not, since they are
+        // owned by projection instead - exactly the reaping contract.
         assert!(!is_skill_command_shape(&commands[0]));
         assert!(is_skill_command_shape(&commands[1]));
+        assert!(commands[2..].iter().all(|c| !is_skill_command_shape(c)));
     }
 
     #[test]
@@ -5061,6 +5150,221 @@ mod tests {
                 "description": SKILL_COMMAND_OPTION_DESCRIPTION
             }]
         })));
+    }
+
+    fn registered_command<'a>(
+        body: &'a serde_json::Value,
+        name: &str,
+    ) -> Option<&'a serde_json::Value> {
+        body.as_array()
+            .and_then(|cmds| cmds.iter().find(|c| c["name"] == name))
+    }
+
+    #[test]
+    fn registration_offers_the_runtime_builtins_only() {
+        let body = slash_command_registration_body(&[]);
+        for name in [
+            "new", "clear", "stop", "model", "models", "config", "thinking",
+        ] {
+            assert!(
+                registered_command(&body, name).is_some(),
+                "/{name} is a runtime chat command and should be offered"
+            );
+        }
+        for name in ["goal", "help", "think"] {
+            assert!(
+                registered_command(&body, name).is_none(),
+                "/{name} is not a runtime-executed channel command (or is an alias)"
+            );
+        }
+
+        let model = registered_command(&body, "model").unwrap();
+        assert_eq!(model["options"][0]["name"], BUILTIN_ARGS_OPTION);
+        assert_eq!(model["options"][0]["required"], false);
+        assert_eq!(
+            model["options"][0]["description"], "[--user|--agent] [model]",
+            "the argument hint comes from the catalog usage"
+        );
+        let description = model["description"].as_str().unwrap_or("");
+        assert!(
+            !description.is_empty() && !description.starts_with('{'),
+            "description resolves from the Fluent catalog, got {description}"
+        );
+        assert!(
+            registered_command(&body, "new")
+                .unwrap()
+                .get("options")
+                .is_none(),
+            "a command without arguments registers no options"
+        );
+    }
+
+    #[test]
+    fn command_set_stays_within_discords_limit() {
+        let builtins = builtin_slash_commands().count();
+        assert!(
+            1 + builtins + MAX_SKILL_SLASH_COMMANDS <= 100,
+            "/ask + {builtins} built-ins + {MAX_SKILL_SLASH_COMMANDS} skills exceeds Discord's 100 commands"
+        );
+    }
+
+    #[test]
+    fn skills_cannot_take_a_builtin_command_name() {
+        let specs = discord_slash_specs_from_skills(&[
+            skill("model", "a skill named like a built-in", &["slash"]),
+            skill("deploy", "an ordinary skill", &["slash"]),
+        ]);
+        let slugs: Vec<&str> = specs.iter().map(|s| s.slug.as_str()).collect();
+        assert_eq!(slugs, vec!["deploy"]);
+    }
+
+    #[test]
+    fn builtin_invocation_becomes_the_typed_command() {
+        assert_eq!(
+            builtin_command_line("model", "  gpt-x  ").as_deref(),
+            Some("/model gpt-x")
+        );
+        assert_eq!(
+            builtin_command_line("model", "--user\ngpt-x").as_deref(),
+            Some("/model --user gpt-x")
+        );
+        assert_eq!(
+            builtin_command_line("thinking", "high").as_deref(),
+            Some("/thinking high")
+        );
+        assert_eq!(builtin_command_line("new", "").as_deref(), Some("/new"));
+        assert_eq!(
+            builtin_command_line("ask", "hi"),
+            None,
+            "/ask keeps its own path"
+        );
+        assert_eq!(builtin_command_line("goal", "start x"), None);
+        assert_eq!(
+            builtin_command_line("deploy", "x"),
+            None,
+            "skill commands keep theirs"
+        );
+    }
+
+    #[test]
+    fn builtin_command_message_targets_the_invoking_conversation() {
+        let msg = builtin_command_message(
+            "900",
+            "u1".into(),
+            "c1".into(),
+            false,
+            "/new".into(),
+            "main".into(),
+        );
+        assert_eq!(
+            msg.reply_target, "c1",
+            "reply and session key follow the channel"
+        );
+        assert_eq!(msg.sender, "u1");
+        assert_eq!(msg.content, "/new");
+        assert_eq!(msg.thread_ts, None);
+        assert_eq!(msg.interruption_scope_id, None);
+        assert_eq!(msg.id, "discord_interaction_900");
+        assert_eq!(msg.channel_alias.as_deref(), Some("main"));
+
+        let in_thread = builtin_command_message(
+            "901",
+            "u1".into(),
+            "t1".into(),
+            true,
+            "/stop".into(),
+            "main".into(),
+        );
+        assert_eq!(in_thread.reply_target, "t1");
+        assert_eq!(
+            in_thread.thread_ts.as_deref(),
+            Some("t1"),
+            "a thread keeps its own session"
+        );
+        assert_eq!(
+            in_thread.interruption_scope_id.as_deref(),
+            Some("t1"),
+            "/stop cancels that thread's turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn reactions_skip_messages_that_came_from_an_interaction() {
+        let ch = DiscordChannel::new(
+            "not-a-real-token".into(),
+            vec![],
+            "main",
+            Arc::new(Vec::new),
+            false,
+            false,
+        );
+        // No Discord message exists for these ids; any REST call would fail.
+        assert!(
+            ch.add_reaction("c1", "discord_interaction_900", "👀")
+                .await
+                .is_ok()
+        );
+        assert!(
+            ch.remove_reaction("c1", "discord_interaction_900", "👀")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_switch_reaps_our_builtins_but_spares_foreign_ones() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let desired = slash_command_registration_body(&[]);
+        let mut our_model = registered_command(&desired, "model").unwrap().clone();
+        our_model["id"] = serde_json::json!("m1");
+        let foreign_stop = serde_json::json!({
+            "id": "s1", "name": "stop", "description": "Stop a DIFFERENT bot", "type": 1
+        });
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/commands"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([our_model, foreign_stop])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/m1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/applications/app1/commands/s1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/applications/app1/guilds/g1/commands"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        reconcile_slash_commands(
+            &reqwest::Client::new(),
+            "tok",
+            "app1",
+            &desired,
+            &server.uri(),
+            SlashScope::Guild,
+            &["g1".to_string()],
+        )
+        .await
+        .unwrap();
     }
 
     fn stale_skill_command(id: &str, name: &str) -> serde_json::Value {
@@ -5181,7 +5485,12 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/applications/app1/guilds/g1/commands"))
             .respond_with(ResponseTemplate::new(200))
-            .expect(1)
+            .expect(
+                slash_command_registration_body(&[])
+                    .as_array()
+                    .unwrap()
+                    .len() as u64,
+            )
             .mount(&server)
             .await;
 
@@ -5327,28 +5636,34 @@ mod tests {
 
     #[tokio::test]
     async fn reconcile_skips_unchanged_and_spares_foreign_commands() {
-        // Steady state: existing /ask matches the desired projection (no
-        // POST), and a foreign command with a generic input option is left
-        // alone. Zero writes.
+        // Steady state: every registered command (/ask and the built-ins)
+        // matches the desired projection (no POST), and a foreign command with
+        // a generic input option is left alone. Zero writes.
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let server = MockServer::start().await;
-        let mut existing_ask = slash_command_registration_body(&[]).as_array().unwrap()[0].clone();
-        existing_ask["id"] = serde_json::json!("a1");
-        let foreign = serde_json::json!({
+        let mut listing: Vec<serde_json::Value> = slash_command_registration_body(&[])
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(i, cmd)| {
+                let mut cmd = cmd.clone();
+                cmd["id"] = serde_json::json!(format!("a{i}"));
+                cmd
+            })
+            .collect();
+        listing.push(serde_json::json!({
             "id": "f1", "name": "run",
             "description": "external tool", "type": 1,
             "options": [{
                 "name": "input", "type": 3, "required": true,
                 "description": "what to run"
             }]
-        });
+        }));
         Mock::given(method("GET"))
             .and(path("/applications/app1/commands"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!([existing_ask, foreign])),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(listing))
             .expect(1)
             .mount(&server)
             .await;

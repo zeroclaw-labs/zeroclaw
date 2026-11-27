@@ -46957,6 +46957,18 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(err.to_string().contains("multiple configured aliases"));
     }
 
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn every_discord_builtin_slash_command_is_a_runtime_command() {
+        for spec in crate::discord::builtin_slash_commands() {
+            let line = format!("/{}", spec.name);
+            assert!(
+                parse_runtime_command("discord", &line).is_some() || is_stop_command(&line),
+                "Discord registers {line} as a slash command but the channel runtime does not handle it"
+            );
+        }
+    }
+
     #[test]
     fn reply_intent_precheck_uses_structured_addressing_signal() {
         let marker_only = zeroclaw_api::channel::ChannelMessage {

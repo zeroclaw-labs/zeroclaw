@@ -128,6 +128,17 @@ pub(crate) async fn discord_reject_interaction(
     interaction_token: &str,
     message: &str,
 ) -> anyhow::Result<()> {
+    discord_ephemeral_interaction_reply(client, interaction_id, interaction_token, message).await
+}
+
+/// Answer an interaction immediately with a message only the invoker sees
+/// (type 4, flags 64).
+pub(crate) async fn discord_ephemeral_interaction_reply(
+    client: &reqwest::Client,
+    interaction_id: &str,
+    interaction_token: &str,
+    message: &str,
+) -> anyhow::Result<()> {
     let url = format!(
         "https://discord.com/api/v10/interactions/{interaction_id}/{interaction_token}/callback"
     );
@@ -145,7 +156,7 @@ pub(crate) async fn discord_reject_interaction(
         .send()
         .await
         .map_err(reqwest::Error::without_url)?;
-    crate::util::ensure_success(resp, "interaction reject").await?;
+    crate::util::ensure_success(resp, "interaction ephemeral reply").await?;
     Ok(())
 }
 
