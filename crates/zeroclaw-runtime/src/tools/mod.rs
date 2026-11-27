@@ -71,6 +71,8 @@ pub use zeroclaw_tools::cloud_patterns::CloudPatternsTool;
 pub use zeroclaw_tools::codex_cli::CodexCliTool;
 #[cfg(feature = "tool-composio")]
 pub use zeroclaw_tools::composio::ComposioTool;
+#[cfg(feature = "tool-computer-use")]
+pub use zeroclaw_tools::computer_use::ComputerUseTool;
 pub use zeroclaw_tools::content_search::ContentSearchTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
@@ -325,6 +327,7 @@ pub fn composio_tool_available(config: &Config) -> bool {
     feature = "tool-codex-cli",
     feature = "tool-gemini-cli",
     feature = "tool-opencode-cli",
+    feature = "tool-computer-use",
     feature = "tools-external"
 )))]
 fn warn_tool_compiled_out(root_config: &Config, tool: zeroclaw_config::opt_in_tools::OptInTool) {
@@ -3291,6 +3294,34 @@ fn all_tools_with_runtime_on_thread(
                     security.clone(),
                     root_config.opencode_cli.clone(),
                     coding_cli_executor.clone(),
+                ),
+                security.clone(),
+            ))
+        );
+    }
+
+    // Native desktop computer-use tool (feature- and config-gated)
+    #[cfg(not(feature = "tool-computer-use"))]
+    warn_tool_compiled_out(
+        root_config,
+        zeroclaw_config::opt_in_tools::OptInTool::ComputerUse,
+    );
+    #[cfg(feature = "tool-computer-use")]
+    if root_config.computer_use.enabled && select_tool!("computer_use") {
+        // Screenshots land in the canonical per-agent workspace, not the
+        // session's `security.workspace_dir`, so one agent's captures never
+        // appear in another's file tools.
+        let agent_workspace_dir = root_config.agent_workspace_dir(agent_alias);
+        register_tool!(
+            "computer_use",
+            Arc::new(RateLimitedTool::new(
+                ComputerUseTool::new(
+                    security.clone(),
+                    root_config.computer_use.clone(),
+                    agent_workspace_dir,
+                    zeroclaw_tools::computer_use::default_backend(
+                        root_config.computer_use.action_timeout_secs,
+                    ),
                 ),
                 security.clone(),
             ))
@@ -8487,6 +8518,7 @@ permissions = ["http_client"]
         cfg.opencode_cli.enabled = true;
         cfg.claude_code_runner.enabled = true;
         cfg.linkedin.enabled = true;
+        cfg.computer_use.enabled = true;
         cfg.image_gen.enabled = true;
         cfg.file_upload.url = Some("https://upload.example.invalid/files".into());
         cfg.file_upload_bundle.url = Some("https://upload.example.invalid/bundles".into());
@@ -8693,6 +8725,80 @@ permissions = ["http_client"]
             now_constructible.is_empty(),
             "allowlisted tools now register under the maximal config; drop them from the \
              allowlist: {now_constructible:?}"
+        );
+    }
+
+    /// `computer_use` needs both gates: the build feature and
+    /// `[computer_use].enabled`. It is off by default, so a compiled-in build
+    /// that never opts in must stay silent — no tool, no registry name.
+    #[test]
+    fn computer_use_registers_only_when_feature_and_config_enabled() {
+        let build = |enabled: bool| {
+            let tmp = TempDir::new().unwrap();
+            let security = Arc::new(SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Full,
+                workspace_dir: tmp.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            });
+            let mem: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(
+                    &MemoryConfig {
+                        backend: "markdown".into(),
+                        ..MemoryConfig::default()
+                    },
+                    tmp.path(),
+                    None,
+                )
+                .unwrap(),
+            );
+            let mut cfg = test_config(&tmp);
+            cfg.computer_use.enabled = enabled;
+
+            all_tools_with_runtime(
+                Arc::new(cfg.clone()),
+                &security,
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+                "test-agent",
+                Arc::new(NativeRuntime::new()),
+                mem,
+                None,
+                None,
+                &BrowserConfig::default(),
+                &zeroclaw_config::schema::HttpRequestConfig::default(),
+                &zeroclaw_config::schema::WebFetchConfig::default(),
+                tmp.path(),
+                &HashMap::new(),
+                None,
+                &cfg,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("tool registry builds")
+            .tools
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect::<Vec<String>>()
+        };
+
+        // Default config: `[computer_use].enabled = false` keeps the tool out
+        // of the registry even when this build carries the feature.
+        let disabled = build(false);
+        assert!(
+            !disabled.contains(&"computer_use".to_string()),
+            "computer_use must stay unregistered while [computer_use].enabled is false"
+        );
+
+        // Enabled: registration follows the compiled feature exactly.
+        let enabled = build(true);
+        assert_eq!(
+            enabled.contains(&"computer_use".to_string()),
+            cfg!(feature = "tool-computer-use"),
+            "an enabled [computer_use] section registers computer_use only when \
+             `tool-computer-use` is compiled in"
         );
     }
 }

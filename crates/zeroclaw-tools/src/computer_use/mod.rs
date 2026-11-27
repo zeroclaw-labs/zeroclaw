@@ -98,9 +98,10 @@ fn classify_action(action: &str) -> Option<ActionClass> {
 
 /// The backend this build and host can actually run.
 ///
-/// `action_timeout_secs` bounds one capture or input action. The unsupported
-/// backend never uses it; a platform backend applies it to its own subprocess
-/// and IPC deadlines.
+/// `action_timeout_secs` bounds how long the real capture path may run: on
+/// macOS it is the deadline `screencapture` gets before the capture fails as a
+/// timeout. Input synthesis posts events directly and takes no timeout of its
+/// own. The unsupported backend never uses the value.
 #[cfg(not(target_os = "macos"))]
 pub fn default_backend(action_timeout_secs: u64) -> Arc<dyn ComputerUseBackend> {
     let _ = action_timeout_secs;
@@ -109,9 +110,10 @@ pub fn default_backend(action_timeout_secs: u64) -> Arc<dyn ComputerUseBackend> 
 
 /// The backend this build and host can actually run.
 ///
-/// `action_timeout_secs` bounds one capture or input action: a capture is
-/// bounded by the `screencapture` deadline and input by the task that posts
-/// it.
+/// `action_timeout_secs` bounds one screen capture: the subprocess
+/// `screencapture` is killed and reported as a timeout when it runs past the
+/// deadline. Input synthesis posts CoreGraphics events synchronously and takes
+/// no timeout of its own.
 #[cfg(target_os = "macos")]
 pub fn default_backend(action_timeout_secs: u64) -> Arc<dyn ComputerUseBackend> {
     Arc::new(macos::MacOsBackend::new(action_timeout_secs))

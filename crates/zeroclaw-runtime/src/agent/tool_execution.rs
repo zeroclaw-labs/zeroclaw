@@ -715,6 +715,12 @@ pub fn should_execute_tools_in_parallel(
         return false;
     }
 
+    // computer_use mutates shared desktop GUI state (cursor, focus, keyboard);
+    // concurrent calls in one batch would race each other.
+    if tool_calls.iter().any(|call| call.name == "computer_use") {
+        return false;
+    }
+
     if let Some(mgr) = approval
         && tool_calls.iter().any(|call| mgr.needs_approval(&call.name))
     {
@@ -2592,6 +2598,31 @@ mod tests {
             should_execute_tools_in_parallel(&calls, None),
             "atomic full replacements retain last-writer-wins semantics"
         );
+    }
+
+    // --- computer_use branch---
+
+    #[test]
+    fn computer_use_in_batch_forces_sequential_execution() {
+        // A `computer_use` call mutates shared desktop state: the cursor, the
+        // focused application, and the keyboard. Any batch that carries one —
+        // beside another tool or beside another `computer_use` — must keep
+        // model order rather than racing two GUI mutations.
+        for batch in [
+            vec![
+                parsed_tool_call("computer_use"),
+                parsed_tool_call("file_read"),
+            ],
+            vec![
+                parsed_tool_call("computer_use"),
+                parsed_tool_call("computer_use"),
+            ],
+        ] {
+            assert!(
+                !should_execute_tools_in_parallel(&batch, None),
+                "batch {batch:?} containing computer_use must force sequential execution"
+            );
+        }
     }
 
     // --- approval-required + control branches---
