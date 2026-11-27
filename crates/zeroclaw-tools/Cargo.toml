@@ -28,6 +28,9 @@ futures-util = { version = "0.3", default-features = false }
 fluent = "0.16"
 glob = "0.3"
 hex = "0.4"
+# PNG decode/encode for `computer_use` screenshot downscaling. PNG-only and
+# optional so a default build carries neither the codec nor the crate.
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 infer = { version = "0.19", default-features = false }
 fantoccini = { version = "0.22.1", optional = true, default-features = false, features = ["rustls-tls"] }
 nanohtml2text = "0.2"
@@ -92,6 +95,9 @@ tool-claude-code-runner = ["zeroclaw-config/tool-claude-code-runner"]
 tool-codex-cli = ["zeroclaw-config/tool-codex-cli"]
 tool-gemini-cli = ["zeroclaw-config/tool-gemini-cli"]
 tool-opencode-cli = ["zeroclaw-config/tool-opencode-cli"]
+# Native desktop capture and input injection. Compiled only where the platform
+# implementation exists; other targets get the stub backend.
+tool-computer-use = ["zeroclaw-config/tool-computer-use", "dep:image"]
 # Exposes cross-crate test-only constructors (e.g.
 # `McpRegistry::for_test_with_server_count`) so downstream test
 # suites can build registry fixtures without spawning real stdio

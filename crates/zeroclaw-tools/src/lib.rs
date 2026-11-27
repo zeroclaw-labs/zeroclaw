@@ -32,6 +32,8 @@ pub mod codex_cli;
 pub mod coding_cli;
 #[cfg(feature = "tool-composio")]
 pub mod composio;
+#[cfg(feature = "tool-computer-use")]
+pub mod computer_use;
 pub mod content_search;
 pub mod data_management;
 pub mod discord_search;
