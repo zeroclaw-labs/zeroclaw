@@ -4,13 +4,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
-struct Repository {
+pub(super) struct Repository {
     root: PathBuf,
-    checkout: PathBuf,
+    pub(super) checkout: PathBuf,
 }
 
 impl Repository {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let root = std::env::temp_dir().join(format!(
             "zeroclaw-buildinfo-{}-{}-{}",
             std::process::id(),
