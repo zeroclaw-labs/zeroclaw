@@ -1127,6 +1127,9 @@ cli-channels-start-hint = チャンネルを開始するには: zeroclaw channel
 cli-channels-doctor-hint = 状態を確認するには:    zeroclaw channel doctor
 cli-channels-configure-hint = 設定するには:      zeroclaw config set channels.<name>.<field>=<value>
 cli-models-set-ok = デフォルトモデルが { $provider } の "{ $model }" に設定されました。
+cli-models-set-context-window = { $provider } の報告に基づき、コンテキストウィンドウを { $tokens } トークンに設定しました。
+cli-models-set-context-window-removed = { $provider } から "{ $model }" のコンテキストウィンドウを取得できませんでした（このプロバイダーが公開していないか、取得に失敗しました）。前のモデルの context_window（{ $tokens } トークン）を削除したため、ZeroClaw の未設定時のフォールバック（{ $fallback } トークン以上）が適用されます。設定するには: zeroclaw config set { $path } <tokens>
+cli-models-set-context-window-kept = { $provider } から "{ $model }" のコンテキストウィンドウを取得できませんでした（このプロバイダーが公開していないか、取得に失敗しました）。既定値以下のため context_window = { $tokens } トークンを維持しました。このモデルがより多く扱える場合: zeroclaw config set { $path } <tokens>
 cli-models-status-current = デフォルトモデル: { $model } (プロバイダー: { $provider })
 cli-models-status-none = デフォルトモデルが設定されていません。
 turn-interrupted-by-user = [ユーザーによって中断されました]

@@ -1129,6 +1129,9 @@ cli-channels-start-hint = Para iniciar canales: zeroclaw channel start
 cli-channels-doctor-hint = Para comprobar el estado:    zeroclaw channel doctor
 cli-channels-configure-hint = Para configurar:      zeroclaw config set channels.<name>.<field>=<value>
 cli-models-set-ok = Modelo predeterminado establecido en "{ $model }" en { $provider }.
+cli-models-set-context-window = Ventana de contexto establecida en { $tokens } tokens, según { $provider }.
+cli-models-set-context-window-removed = No se pudo obtener la ventana de contexto de "{ $model }" desde { $provider } (este proveedor no la publica o la consulta falló). Se eliminó el context_window del modelo anterior ({ $tokens } tokens), así que se aplica el valor de reserva de ZeroClaw para ventanas sin configurar (al menos { $fallback } tokens). Para establecerlo: zeroclaw config set { $path } <tokens>
+cli-models-set-context-window-kept = No se pudo obtener la ventana de contexto de "{ $model }" desde { $provider } (este proveedor no la publica o la consulta falló). Se mantiene context_window = { $tokens } tokens, porque ya es igual o menor que el valor predeterminado. Si este modelo admite más: zeroclaw config set { $path } <tokens>
 cli-models-status-current = Modelo predeterminado: { $model } (proveedor: { $provider })
 cli-models-status-none = No hay ningún modelo predeterminado configurado.
 turn-interrupted-by-user = [interrumpido por el usuario]

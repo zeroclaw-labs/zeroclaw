@@ -16666,11 +16666,53 @@ fn available_gateway_restart_hint_port(host: &str, port: u16) -> Option<u16> {
     None
 }
 
+/// Upper bound on the context-window lookup `models set` makes, so an
+/// unresponsive provider cannot stall the command.
+#[cfg(feature = "agent-runtime")]
+const MODELS_SET_CONTEXT_WINDOW_FETCH_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(3);
+
 /// Persist `model` as the default for the first configured provider.
 #[cfg(feature = "agent-runtime")]
 async fn handle_models_set(config: &mut Config, model: &str) -> Result<()> {
+    handle_models_set_with(config, model, |provider_type, provider_config| async move {
+        tokio::time::timeout(
+            MODELS_SET_CONTEXT_WINDOW_FETCH_TIMEOUT,
+            zeroclaw_providers::fetch_context_window(&provider_type, &provider_config),
+        )
+        .await
+        .ok()
+        .flatten()
+    })
+    .await
+}
+
+/// `models set` with the context-window lookup injected, so tests stay
+/// offline.
+///
+/// An entry's `context_window` describes the model the entry names (see
+/// `Config::resolved_model_context_window_for_route`), so a model change must
+/// not carry the previous model's window over. The provider's own model list
+/// supplies the new window when it publishes one. Otherwise the effective
+/// window is never raised beyond ZeroClaw's unconfigured-window fallback or
+/// what the runtime profile declares: a previous window above the fallback is
+/// removed, and one at or below it is kept.
+#[cfg(feature = "agent-runtime")]
+async fn handle_models_set_with<F, Fut>(
+    config: &mut Config,
+    model: &str,
+    fetch_context_window: F,
+) -> Result<()>
+where
+    F: FnOnce(String, crate::config::schema::ModelProviderConfig) -> Fut,
+    Fut: std::future::Future<Output = Option<usize>>,
+{
+    let model = model.trim();
+    if model.is_empty() {
+        anyhow::bail!("Model name must not be empty.");
+    }
     crate::config::migration::ensure_disk_at_current_version(&config.config_path)?;
-    let (type_key, alias) = {
+    let (type_key, alias, previous) = {
         let entry = config
             .providers
             .models
@@ -16681,22 +16723,93 @@ async fn handle_models_set(config: &mut Config, model: &str) -> Result<()> {
                     "No model provider configured. Run `zeroclaw config init` first.",
                 )
             })?;
-        (entry.0, entry.1.to_string())
+        (entry.0, entry.1.to_string(), entry.2.clone())
     };
-    let prop_path = format!("providers.models.{type_key}.{alias}.model");
-    config.set_prop_persistent(&prop_path, model)?;
+    let provider_ref = format!("{type_key}.{alias}");
+    let entry_path = format!("providers.models.{provider_ref}");
+    let window_path = format!("{entry_path}.context_window");
+    let model_changed = previous.model.as_deref().map(str::trim) != Some(model);
+
+    let refreshed_window = if model_changed {
+        let lookup_config = crate::config::schema::ModelProviderConfig {
+            model: Some(model.to_string()),
+            ..previous.clone()
+        };
+        fetch_context_window(type_key.to_string(), lookup_config).await
+    } else {
+        None
+    };
+    let fallback = crate::config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK;
+    let window_change = match (model_changed, refreshed_window, previous.context_window) {
+        (true, Some(window), _) => WindowChange::Refreshed(window),
+        (true, None, Some(stale)) if stale > fallback => WindowChange::Removed(stale),
+        (true, None, Some(kept)) => WindowChange::KeptBelowFallback(kept),
+        _ => WindowChange::Unchanged,
+    };
+
+    config.set_prop_persistent(&format!("{entry_path}.model"), model)?;
+    match window_change {
+        WindowChange::Refreshed(window) => {
+            config.set_prop_persistent(&window_path, &window.to_string())?;
+        }
+        WindowChange::Removed(_) => config.set_prop_persistent(&window_path, "")?,
+        WindowChange::KeptBelowFallback(_) | WindowChange::Unchanged => {}
+    }
     Box::pin(config.save_dirty()).await?;
+
     println!(
         "{}",
         crate::i18n::get_required_cli_string_with_args(
             "cli-models-set-ok",
-            &[
-                ("model", model),
-                ("provider", &format!("{type_key}.{alias}")),
-            ]
+            &[("model", model), ("provider", &provider_ref)]
         )
     );
+    match window_change {
+        WindowChange::Refreshed(window) => println!(
+            "{}",
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-models-set-context-window",
+                &[("tokens", &window.to_string()), ("provider", &provider_ref)]
+            )
+        ),
+        WindowChange::Removed(stale) => eprintln!(
+            "{}",
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-models-set-context-window-removed",
+                &[
+                    ("model", model),
+                    ("provider", &provider_ref),
+                    ("tokens", &stale.to_string()),
+                    ("fallback", &fallback.to_string()),
+                    ("path", &window_path),
+                ]
+            )
+        ),
+        WindowChange::KeptBelowFallback(kept) => eprintln!(
+            "{}",
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-models-set-context-window-kept",
+                &[
+                    ("model", model),
+                    ("provider", &provider_ref),
+                    ("tokens", &kept.to_string()),
+                    ("path", &window_path),
+                ]
+            )
+        ),
+        WindowChange::Unchanged => {}
+    }
     Ok(())
+}
+
+/// How `models set` changed the entry's `context_window`.
+#[cfg(feature = "agent-runtime")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowChange {
+    Refreshed(usize),
+    Removed(usize),
+    KeptBelowFallback(usize),
+    Unchanged,
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -22159,6 +22272,214 @@ mod tests {
             msg.contains("No model provider configured"),
             "error must mention missing provider; got: {msg}"
         );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    fn models_set_fixture(
+        tmp: &tempfile::TempDir,
+        context_window: Option<usize>,
+    ) -> crate::config::schema::Config {
+        use crate::config::schema::{Config, ModelProviderConfig, TogetherModelProviderConfig};
+
+        let config_path = tmp.path().join("config.toml");
+        let window_line = context_window
+            .map(|window| format!("context_window = {window}\n"))
+            .unwrap_or_default();
+        std::fs::write(
+            &config_path,
+            format!(
+                "schema_version = {}\n\n[providers.models.together.default]\nmodel = \"old-model\"\n{window_line}",
+                crate::config::migration::CURRENT_SCHEMA_VERSION,
+            ),
+        )
+        .unwrap();
+        let mut config = Config {
+            config_path,
+            data_dir: tmp.path().join("workspace"),
+            schema_version: crate::config::migration::CURRENT_SCHEMA_VERSION,
+            ..Config::default()
+        };
+        config.providers.models.together.insert(
+            "default".to_string(),
+            TogetherModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("old-model".to_string()),
+                    uri: Some("https://gateway.example.invalid/v1".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    context_window,
+                    ..Default::default()
+                },
+            },
+        );
+        config
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    fn together_entry<'a>(
+        config: &'a crate::config::schema::Config,
+        alias: &str,
+    ) -> &'a crate::config::schema::ModelProviderConfig {
+        &config
+            .providers
+            .models
+            .together
+            .get(alias)
+            .expect("fixture entry")
+            .base
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn models_set_refreshes_the_context_window_from_the_providers_model_list() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut config = models_set_fixture(&tmp, Some(1_000_000));
+
+        handle_models_set_with(
+            &mut config,
+            "new-model",
+            |provider_type, lookup| async move {
+                assert_eq!(provider_type, "together", "lookup uses the entry's family");
+                assert_eq!(
+                    lookup.model.as_deref(),
+                    Some("new-model"),
+                    "lookup is for the new model"
+                );
+                assert_eq!(
+                    lookup.uri.as_deref(),
+                    Some("https://gateway.example.invalid/v1"),
+                    "lookup asks the endpoint the entry is configured for"
+                );
+                assert_eq!(lookup.api_key.as_deref(), Some("test-key"));
+                Some(200_000)
+            },
+        )
+        .await
+        .expect("models set succeeds");
+
+        let entry = together_entry(&config, "default");
+        assert_eq!(entry.model.as_deref(), Some("new-model"));
+        assert_eq!(
+            entry.context_window,
+            Some(200_000),
+            "the new model must not keep the previous model's window"
+        );
+        let contents = std::fs::read_to_string(&config.config_path).unwrap();
+        assert!(
+            contents.contains("context_window = 200000"),
+            "the refreshed window is persisted; got:\n{contents}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn models_set_removes_a_previous_window_above_the_fallback_when_none_is_reported() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut config = models_set_fixture(&tmp, Some(1_000_000));
+
+        handle_models_set_with(&mut config, "unlisted-model", |_, _| async { None })
+            .await
+            .expect("models set succeeds without a reported window");
+
+        let entry = together_entry(&config, "default");
+        assert_eq!(entry.model.as_deref(), Some("unlisted-model"));
+        assert_eq!(
+            entry.context_window, None,
+            "a larger window from another model must not be applied to the new one"
+        );
+        let contents = std::fs::read_to_string(&config.config_path).unwrap();
+        assert!(
+            !contents.contains("context_window"),
+            "the stale window is removed on disk; got:\n{contents}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn models_set_keeps_a_previous_window_at_or_below_the_fallback_when_none_is_reported() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut config = models_set_fixture(&tmp, Some(2_048));
+
+        handle_models_set_with(&mut config, "sibling-model", |_, _| async { None })
+            .await
+            .expect("models set succeeds without a reported window");
+
+        assert_eq!(
+            together_entry(&config, "default").context_window,
+            Some(2_048),
+            "removing a small window would raise the effective window to the fallback"
+        );
+        let contents = std::fs::read_to_string(&config.config_path).unwrap();
+        assert!(
+            contents.contains("context_window = 2048"),
+            "got:\n{contents}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn models_set_to_the_same_model_keeps_a_tuned_window_without_a_lookup() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut config = models_set_fixture(&tmp, Some(16_384));
+
+        handle_models_set_with(&mut config, " old-model ", |_, _| async {
+            panic!("re-setting the current model must not look anything up")
+        })
+        .await
+        .expect("models set succeeds");
+
+        let entry = together_entry(&config, "default");
+        assert_eq!(entry.model.as_deref(), Some("old-model"));
+        assert_eq!(entry.context_window, Some(16_384));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn models_set_rejects_an_empty_model() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut config = models_set_fixture(&tmp, Some(16_384));
+
+        handle_models_set_with(&mut config, "   ", |_, _| async {
+            panic!("an empty model must be rejected before any lookup")
+        })
+        .await
+        .expect_err("an empty model name is rejected");
+
+        assert_eq!(
+            together_entry(&config, "default").model.as_deref(),
+            Some("old-model")
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn models_set_changes_only_the_entry_it_switches() {
+        use crate::config::schema::{ModelProviderConfig, TogetherModelProviderConfig};
+
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let mut config = models_set_fixture(&tmp, Some(1_000_000));
+        // `iter_entries` visits aliases in sorted order, so "default" is the
+        // entry `models set` switches.
+        config.providers.models.together.insert(
+            "other".to_string(),
+            TogetherModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("old-model".to_string()),
+                    context_window: Some(1_000_000),
+                    ..Default::default()
+                },
+            },
+        );
+
+        handle_models_set_with(&mut config, "new-model", |_, _| async { Some(200_000) })
+            .await
+            .expect("models set succeeds");
+
+        let switched = together_entry(&config, "default");
+        assert_eq!(switched.model.as_deref(), Some("new-model"));
+        assert_eq!(switched.context_window, Some(200_000));
+        let other = together_entry(&config, "other");
+        assert_eq!(other.model.as_deref(), Some("old-model"));
+        assert_eq!(other.context_window, Some(1_000_000));
     }
 
     /// The in-tree tool component, for every test in this binary that needs a

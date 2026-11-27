@@ -1128,6 +1128,9 @@ cli-channels-start-hint = 启动渠道：zeroclaw channel start
 cli-channels-doctor-hint = 检查健康状况：    zeroclaw channel doctor
 cli-channels-configure-hint = 配置方法：      zeroclaw config set channels.<name>.<field>=<value>
 cli-models-set-ok = 默认模型已设置为 "{ $model }" (provider: { $provider })。
+cli-models-set-context-window = 已按 { $provider } 报告的值将上下文窗口设置为 { $tokens } 个 token。
+cli-models-set-context-window-removed = 无法从 { $provider } 获取 "{ $model }" 的上下文窗口（该提供商未公布，或查询失败）。已删除上一个模型的 context_window（{ $tokens } 个 token），因此改用 ZeroClaw 对未配置窗口的回退值（至少 { $fallback } 个 token）。如需设置：zeroclaw config set { $path } <tokens>
+cli-models-set-context-window-kept = 无法从 { $provider } 获取 "{ $model }" 的上下文窗口（该提供商未公布，或查询失败）。由于 context_window = { $tokens } 个 token 已不高于默认值，故予以保留。如果该模型支持更多：zeroclaw config set { $path } <tokens>
 cli-models-status-current = 默认模型: { $model } (provider: { $provider })
 cli-models-status-none = 未配置默认模型。
 turn-interrupted-by-user = [被用户中断]

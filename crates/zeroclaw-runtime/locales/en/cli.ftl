@@ -1341,6 +1341,9 @@ cli-channels-configure-hint = To configure:      zeroclaw config set channels.<n
 cli-channels-delivery-disabled = [channels.{$table}.{$alias}] is disabled; set enabled = true to deliver
 
 cli-models-set-ok = Default model set to "{ $model }" on { $provider }.
+cli-models-set-context-window = Context window set to { $tokens } tokens, as reported by { $provider }.
+cli-models-set-context-window-removed = Could not get a context window for "{ $model }" from { $provider } (not published by this provider, or the lookup failed). The previous model's context_window ({ $tokens } tokens) was removed, so ZeroClaw's unconfigured-window fallback (at least { $fallback } tokens) applies. To set it: zeroclaw config set { $path } <tokens>
+cli-models-set-context-window-kept = Could not get a context window for "{ $model }" from { $provider } (not published by this provider, or the lookup failed). Kept context_window = { $tokens } tokens, since it is already at or below the default. If this model allows more: zeroclaw config set { $path } <tokens>
 cli-models-status-current = Default model: { $model } (provider: { $provider })
 cli-models-status-none = No default model configured.
 
