@@ -31,7 +31,6 @@ async-trait = "0.1"
 base64 = "0.22"
 cap-std = "4"
 cap-fs-ext = "4"
-chacha20poly1305 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
 chardetng = "0.1"
@@ -142,7 +141,6 @@ tool-project-intel = ["zeroclaw-tools/tool-project-intel"]
 tool-claude-code = ["zeroclaw-tools/tool-claude-code"]
 tool-claude-code-runner = ["zeroclaw-tools/tool-claude-code-runner"]
 tool-codex-cli = ["zeroclaw-tools/tool-codex-cli"]
-tool-gemini-cli = ["zeroclaw-tools/tool-gemini-cli"]
 tool-opencode-cli = ["zeroclaw-tools/tool-opencode-cli"]
 sandbox-bubblewrap = []
 # Exposes test-only helpers (including `ScopedToolRegistry::from_raw_for_test`

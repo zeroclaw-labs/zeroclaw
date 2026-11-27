@@ -44,6 +44,12 @@ pub const PRE_EXISTING_VALIDATION_ERROR: &str = "pre_existing_validation_error";
 /// Stable code for warnings whose details are withheld from a write-only client.
 pub const CONFIG_WARNING_DETAILS_HIDDEN: &str = "config_warning_details_hidden";
 
+/// Stable code for an enabled section of a tool that has been removed from
+/// ZeroClaw. `Config::validate()` refuses the same condition as an error; this
+/// is the non-fatal copy for surfaces that read only the warning list, such as
+/// `zeroclaw doctor` and the dashboard, so they can say why the tool is gone.
+pub const TOOL_REMOVED: &str = "tool_removed";
+
 /// Stable code for delegate grants the agent's risk profile can never fire:
 /// its delegation_policy forbids delegation or its tool policy blocks `delegate`.
 pub const DEAD_DELEGATE_GRANTS: &str = "dead_delegate_grants";
@@ -122,6 +128,11 @@ pub const EMAIL_SMTP_PARTIALLY_CONFIGURED: &str = "email_smtp_partially_configur
 ///   set, and can be skipped without bypassing a related check.
 /// - `config_warning_details_hidden`: warnings exist, but their details are
 ///   withheld because the editor lacks configuration read access.
+/// - `tool_removed`: a `[<tool>]` section is enabled for a tool ZeroClaw no
+///   longer ships (currently `[gemini_cli]`). `Config::validate()` refuses
+///   this condition; the warning carries the same removal notice and
+///   migration path to surfaces that do not run validation, such as
+///   `zeroclaw doctor`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {
