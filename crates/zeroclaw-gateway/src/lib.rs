@@ -1553,10 +1553,10 @@ pub async fn run_gateway_with_plugin_webhooks(
     // dashboard seed and the per-agent `/api/tools` listings connect every
     // granted MCP server once. Health checks must not queue unanswered in
     // the listen backlog meanwhile, or a liveness probe restarts the process
-    // during an MCP server outage. Serve `/health` (same body) and 503
-    // everything else until the router is ready; see `startup_health`. The
-    // pairing guard and the TLS acceptor are built above so the responder
-    // serves the same body over the same transport.
+    // during an MCP server outage. Serve `/health` (same body) until the
+    // router is ready and hold every other request for it; see
+    // `startup_health`. The pairing guard and the TLS acceptor are built
+    // above so the responder serves the same body over the same transport.
     let startup_health = {
         let pairing = Arc::clone(&pairing);
         let prefix = config
@@ -1574,7 +1574,12 @@ pub async fn run_gateway_with_plugin_webhooks(
         } else {
             router.layer(axum::middleware::from_fn(security_headers::apply))
         };
-        startup_health::StartupHealthResponder::spawn(listener, router, tls_acceptor.clone())
+        startup_health::StartupHealthResponder::spawn(
+            listener,
+            prefix,
+            router,
+            tls_acceptor.clone(),
+        )
     };
 
     // Seed the install-wide default provider from the first entry that
@@ -3017,8 +3022,9 @@ pub async fn run_gateway_with_plugin_webhooks(
     };
 
     // Hand the listener from the startup health responder to the accept
-    // loop below.
-    let listener = startup_health.into_listener()?;
+    // loop below, with the connections it held for the real router.
+    let (listener, deferred) = startup_health.into_listener()?;
+    let mut deferred = Some(deferred);
 
     if let Some(readiness) = readiness {
         readiness.report_ready(actual_addr);
@@ -3045,7 +3051,7 @@ pub async fn run_gateway_with_plugin_webhooks(
     };
     loop {
         tokio::select! {
-            conn = listener.accept() => {
+            conn = startup_health::accept_next(&listener, &mut deferred) => {
                 let (tcp_stream, remote_addr) = match conn {
                     Ok(pair) => pair,
                     Err(e) => match accept_error_action(&e, tls_acceptor.is_some()) {
@@ -7832,9 +7838,22 @@ path = "{trigger_path}"
             body["runtime"]["components"][component]["status"], "starting",
             "{body}"
         );
-        // Not ready yet: everything but /health is refused, not left hanging.
-        let tools = get("/api/tools").await;
-        assert!(tools.starts_with("HTTP/1.1 503"), "{tools}");
+        // Not ready yet: a real route is held for the router, neither
+        // answered by the startup responder nor refused.
+        let mut held = tokio::net::TcpStream::connect(addr).await.unwrap();
+        held.write_all(
+            format!("GET /api/tools HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut byte = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), held.read(&mut byte))
+                .await
+                .is_err(),
+            "/api/tools must wait for the router while the gateway starts"
+        );
         assert!(
             ready_rx.borrow().is_none(),
             "the gateway must still be in setup, waiting on the MCP listing"
@@ -7842,12 +7861,22 @@ path = "{trigger_path}"
         assert!(!handle.is_finished());
 
         // Handover: once `initialize` fails the listing finishes, readiness is
-        // reported, and the real router serves on the same port.
+        // reported, and the real router serves on the same port, starting
+        // with the request held during setup.
         tokio::time::timeout(Duration::from_secs(20), ready_rx.wait_for(Option::is_some))
             .await
             .expect("the gateway must become ready once the MCP listing is done")
             .unwrap();
         assert_eq!(ready_rx.borrow().unwrap().port(), port);
+        let mut held_response = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            held.read_to_string(&mut held_response),
+        )
+        .await
+        .expect("the held request must be served once the gateway is ready")
+        .unwrap();
+        assert!(held_response.starts_with("HTTP/1.1 200"), "{held_response}");
         let tools = get("/api/tools").await;
         assert!(tools.starts_with("HTTP/1.1 200"), "{tools}");
         let body = health_body(&get("/health").await);
