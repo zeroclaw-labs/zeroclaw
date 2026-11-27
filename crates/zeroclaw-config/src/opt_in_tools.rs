@@ -128,7 +128,10 @@ impl OptInTool {
             Self::CodexCli => config.codex_cli.enabled,
             Self::GeminiCli => config.gemini_cli.enabled,
             Self::OpenCodeCli => config.opencode_cli.enabled,
-            Self::ComputerUse => config.computer_use.enabled,
+            Self::ComputerUse => config
+                .risk_profiles
+                .values()
+                .any(|profile| profile.computer_use.enabled),
             Self::WebSearch => config.web_search.enabled,
         }
     }

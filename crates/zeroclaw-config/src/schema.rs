@@ -776,12 +776,6 @@ pub struct Config {
     #[group = "Integrations"]
     pub opencode_cli: OpenCodeCliConfig,
 
-    /// Native desktop computer-use tool configuration (`[computer_use]`).
-    #[serde(default)]
-    #[nested]
-    #[group = "Tools"]
-    pub computer_use: ComputerUseToolConfig,
-
     /// Standard Operating Procedures engine configuration (`[sop]`).
     #[serde(default)]
     #[nested]
@@ -11536,11 +11530,11 @@ impl Default for OpenCodeCliConfig {
 
 // ── Computer Use ───────────────────────────────────────────────
 
-/// Native desktop computer-use tool configuration (`[computer_use]` section).
+/// Native desktop computer-use tool configuration (`[risk_profiles.<alias>.computer_use]`).
 ///
 /// Defaults closed (`enabled = false`) and restricts capture/input to the
 /// primary display unless `allow_secondary_displays = true` is set.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "computer_use"]
 pub struct ComputerUseToolConfig {
@@ -15687,6 +15681,14 @@ pub struct RiskProfileConfig {
     /// Set this to pin a digest or a specific tag so the sandbox stops
     /// tracking whatever the default tag moves to.
     pub sandbox_image: Option<String>,
+    /// Native desktop computer-use tool policy (`[risk_profiles.<alias>.computer_use]`).
+    ///
+    /// Defaults closed (`enabled = false`, `allow_secondary_displays = false`)
+    /// so desktop GUI capture and synthetic input are granted only to profiles
+    /// that explicitly opt in.
+    #[serde(default)]
+    #[nested]
+    pub computer_use: ComputerUseToolConfig,
 }
 
 impl Default for RiskProfileConfig {
@@ -15711,6 +15713,7 @@ impl Default for RiskProfileConfig {
             sandbox_backend: None,
             firejail_args: Vec::new(),
             sandbox_image: None,
+            computer_use: ComputerUseToolConfig::default(),
         }
     }
 }
@@ -22453,7 +22456,6 @@ impl Default for Config {
             codex_cli: CodexCliConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
-            computer_use: ComputerUseToolConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
@@ -24709,6 +24711,29 @@ impl Config {
             if tool.compiled() || !tool.enabled_in(self) {
                 continue;
             }
+            if tool == crate::opt_in_tools::OptInTool::ComputerUse {
+                let feature = tool.feature();
+                let mut aliases: Vec<&String> = self
+                    .risk_profiles
+                    .iter()
+                    .filter(|(_, profile)| profile.computer_use.enabled)
+                    .map(|(alias, _)| alias)
+                    .collect();
+                aliases.sort();
+                for alias in aliases {
+                    warnings.push(crate::validation_warnings::ValidationWarning::new(
+                        crate::validation_warnings::TOOL_COMPILED_OUT,
+                        format!(
+                            "[risk_profiles.{alias}.computer_use] is enabled, but this build was \
+                             compiled without the `{feature}` feature, so the tool is unavailable \
+                             and its settings are not checked. Use a build that includes \
+                             `{feature}`, or disable the section."
+                        ),
+                        format!("risk_profiles.{alias}.computer_use.enabled"),
+                    ));
+                }
+                continue;
+            }
             let (section, feature) = (tool.section(), tool.feature());
             warnings.push(crate::validation_warnings::ValidationWarning::new(
                 crate::validation_warnings::TOOL_COMPILED_OUT,
@@ -25874,6 +25899,31 @@ impl Config {
                     "risk_profiles.{profile_alias}.deny_all_tools cannot be combined with a non-empty allowed_tools list: deny_all_tools denies every tool, while allowed_tools = [] alone means unrestricted"
                 );
             }
+            if crate::opt_in_tools::OptInTool::ComputerUse.compiled()
+                && profile.computer_use.enabled
+            {
+                if !(320..=3840).contains(&profile.computer_use.max_dimension) {
+                    validation_bail!(
+                        InvalidNumericRange,
+                        format!("risk_profiles.{profile_alias}.computer_use.max_dimension"),
+                        "risk_profiles.{profile_alias}.computer_use.max_dimension must be between 320 and 3840"
+                    );
+                }
+                if !(1..=120).contains(&profile.computer_use.action_timeout_secs) {
+                    validation_bail!(
+                        InvalidNumericRange,
+                        format!("risk_profiles.{profile_alias}.computer_use.action_timeout_secs"),
+                        "risk_profiles.{profile_alias}.computer_use.action_timeout_secs must be between 1 and 120"
+                    );
+                }
+                if !(1..=300).contains(&profile.computer_use.max_wait_secs) {
+                    validation_bail!(
+                        InvalidNumericRange,
+                        format!("risk_profiles.{profile_alias}.computer_use.max_wait_secs"),
+                        "risk_profiles.{profile_alias}.computer_use.max_wait_secs must be between 1 and 300"
+                    );
+                }
+            }
         }
 
         // Inbound authentication & principals (RFC 7141): one auth-specific
@@ -26620,31 +26670,6 @@ impl Config {
                         action
                     );
                 }
-            }
-        }
-
-        // Computer use
-        if crate::opt_in_tools::OptInTool::ComputerUse.runs_in(self) {
-            if !(320..=3840).contains(&self.computer_use.max_dimension) {
-                validation_bail!(
-                    InvalidNumericRange,
-                    "computer_use.max_dimension",
-                    "computer_use.max_dimension must be between 320 and 3840"
-                );
-            }
-            if !(1..=120).contains(&self.computer_use.action_timeout_secs) {
-                validation_bail!(
-                    InvalidNumericRange,
-                    "computer_use.action_timeout_secs",
-                    "computer_use.action_timeout_secs must be between 1 and 120"
-                );
-            }
-            if !(1..=300).contains(&self.computer_use.max_wait_secs) {
-                validation_bail!(
-                    InvalidNumericRange,
-                    "computer_use.max_wait_secs",
-                    "computer_use.max_wait_secs must be between 1 and 300"
-                );
             }
         }
 
@@ -36149,7 +36174,6 @@ auto_save = true
             codex_cli: CodexCliConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
-            computer_use: ComputerUseToolConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
@@ -37615,7 +37639,6 @@ default_temperature = 0.7
             codex_cli: CodexCliConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
-            computer_use: ComputerUseToolConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
@@ -41730,7 +41753,7 @@ runtime_profile = "default"
                 .into_iter()
                 .filter(|warning| {
                     warning.code == crate::validation_warnings::TOOL_COMPILED_OUT
-                        && warning.path == "computer_use.enabled"
+                        && warning.path.ends_with(".computer_use.enabled")
                 })
                 .map(|warning| warning.path)
                 .collect()
@@ -41738,22 +41761,38 @@ runtime_profile = "default"
 
         type Break = fn(&mut ComputerUseToolConfig);
         let cases: [(&str, Break); 6] = [
-            ("computer_use.max_dimension", |c| c.max_dimension = 100),
-            ("computer_use.max_dimension", |c| c.max_dimension = 5000),
-            ("computer_use.action_timeout_secs", |c| {
-                c.action_timeout_secs = 0;
+            ("risk_profiles.desktop.computer_use.max_dimension", |c| {
+                c.max_dimension = 100;
             }),
-            ("computer_use.action_timeout_secs", |c| {
-                c.action_timeout_secs = 121;
+            ("risk_profiles.desktop.computer_use.max_dimension", |c| {
+                c.max_dimension = 5000;
             }),
-            ("computer_use.max_wait_secs", |c| c.max_wait_secs = 0),
-            ("computer_use.max_wait_secs", |c| c.max_wait_secs = 301),
+            (
+                "risk_profiles.desktop.computer_use.action_timeout_secs",
+                |c| {
+                    c.action_timeout_secs = 0;
+                },
+            ),
+            (
+                "risk_profiles.desktop.computer_use.action_timeout_secs",
+                |c| {
+                    c.action_timeout_secs = 121;
+                },
+            ),
+            ("risk_profiles.desktop.computer_use.max_wait_secs", |c| {
+                c.max_wait_secs = 0;
+            }),
+            ("risk_profiles.desktop.computer_use.max_wait_secs", |c| {
+                c.max_wait_secs = 301;
+            }),
         ];
 
         for (field, break_field) in cases {
             let mut config = Config::default();
-            config.computer_use.enabled = true;
-            break_field(&mut config.computer_use);
+            let mut profile = RiskProfileConfig::default();
+            profile.computer_use.enabled = true;
+            break_field(&mut profile.computer_use);
+            config.risk_profiles.insert("desktop".into(), profile);
 
             if OptInTool::ComputerUse.compiled() {
                 let err = config
@@ -41774,7 +41813,7 @@ runtime_profile = "default"
                     .expect("a build without the tool does not check its settings");
                 assert_eq!(
                     computer_use_compiled_out(&config),
-                    ["computer_use.enabled"],
+                    ["risk_profiles.desktop.computer_use.enabled"],
                     "{field}: the enabled section is reported as compiled out"
                 );
             }

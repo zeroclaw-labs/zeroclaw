@@ -327,7 +327,6 @@ pub fn composio_tool_available(config: &Config) -> bool {
     feature = "tool-codex-cli",
     feature = "tool-gemini-cli",
     feature = "tool-opencode-cli",
-    feature = "tool-computer-use",
     feature = "tools-external"
 )))]
 fn warn_tool_compiled_out(root_config: &Config, tool: zeroclaw_config::opt_in_tools::OptInTool) {
@@ -3300,14 +3299,23 @@ fn all_tools_with_runtime_on_thread(
         );
     }
 
-    // Native desktop computer-use tool (feature- and config-gated)
+    // Native desktop computer-use tool (feature- and risk-profile-gated)
     #[cfg(not(feature = "tool-computer-use"))]
-    warn_tool_compiled_out(
-        root_config,
-        zeroclaw_config::opt_in_tools::OptInTool::ComputerUse,
-    );
+    if risk_profile.computer_use.enabled {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "code": zeroclaw_config::validation_warnings::TOOL_COMPILED_OUT,
+                    "section": zeroclaw_config::opt_in_tools::OptInTool::ComputerUse.section(),
+                    "feature": zeroclaw_config::opt_in_tools::OptInTool::ComputerUse.feature(),
+                })),
+            "a tool is enabled in config but this build was compiled without its feature; skipping it"
+        );
+    }
     #[cfg(feature = "tool-computer-use")]
-    if root_config.computer_use.enabled && select_tool!("computer_use") {
+    if risk_profile.computer_use.enabled && select_tool!("computer_use") {
         // Screenshots land in the canonical per-agent workspace, not the
         // session's `security.workspace_dir`, so ACP/Code sessions never
         // litter git repositories with untracked screenshot directories.
@@ -3317,10 +3325,10 @@ fn all_tools_with_runtime_on_thread(
             Arc::new(RateLimitedTool::new(
                 ComputerUseTool::new(
                     security.clone(),
-                    root_config.computer_use.clone(),
+                    risk_profile.computer_use.clone(),
                     agent_workspace_dir,
                     zeroclaw_tools::computer_use::default_backend(
-                        root_config.computer_use.action_timeout_secs,
+                        risk_profile.computer_use.action_timeout_secs,
                     ),
                 ),
                 security.clone(),
@@ -8518,7 +8526,6 @@ permissions = ["http_client"]
         cfg.opencode_cli.enabled = true;
         cfg.claude_code_runner.enabled = true;
         cfg.linkedin.enabled = true;
-        cfg.computer_use.enabled = true;
         cfg.image_gen.enabled = true;
         cfg.file_upload.url = Some("https://upload.example.invalid/files".into());
         cfg.file_upload_bundle.url = Some("https://upload.example.invalid/bundles".into());
@@ -8603,10 +8610,12 @@ permissions = ["http_client"]
         let sop_engine = Arc::new(Mutex::new(SopEngine::new(cfg.sop.clone())));
         let sop_audit = Arc::new(crate::sop::SopAuditLogger::new(Arc::clone(&mem)));
 
+        let mut maximal_risk = zeroclaw_config::schema::RiskProfileConfig::default();
+        maximal_risk.computer_use.enabled = true;
         let built = all_tools_with_runtime(
             Arc::new(cfg.clone()),
             &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            &maximal_risk,
             "test-agent",
             Arc::new(NativeRuntime::new()),
             mem,
@@ -8729,8 +8738,9 @@ permissions = ["http_client"]
     }
 
     /// `computer_use` needs both gates: the build feature and
-    /// `[computer_use].enabled`. It is off by default, so a compiled-in build
-    /// that never opts in must stay silent — no tool, no registry name.
+    /// `[risk_profiles.<alias>.computer_use].enabled`. It is off by default,
+    /// so a compiled-in build whose risk profile never opts in must stay
+    /// silent — no tool, no registry name.
     #[test]
     fn computer_use_registers_only_when_feature_and_config_enabled() {
         let build = |enabled: bool| {
@@ -8751,13 +8761,14 @@ permissions = ["http_client"]
                 )
                 .unwrap(),
             );
-            let mut cfg = test_config(&tmp);
-            cfg.computer_use.enabled = enabled;
+            let cfg = test_config(&tmp);
+            let mut risk_profile = zeroclaw_config::schema::RiskProfileConfig::default();
+            risk_profile.computer_use.enabled = enabled;
 
             all_tools_with_runtime(
                 Arc::new(cfg.clone()),
                 &security,
-                &zeroclaw_config::schema::RiskProfileConfig::default(),
+                &risk_profile,
                 "test-agent",
                 Arc::new(NativeRuntime::new()),
                 mem,
@@ -8784,20 +8795,20 @@ permissions = ["http_client"]
             .collect::<Vec<String>>()
         };
 
-        // Default config: `[computer_use].enabled = false` keeps the tool out
-        // of the registry even when this build carries the feature.
+        // Default risk profile: `computer_use.enabled = false` keeps the tool
+        // out of the registry even when this build carries the feature.
         let disabled = build(false);
         assert!(
             !disabled.contains(&"computer_use".to_string()),
-            "computer_use must stay unregistered while [computer_use].enabled is false"
+            "computer_use must stay unregistered while risk_profile.computer_use.enabled is false"
         );
 
-        // Enabled: registration follows the compiled feature exactly.
+        // Enabled on the risk profile: registration follows the compiled feature.
         let enabled = build(true);
         assert_eq!(
             enabled.contains(&"computer_use".to_string()),
             cfg!(feature = "tool-computer-use"),
-            "an enabled [computer_use] section registers computer_use only when \
+            "an enabled risk_profile.computer_use registers computer_use only when \
              `tool-computer-use` is compiled in"
         );
     }

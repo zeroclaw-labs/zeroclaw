@@ -162,14 +162,10 @@ impl ComputerUseTool {
         let display_index = match args.get("display") {
             None | Some(Value::Null) => 0,
             Some(value) => match value.as_u64() {
-                Some(raw) => u32::try_from(raw).map_err(|_| {
-                    invalid_param(
-                        "display",
-                        "must be a non-negative integer that fits in 32 bits",
-                    )
-                })?,
+                Some(raw) => u32::try_from(raw)
+                    .map_err(|_| tool_error("tool-computer-use-error-display-u32-overflow"))?,
                 None => {
-                    return Err(invalid_param("display", "must be a non-negative integer"));
+                    return Err(tool_error("tool-computer-use-error-display-must-be-u32"));
                 }
             },
         };
@@ -215,7 +211,7 @@ impl ComputerUseTool {
             self.config.max_dimension,
         ) {
             Ok(size) => size,
-            Err(error) => return Err(ToolResult::err(error.to_string())),
+            Err(error) => return Err(scale_error(&error)),
         };
 
         let raw_png = match self.backend.capture_display(display).await {
@@ -225,7 +221,7 @@ impl ComputerUseTool {
 
         let png = match scale::resize_png_to(&raw_png, target_w, target_h) {
             Ok(png) => png,
-            Err(error) => return Err(ToolResult::err(error.to_string())),
+            Err(error) => return Err(scale_error(&error)),
         };
 
         let path = match self.save_screenshot(&png).await {
@@ -291,7 +287,7 @@ impl ComputerUseTool {
         y: f64,
     ) -> Result<LogicalPoint, ToolResult> {
         scale::image_to_logical(display, x, y, self.config.max_dimension)
-            .map_err(|error| ToolResult::err(error.to_string()))
+            .map_err(|error| scale_error(&error))
     }
 
     async fn screenshot_action(&self, args: &Value) -> ToolResult {
@@ -450,7 +446,7 @@ impl ComputerUseTool {
         };
         let chord = match keys::parse_key_chord(raw) {
             Ok(chord) => chord,
-            Err(error) => return invalid_param("key", &error.to_string()),
+            Err(error) => return key_parse_error(&error),
         };
 
         if let Err(error) = self.backend.press_key(&chord).await {
@@ -533,7 +529,7 @@ impl Tool for ComputerUseTool {
                     "type": "integer",
                     "minimum": 0,
                     "default": 0,
-                    "description": "Display index; 0 is the primary display. Secondary displays require [computer_use].allow_secondary_displays = true."
+                    "description": "Display index; 0 is the primary display. Secondary displays require [risk_profiles.<alias>.computer_use].allow_secondary_displays = true."
                 },
                 "x": {
                     "type": "number",
@@ -578,7 +574,7 @@ impl Tool for ComputerUseTool {
                 "seconds": {
                     "type": "number",
                     "minimum": 0,
-                    "description": "Seconds to wait; bounded by [computer_use].max_wait_secs."
+                    "description": "Seconds to wait; bounded by [risk_profiles.<alias>.computer_use].max_wait_secs."
                 }
             },
             "required": ["action"]
@@ -640,17 +636,73 @@ fn tool_error_with_args(key: &str, args: &[(&str, &str)]) -> ToolResult {
     ToolResult::err(get_required_tool_string_with_args(key, args))
 }
 
-/// Build an `invalid parameter` failure naming the offending parameter.
-fn invalid_param(param: &str, reason: &str) -> ToolResult {
-    tool_error_with_args(
-        "tool-computer-use-error-invalid-param",
-        &[("param", param), ("reason", reason)],
-    )
+/// Surface a [`KeyParseError`] through its localized Fluent template.
+fn key_parse_error(error: &KeyParseError) -> ToolResult {
+    match error {
+        KeyParseError::Empty => tool_error("tool-computer-use-error-key-empty"),
+        KeyParseError::MissingKey => tool_error("tool-computer-use-error-key-missing-key"),
+        KeyParseError::UnknownKey(token) => {
+            tool_error_with_args("tool-computer-use-error-key-unknown", &[("key", token)])
+        }
+        KeyParseError::MultipleKeys => tool_error("tool-computer-use-error-key-multiple"),
+    }
 }
 
-/// Surface a backend failure with its own actionable wording.
+/// Surface a [`ScaleError`] through its localized Fluent template.
+fn scale_error(error: &ScaleError) -> ToolResult {
+    match error {
+        ScaleError::InvalidDisplayDimensions => {
+            tool_error("tool-computer-use-error-scale-invalid-display")
+        }
+        ScaleError::NonFiniteCoordinate => tool_error("tool-computer-use-error-scale-non-finite"),
+        ScaleError::OutOfBounds {
+            x,
+            y,
+            width,
+            height,
+        } => {
+            let x = x.to_string();
+            let y = y.to_string();
+            let width = width.to_string();
+            let height = height.to_string();
+            tool_error_with_args(
+                "tool-computer-use-error-scale-out-of-bounds",
+                &[("x", &x), ("y", &y), ("width", &width), ("height", &height)],
+            )
+        }
+        ScaleError::InvalidPng(err) => {
+            tool_error_with_args("tool-computer-use-error-scale-invalid-png", &[("err", err)])
+        }
+    }
+}
+
+/// Surface a [`BackendError`] through its localized Fluent template.
 fn backend_error(error: &BackendError) -> ToolResult {
-    ToolResult::err(error.to_string())
+    match error {
+        BackendError::PermissionDenied {
+            permission,
+            instructions,
+        } => tool_error_with_args(
+            "tool-computer-use-error-backend-permission-denied",
+            &[("permission", permission), ("instructions", instructions)],
+        ),
+        BackendError::UnsupportedPlatform(detail) => tool_error_with_args(
+            "tool-computer-use-error-backend-unsupported",
+            &[("detail", detail)],
+        ),
+        BackendError::CaptureFailed(detail) => tool_error_with_args(
+            "tool-computer-use-error-backend-capture-failed",
+            &[("detail", detail)],
+        ),
+        BackendError::InputFailed(detail) => tool_error_with_args(
+            "tool-computer-use-error-backend-input-failed",
+            &[("detail", detail)],
+        ),
+        BackendError::Timeout(detail) => tool_error_with_args(
+            "tool-computer-use-error-backend-timeout",
+            &[("detail", detail)],
+        ),
+    }
 }
 
 /// The `button` label a click summary reports.
@@ -665,11 +717,20 @@ fn button_label(button: MouseButton) -> &'static str {
 /// Read a required finite numeric coordinate.
 fn required_coordinate(args: &Value, param: &str) -> Result<f64, ToolResult> {
     match args.get(param) {
-        None | Some(Value::Null) => Err(invalid_param(param, "is required")),
+        None | Some(Value::Null) => Err(tool_error_with_args(
+            "tool-computer-use-error-param-required",
+            &[("param", param)],
+        )),
         Some(value) => match value.as_f64() {
             Some(number) if number.is_finite() => Ok(number),
-            Some(_) => Err(invalid_param(param, "must be a finite number")),
-            None => Err(invalid_param(param, "must be a number")),
+            Some(_) => Err(tool_error_with_args(
+                "tool-computer-use-error-param-must-be-finite-number",
+                &[("param", param)],
+            )),
+            None => Err(tool_error_with_args(
+                "tool-computer-use-error-param-must-be-number",
+                &[("param", param)],
+            )),
         },
     }
 }
@@ -682,12 +743,12 @@ fn optional_button(args: &Value) -> Result<MouseButton, ToolResult> {
             "left" => Ok(MouseButton::Left),
             "right" => Ok(MouseButton::Right),
             "middle" => Ok(MouseButton::Middle),
-            _ => Err(invalid_param(
-                "button",
-                "must be 'left', 'right', or 'middle'",
-            )),
+            _ => Err(tool_error("tool-computer-use-error-button-invalid")),
         },
-        Some(_) => Err(invalid_param("button", "must be a string")),
+        Some(_) => Err(tool_error_with_args(
+            "tool-computer-use-error-param-must-be-string",
+            &[("param", "button")],
+        )),
     }
 }
 
@@ -698,8 +759,7 @@ fn optional_clicks(args: &Value) -> Result<u8, ToolResult> {
         Some(value) => match value.as_u64() {
             Some(1) => Ok(1),
             Some(2) => Ok(2),
-            Some(_) => Err(invalid_param("clicks", "must be 1 or 2")),
-            None => Err(invalid_param("clicks", "must be the integer 1 or 2")),
+            Some(_) | None => Err(tool_error("tool-computer-use-error-clicks-invalid")),
         },
     }
 }
@@ -709,9 +769,16 @@ fn optional_i32(args: &Value, param: &str) -> Result<i32, ToolResult> {
     match args.get(param) {
         None | Some(Value::Null) => Ok(0),
         Some(value) => match value.as_i64() {
-            Some(raw) => i32::try_from(raw)
-                .map_err(|_| invalid_param(param, "must fit in a 32-bit signed integer")),
-            None => Err(invalid_param(param, "must be an integer")),
+            Some(raw) => i32::try_from(raw).map_err(|_| {
+                tool_error_with_args(
+                    "tool-computer-use-error-param-i32-overflow",
+                    &[("param", param)],
+                )
+            }),
+            None => Err(tool_error_with_args(
+                "tool-computer-use-error-param-must-be-integer",
+                &[("param", param)],
+            )),
         },
     }
 }
@@ -732,8 +799,14 @@ fn required_text(args: &Value) -> Result<&str, ToolResult> {
             }
             Ok(text.as_str())
         }
-        Some(_) => Err(invalid_param("text", "must be a string")),
-        None => Err(invalid_param("text", "is required")),
+        Some(_) => Err(tool_error_with_args(
+            "tool-computer-use-error-param-must-be-string",
+            &[("param", "text")],
+        )),
+        None => Err(tool_error_with_args(
+            "tool-computer-use-error-param-required",
+            &[("param", "text")],
+        )),
     }
 }
 
@@ -741,9 +814,15 @@ fn required_text(args: &Value) -> Result<&str, ToolResult> {
 fn required_key(args: &Value) -> Result<&str, ToolResult> {
     match args.get("key") {
         Some(Value::String(raw)) if !raw.trim().is_empty() => Ok(raw.as_str()),
-        Some(Value::String(_)) => Err(invalid_param("key", "must not be empty")),
-        Some(_) => Err(invalid_param("key", "must be a string")),
-        None => Err(invalid_param("key", "is required")),
+        Some(Value::String(_)) => Err(tool_error("tool-computer-use-error-key-empty")),
+        Some(_) => Err(tool_error_with_args(
+            "tool-computer-use-error-param-must-be-string",
+            &[("param", "key")],
+        )),
+        None => Err(tool_error_with_args(
+            "tool-computer-use-error-param-required",
+            &[("param", "key")],
+        )),
     }
 }
 
@@ -752,9 +831,15 @@ fn required_seconds(args: &Value) -> Result<f64, ToolResult> {
     match args.get("seconds") {
         Some(value) => match value.as_f64() {
             Some(number) => Ok(number),
-            None => Err(invalid_param("seconds", "must be a number")),
+            None => Err(tool_error_with_args(
+                "tool-computer-use-error-param-must-be-number",
+                &[("param", "seconds")],
+            )),
         },
-        None => Err(invalid_param("seconds", "is required")),
+        None => Err(tool_error_with_args(
+            "tool-computer-use-error-param-required",
+            &[("param", "seconds")],
+        )),
     }
 }
 
