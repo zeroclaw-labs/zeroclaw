@@ -48,6 +48,7 @@ mod relay_ingress;
 pub mod security_headers;
 pub mod session_queue;
 pub mod sse;
+mod startup_health;
 pub mod static_files;
 pub mod tls;
 pub mod version;
@@ -1507,6 +1508,75 @@ pub async fn run_gateway_with_plugin_webhooks(
     let actual_port = actual_addr.port();
     let display_addr = format!("{host}:{actual_port}");
 
+    // ── Pairing guard ──────────────────────────────────────
+    // Supervised runs share the daemon's live authority so pairing and
+    // revocation reach RPC authentication too; standalone constructs its
+    // own from config exactly as before. Either way the pairing-code policy
+    // is resolved from config in exactly one guard: startup pairing,
+    // `gateway get-paircode --new`, the dashboard pairing flow, and
+    // rotate-device all issue through it. Its code lifetime and brute-force
+    // limits are read from `[gateway.pairing_dashboard]` in live config on
+    // every use, in the daemon's guard as in this one.
+    let pairing = Arc::new(shared_pairing.unwrap_or_else(|| {
+        PairingGuard::new(
+            config.gateway.require_pairing,
+            &config.gateway.paired_tokens,
+            config.gateway.pairing_code,
+        )
+        .with_live_limits(PairingLimits::live(config_state.clone()))
+    }));
+
+    // ── TLS / mTLS setup ───────────────────────────────────────────
+    let tls_acceptor = match &config.gateway.tls {
+        Some(tls_cfg) if tls_cfg.enabled => {
+            let has_mtls = tls_cfg.client_auth.as_ref().is_some_and(|ca| ca.enabled);
+            if has_mtls {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "TLS enabled with mutual TLS (mTLS) client verification"
+                );
+            } else {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "TLS enabled (no client certificate requirement)"
+                );
+            }
+            Some(tls::build_tls_acceptor(tls_cfg)?)
+        }
+        _ => None,
+    };
+
+    // ── Startup health responder ───────────────────────────────────
+    // Everything from here to the accept loop can take a long time: the
+    // dashboard seed and the per-agent `/api/tools` listings connect every
+    // granted MCP server once. Health checks must not queue unanswered in
+    // the listen backlog meanwhile, or a liveness probe restarts the process
+    // during an MCP server outage. Serve `/health` (same body) and 503
+    // everything else until the router is ready; see `startup_health`. The
+    // pairing guard and the TLS acceptor are built above so the responder
+    // serves the same body over the same transport.
+    let startup_health = {
+        let pairing = Arc::clone(&pairing);
+        let prefix = config
+            .gateway
+            .path_prefix
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .unwrap_or("");
+        let router = startup_health::startup_router(prefix, move || {
+            let pairing = Arc::clone(&pairing);
+            async move { Json(public_health_body(&pairing)) }
+        });
+        let router = if tls_acceptor.is_some() {
+            router.layer(axum::middleware::from_fn(security_headers::apply_with_hsts))
+        } else {
+            router.layer(axum::middleware::from_fn(security_headers::apply))
+        };
+        startup_health::StartupHealthResponder::spawn(listener, router, tls_acceptor.clone())
+    };
+
     // Seed the install-wide default provider from the first entry that
     // actually declares a `model`. Entries without one cannot serve as the
     // default (there is no model string to pair with the provider), so
@@ -2137,23 +2207,6 @@ pub async fn run_gateway_with_plugin_webhooks(
         None
     };
 
-    // ── Pairing guard ──────────────────────────────────────
-    // Supervised runs share the daemon's live authority so pairing and
-    // revocation reach RPC authentication too; standalone constructs its
-    // own from config exactly as before. Either way the pairing-code policy
-    // is resolved from config in exactly one guard: startup pairing,
-    // `gateway get-paircode --new`, the dashboard pairing flow, and
-    // rotate-device all issue through it. Its code lifetime and brute-force
-    // limits are read from `[gateway.pairing_dashboard]` in live config on
-    // every use, in the daemon's guard as in this one.
-    let pairing = Arc::new(shared_pairing.unwrap_or_else(|| {
-        PairingGuard::new(
-            config.gateway.require_pairing,
-            &config.gateway.paired_tokens,
-            config.gateway.pairing_code,
-        )
-        .with_live_limits(PairingLimits::live(config_state.clone()))
-    }));
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
         RATE_LIMIT_MAX_KEYS_DEFAULT,
@@ -2963,27 +3016,9 @@ pub async fn run_gateway_with_plugin_webhooks(
         app.layer(axum::middleware::from_fn(security_headers::apply))
     };
 
-    // ── TLS / mTLS setup ───────────────────────────────────────────
-    let tls_acceptor = match &config.gateway.tls {
-        Some(tls_cfg) if tls_cfg.enabled => {
-            let has_mtls = tls_cfg.client_auth.as_ref().is_some_and(|ca| ca.enabled);
-            if has_mtls {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                    "TLS enabled with mutual TLS (mTLS) client verification"
-                );
-            } else {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                    "TLS enabled (no client certificate requirement)"
-                );
-            }
-            Some(tls::build_tls_acceptor(tls_cfg)?)
-        }
-        _ => None,
-    };
+    // Hand the listener from the startup health responder to the accept
+    // loop below.
+    let listener = startup_health.into_listener()?;
 
     if let Some(readiness) = readiness {
         readiness.report_ready(actual_addr);
@@ -3307,13 +3342,18 @@ fn public_health_snapshot() -> serde_json::Value {
 
 /// GET /health — always public (no secrets leaked)
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
-    let body = serde_json::json!({
+    Json(public_health_body(&state.pairing))
+}
+
+/// The public `/health` body, shared by [`handle_health`] and the startup
+/// health responder that answers before the router is ready.
+fn public_health_body(pairing: &PairingGuard) -> serde_json::Value {
+    serde_json::json!({
         "status": "ok",
-        "paired": state.pairing.is_paired(),
-        "require_pairing": state.pairing.require_pairing(),
+        "paired": pairing.is_paired(),
+        "require_pairing": pairing.require_pairing(),
         "runtime": public_health_snapshot(),
-    });
-    Json(body)
+    })
 }
 
 /// Prometheus content type for text exposition format.
@@ -7659,6 +7699,163 @@ path = "{trigger_path}"
                 result
             );
         }
+        handle.abort();
+    }
+
+    /// The gateway's startup tool listing connects every granted MCP server
+    /// once before the accept loop runs. While an MCP server accepts the
+    /// connection but does not answer, `/health` must still answer within a
+    /// 1s probe timeout and report the runtime components, or a liveness
+    /// probe restarts the process for as long as the MCP server is down.
+    #[tokio::test]
+    async fn run_gateway_answers_health_while_mcp_listing_connect_is_pending() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, McpBundleConfig, McpServerConfig, McpTransport, RiskProfileConfig,
+        };
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+
+        // Accepts the connection and holds `initialize` for 3s, then fails
+        // it: the listing skips the server and the gateway finishes setup.
+        let mcp = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method": "initialize"}),
+            ))
+            .respond_with(ResponseTemplate::new(500).set_delay(Duration::from_secs(3)))
+            .mount(&mcp)
+            .await;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.gateway.require_pairing = false;
+        config.memory.backend = "none".into();
+        config.mcp.enabled = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "docs".into(),
+            transport: McpTransport::Http,
+            url: Some(mcp.uri()),
+            ..Default::default()
+        }];
+        config.mcp_bundles.insert(
+            "docsbundle".into(),
+            McpBundleConfig {
+                servers: vec!["docs".into()],
+                exclude: Vec::new(),
+            },
+        );
+        config
+            .risk_profiles
+            .insert("probe-profile".into(), RiskProfileConfig::default());
+        config.agents.insert(
+            "probe-agent".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                risk_profile: "probe-profile".into(),
+                mcp_bundles: vec!["docsbundle".into()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        // Any runtime component set before the router is ready must show up.
+        let component = "startup-health-probe";
+        zeroclaw_runtime::health::mark_component_starting(component);
+
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
+        let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+            let _ = ready_tx.send(Some(addr));
+        });
+        let handle = zeroclaw_spawn::spawn!(async move {
+            run_gateway(
+                "127.0.0.1",
+                port,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(readiness),
+            )
+            .await
+        });
+
+        // Precondition: the gateway's listing is blocked in `initialize`.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while mcp.received_requests().await.unwrap_or_default().is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the gateway listing must connect the granted MCP server");
+
+        let get = |path: &'static str| async move {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let request =
+                    format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+                stream.write_all(request.as_bytes()).await.unwrap();
+                let mut response = String::new();
+                stream.read_to_string(&mut response).await.unwrap();
+                response
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{path} must answer within the 1s probe timeout"))
+        };
+
+        let health_body = |health: &str| -> serde_json::Value {
+            assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+            let (_, body) = health.split_once("\r\n\r\n").unwrap();
+            serde_json::from_str(body).unwrap()
+        };
+
+        // During setup: the startup responder answers.
+        let body = health_body(&get("/health").await);
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["require_pairing"], false);
+        assert_eq!(
+            body["runtime"]["components"][component]["status"], "starting",
+            "{body}"
+        );
+        // Not ready yet: everything but /health is refused, not left hanging.
+        let tools = get("/api/tools").await;
+        assert!(tools.starts_with("HTTP/1.1 503"), "{tools}");
+        assert!(
+            ready_rx.borrow().is_none(),
+            "the gateway must still be in setup, waiting on the MCP listing"
+        );
+        assert!(!handle.is_finished());
+
+        // Handover: once `initialize` fails the listing finishes, readiness is
+        // reported, and the real router serves on the same port.
+        tokio::time::timeout(Duration::from_secs(20), ready_rx.wait_for(Option::is_some))
+            .await
+            .expect("the gateway must become ready once the MCP listing is done")
+            .unwrap();
+        assert_eq!(ready_rx.borrow().unwrap().port(), port);
+        let tools = get("/api/tools").await;
+        assert!(tools.starts_with("HTTP/1.1 200"), "{tools}");
+        let body = health_body(&get("/health").await);
+        assert_eq!(body["status"], "ok");
+        assert_eq!(
+            body["runtime"]["components"][component]["status"], "starting",
+            "{body}"
+        );
         handle.abort();
     }
 
