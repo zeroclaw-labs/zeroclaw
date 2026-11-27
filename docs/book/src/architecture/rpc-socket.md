@@ -188,8 +188,10 @@ another same-mode session also keeps siblings with any bound Goal, including
 terminal ones. If a Goal lookup fails, the sweep retains the live session.
 
 Goal output follows the client that currently holds the session once it has
-loaded the session history. After a client reattaches, the rest of a parent turn
-already under way is delivered live from that point; earlier events of that
+read the complete session history (a `session/messages` request without
+`limit`, `before_index` or `cursor`) and that history reads back without errors.
+After a client reattaches, the rest of a parent turn already under way is
+delivered live from that point; earlier events of that
 turn are not replayed. Each frame is sent only while that client may still read
 the session. Output produced before the attach is not replayed; the saved
 transcript and `/goal status` remain available. Over WSS, the client that already

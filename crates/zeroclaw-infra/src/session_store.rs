@@ -1582,6 +1582,32 @@ mod tests {
     }
 
     #[test]
+    fn damaged_jsonl_has_only_a_best_effort_history() {
+        use std::io::Write;
+
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "history";
+        store.append(key, &ChatMessage::user("valid")).unwrap();
+        let clean = store.try_load(key).unwrap();
+        assert_eq!(clean.len(), 1);
+        assert_eq!(store.load(key)[0].content, clean[0].content);
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(store.session_path(key))
+            .unwrap();
+        writeln!(file, "invalid JSONL").unwrap();
+        assert_eq!(
+            store.try_load(key).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let best_effort = store.load(key);
+        assert_eq!(best_effort.len(), 1);
+        assert_eq!(best_effort[0].content, "valid");
+    }
+
+    #[test]
     fn trim_breadcrumb_round_trips_and_survives_reopen() {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path()).unwrap();

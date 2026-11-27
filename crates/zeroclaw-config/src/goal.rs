@@ -624,6 +624,56 @@ mod tests {
     }
 
     #[test]
+    fn goal_validation_runs_before_retired_gemini_cli_sections() {
+        let mut config = Config::default();
+        config.goal.enabled = true;
+        config.goal.verifier.model_provider = ModelProviderRef::new("openai.missing");
+        config
+            .providers
+            .models
+            .gemini_cli
+            .insert("home".into(), Default::default());
+        config.gemini_cli.enabled = true;
+
+        let assert_first_error = |config: &Config, code: ConfigApiCode, path: &str| {
+            let error = ConfigApiError::from_validation(
+                config
+                    .validate()
+                    .expect_err("configuration remains invalid"),
+            );
+            assert_eq!(error.code, code);
+            assert_eq!(error.path.as_deref(), Some(path));
+        };
+        assert_first_error(
+            &config,
+            ConfigApiCode::DanglingReference,
+            "goal.verifier.model_provider",
+        );
+
+        config.goal.verifier.model_provider = ModelProviderRef::new("openai.default");
+        config
+            .providers
+            .models
+            .openai
+            .insert("default".into(), Default::default());
+        assert_first_error(
+            &config,
+            ConfigApiCode::ValidationFailed,
+            "providers.models.gemini_cli.home",
+        );
+
+        config.providers.models.gemini_cli.remove("home");
+        assert_first_error(
+            &config,
+            ConfigApiCode::ValidationFailed,
+            "gemini_cli.enabled",
+        );
+
+        config.gemini_cli.enabled = false;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn goal_validation_input_paths_follow_enablement_and_verifier_reference() {
         // Only enabled, well-formed verifier references add a provider input.
         let mut config = Config::default();

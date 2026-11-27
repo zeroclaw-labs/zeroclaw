@@ -10697,7 +10697,7 @@ impl RpcDispatcher {
     }
 
     async fn handle_session_messages(&self, params: &Value) -> RpcResult {
-        let (value, record) = self.handle_session_messages_record(params).await?;
+        let (value, record, _) = self.handle_session_messages_record(params, false).await?;
         let _authority = self.session_effect_lease(
             Method::SessionMessages,
             record.as_ref().and_then(|r| r.owner.as_deref()),
@@ -10706,8 +10706,13 @@ impl RpcDispatcher {
     }
 
     async fn commit_session_messages(&self, id: Value, params: &Value) {
+        // Promotion needs the complete stored history in the response.
         let history_read = match parse_params::<SessionMessagesParams>(params) {
-            Ok(req) if req.before_index.is_none() && params.get("cursor").is_none() => {
+            Ok(req)
+                if req.before_index.is_none()
+                    && req.limit.is_none()
+                    && params.get("cursor").is_none() =>
+            {
                 self.ctx
                     .sessions
                     .goal_history_read(&req.session_id, &self.rpc)
@@ -10715,19 +10720,19 @@ impl RpcDispatcher {
             }
             _ => None,
         };
-        let prepared =
-            self.handle_session_messages_record(params)
-                .await
-                .and_then(|(value, record)| {
-                    serde_json::to_string(&JsonRpcResponse {
-                        jsonrpc: JSONRPC_VERSION,
-                        id: id.clone(),
-                        result: Some(value),
-                        error: None,
-                    })
-                    .map(|frame| (frame, record))
-                    .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))
-                });
+        let prepared = self
+            .handle_session_messages_record(params, history_read.is_some())
+            .await
+            .and_then(|(value, record, checked)| {
+                serde_json::to_string(&JsonRpcResponse {
+                    jsonrpc: JSONRPC_VERSION,
+                    id: id.clone(),
+                    result: Some(value),
+                    error: None,
+                })
+                .map(|frame| (frame, record, checked))
+                .map_err(|error| rpc_err(INTERNAL_ERROR, error.to_string()))
+            });
         self.ctx
             .sessions
             .wait_test_effect_pause("messages-frame")
@@ -10738,7 +10743,7 @@ impl RpcDispatcher {
         let mut permit = Some(permit);
         let result = match prepared {
             Err(error) => Err(error),
-            Ok((frame, record)) => {
+            Ok((frame, record, checked)) => {
                 let mut frame = Some(frame);
                 let sid = params
                     .get("session_id")
@@ -10802,7 +10807,10 @@ impl RpcDispatcher {
                         .map_err(|error| {
                             session_effect_error(error, "Failed to commit session messages")
                         })?;
-                        if sent && let (Some(gate), Some(live)) = (&history_read, live) {
+                        if sent
+                            && checked
+                            && let (Some(gate), Some(live)) = (&history_read, live)
+                        {
                             gate.promote(live, &self.rpc);
                         }
                         Ok(())
@@ -10828,7 +10836,8 @@ impl RpcDispatcher {
     async fn handle_session_messages_record(
         &self,
         params: &Value,
-    ) -> Result<(Value, Option<crate::rpc::session::SessionRecord>), JsonRpcError> {
+        checked_chat_snapshot: bool,
+    ) -> Result<(Value, Option<crate::rpc::session::SessionRecord>, bool), JsonRpcError> {
         let req: SessionMessagesParams = parse_params(params)?;
         let cursor_mode = params.get("cursor").is_some();
         let authorized = self
@@ -10884,6 +10893,7 @@ impl RpcDispatcher {
         let durable = record.as_ref().and_then(|record| record.durable.clone());
         let expected_owner = record.as_ref().and_then(|record| record.owner.clone());
         let mut cursor_result = None;
+        let mut checked = true;
         let messages = match durable {
             Some(DurableSession::Acp) => {
                 let store =
@@ -10996,8 +11006,31 @@ impl RpcDispatcher {
                     self.ctx.session_backend.as_ref().ok_or_else(|| {
                         rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
                     })?;
-                backend
-                    .load(&key)
+                let history = if checked_chat_snapshot {
+                    match backend.try_load(&key) {
+                        Ok(history) => history,
+                        Err(error) => {
+                            checked = false;
+                            zeroclaw_log::record!(
+                                WARN,
+                                zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    zeroclaw_log::Action::Fail
+                                )
+                                .with_outcome(zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(serde_json::json!({
+                                    "session_id": req.session_id,
+                                    "error_kind": format!("{:?}", error.kind()),
+                                })),
+                                "ZeroCode Goal history is incomplete; live delivery did not move"
+                            );
+                            backend.load(&key)
+                        }
+                    }
+                } else {
+                    backend.load(&key)
+                };
+                history
                     .into_iter()
                     .map(|message| MessageEntry {
                         role: message.role,
@@ -11048,7 +11081,7 @@ impl RpcDispatcher {
                 "next_cursor": next_cursor,
                 "has_older": has_older,
             }))
-            .map(|value| (value, record));
+            .map(|value| (value, record, checked));
         }
 
         let total = messages.len();
@@ -11065,7 +11098,7 @@ impl RpcDispatcher {
             next_cursor: None,
             has_older: None,
         })
-        .map(|value| (value, record))
+        .map(|value| (value, record, checked))
     }
 
     async fn handle_session_state(&self, params: &Value) -> RpcResult {

@@ -822,6 +822,18 @@ fn verifier_attribution_from_attempts<'a>(
         .last()
 }
 
+/// Let Tokio move other work off this worker without detaching an admitted
+/// session write from the Goal lease. Current-thread runtimes run it inline.
+fn run_session_write<T>(write: impl FnOnce() -> T) -> T {
+    if tokio::runtime::Handle::current().runtime_flavor()
+        == tokio::runtime::RuntimeFlavor::MultiThread
+    {
+        tokio::task::block_in_place(write)
+    } else {
+        write()
+    }
+}
+
 #[async_trait]
 impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
     fn session_key(&self) -> &GoalSessionKey {
@@ -861,8 +873,7 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
             .session_backend
             .as_ref()
             .context("cannot resume Goal response: ZeroCode session persistence is disabled")?;
-        backend
-            .append(&session_key, &message)
+        run_session_write(|| backend.append(&session_key, &message))
             .context("persist ZeroCode Goal resume response")?;
         agent.seed_history(std::slice::from_ref(&message));
         Ok(())
@@ -1081,8 +1092,7 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
                     .sessions
                     .wait_test_effect_pause("goal-before-candidate-save")
                     .await;
-                backend
-                    .append(&session_key, &message)
+                run_session_write(|| backend.append(&session_key, &message))
                     .context("persist ZeroCode Goal parent response")
             }
             Err(error) => Err(error),

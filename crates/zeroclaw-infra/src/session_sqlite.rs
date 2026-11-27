@@ -1136,9 +1136,16 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
         let now = Utc::now().to_rfc3339();
-        Self::append_on(&conn, session_key, message, &now).map_err(std::io::Error::other)
+        // The message row and its metadata update commit or roll back
+        // together. IMMEDIATE takes the write lock before either statement
+        // runs, as `append_authorized` does.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        Self::append_on(&tx, session_key, message, &now).map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)
     }
 
     fn append_authorized(
@@ -2350,6 +2357,61 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[1].role, "assistant");
+    }
+
+    #[test]
+    fn append_sqlite_rolls_back_message_if_metadata_update_fails() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("s1", &ChatMessage::user("first")).unwrap();
+
+        Connection::open(SqliteSessionBackend::db_path(tmp.path()))
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_append_metadata
+                 BEFORE UPDATE OF message_count ON session_metadata
+                 WHEN NEW.session_key = 's1'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected append metadata failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = backend
+            .append("s1", &ChatMessage::assistant("must not persist"))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected append metadata failure")
+        );
+
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        for store in [&backend, &reopened] {
+            let messages = store.try_load("s1").unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].content, "first");
+            assert_eq!(store.get_session_metadata("s1").unwrap().message_count, 1);
+        }
+    }
+
+    #[test]
+    fn append_sqlite_commits_message_and_metadata_once() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("s1", &ChatMessage::user("first")).unwrap();
+        backend
+            .append("s1", &ChatMessage::assistant("second"))
+            .unwrap();
+
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        for store in [&backend, &reopened] {
+            let messages = store.try_load("s1").unwrap();
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0].content, "first");
+            assert_eq!(messages[1].content, "second");
+            assert_eq!(store.get_session_metadata("s1").unwrap().message_count, 2);
+        }
     }
 
     #[test]

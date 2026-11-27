@@ -67,19 +67,19 @@ impl Peer {
     }
 
     fn start_history(&self) -> JoinHandle<()> {
+        self.start_history_with(json!({"session_id": REATTACH_SID}))
+    }
+
+    fn start_history_with(&self, params: Value) -> JoinHandle<()> {
         let mut connection = self.dispatcher.spawn_handle();
         zeroclaw_spawn::spawn!(async move {
             connection
-                .process_line(&request(
-                    Method::SessionMessages,
-                    &json!({"session_id":REATTACH_SID}),
-                    HISTORY_ID,
-                ))
+                .process_line(&request(Method::SessionMessages, &params, HISTORY_ID))
                 .await;
         })
     }
 
-    async fn history(&mut self, saved: Option<&str>) {
+    async fn history_snapshot(&mut self) -> SessionMessagesResult {
         let response = self.next_frame().await;
         assert_eq!(
             response["id"], HISTORY_ID,
@@ -88,6 +88,11 @@ impl Peer {
         let snapshot: SessionMessagesResult =
             serde_json::from_value(response["result"].clone()).unwrap();
         assert_eq!(snapshot.session_id, REATTACH_SID);
+        snapshot
+    }
+
+    async fn history(&mut self, saved: Option<&str>) {
+        let snapshot = self.history_snapshot().await;
         let mut expected = vec![("user", "Choose a bounded repair.")];
         if let Some(candidate) = saved {
             expected.push(("assistant", candidate));
@@ -200,7 +205,7 @@ struct HistoryCase {
     goal: GoalReattachFixture,
     a: Peer,
     b: Peer,
-    _directory: tempfile::TempDir,
+    directory: tempfile::TempDir,
 }
 
 impl HistoryCase {
@@ -241,7 +246,7 @@ impl HistoryCase {
             goal,
             a,
             b,
-            _directory: directory,
+            directory,
         }
     }
 
@@ -269,6 +274,29 @@ impl HistoryCase {
 
     async fn verifier_started(&self) {
         arrived(&self.goal.verifier.turn.started, "held verifier").await;
+    }
+
+    async fn assert_original_recipient(&self) {
+        let recipient = self
+            .ctx
+            .sessions
+            .goal_session_snapshot(REATTACH_SID)
+            .await
+            .unwrap()
+            .goal_recipient;
+        let (active, pending) = recipient.destinations_for_test();
+        assert!(
+            active
+                .and_then(|connection| connection.upgrade())
+                .is_some_and(|connection| connection.matches(&self.a.dispatcher.rpc)),
+            "a non-promoting request must keep A active"
+        );
+        assert!(
+            pending
+                .and_then(|connection| connection.upgrade())
+                .is_some_and(|connection| connection.matches(&self.b.dispatcher.rpc)),
+            "a non-promoting request must keep B pending"
+        );
     }
 
     async fn finish(self, expected: &str) {
@@ -362,6 +390,262 @@ async fn goal_saved_candidate_is_history_only_and_blocker_is_live() {
     case.b.notice(true).await;
     case.a.result(Method::Status, json!({}), 7).await;
     case.finish(QUESTION).await;
+}
+
+#[tokio::test]
+async fn goal_empty_page_does_not_promote_a_pending_destination() {
+    assert_limited_history_keeps_recipient(0).await;
+}
+
+#[tokio::test]
+async fn goal_single_message_page_does_not_promote_a_pending_destination() {
+    assert_limited_history_keeps_recipient(1).await;
+}
+
+async fn assert_limited_history_keeps_recipient(limit: usize) {
+    let mut case = HistoryCase::new(NativeBurstMode::SplitFinal).await;
+    case.goal.parent.turn.release.notify_one();
+    case.a.original_candidate(QUESTION).await;
+    case.verifier_started().await;
+    case.offer().await;
+    let read = case
+        .b
+        .start_history_with(json!({"session_id": REATTACH_SID, "limit": limit}));
+    let snapshot = case.b.history_snapshot().await;
+    assert_eq!(snapshot.total, 2);
+    assert_eq!(snapshot.start, 2 - limit);
+    assert_eq!(snapshot.messages.len(), limit);
+    if limit == 1 {
+        assert_eq!(snapshot.messages[0].content, QUESTION);
+    }
+    join_history(read).await;
+    case.assert_original_recipient().await;
+    case.goal.verifier.turn.release.notify_one();
+    case.a.notice(true).await;
+    case.b.result(Method::Status, json!({}), 7).await;
+    case.finish(QUESTION).await;
+}
+
+#[tokio::test]
+async fn goal_limited_snapshot_does_not_wait_for_the_candidate_save() {
+    let mut case = HistoryCase::new(NativeBurstMode::SplitFinal).await;
+    let (saving, save) = case.ctx.sessions.set_test_effect_pause(BEFORE_SAVE);
+    let (waiting, _retry) = case.ctx.sessions.set_test_effect_pause(WAIT_SAVE);
+    case.goal.parent.turn.release.notify_one();
+    case.a.original_candidate(QUESTION).await;
+    arrived(&saving, BEFORE_SAVE).await;
+    case.offer().await;
+    let read = case
+        .b
+        .start_history_with(json!({"session_id": REATTACH_SID, "limit": 100}));
+    tokio::select! {
+        biased;
+        () = waiting.notified() => panic!("a limited request entered the Goal save gate"),
+        () = case.b.history(None) => {}
+    }
+    join_history(read).await;
+    case.unsaved(true).await;
+    case.assert_original_recipient().await;
+    save.notify_one();
+    case.verifier_started().await;
+    case.goal.verifier.turn.release.notify_one();
+    case.a.notice(true).await;
+    case.b.result(Method::Status, json!({}), 7).await;
+    case.finish(QUESTION).await;
+}
+
+#[tokio::test]
+async fn goal_null_limit_still_promotes_the_complete_snapshot() {
+    let mut case = HistoryCase::new(NativeBurstMode::SplitFinal).await;
+    case.goal.parent.turn.release.notify_one();
+    case.a.original_candidate(QUESTION).await;
+    case.verifier_started().await;
+    case.offer().await;
+    let read = case
+        .b
+        .start_history_with(json!({"session_id": REATTACH_SID, "limit": null}));
+    case.b.history(Some(QUESTION)).await;
+    join_history(read).await;
+    case.goal.verifier.turn.release.notify_one();
+    case.b.notice(true).await;
+    case.a.result(Method::Status, json!({}), 7).await;
+    case.finish(QUESTION).await;
+}
+
+#[tokio::test]
+async fn goal_damaged_snapshot_is_best_effort_without_promoting() {
+    use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
+
+    let mut case = HistoryCase::new(NativeBurstMode::SplitFinal).await;
+    case.goal.parent.turn.release.notify_one();
+    case.a.original_candidate(QUESTION).await;
+    case.verifier_started().await;
+    case.offer().await;
+    let connection =
+        rusqlite::Connection::open(SqliteSessionBackend::db_path(case.directory.path())).unwrap();
+    let key = format!("rpc_{REATTACH_SID}");
+    let row: i64 = connection
+        .query_row(
+            "SELECT MAX(id) FROM sessions WHERE session_key = ?1",
+            [&key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE sessions SET content = CAST(content AS BLOB) WHERE id = ?1",
+                [row],
+            )
+            .unwrap(),
+        1
+    );
+    let backend = case.ctx.session_backend.as_ref().unwrap();
+    assert!(backend.try_load(&key).is_err());
+    assert_eq!(backend.load(&key).len(), 1);
+    let read = case.b.start_history();
+    case.b.history(None).await;
+    join_history(read).await;
+    case.assert_original_recipient().await;
+    case.goal.verifier.turn.release.notify_one();
+    case.a.notice(true).await;
+    case.b.result(Method::Status, json!({}), 7).await;
+    connection
+        .execute(
+            "UPDATE sessions SET content = CAST(content AS TEXT) WHERE id = ?1",
+            [row],
+        )
+        .unwrap();
+    case.finish(QUESTION).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn goal_sqlite_append_keeps_the_only_runtime_worker_responsive() {
+    use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
+
+    let mut case = HistoryCase::new(NativeBurstMode::SplitFinal).await;
+    let (saving, save) = case.ctx.sessions.set_test_effect_pause(BEFORE_SAVE);
+    case.goal.parent.turn.release.notify_one();
+    case.a.original_candidate(QUESTION).await;
+    arrived(&saving, BEFORE_SAVE).await;
+    case.unsaved(true).await;
+
+    let path = SqliteSessionBackend::db_path(case.directory.path());
+    let writer = rusqlite::Connection::open(path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    // Wake the held append from the only worker before enqueuing its probe.
+    // Use a wall-clock receive on the test thread: the blocked worker might
+    // not be able to drive a Tokio timer.
+    zeroclaw_spawn::spawn!(async move { save.notify_one() })
+        .await
+        .unwrap();
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    let probe = zeroclaw_spawn::spawn!(async move { send.send(()).unwrap() });
+    let responsive = receive.recv_timeout(Duration::from_secs(2));
+    writer.execute_batch("ROLLBACK").unwrap();
+    probe.await.unwrap();
+    responsive.expect("SQLite writer contention blocked the sole runtime worker");
+
+    case.verifier_started().await;
+    let reopened = SqliteSessionBackend::new(case.directory.path()).unwrap();
+    let key = format!("rpc_{REATTACH_SID}");
+    use zeroclaw_infra::session_backend::SessionBackend;
+    let durable = reopened.try_load(&key).unwrap();
+    assert_eq!(durable.len(), 2);
+    assert_eq!(durable[0].content, "Choose a bounded repair.");
+    assert_eq!(durable[1].content, QUESTION);
+    let agent = case.ctx.sessions.get_agent(REATTACH_SID).await.unwrap();
+    let visible = zeroclaw_api::model_provider::durable_chat_messages(agent.lock().await.history());
+    assert_eq!(
+        visible
+            .iter()
+            .filter(|message| message.content == QUESTION)
+            .count(),
+        1
+    );
+    case.goal.verifier.turn.release.notify_one();
+    case.a.notice(true).await;
+    case.finish(QUESTION).await;
+}
+
+#[tokio::test]
+async fn goal_sqlite_metadata_failure_rolls_back_candidate_and_reports_the_original_error() {
+    use crate::rpc::types::{GoalFailureReasonWire, SessionUpdateEvent, TurnCompletionOutcome};
+    use std::sync::atomic::Ordering;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
+
+    let mut case = HistoryCase::new(NativeBurstMode::SplitFinal).await;
+    let (saving, save) = case.ctx.sessions.set_test_effect_pause(BEFORE_SAVE);
+    case.goal.parent.turn.release.notify_one();
+    case.a.original_candidate(QUESTION).await;
+    arrived(&saving, BEFORE_SAVE).await;
+    case.unsaved(true).await;
+
+    let path = SqliteSessionBackend::db_path(case.directory.path());
+    let writer = rusqlite::Connection::open(path).unwrap();
+    writer
+        .execute_batch(
+            "CREATE TRIGGER fail_goal_metadata_update BEFORE UPDATE ON session_metadata
+             BEGIN SELECT RAISE(ABORT, 'injected Goal history metadata failure'); END;",
+        )
+        .unwrap();
+    drop(writer);
+    save.notify_one();
+
+    let error = case.a.next_frame().await;
+    assert_eq!(error["method"], "session/update", "{error}");
+    let event: SessionUpdateEvent = serde_json::from_value(error["params"].clone()).unwrap();
+    assert!(
+        matches!(event, SessionUpdateEvent::TurnComplete {
+            session_id,
+            outcome: TurnCompletionOutcome::Failed,
+            content,
+            goal_owned: true,
+            ..
+        } if session_id == REATTACH_SID && content.contains("injected Goal history metadata failure")),
+        "{error}"
+    );
+
+    let failure = case.a.next_frame().await;
+    assert_eq!(failure["method"], "session/goal_update", "{failure}");
+    let update: SessionGoalUpdate = serde_json::from_value(failure["params"].clone()).unwrap();
+    assert!(
+        matches!(update, SessionGoalUpdate::Failed {
+            session_id,
+            reason: GoalFailureReasonWire::CandidatePersistenceFailed
+        } if session_id == REATTACH_SID),
+        "{failure}"
+    );
+    case.unsaved(false).await;
+    assert_eq!(case.goal.verifier.turn.calls.load(Ordering::Acquire), 0);
+
+    let key = format!("rpc_{REATTACH_SID}");
+    let reopened = SqliteSessionBackend::new(case.directory.path()).unwrap();
+    for history in [
+        case.ctx
+            .session_backend
+            .as_ref()
+            .unwrap()
+            .try_load(&key)
+            .unwrap(),
+        reopened.try_load(&key).unwrap(),
+    ] {
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, "user");
+        assert_eq!(history[0].content, "Choose a bounded repair.");
+    }
+    let agent = case.ctx.sessions.get_agent(REATTACH_SID).await.unwrap();
+    let visible = zeroclaw_api::model_provider::durable_chat_messages(agent.lock().await.history());
+    assert!(!visible.iter().any(|message| message.content == QUESTION));
+
+    case.ctx
+        .goal_runtime
+        .dispose_session(REATTACH_SID)
+        .await
+        .unwrap();
+    case.a.result(Method::Status, json!({}), 7).await;
+    case.goal.verifier.finish().await;
 }
 
 #[tokio::test]
