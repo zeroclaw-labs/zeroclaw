@@ -21,7 +21,6 @@ cap-std = "4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 directories = "6.0"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
-chacha20poly1305 = "0.10"
 hex = "0.4"
 hmac = "0.12"
 image = { version = "0.25", default-features = false, features = [
@@ -55,7 +54,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-nix = { version = "0.30", default-features = false, features = ["process", "signal"] }
+nix = { version = "0.30", default-features = false, features = ["process", "signal", "user"] }
 
 [target.'cfg(windows)'.dependencies]
 process-wrap = { version = "=9.0.0", default-features = false, features = ["job-object", "kill-on-drop", "tokio1"] }
