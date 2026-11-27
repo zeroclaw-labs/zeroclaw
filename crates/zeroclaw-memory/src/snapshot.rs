@@ -20,7 +20,7 @@ const SNAPSHOT_HEADER: &str = "# 🧠 ZeroClaw Memory Snapshot\n\n\
     > This file is the \"soul\" of your agent — if `brain.db` is lost, start the agent\n\
     > in this workspace and it will auto-hydrate from this file.\n\n";
 
-/// Export all `Core` memories from SQLite → `MEMORY_SNAPSHOT.md`.
+/// Export active, non-private `Core` memories from SQLite → `MEMORY_SNAPSHOT.md`.
 /// Returns the number of entries exported.
 pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
     let db_path = workspace_dir.join("memory").join("brain.db");
@@ -36,28 +36,23 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
     let conn = Connection::open(&db_path)?;
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
 
-    // Private principal rows never enter the snapshot. The column arrived
-    // with private principal memory; a database written before it has no
-    // private rows to exclude and no column to name, so the predicate is
-    // applied only where the column exists.
-    let has_principal_column = conn
+    // Older databases may lack one or both of these visibility markers.
+    let columns = conn
         .prepare("PRAGMA table_info(memories)")?
         .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .iter()
-        .any(|column| column == "principal_id");
-    let sql = if has_principal_column {
-        "SELECT key, content, created_at, updated_at
-         FROM memories
-         WHERE category = 'core' AND principal_id IS NULL
-         ORDER BY updated_at DESC"
-    } else {
-        "SELECT key, content, created_at, updated_at
-         FROM memories
-         WHERE category = 'core'
-         ORDER BY updated_at DESC"
-    };
-    let mut stmt = conn.prepare(sql)?;
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut sql = String::from(
+        "SELECT key, content, created_at, updated_at FROM memories WHERE category = 'core'",
+    );
+    if columns.iter().any(|column| column == "principal_id") {
+        sql.push_str(" AND principal_id IS NULL");
+    }
+    if columns.iter().any(|column| column == "superseded_by") {
+        // Hydration restores each exported row as active.
+        sql.push_str(" AND superseded_by IS NULL");
+    }
+    sql.push_str(" ORDER BY updated_at DESC");
+    let mut stmt = conn.prepare(&sql)?;
 
     let rows: Vec<(String, String, String, String)> = stmt
         .query_map([], |row| {
