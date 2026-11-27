@@ -603,11 +603,60 @@ impl Default for SessionsSection {
 impl SessionsSection {
     pub(crate) fn validate(&self) -> Result<()> {
         if !(1..=MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE).contains(&self.max_tracked_per_pane) {
-            anyhow::bail!(
-                "max_tracked_per_pane must be between 1 and {MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE}"
-            );
+            return Err(SessionsLimitOutOfRange {
+                min: 1,
+                max: MAX_CONFIGURED_TRACKED_SESSIONS_PER_PANE,
+            }
+            .into());
         }
         Ok(())
+    }
+}
+
+/// `[sessions] max_tracked_per_pane` outside its allowed range. Formatted
+/// through the catalogue when displayed, so startup prints it in the
+/// selected language.
+#[derive(Debug)]
+struct SessionsLimitOutOfRange {
+    min: usize,
+    max: usize,
+}
+
+impl std::fmt::Display for SessionsLimitOutOfRange {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (min, max) = (self.min.to_string(), self.max.to_string());
+        formatter.write_str(&crate::i18n::t_args(
+            "zc-config-sessions-limit-range",
+            &[("min", min.as_str()), ("max", max.as_str())],
+        ))
+    }
+}
+
+impl std::error::Error for SessionsLimitOutOfRange {}
+
+/// Context for a `[sessions]` section in the config file that does not parse.
+#[derive(Debug)]
+struct SessionsSectionMalformed {
+    path: String,
+}
+
+impl std::fmt::Display for SessionsSectionMalformed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&crate::i18n::t_args(
+            "zc-config-sessions-malformed",
+            &[("path", self.path.as_str())],
+        ))
+    }
+}
+
+/// Context for a `[sessions]` value, from the file or the environment, that
+/// fails validation.
+#[derive(Debug)]
+struct SessionsSectionInvalid;
+
+impl std::fmt::Display for SessionsSectionInvalid {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&crate::i18n::t("zc-config-sessions-invalid"))
     }
 }
 
@@ -911,13 +960,15 @@ pub(crate) fn resolve_max_tracked_sessions_per_pane_checked(config_dir: &Path) -
             value
                 .clone()
                 .try_into::<SessionsSection>()
-                .with_context(|| format!("[sessions] in {} is malformed", path.display()))?;
+                .with_context(|| SessionsSectionMalformed {
+                    path: path.display().to_string(),
+                })?;
         }
     }
     let config = ensure_and_load(config_dir)?;
     config
         .resolve_max_tracked_sessions_per_pane()
-        .map_err(|error| anyhow::Error::msg(format!("[sessions] is invalid: {error}")))
+        .map_err(|error| error.context(SessionsSectionInvalid))
 }
 
 /// Resolve the effective `[todotracker]` settings for a session boundary,
@@ -2798,6 +2849,68 @@ mod tests {
         seed(dir.path(), "[sessions]\nmax_tracked_per_pane = \"many\"\n");
         let error = resolve_max_tracked_sessions_per_pane_checked(dir.path()).unwrap_err();
         assert!(format!("{error:#}").contains("[sessions]"));
+    }
+
+    /// The tracked-session startup errors go through the catalogue, so a
+    /// French operator sees them in French. Runs in a child process because
+    /// the selected locale is process-global.
+    #[test]
+    fn tracked_session_limit_errors_print_in_the_selected_language() {
+        if let Some(dir) = std::env::var_os("ZEROCODE_SESSIONS_LOCALE_CHILD") {
+            let dir = std::path::PathBuf::from(dir);
+            crate::i18n::init("fr", &dir);
+            seed(&dir, "[sessions]\nmax_tracked_per_pane = 0\n");
+            let range = resolve_max_tracked_sessions_per_pane_checked(&dir).unwrap_err();
+            eprintln!("RANGE<{range:#}>");
+            seed(&dir, "[sessions]\nmax_tracked_per_pane = \"many\"\n");
+            let malformed = resolve_max_tracked_sessions_per_pane_checked(&dir).unwrap_err();
+            eprintln!("MALFORMED<{malformed:#}>");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalogue = dir.path().join("data/ftl/fr");
+        std::fs::create_dir_all(&catalogue).unwrap();
+        std::fs::write(
+            catalogue.join("zerocode.ftl"),
+            include_str!("../../locales/fr/zerocode.ftl"),
+        )
+        .unwrap();
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current zerocode test binary path"),
+        )
+        .args([
+            "config::tests::tracked_session_limit_errors_print_in_the_selected_language",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("ZEROCODE_SESSIONS_LOCALE_CHILD", dir.path())
+        .env_remove("ZEROCLAW_CONFIG_DIR")
+        .env_remove("ZEROCODE_LOCALE_DIR")
+        .env_remove("ZEROCODE_locale")
+        .env_remove("ZEROCODE_sessions__max_tracked_per_pane")
+        .output()
+        .expect("spawn tracked-session locale child");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "child failed: {stderr}");
+        let between = |start: &str| {
+            let rest = stderr
+                .split_once(start)
+                .unwrap_or_else(|| panic!("child must print {start}: {stderr}"))
+                .1;
+            rest.split_once('>').expect("closed marker").0.to_string()
+        };
+        let range = between("RANGE<");
+        assert!(
+            range.starts_with("[sessions] n'est pas valide: ")
+                && range.contains("max_tracked_per_pane doit être compris entre 1 et 32"),
+            "out-of-range error must be French: {range}"
+        );
+        let malformed = between("MALFORMED<");
+        assert!(
+            malformed.contains("est mal formé") && !malformed.contains("is malformed"),
+            "malformed-section error must be French: {malformed}"
+        );
     }
 
     #[test]

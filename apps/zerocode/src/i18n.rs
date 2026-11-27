@@ -753,6 +753,44 @@ mod tests {
     }
 
     #[test]
+    fn tracked_session_config_errors_format_in_all_builtin_catalogues() {
+        let catalogues = [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ];
+
+        for (locale, source) in catalogues {
+            let bundle = build_ftl_bundle(source, locale);
+            let range = format_ftl_message(
+                &bundle,
+                "zc-config-sessions-limit-range",
+                &[("min", "1"), ("max", "32")],
+            )
+            .unwrap_or_else(|| panic!("session limit range must format for {locale}"));
+            assert!(
+                range.contains('1') && range.contains("32"),
+                "{locale}: {range}"
+            );
+            let malformed = format_ftl_message(
+                &bundle,
+                "zc-config-sessions-malformed",
+                &[("path", "/tmp/zerocode-config.toml")],
+            )
+            .unwrap_or_else(|| panic!("malformed [sessions] must format for {locale}"));
+            assert!(
+                malformed.contains("/tmp/zerocode-config.toml"),
+                "{locale}: {malformed}"
+            );
+            let invalid = format_ftl_message(&bundle, "zc-config-sessions-invalid", &[])
+                .unwrap_or_else(|| panic!("invalid [sessions] must format for {locale}"));
+            assert!(invalid.contains("[sessions]"), "{locale}: {invalid}");
+        }
+    }
+
+    #[test]
     fn spawned_daemon_startup_failure_formats_in_all_builtin_catalogues() {
         let catalogues = [
             ("en", EN_FTL),
