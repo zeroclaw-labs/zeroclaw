@@ -2,7 +2,9 @@
 """Exercise the Nix hash drift gate through its command-line interface."""
 
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -10,6 +12,7 @@ import unittest
 
 
 SCRIPT = Path(__file__).with_name("list_git_dep_keys.py")
+REFRESH = SCRIPT.parent.parent / "dev" / "refresh-nix-hashes.sh"
 GIT_PACKAGE = '''
 [[package]]
 name = "fixture"
@@ -61,6 +64,49 @@ class HashDriftTest(unittest.TestCase):
         result = self.run_gate(GIT_PACKAGE, {"fixture-1.0.0": "fixture-hash"})
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    @unittest.skipUnless(shutil.which("cargo") and shutil.which("jq"), "requires cargo and jq")
+    def test_refresh_hashes_uses_locked_git_revisions(self):
+        repourl = "https://example.invalid/fixtures"
+        revisions = {
+            "branch": ("?branch=main", "a" * 40),
+            "tag": ("?tag=v1", "a" * 40),
+            "rev": ("?rev=bbbbbbb", "b" * 40),
+            "default": ("", "c" * 40),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            refresh = root / "scripts/dev/refresh-nix-hashes.sh"
+            refresh.parent.mkdir(parents=True)
+            shutil.copyfile(REFRESH, refresh)
+            hashes = root / "nix/hashes.json"
+            hashes.parent.mkdir()
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            prefetch = bin_dir / "nix-prefetch-git"
+            prefetch.write_text(
+                '#!/bin/sh\nset -eu\n[ "$#" -eq 3 ] && [ "$2" = --rev ] || exit 1\n'
+                'printf "%s %s\\n" "$1" "$3" >> "$PREFETCH_CALLS"\n'
+                'printf \'{"hash":"fixture-%s"}\\n\' "$3"\n'
+            )
+            prefetch.chmod(0o755)
+            calls = root / "prefetch-calls"
+            lock = root / "Cargo.lock"
+            lock.write_text(REGISTRY_PACKAGE + "".join(
+                f'\n[[package]]\nname = "{name}"\nversion = "1.0.0"\n'
+                f'source = "git+{repourl}{selector}#{sha}"\n'
+                for name, (selector, sha) in revisions.items()
+            ))
+            result = subprocess.run(
+                ["bash", str(refresh)], capture_output=True, text=True, check=False,
+                env={**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                     "PREFETCH_CALLS": str(calls)},
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(json.loads(hashes.read_text()), {
+                f"{name}-1.0.0": f"fixture-{sha}" for name, (_, sha) in revisions.items()
+            })
+            self.assertCountEqual(calls.read_text().splitlines(),
+                                  [f"{repourl} {sha * 40}" for sha in "abc"])
 
 if __name__ == "__main__":
     unittest.main()
