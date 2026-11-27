@@ -137,16 +137,22 @@ impl BubblewrapSandbox {
         launcher: &Path,
     ) -> std::io::Result<()> {
         let invocation = super::shell_identity::invocation(cmd, None)?;
-        self.wrap_invocation(cmd, support, launcher, &invocation)
+        Self::wrap_invocation(cmd, support, launcher, &invocation);
+        Ok(())
     }
 
     fn wrap_invocation(
-        &self,
         cmd: &mut Command,
         support: BubblewrapHardeningSupport,
         launcher: &Path,
         invocation: &[OsString],
-    ) -> std::io::Result<()> {
+    ) {
+        let mut bwrap_cmd = Self::isolated_command(launcher, support);
+        bwrap_cmd.args(invocation);
+        *cmd = bwrap_cmd;
+    }
+
+    fn isolated_command(launcher: &Path, support: BubblewrapHardeningSupport) -> Command {
         let mut bwrap_cmd = Command::new(launcher);
         bwrap_cmd.args([
             "--ro-bind",
@@ -177,14 +183,34 @@ impl BubblewrapSandbox {
                 bwrap_cmd.args(["--ro-bind", lib_dir, lib_dir]);
             }
         }
-        bwrap_cmd.args(invocation);
-
-        *cmd = bwrap_cmd;
-        Ok(())
+        bwrap_cmd
     }
 }
 
 impl Sandbox for BubblewrapSandbox {
+    fn wrap_literal_command(&self, cmd: &mut Command) -> std::io::Result<()> {
+        let program = Path::new(cmd.get_program());
+        let workspace = cmd
+            .get_current_dir()
+            .ok_or(std::io::ErrorKind::InvalidInput)?;
+        if !program.is_absolute() || !workspace.is_absolute() {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        let launcher = Self::resolve_launcher()?;
+        let mut wrapped =
+            Self::isolated_command(&launcher, Self::detect_hardening_support(&launcher));
+        // Select the cwd *inside* the existing namespace. If it isn't visible,
+        // bwrap refuses rather than mounting new host paths or substituting `/`.
+        wrapped
+            .arg("--chdir")
+            .arg(workspace)
+            .arg("--")
+            .arg(program)
+            .args(cmd.get_args());
+        *cmd = wrapped;
+        Ok(())
+    }
+
     fn wrap_shell_command(
         &self,
         cmd: &mut Command,
@@ -193,7 +219,8 @@ impl Sandbox for BubblewrapSandbox {
         let invocation = super::shell_identity::invocation(cmd, shell_program)?;
         let launcher = Self::resolve_launcher()?;
         let support = Self::detect_hardening_support(&launcher);
-        self.wrap_invocation(cmd, support, &launcher, &invocation)
+        Self::wrap_invocation(cmd, support, &launcher, &invocation);
+        Ok(())
     }
 
     fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
@@ -234,14 +261,12 @@ mod tests {
                 Ok(PathBuf::from("/usr/bin/env"))
             })
             .unwrap();
-        BubblewrapSandbox
-            .wrap_invocation(
-                &mut cmd,
-                BubblewrapHardeningSupport::default(),
-                Path::new("/usr/bin/bwrap"),
-                &invocation,
-            )
-            .unwrap();
+        BubblewrapSandbox::wrap_invocation(
+            &mut cmd,
+            BubblewrapHardeningSupport::default(),
+            Path::new("/usr/bin/bwrap"),
+            &invocation,
+        );
         assert_eq!(cmd.get_program(), "/usr/bin/bwrap");
         assert!(
             cmd.get_args().collect::<Vec<_>>().ends_with(
@@ -257,6 +282,101 @@ mod tests {
         cmd.get_args()
             .map(|s| s.to_string_lossy().to_string())
             .collect()
+    }
+
+    #[test]
+    fn literal_command_requires_resolved_program_and_explicit_workspace() {
+        for (program, cwd) in [
+            ("echo", Some("/tmp")),
+            ("/bin/echo", None),
+            ("/bin/echo", Some(".")),
+        ] {
+            let mut cmd = Command::new(program);
+            if let Some(cwd) = cwd {
+                cmd.current_dir(cwd);
+            }
+            assert_eq!(
+                BubblewrapSandbox
+                    .wrap_literal_command(&mut cmd)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires bwrap and usable user namespaces"]
+    async fn literal_skill_under_bubblewrap_obeys_allowlist_and_preserves_argument_and_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc;
+
+        let workspace = tempfile::tempdir_in("/tmp").unwrap();
+        let dir = workspace.path();
+        let recorder = dir.join("recorder");
+        std::fs::write(
+            &recorder,
+            "#!/bin/sh\nprintf '%s' \"$#\" > called\nprintf '%s' \"$1\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&recorder, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let skill = dir.join("skills/sample");
+        std::fs::create_dir_all(&skill).unwrap();
+        let manifest = format!(
+            "[skill]\nname='sample'\ndescription='test'\n\
+             [[tools]]\nname='record'\ndescription='record text'\nkind='shell'\n\
+             argv=['{}','{{{{text}}}}']\n[tools.args]\ntext='message'\n",
+            recorder.display()
+        );
+        std::fs::write(skill.join("SKILL.toml"), manifest).unwrap();
+        let (skills, dropped) =
+            crate::skills::load_skills_from_directory(&dir.join("skills"), false);
+        assert!(dropped.is_empty());
+        let sandbox = Arc::new(BubblewrapSandbox::new().unwrap());
+        let text = "--literal '雪' \"quoted\"\n{{text}}  ";
+        let marker = dir.join("called");
+        for allowed in [false, true] {
+            let policy = crate::security::SecurityPolicy {
+                workspace_dir: dir.to_owned(),
+                sandbox_enabled: Some(true),
+                allowed_commands: if allowed {
+                    vec![recorder.to_str().unwrap().to_owned()]
+                } else {
+                    vec![]
+                },
+                ..Default::default()
+            };
+            let tools = crate::skills::prepare_skill_tools_with_runtime(
+                &skills,
+                Arc::new(policy),
+                Arc::new(crate::platform::NativeRuntime::new()),
+                Some(sandbox.clone()),
+                Some(&[]),
+                |tool| tool,
+                |_, _, _| None,
+            );
+            let [tool] = tools.as_slice() else {
+                panic!("expected one registered skill");
+            };
+            assert_eq!(tool.name(), "sample__record");
+            let result = tool.execute(serde_json::json!({"text": text})).await;
+            if allowed {
+                let result = result.unwrap();
+                assert!(result.success, "{:?}", result.error);
+                assert_eq!(std::fs::read(&marker).unwrap(), b"1");
+                assert_eq!(result.output.as_bytes(), text.as_bytes());
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Executable not allowed by security policy"),
+                    "{error}"
+                );
+                assert!(!marker.try_exists().unwrap());
+            }
+        }
     }
 
     #[test]
