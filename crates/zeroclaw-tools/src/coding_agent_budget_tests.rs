@@ -2,7 +2,6 @@ use crate::claude_code::ClaudeCodeTool;
 use crate::claude_code_runner::ClaudeCodeRunnerTool;
 use crate::codex_cli::CodexCliTool;
 use crate::coding_cli::{CodingCliCommand, CodingCliExecutionError, CodingCliExecutor};
-use crate::gemini_cli::GeminiCliTool;
 use crate::opencode_cli::OpenCodeCliTool;
 use crate::wrappers::RateLimitedTool;
 use async_trait::async_trait;
@@ -14,7 +13,7 @@ use zeroclaw_api::tool::Tool;
 use zeroclaw_config::autonomy::AutonomyLevel;
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::{
-    ClaudeCodeConfig, ClaudeCodeRunnerConfig, CodexCliConfig, GeminiCliConfig, OpenCodeCliConfig,
+    ClaudeCodeConfig, ClaudeCodeRunnerConfig, CodexCliConfig, OpenCodeCliConfig,
 };
 
 #[derive(Debug)]
@@ -110,19 +109,6 @@ fn coding_agent_cases(
             CodexCliTool::new_with_executor(
                 security.clone(),
                 CodexCliConfig::default(),
-                executor.clone(),
-            ),
-            security,
-        ),
-    ));
-
-    let security = policy(autonomy, max_actions_per_hour, workspace);
-    cases.push((
-        security.clone(),
-        wrapped_tool(
-            GeminiCliTool::new_with_executor(
-                security.clone(),
-                GeminiCliConfig::default(),
                 executor.clone(),
             ),
             security,
