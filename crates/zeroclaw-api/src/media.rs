@@ -87,6 +87,13 @@ pub struct RenderedMarker {
     pub kind: MarkerKind,
 }
 
+/// Identify an MP4 container header. This does not validate codecs or playback.
+/// Shared by resource intake and provider dispatch so both grant video input
+/// only after the same minimum container check.
+pub fn is_mp4_container(bytes: &[u8]) -> bool {
+    bytes.len() >= 12 && &bytes[4..8] == b"ftyp"
+}
+
 /// A single media attachment on an inbound message.
 #[derive(Debug, Clone, Default)]
 pub struct MediaAttachment {

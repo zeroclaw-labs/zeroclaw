@@ -150,6 +150,33 @@ pub fn materialize_resource_blob(
     materialize_bytes(workspace_dir, &bytes, &filename, &mime)
 }
 
+/// MCP video resources declare their media type explicitly. Keep the URI as
+/// provenance only; never fetch it or derive the persisted extension from it.
+fn materialize_mcp_resource_blob(
+    workspace_dir: &Path,
+    uri: Option<&str>,
+    mime_type: Option<&str>,
+    blob_b64: &str,
+) -> Result<MaterializedResource, EmbeddedResourceError> {
+    let is_mp4 = mime_type.is_some_and(|mime| {
+        mime.split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .eq_ignore_ascii_case("video/mp4")
+    });
+    if !is_mp4 {
+        return materialize_resource_blob(workspace_dir, uri, mime_type, blob_b64);
+    }
+    let bytes = decode_embedded_blob(blob_b64)?;
+    if !zeroclaw_api::media::is_mp4_container(&bytes) {
+        return Err(EmbeddedResourceError(
+            "video resource is not an MP4 container".into(),
+        ));
+    }
+    materialize_bytes(workspace_dir, &bytes, "upload.mp4", "video/mp4")
+}
+
 /// Materialize an MCP `type: "image"` payload, which carries a base64 `data`
 /// field and no source URI. The on-disk extension must match the bytes: the
 /// multimodal loader prefers a path's extension over the decoded bytes' magic,
@@ -551,10 +578,10 @@ fn structured_copy_of_text(text: &str, structured: &serde_json::Value) -> bool {
 /// as that text alone — see [`all_text_content`]. Results without binary content
 /// that cannot be compacted keep the existing pretty-printed JSON shape.
 ///
-/// Materialized images are declared in the returned attachment list (one
-/// `RenderedMarker` per written image file) instead of being written into the
+/// Materialized images and validated MP4 videos are declared in the returned
+/// attachment list (one `RenderedMarker` per written visual file) instead of being written into the
 /// text as marker syntax: the caller attaches them to the `ToolResult`, so they
-/// ride the tool carrier grammar. A non-image resource blob keeps its Document
+/// ride the tool carrier grammar. Other resource blobs keep their Document
 /// marker in the text — that syntax is the channel delivery contract, and it
 /// was never image-promotable.
 ///
@@ -673,7 +700,7 @@ pub(crate) fn format_mcp_tool_result_for_model(
                 let marker = if let Some(m) = over_budget_marker {
                     m.to_string()
                 } else {
-                    match materialize_resource_blob(
+                    match materialize_mcp_resource_blob(
                         workspace_dir,
                         uri.as_deref(),
                         mime.as_deref(),
@@ -684,12 +711,19 @@ pub(crate) fn format_mcp_tool_result_for_model(
                                 &materialized.abs_path.to_string_lossy(),
                             )
                             .into_owned();
-                            if materialized.mime_type.starts_with("image/") {
+                            let visual_kind = if materialized.mime_type == "video/mp4" {
+                                Some(MarkerKind::Video)
+                            } else if materialized.mime_type.starts_with("image/") {
+                                Some(MarkerKind::Image)
+                            } else {
+                                None
+                            };
+                            if let Some(kind) = visual_kind {
                                 attachments.push(RenderedMarker {
                                     target: abs_display.clone(),
-                                    kind: MarkerKind::Image,
+                                    kind,
                                 });
-                                // The image rides the attachment list; the
+                                // Visual media rides the attachment list; the
                                 // text references the plain path.
                                 abs_display
                             } else {
@@ -2133,3 +2167,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "embedded_video_tests.rs"]
+mod video_tests;

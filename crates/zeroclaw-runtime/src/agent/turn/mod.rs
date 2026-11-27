@@ -1723,7 +1723,22 @@ pub fn run_tool_call_loop(
     run_tool_call_loop_impl(p, None, None, None)
 }
 
-async fn run_tool_call_loop_impl<'a>(
+fn run_tool_call_loop_impl<'a>(
+    p: ToolLoop<'a>,
+    initial_ingress: Option<InitialIngressSubject<'a>>,
+    seed_reported_usage: Option<ReportedRequestUsage>,
+    repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    let policy = p.exec.security.cloned().map(Arc::new);
+    // Delegated turns recurse through this seam. Erase the scoped future so
+    // Send checking does not expand the entire nested tool-loop type.
+    Box::pin(zeroclaw_providers::with_video_read_policy(
+        policy,
+        run_tool_call_loop_inner(p, initial_ingress, seed_reported_usage, repetition_guard),
+    ))
+}
+
+async fn run_tool_call_loop_inner<'a>(
     mut p: ToolLoop<'a>,
     initial_ingress: Option<InitialIngressSubject<'a>>,
     seed_reported_usage: Option<ReportedRequestUsage>,
