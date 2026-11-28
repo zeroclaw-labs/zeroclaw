@@ -259,26 +259,47 @@ test('ACP reconnect requests the turn cursor and keeps a single tool card', asyn
   third.socket.receive({ id: retry.id, error: { code: -32000, message: 'Session not found' } });
   await closeAgain;
 
-  await t.test('a refused resume closes without scheduling another socket', async (t) => {
+  await t.test('a tombstoned session stops automatic reconnect without creating a replacement', async (t) => {
     t.mock.timers.enable({ apis: ['setTimeout'] });
-    const staleChat = new AcpChatSocket({ agentAlias: 'test', sessionId: 'deleted', reconnectDelay: 1 });
+    const sessionId = 'a42d7981-8398-4b5c-a866-3bb27044afd7';
+    const staleChat = new AcpChatSocket({ agentAlias: 'test', sessionId, reconnectDelay: 1 });
     t.after(() => staleChat.disconnect());
     const errors: WsMessage[] = [];
-    staleChat.onMessage = (message) => errors.push(message);
+    staleChat.onMessage = (message) => {
+      if (message.type === 'error') errors.push(message);
+    };
     staleChat.connect();
+    const originalSocket = sockets[sockets.length - 1];
+    assert.ok(originalSocket);
+    originalSocket.open();
+    originalSocket.reply('initialize', { protocolVersion: 1 });
+    await Promise.resolve();
+    assert.deepEqual(originalSocket.reply('session/resume', {}), { sessionId });
+    await Promise.resolve();
+    originalSocket.reply('_zeroclaw/session/reattach', { inFlight: false });
+    await Promise.resolve();
+    assert.equal(staleChat.connected, true);
+
+    originalSocket.close();
+    t.mock.timers.tick(1);
     const socket = sockets[sockets.length - 1];
     assert.ok(socket);
+    assert.notEqual(socket, originalSocket);
     const count = sockets.length;
     socket.open();
     socket.reply('initialize', { protocolVersion: 1 });
     await Promise.resolve();
     const resume = socket.sent.find((frame) => frame.method === 'session/resume');
     assert.ok(resume);
-    socket.receive({ id: resume.id, error: { code: -32012, message: 'Session unavailable' } });
+    assert.deepEqual(resume.params, { sessionId });
+    const message = `Session cannot be restored: ${sessionId}`;
+    socket.receive({ id: resume.id, error: { code: -32012, message } });
     await Promise.resolve();
     t.mock.timers.tick(100);
+    assert.deepEqual(socket.sent.map((frame) => frame.method), ['initialize', 'session/resume']);
+    assert.equal(socket.readyState, 3);
     assert.equal(sockets.length, count);
     assert.equal(staleChat.connected, false);
-    assert.equal(errors.filter((message) => message.type === 'error').length, 1);
+    assert.deepEqual(errors, [{ type: 'error', code: 'AGENT_INIT_FAILED', message }]);
   });
 });
