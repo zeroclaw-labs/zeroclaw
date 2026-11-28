@@ -82,9 +82,19 @@ cargo_log="${RUNNER_TEMP:?RUNNER_TEMP must be set}/${log_name}"
 SECONDS=0
 set +e
 "${command[@]}" 2>&1 | tee "$cargo_log"
-cargo_status=${PIPESTATUS[0]}
+pipeline_status=("${PIPESTATUS[@]}")
 set -e
 duration_seconds=$SECONDS
+cargo_status=${pipeline_status[0]}
+tee_status=${pipeline_status[1]}
+
+if [ "$tee_status" -ne 0 ]; then
+    printf 'Clippy log capture failed (tee exited %s).\n' "$tee_status" >&2
+    if [ "$cargo_status" -ne 0 ]; then
+        exit "$cargo_status"
+    fi
+    exit "$tee_status"
+fi
 
 workspace_path_compiles="$(grep -E -c 'Compiling.*\([^)]*zeroclaw' "$cargo_log" || true)"
 total_compiles="$(grep -c 'Compiling' "$cargo_log" || true)"

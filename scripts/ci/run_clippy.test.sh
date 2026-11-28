@@ -165,4 +165,27 @@ if [ "$status" -ne 17 ]; then
 fi
 assert_summary_line "| Clippy status | \`17\` |"
 
+mkdir "$runner_temp/unwritable.log"
+
+assert_log_failure() {
+    local cargo_test_status="$1" status=0
+    ZEROCLAW_CLIPPY_TEST_STATUS="$cargo_test_status" run_runner \
+        --scope workspace \
+        --summary-title "Unwritable log diagnostics" \
+        --log-name unwritable.log 2>/dev/null || status=$?
+
+    if [ "$status" -eq 0 ]; then
+        fail "expected a failure when the Clippy log could not be written"
+    fi
+    if [ "$cargo_test_status" -ne 0 ] && [ "$status" -ne "$cargo_test_status" ]; then
+        fail "expected Cargo status $cargo_test_status when the log could not be written, got $status"
+    fi
+    if [ -s "$summary_file" ]; then
+        fail "wrote a Clippy summary from an unreadable log"
+    fi
+}
+
+assert_log_failure 0
+assert_log_failure 17
+
 echo "shared Clippy runner tests: pass"
