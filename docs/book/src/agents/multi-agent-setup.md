@@ -23,7 +23,15 @@ Without a channel the agent has nowhere to listen. Bind one via the agent's `cha
 
 ## Cross-agent file access
 
-By default, an agent can only read and write within its own workspace dir. You can grant one agent read or write access into another agent's workspace (configured via the gateway, zerocode, or `zeroclaw config set`). Effective behavior, e.g. `researcher` granted write to `primary` and read to `archivist`:
+An agent starts with its own workspace. The filesystem policy also allows reads from the shared skills directory and can grant access to additional roots. You can grant one agent access into another agent's workspace (configured via the gateway, zerocode, or `zeroclaw config set`). The grant lives in the `workspace.access` map of the agent that receives it; the modes are listed under [Workspace](./filesystem.md#workspace). `file_edit` reads the file before changing it, so it needs `read_write`. For example, to give `researcher` read and write access to `primary` and read access to `archivist`:
+
+```toml
+[agents.researcher.workspace.access]
+primary = "read_write"
+archivist = "read"
+```
+
+Effective behavior:
 
 - `file_read` from `researcher` can read both `<install>/agents/primary/workspace/` and `<install>/agents/archivist/workspace/`.
 - `file_write` and `file_edit` from `researcher` can write into `<install>/agents/primary/workspace/` but **not** `<install>/agents/archivist/workspace/`.
@@ -136,4 +144,4 @@ zeroclaw daemon 2>&1 | grep '\[system\]'       # boot/migration/scheduler lines 
 
 </div>
 
-If the boundary checks are working, `file_read /dev/null` from any agent succeeds (POSIX device-file allowlist), `file_read` outside the workspace + access list fails with `Path escapes workspace directory`, and `file_write` to a read-only allowlisted sibling fails with the same message.
+On POSIX, an allowed `file_read /dev/null` succeeds with an empty result. To check a boundary, try reading a sibling file outside all of the agent's permitted roots and writing to a sibling for which its only grant is `read`. Both operations should be refused. Messages can include `Path blocked by security policy` and `Path escapes workspace directory`, depending on the check.

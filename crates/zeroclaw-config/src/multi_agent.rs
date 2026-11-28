@@ -112,7 +112,8 @@ pub struct AgentWorkspaceConfig {
     /// `<install>/agents/<alias>/workspace/`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
-    /// Cross-agent workspace allowlist. An empty map grants no sibling access.
+    /// Outbound cross-agent workspace allowlist: each entry lets this agent into the named sibling.
+    /// The value is the access mode. An empty map adds no sibling grants.
     pub access: BTreeMap<AgentAlias, AccessMode>,
     /// Escape hatch: when `true`, the agent can read or write anywhere
     /// the host filesystem permits. Off by default; flipping this on is

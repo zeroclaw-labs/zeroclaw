@@ -50,9 +50,10 @@ from the schema:
 
 Two things worth calling out:
 
-- **`access`** is an inbound allowlist for cross-agent filesystem sharing. Empty
-  means jailed (own workspace only); an entry grants a named sibling agent a
-  read or write mode into this agent's workspace.
+- **`access`** is an outbound allowlist for cross-agent filesystem sharing. An
+  entry names a sibling agent and grants this agent `read`, `write`, or
+  `read_write` access into that sibling's workspace. An empty map adds no
+  sibling grants; other configured roots and filesystem policy still apply.
 - **`unrestricted_filesystem`** is the escape hatch: when `true`, the agent can
   touch anything the host filesystem permits. It is off by default and flipping
   it on is auditable.
