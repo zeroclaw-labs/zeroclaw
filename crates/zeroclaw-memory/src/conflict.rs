@@ -2,8 +2,8 @@
 
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 
-/// Check for conflicting memories and mark old ones as superseded.
-/// Returns the list of entry IDs that were superseded.
+/// Select similar Core entries for the caller to supersede after storing a replacement.
+/// Raw cosine similarity preserves the existing heuristic; it does not prove contradiction.
 pub async fn check_and_resolve_conflicts(
     memory: &dyn Memory,
     key: &str,
@@ -16,8 +16,9 @@ pub async fn check_and_resolve_conflicts(
         return Ok(Vec::new());
     }
 
-    // Search for similar existing entries
-    let candidates = memory.recall(content, 10, None, None, None).await?;
+    // Ordinary recall scores rank a result set; they are not absolute evidence
+    // for hiding a stored fact (BM25/LIKE may rank an unrelated fact at 1.0).
+    let candidates = memory.recall_for_supersession(content, 10).await?;
 
     let mut superseded = Vec::new();
     for candidate in &candidates {
@@ -28,6 +29,7 @@ pub async fn check_and_resolve_conflicts(
             continue;
         }
         if let Some(score) = candidate.score
+            && score.is_finite()
             && score > threshold
             && candidate.content != content
         {
