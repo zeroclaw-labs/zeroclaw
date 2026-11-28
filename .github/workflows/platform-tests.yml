@@ -75,6 +75,8 @@ jobs:
       - name: Ensure web/dist placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Test portable SSH authentication
+        run: cargo test --locked -p zeroclaw-tools --features portable-ssh --test portable_ssh_auth
       - name: Install cargo-nextest
         shell: bash
         run: |

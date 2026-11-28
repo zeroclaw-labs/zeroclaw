@@ -130,6 +130,7 @@ webauthn = []
 # `zeroclaw-tools` and registers it here. Opt-in; see the root crate's
 # `tools-saas` and `tools-coding-cli` bundles.
 tools-external = ["zeroclaw-tools/tools-external"]
+portable-ssh = ["zeroclaw-tools/portable-ssh"]
 tool-jira = ["zeroclaw-tools/tool-jira"]
 tool-notion = ["zeroclaw-tools/tool-notion"]
 tool-linkedin = ["zeroclaw-tools/tool-linkedin"]

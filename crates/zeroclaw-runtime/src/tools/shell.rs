@@ -60,6 +60,29 @@ impl Drop for ChildGroupGuard {
     }
 }
 
+// The host broker executes outside OS sandboxes. Never pass that capability
+// through a sandbox, including values supplied by passthrough/TUI overlays.
+fn configure_task_ssh_environment(
+    cmd: &mut tokio::process::Command,
+    sandbox: &dyn Sandbox,
+    task: Option<zeroclaw_tools::task_ssh::SshTask>,
+) {
+    for name in [
+        "ZEROCLAW_SSH_TASK",
+        "ZEROCLAW_SSH_STATE_DIR",
+        "ZEROCLAW_SSH_TASK_HELPER",
+    ] {
+        cmd.env_remove(name);
+    }
+    if sandbox.name() == "none"
+        && let Some(task) = task
+        && !task.state_dir.is_empty()
+    {
+        cmd.env("ZEROCLAW_SSH_TASK", task.id);
+        cmd.env("ZEROCLAW_SSH_STATE_DIR", task.state_dir);
+    }
+}
+
 /// Shell command execution tool with sandboxing
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
@@ -183,6 +206,16 @@ fn get_session_id() -> Option<String> {
         .filter(|key| !key.is_empty())
 }
 
+#[cfg(feature = "portable-ssh")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedSshRequest {
+    alias: String,
+    host: String,
+    port: Option<u16>,
+    username: Option<String>,
+}
+
 #[async_trait]
 impl Tool for ShellTool {
     fn name(&self) -> &str {
@@ -194,7 +227,7 @@ impl Tool for ShellTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
+        let schema = json!({
             "type": "object",
             "properties": {
                 "command": {
@@ -208,7 +241,26 @@ impl Tool for ShellTool {
                 }
             },
             "required": ["command"]
-        })
+        });
+        #[cfg(feature = "portable-ssh")]
+        {
+            let mut schema = schema;
+            schema["properties"]["ssh_authorization"] = json!({
+                "type": "object",
+                "description": "Run command on an authorized SSH destination using the credential alias. Omit for local execution.",
+                "additionalProperties": false,
+                "required": ["alias", "host"],
+                "properties": {
+                    "alias": {"type": "string"},
+                    "host": {"type": "string"},
+                    "port": {"type": "integer", "minimum": 1, "maximum": 65535, "default": 22},
+                    "username": {"type": "string", "description": "Required only to disambiguate a destination with multiple authorized users."}
+                }
+            });
+            schema
+        }
+        #[cfg(not(feature = "portable-ssh"))]
+        schema
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -271,6 +323,78 @@ impl Tool for ShellTool {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(format!("Path blocked by security policy: {path}")),
+            });
+        }
+
+        if let Some(ssh) = args.get("ssh_authorization") {
+            #[cfg(feature = "portable-ssh")]
+            {
+                let request: ManagedSshRequest = serde_json::from_value(ssh.clone())?;
+                let result = async {
+                    anyhow::ensure!(
+                        self.sandbox.name() == "none",
+                        "Managed SSH is unavailable in this sandbox"
+                    );
+                    self.security
+                        .validate_command_execution_in("ssh", approved, shell)
+                        .map_err(anyhow::Error::msg)?;
+                    let task = zeroclaw_tools::task_ssh::current()
+                        .and_then(|task| task.portable)
+                        .ok_or_else(|| {
+                            anyhow::Error::msg("Managed SSH is unavailable for this task")
+                        })?;
+                    task.execute_for_alias(
+                        &request.alias,
+                        &request.host,
+                        request.port.unwrap_or(22),
+                        request.username.as_deref(),
+                        command,
+                        Duration::from_secs(self.timeout_secs),
+                    )
+                    .await
+                }
+                .await;
+                return Ok(match result {
+                    Ok(output) => {
+                        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+                        text.push_str(&String::from_utf8_lossy(&output.stderr));
+                        ToolResult {
+                            success: output.status == 0,
+                            output: text.into(),
+                            error: (output.status != 0).then(|| {
+                                format!("SSH command exited with status {}", output.status)
+                            }),
+                        }
+                    }
+                    Err(error) => ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(error.to_string()),
+                    },
+                });
+            }
+            #[cfg(not(feature = "portable-ssh"))]
+            {
+                let _ = ssh;
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some("Managed SSH is unavailable in this build".into()),
+                });
+            }
+        }
+
+        // A shared host broker must not be reachable from an OS sandbox,
+        // even by discovering its socket in a shared directory such as /tmp.
+        if self.sandbox.name() != "none"
+            && zeroclaw_tools::task_ssh::current().is_some_and(|task| !task.state_dir.is_empty())
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "tool-shell-ssh-broker-sandbox-unsupported",
+                )),
             });
         }
 
@@ -344,6 +468,12 @@ impl Tool for ShellTool {
                 cmd.env(k, v);
             }
         }
+
+        configure_task_ssh_environment(
+            &mut cmd,
+            self.sandbox.as_ref(),
+            zeroclaw_tools::task_ssh::current(),
+        );
 
         // Android: platform tools (sh, getprop, am, dumpsys, content, pm, ...)
         // live in /system/bin and /system/xbin. The cleared+rebuilt PATH above
@@ -2517,6 +2647,79 @@ mod tests {
             r2.error.as_deref().unwrap_or("").contains("Rate limit")
                 || r2.error.as_deref().unwrap_or("").contains("budget")
         );
+    }
+
+    struct BrokerIsolationSandbox;
+    #[async_trait::async_trait]
+    impl Sandbox for BrokerIsolationSandbox {
+        fn wrap_command(&self, _: &mut std::process::Command) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &str {
+            "isolated-test"
+        }
+        fn description(&self) -> &str {
+            "Synthetic OS isolation"
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn sandboxed_shell_cannot_inherit_host_ssh_broker() {
+        let mut command = tokio::process::Command::new("/usr/bin/env");
+        command.env_clear();
+        for name in [
+            "ZEROCLAW_SSH_TASK",
+            "ZEROCLAW_SSH_STATE_DIR",
+            "ZEROCLAW_SSH_TASK_HELPER",
+        ] {
+            command.env(name, "untrusted-overlay");
+        }
+        configure_task_ssh_environment(
+            &mut command,
+            &BrokerIsolationSandbox,
+            Some(zeroclaw_tools::task_ssh::SshTask {
+                id: "test-task".into(),
+                state_dir: "/tmp/test-broker".into(),
+                #[cfg(feature = "portable-ssh")]
+                portable: None,
+            }),
+        );
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        assert!(
+            !String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("ZEROCLAW_SSH_")
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn unsandboxed_shell_uses_only_current_broker_identity() {
+        let mut command = tokio::process::Command::new("/usr/bin/env");
+        command.env_clear();
+        command.env("ZEROCLAW_SSH_TASK_HELPER", "untrusted-overlay");
+        command.env("ZEROCLAW_SSH_TASK", "stale-task");
+        configure_task_ssh_environment(
+            &mut command,
+            &crate::security::NoopSandbox,
+            Some(zeroclaw_tools::task_ssh::SshTask {
+                id: "test-task".into(),
+                state_dir: "/tmp/test-broker".into(),
+                #[cfg(feature = "portable-ssh")]
+                portable: None,
+            }),
+        );
+        let output = command.output().await.unwrap();
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("ZEROCLAW_SSH_TASK=test-task"));
+        assert!(text.contains("ZEROCLAW_SSH_STATE_DIR=/tmp/test-broker"));
+        assert!(!text.contains("untrusted-overlay"));
+        assert!(!text.contains("stale-task"));
     }
 
     // ── Sandbox integration tests ────────────────────────
