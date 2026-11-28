@@ -3972,7 +3972,7 @@ mod tests {
         std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
         let mut tool =
             screenshot_tool_with_workspace(tmp.path()).with_credential_config(path.clone());
-        tool.set_agent_browser_bin_for_tests(tmp.path().join("must-not-execute"));
+        tool.agent_browser_bin = Some(tmp.path().join("must-not-execute"));
         let args = json!({"credential":"LOGIN"});
         let result = tool
             .submit_catalog_credential_with_resolver(&args, |_, _| async {
