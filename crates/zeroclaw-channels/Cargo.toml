@@ -67,7 +67,7 @@ lettre = { version = "0.11.24", default-features = false, features = [
 ], optional = true }
 pulldown-cmark = "0.13"
 mail-parser = { version = "0.11.2", optional = true }
-matrix-sdk = { version = "0.19", optional = true, default-features = false, features = [
+matrix-sdk = { version = "0.20", optional = true, default-features = false, features = [
   # 0.19 moved the TLS provider out of `reqwest/rustls` into its own feature
   # and made it a default; with default-features = false we have to name it or
   # every Client build panics with "No rustls crypto provider is configured".
@@ -94,7 +94,7 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls-webpki-roots-no-provider",
   "stream",
 ] }
-rusqlite = { version = "0.40", optional = true, features = ["bundled", "fallible_uint"] }
+rusqlite = { version = "0.41", optional = true, features = ["bundled", "fallible_uint"] }
 rustls = { version = "0.23", default-features = false, features = [
   "logging",
   "ring",
@@ -306,17 +306,17 @@ image = { version = "0.25", default-features = false, features = [
   "png",
   "webp",
 ] }
-matrix-sdk = { version = "0.19", default-features = false, features = [
+matrix-sdk = { version = "0.20", default-features = false, features = [
   "rustls-aws-lc-rs",
   "testing",
   "e2e-encryption",
   "markdown",
   "sqlite",
 ] }
-matrix-sdk-base = { version = "0.19", default-features = false, features = ["e2e-encryption"] }
-matrix-sdk-test = "0.19"
+matrix-sdk-base = { version = "0.20", default-features = false, features = ["e2e-encryption"] }
+matrix-sdk-test = "0.20"
 rcgen = "0.13"
-rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
+rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
 tempfile = "3.26"
 toml = "1.0"
 wiremock = "0.6"

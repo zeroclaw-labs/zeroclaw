@@ -561,6 +561,16 @@ mod tests {
 
         let server = zeroclaw_spawn::spawn!(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
+            // Complete the GET before replying; early bytes can be rejected as
+            // an unsolicited response by the HTTP client's connection driver.
+            let mut request_head = Vec::new();
+            while !request_head.ends_with(b"\r\n\r\n") {
+                assert!(
+                    request_head.len() < 8192,
+                    "fixture request head exceeds limit"
+                );
+                request_head.push(stream.read_u8().await.unwrap());
+            }
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
