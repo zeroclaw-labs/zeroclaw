@@ -2388,6 +2388,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("cloudflare", "Cloudflare AI", false),
             ("atlascloud", "Atlas Cloud", false),
             ("cheaperinference", "Cheaper Inference", false),
+            ("bf16", "bf16.ai", false),
             ("moonshot", "Moonshot", false),
             ("synthetic", "Synthetic", false),
             ("opencode", "OpenCode", false),
@@ -2662,6 +2663,39 @@ mod tests {
         assert!(
             create_model_provider("atlascloud", Some("provider-test-credential")).is_ok(),
             "Atlas Cloud should construct through the OpenAI-compatible family factory"
+        );
+    }
+
+    #[test]
+    fn resolve_bf16_credential_stays_on_typed_alias_boundary() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("BF16_API_KEY", Some("  bf16-env-key  "));
+        assert!(resolve_model_provider_credential("bf16", None).is_none());
+        assert_eq!(
+            resolve_model_provider_credential("bf16", Some("  sk-bf16-v1-explicit  ")).as_deref(),
+            Some("sk-bf16-v1-explicit")
+        );
+    }
+
+    #[test]
+    fn bf16_uses_canonical_provider_id_only() {
+        assert_eq!(canonicalize_v2_model_provider_name("bf16"), "bf16");
+        for alias in ["bf16.ai", "bf16-ai", "bf16_ai"] {
+            assert_eq!(canonicalize_v2_model_provider_name(alias), alias);
+        }
+    }
+
+    #[test]
+    fn bf16_provider_is_listed_and_constructible() {
+        let providers = list_model_providers();
+        let bf16 = providers
+            .iter()
+            .find(|provider| provider.name == "bf16")
+            .expect("bf16.ai provider should be listed");
+        assert_eq!(bf16.display_name, "bf16.ai");
+        assert!(
+            create_model_provider("bf16", Some("sk-bf16-v1-test")).is_ok(),
+            "bf16.ai should construct through the OpenAI-compatible family factory"
         );
     }
 
@@ -4083,6 +4117,10 @@ mod tests {
         assert_eq!(
             default_model_provider_url("cheaperinference"),
             Some("https://api.cheaperinference.com/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("bf16"),
+            Some("https://api.bf16.ai/v1")
         );
     }
 

@@ -2737,6 +2737,64 @@ pub struct CheaperInferenceModelProviderConfig {
     pub base: ModelProviderConfig,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Bf16Endpoint {
+    #[default]
+    Default,
+}
+
+impl Bf16Endpoint {
+    /// Canonical bf16.ai endpoint. Single source of truth:
+    /// `CompatFamilySpec::DEFAULT_URL` for `Bf16ModelProviderConfig`
+    /// references this const so the schema and factory surfaces never drift.
+    pub const DEFAULT_URI: &'static str = "https://api.bf16.ai/v1";
+}
+
+impl ModelEndpoint for Bf16Endpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => Self::DEFAULT_URI,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.bf16"]
+pub struct Bf16ModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
+#[cfg(test)]
+mod bf16_tests {
+    use super::*;
+
+    #[test]
+    fn bf16_endpoint_uri() {
+        assert_eq!(Bf16Endpoint::Default.uri(), "https://api.bf16.ai/v1");
+    }
+
+    #[test]
+    fn bf16_config_deserializes_with_defaults() {
+        let cfg: Bf16ModelProviderConfig = toml::from_str(
+            r#"
+            model = "deepseek/deepseek-v4.1-flash-uncensored"
+            api_key = "sk-bf16-v1-test"
+            "#,
+        )
+        .expect("bf16 config should deserialize");
+        assert_eq!(
+            cfg.base.model.as_deref(),
+            Some("deepseek/deepseek-v4.1-flash-uncensored")
+        );
+        assert_eq!(cfg.base.api_key.as_deref(), Some("sk-bf16-v1-test"));
+    }
+}
+
 #[cfg(test)]
 mod cheaperinference_tests {
     use super::*;
@@ -3987,6 +4045,7 @@ impl_default_family_endpoint! {
     CloudflareModelProviderConfig,
     AtlasCloudModelProviderConfig,
     CheaperInferenceModelProviderConfig,
+    Bf16ModelProviderConfig,
     OvhModelProviderConfig,
     CopilotModelProviderConfig,
     DoubaoModelProviderConfig,
