@@ -1845,7 +1845,8 @@ impl RpcClient {
             // `elicitation/create` requests via `route_inbound_frame` →
             // the chat widget's pending-elicitation modal.
             "clientCapabilities": {
-                "elicitation": { "form": {} }
+                "elicitation": { "form": {} },
+                "replyOccurrence": {}
             }
         });
         if let Some(id) = prev_tui_id {
@@ -2125,7 +2126,8 @@ impl RpcClient {
             // Advertise ACP elicitation form-mode support. See
             // `connect` above for the rationale.
             "clientCapabilities": {
-                "elicitation": { "form": {} }
+                "elicitation": { "form": {} },
+                "replyOccurrence": {}
             }
         });
         if let Some(id) = prev_tui_id {
@@ -4913,6 +4915,8 @@ pub struct SessionMessagesResult {
 pub struct MessageEntry {
     pub role: String,
     pub content: String,
+    #[serde(default)]
+    pub reply_occurrence: Option<String>,
     #[serde(default)]
     pub kind: MessageEntryKind,
     #[serde(default)]

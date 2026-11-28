@@ -165,6 +165,7 @@ enum GoalUpdate<'a> {
     VerifiedCandidate {
         session_id: &'a str,
         candidate: &'a str,
+        reply_occurrence: Option<&'a str>,
     },
     Completed {
         session_id: &'a str,
@@ -192,10 +193,18 @@ fn parse_goal_update(params: &serde_json::Value) -> Option<GoalUpdate<'_>> {
     let session_id = payload.get("session_id")?.as_str()?;
     match kind.as_str() {
         "command_failed" if payload.len() == 1 => Some(GoalUpdate::CommandFailed { session_id }),
-        "verified_candidate" if payload.len() == 2 => Some(GoalUpdate::VerifiedCandidate {
-            session_id,
-            candidate: payload.get("candidate")?.as_str()?,
-        }),
+        "verified_candidate" => {
+            let reply_occurrence = match payload.len() {
+                2 => None,
+                3 => Some(payload.get("reply_occurrence")?.as_str()?),
+                _ => return None,
+            };
+            Some(GoalUpdate::VerifiedCandidate {
+                session_id,
+                candidate: payload.get("candidate")?.as_str()?,
+                reply_occurrence,
+            })
+        }
         "completed" if payload.len() == 1 => Some(GoalUpdate::Completed { session_id }),
         "paused_for_blocker" if payload.len() == 1 => {
             Some(GoalUpdate::PausedForBlocker { session_id })
@@ -794,6 +803,7 @@ struct SessionReattachResult {
 /// Completion of a durable transcript reload after notification loss.
 struct SessionResyncResult {
     session_id: String,
+    ticket: Arc<()>,
     result: Result<SessionResyncSnapshot, String>,
 }
 
@@ -842,10 +852,25 @@ enum SessionResyncMode {
 /// turn generation when it had a `session/prompt` outstanding as the
 /// resync began; `None` for a pane that was idle and for every mode but
 /// `Reattach`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 struct ResyncInFlight {
     mode: SessionResyncMode,
     owned_turn: Option<u64>,
+    ticket: Arc<()>,
+    pane: Option<Arc<()>>,
+    held: VecDeque<RpcNotification>,
+}
+
+impl ResyncInFlight {
+    fn new(mode: SessionResyncMode, owned_turn: Option<u64>) -> Self {
+        Self {
+            mode,
+            owned_turn,
+            ticket: Arc::new(()),
+            pane: None,
+            held: VecDeque::new(),
+        }
+    }
 }
 
 /// What a lagged own turn still owes once it ends: the wholesale reload
@@ -1575,6 +1600,9 @@ impl Chat {
             return false;
         }
         let mut cleanup_report = CleanupReport::default();
+        self.session_resync_in_flight.remove(session_id);
+        self.deferred_goal_notifications.remove(session_id);
+        self.goal_launch_pending.remove(session_id);
         if let Some(state) = self.state_for_session_mut(session_id) {
             cleanup_report.merge(state.cleanup_active_turn_attachments());
             cleanup_report.merge(state.clear_queue());
@@ -2948,6 +2976,7 @@ impl Chat {
                         .or_default()
                         .push_back(notif);
                 }
+                Ok(notif) if self.hold_session_notification_for_resync(&notif) => {}
                 Ok(notif) if notif.method == "session/update" => {
                     if let Some(update) = parse_session_update(&notif.params) {
                         // Route by session id: background sessions receive
@@ -2986,10 +3015,11 @@ impl Chat {
                                 // outcome and its text are carried across that
                                 // reload by `lag_reattach` and re-applied in
                                 // `replace_history_after_notification_resync`.
-                                state.intercept_terminal_frame_for_reload(update);
+                                let represented = state.reply_already_installed(&notif.params);
+                                state.intercept_terminal_frame_for_reload(update, represented);
                                 terminal_reconcile = true;
                             } else {
-                                state.apply_update(update);
+                                state.apply_notification_update(update, &notif.params, true);
                                 applied = true;
                             }
                         }
@@ -3042,10 +3072,16 @@ impl Chat {
                     ))));
                 state.mark_dirty_append();
             }
-            GoalUpdate::VerifiedCandidate { candidate, .. } => {
+            GoalUpdate::VerifiedCandidate {
+                candidate,
+                reply_occurrence,
+                ..
+            } => {
                 // Recover the full response and its marked tail only while
                 // this reattached pane has not committed any live text.
-                state.finish_goal_output(candidate);
+                let represented = reply_occurrence
+                    .is_some_and(|id| state.installed_reply_occurrences.contains(id));
+                state.finish_goal_output(if represented { "" } else { candidate });
             }
             GoalUpdate::Completed { .. } => {
                 state
@@ -3104,7 +3140,52 @@ impl Chat {
         }
     }
 
+    fn hold_session_notification_for_resync(&mut self, notif: &RpcNotification) -> bool {
+        if self.pane_kind != PaneKind::Chat || self.session_resync_in_flight.is_empty() {
+            return false;
+        }
+        let Some(session_id) = notification_session_id(notif) else {
+            return false;
+        };
+        if self.discard_replaced_resync(&session_id) {
+            return false;
+        }
+        let Some(resync) = self.session_resync_in_flight.get_mut(&session_id) else {
+            return false;
+        };
+        resync.held.push_back(notif.clone());
+        true
+    }
+
+    fn discard_replaced_resync(&mut self, session_id: &str) -> bool {
+        let pane = self
+            .session_resync_in_flight
+            .get(session_id)
+            .and_then(|gate| gate.pane.clone());
+        if let Some(pane) = pane
+            && !self
+                .state_for_session_mut(session_id)
+                .is_some_and(|state| Arc::ptr_eq(&pane, &state.resync_incarnation))
+        {
+            self.session_resync_in_flight.remove(session_id);
+            true
+        } else {
+            false
+        }
+    }
+
     fn apply_session_notification(&mut self, notif: RpcNotification) -> bool {
+        if self.hold_session_notification_for_resync(&notif) {
+            return false;
+        }
+        self.apply_released_session_notification(notif, false)
+    }
+
+    fn apply_released_session_notification(
+        &mut self,
+        notif: RpcNotification,
+        failed_resync: bool,
+    ) -> bool {
         match notif.method.as_str() {
             "session/update" => {
                 let Some(update) = parse_session_update(&notif.params) else {
@@ -3117,18 +3198,20 @@ impl Chat {
                 let mut terminal_reconcile = false;
                 if !self.session_resync_in_flight.contains_key(&session_id)
                     && let Some(state) = self.state_for_session_mut(&session_id)
-                    && state.last_error != Some(SessionError::ResyncFailed)
+                    && (failed_resync || state.last_error != Some(SessionError::ResyncFailed))
                 {
-                    if state
-                        .lag_reattach
-                        .as_ref()
-                        .is_some_and(|lag| lag.generation == state.turn_generation)
+                    if !failed_resync
+                        && state
+                            .lag_reattach
+                            .as_ref()
+                            .is_some_and(|lag| lag.generation == state.turn_generation)
                         && Self::turn_complete_matches_generation(&update, state.turn_generation)
                     {
-                        state.intercept_terminal_frame_for_reload(update);
+                        let represented = state.reply_already_installed(&notif.params);
+                        state.intercept_terminal_frame_for_reload(update, represented);
                         terminal_reconcile = true;
                     } else {
-                        state.apply_update(update);
+                        state.apply_notification_update(update, &notif.params, !failed_resync);
                         applied = true;
                     }
                 }
@@ -3179,7 +3262,7 @@ impl Chat {
             let in_flight = self
                 .session_resync_in_flight
                 .get(&completion.session_id)
-                .copied();
+                .map(|resync| (resync.mode, resync.owned_turn));
             let Some(state) = self.state_for_session_mut(&completion.session_id) else {
                 continue;
             };
@@ -3255,10 +3338,7 @@ impl Chat {
                 }
                 lag_reloads.push(completion.session_id.clone());
             } else if prompt_error.is_some()
-                && let Some(ResyncInFlight {
-                    mode: SessionResyncMode::Reattach,
-                    owned_turn: Some(generation),
-                }) = in_flight
+                && let Some((SessionResyncMode::Reattach, Some(generation))) = in_flight
                 && generation == completion.turn_generation
             {
                 state.lag_reattach = Some(LagReattach {
@@ -3341,12 +3421,20 @@ impl Chat {
         // running for this session) returns without touching the stored
         // value, so a second lag during a terminal follow-up cannot relabel
         // it as a plain reload.
-        match self.session_resync_in_flight.entry(session_id.clone()) {
+        let pane = self
+            .state_for_session_mut(&session_id)
+            .map(|state| Arc::clone(&state.resync_incarnation));
+        self.discard_replaced_resync(&session_id);
+        let ticket = match self.session_resync_in_flight.entry(session_id.clone()) {
             std::collections::hash_map::Entry::Occupied(_) => return,
             std::collections::hash_map::Entry::Vacant(vacant) => {
-                vacant.insert(ResyncInFlight { mode, owned_turn });
+                let mut resync = ResyncInFlight::new(mode, owned_turn);
+                resync.pane = pane;
+                let ticket = Arc::clone(&resync.ticket);
+                vacant.insert(resync);
+                ticket
             }
-        }
+        };
         if self.entry_retry_preparing {
             return;
         }
@@ -3354,6 +3442,7 @@ impl Chat {
         let rpc = self.rpc.clone();
         let tx = self.session_resync_tx.clone();
         if let Some(state) = self.state_for_session_mut(&session_id) {
+            state.installed_reply_occurrences.clear();
             let approval = state.pending_approval.take();
             match mode {
                 // Cancel is on its way to the daemon: the visible turn is
@@ -3377,7 +3466,13 @@ impl Chat {
 
         tokio::spawn(async move {
             let result = Self::confirm_and_reload_with_retry(&rpc, &session_id, mode).await;
-            let _ = tx.send(SessionResyncResult { session_id, result }).await;
+            let _ = tx
+                .send(SessionResyncResult {
+                    session_id,
+                    ticket,
+                    result,
+                })
+                .await;
         });
     }
 
@@ -3501,13 +3596,22 @@ impl Chat {
     }
 
     fn apply_session_resync_result(&mut self, update: SessionResyncResult) {
+        let Some(gate) = self.session_resync_in_flight.get(&update.session_id) else {
+            return;
+        };
+        if !Arc::ptr_eq(&gate.ticket, &update.ticket) {
+            return;
+        }
+        if self.discard_replaced_resync(&update.session_id) {
+            return;
+        }
         // Read the in-flight record before taking the state borrow
         // (`state_for_session_mut` holds `&mut self`).
         let in_flight = self
             .session_resync_in_flight
             .get(&update.session_id)
-            .copied();
-        let mode = in_flight.map(|entry| entry.mode);
+            .map(|resync| (resync.mode, resync.owned_turn));
+        let mode = in_flight.map(|(mode, _)| mode);
         match update.result {
             Ok(snapshot) => {
                 let strip_runtime_enrichment = self.pane_kind == PaneKind::Acp;
@@ -3522,10 +3626,8 @@ impl Chat {
                         return;
                     };
                     if snapshot.turn_running
-                        && in_flight.is_some_and(|entry| {
-                            entry
-                                .owned_turn
-                                .is_some_and(|generation| generation == state.turn_generation)
+                        && in_flight.is_some_and(|(_, owned_turn)| {
+                            owned_turn.is_some_and(|generation| generation == state.turn_generation)
                         })
                         && state.turn_in_flight
                     {
@@ -3541,7 +3643,7 @@ impl Chat {
                             state.todo_tracker.set_plan(plan);
                         }
                     } else if snapshot.turn_running
-                        && in_flight.is_some_and(|entry| entry.owned_turn.is_some())
+                        && in_flight.is_some_and(|(_, owned_turn)| owned_turn.is_some())
                     {
                         // The pane's own turn ended while the reload ran; its
                         // prompt response settled it during the gate, and the
@@ -3601,18 +3703,28 @@ impl Chat {
                     }
                 }
                 if own_turn_ended {
-                    self.session_resync_in_flight.remove(&update.session_id);
+                    let prior = self.session_resync_in_flight.remove(&update.session_id);
                     self.begin_session_resync(
                         update.session_id.clone(),
                         SessionResyncMode::ReattachTerminal,
                     );
+                    if let (Some(prior), Some(next)) = (
+                        prior,
+                        self.session_resync_in_flight.get_mut(&update.session_id),
+                    ) {
+                        next.held = prior.held;
+                    }
                     self.pump_all_queues();
                     return;
                 }
                 // Dropping the gate re-enables live `session/update` frames for
                 // this session; a kept-running turn streams onto the kept
                 // transcript from here.
-                self.session_resync_in_flight.remove(&update.session_id);
+                if let Some(resync) = self.session_resync_in_flight.remove(&update.session_id) {
+                    for notification in resync.held {
+                        self.apply_session_notification(notification);
+                    }
+                }
                 self.pump_all_queues();
             }
             Err(error) => {
@@ -3625,9 +3737,8 @@ impl Chat {
                     Some(SessionResyncMode::Reattach | SessionResyncMode::ReattachTerminal)
                 ) {
                     // Reattach kept the turn displayed as live while the
-                    // reload ran. Its fate is now unknown and the gate below
-                    // drops its frames, so commit the visible partial and
-                    // settle instead of leaving the pane in flight forever.
+                    // reload ran. Its fate is now unknown, so commit the
+                    // visible partial and settle before replaying held frames.
                     state.settle_turn_after_failed_reattach();
                 }
                 if mode == Some(SessionResyncMode::ReattachTerminal) {
@@ -3647,7 +3758,16 @@ impl Chat {
                 // Release the operation slot but keep dispatch fail-closed via
                 // `last_error`; focusing this session or enqueueing again starts
                 // one fresh bounded reconciliation attempt.
-                self.session_resync_in_flight.remove(&update.session_id);
+                if let Some(resync) = self.session_resync_in_flight.remove(&update.session_id) {
+                    for notification in resync.held {
+                        // Preserve the frames already received without
+                        // reopening dispatch or starting another reload.
+                        self.apply_released_session_notification(notification, true);
+                    }
+                    if let Some(state) = self.state_for_session_mut(&update.session_id) {
+                        state.last_error = Some(SessionError::ResyncFailed);
+                    }
+                }
             }
         }
     }
@@ -10738,6 +10858,8 @@ impl GoalJoinState {
 #[derive(Debug)]
 pub struct ChatState {
     pub session_id: String,
+    resync_incarnation: Arc<()>,
+    installed_reply_occurrences: HashSet<String>,
     pub agent_alias: String,
     /// Durable projected conversation-entry count, not visible bubbles.
     pub message_count: usize,
@@ -10934,6 +11056,8 @@ impl ChatState {
     ) -> Self {
         Self {
             session_id,
+            resync_incarnation: Arc::new(()),
+            installed_reply_occurrences: HashSet::new(),
             agent_alias,
             message_count: 0,
             session_name: None,
@@ -12576,7 +12700,28 @@ impl ChatState {
         }
     }
 
+    fn reply_already_installed(&self, params: &serde_json::Value) -> bool {
+        params
+            .get("reply_occurrence")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| self.installed_reply_occurrences.contains(id))
+    }
+
+    fn apply_notification_update(
+        &mut self,
+        update: SessionUpdate,
+        params: &serde_json::Value,
+        may_suppress: bool,
+    ) {
+        let represented = may_suppress && self.reply_already_installed(params);
+        self.apply_update_with_reply_membership(update, represented);
+    }
+
     pub fn apply_update(&mut self, update: SessionUpdate) {
+        self.apply_update_with_reply_membership(update, false);
+    }
+
+    fn apply_update_with_reply_membership(&mut self, update: SessionUpdate, represented: bool) {
         // Ignore notifications that belong to a different session.
         let update_sid = match &update {
             SessionUpdate::AgentMessageChunk { session_id, .. }
@@ -12600,6 +12745,9 @@ impl ChatState {
                 presentation_only,
                 ..
             } => {
+                if represented && !presentation_only {
+                    return;
+                }
                 self.invalidate_url_interactions();
                 if !self.turn_in_flight && self.append_to_prompt_settled_stream(&text) {
                     return;
@@ -12885,11 +13033,13 @@ impl ChatState {
                 ..
             } => {
                 if goal_owned {
-                    self.finish_goal_output(if outcome == TurnEndOutcome::Completed {
-                        &content
-                    } else {
-                        ""
-                    });
+                    self.finish_goal_output(
+                        if outcome == TurnEndOutcome::Completed && !represented {
+                            &content
+                        } else {
+                            ""
+                        },
+                    );
                     if outcome != TurnEndOutcome::Completed {
                         self.present_turn_error(&content);
                     }
@@ -12916,7 +13066,7 @@ impl ChatState {
                 match outcome {
                     TurnEndOutcome::Completed => {
                         self.last_error = None;
-                        self.commit_turn(content, true);
+                        self.commit_turn_with_reply_membership(content, true, represented);
                     }
                     TurnEndOutcome::Cancelled | TurnEndOutcome::Failed => {
                         if outcome == TurnEndOutcome::Failed {
@@ -12983,6 +13133,15 @@ impl ChatState {
     }
 
     pub fn commit_turn(&mut self, full_text: String, clean: bool) {
+        self.commit_turn_with_reply_membership(full_text, clean, false);
+    }
+
+    fn commit_turn_with_reply_membership(
+        &mut self,
+        full_text: String,
+        clean: bool,
+        represented: bool,
+    ) {
         self.freeze_prompt_settled_stream();
         if self.flush_streaming_text() {
             self.turn_had_streaming_text = true;
@@ -12991,11 +13150,12 @@ impl ChatState {
         // If no streaming text was accumulated during this turn, use the
         // daemon-provided final text as a fallback so the turn is never
         // invisible to the user.
-        if !self.turn_had_streaming_text && !full_text.is_empty() {
+        if !represented && !self.turn_had_streaming_text && !full_text.is_empty() {
             self.entries
                 .push(ChatEntry::AgentMessage(Arc::<str>::from(full_text)));
             self.mark_dirty_append();
-        } else if clean
+        } else if !represented
+            && clean
             && !self.turn_had_streaming_text
             && !self.turn_had_tool_calls
             && full_text.is_empty()
@@ -13603,14 +13763,14 @@ impl ChatState {
     /// otherwise be lost from the transcript view. A completed frame
     /// carries nothing — the reload transcript is the whole story for a
     /// clean turn.
-    fn intercept_terminal_frame_for_reload(&mut self, update: SessionUpdate) {
+    fn intercept_terminal_frame_for_reload(&mut self, update: SessionUpdate, represented: bool) {
         let terminal = match &update {
             SessionUpdate::TurnComplete {
                 outcome, content, ..
             } => Some((*outcome, content.clone())),
             _ => None,
         };
-        self.apply_update(update);
+        self.apply_update_with_reply_membership(update, represented);
         if let Some((outcome, content)) = terminal
             && outcome != crate::client::TurnEndOutcome::Completed
             && let Some(lag) = self.lag_reattach.as_mut()
@@ -13644,6 +13804,21 @@ impl ChatState {
         self.first_message = None;
         self.transcript_layout.reset();
         self.clear_transcript_selection();
+        // Chat history projects these assistant rows directly; tools and
+        // unknown/non-display rows do not establish reply membership.
+        self.installed_reply_occurrences = if strip_runtime_enrichment {
+            HashSet::new()
+        } else {
+            messages
+                .iter()
+                .filter(|row| {
+                    row.role() == crate::client::MessageRole::Assistant
+                        && row.kind == crate::client::MessageEntryKind::Message
+                        && !row.content.is_empty()
+                })
+                .filter_map(|row| row.reply_occurrence.clone())
+                .collect()
+        };
         self.load_history(messages, strip_runtime_enrichment);
         let notice_text = match notice {
             ResyncNotice::TurnFinished => crate::i18n::t("zc-chat-resynced-turn-finished"),
@@ -13866,6 +14041,7 @@ impl ChatState {
         let retain_prefix_cache =
             append_only && start == self.transcript_layout.view().cached_render_start;
         self.entries = entries;
+        self.installed_reply_occurrences.clear();
         self.first_message = None;
         let entries = std::mem::take(&mut self.entries);
         self.seed_first_message(&entries, strip_runtime_enrichment);
@@ -14057,6 +14233,8 @@ impl ChatState {
         todo_settings: crate::todo_tracker::TodoTrackerSettings,
     ) {
         self.session_id = session_id;
+        self.resync_incarnation = Arc::new(());
+        self.installed_reply_occurrences.clear();
         self.session_name = name;
         self.model_provider_ref = None;
         self.model = None;
@@ -20450,10 +20628,7 @@ mod tests {
         chat.session_order.push("sess-1".to_string());
         chat.session_resync_in_flight.insert(
             "sess-1".to_string(),
-            ResyncInFlight {
-                mode: SessionResyncMode::Cancel,
-                owned_turn: None,
-            },
+            ResyncInFlight::new(SessionResyncMode::Cancel, None),
         );
 
         let entries = chat.resume_entries();
@@ -21167,6 +21342,374 @@ mod tests {
             state.turn_in_flight,
             "stale frame must not settle the new turn"
         );
+    }
+
+    #[tokio::test]
+    async fn notification_lag_resync_preserves_repeated_received_ordinary_updates() {
+        assert_lag_resync_keeps_received_ordinary_updates(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn notification_lag_resync_preserves_repeated_launch_deferred_ordinary_updates() {
+        assert_lag_resync_keeps_received_ordinary_updates(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn notification_lag_resync_matches_ordinary_reply_occurrences() {
+        assert_lag_resync_keeps_received_ordinary_updates(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn notification_lag_resync_matches_launch_deferred_reply_occurrences() {
+        assert_lag_resync_keeps_received_ordinary_updates(true, true).await;
+    }
+
+    async fn assert_lag_resync_keeps_received_ordinary_updates(
+        launch_deferred: bool,
+        stamped_page: bool,
+    ) {
+        const SID: &str = "sess-1";
+        const HISTORY: &str = "Ordinary durable history";
+        const REPEATED: &str = "Repeated live narration";
+        const BETWEEN: &str = "Between live updates";
+        const MARKED: &str = "Presentation-only attribution";
+        let (tx, mut writer_rx) = mpsc::channel::<String>(32);
+        let outbound = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(outbound.clone()));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        chat.phase = ChatPhase::Active(Box::new(state_for(SID, "myagent")));
+        chat.session_order = vec![SID.to_owned()];
+        let goal_request = if launch_deferred {
+            use crossterm::event::{KeyCode, KeyModifiers};
+
+            let command = "/goal start Continue the repair";
+            active_state(&mut chat).input_bar.insert_text(command);
+            let mut terminal: crate::config_manager::Term = ratatui::Terminal::with_options(
+                crate::terminal_backend::WideCellCleanupBackend::new(std::io::stdout()),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+                },
+            )
+            .unwrap();
+            chat.handle_key(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &mut terminal,
+            )
+            .await;
+            let request = next_rpc_request(&mut writer_rx, "composer submits Goal command").await;
+            assert_eq!(request["method"], method::SESSION_GOAL);
+            assert_eq!(request["params"]["session_id"], SID);
+            assert_eq!(request["params"]["command"], command);
+            assert_eq!(chat.goal_launch_pending.get(SID), Some(&1));
+            Some(request)
+        } else {
+            None
+        };
+
+        // The overflow starts mandatory recovery; the real updates below
+        // are sent only after the lagged backlog has already been drained.
+        for _ in 0..65 {
+            chat.rpc
+                .push_notification_for_test("session/update", serde_json::Value::Null);
+        }
+        chat.tick_transport_events();
+        assert!(chat.session_resync_in_flight.contains_key(SID));
+        let state = next_rpc_request(&mut writer_rx, "ordinary lag recovery reads state").await;
+        assert_eq!(state["method"], method::SESSION_STATE);
+        assert_eq!(state["params"]["session_id"], SID);
+        respond_ok(
+            &outbound,
+            &state,
+            serde_json::json!({ "session_id": SID, "state": "idle" }),
+        );
+        let page = next_rpc_request(&mut writer_rx, "ordinary lag recovery reads history").await;
+        assert_eq!(page["method"], method::SESSION_MESSAGES);
+        assert_eq!(page["params"]["session_id"], SID);
+
+        assert!(chat.notif_rx.is_empty());
+        let mut snapshot = vec![serde_json::json!({ "role": "user", "content": HISTORY })];
+        let mut frames = Vec::new();
+        if stamped_page {
+            // Same text in three separate replies. Only the first identity
+            // is present on the applied page; the last reply uses legacy wire.
+            snapshot.push(serde_json::json!({
+                "role": "assistant", "content": REPEATED, "reply_occurrence": "fixture:1",
+            }));
+            for (index, occurrence) in [Some("fixture:1"), Some("fixture:2"), None]
+                .into_iter()
+                .enumerate()
+            {
+                if index == 0 {
+                    frames.push(serde_json::json!({
+                        "type": "agent_message_chunk", "session_id": SID, "text": MARKED,
+                        "reply_occurrence": "fixture:1", "presentation_only": true,
+                    }));
+                }
+                let mut chunk = serde_json::json!({
+                    "type": "agent_message_chunk", "session_id": SID, "text": REPEATED,
+                });
+                let mut terminal = serde_json::json!({
+                    "type": "turn_complete", "session_id": SID,
+                    "outcome": "completed", "content": REPEATED,
+                });
+                if let Some(id) = occurrence {
+                    chunk["reply_occurrence"] = serde_json::json!(id);
+                    terminal["reply_occurrence"] = serde_json::json!(id);
+                }
+                if index != 0 {
+                    frames.push(serde_json::json!({
+                        "type": "tool_call", "session_id": SID,
+                        "tool_call_id": format!("call-{index}"), "name": "read", "raw_input": {},
+                    }));
+                }
+                frames.extend([chunk, terminal]);
+            }
+        } else {
+            for text in [REPEATED, BETWEEN, REPEATED] {
+                frames.push(serde_json::json!({
+                    "type": "agent_message_chunk", "session_id": SID,
+                    "text": format!("{text}\n\n"),
+                }));
+            }
+            // End the streaming bubble without a terminal event.
+            frames.push(serde_json::json!({
+                "type": "tool_call", "session_id": SID, "tool_call_id": "call-1",
+                "name": "read", "raw_input": {},
+            }));
+        }
+        let received = frames.len();
+        for frame in frames {
+            chat.rpc.push_notification_for_test("session/update", frame);
+        }
+        assert_eq!(
+            chat.notif_rx.len(),
+            received,
+            "the ordinary updates were received"
+        );
+        chat.tick_transport_events();
+        assert!(chat.notif_rx.is_empty());
+        assert!(chat.session_resync_in_flight.contains_key(SID));
+        if let Some(goal_request) = goal_request {
+            assert_eq!(chat.deferred_goal_notifications[SID].len(), received);
+            respond_ok(
+                &outbound,
+                &goal_request,
+                serde_json::json!({ "response": { "kind": "already_active" } }),
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while chat.goal_completion_rx.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("Goal acknowledgement must arrive during the history read");
+            chat.tick_transport_events();
+            assert!(!chat.goal_launch_pending.contains_key(SID));
+            assert!(!chat.deferred_goal_notifications.contains_key(SID));
+            assert!(chat.session_resync_in_flight.contains_key(SID));
+        }
+
+        respond_ok(
+            &outbound,
+            &page,
+            serde_json::json!({
+                "messages": snapshot,
+                "total": snapshot.len(),
+            }),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while chat.session_resync_rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ordinary lag recovery should return the history page");
+        for pass in 0..2 {
+            chat.tick_transport_events();
+            let rendered = render_reconnect_transcript(&mut chat);
+            if stamped_page {
+                let relevant: Vec<_> = active_state(&mut chat)
+                    .entries()
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        ChatEntry::AgentMessage(text) if text.as_ref() == REPEATED => Some("reply"),
+                        ChatEntry::AgentMessage(text) if text.as_ref() == MARKED => Some("marked"),
+                        ChatEntry::AgentMessageContinuation(text) if text == REPEATED => {
+                            Some("reply")
+                        }
+                        ChatEntry::Tool { tool_call_id, .. }
+                            if tool_call_id.as_ref() == "call-1" =>
+                        {
+                            Some("first tool")
+                        }
+                        ChatEntry::Tool { tool_call_id, .. }
+                            if tool_call_id.as_ref() == "call-2" =>
+                        {
+                            Some("second tool")
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    (
+                        rendered.matches(HISTORY).count(),
+                        rendered.matches(REPEATED).count(),
+                        rendered.matches(MARKED).count(),
+                        relevant.as_slice()
+                    ),
+                    (
+                        1,
+                        3,
+                        1,
+                        [
+                            "reply",
+                            "marked",
+                            "first tool",
+                            "reply",
+                            "second tool",
+                            "reply"
+                        ]
+                        .as_slice()
+                    ),
+                    "only the exact represented reply is suppressed: {rendered}"
+                );
+                if pass == 0 {
+                    // Same published reply, but partly delayed past gate release.
+                    for frame in [
+                        serde_json::json!({
+                            "type": "agent_message_chunk", "session_id": SID,
+                            "text": REPEATED, "reply_occurrence": "fixture:1",
+                        }),
+                        serde_json::json!({
+                            "type": "turn_complete", "session_id": SID,
+                            "outcome": "completed", "content": REPEATED,
+                            "reply_occurrence": "fixture:1",
+                        }),
+                    ] {
+                        chat.rpc.push_notification_for_test("session/update", frame);
+                    }
+                }
+                continue;
+            }
+            let tools = active_state(&mut chat)
+                .entries()
+                .iter()
+                .filter(|entry| {
+                    matches!(entry, ChatEntry::Tool { tool_call_id, .. }
+                        if tool_call_id.as_ref() == "call-1")
+                })
+                .count();
+            assert_eq!(
+                (
+                    rendered.matches(HISTORY).count(),
+                    rendered.matches(REPEATED).count(),
+                    rendered.matches(BETWEEN).count(),
+                    tools,
+                ),
+                (1, 2, 1, 1),
+                "(history, ordinary repeat, intervening text, ordinary tool): {rendered}"
+            );
+            let history = rendered.find(HISTORY).unwrap();
+            let first = rendered.find(REPEATED).unwrap();
+            let between = rendered.find(BETWEEN).unwrap();
+            let last = rendered.rfind(REPEATED).unwrap();
+            assert!(
+                history < first && first < between && between < last,
+                "{rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn notification_lag_resync_rejects_same_id_replacement_snapshot_and_held_events() {
+        let (mut chat, _rx) = test_chat();
+        let sid = "sess-1";
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        chat.begin_session_resync(sid.into(), SessionResyncMode::Reattach);
+        chat.rpc.push_notification_for_test(
+            "session/update",
+            serde_json::json!({
+                "type": "agent_message_chunk", "session_id": sid, "text": "old held",
+            }),
+        );
+        chat.tick_transport_events();
+        let ticket = Arc::clone(&chat.session_resync_in_flight[sid].ticket);
+        assert_eq!(chat.session_resync_in_flight[sid].held.len(), 1);
+        let mut replacement = state();
+        replacement.push_user_message(Some("successor transcript".into()), vec![]);
+        chat.phase = ChatPhase::Active(Box::new(replacement));
+        chat.apply_session_resync_result(SessionResyncResult {
+            session_id: sid.into(),
+            ticket,
+            result: Ok(SessionResyncSnapshot {
+                messages: vec![crate::client::MessageEntry {
+                    role: "assistant".into(),
+                    content: "old page".into(),
+                    reply_occurrence: Some("old:1".into()),
+                    ..Default::default()
+                }],
+                message_count: 1,
+                plan: None,
+                turn_running: false,
+            }),
+        });
+        assert!(!chat.session_resync_in_flight.contains_key(sid));
+        let rendered = render_reconnect_transcript(&mut chat);
+        assert!(rendered.contains("successor transcript"), "{rendered}");
+        assert!(!rendered.contains("old page"), "{rendered}");
+        assert!(!rendered.contains("old held"), "{rendered}");
+        assert!(
+            active_state(&mut chat)
+                .installed_reply_occurrences
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_lag_resync_failure_preserves_only_received_gate_frames() {
+        let (mut chat, _rx) = test_chat();
+        let sid = "sess-1";
+        chat.phase = ChatPhase::Active(Box::new(state()));
+        chat.begin_session_resync(sid.into(), SessionResyncMode::Reattach);
+        for frame in [
+            serde_json::json!({
+                "type": "agent_message_chunk", "session_id": sid, "text": "held on failed reload",
+                "reply_occurrence": "fixture:1",
+            }),
+            serde_json::json!({
+                "type": "turn_complete", "session_id": sid, "outcome": "completed",
+                "content": "held on failed reload", "reply_occurrence": "fixture:1",
+            }),
+        ] {
+            chat.rpc.push_notification_for_test("session/update", frame);
+        }
+        chat.tick_transport_events();
+        let ticket = Arc::clone(&chat.session_resync_in_flight[sid].ticket);
+        assert_eq!(chat.session_resync_in_flight[sid].held.len(), 2);
+        chat.apply_session_resync_result(SessionResyncResult {
+            session_id: sid.into(),
+            ticket,
+            result: Err("fixture exhausted reload".into()),
+        });
+        chat.rpc.push_notification_for_test(
+            "session/update",
+            serde_json::json!({
+                "type": "agent_message_chunk", "session_id": sid, "text": "after exhausted reload",
+            }),
+        );
+        chat.tick_transport_events();
+        let rendered = render_reconnect_transcript(&mut chat);
+        assert_eq!(
+            rendered.matches("held on failed reload").count(),
+            1,
+            "{rendered}"
+        );
+        assert!(!rendered.contains("after exhausted reload"), "{rendered}");
+        assert_eq!(
+            active_state(&mut chat).last_error,
+            Some(SessionError::ResyncFailed)
+        );
+        assert!(!chat.session_resync_in_flight.contains_key(sid));
     }
 
     #[tokio::test]
@@ -35371,6 +35914,7 @@ mod tests {
                     role: "assistant".to_string(),
                     content: "Tool call: shell\n{}".to_string(),
                     kind: MessageEntryKind::ToolCall,
+                    reply_occurrence: None,
                     tool_call_id: Some("call-1".to_string()),
                     tool_name: Some("shell".to_string()),
                     tool_input: Some(serde_json::json!({"command": "pwd"})),
@@ -35380,6 +35924,7 @@ mod tests {
                     role: "tool".to_string(),
                     content: "Tool result: shell\n/tmp".to_string(),
                     kind: MessageEntryKind::ToolResult,
+                    reply_occurrence: None,
                     tool_call_id: Some("call-1".to_string()),
                     tool_name: Some("shell".to_string()),
                     tool_input: None,
@@ -35412,6 +35957,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: "tool call".to_string(),
                 kind: MessageEntryKind::ToolCall,
+                reply_occurrence: None,
                 tool_call_id: Some("call-1".to_string()),
                 tool_name: Some("shell".to_string()),
                 tool_input: Some(serde_json::json!({})),
@@ -35595,10 +36141,7 @@ mod tests {
         chat.session_order = vec!["sess-1".to_string()];
         chat.session_resync_in_flight.insert(
             "sess-1".to_string(),
-            ResyncInFlight {
-                mode: SessionResyncMode::Reattach,
-                owned_turn: None,
-            },
+            ResyncInFlight::new(SessionResyncMode::Reattach, None),
         );
         let s = active_state(&mut chat);
         s.set_pending_elicitation(single_elicitation());
@@ -35611,6 +36154,7 @@ mod tests {
         assert!(writer_rx.try_recv().is_err(), "cancel is sent only once");
         chat.apply_session_resync_result(SessionResyncResult {
             session_id: "sess-1".to_string(),
+            ticket: Arc::clone(&chat.session_resync_in_flight["sess-1"].ticket),
             result: Ok(SessionResyncSnapshot {
                 messages: Vec::new(),
                 message_count: 0,
@@ -35718,10 +36262,7 @@ mod tests {
         chat.session_order = vec!["sess-1".to_string()];
         chat.session_resync_in_flight.insert(
             "sess-1".to_string(),
-            ResyncInFlight {
-                mode: SessionResyncMode::Reattach,
-                owned_turn: None,
-            },
+            ResyncInFlight::new(SessionResyncMode::Reattach, None),
         );
         assert!(matches!(
             chat.try_install_elicitation(inbound_single_elicitation("e-mid", "sess-1")),
@@ -35730,6 +36271,7 @@ mod tests {
 
         chat.apply_session_resync_result(SessionResyncResult {
             session_id: "sess-1".to_string(),
+            ticket: Arc::clone(&chat.session_resync_in_flight["sess-1"].ticket),
             result: Ok(SessionResyncSnapshot {
                 messages: Vec::new(),
                 message_count: 0,
@@ -37068,6 +37610,8 @@ mod tests {
             serde_json::json!({"completed": {"session_id": "sess-1", "error": "unexpected"}}),
             serde_json::json!({"paused_for_blocker": {"session_id": "sess-1", "error": "unexpected"}}),
             serde_json::json!({"verified_candidate": {"session_id": "sess-1", "candidate": false}}),
+            serde_json::json!({"verified_candidate": {"session_id": "sess-1", "candidate": "answer", "reply_occurrence": 1}}),
+            serde_json::json!({"verified_candidate": {"session_id": "sess-1", "candidate": "answer", "unexpected": "fixture:1"}}),
         ] {
             assert!(parse_goal_update(&invalid).is_none(), "{invalid}");
         }
