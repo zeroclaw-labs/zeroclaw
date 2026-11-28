@@ -83,3 +83,26 @@ jobs:
       - name: Run tests
         shell: bash
         run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop --no-fail-fast
+
+  webdav-tests:
+    name: WebDAV Test (${{ matrix.os }})
+    needs: [fmt]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.98.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: webdav-platform-test
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Run HTTPS adapter and authorization tests
+        run: cargo test --locked -p zeroclaw-tools --lib remote_file_

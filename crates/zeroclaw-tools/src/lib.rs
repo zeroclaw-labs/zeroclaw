@@ -1,11 +1,18 @@
 //! Tool implementations for agent-callable capabilities.
 
+mod scoped_credentials;
+
 pub mod attribution;
 pub mod helpers;
 pub(crate) mod i18n;
 pub mod inventory;
 #[cfg(feature = "tool-microsoft365")]
 pub mod microsoft365;
+pub mod remote_file_dispatch;
+#[cfg(target_os = "linux")]
+pub mod remote_file_mount;
+pub mod remote_file_transfer;
+pub mod remote_file_webdav;
 pub mod util_helpers;
 
 pub mod a2a_client;
@@ -261,4 +268,15 @@ mod session_tool_marker_guard {
             "sessions_current addresses only the caller's own session"
         );
     }
+}
+
+pub mod task_ssh;
+
+#[cfg(target_os = "linux")]
+pub mod task_ssh_broker;
+
+/// Localized diagnostic for the broker entry point on unsupported platforms.
+#[cfg(not(target_os = "linux"))]
+pub fn unsupported_task_ssh_message() -> String {
+    i18n::get_required_tool_string("tool-ssh-task-unsupported")
 }

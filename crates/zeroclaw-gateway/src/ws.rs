@@ -990,6 +990,7 @@ async fn handle_socket(
                         let client_gone = process_chat_message(
                             &state,
                             &mut agent,
+                            approval_channel.clone(),
                             &mut sender,
                             &mut receiver,
                             &mut approval_event_rx,
@@ -1210,6 +1211,7 @@ async fn handle_socket(
                 let client_gone = process_chat_message(
                     &state,
                     &mut agent,
+                    approval_channel.clone(),
                     &mut sender,
                     &mut receiver,
                     &mut approval_event_rx,
@@ -2099,6 +2101,7 @@ fn build_done_frame_json(
 async fn process_chat_message(
     state: &AppState,
     agent: &mut zeroclaw_runtime::agent::Agent,
+    approval_channel: Arc<WsApprovalChannel>,
     sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
     approval_event_rx: &mut tokio::sync::mpsc::Receiver<zeroclaw_api::agent::TurnEvent>,
@@ -2203,7 +2206,9 @@ async fn process_chat_message(
     // The shared Agent turn boundary owns safeguard attribution and returns it
     // alongside the undecorated transcript. This transport only renders the
     // typed result as a standalone WS frame.
-    let turn_fut = Box::pin(async {
+    let approval_context = zeroclaw_api::tool::ToolExecutionContext::default()
+        .with_credential_approver(approval_channel);
+    let turn_fut = Box::pin(approval_context.scope(async {
         use ::zeroclaw_log::Instrument as _;
         let span = ::zeroclaw_log::info_span!(
             target: "zeroclaw_log_internal_scope",
@@ -2232,7 +2237,7 @@ async fn process_chat_message(
             ),
         )
         .await
-    });
+    }));
 
     // Drive both futures concurrently: the agent turn produces events
     // and we relay them over WebSocket. Track streamed chunks so we

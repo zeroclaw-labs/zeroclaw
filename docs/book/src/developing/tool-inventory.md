@@ -236,6 +236,7 @@ application-owned tool source and for an optional-tools feature (proposed as
 | Utilities | `calculator`, `weather`, `pushover`, `screenshot`, `image_info` | Always |
 | Browser | `browser_open`, `browser`, `browser_delegate`, `text_browser` | `browser_open` yes, because the browser section is enabled by default; the others no |
 | Network | `http_request`, `web_search_tool` | Yes, both default to enabled |
+| Remote files | `remote_files` | No; requires an operator-configured WebDAV resource |
 | SaaS integrations | `notion`, `jira`, `linkedin`, `composio`, `google_workspace`, `microsoft365` | No |
 | Reporting | `project_intel`, `report_template` | No |
 | Coding runner | `claude_code_runner` | No |

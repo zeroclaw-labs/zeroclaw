@@ -459,7 +459,8 @@ async fn execute_one_tool_with_provenance(
             .await;
     }
 
-    let context = ToolExecutionContext::new(cancellation_token.cloned());
+    let context =
+        ToolExecutionContext::new(cancellation_token.cloned()).inherit_credential_approver();
     let execute = context
         .run(tool.execute_with_context(call_arguments.clone(), &context))
         .instrument(tool_span.clone());

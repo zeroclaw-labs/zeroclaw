@@ -1427,6 +1427,19 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
             .map(AttributedApprovalResponse::operator))
     }
 
+    /// Request credential approval in the originating conversation only.
+    ///
+    /// Channels must opt in after verifying that the recipient and responder
+    /// belong to the originating conversation. Generic approval routers may
+    /// forward requests elsewhere and must not be used as a fallback.
+    async fn request_origin_credential_approval(
+        &self,
+        _recipient: &str,
+        _request: &ChannelApprovalRequest,
+    ) -> bool {
+        false
+    }
+
     /// Request an attributed approval using a caller-owned response budget.
     ///
     /// The default keeps the existing caller-side timeout semantics. Channels

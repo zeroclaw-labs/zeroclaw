@@ -39,6 +39,7 @@ pub mod sop_list;
 pub mod sop_status;
 pub mod sop_workshop;
 pub mod spawn_subagent;
+mod task_ssh_sandbox;
 pub mod todo_write;
 pub mod verifiable_intent;
 
@@ -1666,6 +1667,7 @@ fn runtime_shell_assembly(
         Some(&security.workspace_dir),
         &sandbox_extra_roots,
     );
+    let sandbox: Arc<dyn Sandbox> = Arc::new(task_ssh_sandbox::TaskSshSandbox(sandbox));
     let shell_tool = ShellTool::new_with_sandbox(security, runtime, sandbox.clone());
     RuntimeShellAssembly {
         shell_tool,
@@ -2751,6 +2753,7 @@ fn all_tools_with_runtime_on_thread(
             browser_config.allowed_private_hosts.clone(),
         ) {
             Ok(tool) => {
+                let tool = tool.with_credential_config(root_config.config_path.clone());
                 tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
             }
             Err(e) => {
@@ -2784,6 +2787,13 @@ fn all_tools_with_runtime_on_thread(
                 "browser_delegate: skipped registration because the current runtime does not allow shell access"
             );
         }
+    }
+
+    if !root_config.remote_files.is_empty() && select_tool!("remote_files") {
+        let tool = zeroclaw_tools::remote_file_dispatch::RemoteFilesTool::new(
+            root_config.config_path.clone(),
+        );
+        tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
     }
 
     if http_config.enabled && select_tool!("http_request") {
@@ -8418,6 +8428,13 @@ permissions = ["http_client"]
 
         let mut cfg = test_config(tmp);
         cfg.tools.optional = vec!["*".into()];
+        cfg.remote_files
+            .webdav
+            .push(zeroclaw_config::remote_files::WebDavResourceConfig {
+                alias: "inventory".into(),
+                root: "https://files.example.invalid/".into(),
+                credential_alias: "inventory-placeholder".into(),
+            });
         std::fs::create_dir_all(&cfg.data_dir).unwrap();
         // Plugin tools are outside the inventory, so plugins stay off, and the
         // plugin directory points under `tmp` as well.
