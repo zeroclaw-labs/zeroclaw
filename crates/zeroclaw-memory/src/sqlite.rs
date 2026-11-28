@@ -2471,21 +2471,19 @@ impl Memory for SqliteMemory {
         .await??;
 
         let mut count = 0;
-        for (id, content) in &entries {
-            if let Ok(Some(emb)) = self.get_or_compute_embedding(content).await {
+        for (id, content) in entries {
+            if let Ok(Some(emb)) = self.get_or_compute_embedding(&content).await {
                 let bytes = vector::vec_to_bytes(&emb);
                 let conn = self.conn.clone();
-                let id = id.clone();
-                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                    let conn = conn.lock();
-                    conn.execute(
-                        "UPDATE memories SET embedding = ?1 WHERE id = ?2",
-                        params![bytes, id],
-                    )?;
-                    Ok(())
+                // The row may have been edited or filled while inference was in flight.
+                count += tokio::task::spawn_blocking(move || {
+                    conn.lock().execute(
+                        "UPDATE memories SET embedding = ?1
+                         WHERE id = ?2 AND content = ?3 AND embedding IS NULL",
+                        params![bytes, id, content],
+                    )
                 })
                 .await??;
-                count += 1;
             }
         }
 
@@ -4771,6 +4769,138 @@ mod tests {
         // FTS should still work after rebuild
         let results = mem.recall("reindex", 10, None, None, None).await.unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    const OLD_TEXT: &str = "orbital draft";
+
+    #[derive(Default)]
+    struct PausedKeyedEmbedding {
+        started: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for PausedKeyedEmbedding {
+        fn name(&self) -> &str {
+            KeyedEmbedding.name()
+        }
+        fn dimensions(&self) -> usize {
+            KeyedEmbedding.dimensions()
+        }
+        async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            if texts.contains(&OLD_TEXT) {
+                self.started.notify_one();
+                self.resume.notified().await;
+            }
+            KeyedEmbedding.embed(texts).await
+        }
+    }
+
+    async fn reindex_during_write(
+        mem: &SqliteMemory,
+        write: impl Future<Output = anyhow::Result<()>>,
+    ) -> usize {
+        let embedder = Arc::new(PausedKeyedEmbedding::default());
+        mem.swap_embedder(embedder.clone());
+        let concurrent_write = async {
+            embedder.started.notified().await;
+            write.await.unwrap();
+            embedder.resume.notify_one();
+        };
+        let (repaired, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(mem.reindex(), concurrent_write)
+        })
+        .await
+        .expect("the write must finish while repair inference is paused");
+        repaired.unwrap()
+    }
+
+    #[tokio::test]
+    async fn reindex_preserves_concurrent_edit_and_repairs_unchanged_row() {
+        let (tmp, mem) = temp_sqlite(); // Noop embedder: both rows start without vectors.
+        mem.store("note", OLD_TEXT, MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("control", "garden path", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let id = mem.get("note").await.unwrap().unwrap().id;
+
+        let repaired = reindex_during_write(
+            &mem,
+            mem.store("note", "oak grove", MemoryCategory::Core, None),
+        )
+        .await;
+        drop(mem);
+
+        let reopened = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(KeyedEmbedding),
+            1.0,
+            0.0,
+            1000,
+            None,
+            SearchMode::Embedding,
+        )
+        .unwrap();
+        let note = reopened.get("note").await.unwrap().unwrap();
+        assert_eq!(note.id, id);
+        assert_eq!(note.content, "oak grove");
+        // Probe the two orthogonal axes without keyword matches. The untouched
+        // control must now have a vector, and neither row should hit the old axis.
+        let current = reopened
+            .recall("woodland", 10, None, None, None)
+            .await
+            .unwrap();
+        assert!(current.iter().any(|entry| entry.key == "control"));
+        assert!(current.iter().any(|entry| entry.id == id));
+        assert!(
+            reopened
+                .recall("orbital probe", 10, None, None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(repaired, 1, "only the untouched control was repaired");
+    }
+
+    #[tokio::test]
+    async fn reindex_skips_changed_text_even_if_embedding_is_still_null() {
+        let (tmp, mem) = temp_sqlite();
+        mem.store("note", OLD_TEXT, MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let noop_writer = SqliteMemory::new("test", tmp.path()).unwrap();
+        let repaired = reindex_during_write(
+            &mem,
+            noop_writer.store("note", "oak grove", MemoryCategory::Core, None),
+        )
+        .await;
+        assert_eq!(repaired, 0);
+        assert_eq!(
+            count_scalar(
+                &mem,
+                "SELECT COUNT(*) FROM memories WHERE embedding IS NULL"
+            ),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_skips_already_filled_row_even_if_text_is_unchanged() {
+        let (tmp, mem) = temp_sqlite();
+        mem.store("note", OLD_TEXT, MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let writer = SqliteMemory::new("test", tmp.path()).unwrap();
+        writer.swap_embedder(Arc::new(KeyedEmbedding));
+        let repaired = reindex_during_write(
+            &mem,
+            writer.store("note", OLD_TEXT, MemoryCategory::Core, None),
+        )
+        .await;
+        assert_eq!(repaired, 0);
     }
 
     // ── Embedding identity primitives──────────────
