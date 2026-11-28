@@ -2,7 +2,7 @@ use crate::schema::DockerRuntimeConfig;
 use anyhow::{Context, Result};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect};
+use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellCommandCleanup, ShellDialect};
 
 /// Canonicalization failures that the runtime layer can present through
 /// localized tool diagnostics without parsing an English error chain.
@@ -152,6 +152,8 @@ impl DockerRuntime {
         let mut process = tokio::process::Command::new(docker);
         process
             .arg("run")
+            .arg("--name")
+            .arg(format!("zeroclaw-shell-{}", uuid::Uuid::new_v4()))
             .arg("--rm")
             .arg("--init")
             .arg("--interactive");
@@ -237,7 +239,80 @@ fn docker_env_key(key: &OsStr) -> Result<&str> {
     Ok(key)
 }
 
+/// A per-invocation removal operation derived from the built `docker run`.
+struct DockerShellCleanup {
+    removal: tokio::process::Command,
+}
+
+#[async_trait::async_trait]
+impl ShellCommandCleanup for DockerShellCleanup {
+    async fn cleanup(
+        &mut self,
+        child: &mut tokio::process::Child,
+        process: &tokio::process::Command,
+    ) -> Result<()> {
+        // Use the same Docker context/host and credentials as the launcher,
+        // without inheriting additional variables from the daemon process.
+        self.removal.env_clear();
+        for (key, value) in process.as_std().get_envs() {
+            if let Some(value) = value {
+                self.removal.env(key, value);
+            }
+        }
+
+        loop {
+            // Only an absence observed AFTER launcher exit is conclusive:
+            // it could create a container and exit while `rm` is in flight.
+            let launcher_finished = child.try_wait()?.is_some();
+            let output = self
+                .removal
+                .output()
+                .await
+                .context("Docker container cleanup failed")?;
+            if output.status.success() {
+                return Ok(());
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("No such container:") {
+                anyhow::bail!("Docker container cleanup failed: {}", stderr.trim());
+            }
+            if launcher_finished {
+                // --rm already removed it, or the launcher failed before
+                // creation. A running launcher may still be pulling/creating;
+                // keep it alive and retry rather than losing that race.
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+}
+
 impl RuntimeAdapter for DockerRuntime {
+    fn shell_command_cleanup(
+        &self,
+        command: &tokio::process::Command,
+    ) -> Result<Option<Box<dyn ShellCommandCleanup>>> {
+        let mut args = command.as_std().get_args();
+        anyhow::ensure!(
+            args.next() == Some(OsStr::new("run")) && args.next() == Some(OsStr::new("--name")),
+            "Docker shell cleanup requires the runtime-built command"
+        );
+        let name = args
+            .next()
+            .context("Docker shell command is missing its container name")?;
+        let mut removal = tokio::process::Command::new(command.as_std().get_program());
+        removal
+            .args([
+                OsStr::new("rm"),
+                OsStr::new("--force"),
+                OsStr::new("--"),
+                name,
+            ])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        Ok(Some(Box::new(DockerShellCleanup { removal })))
+    }
+
     fn name(&self) -> &str {
         "docker"
     }
@@ -342,6 +417,50 @@ mod tests {
     fn docker_reports_posix_shell_dialect() {
         let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
         assert_eq!(runtime.shell_dialect(), ShellDialect::Posix);
+    }
+
+    #[test]
+    fn docker_shell_invocations_have_distinct_runtime_owned_names() {
+        let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
+        let build = || {
+            runtime
+                .build_shell_command_with_launcher(
+                    "echo --name another-container",
+                    None,
+                    &[],
+                    Path::new("docker"),
+                )
+                .unwrap()
+        };
+        let first = build();
+        let second = build();
+        let name = |command: &tokio::process::Command| {
+            let args = command.as_std().get_args().collect::<Vec<_>>();
+            assert_eq!(args[0], "run");
+            assert_eq!(args[1], "--name");
+            assert_eq!(args[3], "--rm");
+            let name = args[2].to_str().unwrap();
+            assert!(name.starts_with("zeroclaw-shell-"));
+            assert_ne!(name, "another-container");
+            name.to_owned()
+        };
+        assert_ne!(name(&first), name(&second));
+    }
+
+    #[test]
+    fn docker_cleanup_refuses_commands_without_a_runtime_owned_name() {
+        let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
+        for args in [
+            vec![],
+            vec!["start", "--name", "other"],
+            vec!["run"],
+            vec!["run", "--name"],
+            vec!["run", "--rm", "alpine", "sh", "-c", "echo --name other"],
+        ] {
+            let mut command = tokio::process::Command::new("docker");
+            command.args(&args);
+            assert!(runtime.shell_command_cleanup(&command).is_err(), "{args:?}");
+        }
     }
 
     #[test]

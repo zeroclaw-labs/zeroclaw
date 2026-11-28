@@ -1,6 +1,23 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+/// An invocation's runtime resources that outlive its local launcher process.
+///
+/// The executor must keep ownership of this operation across cancellation and
+/// await it before killing the launcher. Otherwise a container still being
+/// created by a daemon can escape cleanup.
+#[async_trait::async_trait]
+pub trait ShellCommandCleanup: Send {
+    /// Stop this invocation's resources. `process` supplies the final child
+    /// environment, including explicit removals; it may have a sandbox wrapper.
+    /// The caller bounds the cleanup duration and reaps `child` afterwards.
+    async fn cleanup(
+        &mut self,
+        child: &mut tokio::process::Child,
+        process: &tokio::process::Command,
+    ) -> anyhow::Result<()>;
+}
+
 /// Shell language understood by a runtime's command builder.
 ///
 /// This is part of the execution boundary: security policy must validate the
@@ -322,6 +339,17 @@ pub trait RuntimeAdapter: Send + Sync {
     ) -> anyhow::Result<tokio::process::Command> {
         let _ = env_keys;
         self.build_shell_command(command, workspace_dir)
+    }
+
+    /// Prepare cleanup from the command built by this adapter, before sandbox
+    /// wrapping changes its launcher. Native runtimes need only process-tree
+    /// cleanup and return `None`; daemon-backed runtimes own their resource
+    /// identification and removal protocol here.
+    fn shell_command_cleanup(
+        &self,
+        _command: &tokio::process::Command,
+    ) -> anyhow::Result<Option<Box<dyn ShellCommandCleanup>>> {
+        Ok(None)
     }
 }
 

@@ -9,12 +9,14 @@ use std::ffi::OsStr;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::platform::is_android;
+use zeroclaw_api::runtime_traits::ShellCommandCleanup;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_warning};
 use zeroclaw_config::policy::ShellTarget;
 
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
 const POST_EXIT_DRAIN: Duration = Duration::from_millis(250);
+const RUNTIME_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Drop guard that SIGKILLs the child's process group on cancel/timeout paths.
 /// Disarmed after `child.wait()` returns so it never signals a recycled PID.
@@ -307,6 +309,20 @@ impl Tool for ShellTool {
             });
         }
 
+        let cleanup = match self.runtime.shell_command_cleanup(&cmd) {
+            Ok(cleanup) => cleanup,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(crate::i18n::get_required_cli_string_with_args(
+                        "tool-shell-cleanup-prepare-failed",
+                        &[("error", &error.to_string())],
+                    )),
+                });
+            }
+        };
+
         // Apply sandbox wrapping before execution.
         // The Sandbox trait operates on std::process::Command, so use as_std_mut
         // to get a mutable reference to the underlying command.
@@ -382,7 +398,7 @@ impl Tool for ShellTool {
         cmd.stderr(std::process::Stdio::piped());
         cmd.stdin(std::process::Stdio::null());
 
-        let mut child = match cmd.spawn() {
+        let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult {
@@ -393,80 +409,30 @@ impl Tool for ShellTool {
             }
         };
 
-        #[cfg(unix)]
-        let group_guard = ChildGroupGuard::new(child.id());
-
-        let stdout_handle = child.stdout.take();
-        let stderr_handle = child.stderr.take();
-
-        let stdout_drain = spawn_drain(stdout_handle, MAX_OUTPUT_BYTES);
-        let stderr_drain = spawn_drain(stderr_handle, MAX_OUTPUT_BYTES);
-
-        let mut result =
-            match tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-                Ok(Ok(status)) => {
-                    #[cfg(unix)]
-                    group_guard.disarm();
-                    let (stdout_capture, stderr_capture) =
-                        tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
-
-                    let mut stdout = decode_capture(&stdout_capture);
-                    let mut stderr = decode_capture(&stderr_capture);
-
-                    if stdout_capture.truncated || stdout.len() > MAX_OUTPUT_BYTES {
-                        append_truncation_marker(&mut stdout, "\n... [output truncated at 1MB]");
-                    }
-                    if stderr_capture.truncated || stderr.len() > MAX_OUTPUT_BYTES {
-                        append_truncation_marker(&mut stderr, "\n... [stderr truncated at 1MB]");
-                    }
-
-                    let success = status.success();
-                    // On failure, put the exit status plus stderr (or stdout if
-                    // stderr is empty) into `error`. Leaving `error` empty made
-                    // run logs show `"error":""` and hid the command's diagnostic
-                    // from the model. When stdout is used as the failure detail,
-                    // clear `output` so the dispatcher does not fold a duplicate
-                    // copy into the model-visible text.
-                    let used_stdout_as_error =
-                        !success && stderr.trim_end().is_empty() && !stdout.trim_end().is_empty();
-                    ToolResult {
-                        success,
-                        output: if used_stdout_as_error {
-                            ToolOutput::default()
-                        } else {
-                            stdout.clone().into()
-                        },
-                        error: if success {
-                            if stderr.is_empty() {
-                                None
-                            } else {
-                                Some(stderr)
-                            }
-                        } else {
-                            Some(format_shell_failure_error(status, &stderr, &stdout))
-                        },
-                    }
-                }
-                Ok(Err(e)) => {
-                    tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
-                    ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(format!("Failed to execute command: {e}")),
-                    }
-                }
-                Err(_) => {
-                    let _ = child.start_kill();
-                    tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
-                    ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(format!(
-                            "Command timed out after {timeout_secs}s and was killed"
-                        )),
-                    }
-                }
-            };
+        let needs_owned_cleanup = cleanup.is_some();
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        let execution = wait_for_shell_command(child, cmd, timeout_secs, cleanup, cancelled);
+        let mut result = if needs_owned_cleanup {
+            // Dropping the caller closes `cancel`, but does not abort the
+            // resource owner. It removes the runtime resource before reaping
+            // the local launcher, including while Docker is still creating it.
+            zeroclaw_spawn::spawn!(execution).await.map_err(|error| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(serde_json::json!({"error_key": "shell_execution_task_failed", "error": error.to_string()})),
+                    "shell execution task failed"
+                );
+                anyhow::Error::msg(crate::i18n::get_required_cli_string_with_args(
+                    "tool-shell-worker-failed",
+                    &[("error", &error.to_string())],
+                ))
+            })?
+        } else {
+            execution.await
+        };
+        drop(cancel);
 
         // The command ran inside an ephemeral workspace: any files it wrote are
         // invisible on the host and discarded at session end
@@ -481,6 +447,138 @@ impl Tool for ShellTool {
 
         Ok(result)
     }
+}
+
+enum ShellCommandExit {
+    Finished(std::io::Result<std::process::ExitStatus>),
+    TimedOut,
+    Cancelled,
+}
+
+async fn wait_for_shell_command(
+    mut child: tokio::process::Child,
+    process: tokio::process::Command,
+    timeout_secs: u64,
+    mut cleanup: Option<Box<dyn ShellCommandCleanup>>,
+    cancelled: tokio::sync::oneshot::Receiver<()>,
+) -> ToolResult {
+    // Runtime cleanup may reap the launcher while checking whether creation
+    // finished. Only native execution uses the PID-based drop guard, so a
+    // later drop cannot signal a recycled Docker launcher PID.
+    #[cfg(unix)]
+    let group_guard = ChildGroupGuard::new(if cleanup.is_none() { child.id() } else { None });
+    let stdout_drain = spawn_drain(child.stdout.take(), MAX_OUTPUT_BYTES);
+    let stderr_drain = spawn_drain(child.stderr.take(), MAX_OUTPUT_BYTES);
+    let exit = tokio::select! {
+        status = child.wait() => ShellCommandExit::Finished(status),
+        _ = tokio::time::sleep(Duration::from_secs(timeout_secs)) => ShellCommandExit::TimedOut,
+        _ = cancelled => ShellCommandExit::Cancelled,
+    };
+    let needs_cleanup =
+        !matches!(&exit, ShellCommandExit::Finished(Ok(status)) if status.success());
+
+    let mut result = match exit {
+        ShellCommandExit::Finished(Ok(status)) => {
+            #[cfg(unix)]
+            group_guard.disarm();
+            let (stdout_capture, stderr_capture) =
+                tokio::join!(finish_drain(stdout_drain), finish_drain(stderr_drain));
+            let mut stdout = decode_capture(&stdout_capture);
+            let mut stderr = decode_capture(&stderr_capture);
+            if stdout_capture.truncated || stdout.len() > MAX_OUTPUT_BYTES {
+                append_truncation_marker(&mut stdout, "\n... [output truncated at 1MB]");
+            }
+            if stderr_capture.truncated || stderr.len() > MAX_OUTPUT_BYTES {
+                append_truncation_marker(&mut stderr, "\n... [stderr truncated at 1MB]");
+            }
+            let success = status.success();
+            // Avoid returning a duplicate when stdout supplies the diagnostic.
+            let used_stdout_as_error =
+                !success && stderr.trim_end().is_empty() && !stdout.trim_end().is_empty();
+            ToolResult {
+                success,
+                output: if used_stdout_as_error {
+                    ToolOutput::default()
+                } else {
+                    stdout.clone().into()
+                },
+                error: if success {
+                    if stderr.is_empty() {
+                        None
+                    } else {
+                        Some(stderr)
+                    }
+                } else {
+                    Some(format_shell_failure_error(status, &stderr, &stdout))
+                },
+            }
+        }
+        ShellCommandExit::Finished(Err(error)) => {
+            tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
+            ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("Failed to execute command: {error}")),
+            }
+        }
+        ShellCommandExit::TimedOut | ShellCommandExit::Cancelled => {
+            tokio::join!(abort_drain(stdout_drain), abort_drain(stderr_drain));
+            ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(match exit {
+                    ShellCommandExit::TimedOut => {
+                        format!("Command timed out after {timeout_secs}s and was killed")
+                    }
+                    _ => crate::i18n::get_required_cli_string("tool-shell-cancelled"),
+                }),
+            }
+        }
+    };
+
+    if needs_cleanup {
+        if let Some(cleanup) = cleanup.as_mut() {
+            let removal = tokio::time::timeout(
+                RUNTIME_CLEANUP_TIMEOUT,
+                cleanup.cleanup(&mut child, &process),
+            )
+            .await;
+            let error = match removal {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(_) => Some(crate::i18n::get_required_cli_string_with_args(
+                    "tool-shell-cleanup-timed-out",
+                    &[("seconds", &RUNTIME_CLEANUP_TIMEOUT.as_secs().to_string())],
+                )),
+            };
+            if let Some(error) = error {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(serde_json::json!({"error_key": "shell_runtime_cleanup_failed", "error": error})),
+                    "shell runtime resource cleanup failed"
+                );
+                // Do not claim that the command was killed if the daemon did
+                // not confirm removal of its resource.
+                result.error = Some(crate::i18n::get_required_cli_string_with_args(
+                    "tool-shell-cleanup-failed",
+                    &[("error", &error)],
+                ));
+            }
+            // Cleanup may have reaped the launcher. Resolve its still-owned
+            // PID now, and signal its host helpers before the final wait.
+            #[cfg(unix)]
+            drop(ChildGroupGuard::new(child.id()));
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(POST_EXIT_DRAIN, child.wait()).await;
+        } else {
+            // The native group guard must signal descendants before reaping
+            // the leader; leave the original drop ordering intact.
+            let _ = child.start_kill();
+        }
+    }
+    result
 }
 
 struct DrainHandle {
@@ -640,6 +738,9 @@ fn android_child_path(tui_path: Option<&str>, ambient_path: &str) -> String {
         format!("/system/bin:/system/xbin:{base}")
     }
 }
+
+#[cfg(test)]
+mod cleanup_tests;
 
 /// Doubles for the regressions that hold a command's grammar to the shell
 /// that runs it, shared by the shell tool, the shell-backed skill tool and
