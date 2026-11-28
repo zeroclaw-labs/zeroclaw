@@ -657,6 +657,7 @@ runtime_profile = "hinted"
                     tools_registry: spec.tools_registry,
                     observer: &observability::NoopObserver {},
                     silent: true,
+                    live_sop_interactive: false,
                     approval: None,
                     security: None,
                     multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),

@@ -86,6 +86,7 @@ pub async fn run_case(trace: &LlmTrace) -> anyhow::Result<RunRecord> {
     let eval_security = Arc::new(zeroclaw_config::policy::SecurityPolicy::default());
     let eval_registry = zeroclaw_runtime::tools::scoped::ScopedToolRegistry::assemble(
         zeroclaw_runtime::tools::scoped::ScopedAssembly {
+            interactive: false,
             config: &eval_config,
             agent_alias: "eval",
             security: &eval_security,
