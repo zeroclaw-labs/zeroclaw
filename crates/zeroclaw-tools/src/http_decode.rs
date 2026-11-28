@@ -477,6 +477,79 @@ pub(crate) async fn read_decoded_text(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn decoded_response_caps_preserve_utf8_across_all_content_codings() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn encoded_response(encoding: &str, body: &[u8]) -> reqwest::Response {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Encoding: {encoding}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(body);
+            let server = zeroclaw_spawn::spawn!(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let mut buffer = [0_u8; 1024];
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    assert!(read > 0, "client closed before completing request headers");
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                stream.write_all(&response).await.unwrap();
+                stream.shutdown().await.unwrap();
+            });
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .no_gzip()
+                .no_deflate()
+                .no_brotli()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap()
+                .get(format!("http://{address}"))
+                .send()
+                .await
+                .unwrap();
+            server.await.unwrap();
+            response
+        }
+
+        let payload = "a🦀中e\u{301}";
+        let mut brotli_body = Vec::new();
+        {
+            let mut encoder = brotli::CompressorWriter::new(&mut brotli_body, 4096, 5, 22);
+            encoder.write_all(payload.as_bytes()).unwrap();
+        }
+        for (encoding, body) in [
+            ("gzip", gzip_member(payload.as_bytes())),
+            ("deflate", zlib_member(payload.as_bytes())),
+            ("br", brotli_body),
+        ] {
+            // Literal prefixes cover cuts inside four-, three-, and two-byte characters.
+            for (limit, expected, overflowed) in [
+                (Some(0), "", true),
+                (Some(4), "a", true),
+                (Some(7), "a🦀", true),
+                (Some(8), "a🦀中", true),
+                (Some(10), "a🦀中e", true),
+                (Some(11), payload, false),
+                (None, payload, false),
+            ] {
+                let response = encoded_response(encoding, &body).await;
+                let actual = read_decoded_text(response, limit, None).await.unwrap();
+                assert_eq!(
+                    actual,
+                    (expected.into(), overflowed),
+                    "{encoding}, {limit:?}"
+                );
+            }
+        }
+    }
+
     fn headers(values: &[&[u8]]) -> reqwest::header::HeaderMap {
         let mut map = reqwest::header::HeaderMap::new();
         for value in values {
