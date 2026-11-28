@@ -17,6 +17,16 @@ Switching to another pane parks your draft. Navigation that would replace a pend
 
 Before opening an external personality or Skills editor, Config explains that a successful editor exit imports and saves changed content. You can cancel before launch and continue in the inline editor.
 
+## Delete entries and reset fields
+
+By default, `x` opens a deletion confirmation for the selected alias or Costs entry. The `d` shortcut opens a reset confirmation for an optional field or a secret-map entry. It no longer deletes Costs entries. Rebound shortcuts appear in the pane's help and footer. Fields that cannot be cleared have no reset footer hint; pressing `d` shows a message to edit the value instead.
+
+The confirmation shows the captured target before any mutation. Reset removes the configured value; defaults or environment overrides can still determine the effective value. Press Enter after the dialog appears to confirm, or Escape to cancel. Input buffered before the first dialog frame is discarded. The result panel also requires a fresh Enter after it appears, so a double Enter cannot skip a cleanup warning. Use the navigation keys or mouse wheel to scroll either panel. A click closes the panel.
+
+The current daemon exposes deletion previews through the gateway HTTP API, but not through Config RPC. Deletion therefore shows the unavailable-preview notice, and the daemon checks the mutation when confirmed. Preview blockers and reference cleanup details require a daemon that supports `config/delete-plan` over RPC. The current RPC deletion response also has no cleanup warnings; the client can display warnings from a daemon that supplies them. Preview and warning support in the client is forward compatibility with #11172.
+
+The new confirmation messages use English fallback in `es`, `fr`, `ja`, and `zh-CN`. Translations are deferred to a focused `cargo fluent fill --catalog zerocode` pass, as described in [Localization catalog lifecycle](../architecture/localization-catalog-lifecycle.md). The message for an unavailable field reset is translated in all five catalogs.
+
 ## Keybinding modifiers
 
 Keybindings use canonical modifier names: `control` is literal Control, `primary` is Command on macOS and Control elsewhere, and `super` is literal Super/Command. For example, `control+c`, `primary+r`, and `alt+shift+up` are portable persisted values. Older `ctrl+...` values are migrated once when the config loads and rewritten to the corresponding canonical spelling.
