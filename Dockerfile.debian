@@ -195,7 +195,7 @@ RUN for b in zeroclaw zerocode; do \
 # mount point) so a bind mount on /zeroclaw-data cannot shadow it (#6400).
 RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/data && \
     printf '%s\n' \
-        'schema_version = 4' \
+        'schema_version = 5' \
         '' \
         '[gateway]' \
         'port = 42617' \

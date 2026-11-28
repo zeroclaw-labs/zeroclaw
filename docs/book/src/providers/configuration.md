@@ -6,7 +6,7 @@ Every model provider lives at `[providers.models.<type>.<alias>]`. `<type>` is a
 
 The smallest config that loads clean has four section headers: a provider entry, an agent that references it, and a risk profile the agent gates against. Configure them through the gateway, zerocode, or `zeroclaw config set`; the [config reference](../reference/config.md#providers) has the full field index.
 
-If you write `config.toml` by hand, make `schema_version = 4` its first line. The tools above add it for you. Without it, ZeroClaw has to guess the file's version: it reads a file whose sections are plainly in the current shape as version 3, migrates it from there and warns you to add the key (`zeroclaw config migrate` writes it), but any other file is read as the oldest version and migrated.
+If you write `config.toml` by hand, make `schema_version = 5` its first line. The tools above add it for you. Without it, ZeroClaw has to guess the file's version: it reads a file whose sections are plainly in the current shape as version 3, migrates it from there and warns you to add the key (`zeroclaw config migrate` writes it), but any other file is read as the oldest version and migrated.
 
 ## Field reference: provider entry
 
