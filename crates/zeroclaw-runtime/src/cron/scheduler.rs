@@ -18,6 +18,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
+use zeroclaw_api::channel::PeerAddressing;
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::schema::{CronJobDecl, CronScheduleDecl, CronShellOutputFormat};
@@ -1572,6 +1573,9 @@ async fn deliver_if_configured(
 /// Delivery function type — takes owned values so the returned future is 'static.
 /// The fourth `Option<String>` is the optional thread/conversation id propagated
 /// to channels whose outbound `thread_id` is distinct from the recipient (webhook).
+/// The last argument says how the recipient relates to an external peer, so
+/// the delivering channel's peer-route declaration can be checked before
+/// sending (see `PeerAddressing`); announcements pass `PeerAddressing::Direct`.
 pub type DeliveryFn = Box<
     dyn Fn(
             Config,
@@ -1579,6 +1583,7 @@ pub type DeliveryFn = Box<
             String,
             Option<String>,
             String,
+            PeerAddressing,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
         + Send
         + Sync,
@@ -1599,6 +1604,29 @@ pub async fn deliver_announcement(
     thread_id: Option<&str>,
     output: &str,
 ) -> Result<()> {
+    deliver_announcement_addressed(
+        config,
+        channel,
+        target,
+        thread_id,
+        output,
+        PeerAddressing::Direct,
+    )
+    .await
+}
+
+/// [`deliver_announcement`] for a recipient that is, or stands in for, an
+/// external peer. The delivering channel checks `addressing` against its own
+/// peer-route declaration and refuses with a downcastable
+/// `zeroclaw_api::channel::PeerRouteError` before sending anything.
+pub async fn deliver_announcement_addressed(
+    config: &Config,
+    channel: &str,
+    target: &str,
+    thread_id: Option<&str>,
+    output: &str,
+    addressing: PeerAddressing,
+) -> Result<()> {
     if let Some(f) = DELIVERY_FN.get() {
         f(
             config.clone(),
@@ -1606,6 +1634,7 @@ pub async fn deliver_announcement(
             target.to_string(),
             thread_id.map(str::to_string),
             output.to_string(),
+            addressing,
         )
         .await
     } else {
@@ -4192,28 +4221,33 @@ mod tests {
         // so repeated calls across tests are safe and the first writer wins. The
         // handler honours the `fail-delivery` failure contract used by the
         // delivery-classification tests so it composes regardless of order.
-        register_delivery_fn(Box::new(|_config, channel, _target, _thread, output| {
-            Box::pin(async move {
-                if channel == "paused-admission-delivery" {
-                    DELIVERY_ENTERED.notify_one();
-                    DELIVERY_RELEASE.notified().await;
-                }
-                if channel == "fail-delivery" {
-                    anyhow::bail!("synthetic delivery failure");
-                }
-                if channel == COUNT_CHANNEL {
-                    DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                if channel == CONTEXT_FAILURE_CHANNEL {
-                    assert_eq!(
-                        output,
-                        crate::i18n::get_required_cli_string("turn-context-window-exceeded-error")
-                    );
-                    CONTEXT_FAILURES_DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                Ok(())
-            })
-        }));
+        register_delivery_fn(Box::new(
+            |_config, channel, _target, _thread, output, _addressing| {
+                Box::pin(async move {
+                    if channel == "paused-admission-delivery" {
+                        DELIVERY_ENTERED.notify_one();
+                        DELIVERY_RELEASE.notified().await;
+                    }
+                    if channel == "fail-delivery" {
+                        anyhow::bail!("synthetic delivery failure");
+                    }
+                    if channel == COUNT_CHANNEL {
+                        DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    if channel == CONTEXT_FAILURE_CHANNEL {
+                        assert_eq!(
+                            output,
+                            crate::i18n::get_required_cli_string(
+                                "turn-context-window-exceeded-error"
+                            )
+                        );
+                        CONTEXT_FAILURES_DELIVERED
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Ok(())
+                })
+            },
+        ));
     }
 
     #[tokio::test]

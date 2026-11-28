@@ -1752,6 +1752,11 @@ channel-approval-opt-reject-with-edit = Reject with edit
 # ── Peer-agent delivery ──
 peer-delivery-control-plane-unavailable = in-process peer delivery requires an available durable task store: {$error}
 peer-delivery-registration-failed = peer delivery rejected: {$error}
+peer-delivery-route-required = target {$target} is an external peer on {$channel} with no route, so this send cannot be delivered: {$channel} identifies external peers by user, not by a place to post. Configure where messages to this peer are posted with a route in a peer group that lists this agent, [peer_groups.<name>.routes."<peer>"] destination = "<where to post>", or post where the peer can read it and mention the peer there
+peer-delivery-routes-unsupported = target {$target} has a route on {$channel}, but {$channel} does not support peer routes; remove the route from the peer groups that list this agent so messages go to the peer directly
+peer-delivery-route-conflict = target {$target} is routed differently on {$channel} by peer groups {$groups}; make those routes agree or keep the route in one group
+peer-delivery-routed = delivered to external peer {$target} on {$channel} by posting in {$destination}, the channel or thread its route names (readable by everyone there)
+peer-delivery-routed-failed = could not deliver to external peer {$target} on {$channel} in {$destination}, the channel or thread its route names: {$error}
 peer-delivery-accepted = accepted for in-process delivery to peer agent "{$recipient}" (task_id={$task_id})
 tool-git-operations-error-docker-runtime-write-unsupported = Git write commands are unavailable with the Docker runtime because they cannot be confined to its container.
 

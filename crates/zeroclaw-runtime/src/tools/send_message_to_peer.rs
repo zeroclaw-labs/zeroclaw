@@ -9,7 +9,7 @@ use crate::control_plane::{
     ControlPlaneHandle, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
     control_plane as global_control_plane,
 };
-use crate::cron::scheduler::deliver_announcement;
+use crate::cron::scheduler::deliver_announcement_addressed;
 use crate::live_config_authority::{AgentExecutionAdmission, AgentExecutionCapability};
 use crate::peers::resolve_peer_set;
 use crate::security::SecurityPolicy;
@@ -26,8 +26,11 @@ use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use zeroclaw_api::channel::{PeerAddressing, PeerRouteError};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_config::multi_agent::{PeerRouteLookup, lookup_peer_route};
 use zeroclaw_config::schema::Config;
+use zeroclaw_tools::send_via::routed_peer;
 
 const PEER_SETTLEMENT_RETRY_DELAY: Duration = Duration::from_millis(25);
 const PEER_SETTLEMENT_MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -78,6 +81,16 @@ impl SendMessageToPeerTool {
             security,
             execution_capability,
         ))
+    }
+
+    /// The config one send is resolved against: the live view when the tool
+    /// has one, so peer membership, channel bindings, and peer routes
+    /// reflect the latest reload, and all checks in a send agree.
+    fn current_config(&self) -> Arc<Config> {
+        self.live_config.as_ref().map_or_else(
+            || Arc::clone(&self.config),
+            |live| Arc::new(live.snapshot()),
+        )
     }
 
     pub fn new_with_security(
@@ -237,8 +250,9 @@ impl Tool for SendMessageToPeerTool {
             })?
             .to_string();
 
+        let config = self.current_config();
         let fallback_channel_type = channel.split_once('.').map(|(t, _)| t);
-        let resolved = resolve_peer_set(&self.config, &self.sender_alias);
+        let resolved = resolve_peer_set(&config, &self.sender_alias);
 
         if !resolved.is_known_peer(&channel, &target)
             && !fallback_channel_type
@@ -258,8 +272,7 @@ impl Tool for SendMessageToPeerTool {
         // The agent must itself listen on the channel — the target may
         // be reachable on it via a peer group, but a sender can't
         // dispatch on a channel it isn't configured for.
-        let agent_listens_on_channel = self
-            .config
+        let agent_listens_on_channel = config
             .agents
             .get(&self.sender_alias)
             .map(|a| a.channels.iter().any(|c| c.as_str() == channel.as_str()))
@@ -277,8 +290,7 @@ impl Tool for SendMessageToPeerTool {
         }
 
         let target_norm = target.trim_start_matches('@').to_ascii_lowercase();
-        let target_is_agent = self
-            .config
+        let target_is_agent = config
             .agents
             .keys()
             .any(|alias| alias.to_ascii_lowercase() == target_norm);
@@ -288,8 +300,7 @@ impl Tool for SendMessageToPeerTool {
             // raw input ("@Beta" -> "beta"). Look up the canonical
             // alias once so the agent loop's `agent_alias` field
             // matches the [agents.<alias>] config key.
-            let canonical = self
-                .config
+            let canonical = config
                 .agents
                 .keys()
                 .find(|alias| alias.to_ascii_lowercase() == target_norm)
@@ -304,7 +315,7 @@ impl Tool for SendMessageToPeerTool {
             let cfg = admission
                 .as_ref()
                 .map(AgentExecutionAdmission::config)
-                .unwrap_or_else(|| Arc::clone(&self.config));
+                .unwrap_or_else(|| Arc::clone(&config));
             let sender = self.sender_alias.clone();
             let recipient_alias = canonical.clone();
             let turn_recipient_alias = recipient_alias.clone();
@@ -470,18 +481,111 @@ impl Tool for SendMessageToPeerTool {
             });
         }
 
-        match deliver_announcement(&self.config, &channel, &target, None, &message).await {
-            Ok(()) => Ok(ToolResult {
-                success: true,
-                output: format!("delivered to external peer {target:?} on {channel}").into(),
-                error: None,
-            }),
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!("delivery failed: {e:#}")),
-            }),
-        }
+        // An external peer is the recipient, unless the operator routed it: a
+        // route in one of the sender's own groups names where messages to the
+        // peer are posted instead. Whether the channel needs (or accepts) a
+        // route is the channel's own declaration, checked by the delivery
+        // layer before anything is sent.
+        let sender_groups = config
+            .peer_groups
+            .iter()
+            .filter(|(_, group)| group.agents.iter().any(|a| a.as_str() == self.sender_alias))
+            .map(|(name, group)| (name.as_str(), group));
+        let route = match lookup_peer_route(sender_groups, &channel, &target) {
+            PeerRouteLookup::Routed(route) => Some(route),
+            PeerRouteLookup::Unrouted => None,
+            PeerRouteLookup::Conflict(groups) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(crate::i18n::get_required_cli_string_with_args(
+                        "peer-delivery-route-conflict",
+                        &[
+                            ("target", &format!("{target:?}")),
+                            ("channel", &channel),
+                            ("groups", &groups.join(", ")),
+                        ],
+                    )),
+                });
+            }
+        };
+        let (recipient, addressing) = match &route {
+            Some(route) => (
+                route.destination.as_str(),
+                PeerAddressing::Routed(routed_peer(route)),
+            ),
+            None => (target.as_str(), PeerAddressing::Peer),
+        };
+        let delivered = deliver_announcement_addressed(
+            &config, &channel, recipient, None, &message, addressing,
+        )
+        .await;
+        Ok(external_peer_delivery_result(
+            &target,
+            &channel,
+            route.as_ref().map(|route| route.destination.as_str()),
+            delivered,
+        ))
+    }
+}
+
+/// The tool result for a send to external peer `target` on `channel`, posted
+/// in `destination` when a route supplied one.
+fn external_peer_delivery_result(
+    target: &str,
+    channel: &str,
+    destination: Option<&str>,
+    delivered: Result<()>,
+) -> ToolResult {
+    let target = format!("{target:?}");
+    let failure = |error: String| ToolResult {
+        success: false,
+        output: ToolOutput::default(),
+        error: Some(error),
+    };
+    match (delivered, destination) {
+        (Ok(()), None) => ToolResult {
+            success: true,
+            output: format!("delivered to external peer {target} on {channel}").into(),
+            error: None,
+        },
+        (Ok(()), Some(destination)) => ToolResult {
+            success: true,
+            output: crate::i18n::get_required_cli_string_with_args(
+                "peer-delivery-routed",
+                &[
+                    ("target", &target),
+                    ("channel", channel),
+                    ("destination", destination),
+                ],
+            )
+            .into(),
+            error: None,
+        },
+        (Err(e), destination) => match (e.downcast_ref::<PeerRouteError>(), destination) {
+            (Some(PeerRouteError::RouteRequired), _) => {
+                failure(crate::i18n::get_required_cli_string_with_args(
+                    "peer-delivery-route-required",
+                    &[("target", &target), ("channel", channel)],
+                ))
+            }
+            (Some(PeerRouteError::RoutesUnsupported), _) => {
+                failure(crate::i18n::get_required_cli_string_with_args(
+                    "peer-delivery-routes-unsupported",
+                    &[("target", &target), ("channel", channel)],
+                ))
+            }
+            (None, Some(destination)) => failure(crate::i18n::get_required_cli_string_with_args(
+                "peer-delivery-routed-failed",
+                &[
+                    ("target", &target),
+                    ("channel", channel),
+                    ("destination", destination),
+                    ("error", &format!("{e:#}")),
+                ],
+            )),
+            (None, None) => failure(format!("delivery failed: {e:#}")),
+        },
     }
 }
 
@@ -1194,6 +1298,466 @@ mod tests {
         assert_eq!(
             peer_acceptance_output("recipient", task_id),
             "accepted for in-process delivery to peer agent \"recipient\" (task_id=task-123)"
+        );
+    }
+
+    const ROUTED_PEER: &str = "123456789012345678";
+    /// Channels the emulated delivery below treats as declaring peer routes
+    /// (`routes.*`) or not (`plain.*`); `routes.fail` declares them and then
+    /// fails to deliver.
+    const ROUTES: &str = "routes.prod";
+    const PLAIN: &str = "plain.prod";
+    const FAILING: &str = "routes.fail";
+
+    /// A test peer group: `(name, channel, agents, ignore, route destination)`.
+    type RouteGroupSpec<'a> = (
+        &'a str,
+        &'a str,
+        &'a [&'a str],
+        &'a [&'a str],
+        Option<&'a str>,
+    );
+
+    /// One group on `channel` whose only external peer is `key`, routed to
+    /// `destination` with `mention`. The route lookup is identity-based, so an
+    /// `'@'`-prefixed `key` still names `ROUTED_PEER`.
+    fn route_config_keyed(
+        install: &std::path::Path,
+        channel: &str,
+        key: &str,
+        destination: &str,
+        mention: bool,
+    ) -> Config {
+        let mut config = route_config(install, &[("bots", channel, &["aa", "bb"], &[], None)]);
+        let group = config.peer_groups.get_mut("bots").unwrap();
+        group.external_peers = vec![PeerUsername::new(key)];
+        group.routes = std::iter::once((
+            key.to_string(),
+            zeroclaw_config::multi_agent::PeerRouteConfig {
+                destination: destination.to_string(),
+                mention,
+            },
+        ))
+        .collect();
+        config
+    }
+
+    /// Agents `aa` and `bb` on every test channel; each group in `groups`
+    /// lists `ROUTED_PEER`, routed with `mention` when a destination is given.
+    fn route_config(install: &std::path::Path, groups: &[RouteGroupSpec<'_>]) -> Config {
+        let mut config = peer_policy_config(install);
+        config.peer_groups.clear();
+        for alias in ["aa", "bb"] {
+            config.agents.insert(
+                alias.to_string(),
+                AliasedAgentConfig {
+                    channels: vec![ROUTES.into(), PLAIN.into(), FAILING.into()],
+                    risk_profile: "default".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
+        for (name, channel, agents, ignore, destination) in groups {
+            config.peer_groups.insert(
+                (*name).to_string(),
+                PeerGroupConfig {
+                    channel: (*channel).into(),
+                    agents: agents.iter().map(|a| AgentAlias::new(*a)).collect(),
+                    external_peers: vec![PeerUsername::new(ROUTED_PEER)],
+                    ignore: ignore.iter().map(|p| PeerUsername::new(*p)).collect(),
+                    routes: destination
+                        .iter()
+                        .map(|d| {
+                            (
+                                ROUTED_PEER.to_string(),
+                                zeroclaw_config::multi_agent::PeerRouteConfig {
+                                    destination: (*d).to_string(),
+                                    mention: true,
+                                },
+                            )
+                        })
+                        .collect(),
+                    ..PeerGroupConfig::default()
+                },
+            );
+        }
+        config
+    }
+
+    fn route_tool(groups: &[RouteGroupSpec<'_>]) -> (tempfile::TempDir, SendMessageToPeerTool) {
+        let install = tempfile::TempDir::new().expect("isolated install");
+        let config = route_config(install.path(), groups);
+        let tool = SendMessageToPeerTool::new(Arc::new(config), "aa").expect("sender policy");
+        (install, tool)
+    }
+
+    async fn send_to_peer_on(tool: &SendMessageToPeerTool, channel: &str) -> ToolResult {
+        tool.execute(json!({
+            "channel": channel,
+            "target": ROUTED_PEER,
+            "message": "hello",
+        }))
+        .await
+        .expect("delivery outcomes are reported as a ToolResult")
+    }
+
+    /// `(channel, recipient, body, addressing)` for each delivery that went out.
+    type Delivered = (String, String, String, PeerAddressing);
+    static DELIVERED: std::sync::Mutex<Vec<Delivered>> = std::sync::Mutex::new(Vec::new());
+
+    fn delivered() -> Vec<Delivered> {
+        DELIVERED.lock().unwrap().clone()
+    }
+
+    /// Stand-in for channel delivery that checks the addressing the way the
+    /// orchestrator does, against a declaration taken from the channel name.
+    fn install_emulated_delivery() {
+        crate::cron::scheduler::register_delivery_fn(Box::new(
+            |_config, channel, target, _thread, output, addressing| {
+                Box::pin(async move {
+                    addressing.check(channel.starts_with("routes."))?;
+                    if channel == FAILING {
+                        anyhow::bail!("synthetic delivery failure");
+                    }
+                    DELIVERED
+                        .lock()
+                        .unwrap()
+                        .push((channel, target, output, addressing));
+                    Ok(())
+                })
+            },
+        ));
+    }
+
+    /// `DELIVERY_FN` is process-global and other tests install their own
+    /// handler, so the route tests run again in an isolated child test
+    /// process that installs the emulated delivery. Returns `true` in the
+    /// parent once the child passed, and `false` in the child.
+    async fn reran_in_child(test: &str) -> bool {
+        const CHILD_ENV: &str = "ZEROCLAW_PEER_ROUTE_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            install_emulated_delivery();
+            return false;
+        }
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .arg(format!("tools::send_message_to_peer::tests::{test}"))
+            .arg("--exact")
+            .arg("--test-threads=1")
+            .env(CHILD_ENV, "1")
+            .output()
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // libtest exits 0 when `--exact` matched nothing, so assert it ran.
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated test {test} did not run and pass: {stdout}"
+        );
+        true
+    }
+
+    /// On a channel that identifies external peers by user, an unrouted peer
+    /// is refused with guidance instead of reaching the platform's opaque
+    /// "unknown channel" error.
+    #[tokio::test]
+    async fn unrouted_peer_on_a_route_only_channel_is_rejected_with_guidance() {
+        if reran_in_child("unrouted_peer_on_a_route_only_channel_is_rejected_with_guidance").await {
+            return;
+        }
+        let (_install, tool) = route_tool(&[("bots", ROUTES, &["aa"], &[], None)]);
+        let result = send_to_peer_on(&tool, ROUTES).await;
+        assert!(!result.success, "an unrouted peer must not report delivery");
+        let error = result.error.expect("rejection must carry an error");
+        assert_eq!(
+            error,
+            crate::i18n::get_required_cli_string_with_args(
+                "peer-delivery-route-required",
+                &[("target", &format!("{ROUTED_PEER:?}")), ("channel", ROUTES)],
+            ),
+            "the rejection must come from the Fluent catalogue"
+        );
+        assert!(error.contains("with no route"), "{error}");
+        assert!(!error.contains("delivery failed"), "{error}");
+        assert!(delivered().is_empty(), "nothing may be sent");
+    }
+
+    /// On a channel without peer routes the peer itself is the recipient, as
+    /// before routes existed.
+    #[tokio::test]
+    async fn peer_on_a_channel_without_routes_is_delivered_directly() {
+        if reran_in_child("peer_on_a_channel_without_routes_is_delivered_directly").await {
+            return;
+        }
+        let (_install, tool) = route_tool(&[("friends", PLAIN, &["aa"], &[], None)]);
+        let result = send_to_peer_on(&tool, PLAIN).await;
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            result.output.to_string(),
+            format!("delivered to external peer {ROUTED_PEER:?} on {PLAIN}")
+        );
+        assert_eq!(
+            delivered(),
+            vec![(
+                PLAIN.to_string(),
+                ROUTED_PEER.to_string(),
+                "hello".to_string(),
+                PeerAddressing::Peer,
+            )]
+        );
+    }
+
+    /// A routed peer's message goes to the route's destination, posted for the
+    /// peer: the body is unchanged (the channel renders the mention), and the
+    /// result names the destination so the agent does not think it sent a
+    /// direct message.
+    #[tokio::test]
+    async fn routed_peer_is_delivered_to_its_destination() {
+        if reran_in_child("routed_peer_is_delivered_to_its_destination").await {
+            return;
+        }
+        let (_install, tool) =
+            route_tool(&[("bots", ROUTES, &["aa"], &[], Some("444444444444444444"))]);
+        let result = send_to_peer_on(&tool, ROUTES).await;
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            result.output.to_string(),
+            crate::i18n::get_required_cli_string_with_args(
+                "peer-delivery-routed",
+                &[
+                    ("target", &format!("{ROUTED_PEER:?}")),
+                    ("channel", ROUTES),
+                    ("destination", "444444444444444444"),
+                ],
+            )
+        );
+        assert_eq!(
+            delivered(),
+            vec![(
+                ROUTES.to_string(),
+                "444444444444444444".to_string(),
+                "hello".to_string(),
+                PeerAddressing::Routed(zeroclaw_api::channel::RoutedPeer {
+                    peer: ROUTED_PEER.to_string(),
+                    mention: true,
+                }),
+            )]
+        );
+    }
+
+    /// A route without `mention` posts for the peer but pings nobody, and the
+    /// peer reaches the channel as written in the route key (the channel, not
+    /// the tool, applies its own ID format).
+    #[tokio::test]
+    async fn a_route_without_mention_stays_silent_and_keeps_the_key_as_written() {
+        if reran_in_child("a_route_without_mention_stays_silent_and_keeps_the_key_as_written").await
+        {
+            return;
+        }
+        let install = tempfile::TempDir::new().expect("isolated install");
+        let tool = SendMessageToPeerTool::new(
+            Arc::new(route_config_keyed(
+                install.path(),
+                ROUTES,
+                "@123456789012345678",
+                "444444444444444444",
+                false,
+            )),
+            "aa",
+        )
+        .expect("sender policy");
+        let result = tool
+            .execute(json!({
+                "channel": ROUTES,
+                "target": "@123456789012345678",
+                "message": "hello",
+            }))
+            .await
+            .expect("delivery outcomes are reported as a ToolResult");
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            delivered(),
+            vec![(
+                ROUTES.to_string(),
+                "444444444444444444".to_string(),
+                "hello".to_string(),
+                PeerAddressing::Routed(zeroclaw_api::channel::RoutedPeer {
+                    peer: "@123456789012345678".to_string(),
+                    mention: false,
+                }),
+            )]
+        );
+    }
+
+    /// A route on a channel that does not support routes is refused, never
+    /// silently ignored.
+    #[tokio::test]
+    async fn route_on_a_channel_without_routes_is_refused() {
+        if reran_in_child("route_on_a_channel_without_routes_is_refused").await {
+            return;
+        }
+        let (_install, tool) =
+            route_tool(&[("friends", PLAIN, &["aa"], &[], Some("444444444444444444"))]);
+        let result = send_to_peer_on(&tool, PLAIN).await;
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                crate::i18n::get_required_cli_string_with_args(
+                    "peer-delivery-routes-unsupported",
+                    &[("target", &format!("{ROUTED_PEER:?}")), ("channel", PLAIN)],
+                )
+                .as_str()
+            )
+        );
+        assert!(delivered().is_empty(), "nothing may be sent");
+    }
+
+    /// Routes are read from the live config at send time: a route changed by
+    /// a reload after the tool was built is used, not the startup snapshot's.
+    #[tokio::test]
+    async fn route_is_read_from_the_live_config() {
+        if reran_in_child("route_is_read_from_the_live_config").await {
+            return;
+        }
+        let install = tempfile::TempDir::new().expect("isolated install");
+        let startup = route_config(
+            install.path(),
+            &[("bots", ROUTES, &["aa"], &[], Some("444444444444444444"))],
+        );
+        let reloaded = route_config(
+            install.path(),
+            &[("bots", ROUTES, &["aa"], &[], Some("555555555555555555"))],
+        );
+        let live = zeroclaw_config::live::LiveConfig::new(reloaded);
+        let security = Arc::new(SecurityPolicy::for_agent(&startup, "aa").expect("sender policy"));
+        let tool = SendMessageToPeerTool::new_with_live_config_security_and_capability(
+            Arc::new(startup),
+            "aa",
+            Some(live.handle()),
+            security,
+            None,
+        );
+        let result = send_to_peer_on(&tool, ROUTES).await;
+        assert!(result.success, "{:?}", result.error);
+        let output = result.output.to_string();
+        assert!(output.contains("555555555555555555"), "{output}");
+        assert!(!output.contains("444444444444444444"), "{output}");
+        assert_eq!(delivered()[0].1, "555555555555555555");
+    }
+
+    /// Only the sender's own peer groups are searched: a route configured in a
+    /// group the sender does not belong to does not apply.
+    #[tokio::test]
+    async fn route_in_a_group_without_the_sender_is_not_used() {
+        if reran_in_child("route_in_a_group_without_the_sender_is_not_used").await {
+            return;
+        }
+        let (_install, tool) = route_tool(&[
+            ("mine", ROUTES, &["aa"], &[], None),
+            ("theirs", ROUTES, &["bb"], &[], Some("444444444444444444")),
+        ]);
+        let result = send_to_peer_on(&tool, ROUTES).await;
+        assert!(!result.success);
+        let error = result.error.expect("an unrouted peer is rejected");
+        assert!(error.contains("with no route"), "{error}");
+        assert!(delivered().is_empty());
+    }
+
+    /// A route does not let an ignored peer through.
+    #[tokio::test]
+    async fn route_does_not_make_an_ignored_peer_reachable() {
+        if reran_in_child("route_does_not_make_an_ignored_peer_reachable").await {
+            return;
+        }
+        let (_install, tool) = route_tool(&[
+            ("bots", ROUTES, &["aa"], &[], Some("444444444444444444")),
+            ("deny", ROUTES, &["aa"], &[ROUTED_PEER], None),
+        ]);
+        let result = send_to_peer_on(&tool, ROUTES).await;
+        assert!(!result.success, "an ignored peer must not be delivered to");
+        assert!(result.output.to_string().is_empty());
+        // Depending on peer-group order, the resolved peer set may or may not
+        // drop the ignored peer, so the send is rejected either there or at
+        // route lookup, which excludes ignored peers itself. It is never
+        // delivered.
+        let error = result.error.expect("an ignored peer is rejected");
+        assert!(
+            error.contains("is not on agent \"aa\"'s resolved peer set")
+                || error.contains("with no route"),
+            "{error}"
+        );
+        assert!(delivered().is_empty());
+    }
+
+    /// With the ignoring group on the bare channel type, the resolved peer set
+    /// (keyed by the group's channel string) keeps the peer, so the refusal
+    /// deterministically comes from route lookup, which excludes peers any
+    /// covering group ignores.
+    #[tokio::test]
+    async fn route_lookup_excludes_a_peer_ignored_by_bare_type() {
+        if reran_in_child("route_lookup_excludes_a_peer_ignored_by_bare_type").await {
+            return;
+        }
+        let (_install, tool) = route_tool(&[
+            ("bots", ROUTES, &["aa"], &[], Some("444444444444444444")),
+            ("deny", "routes", &["aa"], &[ROUTED_PEER], None),
+        ]);
+        let result = send_to_peer_on(&tool, ROUTES).await;
+        assert!(!result.success, "an ignored peer must not be delivered to");
+        let error = result.error.expect("an ignored peer is rejected");
+        assert!(error.contains("with no route"), "{error}");
+        assert!(delivered().is_empty());
+    }
+
+    /// A routed send whose channel delivery fails reports the failure through
+    /// the localized message, naming the peer, channel and destination and
+    /// carrying the delivery error.
+    #[tokio::test]
+    async fn routed_delivery_failure_is_localized() {
+        if reran_in_child("routed_delivery_failure_is_localized").await {
+            return;
+        }
+        let (_install, tool) =
+            route_tool(&[("bots", FAILING, &["aa"], &[], Some("444444444444444444"))]);
+        let result = send_to_peer_on(&tool, FAILING).await;
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert_eq!(
+            error,
+            crate::i18n::get_required_cli_string_with_args(
+                "peer-delivery-routed-failed",
+                &[
+                    ("target", &format!("{ROUTED_PEER:?}")),
+                    ("channel", FAILING),
+                    ("destination", "444444444444444444"),
+                    ("error", "synthetic delivery failure"),
+                ],
+            )
+        );
+        assert!(!error.contains("delivery failed:"), "{error}");
+    }
+
+    /// Groups covering the channel by bare type and by dotted alias that route
+    /// the peer differently fail closed, before delivery, and are both named.
+    #[tokio::test]
+    async fn conflicting_routes_fail_closed_naming_both_groups() {
+        let (_install, tool) = route_tool(&[
+            ("typed", "routes", &["aa"], &[], Some("444444444444444444")),
+            ("dotted", ROUTES, &["aa"], &[], Some("555555555555555555")),
+        ]);
+        let result = send_to_peer_on(&tool, ROUTES).await;
+        assert!(!result.success);
+        let error = result.error.expect("conflicting routes are rejected");
+        assert_eq!(
+            error,
+            crate::i18n::get_required_cli_string_with_args(
+                "peer-delivery-route-conflict",
+                &[
+                    ("target", &format!("{ROUTED_PEER:?}")),
+                    ("channel", ROUTES),
+                    ("groups", "dotted, typed"),
+                ],
+            )
         );
     }
 

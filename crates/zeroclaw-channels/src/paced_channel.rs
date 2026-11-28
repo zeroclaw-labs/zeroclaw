@@ -405,6 +405,10 @@ impl Channel for PacedChannel {
         self.inner.stop_typing(recipient).await
     }
 
+    fn supports_peer_routes(&self) -> bool {
+        self.inner.supports_peer_routes()
+    }
+
     fn supports_draft_updates(&self) -> bool {
         self.inner.supports_draft_updates()
     }

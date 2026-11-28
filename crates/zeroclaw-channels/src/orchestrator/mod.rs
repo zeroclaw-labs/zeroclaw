@@ -11123,8 +11123,13 @@ async fn process_channel_message_body(
                         let _ = orig_ch.cancel_draft(&msg.reply_target, draft_id).await;
                     }
                     let suppress = suppress_voice_override.unwrap_or(false);
+                    // A reply redirected to an external peer's route is posted
+                    // for that peer; the channel renders the mention.
                     let mut send_msg = SendMessage::new(&delivered_response, &delivery_recipient)
-                        .in_thread(msg.thread_ts.clone());
+                        .in_thread(msg.thread_ts.clone())
+                        .with_routed_peer(
+                            turn_route.as_ref().and_then(|route| route.routed_peer()),
+                        );
                     if suppress {
                         send_msg = send_msg.suppress_voice();
                     } else if force_voice_override {
@@ -18046,6 +18051,32 @@ pub async fn deliver_announcement(
     thread_id: Option<String>,
     output: &str,
 ) -> anyhow::Result<()> {
+    deliver_announcement_addressed(
+        config,
+        channel,
+        target,
+        thread_id,
+        output,
+        zeroclaw_api::channel::PeerAddressing::Direct,
+    )
+    .await
+}
+
+/// [`deliver_announcement`] for a recipient that is, or stands in for, an
+/// external peer. The delivering channel's
+/// [`Channel::supports_peer_routes`]
+/// declaration is checked before anything is sent; a refusal is returned as a
+/// [`PeerRouteError`](zeroclaw_api::channel::PeerRouteError) the caller can
+/// downcast. A routed message is posted for its peer, and the channel renders
+/// the mention.
+pub async fn deliver_announcement_addressed(
+    config: &zeroclaw_config::schema::Config,
+    channel: &str,
+    target: &str,
+    thread_id: Option<String>,
+    output: &str,
+    addressing: zeroclaw_api::channel::PeerAddressing,
+) -> anyhow::Result<()> {
     use zeroclaw_api::channel::SendMessage;
 
     let safe_output = redact_channel_outbound_leaks(
@@ -18055,7 +18086,12 @@ pub async fn deliver_announcement(
     );
     let safe_output = ensure_nonempty_channel_reply(safe_output, output, channel, target);
 
-    let make_msg = |s: &str| SendMessage::new(s, target).in_thread(thread_id.clone());
+    let make_msg = |ch: &dyn Channel, s: &str| -> anyhow::Result<SendMessage> {
+        let routed = addressing.check(ch.supports_peer_routes())?;
+        Ok(SendMessage::new(s, target)
+            .in_thread(thread_id.clone())
+            .with_routed_peer(routed))
+    };
 
     // Snapshot out of the sync RwLock before awaiting. Use the live
     // channel instance when available — critical for Matrix E2EE which
@@ -18068,7 +18104,7 @@ pub async fn deliver_announcement(
     if let Some(registry) = registry_snapshot
         && let Some(ch) = registry.get(channel.to_ascii_lowercase().as_str())
     {
-        return ch.send(&make_msg(&safe_output)).await;
+        return ch.send(&make_msg(ch.as_ref(), &safe_output)?).await;
     }
 
     let (raw_type, alias) = channel.split_once('.').ok_or_else(|| {
@@ -18103,7 +18139,7 @@ pub async fn deliver_announcement(
                 TelegramChannel::new(tg.bot_token.clone(), alias, peer_resolver, tg.mention_only)
                     .with_api_base(tg.api_base_url.clone())
                     .with_rich_messages(tg.rich_messages);
-            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&ch, &safe_output)?).await?;
         }
         #[cfg(not(feature = "channel-telegram"))]
         "telegram" => {
@@ -18129,7 +18165,7 @@ pub async fn deliver_announcement(
             )
             .with_channel_ids(dc.channel_ids.clone())
             .with_workspace_dir(config.channel_workspace_dir(channel));
-            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&ch, &safe_output)?).await?;
         }
         #[cfg(not(feature = "channel-discord"))]
         "discord" => {
@@ -18160,7 +18196,7 @@ pub async fn deliver_announcement(
                 peer_resolver,
             )
             .with_workspace_dir(config.channel_workspace_dir(channel));
-            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&ch, &safe_output)?).await?;
         }
         #[cfg(not(feature = "channel-slack"))]
         "slack" => {
@@ -18187,7 +18223,7 @@ pub async fn deliver_announcement(
                 sg.ignore_stories,
             )
             .with_workspace_dir(config.channel_workspace_dir(channel));
-            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&ch, &safe_output)?).await?;
         }
         #[cfg(not(feature = "channel-signal"))]
         "signal" => {
@@ -18211,7 +18247,7 @@ pub async fn deliver_announcement(
                 Some(WeChatChannel::resolve_state_dir(wc.state_dir.as_deref())),
             )?
             .with_workspace_dir(config.channel_workspace_dir(channel));
-            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&ch, &safe_output)?).await?;
         }
         #[cfg(not(feature = "channel-wechat"))]
         "wechat" => {
@@ -18230,7 +18266,7 @@ pub async fn deliver_announcement(
                 peer_resolver,
             )
             .with_proxy_url(qq.proxy_url.clone());
-            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&ch, &safe_output)?).await?;
         }
         #[cfg(not(feature = "channel-qq"))]
         "qq" => {
@@ -18285,7 +18321,7 @@ pub async fn deliver_announcement(
                 .with_per_user_session(lk.per_user_session)
                 .with_ack_reactions(lk.ack_reactions.unwrap_or(config.channels.ack_reactions))
                 .with_streaming(lk.stream_mode, lk.draft_update_interval_ms);
-            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&ch, &safe_output)?).await?;
         }
         #[cfg(not(feature = "channel-lark"))]
         "lark" | "feishu" => {
@@ -18310,7 +18346,7 @@ pub async fn deliver_announcement(
                 wh.retry_base_delay_ms,
                 wh.retry_max_delay_ms,
             );
-            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&ch, &safe_output)?).await?;
         }
         #[cfg(not(feature = "channel-webhook"))]
         "webhook" => {
@@ -18335,7 +18371,7 @@ pub async fn deliver_announcement(
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
             let ch = EmailChannel::new(em.clone(), alias.to_string(), peer_resolver);
-            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&ch, &safe_output)?).await?;
         }
         #[cfg(not(feature = "channel-email"))]
         "email" => {
@@ -18366,7 +18402,7 @@ pub async fn deliver_announcement(
                 allowed_groups_resolver,
             )
             .with_workspace_dir(config.channel_workspace_dir(&format!("whatsapp.{alias}")));
-            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&ch, &safe_output)?).await?;
         }
         #[cfg(not(feature = "whatsapp-web"))]
         "whatsapp" | "whatsapp-web" | "whatsapp_web" => {
@@ -22655,6 +22691,95 @@ temperature = 0.3
         assert!(live_channel_map_for_agent(&config, "unknown").is_empty());
     }
 
+    /// Publish `recorder` as the live `chat.main` channel for the duration of a
+    /// test and deliver through it with `addressing`.
+    async fn deliver_addressed_via(
+        recorder: &Arc<SendMessageRecordingChannel>,
+        addressing: zeroclaw_api::channel::PeerAddressing,
+    ) -> anyhow::Result<()> {
+        let (_published, _lease) = publish_cron_channel_registry(&[ConfiguredChannel {
+            display_name: "Chat",
+            alias: Some("main".to_string()),
+            channel: Arc::clone(recorder) as Arc<dyn Channel>,
+        }]);
+        deliver_announcement_addressed(
+            &Config::default(),
+            "chat.main",
+            "333",
+            None,
+            "body",
+            addressing,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn announcement_delivery_checks_the_channel_peer_route_declaration() {
+        use zeroclaw_api::channel::{PeerAddressing, PeerRouteError, RoutedPeer};
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
+        let previous = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _restore = CronChannelRegistryRestore(previous);
+        let routed = RoutedPeer {
+            peer: "111".to_string(),
+            mention: true,
+        };
+
+        let routes = Arc::new(SendMessageRecordingChannel {
+            channel_name: "chat",
+            peer_routes: true,
+            ..SendMessageRecordingChannel::default()
+        });
+        deliver_addressed_via(&routes, PeerAddressing::Routed(routed.clone()))
+            .await
+            .unwrap();
+        let err = deliver_addressed_via(&routes, PeerAddressing::Peer)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<PeerRouteError>(),
+            Some(&PeerRouteError::RouteRequired)
+        );
+        deliver_addressed_via(&routes, PeerAddressing::Direct)
+            .await
+            .unwrap();
+        {
+            let sent = routes.sent_messages.lock().await;
+            assert_eq!(sent.len(), 2, "the refused delivery sent nothing");
+            assert_eq!(sent[0].recipient, "333");
+            assert_eq!(sent[0].content, "body", "the channel renders the mention");
+            assert_eq!(sent[0].routed_peer, Some(routed.clone()));
+            assert_eq!(sent[0].allowed_mentions, Some(vec!["111".to_string()]));
+            assert_eq!(sent[1].routed_peer, None);
+            assert_eq!(
+                sent[1].allowed_mentions, None,
+                "an ordinary announcement keeps the channel's default handling"
+            );
+        }
+
+        let plain = Arc::new(SendMessageRecordingChannel {
+            channel_name: "chat",
+            ..SendMessageRecordingChannel::default()
+        });
+        let err = deliver_addressed_via(&plain, PeerAddressing::Routed(routed))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<PeerRouteError>(),
+            Some(&PeerRouteError::RoutesUnsupported),
+            "a route is never silently ignored"
+        );
+        deliver_addressed_via(&plain, PeerAddressing::Peer)
+            .await
+            .unwrap();
+        let sent = plain.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].recipient, "333");
+        assert_eq!(sent[0].routed_peer, None);
+    }
+
     #[tokio::test]
     async fn daemon_factory_is_empty_until_a_channel_task_publishes() {
         let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
@@ -25919,6 +26044,7 @@ api_key = "anthropic-key"
         sent_messages: tokio::sync::Mutex<Vec<SendMessage>>,
         finalized: tokio::sync::Mutex<Vec<(String, String, String, bool)>>,
         cancelled_drafts: tokio::sync::Mutex<Vec<String>>,
+        peer_routes: bool,
     }
 
     impl Default for SendMessageRecordingChannel {
@@ -25926,6 +26052,7 @@ api_key = "anthropic-key"
             Self {
                 channel_name: "test-channel",
                 drafts: false,
+                peer_routes: false,
                 sent_messages: tokio::sync::Mutex::new(Vec::new()),
                 finalized: tokio::sync::Mutex::new(Vec::new()),
                 cancelled_drafts: tokio::sync::Mutex::new(Vec::new()),
@@ -25974,6 +26101,10 @@ api_key = "anthropic-key"
 
         fn supports_draft_updates(&self) -> bool {
             self.drafts
+        }
+
+        fn supports_peer_routes(&self) -> bool {
+            self.peer_routes
         }
 
         async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
@@ -43933,6 +44064,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ignore: Vec::new(),
             output_modality: OutputModality::default(),
             admin_for_agent_scope,
+            routes: Default::default(),
         }
     }
 
@@ -45057,6 +45189,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ignore: Vec::new(),
             output_modality: OutputModality::default(),
             admin_for_agent_scope,
+            routes: Default::default(),
         }
     }
 

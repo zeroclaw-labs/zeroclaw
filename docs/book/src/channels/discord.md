@@ -80,6 +80,11 @@ can see. To scope it down:
 To find an ID, enable **Developer Mode** in Discord (User Settings -> Advanced),
 then right-click a server or channel and **Copy ID**.
 
+These settings only narrow where the bot listens. A peer group's delivery
+routes can post outside them; see
+[Delivery routes](peer-groups.md#delivery-routes). Discord supports peer
+routes: an external peer is a user ID, so sends to one need a route.
+
 ## Threads and context
 
 {{#thread-context channel="Discord"}}
