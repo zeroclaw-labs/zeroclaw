@@ -45,7 +45,7 @@ trap 'rm -rf "$WORK"' EXIT
 #   { key: "crate-version", url: "https://...", rev: "<sha>" }
 export LOCKFILE_PATH="$LOCKFILE"
 "$PYTHON" -c '
-import json, re, os
+import json, os, sys
 
 for mod in ("tomllib", "tomli", "toml"):
     try:
@@ -65,10 +65,11 @@ for pkg in data.get("package", []):
     src = pkg.get("source", "") or ""
     if not src.startswith("git+"):
         continue
-    m = re.match(r"^git\+([^?]+)\?rev=([^#]+)", src)
-    if not m:
-        continue
-    url, rev = m.groups()
+    # Cargo stores the requested selector in the query and the resolved commit after #.
+    repo, _, rev = src[4:].rpartition("#")
+    url, _, _ = repo.partition("?")
+    if not url or not rev:
+        raise SystemExit("error: missing locked git revision for %s" % pkg["name"])
     entries.append({
         "key": "%s-%s" % (pkg["name"], pkg["version"]),
         "url": url,
@@ -76,7 +77,7 @@ for pkg in data.get("package", []):
     })
 
 print(json.dumps(entries))
-' > "$WORK/deps.json" 2>&1
+' > "$WORK/deps.json"
 
 PKG_COUNT=$(jq length "$WORK/deps.json")
 echo "  Found $PKG_COUNT git-sourced package(s)."
