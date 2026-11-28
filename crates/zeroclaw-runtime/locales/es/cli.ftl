@@ -1390,3 +1390,10 @@ channel-approval-opt-allow-always = Permitir siempre
 channel-approval-opt-reject = Rechazar
 channel-approval-opt-reject-with-edit = Rechazar con edición
 tool-git-operations-error-docker-runtime-write-unsupported = Los comandos de escritura de Git no están disponibles con el entorno de ejecución Docker porque no pueden confinarse a su contenedor.
+
+cli-plugin-registry-command-unavailable = No hay un comando de instalación listo para copiar. Indica por separado la URL original del registro; el identificador no es una URL.
+cli-quickstart-plugins-load-check-command-unavailable = No se instaló {$name}: no se carga en este host: {$error}. No hay un comando de reintento listo para copiar.
+cli-plugin-command-unavailable = No hay un comando listo para copiar. Indica por separado los argumentos originales para el origen deseado.
+cli-plugin-displaced-command-unavailable = Una actualización interrumpida dejó a {$name} fuera de su ubicación. No hay un comando de recuperación listo para copiar.
+cli-plugin-not-installed-command-unavailable = {$name} no está instalado. No hay un comando de instalación listo para copiar.
+cli-plugin-interrupted-command-unavailable = No se pudo actualizar {$name}: {$error}. La versión anterior se conserva en {$preserved}. No hay un comando de recuperación listo para copiar.

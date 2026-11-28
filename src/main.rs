@@ -3711,7 +3711,10 @@ fn with_update_pointer(
     let zeroclaw::plugins::error::PluginError::AlreadyLoaded(name) = &error else {
         return error.into();
     };
-    let command = crate::plugins::update::update_command(config_dir, name, source, &[]);
+    let Some(command) = crate::plugins::update::update_command(config_dir, name, source, &[])
+    else {
+        return anyhow::Error::from(error).context(plugin_command_unavailable());
+    };
     let pointer = ta(
         "cli-plugin-install-already-installed",
         &[("name", name.as_str()), ("command", command.as_str())],
@@ -6410,7 +6413,7 @@ enum UpdateFrom<'a> {
     /// The registry index, fetched once for the whole command, and the
     /// `--registry` URL the operator passed, if any.
     Registry {
-        index: &'a zeroclaw::plugins::registry::PluginRegistryIndex,
+        index: &'a zeroclaw::plugins::registry::RegistryCollection,
         registry: Option<&'a str>,
     },
     /// A local package directory, as an absolute path.
@@ -6450,11 +6453,11 @@ enum PluginUpdateOutcome {
     NeedsApproval {
         version: String,
         items: Vec<String>,
-        command: String,
+        command: Option<String>,
     },
     /// No package of that name is installed. `install` is the command that
     /// installs it from the source the update named.
-    NotInstalled { install: String },
+    NotInstalled { install: Option<String> },
     /// The installed package was not replaced. `kept` is its version, when
     /// one is installed. Config rows created for the replacement, and a
     /// displaced copy recovery put back, stay as they are.
@@ -6472,7 +6475,7 @@ enum PluginUpdateOutcome {
     Interrupted {
         error: String,
         preserved: std::path::PathBuf,
-        command: String,
+        command: Option<String>,
     },
 }
 
@@ -6603,7 +6606,7 @@ async fn run_plugin_update(
         let from = if let Some(dir) = &local {
             UpdateFrom::Local(dir)
         } else {
-            let registry_url = plugin_registry::registry_url(registry.as_deref());
+            let registry_url = plugin_registry::registry_url(registry.as_deref())?;
             println!(
                 "{}",
                 t(
@@ -6612,9 +6615,8 @@ async fn run_plugin_update(
                 )
             );
             fetched = plugin_registry::fetch_registry_index(&registry_url).await?;
-            zeroclaw::plugins::registry::write_cached_registry_index(
+            zeroclaw::plugins::registry::write_cached_registry_collection(
                 &config.data_dir,
-                &registry_url,
                 &fetched,
             )?;
             UpdateFrom::Registry {
@@ -6795,6 +6797,14 @@ fn recover_before_update(
     }
 }
 
+#[cfg(feature = "plugins-wasm")]
+fn plugin_command_unavailable() -> String {
+    t(
+        "cli-plugin-command-unavailable",
+        "No copy-ready command is available. Supply the original arguments separately for the intended source.",
+    )
+}
+
 /// The note `plugin list` and `plugin update --all` print for a package an
 /// interrupted update left displaced, with both commands from
 /// [`plugin_displaced_commands`].
@@ -6807,6 +6817,13 @@ fn plugin_displaced_note(
     let (command, local) =
         plugin_displaced_commands(egress_command_config_dir(config), name, registry);
     let name = crate::plugins::update::printable(name);
+    let (Some(command), Some(local)) = (command, local) else {
+        return ta(
+            "cli-plugin-displaced-command-unavailable",
+            &[("name", &name)],
+            "Displaced package; no copy-ready recovery command.",
+        );
+    };
     ta(
         "cli-plugin-list-displaced",
         &[("name", &name), ("command", &command), ("local", &local)],
@@ -6827,7 +6844,7 @@ fn plugin_displaced_commands(
     config_dir: &std::path::Path,
     name: &str,
     registry: Option<&str>,
-) -> (String, String) {
+) -> (Option<String>, Option<String>) {
     use crate::plugins::update::{UpdateSource, update_command};
 
     (
@@ -6912,7 +6929,17 @@ async fn update_one_plugin(
                 name: name.to_string(),
                 version: pin.map(str::to_string),
             };
-            let Ok(entry) = zeroclaw::plugins::registry::resolve_entry(index, &spec) else {
+            // Installed metadata does not establish a registry publisher.
+            // Never infer one from whichever origin happens to list the name today.
+            if registry.is_none_or(|url| url.trim().is_empty()) && index.registries.len() > 1 {
+                return failed(ta(
+                    "cli-plugin-registry-ambiguous",
+                    &[("name", name)],
+                    "Select a registry with --registry <url>",
+                ));
+            }
+            let Ok(entry) = zeroclaw::plugins::registry::resolve_registry_entry(index, &spec)
+            else {
                 if policy.all {
                     return PluginUpdateOutcome::NotListed;
                 }
@@ -6929,15 +6956,15 @@ async fn update_one_plugin(
                     version: installed.version.clone(),
                 };
             }
-            downloaded = match plugin_registry::download_registry_entry(entry).await {
+            downloaded = match plugin_registry::download_registry_entry(entry.entry).await {
                 Ok(downloaded) => downloaded,
                 Err(error) => return failed(format!("{error:#}")),
             };
             (
                 downloaded.plugin_dir().to_path_buf(),
                 UpdateSource::Registry {
-                    version: Some(&entry.version),
-                    registry,
+                    version: Some(&entry.entry.version),
+                    registry: Some(entry.origin),
                 },
             )
         }
@@ -7282,6 +7309,10 @@ fn plugin_update_outcome_text(name: &str, outcome: &PluginUpdateOutcome) -> Vec<
                     )
                 ));
             }
+            let Some(command) = command else {
+                lines.push(plugin_command_unavailable());
+                return lines;
+            };
             lines.push(ta(
                 "cli-plugin-update-approval-command",
                 &[("command", command)],
@@ -7289,7 +7320,14 @@ fn plugin_update_outcome_text(name: &str, outcome: &PluginUpdateOutcome) -> Vec<
             ));
             lines
         }
-        PluginUpdateOutcome::NotInstalled { install } => vec![ta(
+        PluginUpdateOutcome::NotInstalled { install: None } => vec![ta(
+            "cli-plugin-not-installed-command-unavailable",
+            &[("name", name)],
+            "Package not installed; no copy-ready install command.",
+        )],
+        PluginUpdateOutcome::NotInstalled {
+            install: Some(install),
+        } => vec![ta(
             "cli-plugin-update-not-installed",
             &[("name", name), ("command", install)],
             format!("Could not update '{name}': it is not installed. Install it with: {install}"),
@@ -7324,6 +7362,13 @@ fn plugin_update_outcome_text(name: &str, outcome: &PluginUpdateOutcome) -> Vec<
             command,
         } => {
             let preserved = preserved.display().to_string();
+            let Some(command) = command else {
+                return vec![ta(
+                    "cli-plugin-interrupted-command-unavailable",
+                    &[("name", name), ("error", error), ("preserved", &preserved)],
+                    "Interrupted update; no copy-ready recovery command.",
+                )];
+            };
             vec![ta(
                 "cli-plugin-update-interrupted",
                 &[
@@ -13895,11 +13940,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                 Ok(())
             }
             PluginCommands::Search { query, registry } => {
-                let registry_url = plugin_registry::registry_url(registry.as_deref());
+                let registry_url = plugin_registry::registry_url(registry.as_deref())?;
                 let index = plugin_registry::fetch_registry_index(&registry_url).await?;
-                zeroclaw::plugins::registry::write_cached_registry_index(
+                zeroclaw::plugins::registry::write_cached_registry_collection(
                     &config.data_dir,
-                    &registry_url,
                     &index,
                 )?;
                 let matches = plugin_registry::search_entries(&index, &query);
@@ -13935,7 +13979,10 @@ Add pricing to the active provider profile or supply a catalog entry."
                             ta(
                                 "cli-plugin-search-result",
                                 &[
-                                    ("name", &plugin.name),
+                                    (
+                                        "name",
+                                        &ta("cli-plugin-registry-origin", &[("name", &plugin.name), ("origin", &zeroclaw::plugins::registry::registry_origin_label(plugin.origin))], "Plugin registry origin")
+                                    ),
                                     ("version", &plugin.version),
                                     ("description", description),
                                 ],
@@ -13994,7 +14041,7 @@ Add pricing to the active provider profile or supply a catalog entry."
                     ))
                     .await?
                 } else {
-                    let registry_url = plugin_registry::registry_url(registry.as_deref());
+                    let registry_url = plugin_registry::registry_url(registry.as_deref())?;
                     println!(
                         "{}",
                         ta(
@@ -27698,6 +27745,7 @@ hosts = ["api.example.com", "api2.example.com"]
             },
             &increase,
         );
+        let command = command.unwrap();
         // The shell only tokenizes these synthetic literals into positional
         // arguments; it never runs the rendered zeroclaw command.
         let out = std::process::Command::new("/bin/sh")
@@ -27774,19 +27822,21 @@ hosts = ["api.example.com", "api2.example.com"]
     fn unfetchable_index(
         name: &str,
         version: &str,
-    ) -> zeroclaw::plugins::registry::PluginRegistryIndex {
-        zeroclaw::plugins::registry::PluginRegistryIndex {
-            plugins: vec![zeroclaw::plugins::registry::PluginRegistryEntry {
-                name: name.to_string(),
-                version: version.to_string(),
-                description: None,
-                author: None,
-                capabilities: Vec::new(),
-                url: "http://127.0.0.1:9/never-downloaded.zip".to_string(),
-                sha256: None,
-            }],
-            registry_url: None,
-        }
+    ) -> zeroclaw::plugins::registry::RegistryCollection {
+        zeroclaw::plugins::registry::RegistryCollection::from(
+            zeroclaw::plugins::registry::PluginRegistryIndex {
+                plugins: vec![zeroclaw::plugins::registry::PluginRegistryEntry {
+                    name: name.to_string(),
+                    version: version.to_string(),
+                    description: None,
+                    author: None,
+                    capabilities: Vec::new(),
+                    url: "http://127.0.0.1:9/never-downloaded.zip".to_string(),
+                    sha256: None,
+                }],
+                registry_url: Some(plugin_registry::DEFAULT_REGISTRY_URL.into()),
+            },
+        )
     }
 
     #[cfg(feature = "plugins-wasm")]
@@ -27843,6 +27893,7 @@ hosts = ["api.example.com", "api2.example.com"]
             panic!("expected NeedsApproval, got {outcome:?}");
         };
         assert_eq!(version, "2.0.0");
+        let command = command.unwrap();
         assert_eq!(items, ["permission:http_client"]);
         for part in [
             "plugin update",
@@ -27908,6 +27959,62 @@ hosts = ["api.example.com", "api2.example.com"]
             Some("version = \"1.0.0\"")
         );
         assert!(config.plugins.entries.is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn registry_update_rejects_cross_origin_names_even_with_a_unique_pinned_version() {
+        let plugins = tempfile::tempdir().unwrap();
+        let mut host = host_with_installed_tool(plugins.path(), "weather");
+        let config_dir = tempfile::tempdir().unwrap();
+        let mut config = config_in_dir(config_dir.path());
+        let mut a = unfetchable_index("weather", "1.0.0");
+        a.registries[0].registry_url = Some("https://a.invalid/index".to_string());
+        let mut b = unfetchable_index("weather", "2.0.0");
+        b.registries[0].registry_url = Some("https://b.invalid/index".to_string());
+        a.registries.extend(b.registries);
+        for all in [false, true] {
+            let policy = update_policy(
+                UpdateFrom::Registry {
+                    index: &a,
+                    registry: None,
+                },
+                &[],
+                all,
+            );
+            let outcome = Box::pin(update_one_plugin(
+                &mut host,
+                &mut config,
+                "weather",
+                Some("1.0.0"),
+                &policy,
+            ))
+            .await;
+            assert!(
+                matches!(outcome, PluginUpdateOutcome::Failed { ref error, .. } if error.contains("--registry")),
+                "{outcome:?}"
+            );
+        }
+        assert_eq!(host.get_plugin("weather").unwrap().version, "1.0.0");
+        // An explicitly selected single-origin view retains the old current-version path.
+        a.registries.truncate(1);
+        let policy = update_policy(
+            UpdateFrom::Registry {
+                index: &a,
+                registry: Some("https://a.invalid/index"),
+            },
+            &[],
+            false,
+        );
+        let outcome = Box::pin(update_one_plugin(
+            &mut host,
+            &mut config,
+            "weather",
+            None,
+            &policy,
+        ))
+        .await;
+        assert!(matches!(outcome, PluginUpdateOutcome::UpToDate { .. }));
     }
 
     /// The version the registry selects being the installed one is up to date,
@@ -28331,7 +28438,7 @@ type = "integer"
             &PluginUpdateOutcome::NeedsApproval {
                 version: "2.0.0\u{1b}[2K".to_string(),
                 items: vec!["provides:tele\u{1b}[8mgram".to_string()],
-                command: "zeroclaw plugin update 'weather@2.0.0\u{1b}[2K'".to_string(),
+                command: Some("zeroclaw plugin update 'weather@2.0.0\u{1b}[2K'".to_string()),
             },
         );
         assert!(
@@ -28356,7 +28463,7 @@ type = "integer"
                     "permission:http_client".to_string(),
                     "capability:channel".to_string(),
                 ],
-                command: command.to_string(),
+                command: Some(command.to_string()),
             },
         );
         assert_eq!(lines.len(), 4, "{lines:#?}");
@@ -28414,6 +28521,7 @@ type = "integer"
         let registry = "https://registry.example/i.json";
         let (command, local) =
             plugin_displaced_commands(config_dir.path(), "weather", Some(registry));
+        let (command, local) = (command.unwrap(), local.unwrap());
 
         assert!(
             command.contains("--registry") && !command.contains("--from"),
@@ -28522,6 +28630,7 @@ type = "integer"
             },
         );
 
+        let command = command.unwrap();
         assert_eq!(lines.len(), 1, "{lines:#?}");
         assert!(
             lines[0].contains(

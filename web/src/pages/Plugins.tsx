@@ -11,6 +11,7 @@ import { t } from "@/lib/i18n";
 import {
   catalogCapabilities,
   catalogDescription,
+  catalogIdentity,
   matchesCatalogFilter,
 } from "./pluginCatalog";
 import type { PluginCatalogFilter } from "./pluginCatalog";
@@ -195,7 +196,7 @@ export default function Plugins() {
             const description = catalogDescription(entry);
             return (
               <article
-                key={entry.name}
+                key={catalogIdentity(entry)}
                 className="flex min-w-0 flex-col gap-4 rounded-[var(--radius-lg)] border border-pc-border bg-pc-surface p-5"
               >
                 <div className="space-y-2">
@@ -216,6 +217,12 @@ export default function Plugins() {
                     {description ?? t("plugins.no_description")}
                   </p>
                 </div>
+
+                {entry.available?.registry_id && (
+                  <p className="break-all text-xs text-pc-text-muted">
+                    {t("plugins.registry")}: <code>{entry.available.registry_id}</code>
+                  </p>
+                )}
 
                 <dl className="space-y-1 text-xs text-pc-text-muted">
                   {entry.installed && (

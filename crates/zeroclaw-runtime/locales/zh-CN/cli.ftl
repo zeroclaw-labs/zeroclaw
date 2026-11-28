@@ -1392,3 +1392,10 @@ tool-git-operations-error-docker-runtime-write-unsupported = Git 写入命令在
 
 turn-context-window-exceeded-error = 本次请求超过所选模型的上下文容量。请减少请求内容或启用的工具，或选择上下文容量更大的模型。
 cron-agent-job-failed = 定时任务未能完成，请重试或联系管理员查看日志。
+
+cli-plugin-registry-command-unavailable = 无法提供可直接复制的安装命令。请另行指定原始注册表 URL；注册表 ID 不是 URL。
+cli-quickstart-plugins-load-check-command-unavailable = 未安装 {$name}：无法在此主机上加载：{$error}。没有可直接复制的重试命令。
+cli-plugin-command-unavailable = 没有可直接复制的命令。请为目标来源分别提供原始参数。
+cli-plugin-displaced-command-unavailable = 更新中断后，{$name} 不在原位置。没有可直接复制的恢复命令。
+cli-plugin-not-installed-command-unavailable = 未安装 {$name}。没有可直接复制的安装命令。
+cli-plugin-interrupted-command-unavailable = 无法更新 {$name}：{$error}。旧版本保留在 {$preserved}。没有可直接复制的恢复命令。
