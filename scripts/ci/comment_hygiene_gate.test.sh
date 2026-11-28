@@ -209,6 +209,16 @@ expect_pass "shell multiline single-quoted text" b.sh
 printf 'text="first line\n# tracking #8519 is multiline shell text\nlast line"\n' > b.sh
 expect_pass "shell multiline double-quoted text" b.sh
 
+cat > b.sh <<'SH'
+printf '%s\n' \' 'Example ticket #8519'
+SH
+expect_pass "escaped apostrophe before a single-quoted argument" b.sh
+
+cat > b.sh <<'SH'
+printf '%s\n' \" "Example ticket #8519"
+SH
+expect_pass "escaped quote before a double-quoted argument" b.sh
+
 printf 'let text = "first line\n// tracking #8519 is multiline Rust text\nlast line";\n' > b.rs
 expect_pass "rust multiline string issue-like text" b.rs
 
