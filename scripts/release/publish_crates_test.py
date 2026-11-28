@@ -88,7 +88,7 @@ class PublishCratesTest(unittest.TestCase):
                       web_digest=None, source_root=None):
         # Match the real workspace's private and independent members. Bash 3.2
         # cannot expand empty arrays under nounset in the existing summary.
-        metadata = raw if raw is not None else json.dumps({"packages": [
+        metadata = raw if raw is not None else json.dumps({"workspace_root": str(self.root), "packages": [
             *packages, package("fixture-private", publish=[]),
             package("fixture-independent", version="0.1.0")
         ]})
@@ -268,6 +268,18 @@ class PublishCratesTest(unittest.TestCase):
                 )
                 packages = json.loads(metadata.stdout)["packages"]
                 self.assertEqual(packages[0]["dependencies"][0]["req"], "*")
+                if inherited:
+                    ordered = subprocess.run(
+                        ["python3", str(RELEASE / "publish_order.py"), VERSION],
+                        input=metadata.stdout, cwd=self.root / "a", text=True,
+                        capture_output=True, timeout=15,
+                    )
+                    if explicit:
+                        self.assertEqual(ordered.returncode, 1, ordered.stdout)
+                        self.assertIn("dependency cycle: a -> b -> a", ordered.stderr)
+                    else:
+                        self.assertEqual(ordered.returncode, 0, ordered.stderr)
+                        self.assertEqual(ordered.stdout.splitlines(), ["a", "b"])
                 for log in ("publishes.jsonl", "queries.jsonl"):
                     (self.root / log).unlink(missing_ok=True)
                 result = self.run_publisher(packages)
