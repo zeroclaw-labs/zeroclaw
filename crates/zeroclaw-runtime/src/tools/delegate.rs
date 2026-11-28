@@ -5125,6 +5125,7 @@ impl DelegateTool {
             autonomy_level,
             inject_memory: true,
             shell_profile,
+            is_messaging_channel_turn: false,
         };
 
         let builder = SystemPromptBuilder::default()
