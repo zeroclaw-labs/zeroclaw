@@ -26,7 +26,8 @@
 # handler and its tests, the router that mounts it, the manifest that defines
 # the feature, the golden harness and fixtures, the shared webhook types in
 # zeroclaw-api, and the plugin webhook ingress in zeroclaw-infra. Other gateway
-# paths stay out: the default-feature Test job covers them.
+# paths stay out unless they own feature-gated tests, such as the plugin TLS
+# credential handlers and principal-gate regression.
 # The plugin artifact smoke harness is listed as well: this job is the only
 # place its scripts run before a release, so a change to them has to run it.
 # Prints "false" otherwise. Always exits 0; the workflow step forwards the
@@ -46,6 +47,7 @@ while IFS= read -r path; do
         tests/channel_egress_e2e.rs|\
         tests/component/plugin_info_cli.rs|tests/component/plugin_update_cli.rs|\
         crates/zeroclaw-gateway/src/plugin_webhook*|\
+        crates/zeroclaw-gateway/src/api_config.rs|crates/zeroclaw-gateway/src/principal_gate.rs|\
         crates/zeroclaw-gateway/src/lib.rs|\
         crates/zeroclaw-gateway/Cargo.toml|\
         crates/zeroclaw-gateway/tests/golden*|\
