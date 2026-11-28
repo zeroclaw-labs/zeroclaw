@@ -2504,8 +2504,8 @@ mod tests {
         let cli_shim = snapshot
             .model_provider_types
             .iter()
-            .find(|provider| provider.kind == "gemini_cli")
-            .expect("Gemini CLI should be present in the canonical provider registry");
+            .find(|provider| provider.kind == "grok_cli")
+            .expect("Grok Build CLI should be present in the canonical provider registry");
         assert!(cli_shim.local);
         assert_eq!(
             cli_shim.default_runtime_profile.as_deref(),

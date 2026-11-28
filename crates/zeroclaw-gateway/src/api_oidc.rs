@@ -926,6 +926,23 @@ struct SignInQuery {
     return_to: Option<String>,
     #[serde(default)]
     popup: Option<String>,
+    #[serde(default)]
+    notice: Option<String>,
+}
+
+impl SignInQuery {
+    fn landing(&self) -> String {
+        let path = safe_return_path(self.return_to.as_deref());
+        if let Some(notice) = self
+            .notice
+            .as_deref()
+            .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+        {
+            format!("{path}#zeroclaw-signed-in={notice}")
+        } else {
+            path
+        }
+    }
 }
 
 /// Where a sign-in may land: a path on this dashboard, never another site.
@@ -1088,7 +1105,7 @@ async fn handle_dashboard_sign_in(
         client: key,
         mode: FlowMode::Dashboard {
             binding_hash: dashboard_session::session_key(&binding),
-            return_to: safe_return_path(query.return_to.as_deref()),
+            return_to: query.landing(),
             popup: query.popup.as_deref() == Some("1"),
             replaces: scope
                 .session_value(&headers)
@@ -3875,6 +3892,27 @@ mod tests {
                 assert_eq!(requests_to(&server, "/token").await, 0);
             }
         }
+    }
+
+    #[test]
+    fn dashboard_sign_in_appends_only_the_requested_uuid_to_the_safe_landing() {
+        let notice = "4494e230-198b-4eb8-b8e3-b9037249ffc8";
+        let query = |path: &str, notice: Option<&str>| SignInQuery {
+            return_to: Some(path.to_string()),
+            popup: None,
+            notice: notice.map(str::to_string),
+        };
+        let path = "/chat?sort=new#turn";
+        assert_eq!(query(path, None).landing(), path);
+        assert_eq!(query(path, Some("lookalike")).landing(), path);
+        assert_eq!(
+            query(path, Some(notice)).landing(),
+            format!("{path}#zeroclaw-signed-in={notice}")
+        );
+        assert_eq!(
+            query("//example.com", Some(notice)).landing(),
+            format!("/#zeroclaw-signed-in={notice}")
+        );
     }
 
     #[test]

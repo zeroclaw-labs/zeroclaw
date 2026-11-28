@@ -21,8 +21,8 @@
 // produce `enc2:` (ChaCha20-Poly1305).
 
 use anyhow::{Context, Result};
-use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
-use chacha20poly1305::{AeadCore, ChaCha20Poly1305, Key, Nonce};
+use chacha20poly1305::aead::{Aead, Generate, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::fmt::Debug;
@@ -254,10 +254,10 @@ impl SecretStore {
         }
 
         self.get_key(|key| {
-            let key = Key::from_slice(key);
-            let cipher = ChaCha20Poly1305::new(key);
+            let cipher = ChaCha20Poly1305::new_from_slice(key)
+                .context("Invalid secret encryption key length")?;
 
-            let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+            let nonce = Nonce::generate();
             let ciphertext = cipher.encrypt(&nonce, plaintext.as_bytes()).map_err(|e| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -347,13 +347,13 @@ impl SecretStore {
         );
 
         let (nonce_bytes, ciphertext) = blob.split_at(NONCE_LEN);
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let nonce = Nonce::try_from(nonce_bytes).context("Invalid secret nonce length")?;
 
         self.get_key(|key| {
-            let key = Key::from_slice(key);
-            let cipher = ChaCha20Poly1305::new(key);
+            let cipher = ChaCha20Poly1305::new_from_slice(key)
+                .context("Invalid secret encryption key length")?;
 
-            let plaintext_bytes = cipher.decrypt(nonce, ciphertext).map_err(|e| {
+            let plaintext_bytes = cipher.decrypt(&nonce, ciphertext).map_err(|e| {
                 let backend = self.key_source.backend_name();
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -466,7 +466,9 @@ fn keyed_digest_subkey(key: &[u8]) -> Result<[u8; 32]> {
 //
 // Key creation writes full content to a restrictive-at-creation temp file,
 // then publishes it without replacing an existing target:
-//   - Unix: hard_link(temp, final).
+//   - Android: renameat2(temp, final, RENAME_NOREPLACE). SELinux denies
+//     link(2) to apps, even inside their own data directory.
+//   - Other Unix: hard_link(temp, final).
 //   - Windows: FileRenameInfo on the same exclusive handle.
 // The final path either appears with complete content, or not at all.
 
@@ -637,9 +639,9 @@ fn read_key_file_no_follow(key_path: &Path) -> std::io::Result<String> {
 /// Load the key from `key_path`, creating it if absent.
 ///
 /// Reads go through a no-follow / reparse-point-verified handle.  Creation
-/// uses atomic no-replace publication (write-to-temp then `hard_link` on Unix
-/// / handle-based no-replace rename on Windows) so readers never observe empty or
-/// partial key material.
+/// uses atomic no-replace publication (write-to-temp then `hard_link` on Unix,
+/// `renameat2(RENAME_NOREPLACE)` on Android, handle-based no-replace rename on
+/// Windows) so readers never observe empty or partial key material.
 fn load_or_create_key(key_path: &Path) -> Result<Vec<u8>> {
     let validate_key = |bytes: Vec<u8>| {
         anyhow::ensure!(
@@ -743,25 +745,80 @@ where
 
         sync_parent_dir(&temp_path)?;
         let _ = fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600));
-        match std::fs::hard_link(&temp_path, key_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(e)
-                    .context("Key file already exists — another process created it concurrently");
+
+        // The rename moves the temp name away, so nothing is left to remove.
+        #[cfg(target_os = "android")]
+        {
+            match rename_no_replace(&temp_path, key_path) {
+                Ok(()) => temp_guard.disarm(),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(e).context(
+                        "Key file already exists — another process created it concurrently",
+                    );
+                }
+                Err(e) => return Err(e).context("Failed to atomically publish key file"),
             }
-            Err(e) => return Err(e).context("Failed to atomically publish key file"),
-        }
-        // Persist the final link before removing the temp inode's other name.
-        sync_parent_dir(key_path)?;
-        if std::fs::remove_file(&temp_path).is_ok() {
-            temp_guard.disarm();
             sync_parent_dir(key_path)?;
+            Ok(())
         }
-        Ok(())
+
+        #[cfg(not(target_os = "android"))]
+        {
+            match std::fs::hard_link(&temp_path, key_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(e).context(
+                        "Key file already exists — another process created it concurrently",
+                    );
+                }
+                Err(e) => return Err(e).context("Failed to atomically publish key file"),
+            }
+            // Persist the final link before removing the temp inode's other name.
+            sync_parent_dir(key_path)?;
+            if std::fs::remove_file(&temp_path).is_ok() {
+                temp_guard.disarm();
+                sync_parent_dir(key_path)?;
+            }
+            Ok(())
+        }
     }
 
     #[cfg(not(any(unix, windows)))]
     compile_error!("atomic key publication requires a platform no-replace mechanism");
+}
+
+/// Rename `src` to `dst`, failing with `AlreadyExists` instead of replacing an
+/// existing `dst`. Calls the syscall directly because bionic has no
+/// `renameat2` wrapper at every supported API level. A kernel without
+/// `RENAME_NOREPLACE` fails (ENOSYS/EINVAL) rather than falling back to a
+/// rename that could replace the key.
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+fn rename_no_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = |p: &Path| {
+        CString::new(p.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))
+    };
+    let (src, dst) = (c_path(src)?, c_path(dst)?);
+    const RENAME_NOREPLACE: libc::c_uint = 1;
+    // SAFETY: both strings are NUL-terminated and outlive the call.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            src.as_ptr(),
+            libc::AT_FDCWD,
+            dst.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// Sync the parent directory so the new name is crash-durable.
@@ -801,10 +858,10 @@ fn xor_cipher(data: &[u8], key: &[u8]) -> Vec<u8> {
 
 /// Generate a random 256-bit key using the OS CSPRNG.
 ///
-/// Uses `OsRng` (via `getrandom`) directly, providing full 256-bit entropy
+/// Uses the operating-system RNG (via `getrandom`), providing full 256-bit entropy
 /// without the fixed version/variant bits that UUID v4 introduces.
 fn generate_random_key() -> Vec<u8> {
-    ChaCha20Poly1305::generate_key(&mut OsRng).to_vec()
+    chacha20poly1305::Key::generate().to_vec()
 }
 
 /// Hex-encode bytes to a lowercase hex string.
@@ -1003,6 +1060,50 @@ mod tests {
         let mut perms = fs::metadata(&op_path).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&op_path, perms).unwrap();
+    }
+
+    #[test]
+    fn enc2_ciphertext_from_chacha20poly1305_010_remains_compatible() {
+        // Synthetic fixture generated with chacha20poly1305 0.10.1, a fixed
+        // 0x42 key and 0x24 nonce. Matching ciphertext also protects rollback.
+        const FIXTURE: &str = concat!(
+            "enc2:242424242424242424242424",
+            "8768e87e8aaa31caec07e1ff9d3a6efd9cbb2cc5eea4c87e99d1b1b1f70f25a7ccf5c5ec"
+        );
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+        store.encrypt("initialize-fixture-key-file").unwrap();
+        let key_path = tmp.path().join(".secret_key");
+        let key = [0x42u8; 32];
+        fs::write(&key_path, hex_encode(&key)).unwrap();
+        let original_key = fs::read(&key_path).unwrap();
+
+        assert_eq!(store.decrypt(FIXTURE).unwrap(), "compatibility-secret");
+        assert_eq!(fs::read(&key_path).unwrap(), original_key);
+
+        let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
+        let nonce = Nonce::from([0x24; NONCE_LEN]);
+        let ciphertext = cipher
+            .encrypt(&nonce, b"compatibility-secret".as_ref())
+            .unwrap();
+        let old_blob = hex_decode(&FIXTURE[5..]).unwrap();
+        assert_eq!(ciphertext, old_blob[NONCE_LEN..]);
+
+        let mut tampered = old_blob.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        assert!(
+            store
+                .decrypt(&format!("enc2:{}", hex_encode(&tampered)))
+                .is_err()
+        );
+        assert!(
+            store
+                .decrypt(&format!(
+                    "enc2:{}",
+                    hex_encode(&old_blob[..old_blob.len() - 1])
+                ))
+                .is_err()
+        );
     }
 
     // ── SecretStore basics ─────────────────────────────────────
@@ -1902,6 +2003,28 @@ exit 65
         write_key_file(&key_path, &key).unwrap();
         // Already called during publication; exercise helper directly.
         sync_parent_dir(&key_path).unwrap();
+    }
+
+    // Android publishes the key with this rename; Linux runs the same syscall.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn rename_no_replace_publishes_once_and_never_replaces() {
+        let tmp = TempDir::new().unwrap();
+        let (first, second, key_path) = (
+            tmp.path().join("first"),
+            tmp.path().join("second"),
+            tmp.path().join(".secret_key"),
+        );
+        fs::write(&first, "winner").unwrap();
+        fs::write(&second, "loser").unwrap();
+
+        rename_no_replace(&first, &key_path).unwrap();
+        let err = rename_no_replace(&second, &key_path).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&key_path).unwrap(), "winner");
+        assert!(!first.exists());
+        assert!(second.exists());
     }
 
     // ── Symlink rejection on read paths ──────────────────────

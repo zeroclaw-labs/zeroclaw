@@ -1528,6 +1528,12 @@ fn localized_validation_warning_message(
                 "cli-doctor-security-audit-disabled-drops-certificate-record",
             )
         }
+        zeroclaw_config::validation_warnings::DEAD_DELEGATE_GRANTS => {
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-doctor-dead-delegate-grants",
+                &[("path", warning.path.as_str())],
+            )
+        }
         _ => warning.message.clone(),
     }
 }
@@ -2377,6 +2383,7 @@ mod tests {
         config.providers.transcription.local_whisper.insert(
             "default".to_string(),
             zeroclaw_config::schema::LocalWhisperTranscriptionProviderConfig {
+                model: None,
                 uri: "http://localhost:8001/inference".to_string(),
                 bearer_token: None,
                 language: None,
@@ -3715,6 +3722,27 @@ mod tests {
     }
 
     #[test]
+    fn dead_delegate_grants_warning_uses_fluent() {
+        let structured_message = "structured API fallback";
+        let warning = zeroclaw_config::validation_warnings::ValidationWarning::new(
+            zeroclaw_config::validation_warnings::DEAD_DELEGATE_GRANTS,
+            structured_message,
+            "agents.projects_assistant.delegates",
+        );
+
+        let localized = localized_validation_warning_message(&warning);
+        assert_ne!(localized, structured_message);
+        assert!(
+            !localized.starts_with("{cli-doctor-dead-delegate-grants"),
+            "the Fluent key must resolve: {localized}"
+        );
+        assert!(
+            localized.contains("agents.projects_assistant.delegates"),
+            "the localized line must name the config path: {localized}"
+        );
+    }
+
+    #[test]
     fn disabled_security_audit_warning_uses_fluent() {
         let structured_message = "structured API fallback";
         let warning = zeroclaw_config::validation_warnings::ValidationWarning::new(
@@ -3735,6 +3763,31 @@ mod tests {
         assert!(
             expected.contains("Command execution is not audited"),
             "the operator line must scope the gap to command execution: {expected}"
+        );
+    }
+
+    #[test]
+    fn diagnose_reports_an_enabled_removed_gemini_cli_section() {
+        let mut config = Config::default();
+        config.gemini_cli.enabled = true;
+
+        let results = diagnose(&config);
+        let hit = results.iter().find(|item| {
+            item.category == "config"
+                && item.message.contains("(at gemini_cli.enabled)")
+                && item.message.contains("the `gemini_cli` tool is removed")
+        });
+        assert!(
+            hit.is_some(),
+            "doctor must explain why an enabled [gemini_cli] tool is gone; got: {results:?}"
+        );
+
+        config.gemini_cli.enabled = false;
+        assert!(
+            !diagnose(&config)
+                .iter()
+                .any(|item| item.message.contains("gemini_cli.enabled")),
+            "a disabled [gemini_cli] section is not reported"
         );
     }
 
