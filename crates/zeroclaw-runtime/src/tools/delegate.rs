@@ -5125,6 +5125,7 @@ impl DelegateTool {
             autonomy_level,
             inject_memory: true,
             shell_profile,
+            identity_snapshot: None,
         };
 
         let builder = SystemPromptBuilder::default()

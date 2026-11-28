@@ -150,6 +150,171 @@ pub struct PromptContext<'a> {
     /// Resolved from `RuntimeAdapter::shell_profile` so the reported shell
     /// cannot drift from the executed one.
     pub shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
+    /// Pre-rendered `IdentitySection` text. A long-lived session renders its
+    /// personality files once and passes the same text every turn, so an edit
+    /// to `AGENTS.md`/`SOUL.md`/... mid-session does not change the system
+    /// prompt (and with it every provider prompt-cache entry hashed behind
+    /// it) for each live session on its next turn. `None` reads the files
+    /// now. See [`render_identity_section`].
+    pub identity_snapshot: Option<&'a str>,
+}
+
+/// Render the `## Project Context` block from the agent workspace's
+/// personality files (or its AIEOS identity). This reads the files from disk
+/// on every call; callers that build a prompt repeatedly for one session
+/// should render once and pass the text through
+/// [`PromptContext::identity_snapshot`].
+pub fn render_identity_section(
+    identity_config: Option<&IdentityConfig>,
+    agent_workspace_dir: &Path,
+    inject_memory: bool,
+) -> String {
+    let profile = if inject_memory {
+        personality::load_personality(agent_workspace_dir)
+    } else {
+        personality::load_personality_files(
+            agent_workspace_dir,
+            &personality::personality_files_without_memory(),
+        )
+    };
+    render_identity_with_profile(identity_config, agent_workspace_dir, &profile).text
+}
+
+/// The text and source-file names belong to the same historical read. Disk
+/// remains canonical for new renders; this manifest describes the cached text.
+#[derive(Debug)]
+pub(crate) struct IdentitySnapshot {
+    pub text: String,
+    pub files: Vec<String>,
+    has_aieos: bool,
+}
+
+impl IdentitySnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty() && !self.has_aieos
+    }
+}
+
+/// Unlike the legacy renderer, session capture must not freeze read failures.
+pub(crate) fn render_identity_snapshot(
+    identity_config: Option<&IdentityConfig>,
+    agent_workspace_dir: &Path,
+    inject_memory: bool,
+) -> Result<IdentitySnapshot> {
+    let filenames = if inject_memory {
+        personality::PERSONALITY_FILES.to_vec()
+    } else {
+        personality::personality_files_without_memory()
+    };
+    let profile = capture_personality_profile(agent_workspace_dir, &filenames)?;
+    let aieos = if let Some(config) = identity_config
+        && identity::is_aieos_configured(config)
+    {
+        match identity::load_aieos_identity(config, agent_workspace_dir) {
+            Ok(Some(aieos)) => Some(aieos),
+            // The configuration guard excludes the loader's unconfigured case.
+            // A configured identity must load before a session can cache it.
+            Ok(None) => {
+                anyhow::bail!("Could not load AIEOS identity: no configured identity loaded")
+            }
+            Err(error) => anyhow::bail!("Could not load AIEOS identity: {error}"),
+        }
+    } else {
+        None
+    };
+    Ok(render_identity_with_aieos(&profile, aieos.as_ref()))
+}
+
+/// How many times a capture is retried when a skipped file turns out to
+/// have text on the recheck (an editor saving it mid-read).
+const PERSONALITY_CAPTURE_ATTEMPTS: usize = 3;
+
+/// The shared loader treats an unreadable or empty file like a missing one.
+/// Recheck only the files it skipped: one that exists but cannot be read
+/// fails the capture, and one that now has text means the file changed
+/// during the read, so the whole profile is read again rather than pinning
+/// a snapshot that lacks it.
+fn capture_personality_profile(
+    agent_workspace_dir: &Path,
+    filenames: &[&str],
+) -> Result<personality::PersonalityProfile> {
+    capture_personality_profile_with(agent_workspace_dir, || {
+        personality::load_personality_files(agent_workspace_dir, filenames)
+    })
+}
+
+fn capture_personality_profile_with(
+    agent_workspace_dir: &Path,
+    mut load: impl FnMut() -> personality::PersonalityProfile,
+) -> Result<personality::PersonalityProfile> {
+    let mut changed = None;
+    for _ in 0..PERSONALITY_CAPTURE_ATTEMPTS {
+        let profile = load();
+        changed = None;
+        for name in &profile.missing {
+            match std::fs::read_to_string(agent_workspace_dir.join(name)) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    anyhow::bail!("Could not read personality file {name}: {error}");
+                }
+                Ok(raw) if !raw.trim().is_empty() => {
+                    changed = Some(name.clone());
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if changed.is_none() {
+            return Ok(profile);
+        }
+    }
+    let name = changed.unwrap_or_default();
+    anyhow::bail!("Personality file {name} kept changing while it was being read")
+}
+
+fn render_identity_with_profile(
+    identity_config: Option<&IdentityConfig>,
+    agent_workspace_dir: &Path,
+    profile: &personality::PersonalityProfile,
+) -> IdentitySnapshot {
+    let aieos = if let Some(config) = identity_config
+        && identity::is_aieos_configured(config)
+    {
+        identity::load_aieos_identity(config, agent_workspace_dir)
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    render_identity_with_aieos(profile, aieos.as_ref())
+}
+
+fn render_identity_with_aieos(
+    profile: &personality::PersonalityProfile,
+    aieos: Option<&identity::AieosIdentity>,
+) -> IdentitySnapshot {
+    let mut prompt = String::from("## Project Context\n\n");
+    let mut has_aieos = false;
+    if let Some(aieos) = aieos {
+        let rendered = identity::aieos_to_system_prompt(aieos);
+        if !rendered.is_empty() {
+            prompt.push_str(&rendered);
+            prompt.push_str("\n\n");
+            has_aieos = true;
+        }
+    }
+
+    if !has_aieos {
+        prompt.push_str(
+            "The following workspace files define your identity, behavior, and context.\n\n",
+        );
+    }
+
+    prompt.push_str(&profile.render());
+    IdentitySnapshot {
+        text: prompt,
+        files: profile.files.iter().map(|file| file.name.clone()).collect(),
+        has_aieos,
+    }
 }
 
 /// Model-facing Full-autonomy approval contract used by [`SafetySection`].
@@ -338,37 +503,14 @@ impl PromptSection for IdentitySection {
     }
 
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
-        let mut prompt = String::from("## Project Context\n\n");
-        let mut has_aieos = false;
-        if let Some(config) = ctx.identity_config
-            && identity::is_aieos_configured(config)
-            && let Ok(Some(aieos)) = identity::load_aieos_identity(config, ctx.agent_workspace_dir)
-        {
-            let rendered = identity::aieos_to_system_prompt(&aieos);
-            if !rendered.is_empty() {
-                prompt.push_str(&rendered);
-                prompt.push_str("\n\n");
-                has_aieos = true;
-            }
+        if let Some(snapshot) = ctx.identity_snapshot {
+            return Ok(snapshot.to_string());
         }
-
-        if !has_aieos {
-            prompt.push_str(
-                "The following workspace files define your identity, behavior, and context.\n\n",
-            );
-        }
-
-        let profile = if ctx.inject_memory {
-            personality::load_personality(ctx.agent_workspace_dir)
-        } else {
-            personality::load_personality_files(
-                ctx.agent_workspace_dir,
-                &personality::personality_files_without_memory(),
-            )
-        };
-        prompt.push_str(&profile.render());
-
-        Ok(prompt)
+        Ok(render_identity_section(
+            ctx.identity_config,
+            ctx.agent_workspace_dir,
+            ctx.inject_memory,
+        ))
     }
 }
 
@@ -616,6 +758,54 @@ mod tests {
     use async_trait::async_trait;
     use zeroclaw_api::tool::Tool;
 
+    #[test]
+    fn personality_capture_rereads_a_file_that_gained_text_during_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("SOUL.md"), "be kind").unwrap();
+        let mut loads = 0;
+        let profile = capture_personality_profile_with(dir.path(), || {
+            loads += 1;
+            if loads == 1 {
+                // The first read saw the file mid-save, empty.
+                personality::PersonalityProfile {
+                    missing: vec!["SOUL.md".to_string()],
+                    ..Default::default()
+                }
+            } else {
+                personality::load_personality_files(dir.path(), &["SOUL.md"])
+            }
+        })
+        .unwrap();
+        assert_eq!(loads, 2);
+        assert!(profile.missing.is_empty());
+        assert_eq!(profile.files[0].content, "be kind");
+    }
+
+    #[test]
+    fn personality_capture_fails_when_a_file_keeps_changing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("SOUL.md"), "be kind").unwrap();
+        let mut loads = 0;
+        let error = capture_personality_profile_with(dir.path(), || {
+            loads += 1;
+            personality::PersonalityProfile {
+                missing: vec!["SOUL.md".to_string()],
+                ..Default::default()
+            }
+        })
+        .unwrap_err();
+        assert_eq!(loads, PERSONALITY_CAPTURE_ATTEMPTS);
+        assert!(error.to_string().contains("SOUL.md"), "{error}");
+    }
+
+    #[test]
+    fn personality_capture_accepts_files_that_are_really_missing_or_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("USER.md"), "  \n").unwrap();
+        let profile = capture_personality_profile(dir.path(), &["SOUL.md", "USER.md"]).unwrap();
+        assert_eq!(profile.missing, ["SOUL.md", "USER.md"]);
+    }
+
     zeroclaw_api::mock_tool_attribution!(TestTool);
     zeroclaw_api::mock_tool_attribution!(ReadSkillTestTool);
     zeroclaw_api::mock_tool_attribution!(ShellTestTool);
@@ -788,6 +978,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = IdentitySection.build(&ctx).unwrap();
@@ -871,6 +1062,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let section = IdentitySection;
@@ -886,6 +1078,33 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn legacy_identity_renderer_tolerates_aieos_load_failure() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let identity = workspace.path().join("identity.json");
+        std::fs::write(workspace.path().join("AGENTS.md"), "SURVIVING_MARKDOWN").unwrap();
+        let config = IdentityConfig {
+            format: "aieos".into(),
+            aieos_path: Some("identity.json".into()),
+            aieos_inline: None,
+        };
+
+        for failure in ["missing", "malformed", "directory"] {
+            match failure {
+                "missing" => {}
+                "malformed" => std::fs::write(&identity, "{invalid JSON").unwrap(),
+                "directory" => {
+                    std::fs::remove_file(&identity).unwrap();
+                    std::fs::create_dir(&identity).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let rendered = render_identity_section(Some(&config), workspace.path(), true);
+            assert!(rendered.contains("SURVIVING_MARKDOWN"));
+            assert!(rendered.contains("The following workspace files define your identity"));
+        }
     }
 
     #[test]
@@ -908,6 +1127,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Tools"));
@@ -935,6 +1155,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = InteractionSection.build(&ctx).unwrap();
@@ -974,6 +1195,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -1001,6 +1223,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(!prompt.contains("## Tools"));
@@ -1028,6 +1251,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -1085,6 +1309,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -1142,6 +1367,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -1188,6 +1414,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -1241,6 +1468,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -1273,6 +1501,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         // The section is opt-in: it must still render when a builder adds it
@@ -1325,6 +1554,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         // The system prompt is the cached prefix of every long-lived session,
@@ -1390,6 +1620,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -1430,6 +1661,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -1471,6 +1703,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -1504,6 +1737,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Full,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -1554,6 +1788,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Full,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = SafetySection
@@ -1593,6 +1828,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Full,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = SafetySection
@@ -1628,6 +1864,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile: None,
+            identity_snapshot: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -1663,6 +1900,7 @@ mod tests {
             autonomy_level: AutonomyLevel::Supervised,
             inject_memory: true,
             shell_profile,
+            identity_snapshot: None,
         }
     }
 
