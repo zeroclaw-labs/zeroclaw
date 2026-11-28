@@ -1,5 +1,5 @@
-//! Slash-command registration + reconcile (the prototype `/ask` plus one
-//! command per `slash`-tagged skill). Discord delivers application-command
+//! Slash-command registration + reconcile (the prototype `/ask`, the
+//! built-in chat commands, and one command per `slash`-tagged skill). Discord delivers application-command
 //! interactions over the same Gateway WebSocket as INTERACTION_CREATE; this
 //! module owns deriving the desired command set from installed skills and
 
@@ -7,6 +7,62 @@ use serde_json::json;
 
 use super::slash_options::{Choice, OptKind, OptionSpec};
 use super::types::{DiscordSlashCommandSpec, ReconcileOutcome, SlashScope};
+use zeroclaw_commands::{CommandExecution, CommandSpec, CommandSurface};
+use zeroclaw_runtime::i18n;
+
+/// The option that carries a built-in command's arguments, exactly as they
+/// would be typed after the command name.
+pub(crate) const BUILTIN_ARGS_OPTION: &str = "args";
+
+/// Built-in chat commands offered as native slash commands: the channel
+/// commands the command catalog marks as executed by the channel runtime. A
+/// slash invocation is forwarded as the equivalent text command, so the
+/// runtime's command parser stays the only place that interprets it.
+pub(crate) fn builtin_slash_commands() -> impl Iterator<Item = CommandSpec> {
+    zeroclaw_commands::commands_for_surface(CommandSurface::Channel)
+        .filter(|spec| spec.execution == CommandExecution::RuntimeCommand)
+}
+
+/// The text command a built-in slash invocation stands for: `/name` plus the
+/// submitted arguments on one line. `None` for any other command name.
+pub(crate) fn builtin_command_line(command: &str, args: &str) -> Option<String> {
+    let spec = builtin_slash_commands().find(|spec| spec.name == command)?;
+    let args = args.split_whitespace().collect::<Vec<_>>().join(" ");
+    Some(if args.is_empty() {
+        format!("/{}", spec.name)
+    } else {
+        format!("/{} {args}", spec.name)
+    })
+}
+
+/// Registration JSON for one built-in: its catalog description, plus an
+/// optional free-form arguments option described by the catalog usage when
+/// the command takes any.
+fn builtin_command_registration(spec: CommandSpec) -> serde_json::Value {
+    let description: String = i18n::get_required_cli_string(spec.description_key)
+        .chars()
+        .take(100)
+        .collect();
+    let arg_usage = spec
+        .usage
+        .strip_prefix('/')
+        .and_then(|rest| rest.strip_prefix(spec.name))
+        .map_or("", str::trim);
+    let mut cmd = json!({
+        "name": spec.name,
+        "description": description,
+        "type": 1, // CHAT_INPUT
+    });
+    if !arg_usage.is_empty() {
+        cmd["options"] = json!([{
+            "name": BUILTIN_ARGS_OPTION,
+            "description": arg_usage.chars().take(100).collect::<String>(),
+            "type": 3, // STRING
+            "required": false
+        }]);
+    }
+    cmd
+}
 
 /// Discord caps an application at 100 global commands; stay under it with
 /// headroom for `/ask` and future built-ins.
@@ -42,6 +98,7 @@ pub fn discord_slash_specs_from_skills(
 
     let mut seen = std::collections::HashSet::new();
     seen.insert("ask".to_string());
+    seen.extend(builtin_slash_commands().map(|spec| spec.name.to_string()));
     let mut specs = Vec::new();
     for skill in candidates {
         let slug = discord_command_slug(&skill.name);
@@ -252,8 +309,9 @@ fn map_options_cap(specs: &mut Vec<DiscordSlashCommandSpec>) {
     }
 }
 
-/// The desired global-command set: `/ask` plus one command per skill spec,
-/// each taking a single required string `input`. Also the registration
+/// The desired global-command set: `/ask`, one command per skill spec (each
+/// taking a single required string `input` unless it declares typed
+/// options), then the built-in chat commands. Also the registration
 /// fingerprint input — its JSON string hashes into the skip-if-unchanged
 /// gate.
 pub(crate) fn slash_command_registration_body(
@@ -309,6 +367,7 @@ pub(crate) fn slash_command_registration_body(
         }
         commands.push(cmd);
     }
+    commands.extend(builtin_slash_commands().map(builtin_command_registration));
     serde_json::Value::Array(commands)
 }
 
@@ -488,17 +547,22 @@ pub(crate) async fn reconcile_slash_commands(
             vec![global_base],
         ),
     };
-    // The canonical `/ask` we would register, used to prove ownership before
-    // reaping a `/ask` from the inactive scope a foreign `/ask` whose
-    // projection differs is left untouched.
-    let expected_ask = desired
+    // The canonical `/ask` and built-in commands we would register, used to
+    // prove ownership before reaping one from the inactive scope: a foreign
+    // command of the same name whose projection differs is left untouched.
+    let projection_owned: Vec<&serde_json::Value> = desired
         .iter()
-        .find(|c| c.get("name").and_then(|n| n.as_str()) == Some("ask"));
+        .filter(|c| {
+            c.get("name")
+                .and_then(|n| n.as_str())
+                .is_some_and(|name| name == "ask" || builtin_command_line(name, "").is_some())
+        })
+        .collect();
     // Best-effort cleanup of the now-inactive scope first; a 429 surfaces the
     // cooldown like any active-scope pass would.
     for base in &inactive {
         if let ReconcileOutcome::RateLimited { until } =
-            reap_all_owned_commands(client, &auth, base, expected_ask).await?
+            reap_all_owned_commands(client, &auth, base, &projection_owned).await?
         {
             return Ok(ReconcileOutcome::RateLimited { until });
         }
@@ -518,7 +582,7 @@ async fn reap_all_owned_commands(
     client: &reqwest::Client,
     auth: &str,
     base: &str,
-    expected_ask: Option<&serde_json::Value>,
+    projection_owned: &[&serde_json::Value],
 ) -> anyhow::Result<ReconcileOutcome> {
     // `with_localizations=true` so the listing echoes the full `*_localizations`
     // dictionaries; without it Discord returns them null and our `/ask`
@@ -561,13 +625,16 @@ async fn reap_all_owned_commands(
     };
     for cmd in &existing {
         let name = cmd.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        // Only reap a `/ask` that is *ours* - one whose projection matches the
-        // `/ask` we register Deleting by name alone would reap a `/ask`
-        // registered by other tooling that happens to share the inactive scope.
-        // Skill commands keep their own shape-based ownership marker.
-        let is_owned_ask = name == "ask"
-            && expected_ask.is_some_and(|a| command_projection(cmd) == command_projection(a));
-        if !is_owned_ask && !is_skill_command_shape(cmd) {
+        // Only reap a `/ask` or built-in that is *ours* - one whose projection
+        // matches the command we register. Deleting by name alone would reap a
+        // same-named command registered by other tooling that happens to share
+        // the inactive scope. Skill commands keep their own shape-based
+        // ownership marker.
+        let is_projection_owned = projection_owned.iter().any(|owned| {
+            owned.get("name").and_then(|n| n.as_str()) == Some(name)
+                && command_projection(cmd) == command_projection(owned)
+        });
+        if !is_projection_owned && !is_skill_command_shape(cmd) {
             continue;
         }
         let Some(id) = cmd.get("id").and_then(|i| i.as_str()) else {

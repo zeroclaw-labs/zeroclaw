@@ -84,6 +84,21 @@ then right-click a server or channel and **Copy ID**.
 
 {{#thread-context channel="Discord"}}
 
+## Slash commands
+
+Set `slash_commands = true` to add the bot to Discord's `/` menu:
+
+- `/ask <prompt>` asks a one-off question.
+- The built-in chat commands (`/model`, `/models`, `/thinking`, `/new`,
+  `/clear`, `/stop` and `/config`) appear with their descriptions. Picking
+  one runs it exactly as if you had typed it in that channel or thread, so it
+  acts on that conversation. Discord confirms it with a message only you see,
+  and the command's answer is posted in the channel as usual. Arguments go in
+  the optional `args` field, for example `/model args: <model-name>`.
+- Each skill tagged `slash` gets its own command.
+
+Typed commands keep working too, with or without the menu.
+
 ## Archive and search
 
 Set `archive = true` and the channel opens a sidecar `discord.db` memory store,
