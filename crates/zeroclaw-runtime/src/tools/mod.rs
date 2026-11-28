@@ -1126,6 +1126,17 @@ impl Memory for NativeMemoryBinding {
         actual.health_check().await
     }
 
+    async fn supersede_for_agent(
+        &self,
+        superseded_ids: &[String],
+        replacement: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<()> {
+        self.begin_operation()
+            .supersede_for_agent(superseded_ids, replacement, agent_id)
+            .await
+    }
+
     async fn supersede(&self, superseded_ids: &[String], new_id: &str) -> anyhow::Result<()> {
         let actual = self.begin_operation();
         actual.supersede(superseded_ids, new_id).await
@@ -9156,6 +9167,19 @@ mod native_memory_binding_tests {
             true
         }
 
+        async fn supersede_for_agent(
+            &self,
+            ids: &[String],
+            replacement: &str,
+            agent_id: &str,
+        ) -> anyhow::Result<()> {
+            assert_eq!(ids, &["old"]);
+            assert_eq!(replacement, "new");
+            assert_eq!(agent_id, "owner");
+            self.calls.lock().push("supersede_for_agent");
+            Ok(())
+        }
+
         async fn supersede(&self, superseded_ids: &[String], new_id: &str) -> anyhow::Result<()> {
             assert_eq!(superseded_ids[0], "sentinel");
             assert_eq!(new_id, "sentinel");
@@ -9506,6 +9530,10 @@ mod native_memory_binding_tests {
         assert_eq!(binding.count().await.unwrap(), 7);
         assert!(binding.health_check().await);
         binding
+            .supersede_for_agent(&["old".to_owned()], "new", "owner")
+            .await
+            .unwrap();
+        binding
             .supersede(&["sentinel".to_owned()], "sentinel")
             .await
             .unwrap();
@@ -9642,6 +9670,7 @@ mod native_memory_binding_tests {
                 "count_agent",
                 "count",
                 "health_check",
+                "supersede_for_agent",
                 "supersede",
                 "store_procedural",
                 "count_in_scope",

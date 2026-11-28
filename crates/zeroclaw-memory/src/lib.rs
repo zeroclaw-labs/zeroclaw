@@ -3055,6 +3055,112 @@ url = "http://localhost:6333"
     }
 
     #[tokio::test]
+    async fn named_agent_supersession_preserves_history_and_write_ownership() -> anyhow::Result<()>
+    {
+        use zeroclaw_config::multi_agent::MemoryGrant;
+        let tmp = TempDir::new().unwrap();
+        let mut config = agent_config(&tmp);
+        config.memory.audit_enabled = true;
+        config.agents.insert("peer".into(), Default::default());
+        config
+            .agents
+            .get_mut("ops")
+            .unwrap()
+            .workspace
+            .read_memory_from = vec![MemoryGrant::Agent("peer".into())];
+        let owner = create_memory_for_agent(&config, "ops", None).await?;
+        let peer = create_memory_for_agent(&config, "peer", None).await?;
+        for (mem, key, text) in [
+            (&owner, "previous", "Parcel pickup at the amber gate"),
+            (&owner, "current", "Parcel pickup at the cobalt gate"),
+            (&peer, "current", "Parcel pickup at the crimson gate"),
+        ] {
+            mem.store(key, text, MemoryCategory::Core, None).await?;
+        }
+        let old = owner.get("previous").await?.unwrap();
+        let new = owner.get("current").await?.unwrap();
+        let foreign = peer.get("current").await?.unwrap();
+        let hits = owner.recall("parcel", 10, None, None, None).await?;
+        assert!(
+            hits.iter().any(|e| e.id == foreign.id),
+            "read grant is live"
+        );
+        // Even a forced-low threshold must not promote ordinary search ranks
+        // to evidence. Both compatible facts remain current without an explicit link.
+        assert!(
+            conflict::check_and_resolve_conflicts(
+                &*owner,
+                "later",
+                "Parcel delivery on Tuesday",
+                &MemoryCategory::Core,
+                0.0
+            )
+            .await?
+            .is_empty()
+        );
+        let scope = zeroclaw_api::memory_traits::PrincipalScope::new("principal")
+            .with_agent(Some("ops".into()));
+        owner
+            .store_for_principal(
+                &scope,
+                "private",
+                "Private parcel locker",
+                MemoryCategory::Core,
+                None,
+            )
+            .await?;
+        let private = owner.get_for_principal(&scope, "private").await?.unwrap();
+        // A replacement that names one row by ID and another by key is ambiguous.
+        owner
+            .store(&new.id, "unrelated fact", MemoryCategory::Core, None)
+            .await?;
+        assert!(
+            owner
+                .supersede(std::slice::from_ref(&old.id), &new.id)
+                .await
+                .is_err()
+        );
+        assert!(owner.forget(&new.id).await?);
+        for (losers, successor) in [
+            (vec![old.id.clone(), foreign.id.clone()], &new.id),
+            (vec![old.id.clone()], &foreign.id),
+            (vec![new.id.clone()], &new.id),
+            (vec![private.id.clone()], &new.id),
+            (vec![old.id.clone()], &private.id),
+        ] {
+            assert!(owner.supersede(&losers, successor).await.is_err());
+        }
+        assert!(
+            owner
+                .get("previous")
+                .await?
+                .unwrap()
+                .superseded_by
+                .is_none()
+        );
+        owner
+            .supersede(std::slice::from_ref(&old.id), &new.key)
+            .await?;
+        assert!(
+            owner
+                .supersede(std::slice::from_ref(&new.id), &old.id)
+                .await
+                .is_err()
+        );
+        drop(owner);
+        drop(peer);
+        let reopened = create_memory_for_agent(&config, "ops", None).await?;
+        let history = reopened.get("previous").await?.unwrap();
+        assert_eq!(history.id, old.id);
+        assert_eq!(history.superseded_by.as_deref(), Some(new.id.as_str()));
+        let hits = reopened.recall("parcel", 10, None, None, None).await?;
+        assert!(!hits.iter().any(|e| e.id == old.id));
+        assert!(hits.iter().any(|e| e.id == new.id));
+        assert!(hits.iter().any(|e| e.id == foreign.id));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn create_memory_for_agent_rejects_duplicate_grants_before_wrapper() {
         let tmp = TempDir::new().unwrap();
         let mut config = agent_config(&tmp);

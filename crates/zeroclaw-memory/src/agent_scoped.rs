@@ -480,6 +480,15 @@ impl Memory for AgentScopedMemory {
         Ok(self.filter_attributed_entries(entries))
     }
 
+    async fn supersede(&self, ids: &[String], replacement: &str) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.inner
+            .supersede_for_agent(ids, replacement, &self.agent_id)
+            .await
+    }
+
     async fn forget(&self, key: &str) -> Result<bool> {
         if self.inner.forget_for_agent(key, &self.agent_id).await? {
             return Ok(true);

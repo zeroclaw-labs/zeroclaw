@@ -580,6 +580,19 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         Ok(())
     }
 
+    /// Retire explicitly selected shared rows owned by `agent_id`. The replacement
+    /// is an active row ID or storage key belonging to the same agent; persist its
+    /// row ID. Reject an ambiguous target or an invalid batch without partial writes.
+    /// A read grant does not authorize this operation.
+    async fn supersede_for_agent(
+        &self,
+        _superseded_ids: &[String],
+        _replacement: &str,
+        _agent_id: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("this memory backend does not support agent-scoped supersession")
+    }
+
     /// Store a procedural "how to" trace from a tool-calling turn.
     ///
     /// Default: no-op. Backends that support procedural storage can override.

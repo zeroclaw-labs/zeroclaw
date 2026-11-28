@@ -2707,6 +2707,48 @@ impl Memory for SqliteMemory {
         .await
     }
 
+    async fn supersede_for_agent(
+        &self,
+        superseded_ids: &[String],
+        replacement: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<()> {
+        if superseded_ids.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.clone();
+        let ids = superseded_ids.to_vec();
+        let replacement = replacement.to_owned();
+        let agent_id = agent_id.to_owned();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let mut conn = conn.lock();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            // query_one also rejects a key which is another owned row's ID.
+            let winner: String = tx
+                .query_one(
+                    "SELECT id FROM memories WHERE agent_id = ?1 AND principal_id IS NULL
+                 AND superseded_by IS NULL AND (id = ?2 OR key = ?2)",
+                    params![agent_id, replacement],
+                    |row| row.get(0),
+                )
+                .context("expected one active replacement in the agent's shared memory")?;
+            for id in ids {
+                let changed = tx.execute(
+                    "UPDATE memories SET superseded_by = ?1 WHERE id = ?2 AND id != ?1
+                     AND agent_id = ?3 AND principal_id IS NULL AND superseded_by IS NULL",
+                    params![winner, id, agent_id],
+                )?;
+                anyhow::ensure!(
+                    changed == 1,
+                    "expected a distinct active predecessor in the agent's shared memory"
+                );
+            }
+            tx.commit()?;
+            Ok(())
+        })
+        .await?
+    }
+
     async fn supersede(&self, superseded_ids: &[String], new_id: &str) -> anyhow::Result<()> {
         let conn = self.conn.clone();
         let ids = superseded_ids.to_vec();
