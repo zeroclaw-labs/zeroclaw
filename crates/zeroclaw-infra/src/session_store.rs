@@ -11,7 +11,7 @@ use crate::session_disposition::{
 use crate::session_disposition::{SessionDispositionObservation, SessionDispositionWitness};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 use zeroclaw_api::model_provider::ChatMessage;
@@ -153,7 +153,10 @@ impl SessionStore {
         }
     }
 
-    /// Append a single message to the session JSONL file.
+    /// Append a message on its own JSONL line without modifying existing bytes.
+    /// A non-empty file without a final LF gets one separator before the new record.
+    /// A write error may leave a partial record; the error is returned without rollback.
+    /// The next append still starts on a new line.
     pub fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
         let _guard = self.mutation_guard()?;
         self.append_unlocked(session_key, message)
@@ -178,17 +181,24 @@ impl SessionStore {
     fn append_unlocked(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
         let path = self.session_path(session_key);
         validate_jsonl_suffix(&path)?;
-        let mut file = match jsonl::classify_append(&path)? {
-            Entry::Transcript(file) => file,
-            Entry::Missing => jsonl::create_append(&path)?,
+        let (mut file, needs_separator) = match jsonl::classify_append(&path)? {
+            Entry::Transcript(mut file) => {
+                let needs_separator = ends_without_lf(&mut file)?;
+                (file, needs_separator)
+            }
+            // Exclusive creation guarantees an empty file; its handle is write-only.
+            Entry::Missing => (jsonl::create_append(&path)?, false),
             Entry::Marker(_) => return Err(unacknowledged_delete()),
         };
 
-        let json = serde_json::to_string(message)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        writeln!(file, "{json}")?;
-        Ok(())
+        let mut record = Vec::new();
+        if needs_separator {
+            record.push(b'\n');
+        }
+        serde_json::to_writer(&mut record, message)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        record.push(b'\n');
+        file.write_all(&record)
     }
 
     /// Remove the last message from a session's JSONL file.
@@ -543,6 +553,18 @@ fn session_filename(key: &str) -> String {
 
 fn trim_breadcrumb_filename(key: &str) -> String {
     format!("{}.trim_breadcrumb", sanitize_session_key(key))
+}
+
+// Read the final byte through the already-readable classified handle.
+fn ends_without_lf(file: &mut File) -> io::Result<bool> {
+    let len = file.seek(SeekFrom::End(0))?;
+    if len == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(len - 1))?;
+    let mut last = [0];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
 }
 
 fn load_transcript(file: File) -> Vec<ChatMessage> {
@@ -1579,6 +1601,207 @@ mod tests {
         assert_eq!(messages[0].content, "hello");
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].content, "hi there");
+    }
+
+    const PARTIAL_FRAMING_ROW: &str = r#"{"role":"assistant","content":"cut"#;
+
+    fn framing_messages() -> ([ChatMessage; 3], [String; 3]) {
+        let messages = [
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+        ];
+        let rows = messages
+            .each_ref()
+            .map(|message| serde_json::to_string(message).unwrap());
+        (messages, rows)
+    }
+
+    fn assert_framing_history(actual: &[ChatMessage], expected: &[ChatMessage]) {
+        fn pairs(messages: &[ChatMessage]) -> Vec<(&str, &str)> {
+            messages
+                .iter()
+                .map(|message| (message.role.as_str(), message.content.as_str()))
+                .collect()
+        }
+        assert_eq!(pairs(actual), pairs(expected));
+    }
+
+    // A complete final row without LF needs one separator, even with repeated appends.
+    #[test]
+    fn append_preserves_complete_jsonl_final_row_without_lf() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "append-framing";
+        let path = store.session_path(key);
+        let ([first, second, third], [j1, j2, j3]) = framing_messages();
+        let initial = format!("{j1}\n{j2}");
+        std::fs::write(&path, &initial).unwrap();
+        assert_framing_history(
+            &store.try_load(key).unwrap(),
+            &[first.clone(), second.clone()],
+        );
+
+        store.append(key, &third).unwrap();
+        store.append(key, &third).unwrap();
+        drop(store);
+        let reopened = SessionStore::new(tmp.path()).unwrap();
+        let strict = reopened.try_load(key);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{initial}\n{j3}\n{j3}\n"),
+            "strict reopen: {strict:?}",
+        );
+        let expected = [first, second, third.clone(), third];
+        assert_framing_history(&strict.unwrap(), &expected);
+        assert_framing_history(&reopened.load(key), &expected);
+    }
+
+    // Preserve LF, trailing blank lines and CRLF without inserting another separator.
+    #[test]
+    fn append_preserves_lf_terminated_jsonl_history() {
+        for ending in ["\n", "\n\n", "\r\n"] {
+            let tmp = TempDir::new().unwrap();
+            let store = SessionStore::new(tmp.path()).unwrap();
+            let key = "append-terminated";
+            let path = store.session_path(key);
+            let (messages, [j1, j2, j3]) = framing_messages();
+            let initial = format!("{j1}\n{j2}{ending}");
+            std::fs::write(&path, &initial).unwrap();
+
+            store.append(key, &messages[2]).unwrap();
+            drop(store);
+            let reopened = SessionStore::new(tmp.path()).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                format!("{initial}{j3}\n")
+            );
+            assert_framing_history(&reopened.try_load(key).unwrap(), &messages);
+        }
+    }
+
+    // Neither an existing empty file nor a newly created file needs a leading LF.
+    #[test]
+    fn append_to_empty_or_missing_session_adds_no_separator() {
+        for existing in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let store = SessionStore::new(tmp.path()).unwrap();
+            let key = "append-empty-or-missing";
+            let path = store.session_path(key);
+            let (messages, [j1, j2, _]) = framing_messages();
+            if existing {
+                std::fs::write(&path, b"").unwrap();
+            }
+            assert_eq!(path.exists(), existing);
+
+            store.append(key, &messages[0]).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{j1}\n"));
+            store.append(key, &messages[1]).unwrap();
+            drop(store);
+            let reopened = SessionStore::new(tmp.path()).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                format!("{j1}\n{j2}\n")
+            );
+            assert_framing_history(&reopened.try_load(key).unwrap(), &messages[..2]);
+        }
+    }
+
+    fn assert_append_leaves_damaged_tail(tail: &str, separator: &str) {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "append-damaged-tail";
+        let path = store.session_path(key);
+        let (messages, [j1, j2, _]) = framing_messages();
+        let initial = format!("{j1}\n{tail}");
+        std::fs::write(&path, &initial).unwrap();
+
+        store.append(key, &messages[1]).unwrap();
+        drop(store);
+        let reopened = SessionStore::new(tmp.path()).unwrap();
+        let best_effort = reopened.load(key);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{initial}{separator}{j2}\n"),
+            "best-effort reopen: {best_effort:?}",
+        );
+        assert_framing_history(&best_effort, &messages[..2]);
+        assert_eq!(
+            reopened.try_load(key).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    // A partial row stays damaged, but later good history must remain readable.
+    #[test]
+    fn append_after_partial_final_record_keeps_new_record_distinct() {
+        assert_append_leaves_damaged_tail(PARTIAL_FRAMING_ROW, "\n");
+    }
+
+    // An already terminated malformed row does not need repair or another separator.
+    #[test]
+    fn append_after_terminated_malformed_record_adds_no_separator() {
+        assert_append_leaves_damaged_tail("not json\n", "");
+    }
+
+    // Guarded append counts valid history, commits once, and uses the same framing.
+    #[test]
+    fn append_authorized_frames_unterminated_record() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "append-authorized-valid";
+        let path = store.session_path(key);
+        let (messages, [j1, j2, j3]) = framing_messages();
+        std::fs::write(&path, format!("{j1}\n{j2}")).unwrap();
+        let commits = std::cell::Cell::new(0);
+        let count = store
+            .append_authorized(
+                key,
+                &messages[2],
+                &|owner| {
+                    assert_eq!(owner, None);
+                    Ok(Box::new(()))
+                },
+                &mut || commits.set(commits.get() + 1),
+            )
+            .unwrap();
+        assert_eq!((count, commits.get()), (3, 1));
+        drop(store);
+        let reopened = SessionStore::new(tmp.path()).unwrap();
+        let strict = reopened.try_load(key);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{j1}\n{j2}\n{j3}\n"),
+            "strict reopen: {strict:?}",
+        );
+        assert_framing_history(&strict.unwrap(), &messages);
+    }
+
+    // Guarded append must still refuse damaged history without publishing any effect.
+    #[test]
+    fn append_authorized_refuses_malformed_tail_without_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "append-authorized-damaged";
+        let path = store.session_path(key);
+        let (messages, [j1, _, _]) = framing_messages();
+        let initial = format!("{j1}\n{PARTIAL_FRAMING_ROW}");
+        std::fs::write(&path, &initial).unwrap();
+        let committed = std::cell::Cell::new(false);
+        let error = store
+            .append_authorized(
+                key,
+                &messages[1],
+                &|owner| {
+                    assert_eq!(owner, None);
+                    Ok(Box::new(()))
+                },
+                &mut || committed.set(true),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!committed.get());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), initial);
     }
 
     #[test]
