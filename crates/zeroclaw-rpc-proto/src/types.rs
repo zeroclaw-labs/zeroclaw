@@ -2391,7 +2391,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
+    #[expect(
+        deprecated,
+        reason = "the fixture sets the deprecated next_cursor field"
+    )]
     fn logs_query_result_exposes_active_log_path_when_present() {
         let result = LogsQueryResult {
             events: Vec::new(),

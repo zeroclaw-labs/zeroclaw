@@ -104,3 +104,7 @@ windows = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 [[example]]
 name = "sign_manifest"
 test = true
+
+[lints.clippy]
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"

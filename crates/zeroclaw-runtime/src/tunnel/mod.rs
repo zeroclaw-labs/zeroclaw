@@ -9,7 +9,6 @@ mod tailscale;
 pub use cloudflare::CloudflareTunnel;
 pub use custom::CustomTunnel;
 pub use ngrok::NgrokTunnel;
-#[allow(unused_imports)]
 pub use none::NoneTunnel;
 pub use openvpn::OpenVpnTunnel;
 pub use pinggy::PinggyTunnel;

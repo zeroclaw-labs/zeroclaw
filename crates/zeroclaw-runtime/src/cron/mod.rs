@@ -12,11 +12,9 @@ mod types;
 pub mod outbox;
 pub mod scheduler;
 
-#[allow(unused_imports)]
 pub use schedule::{
     next_run_for_schedule, normalize_expression, schedule_cron_expression, validate_schedule,
 };
-#[allow(unused_imports)]
 pub use store::{
     RunOutcomes, RunProvenance, add_agent_job, all_overdue_jobs, claim_job, claim_job_for_agent,
     claim_job_for_agent_with_token, clear_stale_locks, due_jobs, get_job, get_job_for_agent,

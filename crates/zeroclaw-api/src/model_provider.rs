@@ -588,7 +588,6 @@ pub struct ModelListingUnsupportedError;
 /// ModelProvider capabilities declaration.
 /// Describes what features a model_provider supports, enabling intelligent
 /// adaptation of tool calling modes and request formatting.
-#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProviderCapabilities {
     /// Whether the model_provider supports native tool calling via API primitives.

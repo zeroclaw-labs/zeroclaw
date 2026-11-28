@@ -7,3 +7,7 @@ description = "Canonical distribution-target identity registry — the single so
 publish = false
 
 [dependencies]
+
+[lints.clippy]
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"

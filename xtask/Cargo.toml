@@ -49,3 +49,7 @@ zerocode = { workspace = true }
 # Draft 7 validation of the generated OpenRPC schemas (same version zeroclaw-plugins pins).
 jsonschema = { version = "0.48", default-features = false }
 tempfile = "3"
+
+[lints.clippy]
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"

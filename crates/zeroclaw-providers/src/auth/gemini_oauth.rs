@@ -13,7 +13,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 // Re-export for external use (used by main.rs)
-#[allow(unused_imports)]
 pub use crate::auth::oauth_common::{PkceState, generate_pkce_state};
 
 pub const GOOGLE_OAUTH_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";

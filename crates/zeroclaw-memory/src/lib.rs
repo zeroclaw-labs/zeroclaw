@@ -49,31 +49,25 @@ pub mod vector;
 pub use agent_scoped::{AgentMemoryGrant, AgentScopedMemory};
 pub use agent_scoped_markdown::{AgentScopedMarkdownMemory, MarkdownPeer};
 pub use audit::AuditedMemory;
-#[allow(unused_imports)]
 pub use backend::{
     MemoryBackendKind, MemoryBackendProfile, classify_memory_backend, default_memory_backend_key,
     memory_backend_profile, selectable_memory_backends,
 };
-#[allow(unused_imports)]
 pub use embeddings::EmbeddingIdentity;
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
-#[allow(unused_imports)]
 pub use policy::PolicyEnforcer;
 #[cfg(feature = "memory-postgres")]
-#[allow(unused_imports)]
 pub use postgres::PostgresMemory;
 pub use principal_plane::PrincipalPlaneMemory;
 pub use qdrant::QdrantMemory;
 pub use rerank::{RerankConfig, RerankStrategy};
 pub use response_cache::ResponseCache;
-#[allow(unused_imports)]
 pub use retrieval::{RetrievalConfig, RetrievalPipeline};
 pub use scanned::ScannedMemory;
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
-#[allow(unused_imports)]
 pub use traits::{
     ExportFilter, MemoryCategory, MemoryEntry, ProceduralMessage, is_recent_recall_query,
     normalize_recent_recall_query,

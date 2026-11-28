@@ -29,3 +29,7 @@ schema-export = [
     "zeroclaw-config/schema-export",
     "zeroclaw-sop-graph/schema-export",
 ]
+
+[lints.clippy]
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"

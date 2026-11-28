@@ -8,3 +8,7 @@ publish = false
 [dependencies]
 zeroclaw-log.workspace = true
 zeroclaw-log-attribution-macro-support = { path = "../attribution-macro-support" }
+
+[lints.clippy]
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"

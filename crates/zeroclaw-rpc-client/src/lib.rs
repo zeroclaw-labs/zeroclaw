@@ -14,12 +14,12 @@
 //! process later; [`RpcClient::connect_local`] dials the daemon endpoint
 //! that [`endpoint::resolve_socket_path`] names.
 
-// Like `apps/zerocode`, this is a standalone RPC client: it must not link
-// `zeroclaw-log`, so it cannot use `::zeroclaw_spawn::spawn!`, and its two
-// tasks (transport reader and writer) carry no daemon attribution span to
-// inherit. The workspace ban on `tokio::spawn` exists for daemon paths; see
-// the exemption list in `clippy.toml`.
-#![allow(clippy::disallowed_methods)]
+// The workspace ban on `tokio::spawn` exists for daemon paths; see the
+// exemption list in `clippy.toml`.
+#![expect(
+    clippy::disallowed_methods,
+    reason = "its transport tasks have no daemon attribution span for spawn! to carry"
+)]
 
 pub mod backoff;
 pub mod client;

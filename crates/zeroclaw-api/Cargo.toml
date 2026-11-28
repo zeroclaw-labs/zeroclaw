@@ -29,3 +29,7 @@ schema-export = ["dep:schemars"]
 [dev-dependencies]
 parking_lot = "0.12"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
+
+[lints.clippy]
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"

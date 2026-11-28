@@ -357,7 +357,10 @@ impl<'de> serde::Deserialize<'de> for TaskState {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-        #[allow(clippy::enum_variant_names)]
+        #[expect(
+            clippy::enum_variant_names,
+            reason = "variants mirror the TASK_STATE_* wire names"
+        )]
         enum TaskStateWire {
             TaskStateUnspecified,
             TaskStateSubmitted,
