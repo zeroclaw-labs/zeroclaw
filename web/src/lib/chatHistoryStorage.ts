@@ -11,7 +11,7 @@ export interface PersistedChatBubble {
   thinking?: string;
   markdown?: boolean;
   /** Verbatim locally-composed user input — never gateway-prefixed, so the
-   *  bubble skips stripServerTimestamp for it. (Server rows omit this.) */
+   *  bubble skips the server-prefix stripping for it. (Server rows omit this.) */
   local?: boolean;
   toolCall?: { name: string; args?: unknown; output?: string };
   timestamp: string;
@@ -58,14 +58,19 @@ export function removeChatHistory(sessionId: string): void {
   }
 }
 
-/** Map server-persisted rows into UI messages (timestamps are synthetic for ordering). */
+/**
+ * Map server-persisted rows into UI messages. Each bubble takes the row's
+ * stored `created_at`; a row without one (backends that don't record it, or an
+ * unparseable value) gets a synthetic timestamp near the current time.
+ */
 export function mapServerMessagesToPersisted(rows: SessionMessageRow[]): PersistedChatBubble[] {
   const base = Date.now() - rows.length * 1000;
   const out: PersistedChatBubble[] = [];
   let idx = 0;
   for (const row of rows) {
     if (row.role === 'system') continue;
-    const ts = new Date(base + idx * 1000).toISOString();
+    const stored = Date.parse(row.created_at ?? '');
+    const ts = new Date(Number.isNaN(stored) ? base + idx * 1000 : stored).toISOString();
     idx += 1;
     if (row.role === 'user') {
       out.push({

@@ -2098,6 +2098,50 @@ test('F5 after the detached turn committed shows the prompt once, with its answe
   await unmount(second.renderer);
 });
 
+test('a chat rebuilt from the stored transcript shows the typed prompt and stored times', async () => {
+  const runtime = new FakeSessionRuntime();
+  runtime.queueMessages('A', () => Promise.resolve({
+    session_id: 'A',
+    session_persistence: true,
+    messages: [
+      {
+        role: 'user',
+        content: '[CURRENT DATE & TIME: 2026-10-01 10:00:00 UTC]\n\nfirst prompt',
+        created_at: '2001-01-01T00:00:07+00:00',
+      },
+      { role: 'assistant', content: 'first reply', created_at: '2001-01-01T00:00:09+00:00' },
+      // A backend without per-row times still gets a synthetic time.
+      { role: 'user', content: 'second prompt', created_at: null },
+      // A datetime the user typed at the start survives the prefix strip.
+      {
+        role: 'user',
+        content: '[CURRENT DATE & TIME: 2026-10-01 10:01:00 UTC]\n\n[2026-01-01 00:00:00 UTC] kept',
+        created_at: null,
+      },
+      // An agent reply quoting the envelope is shown as is.
+      { role: 'assistant', content: '[CURRENT DATE & TIME: quoted]\n\nreply', created_at: null },
+    ],
+  }));
+  const mounted = await mountChat(runtime, true);
+  await openSocket(runtime, 0);
+  await settle();
+
+  const [first, reply, synthetic] = mounted.context().messages.map((m) => m.timestamp.getTime());
+  assert.deepEqual(
+    [first, reply],
+    [Date.parse('2001-01-01T00:00:07Z'), Date.parse('2001-01-01T00:00:09Z')],
+    'hydrated bubbles must take the rows\' created_at',
+  );
+  assert.ok((synthetic ?? 0) > (reply ?? 0), 'a row without created_at keeps a synthetic time');
+
+  const rendered = nodeText(mounted.renderer.root);
+  assert.ok(rendered.includes('first prompt'), rendered);
+  assert.ok(rendered.includes('[2026-01-01 00:00:00 UTC] kept'), rendered);
+  assert.ok(!rendered.includes('2026-10-01 10:0'), `the runtime's date prefix must not be displayed: ${rendered}`);
+  assert.ok(rendered.includes('[CURRENT DATE & TIME: quoted]'), rendered);
+  await unmount(mounted.renderer);
+});
+
 test('an uncommitted prompt does not follow the operator into another conversation', async () => {
   const runtime = new FakeSessionRuntime();
   runtime.queueMessages('A', () => Promise.resolve(messagesResponse('A', true)));

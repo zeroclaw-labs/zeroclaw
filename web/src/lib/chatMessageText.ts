@@ -1,4 +1,5 @@
 import type { ChatMessage } from '@/contexts/AgentContext';
+import { normalizeServerUserContent } from '@/contexts/chatHydration.logic';
 
 // Channel-user (and some agent) messages arrive with a leading
 // `[YYYY-MM-DD HH:MM:SS TZ] ` prefix the gateway prepends. The zone is a chrono
@@ -8,7 +9,18 @@ import type { ChatMessage } from '@/contexts/AgentContext';
 // datetime appearing mid-message (a log line, an error report) is left intact.
 const SERVER_TIMESTAMP_RE = /^\s*\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [^\]]+\]\s*/;
 
-
-export function displayMessageText(message: Pick<ChatMessage, 'content' | 'local' | 'ephemeral'>): string {
-  return message.local || message.ephemeral ? message.content : message.content.replace(SERVER_TIMESTAMP_RE, '');
+// A server user turn from the agent path carries the runtime's
+// `[CURRENT DATE & TIME: …]` prefix instead (see chatHydration.logic). Strip
+// one prefix or the other, never both, so a bracketed datetime the user typed
+// at the start of their message survives. Locally composed input and command
+// output are verbatim and never stripped.
+export function displayMessageText(
+  message: Pick<ChatMessage, 'role' | 'content' | 'local' | 'ephemeral'>,
+): string {
+  if (message.local || message.ephemeral) return message.content;
+  if (message.role === 'user') {
+    const unlabeled = normalizeServerUserContent(message.content);
+    if (unlabeled !== message.content) return unlabeled;
+  }
+  return message.content.replace(SERVER_TIMESTAMP_RE, '');
 }
