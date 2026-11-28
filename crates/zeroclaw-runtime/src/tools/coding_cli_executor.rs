@@ -33,6 +33,15 @@ impl RuntimeCodingCliExecutor {
 #[async_trait]
 impl CodingCliExecutor for RuntimeCodingCliExecutor {
     async fn output(&self, command: CodingCliCommand) -> Result<Output, CodingCliExecutionError> {
+        if self.sandbox.name() != "none"
+            && (zeroclaw_tools::task_ssh::current().is_some()
+                || std::env::var_os("ZEROCLAW_SSH_TASK_HELPER").is_some())
+        {
+            return Err(CodingCliExecutionError::Prepare(anyhow::Error::msg(
+                crate::i18n::get_required_cli_string("tool-shell-ssh-broker-sandbox-unsupported"),
+            )));
+        }
+
         if let Some(reason) = self.sandbox.coding_cli_unsupported_reason() {
             let backend = self.sandbox.name();
             ::zeroclaw_log::record!(
@@ -88,6 +97,11 @@ impl CodingCliExecutor for RuntimeCodingCliExecutor {
         for (key, value) in command.env {
             process.env(key, value);
         }
+        super::shell::configure_task_ssh_environment(
+            &mut process,
+            self.sandbox.as_ref(),
+            zeroclaw_tools::task_ssh::current(),
+        );
         process.kill_on_drop(true);
 
         tokio::time::timeout(Duration::from_secs(timeout_secs), process.output())
@@ -356,6 +370,36 @@ mod tests {
                 .current_dir(workspace_dir);
             Ok(process)
         }
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn sandboxed_codex_cli_refuses_active_host_ssh_broker() {
+        let workspace = tempfile::TempDir::new().expect("temp workspace");
+        let seen_command = Arc::new(Mutex::new(None));
+        let runtime = Arc::new(FakeRuntime {
+            seen_command: Arc::clone(&seen_command),
+        });
+        let executor = RuntimeCodingCliExecutor::shared(runtime, Arc::new(FakeSandbox), false);
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tool = CodexCliTool::new_with_executor(security, CodexCliConfig::default(), executor);
+        let task = zeroclaw_tools::task_ssh::SshTask {
+            id: "test".into(),
+            state_dir: workspace.path().display().to_string(),
+        };
+
+        let result = zeroclaw_tools::task_ssh::scope_inherited(
+            Some(task),
+            tool.execute(json!({"prompt": "test admission"})),
+        )
+        .await
+        .expect("codex_cli should return a tool result");
+        assert!(!result.success);
+        assert!(seen_command.lock().expect("fake runtime mutex").is_none());
     }
 
     #[tokio::test]

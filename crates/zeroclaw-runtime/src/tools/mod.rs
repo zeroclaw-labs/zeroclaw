@@ -39,6 +39,7 @@ pub mod sop_list;
 pub mod sop_status;
 pub mod sop_workshop;
 pub mod spawn_subagent;
+mod task_ssh_sandbox;
 pub mod todo_write;
 pub mod verifiable_intent;
 
@@ -1666,6 +1667,7 @@ fn runtime_shell_assembly(
         Some(&security.workspace_dir),
         &sandbox_extra_roots,
     );
+    let sandbox: Arc<dyn Sandbox> = Arc::new(task_ssh_sandbox::TaskSshSandbox(sandbox));
     let shell_tool = ShellTool::new_with_sandbox(security, runtime, sandbox.clone());
     RuntimeShellAssembly {
         shell_tool,
