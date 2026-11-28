@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 use std::sync::Arc;
 
+mod attempt_budget;
+pub use attempt_budget::{
+    BoundedChatUnsupported, GenerationAttemptBudget, GenerationAttemptBudgetExhausted,
+};
+
 pub const MAX_BUDGET_TOKENS: u32 = 128_000;
 /// Anthropic's documented minimum for extended-thinking `budget_tokens`.
 /// Requests below this are rejected with 400 by the provider; clamping at
@@ -728,6 +733,23 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         self.chat(request, model, temperature).await
     }
 
+    /// Non-streaming chat sharing one cumulative generation allowance.
+    ///
+    /// Implementations must forward the same budget through recovery and spend
+    /// before every generation submission, including internal transport retries.
+    /// Adapter recovery preserves the request's native or prompt tool protocol.
+    /// Unsupported providers decline before I/O rather than calling unbounded chat.
+    async fn chat_with_attempt_budget(
+        &self,
+        _request: ChatRequest<'_>,
+        _model: &str,
+        _temperature: Option<f64>,
+        _policy: ToolRoundPolicy,
+        _budget: &GenerationAttemptBudget,
+    ) -> anyhow::Result<ChatResponse> {
+        Err(BoundedChatUnsupported.into())
+    }
+
     fn stream_chat_with_tool_round_policy(
         &self,
         request: ChatRequest<'_>,
@@ -1020,6 +1042,19 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
 /// boilerplate in test and production code.
 #[async_trait]
 impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
+    async fn chat_with_attempt_budget(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: ToolRoundPolicy,
+        budget: &GenerationAttemptBudget,
+    ) -> anyhow::Result<ChatResponse> {
+        self.as_ref()
+            .chat_with_attempt_budget(request, model, temperature, policy, budget)
+            .await
+    }
+
     fn supports_single_tool_rounds(&self, model: &str) -> bool {
         self.as_ref().supports_single_tool_rounds(model)
     }

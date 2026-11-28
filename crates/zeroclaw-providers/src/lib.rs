@@ -7,6 +7,7 @@ pub mod antigravity_cli;
 pub mod auth;
 pub mod azure_openai;
 pub mod bedrock;
+mod bounded;
 pub mod catalog;
 pub mod compatible;
 pub mod copilot;

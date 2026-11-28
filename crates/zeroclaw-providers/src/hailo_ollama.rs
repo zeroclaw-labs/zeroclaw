@@ -990,6 +990,7 @@ impl HailoOllamaModelProvider {
         messages: &[Message],
         model: &str,
         temperature: Option<f64>,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
     ) -> anyhow::Result<ApiChatResponse> {
         let request = self.build_request(messages.to_vec(), model, temperature);
         ::zeroclaw_log::record!(
@@ -1006,15 +1007,22 @@ impl HailoOllamaModelProvider {
         );
 
         let url = format!("{}/api/chat", self.base_url);
-        let response = self
-            .http_client()?
+        let client = match budget {
+            Some(_) => crate::bounded::client(
+                Client::builder()
+                    .timeout(std::time::Duration::from_secs(self.request_timeout_secs))
+                    .connect_timeout(std::time::Duration::from_secs(10)),
+                Some("model_provider.hailo_ollama"),
+            )?,
+            None => self.http_client()?,
+        };
+        let request = client
             .post(url)
             .headers(self.request_headers.clone())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::CONNECTION, "close")
-            .body(serialize_request(&request)?)
-            .send()
-            .await?;
+            .body(serialize_request(&request)?);
+        let response = crate::bounded::send(request, budget, None).await?;
         let status = response.status();
         let body = response.bytes().await?;
 
@@ -1108,6 +1116,7 @@ impl HailoOllamaModelProvider {
         messages: Vec<Message>,
         model: &str,
         temperature: Option<f64>,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
     ) -> anyhow::Result<ApiChatResponse> {
         let messages = self.normalize_messages(messages)?;
         let gate = self.generation_gate.clone();
@@ -1152,11 +1161,12 @@ impl HailoOllamaModelProvider {
         let provider = self.clone();
         let model = model.to_string();
         let worker_gate = gate.clone();
+        let budget = budget.cloned();
         let worker = zeroclaw_spawn::spawn!(async move {
             let _permit = permit;
             let mut in_flight = InFlightGuard::new(worker_gate);
             let result = provider
-                .send_request_inner(&messages, &model, temperature)
+                .send_request_inner(&messages, &model, temperature, budget.as_ref())
                 .await;
             if let Err(error) = &result
                 && let Some(reason) = Self::quarantine_reason(error)
@@ -1236,9 +1246,36 @@ impl HailoOllamaModelProvider {
         messages: &[ChatMessage],
         model: &str,
         temperature: Option<f64>,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
     ) -> anyhow::Result<ApiChatResponse> {
         let messages = self.convert_messages(messages);
-        self.send_request(messages, model, temperature).await
+        self.send_request(messages, model, temperature, budget)
+            .await
+    }
+}
+
+impl HailoOllamaModelProvider {
+    async fn chat_inner(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        budget: Option<&zeroclaw_api::model_provider::GenerationAttemptBudget>,
+    ) -> anyhow::Result<ChatResponse> {
+        if let Some(budget) = budget {
+            budget.ensure_available()?;
+        }
+        if request.thinking.is_some() {
+            return Err(anyhow::Error::new(NonRetryableProviderError::new(
+                "Hailo-Ollama does not support call-level thinking",
+            )));
+        }
+        let messages =
+            self.with_prompt_guided_tool_instructions(request.messages, request.tools)?;
+        let response = self
+            .chat_messages(&messages, model, temperature, budget)
+            .await?;
+        Self::response_to_chat_response(response)
     }
 }
 
@@ -1281,7 +1318,9 @@ impl ModelProvider for HailoOllamaModelProvider {
             messages.push(ChatMessage::system(system_prompt));
         }
         messages.push(ChatMessage::user(message));
-        let response = self.chat_messages(&messages, model, temperature).await?;
+        let response = self
+            .chat_messages(&messages, model, temperature, None)
+            .await?;
         Self::response_text(&response)
     }
 
@@ -1291,7 +1330,9 @@ impl ModelProvider for HailoOllamaModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let response = self.chat_messages(messages, model, temperature).await?;
+        let response = self
+            .chat_messages(messages, model, temperature, None)
+            .await?;
         Self::response_text(&response)
     }
 
@@ -1307,7 +1348,9 @@ impl ModelProvider for HailoOllamaModelProvider {
                 "Hailo-Ollama does not support native tool calling",
             )));
         }
-        let response = self.chat_messages(messages, model, temperature).await?;
+        let response = self
+            .chat_messages(messages, model, temperature, None)
+            .await?;
         Self::response_to_chat_response(response)
     }
 
@@ -1321,15 +1364,19 @@ impl ModelProvider for HailoOllamaModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
-        if request.thinking.is_some() {
-            return Err(anyhow::Error::new(NonRetryableProviderError::new(
-                "Hailo-Ollama does not support call-level thinking",
-            )));
-        }
-        let messages =
-            self.with_prompt_guided_tool_instructions(request.messages, request.tools)?;
-        let response = self.chat_messages(&messages, model, temperature).await?;
-        Self::response_to_chat_response(response)
+        self.chat_inner(request, model, temperature, None).await
+    }
+
+    async fn chat_with_attempt_budget(
+        &self,
+        request: crate::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        _policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: &zeroclaw_api::model_provider::GenerationAttemptBudget,
+    ) -> anyhow::Result<crate::traits::ChatResponse> {
+        self.chat_inner(request, model, temperature, Some(budget))
+            .await
     }
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
@@ -1615,7 +1662,7 @@ mod tests {
         provider.generation_gate.semaphore.close();
 
         let error = provider
-            .send_request(Vec::new(), "qwen3:1.7b", None)
+            .send_request(Vec::new(), "qwen3:1.7b", None, None)
             .await
             .expect_err("a closed generation semaphore must reject before transport");
 
@@ -1685,5 +1732,108 @@ mod tests {
             gate.quarantine_reason.get().is_some(),
             "the endpoint must be quarantined before a panic releases its permit"
         );
+    }
+}
+
+#[cfg(test)]
+mod attempt_budget_tests {
+    use super::*;
+    use crate::bounded::tests as fixture;
+
+    #[tokio::test]
+    async fn hailo_shares_budget_across_calls() {
+        let server = fixture::server(vec![
+            fixture::Reply::json(200, fixture::HAILO_OK),
+            fixture::Reply::json(200, fixture::HAILO_OK),
+        ])
+        .await;
+        let provider = HailoOllamaModelProvider::new(
+            "fixture",
+            Some(&server.url),
+            90,
+            5,
+            OllamaTuning::default(),
+        )
+        .unwrap();
+        fixture::assert_two_requests(&provider, &server).await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_send_does_not_refund_the_worker_budget() {
+        let server = fixture::server(vec![
+            fixture::Reply::json(200, fixture::HAILO_OK).held(),
+            fixture::Reply::json(200, fixture::HAILO_OK),
+        ])
+        .await;
+        let provider = Arc::new(
+            HailoOllamaModelProvider::new(
+                "fixture",
+                Some(&server.url),
+                90,
+                5,
+                OllamaTuning::default(),
+            )
+            .unwrap(),
+        );
+        let budget = crate::traits::GenerationAttemptBudget::new(2);
+        let child_provider = provider.clone();
+        let child_budget = budget.clone();
+        let caller = ::zeroclaw_spawn::spawn!(async move {
+            fixture::call(&child_provider, &child_budget, None).await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server.received.notified(),
+        )
+        .await
+        .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert_eq!(budget.remaining(), 1);
+        server.release.notify_one();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            fixture::call(&provider, &budget, None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            fixture::call(&provider, &budget, None)
+                .await
+                .unwrap_err()
+                .is::<crate::traits::GenerationAttemptBudgetExhausted>()
+        );
+        assert_eq!(server.requests.lock().len(), 2);
+        assert_eq!(budget.remaining(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_queue_wait_spends_nothing() {
+        let server = fixture::server(vec![fixture::Reply::json(200, fixture::HAILO_OK)]).await;
+        let provider = HailoOllamaModelProvider::new(
+            "fixture",
+            Some(&server.url),
+            90,
+            5,
+            OllamaTuning::default(),
+        )
+        .unwrap();
+        let permit = provider.generation_gate.semaphore.acquire().await.unwrap();
+        let budget = crate::traits::GenerationAttemptBudget::new(2);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                fixture::call(&provider, &budget, None)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(budget.remaining(), 2);
+        assert!(server.requests.lock().is_empty());
+        drop(permit);
+        fixture::call(&provider, &budget, None).await.unwrap();
+        assert_eq!(server.requests.lock().len(), 1);
+        assert_eq!(budget.remaining(), 1);
     }
 }

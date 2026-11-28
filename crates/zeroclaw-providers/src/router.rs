@@ -453,6 +453,31 @@ impl ModelProvider for RouterModelProvider {
         .await
     }
 
+    async fn chat_with_attempt_budget(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+        budget: &zeroclaw_api::model_provider::GenerationAttemptBudget,
+    ) -> anyhow::Result<ChatResponse> {
+        mark_current_dispatch_composite();
+        let (provider_idx, resolved_model) = self.resolve(model);
+        let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        with_exact_dispatch_route(
+            provider_name.clone(),
+            resolved_model.clone(),
+            ProviderDispatch::from_ref(&**model_provider).chat_with_attempt_budget(
+                request,
+                &resolved_model,
+                temperature,
+                policy,
+                budget,
+            ),
+        )
+        .await
+    }
+
     async fn chat_with_tools(
         &self,
         messages: &[ChatMessage],
