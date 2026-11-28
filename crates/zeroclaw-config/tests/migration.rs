@@ -2884,10 +2884,10 @@ fn map_key_sections_exposes_typed_family_slots() {
     // Config::map_key_sections()). Verify every providers.<category>
     // typed-family root has its per-type slots registered there.
     use zeroclaw_config::schema::Config;
-    let paths: std::collections::HashSet<&'static str> = Config::map_key_sections()
+    let paths: std::collections::HashSet<String> = Config::map_key_sections()
         .iter()
         .filter(|s| matches!(s.kind, zeroclaw_config::traits::MapKeyKind::Map))
-        .map(|s| s.path)
+        .map(|s| s.path.clone())
         .collect();
     for required in [
         "providers.models.anthropic",
@@ -3032,26 +3032,26 @@ deny_all_tools = true
 const V4_FIXTURE: &str = include_str!("../fixtures/v4.toml");
 
 #[test]
-fn v4_fixture_is_at_current_version() {
+fn v4_fixture_is_at_its_frozen_version() {
     let v: toml::Value = toml::from_str(V4_FIXTURE).expect("V4 fixture parses as TOML");
     assert_eq!(detect_version(&v).expect("detect V4"), 4);
-    assert_eq!(CURRENT_SCHEMA_VERSION, 4);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 5);
 }
 
 #[test]
 fn v4_fixture_loads_as_config() {
     let cfg: Config = toml::from_str(V4_FIXTURE).expect("V4 fixture parses as Config");
-    assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
+    assert_eq!(cfg.schema_version, 4);
 }
 
 #[test]
-fn v4_fixture_is_migration_idempotent() {
-    assert!(
-        migrate_file(V4_FIXTURE)
-            .expect("migrate_file on V4 succeeds")
-            .is_none(),
-        "a config already at CURRENT_SCHEMA_VERSION with no retired key must not be rewritten"
-    );
+fn v4_fixture_migrates_to_v5_then_is_idempotent() {
+    let migrated = migrate_file(V4_FIXTURE)
+        .expect("migrate_file on V4 succeeds")
+        .expect("released V4 must migrate to V5");
+    let value: toml::Value = toml::from_str(&migrated).unwrap();
+    assert_eq!(value["schema_version"].as_integer(), Some(5));
+    assert!(migrate_file(&migrated).unwrap().is_none());
 }
 
 #[test]

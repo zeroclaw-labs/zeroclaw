@@ -96,6 +96,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "tool.pushover",
     "tool.web_search",
     "memory.embeddings",
+    "decision",
     "tunnel.custom",
     "transcription.groq",
     "transcription.openai",
@@ -882,6 +883,34 @@ impl WireApi {
         match self {
             Self::Responses => "responses",
             Self::ChatCompletions => "chat_completions",
+        }
+    }
+}
+
+/// Wire protocol used by a typed decision model.
+///
+/// `openai_decisions` is OpenAI's dedicated Decisions API (`POST
+/// /v1/decisions`). OpenAI-compatible gateways and local servers can expose
+/// the same contract. `system_one` keeps the existing Jev / Laya contract
+/// available for legacy decision entries. Chat Completions and Responses are
+/// chat wire APIs and are intentionally represented by [`WireApi`] instead.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionWireApi {
+    #[serde(rename = "openai_decisions")]
+    OpenAiDecisions,
+    SystemOne,
+}
+
+impl DecisionWireApi {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiDecisions => "openai_decisions",
+            Self::SystemOne => "system_one",
         }
     }
 }
@@ -12432,6 +12461,32 @@ pub fn apply_runtime_proxy_to_builder(
     service_key: &str,
 ) -> reqwest::ClientBuilder {
     runtime_proxy_config().apply_to_reqwest_builder(builder, service_key)
+}
+
+/// Reuse a customized client for the current proxy generation. `profile` must
+/// identify all transport settings supplied by `configure`, without secrets.
+/// Proxy changes invalidate this cache through the existing runtime authority.
+pub fn try_build_runtime_proxy_client_with(
+    service_key: &str,
+    profile: &str,
+    configure: impl FnOnce(reqwest::ClientBuilder) -> anyhow::Result<reqwest::ClientBuilder>,
+) -> anyhow::Result<reqwest::Client> {
+    let cache_key = format!("custom|{service_key}|{profile}");
+    if let Some(client) = runtime_proxy_cached_client(&cache_key) {
+        return Ok(client);
+    }
+    let (generation, proxy) = runtime_proxy_config_snapshot();
+    if proxy.should_apply_to_service(service_key) {
+        proxy.validate().map_err(|_| {
+            anyhow::Error::msg(format!(
+                "Invalid runtime proxy configuration for {service_key}"
+            ))
+        })?;
+    }
+    let builder = proxy.try_apply_to_reqwest_builder(reqwest::Client::builder(), service_key)?;
+    let client = configure(builder)?.build()?;
+    set_runtime_proxy_cached_client(cache_key, generation, client.clone());
+    Ok(client)
 }
 
 pub fn build_runtime_proxy_client(service_key: &str) -> reqwest::Client {
@@ -27366,7 +27421,7 @@ impl Config {
 
     fn ensure_key_for_path(&mut self, path: &str, include_lists: bool) -> bool {
         use crate::traits::MapKeyKind;
-        let mut best: Option<&'static str> = None;
+        let mut best: Option<String> = None;
         for s in Self::map_key_sections()
             .iter()
             .filter(|s| {
@@ -27378,9 +27433,9 @@ impl Config {
             let prefix = format!("{}.", s.path);
             if path.starts_with(&prefix)
                 && path.len() > prefix.len()
-                && best.is_none_or(|b| s.path.len() > b.len())
+                && best.as_ref().is_none_or(|b| s.path.len() > b.len())
             {
-                best = Some(s.path);
+                best = Some(s.path.clone());
             }
         }
         let Some(section) = best else {
@@ -27391,7 +27446,7 @@ impl Config {
             return false;
         };
         if self
-            .get_map_keys(section)
+            .get_map_keys(&section)
             .is_some_and(|keys| keys.iter().any(|k| k == alias))
         {
             return false;
@@ -27424,7 +27479,7 @@ impl Config {
         // helper `ensure_map_key_for_prop_path` (src/main.rs) uses: never gate
         // this on the earlier `get_map_keys` pre-check, or a bogus tail field
         // on an already-existing alias would delete a legitimate config entry.
-        if matches!(self.create_map_key(section, alias), Ok(true))
+        if matches!(self.create_map_key(&section, alias), Ok(true))
             && self.get_prop(path).is_err()
             // A missing entry under a dynamic secret map is a valid first
             // write, not an unknown schema tail. `get_prop` can only read
@@ -27433,7 +27488,7 @@ impl Config {
             // recognizes the map prefix without requiring the key to exist.
             && !Self::prop_is_secret(path)
         {
-            let _ = self.delete_map_key(section, alias);
+            let _ = self.delete_map_key(&section, alias);
         }
         false
     }
@@ -27451,7 +27506,7 @@ impl Config {
             return Ok(());
         };
         let remainder = &name[section.path.len() + 1..];
-        let Some(keys) = self.get_map_keys(section.path) else {
+        let Some(keys) = self.get_map_keys(&section.path) else {
             return Ok(());
         };
         if !keys.iter().any(|key| key == remainder) {
@@ -27461,7 +27516,7 @@ impl Config {
         let Some((field_key, inner_name)) = crate::helpers::route_hashmap_path(
             name,
             "",
-            section.path,
+            &section.path,
             "",
             keys.iter().map(String::as_str),
         ) else {
@@ -28311,7 +28366,7 @@ fn apply_dirty_path(
 /// `"mcp.servers"`); `natural_key_field` is the snake_case field name
 /// on the inner type that holds each element's alias (e.g. `"name"`).
 struct NaturalKeySection {
-    section_path: &'static str,
+    section_path: String,
     natural_key_field: &'static str,
 }
 
@@ -28361,7 +28416,7 @@ fn find_natural_key_section_for_path(dotted: &str) -> Option<NaturalKeySection> 
         // have *something* after the dot" guard a natural fallout of
         // the second `strip_prefix('.')` rather than a length check.
         let Some(after) = dotted
-            .strip_prefix(section.path)
+            .strip_prefix(&section.path)
             .and_then(|s| s.strip_prefix('.'))
         else {
             continue;
@@ -28378,7 +28433,7 @@ fn find_natural_key_section_for_path(dotted: &str) -> Option<NaturalKeySection> 
             .is_none_or(|b| section.path.len() > b.section_path.len());
         if better {
             best = Some(NaturalKeySection {
-                section_path: section.path,
+                section_path: section.path.clone(),
                 natural_key_field,
             });
         }
@@ -28444,7 +28499,7 @@ fn apply_dirty_natural_key_path(
     // `find_natural_key_section_for_path`; split the alias and inner
     // suffix off the tail.
     let rest = match dotted
-        .strip_prefix(section.section_path)
+        .strip_prefix(&section.section_path)
         .and_then(|s| s.strip_prefix('.'))
     {
         Some(r) => r,
@@ -28621,7 +28676,7 @@ fn find_map_key_section_for_path(dotted: &str) -> Option<crate::traits::MapKeySe
             continue;
         }
         let Some(after) = dotted
-            .strip_prefix(section.path)
+            .strip_prefix(&section.path)
             .and_then(|s| s.strip_prefix('.'))
         else {
             continue;
@@ -28689,7 +28744,7 @@ fn apply_dirty_map_key_path(
     let key_match: Option<(&str, Option<String>)> = if keys.contains(&remainder) {
         Some((remainder, None))
     } else {
-        crate::helpers::route_hashmap_path(dotted, "", section.path, "", keys.iter().copied())
+        crate::helpers::route_hashmap_path(dotted, "", &section.path, "", keys.iter().copied())
             .map(|(key, inner)| (key, Some(inner)))
     };
 
@@ -42365,6 +42420,36 @@ api_token = "tok"
     }
 
     #[test]
+    async fn customized_proxy_client_reuses_pool_and_rebuilds_after_proxy_change() {
+        let _env_guard = env_override_lock().await;
+        let previous = runtime_proxy_config();
+        let builds = std::cell::Cell::new(0);
+        let build = || {
+            try_build_runtime_proxy_client_with("memory.embeddings", "reuse-test", |builder| {
+                builds.set(builds.get() + 1);
+                Ok(builder.redirect(reqwest::redirect::Policy::none()))
+            })
+            .unwrap()
+        };
+        set_runtime_proxy_config(ProxyConfig::default());
+        let _first = build();
+        let _second = build();
+        assert_eq!(
+            builds.get(),
+            1,
+            "unchanged transports reuse the client pool"
+        );
+        set_runtime_proxy_config(ProxyConfig::default());
+        let _third = build();
+        assert_eq!(
+            builds.get(),
+            2,
+            "proxy publication invalidates cached clients"
+        );
+        set_runtime_proxy_config(previous);
+    }
+
+    #[test]
     async fn runtime_proxy_client_cache_reuses_default_profile_key() {
         let _env_guard = env_override_lock().await;
         let service_key = format!(
@@ -50800,7 +50885,7 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         for (first, second) in first.iter().zip(second) {
             assert_eq!(
                 (
-                    first.path,
+                    &first.path,
                     first.kind,
                     first.value_type,
                     first.description,
@@ -50808,7 +50893,7 @@ api_key = "op://zeroclaw/provider/openai-api-key"
                     first.resource_key,
                 ),
                 (
-                    second.path,
+                    &second.path,
                     second.kind,
                     second.value_type,
                     second.description,
@@ -50816,17 +50901,11 @@ api_key = "op://zeroclaw/provider/openai-api-key"
                     second.resource_key,
                 ),
             );
-            assert_eq!(
-                first.path.as_ptr(),
-                second.path.as_ptr(),
-                "schema path {} must reuse its static backing storage",
-                first.path,
-            );
         }
     }
 
     #[test]
-    async fn map_key_sections_reuses_static_paths() {
+    async fn map_key_sections_reuses_path_values() {
         let sections = Config::map_key_sections();
         for path in ["agents", "model_routes", "mcp.servers", "cost.rates.tools"] {
             assert!(sections.iter().any(|section| section.path == path));
