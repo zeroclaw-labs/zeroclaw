@@ -151,44 +151,10 @@ pub fn clamp_temperature(temp: f64) -> f64 {
     temp.clamp(0.0, 2.0)
 }
 
-pub struct ResolvedThinking {
-    pub effective_message: String,
-    pub params: ThinkingParams,
-    pub effective_temperature: f64,
-}
-
 /// Validate thinking config at startup. Call once during agent
 /// initialization to warn about unrecognized budget_tokens keys.
 pub fn validate_thinking_config(config: &ThinkingConfig) {
     config.warn_unknown_budget_keys();
-}
-
-pub fn resolve_thinking_from_message(
-    message: &str,
-    config: &ThinkingConfig,
-    base_temperature: f64,
-) -> ResolvedThinking {
-    let (directive, effective_message) = match parse_thinking_directive(message) {
-        Some((level, remaining)) => {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                    .with_attrs(::serde_json::json!({"thinking_level": format!("{level:?}")})),
-                "Thinking directive parsed from message"
-            );
-            (Some(level), remaining)
-        }
-        None => (None, message.to_string()),
-    };
-    let level = resolve_thinking_level(directive, None, config);
-    let params = apply_thinking_level_with_config(level, config);
-    let effective_temperature = clamp_temperature(base_temperature + params.temperature_adjustment);
-    ResolvedThinking {
-        effective_message,
-        params,
-        effective_temperature,
-    }
 }
 
 #[cfg(test)]
