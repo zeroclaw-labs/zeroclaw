@@ -13,6 +13,13 @@ use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 
+thread_local! {
+    /// End of the current connection preparation's lock wait window, read by
+    /// [`wait_within_preparation_window`]. Set only while
+    /// `initialize_schema` runs on this thread.
+    static PREPARATION_DEADLINE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
 #[cfg(test)]
 thread_local! {
     static PATCH_WRITER_WAIT: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
@@ -2309,34 +2316,93 @@ fn apply_run_completion_state(
 /// outlasts the busy window in ANY phase — refuses the operation before it
 /// starts rather than letting it run against an incompletely recovered or
 /// migrated database.
+///
+/// Every phase is safe to repeat and runs on each open, so lock contention
+/// in any of them retries the whole preparation until one shared deadline.
+/// That covers the statements SQLite refuses at once without consulting the
+/// busy handler: a schema read overtaken by another connection's commit
+/// before its write. Every lock wait during preparation, in any phase and
+/// any statement, ends at that same deadline, so a writer that outlasts the
+/// window is still refused once, at the window.
 fn initialize_schema(conn: &Connection, config: &Config) -> Result<()> {
-    apply_schema_and_migrations(conn, config).map_err(|err| {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(CRON_BUSY_TIMEOUT_MS);
+    let _window = PreparationWindow::open(conn, deadline)?;
+    loop {
+        let err = match apply_schema_and_migrations(conn, config, deadline) {
+            Ok(()) => {
+                // The operation that follows gets its own full window.
+                conn.busy_timeout(std::time::Duration::from_millis(CRON_BUSY_TIMEOUT_MS))
+                    .context("Failed to set cron DB busy timeout")?;
+                return Ok(());
+            }
+            Err(err) => err,
+        };
         let contended = err
             .chain()
             .filter_map(|cause| cause.downcast_ref::<rusqlite::Error>())
             .any(is_lock_contention);
-        if contended {
-            err.context(MIGRATION_CONTENTION_CONTEXT)
-        } else {
-            err
+        if !contended {
+            return Err(err);
         }
-    })
+        if std::time::Instant::now() >= deadline {
+            return Err(err.context(MIGRATION_CONTENTION_CONTEXT));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
-fn apply_schema_and_migrations(conn: &Connection, config: &Config) -> Result<()> {
+/// Holds the preparation window open: while it lives, every SQLite lock
+/// wait on the connection ends at the deadline it was opened with. Dropping
+/// it clears the thread's deadline, so the handler stops waiting at once if
+/// the connection outlives a failed preparation.
+struct PreparationWindow;
+
+impl PreparationWindow {
+    fn open(conn: &Connection, deadline: std::time::Instant) -> Result<Self> {
+        PREPARATION_DEADLINE.set(Some(deadline));
+        let window = Self;
+        conn.busy_handler(Some(wait_within_preparation_window))
+            .context("Failed to set cron DB busy handler")?;
+        Ok(window)
+    }
+}
+
+impl Drop for PreparationWindow {
+    fn drop(&mut self) {
+        PREPARATION_DEADLINE.set(None);
+    }
+}
+
+/// SQLite busy handler for connection preparation: keep waiting in short
+/// steps until the thread's preparation deadline, then give up.
+fn wait_within_preparation_window(_attempt: i32) -> bool {
+    let Some(deadline) = PREPARATION_DEADLINE.get() else {
+        return false;
+    };
+    let now = std::time::Instant::now();
+    if now >= deadline {
+        return false;
+    }
+    std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(5)));
+    true
+}
+
+fn apply_schema_and_migrations(
+    conn: &Connection,
+    config: &Config,
+    deadline: std::time::Instant,
+) -> Result<()> {
     // Wait for a competing writer instead of failing on first contention,
     // and WAL so readers never block a migration commit — as the SOP, task,
     // cert, and ACP stores do. Unlike them, synchronous stays FULL: a commit
     // lost to power failure here can re-run a one-shot job's side effect or
     // resurrect a removed job, so cron keeps the pre-WAL durability.
-    // Set before recovery below so its write transactions are covered too;
-    // contention that outlasts the busy window fails the open closed.
-    conn.execute_batch(
-        "PRAGMA busy_timeout = 5000;
-         PRAGMA journal_mode = WAL;
-         PRAGMA synchronous = FULL;",
-    )
-    .context("Failed to set cron DB connection pragmas")?;
+    // The busy handler `initialize_schema` installed covers every phase
+    // below; contention that outlasts the window fails the open closed.
+    conn.execute_batch("PRAGMA synchronous = FULL;")
+        .context("Failed to set cron DB connection pragmas")?;
+    enable_wal(conn, deadline)?;
 
     // Before anything references cron_runs: in the between-DROP-and-RENAME
     // state an interrupted (predecessor, non-atomic) rebuild leaves behind,
@@ -2471,6 +2537,29 @@ fn apply_schema_and_migrations(conn: &Connection, config: &Config) -> Result<()>
     super::outbox::initialize_schema(conn)?;
 
     Ok(())
+}
+
+/// How long a cron connection waits for a competing writer.
+const CRON_BUSY_TIMEOUT_MS: u64 = 5000;
+
+/// Switch the connection to WAL, waiting out contention like every other
+/// phase. While a new database file is still in rollback-journal mode, SQLite
+/// fails the switch at once if another connection holds a lock, without
+/// consulting the busy handler, so two connections opening a fresh file
+/// together refused one of them immediately. Once the file is in WAL mode
+/// the switch is a no-op and never contends.
+fn enable_wal(conn: &Connection, deadline: std::time::Instant) -> Result<()> {
+    loop {
+        match conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+            row.get::<_, String>(0)
+        }) {
+            Ok(_) => return Ok(()),
+            Err(err) if is_lock_contention(&err) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(err) => return Err(err).context("Failed to set cron DB journal mode"),
+        }
+    }
 }
 
 /// True when SQLite reports lock contention with another connection.
@@ -7456,5 +7545,99 @@ schedule = { kind = "every", every_ms = 300000 }
         // it for API/admin visibility, but execution won't pick it up).
         let job = get_job(&config, "orphan-decl").unwrap();
         assert_eq!(job.source, "declarative");
+    }
+
+    #[test]
+    fn opening_a_fresh_database_waits_for_a_competing_writer() {
+        // A brand-new file starts in rollback-journal mode. While another
+        // connection holds its write lock, the switch to WAL must wait for
+        // it like every other phase, not refuse the operation at once.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let path = cron_db(&config);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let holder = Connection::open(&path).unwrap();
+        holder
+            .execute_batch(
+                "CREATE TABLE warmup (x INTEGER); BEGIN IMMEDIATE; INSERT INTO warmup VALUES (1);",
+            )
+            .unwrap();
+        // Started before the release thread, so a slow spawn can only make
+        // the measured wait longer, never shorter than the writer's hold.
+        let started = std::time::Instant::now();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            holder.execute_batch("COMMIT").unwrap();
+        });
+
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok");
+        let waited = started.elapsed();
+        release.join().unwrap();
+        let job = job.expect("a fresh database must wait out a competing writer");
+        assert!(
+            waited >= std::time::Duration::from_millis(250),
+            "the open should have waited for the writer, returned after {waited:?}"
+        );
+        assert_eq!(get_job(&config, &job.id).unwrap().id, job.id);
+    }
+
+    #[test]
+    fn two_connections_opening_a_fresh_database_both_succeed() {
+        use std::sync::{Arc, Barrier};
+        for round in 0..40 {
+            let tmp = TempDir::new().unwrap();
+            let config = Arc::new(test_config(&tmp));
+            let barrier = Arc::new(Barrier::new(2));
+            let handles: Vec<_> = (0..2)
+                .map(|who| {
+                    let (config, barrier) = (config.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        add_job(&config, "test-agent", "*/5 * * * *", &format!("echo {who}"))
+                            .map(|_| ())
+                            .map_err(|e| format!("round {round}, opener {who}: {e:#}"))
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_writer_outlasting_the_window_is_refused_once_at_the_window() {
+        // The retry loop ends at the shared deadline: a writer held past the
+        // window on a fresh file, where preparation must write, still gets
+        // one retryable refusal at the window, not a longer wait or a
+        // different error.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let path = cron_db(&config);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let holder = Connection::open(&path).unwrap();
+        holder
+            .execute_batch(
+                "CREATE TABLE warmup (x INTEGER); BEGIN IMMEDIATE; INSERT INTO warmup VALUES (1);",
+            )
+            .unwrap();
+        let started = std::time::Instant::now();
+        let result = add_job(&config, "test-agent", "*/5 * * * *", "echo again");
+        let waited = started.elapsed();
+        let err = result.expect_err("a writer held past the window must refuse the open");
+        assert!(
+            format!("{err:#}").contains(MIGRATION_CONTENTION_CONTEXT),
+            "expected the retryable contention refusal, got: {err:#}"
+        );
+        let window = std::time::Duration::from_millis(CRON_BUSY_TIMEOUT_MS);
+        assert!(
+            waited >= window - std::time::Duration::from_millis(250),
+            "the open gave up before the window: {waited:?}"
+        );
+        assert!(
+            waited < window + std::time::Duration::from_millis(2500),
+            "retries stretched the wait past the window: {waited:?}"
+        );
+        drop(holder);
     }
 }
