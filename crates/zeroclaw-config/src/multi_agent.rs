@@ -100,6 +100,9 @@ pub enum MemoryBackendKind {
     /// Hybrid local SQLite + external Lucid CLI
     /// (`crates/zeroclaw-memory/src/lucid.rs`).
     Lucid,
+    /// EverOS HTTP sidecar (`crates/zeroclaw-memory/src/everos.rs`).
+    /// Durable Markdown-backed memory via a local EverOS server.
+    Everos,
 }
 
 /// Per-agent workspace and cross-agent access configuration.
@@ -434,6 +437,7 @@ external_peers = ["@user_1", "@user_2"]
             (MemoryBackendKind::Qdrant, "\"qdrant\""),
             (MemoryBackendKind::Markdown, "\"markdown\""),
             (MemoryBackendKind::Lucid, "\"lucid\""),
+            (MemoryBackendKind::Everos, "\"everos\""),
         ];
         for (kind, expected) in cases {
             let json = serde_json::to_string(&kind).unwrap();

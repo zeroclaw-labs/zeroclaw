@@ -177,6 +177,7 @@ pub enum MemoryBackendKind {
     Qdrant,
     Markdown,
     Lucid,
+    Everos,
 }
 
 // ── Config explorer wire shapes ────────────────────────────────
