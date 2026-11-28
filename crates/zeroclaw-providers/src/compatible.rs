@@ -2681,6 +2681,37 @@ fn is_valid_mistral_tool_call_id(id: &str) -> bool {
     id.len() == 9 && id.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
+/// Read the `tool_call_id` out of the leading JSON envelope of a tool-result
+/// content string, tolerating trailing bytes.
+///
+/// Some replay paths concatenate a follow-up turn onto the result text, which
+/// leaves the envelope itself intact but makes the whole string invalid JSON.
+/// Parsing just the first value recovers the id the result belongs to, so the
+/// request keeps a `role=tool` message that carries its `tool_call_id` (strict
+/// providers reject the entire request otherwise).
+fn recover_leading_tool_call_id(content: &str) -> Option<String> {
+    let mut values = serde_json::Deserializer::from_str(content).into_iter::<serde_json::Value>();
+    let value = values.next()?.ok()?;
+    value.get("tool_call_id")?.as_str().map(ToString::to_string)
+}
+
+/// Consume an explicit result ID, or infer it when exactly one current call is still pending.
+fn take_tool_result_id(pending: &mut Vec<String>, explicit: Option<String>) -> Option<String> {
+    if let Some(id) = explicit {
+        if let Some(index) = pending.iter().position(|call| call == &id) {
+            pending.swap_remove(index);
+        }
+        return Some(id);
+    }
+    if pending.len() == 1 {
+        return pending.pop();
+    }
+    // This result could belong to any pending call. Later explicit IDs remain usable,
+    // but another anonymous result can no longer be paired reliably in this batch.
+    pending.clear();
+    None
+}
+
 fn reserve_tool_call_id_for_contract(
     targets_mistral_tool_call_contract: bool,
     raw_id: Option<String>,
@@ -3555,12 +3586,15 @@ impl OpenAiCompatibleModelProvider {
         let requires_string_tool_call_content = self.requires_string_tool_call_content();
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let mut tool_call_id_map = std::collections::HashMap::new();
-        let mut last_assistant_tool_call_ids: Vec<String> = Vec::new();
+        let mut pending_tool_call_ids = Vec::new();
         let mut tool_name_map = std::collections::HashMap::new();
 
         let native: Vec<NativeMessage> = messages
             .iter()
             .map(|message| {
+                if message.role != "tool" {
+                    pending_tool_call_ids.clear();
+                }
                 if message.role == "assistant"
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
                     && let Some(tool_calls_value) = value.get("tool_calls")
@@ -3570,6 +3604,7 @@ impl OpenAiCompatibleModelProvider {
                     let tool_calls = parsed_calls
                         .into_iter()
                         .map(|tc| {
+                            pending_tool_call_ids.push(tc.id.clone());
                             let tc_id = tc.id.clone();
                             let tc_name = tc.name.clone();
                             tool_name_map.insert(tc_id, tc_name);
@@ -3597,9 +3632,6 @@ impl OpenAiCompatibleModelProvider {
                             }
                         })
                         .collect::<Vec<_>>();
-
-                    last_assistant_tool_call_ids =
-                        tool_calls.iter().filter_map(|tc| tc.id.clone()).collect();
 
                     let content = crate::request_payload::non_empty_string_field(&value, "content")
                         .map(MessageContent::Text)
@@ -3650,79 +3682,50 @@ impl OpenAiCompatibleModelProvider {
                     };
                 }
 
-                if message.role == "tool"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
-                {
-                    let mut tool_call_id = value
-                        .get("tool_call_id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|raw_id| {
-                            tool_call_id_map.get(raw_id).cloned().unwrap_or_else(|| {
-                                let normalized_id = reserve_tool_call_id_for_contract(
-                                    targets_mistral_tool_call_contract,
-                                    Some(raw_id.to_string()),
-                                    &mut used_tool_call_ids,
-                                );
-                                tool_call_id_map.insert(raw_id.to_string(), normalized_id.clone());
-                                normalized_id
-                            })
-                        });
-                    // Fallback: if the tool result JSON dropped the tool_call_id,
-                    // borrow the first id from the most recent assistant message.
-                    // Some multi-turn reconstruction paths strip this field, and
-                    // strict backends (Groq, Mistral) reject null/missing ids.
-                    if tool_call_id.is_none() && !last_assistant_tool_call_ids.is_empty() {
-                        tool_call_id = last_assistant_tool_call_ids.first().cloned();
-                    }
-                    // The envelope's attachments are the only image source:
-                    // the content string is never scanned for markers.
-                    // Declaredness comes from the one classifier, so this
-                    // seam cannot drift from the adapters on what counts as
-                    // a declaration.
-                    let attachments = classify("tool", &message.content)
-                        .filter(|parts| parts.declared)
-                        .map(|parts| parts.attachments)
-                        .unwrap_or_default();
-                    let content = value
-                        .get("content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|body| {
-                            self.tool_carrier_content(body, &attachments, allow_user_image_parts)
-                        })
-                        .or_else(|| {
-                            Some(self.message_content_for_role(
-                                "tool",
-                                &message.content,
-                                allow_user_image_parts,
-                            ))
-                        });
-
-                    // Groq native tool calling requires the tool `name` on
-                    // every role-tool message; look it up from the paired
-                    // assistant tool-call, falling back to any name carried
-                    // in the tool message content itself./
-                    let tool_name = value
-                        .get("tool_call_id")
-                        .and_then(serde_json::Value::as_str)
-                        .and_then(|raw_id| tool_name_map.get(raw_id).cloned())
-                        .or_else(|| {
-                            value
-                                .get("name")
-                                .and_then(serde_json::Value::as_str)
-                                .map(ToString::to_string)
-                        });
-
-                    return NativeMessage {
-                        role: "tool".to_string(),
-                        content,
-                        tool_call_id,
-                        tool_calls: None,
-                        reasoning_content: None,
-                        reasoning: None,
-                        thinking_blocks: None,
-                        name: tool_name,
+                let (tool_call_id, name) = if message.role == "tool" {
+                    let envelope = serde_json::from_str::<serde_json::Value>(&message.content).ok();
+                    let explicit_id = match &envelope {
+                        Some(value) => value
+                            .get("tool_call_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned),
+                        None => recover_leading_tool_call_id(&message.content),
                     };
-                }
+                    let raw_id = take_tool_result_id(&mut pending_tool_call_ids, explicit_id);
+                    let name = raw_id
+                        .as_ref()
+                        .and_then(|id| tool_name_map.get(id).cloned())
+                        .or_else(|| envelope.as_ref()?.get("name")?.as_str().map(str::to_owned));
+                    let tool_call_id = raw_id.map(|id| {
+                        tool_call_id_map
+                            .entry(id.clone())
+                            .or_insert_with(|| {
+                                reserve_tool_call_id_for_contract(
+                                    targets_mistral_tool_call_contract,
+                                    Some(id),
+                                    &mut used_tool_call_ids,
+                                )
+                            })
+                            .clone()
+                    });
+                    if tool_call_id.is_none() {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "content_chars": message.content.chars().count(),
+                            })),
+                            "tool-result message has no explicit or unambiguous pending call ID"
+                        );
+                    }
+                    (tool_call_id, name)
+                } else {
+                    (None, None)
+                };
 
                 NativeMessage {
                     role: message.role.clone(),
@@ -3731,12 +3734,12 @@ impl OpenAiCompatibleModelProvider {
                         &message.content,
                         allow_user_image_parts,
                     )),
-                    tool_call_id: None,
+                    tool_call_id,
                     tool_calls: None,
                     reasoning_content: None,
                     reasoning: None,
                     thinking_blocks: None,
-                    name: None,
+                    name,
                 }
             })
             .collect();
@@ -5453,6 +5456,25 @@ mod tests {
     fn sanitize_tool_arguments_empty_or_whitespace_becomes_empty_object() {
         assert_eq!(sanitize_tool_arguments("f", ""), "{}");
         assert_eq!(sanitize_tool_arguments("f", "   \n\t  "), "{}");
+    }
+
+    /// A tool-result envelope that some replay path extended with trailing
+    /// prose is still readable: take the leading JSON value and keep the id so
+    /// `role=tool` never reaches the wire without `tool_call_id`.
+    #[test]
+    fn recover_leading_tool_call_id_tolerates_trailing_turn() {
+        assert_eq!(
+            recover_leading_tool_call_id(
+                "{\"content\":\"out\",\"tool_call_id\":\"call_1\"}\n\ngrade the host"
+            ),
+            Some("call_1".to_string())
+        );
+        assert_eq!(recover_leading_tool_call_id("plain tool output"), None);
+        assert_eq!(
+            recover_leading_tool_call_id("{\"content\":\"out\"}"),
+            None,
+            "an envelope without an id yields nothing"
+        );
     }
 
     /// The `/models` success path buffers the whole body before parsing, so a
@@ -11659,6 +11681,144 @@ mod tests {
             converted[0].content.as_ref(),
             Some(MessageContent::Text(value)) if value == "done"
         ));
+    }
+
+    /// A contract that rewrites ids (Mistral allows nine alphanumeric
+    /// characters) must see the assistant call and its tool result carry the
+    /// same id, including when the result envelope only parses as a leading
+    /// JSON value because a replayed turn was appended to it.
+    #[test]
+    fn convert_messages_for_native_maps_recovered_tool_id_through_contract() {
+        let input = vec![
+            ChatMessage::user("run it"),
+            ChatMessage::assistant(
+                r#"{"content":null,"tool_calls":[{"id":"call_1","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(
+                "{\"tool_call_id\":\"call_1\",\"content\":\"out\",\"attachments\":[]}\n\ngo again",
+            ),
+        ];
+        let provider = make_model_provider("mistral", "https://api.mistral.ai", None);
+        let converted = provider.convert_messages_for_native(&input, true);
+
+        let call_id = converted[1]
+            .tool_calls
+            .as_ref()
+            .expect("the assistant turn keeps its tool call")[0]
+            .id
+            .clone()
+            .expect("the assistant call carries an id");
+        assert_eq!(call_id.len(), 9, "the Mistral contract rewrites ids");
+        assert_eq!(
+            converted[2].tool_call_id.as_deref(),
+            Some(call_id.as_str()),
+            "a recovered result id must be resolved through the same map as the call"
+        );
+    }
+
+    #[test]
+    fn explicit_and_inferred_results_consume_each_pending_call_once() {
+        let mut pending = vec!["a".into(), "b".into()];
+        assert_eq!(
+            take_tool_result_id(&mut pending, Some("b".into())).as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            take_tool_result_id(&mut pending, None).as_deref(),
+            Some("a")
+        );
+        assert_eq!(take_tool_result_id(&mut pending, None), None);
+    }
+
+    #[test]
+    fn ambiguous_result_disables_later_guessing_but_keeps_explicit_ids() {
+        let mut pending = vec!["a".into(), "b".into()];
+        assert_eq!(take_tool_result_id(&mut pending, None), None);
+        assert_eq!(
+            take_tool_result_id(&mut pending, Some("a".into())).as_deref(),
+            Some("a")
+        );
+        assert_eq!(take_tool_result_id(&mut pending, None), None);
+    }
+
+    #[test]
+    fn replay_pairs_parallel_result_ids_and_names_after_damage() {
+        let provider = make_model_provider("mistral", "https://api.mistral.ai", None);
+        let calls = r#"{"tool_calls":[{"id":"call_alpha","name":"read","arguments":"{}"},{"id":"call_beta","name":"list","arguments":"{}"}]}"#;
+        let completed = r#"{"tool_call_id":"call_beta","content":"listed"}"#;
+        for (first, second) in [
+            (completed.to_owned(), "partial result".to_owned()),
+            (
+                format!("{completed}\nfollow up"),
+                r#"{"content":"read result"}"#.to_owned(),
+            ),
+        ] {
+            let input = [
+                ChatMessage::assistant(calls),
+                ChatMessage::tool(first),
+                ChatMessage::tool(second),
+            ];
+            let native = provider.convert_messages_for_native(&input, true);
+            let assistant = native[0].tool_calls.as_ref().unwrap();
+            for (result, call, name) in [(1, 1, "list"), (2, 0, "read")] {
+                let normalized = assistant[call].id.as_deref().unwrap();
+                assert_eq!(normalized.len(), 9);
+                assert_eq!(native[result].tool_call_id.as_deref(), Some(normalized));
+                assert_eq!(native[result].name.as_deref(), Some(name));
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_turn_ends_id_recovery_for_the_previous_batch() {
+        let provider = make_model_provider("test", "https://example.com", None);
+        let input = [
+            ChatMessage::assistant(
+                r#"{"tool_calls":[{"id":"old","name":"read","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::user("next turn"),
+            ChatMessage::tool("partial result"),
+        ];
+        let native = provider.convert_messages_for_native(&input, true);
+        assert!(native[2].tool_call_id.is_none());
+        assert!(native[2].name.is_none());
+    }
+
+    /// A recovered tool result must also carry the paired assistant
+    /// tool-call's `name`: Groq requires it on every role-tool message, so
+    /// leaving it unset would keep replaying damaged envelopes failing there
+    /// even after the id is restored.
+    #[test]
+    fn convert_messages_for_native_recovers_tool_result_name_from_tool_name_map() {
+        let input = vec![
+            ChatMessage::user("run it"),
+            ChatMessage::assistant(
+                r#"{"content":null,"tool_calls":[{"id":"call_1","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(
+                "{\"tool_call_id\":\"call_1\",\"content\":\"out\",\"attachments\":[]}\n\ngo again",
+            ),
+        ];
+        let provider = make_model_provider("test", "https://example.com", None);
+        let converted = provider.convert_messages_for_native(&input, true);
+
+        let carrier_call_id = converted[1]
+            .tool_calls
+            .as_ref()
+            .expect("the assistant turn keeps its tool call")[0]
+            .id
+            .clone()
+            .expect("the assistant call carries an id");
+        assert_eq!(
+            converted[2].tool_call_id.as_deref(),
+            Some(carrier_call_id.as_str()),
+            "a recovered result id must be resolved through the same map as the call"
+        );
+        assert_eq!(
+            converted[2].name.as_deref(),
+            Some("shell"),
+            "a recovered result must carry the paired assistant tool-call's name"
+        );
     }
 
     #[tokio::test]
