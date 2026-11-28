@@ -1,3 +1,5 @@
+import { displayMessageText } from '@/lib/chatMessageText';
+import BrowserVoiceControls from '@/components/BrowserVoiceControls';
 import { memo, useState, useEffect, useRef, useCallback, useMemo, useId } from 'react';
 import { Link, Navigate, useParams } from 'react-router-dom';
 import { Send, Square, Bot, User, AlertCircle, Copy, Check, X, Trash2, Minimize2, Maximize2, ChevronDown, Wrench, Brain, BarChart2, FolderOpen, ImagePlus, Loader2 } from 'lucide-react';
@@ -24,6 +26,7 @@ import ToolCallCard from '@/components/ToolCallCard';
 import ApprovalBanner from '@/components/ApprovalBanner';
 import { resolveContextBarState } from '@/lib/contextBar';
 import SessionPicker from '@/components/SessionPicker';
+import { isNearBottom } from './agentChatScroll';
 
 const DRAFT_KEY_PREFIX = 'agent-chat';
 
@@ -271,7 +274,13 @@ export function AgentChatInner({
     try { return localStorage.getItem('zeroclaw_keep_thinking_collapsed') === '1'; } catch { return false; }
   });
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
+  // Follow the live tail until the reader deliberately moves away from it.
+  // The decision is based on the pane's current distance from the bottom, not
+  // on the input gesture that produced it, so wheel, touch, keyboard, and
+  // native scrollbar drags all behave the same — and the component's own
+  // scroll-to-bottom cannot be mistaken for a manual scroll-up (#9562).
+  const followTailRef = useRef(true);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const modelDropdownRef = useRef<HTMLDivElement>(null);
   const modelButtonRef = useRef<HTMLButtonElement>(null);
@@ -302,13 +311,42 @@ export function AgentChatInner({
     onStatus?.({ typing, messageCount: messages.length });
   }, [typing, messages.length, onStatus]);
 
-  // Scroll to bottom on new messages / streaming.
+  const scrollToTail = useCallback(() => {
+    const pane = messagesContainerRef.current;
+    if (!pane) return;
+    // Assign scrollTop instead of scrollIntoView({ behavior: 'smooth' }): an
+    // animated follow lags a fast stream and emits intermediate scroll events,
+    // while this lands at the tail in one step.
+    pane.scrollTop = pane.scrollHeight;
+  }, []);
+
+  const handleMessagesScroll = useCallback(() => {
+    const pane = messagesContainerRef.current;
+    if (!pane) return;
+    followTailRef.current = isNearBottom({
+      scrollHeight: pane.scrollHeight,
+      scrollTop: pane.scrollTop,
+      clientHeight: pane.clientHeight,
+    });
+  }, []);
+
+  // Scroll to the tail on new messages / streaming, but only while the reader
+  // is following. Reading the position instead of tracking gestures is what
+  // lets a manual scroll-up survive the stream (#9562).
   // Note: WebSocket lifecycle, hydration, and tool_call/tool_result handling
   // moved to AgentContext (PR #6101). Tool activity is filtered at render
   // time below using `showToolActivity`, not at the message-handler layer.
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, typing, streamingContent]);
+    if (!followTailRef.current) return;
+    scrollToTail();
+  }, [messages, typing, streamingContent, scrollToTail]);
+
+  // A conversation switch is a fresh transcript; follow its tail again even
+  // if the reader had scrolled up in the previous one.
+  useEffect(() => {
+    followTailRef.current = true;
+    scrollToTail();
+  }, [sessionId, scrollToTail]);
 
   // Close model dropdown when clicking outside
   useEffect(() => {
@@ -431,15 +469,23 @@ export function AgentChatInner({
     }
   }, [addLocalMessage, clearAllMessages, startNewSession, currentModel, availableModels, switchModel, modelLoading, operator, commands]);
 
+  const [voiceSubmitRequested, setVoiceSubmitRequested] = useState<string | null>(null);
+  const cancelVoiceCapture = useRef<(() => void) | null>(null);
   const handleSend = () => {
     const trimmed = input.trim();
     if (!trimmed) return;
+    const command = isSlashCommand(trimmed);
+    if (!command && !canSend) return;
+    cancelVoiceCapture.current?.();
+
+    // Sending is an explicit return to the live end of the conversation.
+    followTailRef.current = true;
 
     // Slash commands are dispatched BEFORE the connectivity check so purely
     // local commands like /help still work during transient disconnects.
     // Network-dependent commands (/clear, /model) self-recover via their own
     // reconnect paths inside the context. #7137
-    if (isSlashCommand(trimmed)) {
+    if (command) {
       runCommand(trimmed);
     } else {
       if (!canSend) return;
@@ -455,6 +501,13 @@ export function AgentChatInner({
       inputRef.current.focus();
     }
   };
+
+  useEffect(() => {
+    if (!voiceSubmitRequested) return;
+    setVoiceSubmitRequested(null);
+    // A voice timeout submits a normal ready draft, never a local slash command.
+    if (voiceSubmitRequested === draftKey && canSend && (hydrated || startsConversationOnSend) && !typing && input.trim() && !isSlashCommand(input.trim())) handleSend();
+  });
 
   const isComposingRef = useRef(false);
 
@@ -843,8 +896,12 @@ export function AgentChatInner({
         </div>
       )}
 
-      {/* Messages area. */}
+      {/* Messages area. The onScroll handler only records whether the pane is
+          still near the tail; it never treats scroll events as a gesture, so
+          the component's own scroll-to-bottom keeps following intact. */}
       <div
+        ref={messagesContainerRef}
+        onScroll={handleMessagesScroll}
         className={`flex-1 overflow-y-auto p-4 ${compact ? 'space-y-1.5' : 'space-y-4'}`}
       >
         {messages.length === 0 && (
@@ -910,8 +967,6 @@ export function AgentChatInner({
             )}
           </div>
         )}
-
-        <div ref={messagesEndRef} />
       </div>
 
       {/* Tool approval banner — supervised-mode consent prompt (#6522). */}
@@ -952,6 +1007,7 @@ export function AgentChatInner({
           </div>
         )}
         <div className="flex items-end gap-3 max-w-4xl mx-auto">
+          <BrowserVoiceControls key={draftKey} captureRef={cancelVoiceCapture} onSilence={() => setVoiceSubmitRequested(draftKey)} messages={messages} hydrated={hydrated} typing={typing} onTranscript={text => applyInput(prev => `${prev}${prev && !/\s$/.test(prev) ? ' ' : ''}${text}`)} />
           {operator && (
             <>
               <input
@@ -1054,18 +1110,6 @@ export function AgentChatInner({
   );
 }
 
-// Channel-user (and some agent) messages arrive with a leading
-// `[YYYY-MM-DD HH:MM:SS TZ] ` prefix the gateway prepends. The zone is a chrono
-// `%Z` abbreviation (e.g. CEST) that JS `Date` can't reliably parse, so we
-// don't try — we just strip the prefix for display and copy; the bubble shows
-// its own wall-clock caption separately. Anchored to the start so a bracketed
-// datetime appearing mid-message (a log line, an error report) is left intact.
-const SERVER_TIMESTAMP_RE = /^\s*\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [^\]]+\]\s*/;
-
-function stripServerTimestamp(content: string): string {
-  return content.replace(SERVER_TIMESTAMP_RE, '');
-}
-
 // Each chat message is rendered through this memoized component so that
 // typing into the input does not re-render every existing message (and
 // re-run ReactMarkdown on each one). Keep the prop surface small and pass
@@ -1092,7 +1136,7 @@ const MessageItem = memo(function MessageItem({
   // verbatim and never carry the gateway's `[timestamp]` prefix, so don't strip
   // them (that would clip a message starting with a bracketed datetime). Only
   // server-sourced messages can be prefixed.
-  const cleanContent = msg.local || msg.ephemeral ? msg.content : stripServerTimestamp(msg.content);
+  const cleanContent = displayMessageText(msg);
 
   return (
     <div

@@ -26,7 +26,7 @@ const SECURITY_HEADERS: &[(&str, &str)] = &[
     ("x-permitted-cross-domain-policies", "none"),
     (
         "permissions-policy",
-        "geolocation=(), microphone=(), camera=()",
+        "geolocation=(), microphone=(self), on-device-speech-recognition=(self), camera=()",
     ),
 ];
 
@@ -90,6 +90,16 @@ mod tests {
         assert!(csp.contains("script-src 'self'"));
         assert!(csp.contains("connect-src 'self' ws: wss:"));
         assert!(csp.contains("frame-ancestors 'none'"));
+    }
+
+    #[test]
+    fn speech_permission_is_same_origin_only() {
+        let mut headers = HeaderMap::new();
+        inject(&mut headers, false);
+        assert_eq!(
+            headers.get("permissions-policy").unwrap(),
+            "geolocation=(), microphone=(self), on-device-speech-recognition=(self), camera=()"
+        );
     }
 
     #[test]
