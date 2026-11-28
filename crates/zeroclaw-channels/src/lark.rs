@@ -423,7 +423,7 @@ fn truncate_card_markdown(text: &str, max_bytes: usize) -> String {
 /// Split markdown content into chunks that fit within the card size limit.
 /// Splits on line boundaries to avoid breaking markdown syntax.
 fn split_markdown_chunks(text: &str, max_bytes: usize) -> Vec<&str> {
-    if text.len() <= max_bytes {
+    if text.len() <= max_bytes || max_bytes == 0 {
         return vec![text];
     }
 
@@ -431,33 +431,38 @@ fn split_markdown_chunks(text: &str, max_bytes: usize) -> Vec<&str> {
     let mut start = 0;
 
     while start < text.len() {
-        if start + max_bytes >= text.len() {
+        if text.len() - start <= max_bytes {
             chunks.push(&text[start..]);
             break;
         }
 
-        let end = start + max_bytes;
+        // Never slice at `start + max_bytes` directly: that byte may fall inside
+        // a multi-byte UTF-8 character and panic. Walk back to the nearest
+        // character boundary first, then prefer a newline within the safe region.
+        let requested_end = start + max_bytes;
+        let end = (start..=requested_end)
+            .rev()
+            .find(|&i| text.is_char_boundary(i))
+            .unwrap_or(start);
+
+        if end <= start {
+            // `max_bytes` is smaller than the next character. Emit one whole
+            // character so the loop always makes progress.
+            let next = start + text[start..].chars().next().map_or(0, char::len_utf8);
+            chunks.push(&text[start..next]);
+            start = next;
+            continue;
+        }
+
         let search_region = &text[start..end];
         let split_at = search_region
             .rfind('\n')
             .map(|pos| start + pos + 1)
             .unwrap_or(end);
 
-        let split_at = if text.is_char_boundary(split_at) {
-            split_at
-        } else {
-            (start..split_at)
-                .rev()
-                .find(|&i| text.is_char_boundary(i))
-                .unwrap_or(start)
-        };
-
         if split_at <= start {
-            let forced = (end..=text.len())
-                .find(|&i| text.is_char_boundary(i))
-                .unwrap_or(text.len());
-            chunks.push(&text[start..forced]);
-            start = forced;
+            chunks.push(&text[start..end]);
+            start = end;
         } else {
             chunks.push(&text[start..split_at]);
             start = split_at;
@@ -5868,6 +5873,36 @@ mod tests {
         let text = "abc";
         let chunks = split_markdown_chunks(text, 3);
         assert_eq!(chunks, vec!["abc"]);
+    }
+
+    #[test]
+    fn split_markdown_chunks_never_panics_inside_multibyte_char() {
+        let text = "好".repeat(100);
+        let chunks = split_markdown_chunks(&text, 10);
+
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.concat(), text);
+        for chunk in &chunks[..chunks.len() - 1] {
+            assert!(chunk.len() <= 10, "chunk exceeded budget: {chunk:?}");
+            assert!(!chunk.is_empty());
+        }
+    }
+
+    #[test]
+    fn split_markdown_chunks_handles_multibyte_after_newline() {
+        let text = format!("{}\n{}", "a".repeat(8), "好".repeat(10));
+        let chunks = split_markdown_chunks(&text, 10);
+
+        assert_eq!(chunks.concat(), text);
+        for chunk in &chunks[..chunks.len() - 1] {
+            assert!(chunk.len() <= 10, "chunk exceeded budget: {chunk:?}");
+        }
+    }
+
+    #[test]
+    fn split_markdown_chunks_zero_budget_returns_whole_text() {
+        let text = "好好好";
+        assert_eq!(split_markdown_chunks(text, 0), vec![text]);
     }
 
     #[test]
