@@ -18,6 +18,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use zeroclaw_api::tool::ToolSpec;
 
+pub mod usage;
+
 const DEFAULT_CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const DEFAULT_CODEX_INSTRUCTIONS: &str =
     "You are ZeroClaw, a concise and helpful coding assistant.";
@@ -168,26 +170,28 @@ fn default_zeroclaw_dir() -> PathBuf {
     )
 }
 
-fn build_responses_url(base_or_endpoint: &str) -> anyhow::Result<String> {
+/// Why an endpoint override was rejected. Carries no part of the input, so it
+/// is safe to surface from paths that must not echo configured URLs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResponsesUrlError {
+    Empty,
+    InvalidUrl,
+    UnsupportedScheme,
+}
+
+/// Normalize an endpoint override into a responses URL without logging or
+/// echoing the input.
+pub(crate) fn normalize_responses_url(base_or_endpoint: &str) -> Result<String, ResponsesUrlError> {
     let candidate = base_or_endpoint.trim();
     if candidate.is_empty() {
-        anyhow::bail!("OpenAI Codex endpoint override cannot be empty");
+        return Err(ResponsesUrlError::Empty);
     }
 
-    let mut parsed = reqwest::Url::parse(candidate).map_err(|_| {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"candidate": candidate})),
-            "openai_codex: endpoint override is not a valid URL"
-        );
-        anyhow::Error::msg("OpenAI Codex endpoint override must be a valid URL")
-    })?;
+    let mut parsed = reqwest::Url::parse(candidate).map_err(|_| ResponsesUrlError::InvalidUrl)?;
 
     match parsed.scheme() {
         "http" | "https" => {}
-        _ => anyhow::bail!("OpenAI Codex endpoint override must use http:// or https://"),
+        _ => return Err(ResponsesUrlError::UnsupportedScheme),
     }
 
     let path = parsed.path().trim_end_matches('/');
@@ -204,6 +208,27 @@ fn build_responses_url(base_or_endpoint: &str) -> anyhow::Result<String> {
     parsed.set_fragment(None);
 
     Ok(parsed.to_string())
+}
+
+fn build_responses_url(base_or_endpoint: &str) -> anyhow::Result<String> {
+    normalize_responses_url(base_or_endpoint).map_err(|err| match err {
+        ResponsesUrlError::Empty => {
+            anyhow::Error::msg("OpenAI Codex endpoint override cannot be empty")
+        }
+        ResponsesUrlError::InvalidUrl => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"candidate": base_or_endpoint.trim()})),
+                "openai_codex: endpoint override is not a valid URL"
+            );
+            anyhow::Error::msg("OpenAI Codex endpoint override must be a valid URL")
+        }
+        ResponsesUrlError::UnsupportedScheme => {
+            anyhow::Error::msg("OpenAI Codex endpoint override must use http:// or https://")
+        }
+    })
 }
 
 fn resolve_responses_url(options: &ModelProviderRuntimeOptions) -> anyhow::Result<String> {
@@ -226,7 +251,7 @@ fn canonical_endpoint(url: &str) -> Option<(String, String, u16, String)> {
     Some((parsed.scheme().to_ascii_lowercase(), host, port, path))
 }
 
-fn is_default_responses_url(url: &str) -> bool {
+pub(crate) fn is_default_responses_url(url: &str) -> bool {
     canonical_endpoint(url) == canonical_endpoint(DEFAULT_CODEX_RESPONSES_URL)
 }
 

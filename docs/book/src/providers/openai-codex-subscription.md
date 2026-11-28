@@ -81,6 +81,22 @@ API-key verification and Codex-subscription verification are independent.
 The alias half (`coding`, `review`) is operator-chosen; pick whatever fits.
 Reference it from an agent with `model_provider = "openai.coding"`.
 
+## Check subscription usage
+
+Use the configured native Codex route to check quota before starting a turn:
+
+```bash
+zeroclaw auth usage --model-provider openai.coding
+zeroclaw auth usage --model-provider openai.coding --json
+```
+
+The command uses ZeroClaw's stored Codex OAuth profile and reports the five-hour
+and weekly usage percentages and UTC reset times when available. In JSON, a
+missing window or field is `null`, not zero. The lookup sends one read-only
+request to an undocumented ChatGPT usage endpoint. It does not start inference,
+refresh credentials, or accept a custom endpoint. If the access token has
+expired, run `zeroclaw auth refresh --model-provider openai-codex` separately.
+
 ## Models
 
 The `responses` wire API hits the Codex backend directly, so the `model` value
