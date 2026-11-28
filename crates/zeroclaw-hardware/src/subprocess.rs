@@ -29,14 +29,19 @@ const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
-#[cfg(target_os = "windows")]
-const SAFE_ENV_VARS: &[&str] = &[
+/// Windows allowlist kept as a named slice so every platform's tests can assert
+/// APPDATA / LOCALAPPDATA without scanning this file's source.
+#[cfg(any(test, target_os = "windows"))]
+const WINDOWS_SAFE_ENV_VARS: &[&str] = &[
     "PATH",
     "PATHEXT",
     "HOME",
     "USERPROFILE",
     "HOMEDRIVE",
     "HOMEPATH",
+    // Per-user config/cred/cache roots used by gh, npm, and most Win32 tools.
+    "APPDATA",
+    "LOCALAPPDATA",
     "SYSTEMROOT",
     "SYSTEMDRIVE",
     "WINDIR",
@@ -48,6 +53,8 @@ const SAFE_ENV_VARS: &[&str] = &[
     "USERNAME",
 ];
 
+#[cfg(target_os = "windows")]
+const SAFE_ENV_VARS: &[&str] = WINDOWS_SAFE_ENV_VARS;
 pub struct SubprocessTool {
     /// Parsed plugin manifest (tool metadata + parameter definitions).
     manifest: ToolManifest,
@@ -345,9 +352,21 @@ impl Tool for SubprocessTool {
 }
 
 fn configure_plugin_environment(command: &mut Command) {
+    configure_plugin_environment_with(command, SAFE_ENV_VARS, |key| std::env::var_os(key));
+}
+
+/// [`configure_plugin_environment`] with the allowlist and the parent
+/// environment source supplied, so a test can prove what a real child receives
+/// for a given allowlist on every platform without mutating the test process
+/// environment.
+fn configure_plugin_environment_with(
+    command: &mut Command,
+    allowlist: &[&str],
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) {
     command.env_clear();
-    for key in SAFE_ENV_VARS {
-        if let Some(value) = std::env::var_os(key) {
+    for key in allowlist {
+        if let Some(value) = lookup(key) {
             command.env(key, value);
         }
     }
@@ -714,6 +733,62 @@ mod tests {
         let schema = tool.parameters_schema();
         let required = schema["required"].as_array().unwrap();
         assert!(required.is_empty());
+    }
+
+    #[test]
+    fn windows_profile_roots_stay_in_the_windows_allowlist() {
+        assert!(
+            WINDOWS_SAFE_ENV_VARS.contains(&"APPDATA"),
+            "Windows SAFE_ENV_VARS must forward APPDATA"
+        );
+        assert!(
+            WINDOWS_SAFE_ENV_VARS.contains(&"LOCALAPPDATA"),
+            "Windows SAFE_ENV_VARS must forward LOCALAPPDATA"
+        );
+    }
+
+    /// Prints the two profile roots from the child's own environment.
+    fn profile_root_echo_command() -> Command {
+        #[cfg(windows)]
+        {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "echo %APPDATA%^|%LOCALAPPDATA%"]);
+            command
+        }
+        #[cfg(not(windows))]
+        {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", r#"printf '%s|%s' "$APPDATA" "$LOCALAPPDATA""#]);
+            command
+        }
+    }
+
+    #[test]
+    fn plugin_child_receives_windows_profile_roots_after_env_clear() {
+        let appdata = "/dummy/AppData/Roaming";
+        let local_app_data = "/dummy/AppData/Local";
+        let mut command = profile_root_echo_command();
+        configure_plugin_environment_with(&mut command, WINDOWS_SAFE_ENV_VARS, |key| match key {
+            "APPDATA" => Some(appdata.into()),
+            "LOCALAPPDATA" => Some(local_app_data.into()),
+            _ => None,
+        });
+
+        let output = command
+            .as_std_mut()
+            .output()
+            .expect("profile root echo child should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            stdout.trim(),
+            format!("{appdata}|{local_app_data}"),
+            "both profile roots must reach the child after env_clear"
+        );
     }
 
     #[test]

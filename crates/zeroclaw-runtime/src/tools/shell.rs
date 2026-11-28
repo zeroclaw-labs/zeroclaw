@@ -152,6 +152,28 @@ fn is_valid_env_var_name(name: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
+/// Copy the allowlisted shell environment into a child command that has just
+/// been cleared.
+fn apply_allowed_shell_env_vars(cmd: &mut tokio::process::Command, security: &SecurityPolicy) {
+    let names = collect_allowed_shell_env_vars(security);
+    apply_shell_env_vars(cmd, &names, |name| std::env::var(name).ok());
+}
+
+/// [`apply_allowed_shell_env_vars`] with the values supplied, so a test can
+/// prove what a real child receives for the Windows allowlist on every
+/// platform without mutating the test process environment.
+fn apply_shell_env_vars(
+    cmd: &mut tokio::process::Command,
+    names: &[String],
+    lookup: impl Fn(&str) -> Option<String>,
+) {
+    for name in names {
+        if let Some(value) = lookup(name) {
+            cmd.env(name, value);
+        }
+    }
+}
+
 fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -324,12 +346,7 @@ impl Tool for ShellTool {
             })?;
 
         cmd.env_clear();
-
-        for var in collect_allowed_shell_env_vars(&self.security) {
-            if let Ok(val) = std::env::var(&var) {
-                cmd.env(&var, val);
-            }
-        }
+        apply_allowed_shell_env_vars(&mut cmd, &self.security);
 
         // Injected after env_clear so it survives; absent when the turn is unscoped.
         if let Some(session_id) = get_session_id() {
@@ -2170,6 +2187,56 @@ mod tests {
             "ZEROCLAW_TEST_PASSTHROUGH",
             "db://unit-test"
         ));
+    }
+
+    /// Prints the two profile roots the child actually received.
+    fn profile_root_echo_command() -> tokio::process::Command {
+        #[cfg(target_os = "windows")]
+        {
+            // `env_print_command()` is `set`, a cmd.exe built-in rather than an
+            // executable, so this fixture starts the interpreter itself.
+            let mut cmd = tokio::process::Command::new("cmd");
+            cmd.args(["/C", "echo %APPDATA%^|%LOCALAPPDATA%"]);
+            cmd
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut cmd = tokio::process::Command::new("/bin/sh");
+            cmd.args(["-c", r#"printf '%s|%s' "$APPDATA" "$LOCALAPPDATA""#]);
+            cmd
+        }
+    }
+
+    #[test]
+    fn shell_child_receives_windows_profile_roots_after_env_clear() {
+        let names: Vec<String> = crate::tools::shell_env::WINDOWS_SAFE_SHELL_ENV_VARS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let appdata = "/dummy/AppData/Roaming";
+        let local_app_data = "/dummy/AppData/Local";
+        let mut cmd = profile_root_echo_command();
+        cmd.env_clear();
+        super::apply_shell_env_vars(&mut cmd, &names, |key| match key {
+            "APPDATA" => Some(appdata.to_string()),
+            "LOCALAPPDATA" => Some(local_app_data.to_string()),
+            _ => None,
+        });
+
+        let output = cmd
+            .as_std_mut()
+            .output()
+            .expect("profile root echo child should run");
+        assert!(
+            output.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            format!("{appdata}|{local_app_data}"),
+            "both profile roots must reach the child after env_clear"
+        );
     }
 
     #[test]
