@@ -272,6 +272,9 @@ pub struct ChatRequest<'a> {
     pub thinking: Option<NativeThinkingParams>,
 }
 
+/// Reserved host-envelope key carrying private session-prompt result provenance.
+pub const SESSION_PROMPT_HISTORY_RESULT_KEY: &str = "session_prompt_tool_result";
+
 /// A tool result to feed back to the LLM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResultMessage {
@@ -279,6 +282,16 @@ pub struct ToolResultMessage {
     pub content: String,
     #[serde(default)]
     pub tool_name: String,
+    /// Host-derived privacy provenance of the executed tool result. Preserve
+    /// this through history replay even when a hook changed the original tool
+    /// name. It grants no capability and leaves the opaque result text unchanged.
+    /// Older serialized results default to ordinary, unmarked content.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub session_prompt_tool_result: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// A message in a multi-turn conversation, including tool interactions.
@@ -1442,6 +1455,7 @@ mod projected_entry_count_tests {
 
     fn result(id: &str) -> ToolResultMessage {
         ToolResultMessage {
+            session_prompt_tool_result: false,
             tool_call_id: id.into(),
             content: "out".into(),
             tool_name: "shell".into(),
@@ -1517,5 +1531,30 @@ mod thinking_display_tests {
             !json.contains("display"),
             "expected display field to be omitted, got: {json}"
         );
+    }
+}
+
+#[cfg(test)]
+mod private_result_provenance_tests {
+    use super::*;
+
+    #[test]
+    fn old_tool_results_keep_their_wire_shape_and_private_results_round_trip() {
+        let old_wire = serde_json::json!({
+            "tool_call_id": "ordinary",
+            "tool_name": "ordinary_tool",
+            "content": "ordinary output",
+        });
+        let mut result: ToolResultMessage = serde_json::from_value(old_wire.clone()).unwrap();
+        assert!(!result.session_prompt_tool_result);
+        assert_eq!(serde_json::to_value(&result).unwrap(), old_wire);
+
+        result.session_prompt_tool_result = true;
+        let marked = serde_json::to_value(&result).unwrap();
+        assert_eq!(marked[SESSION_PROMPT_HISTORY_RESULT_KEY], true);
+        let restored: ToolResultMessage = serde_json::from_value(marked).unwrap();
+        assert!(restored.session_prompt_tool_result);
+        assert_eq!(restored.content, result.content);
+        assert_eq!(restored.tool_name, result.tool_name);
     }
 }

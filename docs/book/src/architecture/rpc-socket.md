@@ -206,6 +206,13 @@ events:
 Event types: `agent_message_chunk`, `agent_thought_chunk`, `tool_call`,
 `tool_result`, `approval_request`.
 
+For `session/approve`, `acknowledged` indicates whether the response was
+consumed. A refused persistent action on a still-pending strict request may
+also return `retryable: true`, allowing the owner to answer once instead.
+The field is omitted when retryability is unknown, including for expired or
+unmatched requests and older servers. It describes the request at response
+time; it can still expire before a subsequent answer.
+
 ### ACP durable lifecycle
 
 Native RPC keeps the original visible transcript separate from the retained provider context. Automatic trimming does not delete or renumber original transcript rows. A trim notification is sent only after its retained-context snapshot and covered checkpoint boundary have committed together; a failed write suppresses that notification. The snapshot excludes runtime system prompts, recalled-memory injection, and hidden reasoning. On interruption, recovery appends visible checkpoint progress once while restoring the model from the latest retained snapshot plus later checkpoint events. An explicitly empty retained snapshot remains authoritative. Sessions without a snapshot keep the legacy provider-safe replay path.
@@ -221,6 +228,52 @@ The lifecycle operations have distinct durable meanings:
 - `session/delete` removes the ACP row and its recoverable checkpoint before unregistering and removing the live session when the target is a live ACP session, or when no live mode exists and an ACP durable row is selected. A live same-ID Chat session remains isolated from ACP storage.
 
 Kill and delete signal cancellation before attempting their fallible SQLite operation. If that operation fails for an idle target, the RPC reports an internal error and preserves the live owner and channel registration. If hard cancellation has already removed an active owner, the RPC cannot restore that live generation; the durable row and recoverable checkpoint remain available once storage is working again.
+
+### Chat deletion across RPC and the gateway
+
+In a supervised daemon, RPC `session/delete` shares the gateway's existing
+cancellation registry and actor queue. When the admitted durable target is a
+gateway session, Chat deletion captures that gateway generation, signals its
+authorized predecessor, and waits for its gateway permit after acquiring the
+RPC permit. It revalidates ownership
+and generation before deleting an unambiguous raw, `rpc_` or `gw_` Chat row.
+Multiple distinct candidates are refused because they may be different
+sessions even when their owner is the same; SQLite checks this in the deletion
+transaction. The guarded preflight checks all observed owners before reporting
+ambiguity. Storage repeats that check at each signal and commit; a newly arrived
+foreign or legacy-unowned row receives the same scoped ownership denial.
+Deletion retains the selected row's incarnation across queue waits and refuses
+if it was reset or replaced. For an accepted full stored-key spelling, the
+original wire ID remains in the response while cancellation and fencing use
+the identified owning RPC or gateway queue; unprovable identities are refused.
+An unqualified reaped deletion checks both configured durable domains, including
+normalized gateway keys. At commit it rejects an arrival in the other domain,
+preserving both transcripts. If a configured store is unavailable, specify
+`chat_mode` to select an available domain. Raw keys that could name a channel-owned
+transcript require a lifecycle binding before RPC can delete them.
+
+Dashboard notifications, RPC append, and `sessions_send` select an existing
+transcript and retain its identity until the write. A pending append cannot
+create a missing transcript or modify a same-key successor. The Dashboard
+notification queue serializes a successful append and its publication with
+RPC deletion, including for RPC or raw stored keys. JSONL append coordination
+is limited to handles in the same process.
+
+Custom `SessionBackend` implementations must implement
+`admit_existing_append` to support these three writers. A forwarding backend
+must forward the admission and preserve its conditional append behavior.
+The default returns an unsupported-operation error.
+
+Only a successful durable deletion invalidates the captured gateway generation.
+Old WebSockets cannot recreate metadata or write into a same-ID successor;
+a newly connected successor remains usable. Failed storage deletion preserves
+the rows, attachments and generations, although already-observed cancellation
+cannot be reversed. ACP deletion remains isolated from the Chat gateway.
+
+The shared gateway coordination lasts for one daemon generation, including
+supervised gateway restarts. A daemon reload creates fresh coordination.
+Standalone gateway construction retains its own coordination. Gateway depth
+remains eight; the separate RPC queue remains depth 32.
 
 ### Chunked uploads
 

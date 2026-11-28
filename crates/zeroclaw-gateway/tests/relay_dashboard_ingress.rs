@@ -85,6 +85,7 @@ impl Gateway {
             Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new()),
             authority,
             None,
+            None,
         )
         .with_dashboard_ingress(ingress.clone());
         let server = zeroclaw_spawn::spawn!(Box::pin(

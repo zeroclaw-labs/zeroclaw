@@ -407,6 +407,13 @@
         ],
         "type": "object"
       },
+      "ChatMode": {
+        "enum": [
+          "chat",
+          "acp"
+        ],
+        "type": "string"
+      },
       "CommandDescriptor": {
         "description": "Command identity and accepted tokens advertised to an RPC client.",
         "properties": {
@@ -3339,6 +3346,13 @@
           "request_id": {
             "type": "string"
           },
+          "retryable": {
+            "description": "The bound request rejected this action and was still pending when\nthe response was produced. Missing means retryability is unknown.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "session_id": {
             "type": "string"
           }
@@ -3411,6 +3425,29 @@
         "required": [
           "session_id",
           "overrides"
+        ],
+        "type": "object"
+      },
+      "SessionDeleteParams": {
+        "description": "Parameters for deleting a session from a selected storage domain.",
+        "properties": {
+          "chat_mode": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChatMode"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional storage domain for `session/delete`. A live session\nsupplies its canonical domain. If omitted for a reaped session,\na uniquely resolved Chat or ACP domain is used; ambiguous or\nmissing sessions are refused according to ownership policy."
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id"
         ],
         "type": "object"
       },
@@ -3500,7 +3537,7 @@
         "type": "object"
       },
       "SessionIdParams": {
-        "description": "Shared param for methods that only need a session ID:\n`session/close`, `session/cancel`, `session/messages`,\n`session/state`, `session/delete`.",
+        "description": "Shared param for methods that only need a session ID:\n`session/close`, `session/cancel`, `session/messages`,\n`session/state`.",
         "properties": {
           "session_id": {
             "type": "string"
@@ -4005,6 +4042,13 @@
           },
           {
             "properties": {
+              "allow_always": {
+                "description": "Whether the viewer may offer persistent approval. Absent on older\nservers, which used the ordinary approval affordance.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
               "arguments_summary": {
                 "type": "string"
               },
@@ -5342,6 +5386,21 @@
           "schema": {
             "type": "string"
           }
+        },
+        {
+          "name": "chat_mode",
+          "required": false,
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChatMode"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional storage domain for `session/delete`. A live session\nsupplies its canonical domain. If omitted for a reaped session,\na uniquely resolved Chat or ACP domain is used; ambiguous or\nmissing sessions are refused according to ownership policy."
+          }
         }
       ],
       "result": {
@@ -5358,7 +5417,7 @@
       },
       "x-zeroclaw-params": {
         "shape": "typed",
-        "type": "SessionIdParams"
+        "type": "SessionDeleteParams"
       }
     },
     {

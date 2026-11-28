@@ -356,7 +356,7 @@ impl Tool for SpawnSubagentTool {
         // sources would not have returned.
         let bound = self.capabilities.get().cloned();
         let config = (*config).clone();
-        let run_result = Box::pin(scope!(
+        let subagent_turn = Box::pin(scope!(
             agent_alias: parent_alias,
             session_key: run_id,
             =>
@@ -400,8 +400,10 @@ impl Tool for SpawnSubagentTool {
                     }
                 }
             }
-        ))
-        .await;
+        ));
+        let run_result = zeroclaw_api::TOOL_LOOP_SESSION_PROMPTS_ALLOWED
+            .scope(false, subagent_turn)
+            .await;
 
         // EPIC-A supervision: mirror the subagent's terminal state into the control-plane.
         if let Some(cp) = crate::control_plane::control_plane() {

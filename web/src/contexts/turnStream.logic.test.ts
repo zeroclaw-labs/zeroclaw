@@ -208,9 +208,10 @@ test('captured thinking takes precedence over pending thinking', () => {
   );
 });
 
-test('only CAPABILITY_MISSING and INVALID_JSON leave the running turn going', () => {
+test('request refusals leave the running turn going', () => {
   assert.equal(errorEndsTurn('CAPABILITY_MISSING'), false);
   assert.equal(errorEndsTurn('INVALID_JSON'), false);
+  assert.equal(errorEndsTurn('APPROVAL_ACTION_UNAVAILABLE'), false);
   for (const code of [
     'AGENT_ERROR', 'CORE_UNAVAILABLE', 'TURN_RESULT_LOST', 'NOT_PERMITTED',
     'SESSION_NOT_FOUND', 'CORE_REFUSED', 'PROVIDER_ERROR', undefined,
@@ -218,4 +219,3 @@ test('only CAPABILITY_MISSING and INVALID_JSON leave the running turn going', ()
     assert.equal(errorEndsTurn(code), true, String(code));
   }
 });
-

@@ -144,7 +144,11 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
     let mut delta_sender = on_delta;
     let mut think_stripper = StreamThinkTagStripper::default();
     let mut marker_stripper = StreamTerminalMarkerStripper::new();
-    let mut text_guard = StreamTextGuard::new(guard_tools);
+    let mut text_guard = if strict_tool_parsing {
+        StreamTextGuard::for_strict_text()
+    } else {
+        StreamTextGuard::new(guard_tools)
+    };
     // Correlates PreExecutedToolCall events with their later results so both
     // TurnEvents share a stable id (FIFO per tool name).
     let mut pre_executed_ids: std::collections::HashMap<
@@ -403,11 +407,6 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                 // Append the stripped text to response_text (single accumulation path)
                 outcome.response_text.push_str(&stripped);
 
-                if strict_tool_parsing {
-                    forward_visible!(stripped, true);
-                    continue;
-                }
-
                 let Some(forward_text) = text_guard.push(&stripped) else {
                     continue;
                 };
@@ -422,9 +421,7 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
     if !trailing_delta.is_empty() {
         let trailing_stripped = marker_stripper.push(&trailing_delta);
         outcome.response_text.push_str(&trailing_stripped);
-        if strict_tool_parsing {
-            forward_visible!(trailing_stripped, false);
-        } else if let Some(forward_text) = text_guard.push(&trailing_stripped) {
+        if let Some(forward_text) = text_guard.push(&trailing_stripped) {
             forward_visible!(forward_text, false);
         }
     }
@@ -433,14 +430,12 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
     let remaining = marker_stripper.finish();
     if !remaining.is_empty() {
         outcome.response_text.push_str(&remaining);
-        if strict_tool_parsing {
-            forward_visible!(remaining, false);
-        } else if let Some(forward_text) = text_guard.push(&remaining) {
+        if let Some(forward_text) = text_guard.push(&remaining) {
             forward_visible!(forward_text, false);
         }
     }
 
-    if let Some(forward_text) = text_guard.finish() {
+    if let Some(forward_text) = text_guard.finish_with_context(&outcome.response_text) {
         forward_visible!(forward_text, false);
     }
     // Final forward may null delta_sender on send failure; mark it read.

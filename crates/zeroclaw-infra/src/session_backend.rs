@@ -1,7 +1,84 @@
 //! Trait abstraction for session persistence backends.
 
+use crate::session_prompts::{SessionPrompt, SessionPromptSetOutcome};
 use chrono::{DateTime, Utc};
+use std::sync::Arc;
 use zeroclaw_api::model_provider::ChatMessage;
+
+/// Task-local transport wrapper for the canonical session backend.
+#[derive(Clone)]
+pub struct ScopedSessionBackend(pub Arc<dyn SessionBackend>);
+
+/// Opaque identity of the durable owner admitted for one primary turn.
+///
+/// The SQLite metadata row creates this fact. A reset rotates it, and deletion
+/// removes it; a later session using the same key cannot inherit this handle.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionPromptOwner {
+    pub(crate) session_key: String,
+    pub(crate) incarnation: String,
+}
+
+impl SessionPromptOwner {
+    /// Whether this owner was admitted for the caller's canonical session key.
+    pub fn belongs_to(&self, session_key: &str) -> bool {
+        self.session_key == session_key
+    }
+}
+
+tokio::task_local! {
+    /// Durable owner captured at admission, never reconstructed by a tool.
+    pub static TOOL_LOOP_SESSION_PROMPT_OWNER: Option<SessionPromptOwner>;
+}
+
+tokio::task_local! {
+    /// Canonical durable chat backend for the active primary turn. Session
+    /// prompt tools use this instead of opening an independent SQLite handle.
+    pub static TOOL_LOOP_SESSION_BACKEND: Option<ScopedSessionBackend>;
+}
+
+/// Ephemeral prompt-budget snapshot for the active primary turn.
+///
+/// The runtime/channel owner derives this immediately before the tool loop
+/// from its complete host-authored prompt, before session attachments are
+/// appended. It is advisory admission evidence only: final prompt assembly
+/// remains the authoritative fail-closed guard because later turn state can
+/// still change the host prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionPromptBudget {
+    host_prompt_chars: usize,
+    max_system_prompt_chars: usize,
+}
+
+impl SessionPromptBudget {
+    pub fn new(host_prompt_chars: usize, max_system_prompt_chars: usize) -> Self {
+        Self {
+            host_prompt_chars,
+            max_system_prompt_chars,
+        }
+    }
+
+    /// Whether one completely rendered attachment section fits the current
+    /// primary-turn prompt. A zero limit is the existing unlimited setting.
+    pub fn permits(&self, rendered_attachments: &str) -> bool {
+        self.max_system_prompt_chars == 0
+            || self
+                .host_prompt_chars
+                .saturating_add(if rendered_attachments.is_empty() {
+                    0
+                } else {
+                    rendered_attachments.chars().count().saturating_add(2)
+                })
+                <= self.max_system_prompt_chars
+    }
+}
+
+tokio::task_local! {
+    /// Best-effort admission snapshot for session-prompt mutations in the
+    /// active primary turn. It is intentionally absent from unsupported and
+    /// auxiliary calls.
+    pub static TOOL_LOOP_SESSION_PROMPT_BUDGET: Option<SessionPromptBudget>;
+}
 
 /// Metadata about a persisted session.
 #[derive(Debug, Clone)]
@@ -76,8 +153,245 @@ impl<T> SessionEffectGuard for T {}
 pub type SessionEffectAuthorization<'a> =
     dyn Fn(Option<&str>) -> std::io::Result<Box<dyn SessionEffectGuard + 'a>> + 'a;
 
+/// One currently present deletion candidate. A missing owner is distinct from
+/// the absence of every candidate and must be authorized as a legacy row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionDeletionCandidate {
+    pub key: String,
+    pub principal: Option<String>,
+}
+
+/// Authorize the complete observation under one current authority lease.
+/// An empty slice means no durable candidate was observed.
+pub type SessionDeletionAuthorization<'a> =
+    dyn Fn(&[SessionDeletionCandidate]) -> std::io::Result<Box<dyn SessionEffectGuard + 'a>> + 'a;
+
+/// An exact, non-creating observation of a possible durable deletion target.
+/// Implementations retain their own opaque incarnation proof and compare the
+/// complete candidate set before any authorized effect and before deletion.
+pub trait SessionDeletionAdmission: Send + Sync {
+    fn selected_key(&self) -> Option<&str>;
+    fn principal(&self) -> Option<&str>;
+    /// Whether the exact stored key identifies its live queue without
+    /// a lossy storage normalization. Unknown backends must fail closed.
+    fn queue_identity_is_exact(&self) -> bool {
+        false
+    }
+    fn with_current(
+        &self,
+        authorize: &SessionDeletionAuthorization<'_>,
+        effect: &mut dyn FnMut() -> std::io::Result<()>,
+    ) -> std::io::Result<()>;
+    /// Attempt the same observation without waiting for the store's mutation
+    /// boundary. A caller composing two stores must release its first
+    /// reservation on `WouldBlock` before retrying.
+    fn try_with_current(
+        &self,
+        _authorize: &SessionDeletionAuthorization<'_>,
+        _effect: &mut dyn FnMut() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "nonblocking session deletion reservation unsupported",
+        ))
+    }
+    fn delete(&self, authorize: &SessionDeletionAuthorization<'_>) -> std::io::Result<bool>;
+    /// Attempt deletion without waiting for the mutation boundary.
+    fn try_delete(&self, _authorize: &SessionDeletionAuthorization<'_>) -> std::io::Result<bool> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "nonblocking session deletion unsupported",
+        ))
+    }
+}
+
+/// Whether a candidate must match a stored name literally or may use the
+/// backend's normal path lookup semantics.
+#[derive(Clone, Copy)]
+pub enum AppendKeyLookup {
+    Listed,
+    Addressed,
+}
+
+/// An existing transcript selected before a caller waits for its turn.
+pub trait ExistingSessionAppend: Send + Sync {
+    fn key(&self) -> &str;
+
+    /// Append only to the original transcript, checking current ownership at
+    /// commit. A missing or replaced transcript must never be created here.
+    fn append(
+        &self,
+        message: &ChatMessage,
+        authorize: &SessionEffectAuthorization<'_>,
+        include_count: bool,
+        committed: &mut dyn FnMut(),
+    ) -> std::io::Result<Option<usize>>;
+}
+
 /// Trait for session persistence backends shared across async tasks.
 pub trait SessionBackend: Send + Sync {
+    /// Select the first existing candidate and capture its identity together.
+    fn admit_existing_append(
+        self: Arc<Self>,
+        _keys: &[&str],
+        _lookup: AppendKeyLookup,
+    ) -> std::io::Result<Option<Box<dyn ExistingSessionAppend>>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "existing session append admission unsupported",
+        ))
+    }
+
+    /// Capture deletion identity without creating a missing session. Backends
+    /// without a reliable conditional-deletion primitive fail closed.
+    fn admit_session_deletion(
+        self: Arc<Self>,
+        _candidate_keys: &[&str],
+        _authorize: &SessionDeletionAuthorization<'_>,
+    ) -> std::io::Result<Box<dyn SessionDeletionAdmission>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "identity-bound session deletion unsupported",
+        ))
+    }
+    /// Admit prompt access, creating an empty owner before its first message
+    /// when necessary. Only a primary-turn/session admission may call this.
+    fn admit_session_prompt_owner(
+        &self,
+        _session_key: &str,
+    ) -> std::io::Result<SessionPromptOwner> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session prompt ownership requires SQLite persistence",
+        ))
+    }
+
+    /// Admit an attachment owner after acquiring the storage mutation boundary.
+    /// Hold the caller's current authority through creation and commit. The
+    /// callback must not re-enter this backend; unsupported stores fail closed.
+    fn admit_session_prompt_owner_authorized(
+        &self,
+        _session_key: &str,
+        _authorize: &SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<SessionPromptOwner> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "guarded session prompt admission unsupported",
+        ))
+    }
+
+    /// Persist an inbound message and capture its prompt owner atomically.
+    fn append_with_session_prompt_owner(
+        &self,
+        _session_key: &str,
+        _message: &ChatMessage,
+    ) -> std::io::Result<SessionPromptOwner> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session prompt ownership requires SQLite persistence",
+        ))
+    }
+
+    /// Read only while the originally admitted owner is still current.
+    fn list_session_prompts_for_owner(
+        &self,
+        _owner: &SessionPromptOwner,
+    ) -> std::io::Result<Vec<SessionPrompt>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session prompt ownership requires SQLite persistence",
+        ))
+    }
+
+    /// Validate the admitted owner in the same transaction as the write.
+    fn set_session_prompt_for_owner(
+        &self,
+        _owner: &SessionPromptOwner,
+        _id: &str,
+        _content: &str,
+        _budget: Option<SessionPromptBudget>,
+    ) -> std::io::Result<SessionPromptSetOutcome> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session prompt ownership requires SQLite persistence",
+        ))
+    }
+
+    /// Delete only from the originally admitted owner, never its successor.
+    fn delete_session_prompt_for_owner(
+        &self,
+        _owner: &SessionPromptOwner,
+        _id: &str,
+    ) -> std::io::Result<bool> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session prompt ownership requires SQLite persistence",
+        ))
+    }
+
+    /// Inspect only the key's current incarnation for quiescent setup and tests.
+    /// Turn callers must use `list_session_prompts_for_owner` to fence
+    /// same-key successors against their originally admitted owner.
+    fn list_session_prompts(&self, _session_key: &str) -> std::io::Result<Vec<SessionPrompt>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session prompts require SQLite persistence",
+        ))
+    }
+
+    /// Set on the key's current incarnation; may create a missing owner for
+    /// setup. Turn callers must use `set_session_prompt_for_owner`, never this
+    /// unbound operation.
+    fn set_session_prompt(
+        &self,
+        _session_key: &str,
+        _id: &str,
+        _content: &str,
+    ) -> std::io::Result<SessionPromptSetOutcome> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session prompts require SQLite persistence",
+        ))
+    }
+
+    /// Atomically validate a proposed attachment collection against the
+    /// primary turn's best-effort budget before persisting it.
+    ///
+    /// SQLite is the only supported durable prompt backend. Backends that do
+    /// not implement this operation must not silently skip budget admission.
+    /// This setup operation uses the key's current incarnation: turn callers
+    /// must use `set_session_prompt_for_owner` for incarnation fencing as well
+    /// as budget.
+    fn set_session_prompt_with_budget(
+        &self,
+        session_key: &str,
+        id: &str,
+        content: &str,
+        budget: Option<SessionPromptBudget>,
+    ) -> std::io::Result<SessionPromptSetOutcome> {
+        if budget.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "session prompt budget admission requires SQLite persistence",
+            ));
+        }
+        self.set_session_prompt(session_key, id, content)
+    }
+
+    /// Delete only from the key's current incarnation for quiescent setup and
+    /// tests. Turn callers must use `delete_session_prompt_for_owner` so a
+    /// successor remains untouched.
+    fn delete_session_prompt(&self, _session_key: &str, _id: &str) -> std::io::Result<bool> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session prompts require SQLite persistence",
+        ))
+    }
+
+    /// Reset history and session prompt attachments while retaining the session identity.
+    fn reset_session(&self, session_key: &str) -> std::io::Result<usize> {
+        self.clear_messages(session_key)
+    }
     /// Load all messages for a session. Returns empty vec if session doesn't exist.
     fn load(&self, session_key: &str) -> Vec<ChatMessage>;
 
@@ -219,6 +533,40 @@ pub trait SessionBackend: Send + Sync {
     /// Delete all messages for a session. Returns `true` if the session existed.
     fn delete_session(&self, _session_key: &str) -> std::io::Result<bool> {
         Ok(false)
+    }
+
+    /// Delete every durable spelling owned by one logical session.
+    ///
+    /// Backends with transactional storage should override this operation so a
+    /// failure leaves the whole key set intact. The default preserves the
+    /// established behavior of non-transactional backends, which can only
+    /// delete the individual files in order. Transactional backend decorators
+    /// must forward this operation as well as `delete_session`; forwarding
+    /// only the single-key method would silently weaken the atomic guarantee.
+    fn delete_session_key_set(&self, session_keys: &[&str]) -> std::io::Result<bool> {
+        let mut deleted = false;
+        for session_key in session_keys {
+            deleted |= self.delete_session(session_key)?;
+        }
+        Ok(deleted)
+    }
+
+    /// Delete a complete alias set, checking every existing owner's equality
+    /// and current authority under the storage serialization boundary.
+    /// Transactional stores retain the returned guard through one atomic
+    /// commit, never a sequence of single-key commits. Non-transactional stores
+    /// retain it through their established sequential cleanup, which may fail
+    /// after partial deletion. Unsupported stores fail closed.
+    fn delete_session_key_set_authorized(
+        &self,
+        _session_keys: &[&str],
+        _expected_owner: Option<&str>,
+        _authorize: &SessionEffectAuthorization<'_>,
+    ) -> std::io::Result<bool> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "guarded session key-set deletion unsupported",
+        ))
     }
 
     fn clear_agent_attribution(&self, _agent_alias: &str) -> std::io::Result<usize> {
@@ -443,6 +791,19 @@ pub trait SessionBackend: Send + Sync {
         Ok(false)
     }
 
+    /// Delete a logical session's complete key set only when every existing
+    /// key belongs to `owner_principal_id`. Transactional backends must
+    /// override this so an ownership mismatch or a later failure cannot
+    /// remove only part of the session and its owned metadata. Backends
+    /// without owner-predicated key-set deletion fail closed.
+    fn delete_session_key_set_owned(
+        &self,
+        _session_keys: &[&str],
+        _owner_principal_id: &str,
+    ) -> std::io::Result<bool> {
+        Ok(false)
+    }
+
     /// Set the session state (e.g. "idle", "running", "error").
     /// `turn_id` identifies the current turn (set when running, cleared on idle).
     fn set_session_state(
@@ -508,5 +869,26 @@ mod tests {
         let q = SessionQuery::default();
         assert!(q.keyword.is_none());
         assert!(q.limit.is_none());
+    }
+
+    #[test]
+    fn session_prompt_budget_counts_the_attachment_separator() {
+        let budget = SessionPromptBudget::new(10, 16);
+        assert!(budget.permits("tail"));
+        assert!(
+            !budget.permits("tail!"),
+            "the two newlines separating a non-empty attachment tail must count"
+        );
+    }
+
+    #[test]
+    fn unlimited_session_prompt_budget_permits_any_rendered_tail() {
+        assert!(SessionPromptBudget::new(usize::MAX, 0).permits("tail"));
+    }
+
+    #[test]
+    fn session_prompt_budget_uses_characters_not_bytes() {
+        let budget = SessionPromptBudget::new("Зберегти".chars().count(), 13);
+        assert!(budget.permits("继续"));
     }
 }

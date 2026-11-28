@@ -107,6 +107,14 @@ fn session_targeting_rpc_methods_authorize_ownership() {
 
     let src = repo_file("crates/zeroclaw-runtime/src/rpc/dispatch.rs");
 
+    // Deletion uses an owned task so a committed removal can finish after a
+    // transport disconnect. Check the delegated handler explicitly: the
+    // wrapper itself only forwards opaque parameters.
+    let (wrapper_start, wrapper_end) = fn_body_span_from(&src, "fn handle_session_delete", 0);
+    assert!(src[wrapper_start..wrapper_end].contains("run_session_delete"));
+    let (delete_start, delete_end) = fn_body_span_from(&src, "fn run_session_delete", 0);
+    assert!(src[delete_start..delete_end].contains("authorize_session_owner"));
+
     let mut ungated = Vec::new();
     let mut checked = 0usize;
     let mut from = 0usize;

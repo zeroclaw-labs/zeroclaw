@@ -363,6 +363,16 @@ mod tests {
         let parsed: zeroclaw_rpc_proto::types::SessionIdParams =
             serde_json::from_value(request).expect("descriptor-shaped request parses");
         assert_eq!(parsed.session_id, "s1");
+        let delete = by_name("session/delete");
+        assert_eq!(delete["params"][1]["name"], json!("chat_mode"));
+        assert_eq!(delete["params"][1]["required"], json!(false));
+        let request = json!({ "session_id": "s1", "chat_mode": "acp" });
+        let parsed: zeroclaw_rpc_proto::types::SessionDeleteParams =
+            serde_json::from_value(request).expect("scoped descriptor-shaped request parses");
+        assert_eq!(
+            parsed.chat_mode,
+            Some(zeroclaw_rpc_proto::types::ChatMode::Acp)
+        );
         // initialize: optional fields are optional, the version is required by default.
         let init = by_name("initialize");
         let init_params = init["params"].as_array().unwrap();
