@@ -1,8 +1,8 @@
 //! JSONL-based session persistence for channel conversations.
 
-use crate::session_backend::SessionBackend;
 #[cfg(unix)]
 use crate::session_backend::SessionEffectAuthorization;
+use crate::session_backend::{SessionBackend, SessionTranscriptRow};
 use crate::session_disposition::jsonl::{self, Entry};
 #[cfg(unix)]
 use crate::session_disposition::{
@@ -131,6 +131,13 @@ impl SessionStore {
     /// Returns an empty vec if the path is not a regular JSONL session file or
     /// the file is unreadable.
     pub fn load(&self, session_key: &str) -> Vec<ChatMessage> {
+        self.load_rows(session_key)
+            .into_iter()
+            .map(|row| row.message)
+            .collect()
+    }
+
+    fn load_rows(&self, session_key: &str) -> Vec<SessionTranscriptRow> {
         let Ok(Entry::Transcript(file)) = classify_session(&self.session_path(session_key)) else {
             return Vec::new();
         };
@@ -143,6 +150,14 @@ impl SessionStore {
     /// transcript that could not be verified" instead of seeding a
     /// new-message-only cache over an existing transcript.
     pub fn try_load(&self, session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
+        Ok(self
+            .try_load_rows(session_key)?
+            .into_iter()
+            .map(|row| row.message)
+            .collect())
+    }
+
+    fn try_load_rows(&self, session_key: &str) -> io::Result<Vec<SessionTranscriptRow>> {
         match classify_session(&self.session_path(session_key))? {
             Entry::Missing | Entry::Marker(_) => Ok(Vec::new()),
             Entry::Transcript(file) => {
@@ -178,7 +193,11 @@ impl SessionStore {
         Ok((directory, process))
     }
 
-    fn append_unlocked(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
+    fn append_unlocked(
+        &self,
+        session_key: &str,
+        message: &impl serde::Serialize,
+    ) -> std::io::Result<()> {
         let path = self.session_path(session_key);
         validate_jsonl_suffix(&path)?;
         let (mut file, needs_separator) = match jsonl::classify_append(&path)? {
@@ -240,7 +259,7 @@ impl SessionStore {
         let Some(last) = messages.last_mut() else {
             return Ok(false);
         };
-        *last = message.clone();
+        *last = message.clone().into();
         self.rewrite_with(session_key, &messages, persist)?;
         Ok(true)
     }
@@ -248,11 +267,15 @@ impl SessionStore {
     /// Compact a session file by rewriting only valid messages (removes corrupt lines).
     pub fn compact(&self, session_key: &str) -> std::io::Result<()> {
         let _guard = self.mutation_guard()?;
-        let messages = self.load(session_key);
+        let messages = self.load_rows(session_key);
         self.rewrite(session_key, &messages)
     }
 
-    fn rewrite(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+    fn rewrite<T: serde::Serialize>(
+        &self,
+        session_key: &str,
+        messages: &[T],
+    ) -> std::io::Result<()> {
         self.rewrite_with(session_key, messages, publish_staged_rewrite)
     }
 
@@ -261,14 +284,14 @@ impl SessionStore {
     /// `replace_conversation_state_if_exists` can probe-then-write under one
     /// guard acquisition (`parking_lot` mutexes are not reentrant, so the
     /// trait methods cannot call each other while holding it).
-    fn replace_locked(
+    fn replace_locked<T: serde::Serialize>(
         &self,
         _guard: &MutationGuard<'_>,
         session_key: &str,
-        messages: &[ChatMessage],
+        messages: &[T],
         breadcrumb_present: bool,
     ) -> std::io::Result<()> {
-        let previous_messages = self.load(session_key);
+        let previous_messages = self.load_rows(session_key);
         self.rewrite(session_key, messages)?;
         let breadcrumb_write = self.write_breadcrumb_unlocked(session_key, breadcrumb_present);
         if let Err(e) = breadcrumb_write {
@@ -282,10 +305,24 @@ impl SessionStore {
         Ok(())
     }
 
-    fn rewrite_with<F>(
+    fn replace_rows_if_exists<T: serde::Serialize>(
         &self,
         session_key: &str,
-        messages: &[ChatMessage],
+        rows: &[T],
+        breadcrumb_present: bool,
+    ) -> io::Result<bool> {
+        let guard = self.mutation_guard()?;
+        if !is_regular_jsonl_session_file(&self.session_path(session_key)) {
+            return Ok(false);
+        }
+        self.replace_locked(&guard, session_key, rows, breadcrumb_present)?;
+        Ok(true)
+    }
+
+    fn rewrite_with<F, T: serde::Serialize>(
+        &self,
+        session_key: &str,
+        messages: &[T],
         persist: F,
     ) -> std::io::Result<()>
     where
@@ -323,7 +360,7 @@ impl SessionStore {
         };
         let count = load_transcript(file).len();
         if count > 0 {
-            self.rewrite(session_key, &[])?;
+            self.rewrite::<ChatMessage>(session_key, &[])?;
         }
         Ok(count)
     }
@@ -567,11 +604,11 @@ fn ends_without_lf(file: &mut File) -> io::Result<bool> {
     Ok(last[0] != b'\n')
 }
 
-fn load_transcript(file: File) -> Vec<ChatMessage> {
+fn load_transcript(file: File) -> Vec<SessionTranscriptRow> {
     let mut messages = Vec::new();
     for line in BufReader::new(file).lines() {
         if let Ok(line) = line
-            && let Ok(message) = serde_json::from_str(line.trim())
+            && let Ok(message) = SessionTranscriptRow::from_json_line(line.trim())
         {
             messages.push(message);
         }
@@ -579,14 +616,17 @@ fn load_transcript(file: File) -> Vec<ChatMessage> {
     messages
 }
 
-fn read_strict_transcript(file: File, mut accept: impl FnMut(ChatMessage)) -> io::Result<()> {
+fn read_strict_transcript(
+    file: File,
+    mut accept: impl FnMut(SessionTranscriptRow),
+) -> io::Result<()> {
     for line in BufReader::new(file).lines() {
         let line = line?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let message = serde_json::from_str(trimmed).map_err(|error| {
+        let message = SessionTranscriptRow::from_json_line(trimmed).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("corrupt session JSONL line: {error}"),
@@ -775,6 +815,32 @@ impl SessionBackend for SessionStore {
         self.append(session_key, message)
     }
 
+    fn load_transcript_rows(&self, session_key: &str) -> Vec<SessionTranscriptRow> {
+        self.load_rows(session_key)
+    }
+
+    fn try_load_transcript_rows(&self, session_key: &str) -> io::Result<Vec<SessionTranscriptRow>> {
+        self.try_load_rows(session_key)
+    }
+
+    fn append_transcript_row(
+        &self,
+        session_key: &str,
+        row: &SessionTranscriptRow,
+    ) -> io::Result<()> {
+        let _guard = self.mutation_guard()?;
+        self.append_unlocked(session_key, row)
+    }
+
+    fn replace_transcript_rows_if_exists(
+        &self,
+        session_key: &str,
+        rows: &[SessionTranscriptRow],
+        breadcrumb_present: bool,
+    ) -> io::Result<bool> {
+        self.replace_rows_if_exists(session_key, rows, breadcrumb_present)
+    }
+
     fn append_authorized(
         &self,
         session_key: &str,
@@ -838,12 +904,7 @@ impl SessionBackend for SessionStore {
         // commit between the probe and the writes: once deletion wins, the
         // post-turn write is a no-op instead of recreating the transcript
         // and sidecar files the delete just removed.
-        let guard = self.mutation_guard()?;
-        if !is_regular_jsonl_session_file(&self.session_path(session_key)) {
-            return Ok(false);
-        }
-        self.replace_locked(&guard, session_key, messages, breadcrumb_present)?;
-        Ok(true)
+        self.replace_rows_if_exists(session_key, messages, breadcrumb_present)
     }
 
     fn get_session_trim_breadcrumb(&self, session_key: &str) -> std::io::Result<Option<bool>> {
@@ -2241,6 +2302,38 @@ mod tests {
     }
 
     #[test]
+    fn rewriting_jsonl_retains_occurrences_only_on_surviving_rows() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let path = store.session_path("same-text");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"role\":\"assistant\",\"content\":\"same\",\"reply_occurrence\":\"first\"}\n",
+                "{\"role\":\"assistant\",\"content\":\"same\",\"reply_occurrence\":\"second\"}\n",
+                "{\"role\":\"assistant\",\"content\":\"same\"}\n",
+            ),
+        )
+        .unwrap();
+        store.compact("same-text").unwrap();
+        assert!(store.remove_last("same-text").unwrap());
+        assert!(
+            store
+                .update_last("same-text", &ChatMessage::assistant("same"))
+                .unwrap()
+        );
+        let wire = std::fs::read_to_string(path).unwrap();
+        let rows: Vec<serde_json::Value> = wire
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["reply_occurrence"], "first");
+        assert!(rows[1].get("reply_occurrence").is_none());
+        assert!(rows.iter().all(|row| row["content"] == "same"));
+    }
+
+    #[test]
     fn compact_removes_corrupt_lines() {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path()).unwrap();
@@ -2540,7 +2633,13 @@ mod tests {
         let backend: &dyn SessionBackend = &store;
 
         backend
-            .append("s1", &ChatMessage::user("pre-replace turn"))
+            .append_transcript_row(
+                "s1",
+                &SessionTranscriptRow {
+                    message: ChatMessage::assistant("pre-replace turn"),
+                    reply_occurrence: Some("original".into()),
+                },
+            )
             .unwrap();
         backend.set_session_trim_breadcrumb("s1", false).unwrap();
 
@@ -2561,6 +2660,11 @@ mod tests {
             result.is_err(),
             "the poisoned breadcrumb path must fail the call"
         );
+        assert!(
+            backend
+                .replace_transcript_rows_if_exists("s1", &[], true)
+                .is_err()
+        );
 
         // The transcript must have rolled back to its pre-replace content,
         // not the replacement that could never be paired with a committed
@@ -2568,5 +2672,11 @@ mod tests {
         let messages = backend.load("s1");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "pre-replace turn");
+        assert_eq!(
+            backend.try_load_transcript_rows("s1").unwrap()[0]
+                .reply_occurrence
+                .as_deref(),
+            Some("original")
+        );
     }
 }

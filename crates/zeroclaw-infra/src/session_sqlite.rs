@@ -2,7 +2,7 @@
 
 use crate::session_backend::{
     SessionBackend, SessionContext, SessionEffectAuthorization, SessionMetadata, SessionQuery,
-    SessionState,
+    SessionState, SessionTranscriptRow,
 };
 use crate::session_disposition::{
     SessionDispositionBackend, SessionDispositionEffect, SessionDispositionIdentity,
@@ -150,7 +150,8 @@ impl SqliteSessionBackend {
                 session_key TEXT NOT NULL,
                 role        TEXT NOT NULL,
                 content     TEXT NOT NULL,
-                created_at  TEXT NOT NULL
+                created_at  TEXT NOT NULL,
+                reply_occurrence TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_sessions_key ON sessions(session_key);
              CREATE INDEX IF NOT EXISTS idx_sessions_key_id ON sessions(session_key, id);
@@ -194,6 +195,13 @@ impl SqliteSessionBackend {
         disposition::initialize(&tx, SessionDispositionBackend::ChatSqlite)
             .context("Failed to initialize session disposition schema")?;
 
+        Self::ensure_column(
+            &tx,
+            "sessions",
+            "reply_occurrence",
+            "ALTER TABLE sessions ADD COLUMN reply_occurrence TEXT",
+        )?;
+
         for (column, ddl) in [
             ("name", "ALTER TABLE session_metadata ADD COLUMN name TEXT"),
             (
@@ -233,7 +241,7 @@ impl SqliteSessionBackend {
                 "ALTER TABLE session_metadata ADD COLUMN principal_id TEXT",
             ),
         ] {
-            Self::ensure_metadata_column(&tx, column, ddl)?;
+            Self::ensure_column(&tx, "session_metadata", column, ddl)?;
         }
         for (index, ddl) in [
             (
@@ -380,18 +388,17 @@ impl SqliteSessionBackend {
         }
     }
 
-    fn ensure_metadata_column(conn: &Connection, column: &str, ddl: &str) -> Result<()> {
+    fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
         let present: bool = conn
             .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('session_metadata') \
-                 WHERE name = ?1",
-                params![column],
+                "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name = ?2",
+                params![table, column],
                 |row| row.get(0),
             )
-            .with_context(|| format!("Failed to inspect session metadata column {column}"))?;
+            .with_context(|| format!("Failed to inspect {table}.{column}"))?;
         if !present {
             conn.execute(ddl, [])
-                .with_context(|| format!("Failed to add session metadata column {column}"))?;
+                .with_context(|| format!("Failed to add {table}.{column}"))?;
         }
         Ok(())
     }
@@ -402,10 +409,43 @@ impl SqliteSessionBackend {
         message: &ChatMessage,
         now: &str,
     ) -> rusqlite::Result<()> {
+        Self::append_row_on(conn, session_key, message, None, now)
+    }
+
+    fn append_row(
+        &self,
+        session_key: &str,
+        message: &ChatMessage,
+        occurrence: Option<&str>,
+    ) -> std::io::Result<()> {
+        let mut conn = self.conn.lock();
+        // Take the write lock before either the row or its metadata changes,
+        // as in append_authorized. Both facts must commit or roll back together.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        Self::append_row_on(
+            &tx,
+            session_key,
+            message,
+            occurrence,
+            &Utc::now().to_rfc3339(),
+        )
+        .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)
+    }
+
+    fn append_row_on(
+        conn: &Connection,
+        session_key: &str,
+        message: &ChatMessage,
+        occurrence: Option<&str>,
+        now: &str,
+    ) -> rusqlite::Result<()> {
         conn.execute(
-            "INSERT INTO sessions (session_key, role, content, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![session_key, message.role, message.content, now],
+            "INSERT INTO sessions (session_key, role, content, created_at, reply_occurrence)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![session_key, message.role, message.content, now, occurrence],
         )?;
         conn.execute(
             "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count)
@@ -423,19 +463,89 @@ impl SqliteSessionBackend {
         session_key: &str,
         messages: &[ChatMessage],
     ) -> rusqlite::Result<()> {
+        Self::rewrite_rows_on(
+            conn,
+            session_key,
+            messages.iter().map(|message| (message, None)),
+        )
+    }
+
+    fn rewrite_rows_on<'a>(
+        conn: &Connection,
+        session_key: &str,
+        rows: impl ExactSizeIterator<Item = (&'a ChatMessage, Option<&'a str>)>,
+    ) -> rusqlite::Result<()> {
         conn.execute(
             "DELETE FROM sessions WHERE session_key = ?1",
             params![session_key],
         )?;
         let now = Utc::now().to_rfc3339();
-        for message in messages {
-            Self::append_on(conn, session_key, message, &now)?;
+        let count = rows.len();
+        for (message, occurrence) in rows {
+            Self::append_row_on(conn, session_key, message, occurrence, &now)?;
         }
         conn.execute(
             "UPDATE session_metadata SET message_count = ?2 WHERE session_key = ?1",
-            params![session_key, messages.len() as i64],
+            params![session_key, count as i64],
         )?;
         Ok(())
+    }
+
+    fn read_transcript_rows(
+        &self,
+        key: &str,
+        strict: bool,
+    ) -> rusqlite::Result<Vec<SessionTranscriptRow>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT role, content, reply_occurrence FROM sessions WHERE session_key = ?1 ORDER BY id"
+        )?;
+        let rows = stmt.query_map([key], |r| {
+            let occurrence = match r.get_ref(2)? {
+                rusqlite::types::ValueRef::Text(value) => std::str::from_utf8(value)
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned),
+                _ => None,
+            };
+            Ok(SessionTranscriptRow {
+                message: ChatMessage {
+                    role: r.get(0)?,
+                    content: r.get(1)?,
+                },
+                reply_occurrence: occurrence,
+            })
+        })?;
+        if strict {
+            rows.collect()
+        } else {
+            Ok(rows.filter_map(Result::ok).collect())
+        }
+    }
+
+    fn replace_existing_rows<'a>(
+        &self,
+        session_key: &str,
+        rows: impl ExactSizeIterator<Item = (&'a ChatMessage, Option<&'a str>)>,
+        breadcrumb_present: bool,
+    ) -> rusqlite::Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let exists = tx
+            .query_row(
+                "SELECT 1 FROM session_metadata WHERE session_key = ?1 LIMIT 1",
+                [session_key],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(false);
+        }
+        Self::rewrite_rows_on(&tx, session_key, rows)?;
+        Self::set_session_trim_breadcrumb_on(&tx, session_key, breadcrumb_present)?;
+        tx.commit()?;
+        Ok(true)
     }
 
     fn set_session_trim_breadcrumb_on(
@@ -894,8 +1004,8 @@ impl SqliteSessionBackend {
                 {
                     let mut insert = tx
                         .prepare(
-                            "INSERT INTO sessions (session_key, role, content, created_at) \
-                             VALUES (?1, ?2, ?3, ?4)",
+                            "INSERT INTO sessions (session_key, role, content, created_at, reply_occurrence) \
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
                         )
                         .with_context(|| format!("Failed to prepare JSONL import for {name}"))?;
                     for line in io::BufReader::new(file).split(b'\n') {
@@ -913,11 +1023,17 @@ impl SqliteSessionBackend {
                             continue;
                         }
                         has_non_whitespace_source = true;
-                        let Ok(message) = serde_json::from_str::<ChatMessage>(line) else {
+                        let Ok(row) = SessionTranscriptRow::from_json_line(line) else {
                             continue;
                         };
                         insert
-                            .execute(params![key, message.role, message.content, now])
+                            .execute(params![
+                                key,
+                                row.message.role,
+                                row.message.content,
+                                now,
+                                row.reply_occurrence
+                            ])
                             .with_context(|| format!("Failed to import JSONL session {name}"))?;
                         inserted += 1;
                     }
@@ -1061,6 +1177,34 @@ impl SqliteSessionBackend {
 }
 
 impl SessionBackend for SqliteSessionBackend {
+    fn load_transcript_rows(&self, key: &str) -> Vec<SessionTranscriptRow> {
+        self.read_transcript_rows(key, false).unwrap_or_default()
+    }
+
+    fn try_load_transcript_rows(&self, key: &str) -> std::io::Result<Vec<SessionTranscriptRow>> {
+        self.read_transcript_rows(key, true)
+            .map_err(std::io::Error::other)
+    }
+
+    fn append_transcript_row(&self, key: &str, row: &SessionTranscriptRow) -> std::io::Result<()> {
+        self.append_row(key, &row.message, row.reply_occurrence.as_deref())
+    }
+
+    fn replace_transcript_rows_if_exists(
+        &self,
+        key: &str,
+        rows: &[SessionTranscriptRow],
+        breadcrumb_present: bool,
+    ) -> std::io::Result<bool> {
+        self.replace_existing_rows(
+            key,
+            rows.iter()
+                .map(|row| (&row.message, row.reply_occurrence.as_deref())),
+            breadcrumb_present,
+        )
+        .map_err(std::io::Error::other)
+    }
+
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let conn = self.conn.lock();
         let mut stmt = match conn
@@ -1136,16 +1280,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
-        let mut conn = self.conn.lock();
-        let now = Utc::now().to_rfc3339();
-        // The message row and its metadata update commit or roll back
-        // together. IMMEDIATE takes the write lock before either statement
-        // runs, as `append_authorized` does.
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(std::io::Error::other)?;
-        Self::append_on(&tx, session_key, message, &now).map_err(std::io::Error::other)?;
-        tx.commit().map_err(std::io::Error::other)
+        self.append_row(session_key, message, None)
     }
 
     fn append_authorized(
@@ -1254,25 +1389,12 @@ impl SessionBackend for SqliteSessionBackend {
         messages: &[ChatMessage],
         breadcrumb_present: bool,
     ) -> std::io::Result<bool> {
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction().map_err(std::io::Error::other)?;
-        let exists = tx
-            .query_row(
-                "SELECT 1 FROM session_metadata WHERE session_key = ?1 LIMIT 1",
-                params![session_key],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(std::io::Error::other)?
-            .is_some();
-        if !exists {
-            return Ok(false);
-        }
-        Self::rewrite_messages_on(&tx, session_key, messages).map_err(std::io::Error::other)?;
-        Self::set_session_trim_breadcrumb_on(&tx, session_key, breadcrumb_present)
-            .map_err(std::io::Error::other)?;
-        tx.commit().map_err(std::io::Error::other)?;
-        Ok(true)
+        self.replace_existing_rows(
+            session_key,
+            messages.iter().map(|message| (message, None)),
+            breadcrumb_present,
+        )
+        .map_err(std::io::Error::other)
     }
 
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
@@ -1322,7 +1444,7 @@ impl SessionBackend for SqliteSessionBackend {
         };
 
         conn.execute(
-            "UPDATE sessions SET role = ?1, content = ?2 WHERE id = ?3",
+            "UPDATE sessions SET role = ?1, content = ?2, reply_occurrence = NULL WHERE id = ?3",
             params![message.role, message.content, id],
         )
         .map_err(std::io::Error::other)?;
@@ -2786,6 +2908,50 @@ mod tests {
     }
 
     #[test]
+    fn native_rows_survive_jsonl_import_without_guessing_invalid_markers() {
+        let tmp = TempDir::new().unwrap();
+        let jsonl = crate::session_store::SessionStore::new(tmp.path()).unwrap();
+        let path = tmp.path().join("sessions/equal.jsonl");
+        std::fs::write(&path, concat!(
+            "{\"role\":\"assistant\",\"content\":\"same\",\"reply_occurrence\":\"one\"}\n",
+            "{\"role\":\"assistant\",\"content\":\"same\",\"reply_occurrence\":\"\"}\n",
+            "{\"role\":\"assistant\",\"content\":\"same\",\"reply_occurrence\":{\"unknown\":1}}\n",
+            "{\"role\":\"assistant\",\"content\":\"same\"}\n",
+            "{\"role\":\"assistant\",\"content\":\"same\",\"reply_occurrence\":\"a\",\"reply_occurrence\":\"b\"}\n",
+            "[\"assistant\",\"same\"]\n",
+            "{\"role\":\"assistant\",\"content\":\"same\",\"reply_occurrence\":\"two\"}",
+        )).unwrap();
+        let check = |backend: &dyn SessionBackend| {
+            let rows = backend.try_load_transcript_rows("equal").unwrap();
+            assert!(rows.iter().all(|row| row.message.content == "same"));
+            let ids: Vec<_> = rows
+                .iter()
+                .map(|row| row.reply_occurrence.as_deref())
+                .collect();
+            assert_eq!(
+                ids,
+                [Some("one"), None, None, None, None, None, Some("two")]
+            );
+        };
+        check(&jsonl);
+        let sqlite = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(sqlite.migrate_from_jsonl(tmp.path()).unwrap(), 1);
+        drop(sqlite);
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        check(&reopened);
+        // The dynamic SQLite type of an optional field cannot hide a valid reply.
+        reopened
+            .conn
+            .lock()
+            .execute(
+                "UPDATE sessions SET reply_occurrence = x'ff' WHERE reply_occurrence IS NULL",
+                [],
+            )
+            .unwrap();
+        check(&reopened);
+    }
+
+    #[test]
     fn migrate_from_jsonl_preserves_explicit_trim_breadcrumb() {
         let tmp = TempDir::new().unwrap();
         let sessions_dir = tmp.path().join("sessions");
@@ -3993,6 +4159,11 @@ mod tests {
         // Create backend (runs migration)
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
         backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend
+            .conn
+            .lock()
+            .execute_batch("ALTER TABLE sessions DROP COLUMN reply_occurrence")
+            .unwrap();
 
         // Re-open (migration should be idempotent)
         drop(backend);
@@ -4000,6 +4171,9 @@ mod tests {
         let msgs = backend2.load("s1");
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "hello");
+        let rows = backend2.try_load_transcript_rows("s1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reply_occurrence, None);
 
         // State should default to idle
         let state = backend2.get_session_state("s1").unwrap().unwrap();
@@ -4260,7 +4434,13 @@ mod tests {
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
 
         backend
-            .append("s1", &ChatMessage::user("pre-replace turn"))
+            .append_transcript_row(
+                "s1",
+                &SessionTranscriptRow {
+                    message: ChatMessage::assistant("pre-replace turn"),
+                    reply_occurrence: Some("original".into()),
+                },
+            )
             .unwrap();
         backend.set_session_trim_breadcrumb("s1", false).unwrap();
 
@@ -4288,12 +4468,23 @@ mod tests {
             true,
         );
         assert!(result.is_err(), "the poisoned trigger must fail the call");
+        assert!(
+            backend
+                .replace_transcript_rows_if_exists("s1", &[], true)
+                .is_err()
+        );
 
         // The transcript half must have rolled back with the breadcrumb
         // half, not landed as a new transcript paired with the old flag.
         let messages = backend.load("s1");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "pre-replace turn");
+        assert_eq!(
+            backend.try_load_transcript_rows("s1").unwrap()[0]
+                .reply_occurrence
+                .as_deref(),
+            Some("original")
+        );
         assert_eq!(
             backend.get_session_trim_breadcrumb("s1").unwrap(),
             Some(false)

@@ -73,6 +73,55 @@ pub struct TimestampedMessage {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// A persisted chat row. The optional opaque ID identifies this assistant
+/// reply to a reconnecting native client; it is not part of the model message.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionTranscriptRow {
+    #[serde(flatten)]
+    pub message: ChatMessage,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "read_reply_occurrence"
+    )]
+    pub reply_occurrence: Option<String>,
+}
+
+impl SessionTranscriptRow {
+    pub(crate) fn from_json_line(line: &str) -> serde_json::Result<Self> {
+        // Older readers recognized the message independently of extension
+        // fields. An ambiguous (e.g. duplicate) marker or legacy positional
+        // encoding provides no identity, but cannot erase a valid message.
+        serde_json::from_str(line).or_else(|error| {
+            serde_json::from_str::<ChatMessage>(line)
+                .map(Into::into)
+                .map_err(|_| error)
+        })
+    }
+}
+
+impl From<ChatMessage> for SessionTranscriptRow {
+    fn from(message: ChatMessage) -> Self {
+        Self {
+            message,
+            reply_occurrence: None,
+        }
+    }
+}
+
+fn read_reply_occurrence<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    // An unrecognized marker is not proof of identity, but neither should it
+    // make an otherwise valid message disappear during compaction.
+    Ok(
+        match <serde_json::Value as serde::Deserialize>::deserialize(deserializer)? {
+            serde_json::Value::String(id) if !id.is_empty() => Some(id),
+            _ => None,
+        },
+    )
+}
+
 /// A caller-owned, synchronous authority hold. Storage knows no runtime policy.
 pub trait SessionEffectGuard {}
 impl<T> SessionEffectGuard for T {}
@@ -96,6 +145,24 @@ pub trait SessionBackend: Send + Sync {
         Ok(self.load(session_key))
     }
 
+    /// Like `load`, including any native reply identity actually persisted.
+    /// A backend without identity support supplies ordinary, unmarked rows.
+    fn load_transcript_rows(&self, session_key: &str) -> Vec<SessionTranscriptRow> {
+        self.load(session_key).into_iter().map(Into::into).collect()
+    }
+
+    /// Strict counterpart for seeding live history without hiding a read error.
+    fn try_load_transcript_rows(
+        &self,
+        session_key: &str,
+    ) -> std::io::Result<Vec<SessionTranscriptRow>> {
+        Ok(self
+            .try_load(session_key)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
     /// Same as `load`, but each row carries its persisted `created_at`
     /// when the backend has one. Default impl falls back to `load`
     /// without timestamps so non-SQLite backends keep working.
@@ -111,6 +178,16 @@ pub trait SessionBackend: Send + Sync {
 
     /// Append a single message to a session.
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()>;
+
+    /// Append the row and its presentation metadata together. Legacy stores
+    /// still persist the reply; their later reads cannot establish its identity.
+    fn append_transcript_row(
+        &self,
+        session_key: &str,
+        row: &SessionTranscriptRow,
+    ) -> std::io::Result<()> {
+        self.append(session_key, &row.message)
+    }
 
     /// Append under the storage mutation boundary, resolving its current owner
     /// there. Retain authorization through commit and the synchronous live-cache
@@ -352,6 +429,18 @@ pub trait SessionBackend: Send + Sync {
         Ok(true)
     }
 
+    /// Preserve the caller's exact surviving row identities and breadcrumb
+    /// under the ordinary delete-versus-replace boundary.
+    fn replace_transcript_rows_if_exists(
+        &self,
+        session_key: &str,
+        rows: &[SessionTranscriptRow],
+        breadcrumb_present: bool,
+    ) -> std::io::Result<bool> {
+        let messages: Vec<_> = rows.iter().map(|row| row.message.clone()).collect();
+        self.replace_conversation_state_if_exists(session_key, &messages, breadcrumb_present)
+    }
+
     fn set_session_context(
         &self,
         _session_key: &str,
@@ -531,6 +620,103 @@ pub struct SessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_native_row_lifecycle(kind: &str) {
+        let tmp = tempfile::tempdir().unwrap();
+        let open = || crate::make_session_backend(tmp.path(), kind).unwrap();
+        let key = "equal-replies";
+        let reply = |id: &str| SessionTranscriptRow {
+            message: ChatMessage::assistant("same"),
+            reply_occurrence: Some(id.to_owned()),
+        };
+        let backend = open();
+        let original = [reply("first"), reply("second")];
+        assert!(
+            !backend
+                .replace_transcript_rows_if_exists(key, &original, true)
+                .unwrap()
+        );
+        for row in &original {
+            backend.append_transcript_row(key, row).unwrap();
+        }
+        backend
+            .append(key, &ChatMessage::assistant("same"))
+            .unwrap();
+        let mut rows = backend.try_load_transcript_rows(key).unwrap();
+        rows.push(reply("third"));
+        assert!(
+            backend
+                .replace_transcript_rows_if_exists(key, &rows, false)
+                .unwrap()
+        );
+        drop(backend);
+
+        let backend = open();
+        let mut retained = backend.try_load_transcript_rows(key).unwrap();
+        let ids = |rows: &[SessionTranscriptRow]| {
+            rows.iter()
+                .map(|r| r.reply_occurrence.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(&retained),
+            [
+                Some("first".into()),
+                Some("second".into()),
+                None,
+                Some("third".into())
+            ]
+        );
+        retained.remove(0);
+        assert!(
+            backend
+                .replace_transcript_rows_if_exists(key, &retained, true)
+                .unwrap()
+        );
+        drop(backend);
+
+        let backend = open();
+        assert_eq!(
+            ids(&backend.load_transcript_rows(key)),
+            [Some("second".into()), None, Some("third".into())]
+        );
+        assert_eq!(
+            backend.get_session_trim_breadcrumb(key).unwrap(),
+            Some(true)
+        );
+        let plain = serde_json::json!({"role":"assistant","content":"same"});
+        assert_eq!(
+            serde_json::to_value(backend.try_load(key).unwrap()).unwrap(),
+            serde_json::json!([plain, plain, plain])
+        );
+        assert!(
+            backend
+                .update_last(key, &ChatMessage::assistant("same"))
+                .unwrap()
+        );
+        assert_eq!(
+            ids(&backend.try_load_transcript_rows(key).unwrap()),
+            [Some("second".into()), None, None]
+        );
+        assert!(backend.delete_session(key).unwrap());
+        assert!(
+            !backend
+                .replace_transcript_rows_if_exists(key, &retained, true)
+                .unwrap()
+        );
+        assert!(!backend.session_exists(key));
+        assert_eq!(backend.get_session_trim_breadcrumb(key).unwrap(), None);
+    }
+
+    #[test]
+    fn sqlite_native_rows_survive_only_their_own_rewrites() {
+        assert_native_row_lifecycle("sqlite");
+    }
+
+    #[test]
+    fn jsonl_native_rows_survive_only_their_own_rewrites() {
+        assert_native_row_lifecycle("jsonl");
+    }
 
     #[test]
     fn session_metadata_is_constructible() {
