@@ -322,8 +322,7 @@ pub struct Config {
     #[group = "Agent"]
     pub scheduler: SchedulerConfig,
 
-    /// Agent evaluation harness (`[eval]`) — surfaced via `zeroclaw eval`.
-    /// Distinct from `[agent.eval]`, which is the in-loop response-quality scorer.
+    /// Agent evaluation harness (`[eval]`) used by `zeroclaw eval run`.
     #[serde(default)]
     #[nested]
     #[group = "Operations"]
