@@ -324,6 +324,7 @@ tool-native-ssh-connection = The managed SSH connection could not be established
 
 # Managed browser credentials
 tool-browser-credential-submitted = Credential submitted
+tool-browser-credential-operation-completed = Managed browser operation completed
 tool-browser-credential-submission-failed = Managed browser credential submission failed
 
 tool-send-via-error-no-active-reply = No active channel reply to redirect. To start or resume a conversation, call send_via with both `target` and a non-empty `body`.

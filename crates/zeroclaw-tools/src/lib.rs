@@ -70,6 +70,7 @@ pub mod linkedin;
 #[cfg(feature = "tool-linkedin")]
 pub mod linkedin_client;
 pub mod llm_task;
+pub mod managed_browser;
 pub mod mcp_client;
 pub mod mcp_context;
 pub mod mcp_deferred;

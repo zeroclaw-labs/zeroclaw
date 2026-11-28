@@ -30,7 +30,23 @@ Use disposable HTTPS fixtures. Cover password-only, TOTP-only, both grants and n
 
 ## Integration status
 
-The draft implements separate catalog grants and a Rust predicate over the top-level URL, credential document, and submission target. The predicate is evaluated against their HTTPS origins. It does not establish that the URLs were collected atomically or that the browser prevents subsequent script-driven transmission. Those guarantees belong to the managed browser executor. The ordinary fill action remains separate from the credential flow.
+The draft implements separate catalog grants, current-record revalidation and a
+private managed executor. The ordinary browser backend is never reused for
+catalog release. The tool-loop owner creates a fresh private capability; nested
+or delegated tool loops receive their own scope. The supervisor owns a helper's
+stdin lease, and the helper owns a headless Chromium process and non-persistent
+context. No model-selected task/session identifier can attach to it.
+
+The private protocol exposes only opening an HTTPS page, obtaining its canonical
+origin internally, and submitting a catalog-resolved form. Arbitrary scripts,
+clipboard access, snapshots, screenshots, text extraction, cookie/storage export,
+traces, video and downloads are absent. Generic browser actions are refused for
+the rest of an invocation once it reserves a private context. The restriction
+continues after authentication, explicit close or failed startup.
+
+Only the authorized destination's scripts see its own form values. This does not
+claim to hide credentials from that site or defend against OS compromise. The
+browser sandbox remains enabled; no certificate-error bypass is installed.
 
 The initial acceptance sequence is a disposable HTTPS login with separate password and TOTP steps, followed by a read-only confirmation that the configured operator can reach their intended console. Live validation records the authentication outcome without copying account data, credentials, cookies, or identity-provider responses.
 
@@ -41,19 +57,46 @@ independently of origin grants and browser automation enablement. Saving a grant
 does not enable `submit_credential`. The executor reads this switch from the same
 on-disk config as the catalog before any browser or vault access and again after
 an awaited lookup. Missing, unreadable, malformed or disabled config refuses use.
-This is an experimental acceptance switch for disposable fixtures with synthetic
-credentials, not a claim that the current executor provides managed isolation.
+This remains an experimental acceptance switch for disposable fixtures with
+synthetic credentials while the RFC and parent merge decisions are pending.
 Disable it to stop subsequent releases without deleting grants. Environment-only
 overrides cannot enable this disk-authorized path.
 
-The action submit_credential takes one catalog alias on the active login page. The executor rechecks the catalog after vault lookup and sends values through standard input. The form helper accepts visible top-level fields and a same-origin HTTPS POST action. Its result indicates submission, not authentication. This implementation targets standard HTML forms and six-digit SHA-1 TOTP with a 30-second step.
+Start with `credential_open` and an HTTPS URL. `submit_credential` then takes one
+catalog alias on that private page. The executor rechecks the catalog and the
+enablement switch after vault lookup, sending values through standard input.
+The form helper accepts semantic visible top-level fields and a same-origin
+HTTPS POST action. Its result indicates a confirmed navigation following
+submission, not authentication. This implementation targets standard HTML forms
+and six-digit SHA-1 TOTP with a 30-second step. See the
+[helper setup and lifecycle contract](../../../../scripts/browser/README.md).
 
 ### Multi-step and embedded forms
 
-Use credential_stage to select username, password, login, or otp. A username-only call does not fetch the password. Use credential_field for a field observed on the page, or for a group of one-character OTP controls. Use credential_frame for a single visible iframe when its document and the top-level page share the authorized HTTPS origin. Each submission still requires the form to send a POST to that origin. A cross-origin login embedded by a site must be opened through its normal sign-in navigation before the tool can use a grant for that other origin. Provider access checks remain separate from credential submission.
+Use `credential_stage` to select username, password, login, or otp. A username-only
+call does not fetch the password. Passwords require a password input; TOTP can
+use a visible or masked semantic OTP input or semantic one-character controls.
+The private executor rejects model-provided `credential_field` and
+`credential_frame` selectors, embedded forms, cross-origin redirects/resources
+and unconfirmed SPA submissions. Each submission must POST to the same origin.
+These restrictions reduce compatibility deliberately; no fallback to a generic
+browser session is permitted.
+
+Use `credential_close` to finish early. Completion, errors and cancellation end
+the lease too, including during startup or navigation. Normal completion waits
+for helper cleanup; dropping the owner signals the independent supervisor to
+close the pipe and await the helper. The helper closes its context and browser
+on EOF. A steering yield ends that invocation's context; it is not persisted or
+restored on restart.
 
 ## Current limitations
 
-This remains draft pending RFC #12422 and its catalog dependencies. The current agent-browser path does not yet isolate browser sessions by task or suppress generic observations of credential-bearing pages. Origin grants authorize later password confirmations on that origin, including sensitive operations. A submission acknowledgement does not prove authentication. A refused or unconfirmed result may follow a page-handled submission; inspect page state rather than automatically retrying.
+This remains draft pending RFC #12422 and its catalog dependencies. The private
+executor's isolation and observation restrictions are implemented and exercised
+with synthetic browser fixtures; that is not independent acceptance against a
+real external service. Origin grants authorize later password confirmations on
+that origin, including sensitive operations. A refused or unconfirmed result may
+follow a page-handled submission; do not automatically retry. No raw private-page
+observation is exposed to resolve that uncertainty.
 
 Every permission mutation requires the accepted catalog revision. Replacing a credential with a different suggested service clears HTTP and browser grants; rotation for the same service preserves them. A named OTP field must also match `autocomplete="one-time-code"` or `name="otp"`; a group must have one character per control.

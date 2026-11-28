@@ -1706,7 +1706,12 @@ pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
     Box::pin(zeroclaw_tools::task_ssh::scope(Box::pin(
-        run_tool_call_loop_impl(p, Some(subject), reported_usage, repetition_guard),
+        zeroclaw_tools::managed_browser::scope(run_tool_call_loop_impl(
+            p,
+            Some(subject),
+            reported_usage,
+            repetition_guard,
+        )),
     )))
 }
 
@@ -1715,7 +1720,12 @@ pub(crate) fn run_tool_call_loop_with_guard<'a>(
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
     Box::pin(zeroclaw_tools::task_ssh::scope(Box::pin(
-        run_tool_call_loop_impl(p, None, None, repetition_guard),
+        zeroclaw_tools::managed_browser::scope(run_tool_call_loop_impl(
+            p,
+            None,
+            None,
+            repetition_guard,
+        )),
     )))
 }
 
@@ -1723,7 +1733,7 @@ pub fn run_tool_call_loop(
     p: ToolLoop<'_>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>> {
     Box::pin(zeroclaw_tools::task_ssh::scope(Box::pin(
-        run_tool_call_loop_impl(p, None, None, None),
+        zeroclaw_tools::managed_browser::scope(run_tool_call_loop_impl(p, None, None, None)),
     )))
 }
 

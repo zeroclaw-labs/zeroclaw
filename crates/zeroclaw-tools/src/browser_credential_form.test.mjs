@@ -6,7 +6,7 @@ import test from "node:test";
 const source = readFileSync(new URL("./browser_credential_form.js", import.meta.url), "utf8");
 const origin = "https://login.example.test";
 
-function fixture({ action = origin + "/submit", method = "post", top = true, invalid = false, canceled = false, maskedOtp = false, duplicateOtp = false, frameOrigin = origin, submitOverride, windowOrigin = origin, target = "", buttonCount = 1, otpType, splitForms = false } = {}) {
+function fixture({ action = origin + "/submit", method = "post", top = true, invalid = false, canceled = false, maskedOtp = false, duplicateOtp = false, frameOrigin = origin, submitOverride, windowOrigin = origin, target = "", buttonCount = 1, otpType, splitForms = false, segmentedOtp = false } = {}) {
   const sent = [];
   class Form {
     addEventListener(type, handler) { this.observeSubmit = handler; }
@@ -30,6 +30,7 @@ function fixture({ action = origin + "/submit", method = "post", top = true, inv
   const segments = Array.from({length:6}, () => Object.assign(new Input(), { form, type:"text", maxLength:1 }));
   fields.push(...segments);
   fields.forEach((field, index) => { field.matches = () => index === 2; });
+  if (segmentedOtp) segments.forEach(field => { field.matches = () => true; });
   if (otpType) fields[2].type = otpType;
   if (splitForms) fields[0].form = new Form();
   const window = { location: { origin: windowOrigin } };
@@ -46,6 +47,7 @@ function fixture({ action = origin + "/submit", method = "post", top = true, inv
         return maskedOtp && selector.includes(':not([name="otp"])') ? [] : [fields[1]];
       }
       if (selector.includes('one-time-code')) {
+        if (segmentedOtp) return segments;
         const matches = !maskedOtp || selector.includes('input[name="otp"]') ? [fields[2]] : [];
         return duplicateOtp ? [...matches, Object.assign(new Input(), { form })] : matches;
       }
@@ -67,6 +69,21 @@ test("submits only the one-time code", () => {
   const { run, sent, fields } = fixture();
   assert.equal(run({ otp: "123456" }), true);
   assert.deepEqual(sent, [["", "", "123456", "", "", "", "", "", ""]]);
+  assert.ok(fields.every(field => field.value === ""));
+});
+
+test("a password field changed to plain text is refused before filling", () => {
+  const { run, sent, fields } = fixture();
+  fields[1].type = "text";
+  assert.equal(run({ username: "fixture", password: "sentinel" }), false);
+  assert.deepEqual(sent, []);
+  assert.ok(fields.every(field => field.value === ""));
+});
+
+test("semantic one-character OTP controls need no model selector", () => {
+  const { run, sent, fields } = fixture({ segmentedOtp: true });
+  assert.equal(run({ otp: "123456" }), true);
+  assert.equal(sent[0].slice(3).join(""), "123456");
   assert.ok(fields.every(field => field.value === ""));
 });
 

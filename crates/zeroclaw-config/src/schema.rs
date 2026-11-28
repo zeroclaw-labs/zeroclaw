@@ -9198,9 +9198,9 @@ pub struct BrowserConfig {
     /// unless a risk profile lists it explicitly.
     #[serde(default)]
     pub automation_enabled: bool,
-    /// Experimental catalog submission on agent-browser. Disabled independently
-    /// of origin grants: this backend does not isolate tasks or suppress page
-    /// observation. Enable only for disposable, synthetic acceptance fixtures.
+    /// Experimental catalog submission in a private task-owned managed browser.
+    /// Disabled independently of origin grants. Keep disabled for real credentials
+    /// pending the RFC and independent managed-browser acceptance.
     /// Read from the catalog config on each submission, including after lookup.
     #[serde(default)]
     #[credential_class = "public_value"]

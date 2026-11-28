@@ -30,8 +30,8 @@ function submitCatalogCredential({ origin, values, stage = "auto", field = null,
       if (typeof values.otp !== "string") return false;
       const controls = select(field ?? otpFields);
       if (controls.length === 1 && controls[0].matches(otpFields)) fields = [[controls[0], values.otp]];
-      else if (field && controls.length === values.otp.length &&
-               controls.every(control => control.maxLength === 1)) {
+      else if (controls.length === values.otp.length &&
+               controls.every(control => control.maxLength === 1 && (field || control.matches(otpFields)))) {
         fields = controls.map((control, index) => [control, values.otp[index]]);
       } else return false;
       if (fields.some(([control]) => !["text", "password", "tel", "number"].includes(control.type))) return false;

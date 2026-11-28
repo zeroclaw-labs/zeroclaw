@@ -2055,7 +2055,7 @@ jobs:
           # The generated dashboard contract includes schemas owned by the
           # config, runtime, and SOP graph crates and is rendered by the xtask generator.
           # Keep this trigger aligned with every source that can change it.
-          emit web      "^web/|^crates/zeroclaw-(config|gateway|runtime|sop-graph)/|^xtask/|^Cargo\.(toml|lock)$|^\.nvmrc$|${wf}"
+          emit web      "^web/|^scripts/browser/|^crates/zeroclaw-tools/src/(browser|managed_browser)|^crates/zeroclaw-(config|gateway|runtime|sop-graph)/|^xtask/|^Cargo\.(toml|lock)$|^\.nvmrc$|${wf}"
 
   nix-eval:
     name: Nix Module Eval
@@ -2197,6 +2197,14 @@ jobs:
         run: npm ci
       - name: Typecheck generated dashboard contract
         run: cargo web check
+      - name: Install private browser test dependencies
+        run: |
+          npm ci --prefix scripts/browser --ignore-scripts
+          npx --prefix scripts/browser --no-install playwright-core install --with-deps chromium
+      - name: Test private browser isolation and cleanup
+        run: |
+          export ZEROCLAW_TEST_CHROMIUM="$(node --input-type=module -e 'import { chromium } from "./scripts/browser/node_modules/playwright-core/index.mjs"; console.log(chromium.executablePath())')"
+          npm test --prefix scripts/browser
       - name: Run permission and catalog regressions
         working-directory: web
         run: npm run test:permissions
