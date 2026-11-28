@@ -25,12 +25,17 @@ pub enum OptInTool {
     ClaudeCode,
     ClaudeCodeRunner,
     CodexCli,
-    GeminiCli,
     OpenCodeCli,
+    /// Web search (`[web_search]`, behind `tools-external`). Deliberately not
+    /// part of [`OptInTool::ALL`]: the tool inventory files `web_search_tool`
+    /// under its `External` compilation group, and `ALL` must stay in lockstep
+    /// with the inventory's opt-in rows. `collect_compiled_out_tool_warnings`
+    /// reports it alongside `ALL`.
+    WebSearch,
 }
 
 impl OptInTool {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 11] = [
         Self::Jira,
         Self::Notion,
         Self::LinkedIn,
@@ -41,7 +46,6 @@ impl OptInTool {
         Self::ClaudeCode,
         Self::ClaudeCodeRunner,
         Self::CodexCli,
-        Self::GeminiCli,
         Self::OpenCodeCli,
     ];
 
@@ -58,8 +62,8 @@ impl OptInTool {
             Self::ClaudeCode => "claude_code",
             Self::ClaudeCodeRunner => "claude_code_runner",
             Self::CodexCli => "codex_cli",
-            Self::GeminiCli => "gemini_cli",
             Self::OpenCodeCli => "opencode_cli",
+            Self::WebSearch => "web_search",
         }
     }
 
@@ -76,8 +80,8 @@ impl OptInTool {
             Self::ClaudeCode => "tool-claude-code",
             Self::ClaudeCodeRunner => "tool-claude-code-runner",
             Self::CodexCli => "tool-codex-cli",
-            Self::GeminiCli => "tool-gemini-cli",
             Self::OpenCodeCli => "tool-opencode-cli",
+            Self::WebSearch => "tools-external",
         }
     }
 
@@ -94,8 +98,8 @@ impl OptInTool {
             Self::ClaudeCode => cfg!(feature = "tool-claude-code"),
             Self::ClaudeCodeRunner => cfg!(feature = "tool-claude-code-runner"),
             Self::CodexCli => cfg!(feature = "tool-codex-cli"),
-            Self::GeminiCli => cfg!(feature = "tool-gemini-cli"),
             Self::OpenCodeCli => cfg!(feature = "tool-opencode-cli"),
+            Self::WebSearch => cfg!(feature = "tools-external"),
         }
     }
 
@@ -112,8 +116,8 @@ impl OptInTool {
             Self::ClaudeCode => config.claude_code.enabled,
             Self::ClaudeCodeRunner => config.claude_code_runner.enabled,
             Self::CodexCli => config.codex_cli.enabled,
-            Self::GeminiCli => config.gemini_cli.enabled,
             Self::OpenCodeCli => config.opencode_cli.enabled,
+            Self::WebSearch => config.web_search.enabled,
         }
     }
 
