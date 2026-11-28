@@ -350,6 +350,16 @@ pub struct NativeRecipeInputs<'a> {
     pub execution_capability: Option<crate::live_config_authority::AgentExecutionCapability>,
     /// A read view of ACP sessions, for entry points that serve ACP.
     pub acp_sessions: Option<crate::tools::AcpSessionReadView>,
+    /// The caller's tool ceiling for this build, when the entry point runs
+    /// under one, or `None` for a root entry point with no caller. The
+    /// scheduler, SOP and relay tools persist or launch work that outlives the
+    /// turn, so they need the ceiling's value and not only the filtered list.
+    /// Crate-private: only the runtime's own entry points set it. A recipe
+    /// that forwards `inputs` to [`defaults::native_compat_registry`] carries it
+    /// without seeing it; a recipe in another crate cannot read it, so one that
+    /// builds the scheduler, SOP or relay tools itself builds them without a
+    /// ceiling.
+    pub(crate) caller_ceiling: Option<crate::tools::caller_ceiling::CallerCeiling>,
 }
 
 /// A native compatibility recipe: builds the native registry for one eager
@@ -897,5 +907,480 @@ mod binding_ratchet_tests {
             offenders.is_empty(),
             "production loops drop the capability binding: {offenders:?}"
         );
+    }
+
+    /// The tools that start child work through a capability slot. Their
+    /// slot is empty when built and only an entry point's binding fills it,
+    /// so an instance built anywhere but the registry factory or the
+    /// factories a bounded hop calls to rebuild them for its target runs its
+    /// child work on config-backed sources.
+    const CHILD_STARTING_TOOLS: &str = "SpawnSubagentTool|SendMessageToPeerTool|CronRunTool";
+
+    /// The production sites allowed to call one of their constructors, as
+    /// (file under `src/`, enclosing function, type, number of calls, why).
+    const ALLOWED_CHILD_STARTING_CONSTRUCTIONS: &[(&str, &str, &str, usize, &str)] = &[
+        (
+            "tools/mod.rs",
+            "all_tools_with_runtime_on_thread",
+            "CronRunTool",
+            1,
+            "the native registry, which collects the slot for prepare_registry",
+        ),
+        (
+            "tools/mod.rs",
+            "all_tools_with_runtime_on_thread",
+            "SpawnSubagentTool",
+            1,
+            "the native registry, which collects the slot for prepare_registry",
+        ),
+        (
+            "tools/mod.rs",
+            "all_tools_with_runtime_on_thread",
+            "SendMessageToPeerTool",
+            1,
+            "the native registry, which collects the slot for prepare_registry",
+        ),
+        (
+            "tools/mod.rs",
+            "cron_run_tool",
+            "CronRunTool",
+            1,
+            "the factory a bounded hop calls to rebuild the tool for its target",
+        ),
+        (
+            "tools/mod.rs",
+            "spawn_subagent_tool",
+            "SpawnSubagentTool",
+            1,
+            "the factory a bounded hop calls to rebuild the tool for its target",
+        ),
+        (
+            "tools/mod.rs",
+            "send_message_to_peer_tool",
+            "SendMessageToPeerTool",
+            1,
+            "the factory a bounded hop calls to rebuild the tool for its target",
+        ),
+    ];
+
+    /// One call of a child-starting tool's constructor in production code.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ConstructorHit {
+        file: String,
+        line: usize,
+        function: String,
+        type_name: String,
+        text: String,
+    }
+
+    /// Matches `Type::new*`, also when rustfmt splits the path or the call
+    /// across lines, and when the constructor is passed as a function.
+    fn constructor_pattern() -> regex::Regex {
+        regex::Regex::new(&format!(r"\b({CHILD_STARTING_TOOLS})\s*::\s*(new\w*)\b"))
+            .expect("constructor pattern compiles")
+    }
+
+    /// `#[cfg(test)]` (or `#[cfg(all(.., test, ..))]`), any further outer
+    /// attributes, then a module item. Group 1 is the module name, group 2 the
+    /// `{` of an inline module or the `;` of an out-of-line one.
+    fn test_module_pattern() -> regex::Regex {
+        regex::Regex::new(
+            r#"(?m)^[ \t]*#\[cfg\((?:test|all\([^)\]]*\btest\b[^)\]]*\))\)\][ \t]*\n(?:[ \t]*#\[[^\n]*\][ \t]*\n)*[ \t]*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*([{;])"#,
+        )
+        .expect("test-module pattern compiles")
+    }
+
+    /// The byte just past the `}` that closes the block opened at `open`,
+    /// skipping comments, string and character literals.
+    fn block_end(source: &str, open: usize) -> usize {
+        let chars: Vec<(usize, char)> = source[open..]
+            .char_indices()
+            .map(|(offset, ch)| (open + offset, ch))
+            .collect();
+        let at = |index: usize| chars.get(index).map(|(_, ch)| *ch);
+        let mut depth = 0usize;
+        let mut index = 0;
+        while index < chars.len() {
+            let ch = chars[index].1;
+            match ch {
+                '/' if at(index + 1) == Some('/') => {
+                    while index < chars.len() && chars[index].1 != '\n' {
+                        index += 1;
+                    }
+                    continue;
+                }
+                '/' if at(index + 1) == Some('*') => {
+                    let mut nested = 0usize;
+                    while index < chars.len() {
+                        if chars[index].1 == '/' && at(index + 1) == Some('*') {
+                            nested += 1;
+                            index += 2;
+                        } else if chars[index].1 == '*' && at(index + 1) == Some('/') {
+                            nested -= 1;
+                            index += 2;
+                            if nested == 0 {
+                                break;
+                            }
+                        } else {
+                            index += 1;
+                        }
+                    }
+                    continue;
+                }
+                'r' if !index
+                    .checked_sub(1)
+                    .and_then(at)
+                    .is_some_and(|before| before.is_alphanumeric() || before == '_')
+                    || index
+                        .checked_sub(1)
+                        .and_then(at)
+                        .is_some_and(|before| before == 'b') =>
+                {
+                    let mut hashes = 0usize;
+                    while at(index + 1 + hashes) == Some('#') {
+                        hashes += 1;
+                    }
+                    if at(index + 1 + hashes) != Some('"') {
+                        index += 1;
+                        continue;
+                    }
+                    index += 2 + hashes;
+                    while index < chars.len() {
+                        if chars[index].1 == '"' && (1..=hashes).all(|n| at(index + n) == Some('#'))
+                        {
+                            index += 1 + hashes;
+                            break;
+                        }
+                        index += 1;
+                    }
+                    continue;
+                }
+                '"' => {
+                    index += 1;
+                    while index < chars.len() && chars[index].1 != '"' {
+                        if chars[index].1 == '\\' {
+                            index += 1;
+                        }
+                        index += 1;
+                    }
+                }
+                '\'' => {
+                    if at(index + 1) == Some('\\') {
+                        // Past the quote, the backslash and the escaped
+                        // character, which may itself be a quote.
+                        index += 3;
+                        while index < chars.len() && chars[index].1 != '\'' {
+                            index += 1;
+                        }
+                    } else if at(index + 2) == Some('\'') {
+                        index += 2;
+                    }
+                }
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return chars[index].0 + 1;
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        source.len()
+    }
+
+    /// An out-of-line test module: its name and its `#[path]`, if any.
+    type OutOfLineModule = (String, Option<String>);
+
+    /// The byte ranges of `source` inside inline test modules, and its
+    /// out-of-line test modules.
+    fn test_parts(source: &str) -> (Vec<std::ops::Range<usize>>, Vec<OutOfLineModule>) {
+        let path_attribute =
+            regex::Regex::new(r#"#\[path\s*=\s*"([^"]+)"\]"#).expect("path pattern compiles");
+        let mut inline = Vec::new();
+        let mut out_of_line = Vec::new();
+        for module in test_module_pattern().captures_iter(source) {
+            let whole = module.get(0).expect("whole match");
+            let terminator = module.get(2).expect("terminator");
+            if terminator.as_str() == "{" {
+                inline.push(whole.start()..block_end(source, terminator.start()));
+            } else {
+                let path = path_attribute
+                    .captures(whole.as_str())
+                    .map(|path| path[1].to_string());
+                out_of_line.push((module[1].to_string(), path));
+            }
+        }
+        (inline, out_of_line)
+    }
+
+    /// Every `.rs` file under `src/` as (path relative to `src/`, source).
+    fn runtime_sources() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("source directory is readable") {
+                let path = entry.expect("directory entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                    let relative = path
+                        .strip_prefix(&root)
+                        .expect("under src")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let source = std::fs::read_to_string(&path).expect("source is readable");
+                    sources.push((relative, source));
+                }
+            }
+        }
+        sources.sort();
+        sources
+    }
+
+    /// Files that only exist under a test configuration, found from the
+    /// out-of-line test modules their parents declare. A directory module
+    /// is returned as its directory with a trailing `/`.
+    fn test_only_files(sources: &[(String, String)]) -> Vec<String> {
+        let mut files = Vec::new();
+        for (relative, source) in sources {
+            let (directory, file) = relative.rsplit_once('/').unwrap_or(("", relative));
+            let join = |name: &str| {
+                if directory.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{directory}/{name}")
+                }
+            };
+            let module_directory = if matches!(file, "mod.rs" | "lib.rs" | "main.rs") {
+                join("")
+            } else {
+                join(&format!("{}/", file.trim_end_matches(".rs")))
+            };
+            for (name, path) in test_parts(source).1 {
+                match path {
+                    Some(path) => files.push(join(&path)),
+                    None => {
+                        let base = format!("{}{name}", module_directory.trim_start_matches('/'));
+                        files.push(format!("{base}.rs"));
+                        files.push(format!("{base}/"));
+                    }
+                }
+            }
+        }
+        files
+    }
+
+    /// The constructor calls in `source` outside its inline test modules.
+    fn production_constructor_hits(file: &str, source: &str) -> Vec<ConstructorHit> {
+        let (test_ranges, _) = test_parts(source);
+        let function = regex::Regex::new(r"\bfn\s+(\w+)").expect("function pattern compiles");
+        let mut hits = Vec::new();
+        for hit in constructor_pattern().captures_iter(source) {
+            let whole = hit.get(0).expect("whole match");
+            if test_ranges
+                .iter()
+                .any(|range| range.contains(&whole.start()))
+            {
+                continue;
+            }
+            let line_start = source[..whole.start()].rfind('\n').map_or(0, |at| at + 1);
+            if source[line_start..whole.start()]
+                .trim_start()
+                .starts_with("//")
+            {
+                continue;
+            }
+            hits.push(ConstructorHit {
+                file: file.to_string(),
+                line: source[..whole.start()].matches('\n').count() + 1,
+                function: function
+                    .captures_iter(&source[..whole.start()])
+                    .last()
+                    .map_or_else(String::new, |found| found[1].to_string()),
+                type_name: hit[1].to_string(),
+                text: whole.as_str().split_whitespace().collect(),
+            });
+        }
+        hits
+    }
+
+    /// Every production construction of a child-starting tool in this crate.
+    fn all_production_constructor_hits() -> Vec<ConstructorHit> {
+        let sources = runtime_sources();
+        let test_only = test_only_files(&sources);
+        sources
+            .iter()
+            .filter(|(relative, _)| {
+                !test_only.iter().any(|excluded| {
+                    relative == excluded
+                        || (excluded.ends_with('/') && relative.starts_with(excluded.as_str()))
+                })
+            })
+            .flat_map(|(relative, source)| production_constructor_hits(relative, source))
+            .collect()
+    }
+
+    /// No production code builds `spawn_subagent`, `send_message_to_peer` or
+    /// `cron_run` outside the registry factory and the rebuild factories.
+    ///
+    /// A new site would hand out a tool whose capability slot nothing fills.
+    /// A site that truly has to build one goes through a factory, or is added
+    /// to the allowed list with its reason.
+    ///
+    /// Scope: it reads the source of `crates/zeroclaw-runtime/src` only, and
+    /// matches the text `<Type>::new` followed by any suffix (`new_with_capability`
+    /// and the like). It does not see another crate that
+    /// calls the public constructors, a `use ... as` alias of the type, a
+    /// `type X = ...;` alias, the bracketed form `<SpawnSubagentTool>::new`,
+    /// `Self::new` inside the type's own impl, or a factory called with
+    /// `binding: None`. Nothing checks the callers of the rebuild factories:
+    /// they pass `self.capabilities.get()`, which is legitimately `None` for
+    /// a delegate bound to nothing, so a caller that passed a literal `None`
+    /// would go unnoticed. Making the constructors `pub(crate)` would close
+    /// the first of these.
+    #[test]
+    fn child_starting_tools_are_built_only_by_the_registry_factories() {
+        let hits = all_production_constructor_hits();
+        let mut offenders = Vec::new();
+        for &(file, function, type_name, count, _why) in ALLOWED_CHILD_STARTING_CONSTRUCTIONS {
+            let found = hits
+                .iter()
+                .filter(|hit| {
+                    hit.file == file && hit.function == function && hit.type_name == type_name
+                })
+                .count();
+            if found != count {
+                offenders.push(format!(
+                    "{file} in fn {function}: {found} construction(s) of {type_name}, {count} allowed"
+                ));
+            }
+        }
+        for hit in &hits {
+            let allowed = ALLOWED_CHILD_STARTING_CONSTRUCTIONS.iter().any(
+                |&(file, function, type_name, _, _)| {
+                    hit.file == file && hit.function == function && hit.type_name == type_name
+                },
+            );
+            if !allowed {
+                offenders.push(format!(
+                    "{}:{} in fn {}: {}",
+                    hit.file, hit.line, hit.function, hit.text
+                ));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "child-starting tools built outside the registry factories: {offenders:?}"
+        );
+    }
+
+    /// The scan finds what it is meant to find, so an empty result above
+    /// means there is nothing, not that the pattern missed it.
+    #[test]
+    fn child_starting_constructor_scan_finds_known_sites() {
+        // A synthetic file: a test module BEFORE production code (a scan
+        // that cut at the first test module would miss what follows), a
+        // brace inside a string and a character literal in that module,
+        // calls split across lines, a comment, and a test-only call.
+        let synthetic = concat!(
+            "#[cfg(test)]\n",
+            "mod early {\n",
+            "    const OPEN: &str = \"{\";\n",
+            "    const CLOSE: char = '}';\n",
+            "    fn t() { let _ = CronRunTool::new(a, b, c); }\n",
+            "}\n",
+            "\n",
+            "fn build_split() {\n",
+            "    let tool = crate::tools::SpawnSubagentTool\n",
+            "        ::new(\n",
+            "            config,\n",
+            "        );\n",
+            "    let peer = SendMessageToPeerTool::new_with_live_config_and_capability(\n",
+            "        config, alias, None, None,\n",
+            "    );\n",
+            "    // CronRunTool::new_with_runtime(..) in a comment is not a call.\n",
+            "}\n",
+            "\n",
+            "#[cfg(all(test, unix))]\n",
+            "mod late {\n",
+            "    fn t() { let _ = CronRunTool::new_with_runtime(a, b, c, d, None); }\n",
+            "}\n",
+            "\n",
+            "fn build_after_tests() {\n",
+            "    let _ = CronRunTool::new_with_runtime_and_capability(a, b, c, d, e, f);\n",
+            "}\n",
+        );
+        let found: Vec<(usize, String, String)> =
+            production_constructor_hits("synthetic.rs", synthetic)
+                .into_iter()
+                .map(|hit| (hit.line, hit.function, hit.text))
+                .collect();
+        assert_eq!(
+            found,
+            vec![
+                (
+                    9,
+                    "build_split".to_string(),
+                    "SpawnSubagentTool::new".to_string()
+                ),
+                (
+                    13,
+                    "build_split".to_string(),
+                    "SendMessageToPeerTool::new_with_live_config_and_capability".to_string()
+                ),
+                (
+                    25,
+                    "build_after_tests".to_string(),
+                    "CronRunTool::new_with_runtime_and_capability".to_string()
+                ),
+            ]
+        );
+
+        // The real tree: the six allowed sites in `tools/mod.rs` are found
+        // with their enclosing functions, and nothing else there.
+        let sources = runtime_sources();
+        let (_, tools_mod) = sources
+            .iter()
+            .find(|(relative, _)| relative == "tools/mod.rs")
+            .expect("tools/mod.rs is scanned");
+        let mut in_tools_mod: Vec<(String, String)> =
+            production_constructor_hits("tools/mod.rs", tools_mod)
+                .into_iter()
+                .map(|hit| (hit.function, hit.type_name))
+                .collect();
+        in_tools_mod.sort();
+        let mut expected: Vec<(String, String)> = ALLOWED_CHILD_STARTING_CONSTRUCTIONS
+            .iter()
+            .map(|&(_, function, type_name, _, _)| (function.to_string(), type_name.to_string()))
+            .collect();
+        expected.sort();
+        assert_eq!(in_tools_mod, expected);
+
+        // Test modules are excluded: `spawn_subagent.rs` constructs the tool
+        // only in its tests, and those calls are matched before exclusion.
+        let (_, spawn_subagent) = sources
+            .iter()
+            .find(|(relative, _)| relative == "tools/spawn_subagent.rs")
+            .expect("tools/spawn_subagent.rs is scanned");
+        assert!(constructor_pattern().find_iter(spawn_subagent).count() > 0);
+        assert!(production_constructor_hits("tools/spawn_subagent.rs", spawn_subagent).is_empty());
+
+        // Test-only files declared out of line are recognized, through a
+        // plain module, `#[path]`, and `cfg(all(test, ..))`.
+        let test_only = test_only_files(&sources);
+        for known in [
+            "agent/tests.rs",
+            "agent/safety_net.rs",
+            "agent/parity.rs",
+            "composition/supplied_only_traps.rs",
+        ] {
+            assert!(
+                test_only.iter().any(|file| file == known),
+                "{known} is not recognized as test-only: {test_only:?}"
+            );
+        }
     }
 }
