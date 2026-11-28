@@ -790,14 +790,10 @@ pub async fn run_with_authority(
     // live `[gateway.pairing_dashboard]` on every use, for /pair and
     // certificate enrollment alike.
     let pairing_guard = std::sync::Arc::new(
-        zeroclaw_config::pairing::PairingGuard::new(
-            config.gateway.require_pairing,
-            &config.gateway.paired_tokens,
-            config.gateway.pairing_code,
-        )
-        .with_live_limits(zeroclaw_config::pairing::PairingLimits::live(
-            live_config_authority.live_handle(),
-        )),
+        zeroclaw_config::pairing::PairingGuard::from_gateway_config(&config.gateway)
+            .with_live_limits(zeroclaw_config::pairing::PairingLimits::live(
+                live_config_authority.live_handle(),
+            )),
     );
 
     // One inbound-auth state for this daemon generation. The RPC context

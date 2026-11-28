@@ -165,17 +165,28 @@ With --new, generates a fresh pairing code even if the gateway \
 was previously paired (useful for adding additional clients). This \
 does NOT revoke existing tokens.
 
+With --new --user NAME, the code is bound to the [users.NAME] roster \
+entry: the device that redeems it authenticates as that user, with \
+that user's permission profiles, instead of as the shared operator. \
+Only surfaces that resolve principals (the RPC connection zerocode \
+uses, and the gateway's config routes) accept such a token.
+
 With --rotate, revokes ALL paired bearer tokens, clears the device \
 registry, and issues a fresh code. Use this after a suspected token \
 leak when you do not know which token was compromised; every client \
 must re-pair.
 
 With --rotate-device ID, revokes just that device's bearer token \
-and issues a fresh code for re-pairing that one device.
+and issues a fresh code for re-pairing that one device. A device \
+bound to a roster user gets a code bound to the same user. No code is \
+issued when that user's [users] entry is gone, or when the device's \
+token was already revoked; mint one with --new, adding --user NAME \
+for a roster user.
 
 Examples:
   zeroclaw gateway get-paircode               # show current pairing code
   zeroclaw gateway get-paircode --new         # add another client (no revocation)
+  zeroclaw gateway get-paircode --new --user alice  # code that pairs as roster user alice
   zeroclaw gateway get-paircode --rotate      # revoke ALL tokens, then issue a code
   zeroclaw gateway get-paircode --rotate-device dash-1  # revoke one device's token
   zeroclaw gateway get-paircode --new --port 3001 # target alternate-port gateway")]
@@ -189,8 +200,21 @@ Examples:
         rotate: bool,
 
         /// Revoke a single device's bearer token by id, then issue a new code
+        /// that pairs as the device did (none when its token was already
+        /// revoked or its roster user is gone)
         #[arg(long, value_name = "DEVICE_ID", conflicts_with_all = ["new", "rotate"])]
         rotate_device: Option<String>,
+
+        /// With `--new`: bind the code to this `[users.<name>]` roster entry, so
+        /// the device that redeems it authenticates as that user
+        #[arg(
+            long,
+            value_name = "NAME",
+            requires = "new",
+            conflicts_with_all = ["rotate", "rotate_device"],
+            value_parser = parse_roster_user_name
+        )]
+        user: Option<String>,
 
         /// Port of the running gateway to query; defaults to config gateway.port
         #[arg(short, long)]
@@ -200,8 +224,8 @@ Examples:
         #[arg(long)]
         host: Option<String>,
 
-        /// Print one JSON object (`pairing_code`, `message`) instead of text,
-        /// for programs such as the desktop app
+        /// Print one JSON object (`pairing_code`, `message`, `principal_id`)
+        /// instead of text, for programs such as the desktop app
         #[arg(long)]
         json: bool,
     },
@@ -630,6 +654,17 @@ pub enum MigrateCommands {
         #[arg(long)]
         reindex: bool,
     },
+}
+
+/// A `[users.<name>]` entry name for `gateway get-paircode --user`, trimmed.
+/// A blank name is refused here instead of being sent: the operator asked for
+/// a bound code and must never get an unbound one by mistake.
+fn parse_roster_user_name(raw: &str) -> Result<String, String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err("--user must name a [users.<name>] entry".to_string());
+    }
+    Ok(name.to_string())
 }
 
 /// Reject a `--to` value that is shaped like a flag.

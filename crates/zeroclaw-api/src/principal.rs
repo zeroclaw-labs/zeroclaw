@@ -148,8 +148,9 @@ pub enum AuthMethod {
     SshKey,
     /// Local Unix-socket / named-pipe peer credential (`SO_PEERCRED`).
     Peercred,
-    /// The existing `PairingGuard` bearer token (continuity / operator
-    /// bootstrap).
+    /// The existing `PairingGuard` bearer token: the shared operator for an
+    /// unbound token (continuity / operator bootstrap), or the roster user
+    /// the operator bound the token to when minting its pairing code.
     Native,
 }
 
@@ -175,9 +176,9 @@ impl AuthMethod {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum IdentitySubject {
-    /// Explicitly-trusted shared operator (native pairing token, or the
-    /// daemon's own uid on the local socket). Trusted, but NOT a distinct
-    /// authenticated identity.
+    /// Explicitly-trusted shared operator (an unbound native pairing token,
+    /// or the daemon's own uid on the local socket). Trusted, but NOT a
+    /// distinct authenticated identity.
     SharedOperator,
     /// An OIDC human identity. `issuer` is the VALIDATED `iss`; `subject`
     /// the validated `sub`.
@@ -186,7 +187,8 @@ pub enum IdentitySubject {
     /// identity from the validated token/introspection response.
     Service { issuer: String, client_id: String },
     /// A local roster identity: the durable `[users.<name>]` principal id
-    /// the credential mapped to through explicit configuration.
+    /// the credential mapped to through explicit configuration (a peer uid
+    /// listed on the entry, or a pairing token bound to it).
     Roster { principal_id: String },
 }
 
