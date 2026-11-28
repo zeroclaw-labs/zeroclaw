@@ -9198,6 +9198,13 @@ pub struct BrowserConfig {
     /// unless a risk profile lists it explicitly.
     #[serde(default)]
     pub automation_enabled: bool,
+    /// Experimental catalog submission on agent-browser. Disabled independently
+    /// of origin grants: this backend does not isolate tasks or suppress page
+    /// observation. Enable only for disposable, synthetic acceptance fixtures.
+    /// Read from the catalog config on each submission, including after lookup.
+    #[serde(default)]
+    #[credential_class = "public_value"]
+    pub credential_submission_enabled: bool,
     /// Allowed domains for `browser_open` (exact or subdomain match)
     #[serde(default = "default_browser_allowed_domains")]
     pub allowed_domains: Vec<String>,
@@ -9275,6 +9282,7 @@ impl Default for BrowserConfig {
         Self {
             enabled: true,
             automation_enabled: false,
+            credential_submission_enabled: false,
             allowed_domains: vec!["*".into()],
             session_name: None,
             backend: default_browser_backend(),

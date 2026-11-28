@@ -544,6 +544,20 @@ impl BrowserTool {
         self
     }
 
+    fn check_credential_submission_enabled(&self) -> anyhow::Result<()> {
+        let path = self
+            .credential_config_path
+            .as_deref()
+            .context("Browser catalog config missing")?;
+        let contents = std::fs::read_to_string(path)?;
+        let config: zeroclaw_config::schema::Config = toml::from_str(&contents)?;
+        anyhow::ensure!(
+            config.browser.credential_submission_enabled,
+            "Browser credential submission is disabled"
+        );
+        Ok(())
+    }
+
     async fn submit_catalog_credential(&self, args: &Value) -> anyhow::Result<()> {
         self.submit_catalog_credential_with_resolver(
             args,
@@ -566,8 +580,10 @@ impl BrowserTool {
         use zeroclaw_config::schema::ScopedHttpAuth;
 
         let mut audited_origin = None;
-        let mut audit_phase = "catalog";
+        let mut audit_phase = "enablement";
         let result: anyhow::Result<()> = async {
+        self.check_credential_submission_enabled()?;
+        audit_phase = "catalog";
         let alias = args
             .get("credential")
             .and_then(Value::as_str)
@@ -627,6 +643,7 @@ impl BrowserTool {
             _ => anyhow::bail!("Credential kind is unsupported by the browser"),
         };
         audit_phase = "revision";
+        self.check_credential_submission_enabled()?;
         let (current, revision) = load_scoped_credential_snapshot(self.credential_config_path.as_deref(), alias)?;
         anyhow::ensure!(revision == reviewed, "Browser credential changed during lookup");
         anyhow::ensure!(
@@ -3932,6 +3949,50 @@ mod tests {
         BrowserTool::new(security, vec!["*".into()], None).unwrap()
     }
 
+    #[tokio::test]
+    async fn browser_catalog_default_off_refuses_before_browser_or_resolution() {
+        use zeroclaw_config::{schema::Config, secrets::SecretStore};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let mut config = Config::default();
+        assert!(!config.browser.credential_submission_enabled);
+        config.secrets.encrypt = true;
+        let record = json!({
+            "origin": "https://login.example.test",
+            "browser_origin": "https://login.example.test",
+            "source": "open_bao",
+            "auth": {"kind":"user_password","username":"fixture","password":"kv/fixture/password"}
+        });
+        config.http_request.scoped_credentials.insert(
+            "LOGIN".into(),
+            SecretStore::new(tmp.path(), true)
+                .encrypt(&record.to_string())
+                .unwrap(),
+        );
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        let mut tool =
+            screenshot_tool_with_workspace(tmp.path()).with_credential_config(path.clone());
+        tool.set_agent_browser_bin_for_tests(tmp.path().join("must-not-execute"));
+        let args = json!({"credential":"LOGIN"});
+        let result = tool
+            .submit_catalog_credential_with_resolver(&args, |_, _| async {
+                panic!("disabled submission must not resolve a secret");
+            })
+            .await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Browser credential submission is disabled"
+        );
+        for contents in ["", "[browser]\ncredential_submission_enabled = false\n"] {
+            std::fs::write(&path, contents).unwrap();
+            assert!(tool.check_credential_submission_enabled().is_err());
+        }
+        std::fs::write(&path, "malformed [").unwrap();
+        assert!(tool.check_credential_submission_enabled().is_err());
+        std::fs::remove_file(&path).unwrap();
+        assert!(tool.check_credential_submission_enabled().is_err());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn browser_catalog_submission_uses_only_stdin_and_checks_grants() {
@@ -3941,6 +4002,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let config_path = tmp.path().join("config.toml");
         let mut config = Config::default();
+        config.browser.credential_submission_enabled = true;
         config.secrets.encrypt = true;
         let store = SecretStore::new(tmp.path(), true);
         for (alias, record) in [
@@ -4014,7 +4076,7 @@ esac
             schema::{Config, ScopedHttpCredential},
             secrets::SecretStore,
         };
-        for change in ["replace", "revoke", "delete", "denied"] {
+        for change in ["replace", "revoke", "delete", "denied", "disable"] {
             let tmp = tempfile::tempdir().unwrap();
             let path = tmp.path().join("config.toml");
             let marker = tmp.path().join("submitted");
@@ -4030,6 +4092,7 @@ esac
                 record.browser_origin = None;
             }
             let mut config = Config::default();
+            config.browser.credential_submission_enabled = true;
             config.secrets.encrypt = true;
             let store = SecretStore::new(tmp.path(), true);
             config.http_request.scoped_credentials.insert(
@@ -4060,7 +4123,9 @@ esac
             }
             let mutate = async {
                 lookup_started.await.unwrap();
-                if change == "delete" {
+                if change == "disable" {
+                    config.browser.credential_submission_enabled = false;
+                } else if change == "delete" {
                     config.http_request.scoped_credentials.remove("LOGIN");
                 } else {
                     if change == "revoke" {

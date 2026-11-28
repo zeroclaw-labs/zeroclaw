@@ -24,6 +24,16 @@ The initial acceptance sequence is a disposable HTTPS login with separate passwo
 
 ## Draft runtime implementation
 
+The explicit `browser.credential_submission_enabled` switch defaults to `false`,
+independently of origin grants and browser automation enablement. Saving a grant
+does not enable `submit_credential`. The executor reads this switch from the same
+on-disk config as the catalog before any browser or vault access and again after
+an awaited lookup. Missing, unreadable, malformed or disabled config refuses use.
+This is an experimental acceptance switch for disposable fixtures with synthetic
+credentials, not a claim that the current executor provides managed isolation.
+Disable it to stop subsequent releases without deleting grants. Environment-only
+overrides cannot enable this disk-authorized path.
+
 The action submit_credential takes one catalog alias on the active login page. The executor rechecks the catalog after vault lookup and sends values through standard input. The form helper accepts visible top-level fields and a same-origin HTTPS POST action. Its result indicates submission, not authentication. This implementation targets standard HTML forms and six-digit SHA-1 TOTP with a 30-second step.
 
 ### Multi-step and embedded forms

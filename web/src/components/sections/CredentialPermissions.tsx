@@ -94,6 +94,7 @@ export default function CredentialPermissions() {
   const field = "block w-full rounded-md border border-border bg-background p-2";
   return (
     <section className="space-y-4">
+      <p className="text-sm text-status-warning">{t("http_credentials.browser_grant_warning")}</p>
       {message && <p role="status">{message}</p>}
       <Button type="button" disabled={busy || !eligible.length} onClick={() => {
         setEditing(undefined);

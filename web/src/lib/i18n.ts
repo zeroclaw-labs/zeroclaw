@@ -550,6 +550,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   en: {
+    'http_credentials.browser_grant_warning': 'A browser origin grant also authorizes later password confirmations, including sensitive actions on that origin. Browser credential submission is experimental and disabled by default independently of these grants; enable it only with synthetic credentials in a disposable fixture.',
     'plugin_tls.title': "Plugin TLS credentials",
     'http_credentials.user_password': "Username and password credentials",
     'http_credentials.api_key': "API token credentials",
@@ -11622,6 +11623,7 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   pt: {
+    'http_credentials.browser_grant_warning': 'Uma autorização de origem do navegador também permite confirmações posteriores de senha, inclusive ações sensíveis nessa origem. O envio de credenciais pelo navegador é experimental e vem desativado, independentemente destas autorizações; ative apenas com credenciais sintéticas em um ambiente descartável.',
     'plugin_tls.title': "Credenciais TLS de plugins",
     'http_credentials.user_password': "Credenciais de usuário e senha",
     'http_credentials.api_key': "Credenciais de token de API",
