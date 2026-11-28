@@ -3306,8 +3306,28 @@ fn apply_model_ref(
         sel.model = route.model.clone();
         sel.api_key = route.api_key.clone();
     } else {
+        // A model outside the route table is not that route's selection, so a
+        // credential left by an earlier route no longer applies.
         sel.model = model.to_string();
+        sel.api_key = None;
     }
+}
+
+/// The credential a model-issued switch to `model` on `provider_ref` carries:
+/// that of a route whose stored profile reference and stored model both equal
+/// the switch target exactly. A chat command's route lookup is looser: it
+/// folds case and accepts a hint. A model id that only equals a route's hint
+/// is a literal model on the profile, not that route, so the profile's own
+/// credential applies.
+fn route_api_key_for_switch<'a>(
+    model_routes: &'a [zeroclaw_config::schema::ModelRouteConfig],
+    provider_ref: &str,
+    model: &str,
+) -> Option<&'a str> {
+    model_routes
+        .iter()
+        .find(|route| route.model_provider == provider_ref && route.model == model)
+        .and_then(|route| route.api_key.as_deref())
 }
 
 fn apply_model_issued_route_switch(
@@ -5356,6 +5376,9 @@ async fn handle_runtime_command_for_delivery(
                         Ok(_) => {
                             current.model_provider = provider_ref.clone();
                             current.automatic = false;
+                            // A plain profile selection carries no route
+                            // credential; the profile's own one applies.
+                            current.api_key = None;
                             set_route_selection(
                                 ctx,
                                 &sender_key,
@@ -10662,15 +10685,12 @@ async fn process_channel_message_body(
                     }
                 };
 
-                let resolved_api_key = ctx
-                    .model_routes
-                    .iter()
-                    .find(|r| {
-                        r.model_provider.eq_ignore_ascii_case(&new_model_provider)
-                            && (r.model.eq_ignore_ascii_case(&new_model)
-                                || r.hint.eq_ignore_ascii_case(&new_model))
-                    })
-                    .and_then(|r| r.api_key.clone());
+                let resolved_api_key = route_api_key_for_switch(
+                    &ctx.model_routes,
+                    &resolved_model_provider,
+                    &new_model,
+                )
+                .map(ToString::to_string);
 
                 match get_or_create_provider(
                     ctx.as_ref(),
@@ -33538,6 +33558,406 @@ BTC is currently around $65,000 based on latest tool output."#
             0
         );
         assert_eq!(alt_model_provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    /// One chat request as the provider endpoint received it: the profile path
+    /// it was sent to, the model it asked for and its `Authorization` header.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct WireCall {
+        profile: String,
+        model: String,
+        authorization: Option<String>,
+    }
+
+    fn wire_calls(profile: &str, model: &str, key: &str, count: usize) -> Vec<WireCall> {
+        vec![
+            WireCall {
+                profile: profile.to_string(),
+                model: model.to_string(),
+                authorization: Some(format!("Bearer {key}")),
+            };
+            count
+        ]
+    }
+
+    /// Channel runtime whose provider profiles are built by the channel's own
+    /// construction path, each reaching one recording endpoint under its own
+    /// path prefix with its own key, so a request shows which profile sent it,
+    /// the model it asked for and the credential it carried.
+    ///
+    /// `custom.caller` is the agent's profile (`caller-model`, `caller-key`);
+    /// `custom.other` pins `other-model` with `other-key`.
+    struct RouteCredentialFixture {
+        server: wiremock::MockServer,
+        ctx: Arc<ChannelRuntimeContext>,
+        next_id: AtomicUsize,
+    }
+
+    /// Route `fast` to `custom.other` with model `fast-model` and its own key.
+    fn keyed_fast_route() -> zeroclaw_config::schema::ModelRouteConfig {
+        zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "custom.other".into(),
+            model: "fast-model".into(),
+            api_key: Some("route-key".into()),
+        }
+    }
+
+    impl RouteCredentialFixture {
+        async fn new(model_routes: Vec<zeroclaw_config::schema::ModelRouteConfig>) -> Self {
+            use wiremock::matchers::{method, path_regex};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"/v1/chat/completions$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+                })))
+                .mount(&server)
+                .await;
+
+            let base_uri = server.uri();
+            let mut config: Config = toml::from_str(&format!(
+                r#"
+[providers.models.custom.caller]
+uri = "{base_uri}/caller/v1"
+model = "caller-model"
+api_key = "caller-key"
+
+[providers.models.custom.other]
+uri = "{base_uri}/other/v1"
+model = "other-model"
+api_key = "other-key"
+"#
+            ))
+            .expect("fixture config must parse");
+            config.model_routes = model_routes.clone();
+
+            // Built and cached the way channel startup builds and caches the
+            // agent's provider.
+            let (startup_key, startup_uri) = provider_credentials_for_ref(&config, "custom.caller");
+            let startup_provider: Arc<dyn ModelProvider> = Arc::from(
+                create_resilient_model_provider_nonblocking(
+                    Arc::new(config.clone()),
+                    "custom.caller",
+                    startup_key,
+                    startup_uri,
+                    config.reliability.clone(),
+                    zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+                )
+                .await
+                .expect("startup provider must build"),
+            );
+
+            let channel: Arc<dyn Channel> = Arc::new(TelegramRecordingChannel::default());
+            let base = test_runtime_ctx_with_config_agent_and_provider_ref(
+                channel,
+                Arc::clone(&startup_provider),
+                config,
+                zeroclaw_config::schema::AliasedAgentConfig::default(),
+                "custom.caller",
+                None,
+            );
+            let ctx = Arc::new(ChannelRuntimeContext {
+                model: Arc::new("caller-model".to_string()),
+                model_routes: Arc::new(model_routes),
+                provider_cache: Arc::new(Mutex::new(HashMap::from([(
+                    "custom.caller".to_string(),
+                    startup_provider,
+                )]))),
+                ..(*base).clone()
+            });
+
+            Self {
+                server,
+                ctx,
+                next_id: AtomicUsize::new(0),
+            }
+        }
+
+        /// The same runtime, but the agent's provider asks on its first chat to
+        /// switch the sender to `custom.other` with `model`, and the
+        /// `model_switch` tool is available and approved.
+        fn with_switch_to(self, model: &'static str) -> Self {
+            let switching: Arc<dyn ModelProvider> =
+                Arc::new(OtherProfileSwitchRequestProvider::to(model));
+            let ctx = Arc::new(ChannelRuntimeContext {
+                model_provider: Arc::clone(&switching),
+                provider_cache: Arc::new(Mutex::new(HashMap::from([(
+                    "custom.caller".to_string(),
+                    switching,
+                )]))),
+                tools_registry: Arc::new(
+                    zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                        Box::new(zeroclaw_runtime::tools::ModelSwitchTool::new(
+                            Arc::clone(&self.ctx.security),
+                            Arc::clone(&self.ctx.prompt_config),
+                        )),
+                    ]),
+                ),
+                approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                    &zeroclaw_config::schema::RiskProfileConfig {
+                        auto_approve: vec!["model_switch".into()],
+                        ..Default::default()
+                    },
+                )),
+                ..(*self.ctx).clone()
+            });
+            Self { ctx, ..self }
+        }
+
+        async fn send(&self, sender: &str, content: &str) {
+            let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+            process_channel_message(
+                Arc::clone(&self.ctx),
+                zeroclaw_api::channel::ChannelMessage {
+                    id: format!("credential-msg-{id}"),
+                    sender: sender.to_string(),
+                    reply_target: "chat-1".to_string(),
+                    content: content.to_string(),
+                    channel: "telegram".into(),
+                    timestamp: u64::try_from(id).unwrap_or_default() + 1,
+                    ..Default::default()
+                },
+                CancellationToken::new(),
+            )
+            .await;
+        }
+
+        /// Each chat request the endpoint received, in order. A turn sends two
+        /// through its provider, the reply-intent precheck and then the reply;
+        /// a switched turn retries once on the new provider.
+        async fn calls(&self) -> Vec<WireCall> {
+            self.server
+                .received_requests()
+                .await
+                .expect("mock endpoint records requests")
+                .iter()
+                .filter(|request| request.url.path().ends_with("/v1/chat/completions"))
+                .map(|request| WireCall {
+                    profile: request
+                        .url
+                        .path()
+                        .trim_start_matches('/')
+                        .split('/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string(),
+                    model: request
+                        .body_json::<serde_json::Value>()
+                        .expect("chat request body is JSON")["model"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    authorization: request
+                        .headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .map(ToString::to_string),
+                })
+                .collect()
+        }
+    }
+
+    /// On its first chat, asks to move the sender to `custom.other` with
+    /// `model`; answers in text afterwards.
+    struct OtherProfileSwitchRequestProvider {
+        model: &'static str,
+        call_count: AtomicUsize,
+    }
+
+    impl OtherProfileSwitchRequestProvider {
+        fn to(model: &'static str) -> Self {
+            Self {
+                model,
+                call_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for OtherProfileSwitchRequestProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("fallback".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let tool_calls = if self.call_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                vec![zeroclaw_providers::ToolCall {
+                    id: "switch-call".to_string(),
+                    name: "model_switch".to_string(),
+                    arguments: serde_json::json!({
+                        "action": "set",
+                        "model_provider": "custom.other",
+                        "model": self.model
+                    })
+                    .to_string(),
+                    extra_content: None,
+                }]
+            } else {
+                Vec::new()
+            };
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some(String::new()),
+                tool_calls,
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for OtherProfileSwitchRequestProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "OtherProfileSwitchRequestProvider"
+        }
+    }
+
+    // `custom.other` pins `other-model`, so every request to it asks for that
+    // model whatever was selected; these tests are about the credential.
+
+    #[tokio::test]
+    async fn channel_keyed_route_selected_by_hint_carries_route_credential() {
+        let fixture = RouteCredentialFixture::new(vec![keyed_fast_route()]).await;
+
+        fixture.send("alice", "/model fast").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            wire_calls("other", "other-model", "route-key", 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_literal_model_after_keyed_route_uses_profile_credential() {
+        let fixture = RouteCredentialFixture::new(vec![keyed_fast_route()]).await;
+
+        fixture.send("alice", "/model fast").await;
+        fixture.send("alice", "hello").await;
+        fixture.send("alice", "/model literal-model").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            [
+                wire_calls("other", "other-model", "route-key", 2),
+                wire_calls("other", "other-model", "other-key", 2),
+            ]
+            .concat()
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_models_reselecting_keyed_route_profile_uses_profile_credential() {
+        let fixture = RouteCredentialFixture::new(vec![keyed_fast_route()]).await;
+
+        fixture.send("alice", "/model fast").await;
+        fixture.send("alice", "/models custom.other").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            wire_calls("other", "other-model", "other-key", 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_models_selecting_another_profile_drops_route_credential() {
+        let fixture = RouteCredentialFixture::new(vec![keyed_fast_route()]).await;
+
+        fixture.send("alice", "/model fast").await;
+        fixture.send("alice", "/models custom.caller").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            wire_calls("caller", "caller-model", "caller-key", 2)
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_model_issued_switch_to_a_hint_name_uses_profile_credential() {
+        let fixture = RouteCredentialFixture::new(vec![keyed_fast_route()])
+            .await
+            .with_switch_to("fast");
+
+        fixture.send("alice", "switch please").await;
+        fixture.send("alice", "hello").await;
+
+        // The retry of the switched turn, then both requests of the next one.
+        assert_eq!(
+            fixture.calls().await,
+            wire_calls("other", "other-model", "other-key", 3)
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_model_issued_switch_to_a_route_model_uses_route_credential() {
+        let fixture = RouteCredentialFixture::new(vec![keyed_fast_route()])
+            .await
+            .with_switch_to("fast-model");
+
+        fixture.send("alice", "switch please").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            wire_calls("other", "other-model", "route-key", 3)
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_model_issued_switch_credential_needs_exact_profile_and_model() {
+        // Each decoy route differs from the switch target only by letter case:
+        // one in its profile reference, one in its model id.
+        let fixture = RouteCredentialFixture::new(vec![
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "upper-profile".into(),
+                model_provider: "custom.Other".into(),
+                model: "fast-model".into(),
+                api_key: Some("profile-case-key".into()),
+            },
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "upper-model".into(),
+                model_provider: "custom.other".into(),
+                model: "Fast-Model".into(),
+                api_key: Some("model-case-key".into()),
+            },
+        ])
+        .await
+        .with_switch_to("fast-model");
+
+        fixture.send("alice", "switch please").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            wire_calls("other", "other-model", "other-key", 3)
+        );
     }
 
     #[tokio::test]
