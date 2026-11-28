@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["RecognitionMode"],"fn":["get_device_voice_preferences","get_my_voice_preferences","initiate_pairing","list_devices","put_device_voice_preferences","put_my_voice_preferences","revoke_device","rotate_token","submit_pairing_enhanced","update_my_capabilities"],"struct":["DeviceInfo","DeviceRegistry","VoicePreferences","VoicePreferencesUpdate"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["kind_of_core","parse_semantic_subtype"]};

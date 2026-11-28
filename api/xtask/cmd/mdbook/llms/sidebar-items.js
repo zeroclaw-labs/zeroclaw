@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["BASE_URL_ENV","DOCS_ORIGIN","FULL_FILE","INDEX_FILE","ROOT_LOCALE"],"fn":["base_url_for","first_paragraph","run","sync_root"]};

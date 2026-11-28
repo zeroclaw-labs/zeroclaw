@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ListingAuthorization"],"fn":["authorize_listing","handle_fs_list_dir","listing_is_authorized","resolves_locally"]};

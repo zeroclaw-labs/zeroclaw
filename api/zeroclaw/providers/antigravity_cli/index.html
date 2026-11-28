@@ -1,0 +1,55 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Antigravity CLI (`agy acp`) subprocess model provider."><title>zeroclaw::providers::antigravity_cli - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-203241e4.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="zeroclaw" data-themes="" data-resource-suffix="" data-rustdoc-version="1.100.1 (20ddd0171 2026-11-25)" data-channel="1.100.1" data-search-js="search-b167f383.js" data-stringdex-js="stringdex-b5109af9.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../../static.files/main-1814ead3.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-9f56287d.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"><!-- seo:start --><meta name="robots" content="noindex"><!-- seo:end --></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module antigravity_cli</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../../zeroclaw/index.html">zeroclaw</a><span class="version">0.9.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module antigravity_<wbr>cli</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#usage" title="Usage">Usage</a></li><li><a href="#authentication-policy" title="Authentication policy">Authentication policy</a></li><li><a href="#host-side-trust-boundary" title="Host-side trust boundary">Host-side trust boundary</a></li><li><a href="#limitations" title="Limitations">Limitations</a></li></ul><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#enums" title="Enums">Enums</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="../index.html">In zeroclaw::<wbr>providers</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../../index.html">zeroclaw</a>::<wbr><a href="../index.html">providers</a></div><h1>Module <span>antigravity_<wbr>cli</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Antigravity CLI (<code>agy acp</code>) subprocess model provider.</p>
+<p>Every inference request spawns <code>agy acp</code>, the Agent Client Protocol stdio
+server shipped with Google’s Antigravity CLI, and runs one bounded
+one-shot ACP exchange: initialize → authenticate → session/new →
+session/set_model → session/prompt. The prompt travels as JSON-RPC on
+child stdin; it is never placed in argv or a temporary file.</p>
+<h2 id="usage"><a class="doc-anchor" href="#usage">§</a>Usage</h2><div class="example-wrap"><pre class="language-toml"><code>[providers.models.antigravity_cli.default]
+model = &quot;gemini-3.8-flash-high&quot;
+working_directory = &quot;/path/to/agents/default/workspace&quot;
+api_key = &quot;...&quot;                      # set with `zeroclaw config set`
+# auth_method = &quot;gemini_api_key&quot;     # default
+# binary_path = &quot;/home/you/.local/bin/agy&quot;
+
+[agents.default]
+model_provider = &quot;antigravity_cli.default&quot;</code></pre></div><h2 id="authentication-policy"><a class="doc-anchor" href="#authentication-policy">§</a>Authentication policy</h2>
+<p>ZeroClaw is an outer harness: it injects its own system prompt and owns
+the conversation. Google’s current Antigravity terms (FAQ, Terms §6, and
+staff guidance on the Google AI forum) permit only API-key, Agent
+Platform, and Gemini Enterprise sign-in for such harnesses. Accordingly:</p>
+<ul>
+<li><code>gemini_api_key</code> (default) sends this alias’s typed <code>api_key</code> secret in
+the ACP <code>authenticate</code> <code>_meta.apiKey</code> field. The key never appears in
+argv or the child environment, and <code>GEMINI_*</code> passthrough is rejected.</li>
+<li><code>agent_platform</code> authenticates with Application Default Credentials.</li>
+<li><code>oauth_business</code> is an explicit opt-in that reuses a Gemini Enterprise
+sign-in cached in this alias’s isolated state directory. The session is
+refused unless Antigravity reports a business tier.</li>
+<li><code>oauth_personal</code> is refused when the provider is built.</li>
+</ul>
+<p>Every alias runs with its own <code>--gemini-dir</code>, so a personal sign-in cached
+in <code>~/.gemini</code> can never be picked up, including by Antigravity’s
+fallback to a saved login when an explicit method has no credential.</p>
+<h2 id="host-side-trust-boundary"><a class="doc-anchor" href="#host-side-trust-boundary">§</a>Host-side trust boundary</h2>
+<p>The child is a tool-capable agent outside ZeroClaw’s native tool approval
+path. The shared <code>acp_cli</code> plumbing therefore requires an explicit
+absolute working directory, clears the inherited environment, bounds every
+ACP frame and stream, rejects permission requests unless the alias passes
+<code>--dangerously-skip-permissions</code>, and terminates the child process group
+(Unix) or Job Object (Windows) on every exit path. Public errors never
+include child stderr or raw ACP frames.</p>
+<h2 id="limitations"><a class="doc-anchor" href="#limitations">§</a>Limitations</h2>
+<ul>
+<li>Only the system prompt (if present) and final user message are
+forwarded. The system prompt uses Antigravity’s
+<code>_meta.antigravity.systemPrompt.append</code> session extension.</li>
+<li>The provider is one-shot; ACP sessions are not resumed.</li>
+<li>Native ZeroClaw tool calls are not emitted; <code>ChatRequest.tools</code> is ignored.</li>
+<li>Token usage is not reported (<code>ChatResponse.usage</code> is <code>None</code>).</li>
+<li>Only temperatures <code>0.7</code> and <code>1.0</code> are accepted because <code>agy acp</code> has no
+sampling control.</li>
+<li><code>timeout_secs</code> is clamped to one hour maximum.</li>
+</ul>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.AntigravityCliBuilder.html" title="struct zeroclaw::providers::antigravity_cli::AntigravityCliBuilder">Antigravity<wbr>CliBuilder</a></dt><dd>Typed builder for <a href="struct.AntigravityCliModelProvider.html" title="struct zeroclaw::providers::antigravity_cli::AntigravityCliModelProvider"><code>AntigravityCliModelProvider</code></a>.</dd><dt><a class="struct" href="struct.AntigravityCliModelProvider.html" title="struct zeroclaw::providers::antigravity_cli::AntigravityCliModelProvider">Antigravity<wbr>CliModel<wbr>Provider</a></dt><dd>Model provider that invokes Antigravity CLI through ACP.</dd></dl><h2 id="enums" class="section-header">Enums<a href="#enums" class="anchor">§</a></h2><dl class="item-table"><dt><a class="enum" href="enum.AntigravityCliAuthMethod.html" title="enum zeroclaw::providers::antigravity_cli::AntigravityCliAuthMethod">Antigravity<wbr>CliAuth<wbr>Method</a></dt><dd>How the <code>agy acp</code> child authenticates for an <code>antigravity_cli</code> alias.</dd></dl></section></div></main></body></html>

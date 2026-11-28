@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["TurnEvent"],"fn":["build_session_model_provider","build_session_model_provider_with_capabilities","routed_approval_channel","run","tool_dispatcher_for_provider"],"struct":["Agent","AgentBuilder","AgentChannelHandles","ProviderSwitchConfig","StreamedTurnError","StreamedTurnSuccess"],"type":["ConfigGeneration"]};

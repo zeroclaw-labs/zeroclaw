@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["EPHEMERAL_WORKSPACE_WARNING"],"enum":["OptionDomain"],"fn":["clear_runtime_approval","invocation_trigger_matches","takes_runtime_approval","with_ephemeral_workspace_warning"],"struct":["OptionEntry","ToolExecutionCancelled","ToolExecutionContext","ToolOutput","ToolResult","ToolSpec"],"trait":["Tool"]};

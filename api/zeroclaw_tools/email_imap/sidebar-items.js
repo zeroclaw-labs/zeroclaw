@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["imap_connect","is_tls_close_notify"],"struct":["TlsStreamTolerant"],"type":["ImapSession"]};
