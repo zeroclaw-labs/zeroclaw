@@ -1,5 +1,7 @@
 //! Tool implementations for agent-callable capabilities.
 
+mod scoped_credentials;
+
 pub mod attribution;
 pub mod helpers;
 pub(crate) mod i18n;
@@ -68,6 +70,7 @@ pub mod linkedin;
 #[cfg(feature = "tool-linkedin")]
 pub mod linkedin_client;
 pub mod llm_task;
+pub mod managed_browser;
 pub mod mcp_client;
 pub mod mcp_context;
 pub mod mcp_deferred;
@@ -261,4 +264,15 @@ mod session_tool_marker_guard {
             "sessions_current addresses only the caller's own session"
         );
     }
+}
+
+pub mod task_ssh;
+
+#[cfg(target_os = "linux")]
+pub mod task_ssh_broker;
+
+/// Localized diagnostic for the broker entry point on unsupported platforms.
+#[cfg(not(target_os = "linux"))]
+pub fn unsupported_task_ssh_message() -> String {
+    i18n::get_required_tool_string("tool-ssh-task-unsupported")
 }

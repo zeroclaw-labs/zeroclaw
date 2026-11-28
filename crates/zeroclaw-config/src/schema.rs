@@ -9198,6 +9198,13 @@ pub struct BrowserConfig {
     /// unless a risk profile lists it explicitly.
     #[serde(default)]
     pub automation_enabled: bool,
+    /// Experimental catalog submission in a private task-owned managed browser.
+    /// Disabled independently of origin grants. Keep disabled for real credentials
+    /// pending the RFC and independent managed-browser acceptance.
+    /// Read from the catalog config on each submission, including after lookup.
+    #[serde(default)]
+    #[credential_class = "public_value"]
+    pub credential_submission_enabled: bool,
     /// Allowed domains for `browser_open` (exact or subdomain match)
     #[serde(default = "default_browser_allowed_domains")]
     pub allowed_domains: Vec<String>,
@@ -9275,6 +9282,7 @@ impl Default for BrowserConfig {
         Self {
             enabled: true,
             automation_enabled: false,
+            credential_submission_enabled: false,
             allowed_domains: vec!["*".into()],
             session_name: None,
             backend: default_browser_backend(),
@@ -9336,6 +9344,398 @@ pub struct HttpRequestConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub secrets: HashMap<String, String>,
+    /// Encrypted, origin-bound HTTP credentials managed by the operator.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub scoped_credentials: HashMap<String, String>,
+}
+
+/// The plaintext record exists only inside the operator endpoint and HTTP tool.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopedHttpCredential {
+    pub origin: String,
+    #[serde(default)]
+    pub http_allowed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_origins: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub browser_origins: Vec<String>,
+    #[serde(default)]
+    pub source: ScopedCredentialSource,
+    pub auth: ScopedHttpAuth,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ScopedHttpAuth {
+    ApiKey {
+        value: String,
+        #[serde(default)]
+        header: ScopedApiKeyHeader,
+    },
+    UserPassword {
+        username: String,
+        password: String,
+    },
+    Totp {
+        seed: String,
+    },
+    SshKey {
+        private_key: String,
+        destinations: Vec<SshCredentialDestination>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SshCredentialDestination {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+}
+
+impl SshCredentialDestination {
+    pub fn is_valid(&self) -> bool {
+        let identifier = |value: &str, extra: &[u8]| {
+            !value.is_empty()
+                && !value.starts_with('-')
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || extra.contains(&byte))
+        };
+        self.port != 0
+            && self.host.len() <= 253
+            && self.username.len() <= 64
+            && identifier(&self.host, b".-:")
+            && identifier(&self.username, b"_-")
+    }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopedApiKeyHeader {
+    #[default]
+    Bearer,
+    XApiKey,
+    Token,
+}
+
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopedCredentialSource {
+    #[default]
+    Local,
+    OpenBao,
+    OnePassword,
+    Azure,
+    Aws,
+    Google,
+}
+
+impl ScopedCredentialSource {
+    /// Fixed read-only commands. All resource identifiers are passed as
+    /// arguments, and CLI authentication belongs to the host operator.
+    pub fn command(self, reference: &str) -> Option<(&'static str, Vec<String>)> {
+        let valid = |s: &str| {
+            !s.is_empty()
+                && !s.starts_with('-')
+                && s.len() <= 512
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_-/.:+=@".contains(&b))
+        };
+        if !valid(reference) {
+            return None;
+        }
+        let parts = reference.split('/').collect::<Vec<_>>();
+        let (program, args) = match (self, parts.as_slice()) {
+            (Self::OnePassword, _) => {
+                let fields = reference
+                    .strip_prefix("op://")?
+                    .split('/')
+                    .collect::<Vec<_>>();
+                if fields.len() != 3 || !fields.iter().all(|field| valid(field)) {
+                    return None;
+                }
+                ("op", vec!["read".into(), reference.into()])
+            }
+            (Self::OpenBao, [mount, path @ .., field])
+                if !path.is_empty()
+                    && parts.iter().all(|p| valid(p) && !matches!(*p, "." | "..")) =>
+            {
+                (
+                    "bao",
+                    vec![
+                        "kv".into(),
+                        "get".into(),
+                        format!("-mount={mount}"),
+                        format!("-field={field}"),
+                        path.join("/"),
+                    ],
+                )
+            }
+            (Self::Azure, [vault, name]) if parts.iter().all(|p| valid(p)) => (
+                "az",
+                vec![
+                    "keyvault".into(),
+                    "secret".into(),
+                    "show".into(),
+                    format!("--vault-name={vault}"),
+                    format!("--name={name}"),
+                    "--query=value".into(),
+                    "--output=tsv".into(),
+                    "--only-show-errors".into(),
+                ],
+            ),
+            (Self::Aws, [region, id @ ..]) if !id.is_empty() && parts.iter().all(|p| valid(p)) => (
+                "aws",
+                vec![
+                    "secretsmanager".into(),
+                    "get-secret-value".into(),
+                    format!("--region={region}"),
+                    format!("--secret-id={}", id.join("/")),
+                    "--query=SecretString".into(),
+                    "--output=json".into(),
+                    "--no-cli-pager".into(),
+                    "--no-cli-auto-prompt".into(),
+                ],
+            ),
+            (Self::Google, [project, secret, version]) if parts.iter().all(|p| valid(p)) => (
+                "gcloud",
+                vec![
+                    "secrets".into(),
+                    "versions".into(),
+                    "access".into(),
+                    (*version).into(),
+                    format!("--project={project}"),
+                    format!("--secret={secret}"),
+                    "--out-file=-".into(),
+                    "--quiet".into(),
+                ],
+            ),
+            _ => return None,
+        };
+        Some((program, args))
+    }
+}
+
+#[cfg(test)]
+mod scoped_credential_source_tests {
+    use super::ScopedCredentialSource as Source;
+
+    #[test]
+    fn password_destinations_allow_directory_protocols_without_embedded_credentials() {
+        use super::ScopedHttpCredential;
+
+        for value in [
+            "https://api.example.com",
+            "ldaps://directory.example.com:636",
+            "kerberos://EXAMPLE.COM",
+            "ad://example.com",
+            "postgresql://db.example.com:5432",
+            "imap://mail.example.com",
+        ] {
+            assert_eq!(
+                ScopedHttpCredential::password_service(value).as_deref(),
+                Some(value)
+            );
+        }
+        for value in [
+            "Corporate directory",
+            "service:",
+            "service:ldaps://user:password@directory.example.com",
+            "ldaps://user:password@directory.example.com",
+            "ad://example.com/path",
+            "kerberos://EXAMPLE.COM?value=secret",
+        ] {
+            assert!(ScopedHttpCredential::password_service(value).is_none());
+        }
+    }
+
+    #[test]
+    fn external_reference_formats_use_fixed_read_commands() {
+        for (source, reference, program) in [
+            (Source::OnePassword, "op://vault/item/field", "op"),
+            (Source::OpenBao, "secret/team/service/password", "bao"),
+            (Source::Azure, "vault/secret", "az"),
+            (Source::Aws, "us-east-1/team/service", "aws"),
+            (Source::Google, "project/secret/latest", "gcloud"),
+        ] {
+            let (actual, args) = source.command(reference).unwrap();
+            assert_eq!(actual, program);
+            assert!(!args.is_empty());
+            assert!(source.command("--help").is_none());
+            assert!(source.command("invalid reference").is_none());
+        }
+        assert!(Source::OpenBao.command("secret/../password").is_none());
+        assert!(
+            Source::OnePassword
+                .command("op://vault//password")
+                .is_none()
+        );
+        assert!(Source::Local.command("value").is_none());
+    }
+}
+
+impl ScopedHttpCredential {
+    /// A browser grant is independent from HTTP Request and SSH permissions.
+    pub fn accepts_browser_origin(&self, origin: &str) -> bool {
+        if !Self::is_https_grant_origin(origin) {
+            return false;
+        }
+        matches!(
+            &self.auth,
+            ScopedHttpAuth::UserPassword { .. } | ScopedHttpAuth::Totp { .. }
+        )
+    }
+
+    pub fn is_https_grant_origin(origin: &str) -> bool {
+        Self::password_service(origin).is_some_and(|value| value.starts_with("https://"))
+    }
+
+    pub fn http_grants(&self) -> &[String] {
+        match &self.http_origins {
+            Some(grants) => grants,
+            None if self.http_allowed && Self::is_https_grant_origin(&self.origin) => {
+                std::slice::from_ref(&self.origin)
+            }
+            None => &[],
+        }
+    }
+
+    pub fn browser_grants(&self) -> impl Iterator<Item = &str> {
+        self.browser_origin
+            .as_deref()
+            .into_iter()
+            .chain(self.browser_origins.iter().map(String::as_str))
+    }
+
+    /// Check the active document and the submission destination before
+    /// resolving a browser secret. No matching grant means no vault lookup.
+    pub fn permits_browser_submission(
+        &self,
+        top_level: &url::Url,
+        document: &url::Url,
+        submission: &url::Url,
+    ) -> bool {
+        self.browser_grants().any(|grant| {
+            self.accepts_browser_origin(grant)
+                && [top_level, document, submission].into_iter().all(|target| {
+                    target.scheme() == "https"
+                        && target.username().is_empty()
+                        && target.password().is_none()
+                        && target.origin().ascii_serialization() == grant
+                })
+        })
+    }
+
+    pub fn https_origin(raw: &str) -> Option<String> {
+        let mut url = url::Url::parse(raw).ok()?;
+        if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+            return None;
+        }
+        // Match the HTTP destination policy's DNS-root normalization before
+        // the encrypted record is saved and whenever an origin is compared.
+        let host = url.host_str()?.trim_end_matches('.').to_string();
+        if host.is_empty() {
+            return None;
+        }
+        url.set_host(Some(&host)).ok()?;
+        Some(url.origin().ascii_serialization())
+    }
+
+    pub fn password_service(raw: &str) -> Option<String> {
+        let (_, authority) = raw.split_once("://")?;
+        if authority.is_empty()
+            || authority.starts_with('/')
+            || authority.contains(['@', '\\'])
+            || raw.len() > 253
+            || raw.chars().any(|c| c.is_whitespace() || c.is_control())
+        {
+            return None;
+        }
+        let url = url::Url::parse(raw).ok()?;
+        if url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !matches!(url.path(), "" | "/")
+        {
+            return None;
+        }
+        if url.scheme() == "https" {
+            return Self::https_origin(raw);
+        }
+        Some(url.as_str().trim_end_matches('/').to_owned())
+    }
+
+    pub fn valid_name(name: &str) -> bool {
+        (1..=64).contains(&name.len())
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    }
+}
+
+#[test]
+fn scoped_browser_credentials_require_eligible_kind_and_https_origin() {
+    let mut record: ScopedHttpCredential = serde_json::from_value(serde_json::json!({
+        "origin": "https://login.example.test",
+        "http_allowed": true,
+        "auth": { "kind": "user_password", "username": "fixture", "password": "fixture" }
+    }))
+    .expect("existing credential record");
+    assert!(record.browser_origin.is_none());
+    assert_eq!(record.http_grants(), &["https://login.example.test"]);
+    record.http_origins = Some(vec!["https://other.example.test".into()]);
+    assert_eq!(record.http_grants(), &["https://other.example.test"]);
+    record.http_origins = Some(Vec::new());
+    assert!(record.http_grants().is_empty());
+    assert!(record.accepts_browser_origin("https://login.example.test:443"));
+    assert!(record.accepts_browser_origin("https://login.example.test:8443"));
+    assert!(record.accepts_browser_origin("https://other.example.test"));
+    record.auth = ScopedHttpAuth::Totp {
+        seed: String::new(),
+    };
+    assert!(record.accepts_browser_origin("https://other.example.test:8443"));
+    assert!(!record.accepts_browser_origin("http://other.example.test"));
+    assert!(!record.accepts_browser_origin("https://other.example.test/login"));
+    record.auth = ScopedHttpAuth::ApiKey {
+        value: String::new(),
+        header: ScopedApiKeyHeader::Bearer,
+    };
+    assert!(!record.accepts_browser_origin("https://login.example.test"));
+}
+
+#[test]
+fn scoped_browser_submission_denies_redirects_frames_and_form_origin_changes() {
+    let mut record: ScopedHttpCredential = serde_json::from_value(serde_json::json!({
+        "origin": "",
+        "auth": { "kind": "totp", "seed": "synthetic" }
+    }))
+    .expect("TOTP record");
+    let page = url::Url::parse("https://login.example.test/verify").expect("fixture URL");
+    let form = url::Url::parse("https://login.example.test:443/submit").expect("fixture URL");
+    let foreign = url::Url::parse("https://elsewhere.example.test/submit").expect("fixture URL");
+    assert!(!record.permits_browser_submission(&page, &page, &form));
+    record.browser_origin = Some("https://login.example.test".into());
+    assert!(record.permits_browser_submission(&page, &page, &form));
+    assert!(!record.permits_browser_submission(&foreign, &page, &form));
+    assert!(!record.permits_browser_submission(&page, &foreign, &form));
+    assert!(!record.permits_browser_submission(&page, &page, &foreign));
+    record
+        .browser_origins
+        .push(foreign.origin().ascii_serialization());
+    assert!(record.permits_browser_submission(&foreign, &foreign, &foreign));
+    assert!(record.permits_browser_submission(&page, &page, &form));
+    record.browser_origin = None;
+    assert!(!record.permits_browser_submission(&page, &page, &form));
+    assert!(record.permits_browser_submission(&foreign, &foreign, &foreign));
 }
 
 impl Default for HttpRequestConfig {
@@ -9348,6 +9748,7 @@ impl Default for HttpRequestConfig {
             allow_private_hosts: false,
             allowed_private_hosts: vec![],
             secrets: HashMap::new(),
+            scoped_credentials: HashMap::new(),
         }
     }
 }
@@ -28294,6 +28695,18 @@ fn apply_dirty_path(
         return apply_dirty_map_key_path(root, &section, dotted, full_table, default_table);
     }
 
+    // Credential aliases are opaque and case-sensitive. An alias deleted
+    // from memory must not resolve to a differently spelled sibling.
+    if let ["http_request", "scoped_credentials", alias] = raw.as_slice() {
+        write_or_delete_leaf(
+            root,
+            full_table,
+            default_table,
+            &["http_request", "scoped_credentials", alias],
+        );
+        return Ok(());
+    }
+
     // Resolve each segment against the in-memory table: struct fields
     // serialize as snake_case (so `input-per-mtok` → `input_per_mtok`), but
     // HashMap keys are preserved verbatim and may legitimately carry hyphens
@@ -28513,10 +28926,19 @@ fn apply_dirty_natural_key_path(
         // because two parallel walks (in-memory vs on-disk) drifted apart;
         // a forked copy here would recreate exactly that hazard, so any
         // future fix to dash handling lands in both code paths at once.
-        let inner_segments: Vec<String> = match mem_entry {
-            Some(table) => resolve_dirty_segments(table, &inner_raw),
-            None => inner_raw.iter().map(|s| (*s).to_string()).collect(),
-        };
+        // A deleted dotted map key is only present in the persisted entry.
+        let disk_entry = find_array_of_tables_entry_mut(
+            root,
+            parent_segs,
+            array_key,
+            section.natural_key_field,
+            alias,
+        );
+        let inner_segments = resolve_dirty_segments_from_sources(
+            mem_entry,
+            disk_entry.map(|table| table as &dyn toml_edit::TableLike),
+            &inner_raw,
+        );
         let inner_segs: Vec<&str> = inner_segments.iter().map(String::as_str).collect();
 
         let mem_inner_val = mem_entry.and_then(|t| lookup_path_in_table(t, &inner_segs));
@@ -39548,6 +39970,7 @@ default_temperature = 0.7
         let b = BrowserConfig {
             enabled: true,
             automation_enabled: true,
+            credential_submission_enabled: true,
             allowed_domains: vec!["example.com".into(), "docs.example.com".into()],
             session_name: None,
             backend: "auto".into(),
@@ -39571,6 +39994,7 @@ default_temperature = 0.7
         let parsed: BrowserConfig = toml::from_str(&toml_str).unwrap();
         assert!(parsed.enabled);
         assert!(parsed.automation_enabled);
+        assert!(parsed.credential_submission_enabled);
         assert_eq!(parsed.allowed_domains.len(), 2);
         assert_eq!(parsed.allowed_domains[0], "example.com");
         assert_eq!(parsed.backend, "auto");
@@ -56778,5 +57202,59 @@ model_provider = \"ollama.default\"
         duplicate_route
             .validate()
             .expect("legacy duplicate route hints remain valid");
+    }
+}
+
+#[cfg(test)]
+mod scoped_credential_dirty_paths {
+    use super::apply_dirty_path;
+
+    #[test]
+    fn deleting_dash_alias_preserves_underscore_sibling() {
+        let mut document =
+            "[http_request.scoped_credentials]\nTEST-KEY = 'old'\nTEST_KEY = 'neighbor'\n"
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap();
+        let memory = "[http_request.scoped_credentials]\nTEST_KEY = 'neighbor'\n"
+            .parse::<toml::Table>()
+            .unwrap();
+        apply_dirty_path(
+            document.as_table_mut(),
+            "http_request.scoped_credentials.TEST-KEY",
+            &memory,
+            &toml::Table::new(),
+        )
+        .unwrap();
+        let aliases = &document["http_request"]["scoped_credentials"];
+        assert!(aliases.get("TEST-KEY").is_none());
+        assert_eq!(aliases["TEST_KEY"].as_str(), Some("neighbor"));
+    }
+}
+
+#[cfg(test)]
+mod scoped_http_origin_regressions {
+    use super::ScopedHttpCredential;
+
+    #[test]
+    fn trailing_dns_root_dots_share_the_runtime_http_origin() {
+        for (raw, expected) in [
+            ("https://API.EXAMPLE.COM./", "https://api.example.com"),
+            (
+                "https://api.example.com...:8443/",
+                "https://api.example.com:8443",
+            ),
+            ("https://[::1]:8443/", "https://[::1]:8443"),
+        ] {
+            assert_eq!(
+                ScopedHttpCredential::https_origin(raw).as_deref(),
+                Some(expected)
+            );
+        }
+        assert!(ScopedHttpCredential::password_service("https://api.example.com./v1").is_none());
+        assert_eq!(
+            ScopedHttpCredential::password_service("https://api.example.com./").as_deref(),
+            Some("https://api.example.com")
+        );
+        assert!(ScopedHttpCredential::https_origin("https://./").is_none());
     }
 }

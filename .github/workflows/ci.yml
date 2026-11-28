@@ -229,6 +229,8 @@ jobs:
 
       - name: Test docs version selector and root 404 redirect
         run: node --test scripts/docs/version_selector_test.mjs scripts/docs/root_404_test.mjs
+      - name: Test browser credential submission boundaries
+        run: node --test crates/zeroclaw-tools/src/browser_credential_form.test.mjs
 
   relay-container-smoke-changes:
     name: Detect Relay Container Smoke changes
@@ -1412,6 +1414,10 @@ jobs:
       # `plugins-wasm` feature, so the default-feature Test job never runs its
       # tests. The filter is a module path: it selects every test in the
       # handler's `plugin_webhook::tests`, not one test name.
+      - name: Run gateway plugin TLS credential tests
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'gateway'
+        run: cargo test --locked -p zeroclaw-gateway --features plugins-wasm --lib plugin_tls_credential_api
+
       - name: Run gateway plugin webhook tests
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'gateway'
         run: cargo test --locked -p zeroclaw-gateway --features plugins-wasm --lib plugin_webhook
@@ -2049,7 +2055,7 @@ jobs:
           # The generated dashboard contract includes schemas owned by the
           # config, runtime, and SOP graph crates and is rendered by the xtask generator.
           # Keep this trigger aligned with every source that can change it.
-          emit web      "^web/|^crates/zeroclaw-(config|gateway|runtime|sop-graph)/|^xtask/|^Cargo\.(toml|lock)$|^\.nvmrc$|${wf}"
+          emit web      "^web/|^scripts/browser/|^crates/zeroclaw-tools/src/(browser|managed_browser)|^crates/zeroclaw-(config|gateway|runtime|sop-graph)/|^xtask/|^Cargo\.(toml|lock)$|^\.nvmrc$|${wf}"
 
   nix-eval:
     name: Nix Module Eval
@@ -2191,6 +2197,14 @@ jobs:
         run: npm ci
       - name: Typecheck generated dashboard contract
         run: cargo web check
+      - name: Install private browser test dependencies
+        run: |
+          npm ci --prefix scripts/browser --ignore-scripts
+          npx --prefix scripts/browser --no-install playwright-core install --with-deps chromium
+      - name: Test private browser isolation and cleanup
+        run: |
+          export ZEROCLAW_TEST_CHROMIUM="$(node --input-type=module -e 'import { chromium } from "./scripts/browser/node_modules/playwright-core/index.mjs"; console.log(chromium.executablePath())')"
+          npm test --prefix scripts/browser
       - name: Run permission and catalog regressions
         working-directory: web
         run: npm run test:permissions
