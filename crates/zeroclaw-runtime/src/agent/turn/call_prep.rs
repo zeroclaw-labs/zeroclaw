@@ -313,6 +313,7 @@ pub(crate) async fn prepare_tool_calls(
                 tools_registry,
                 activated_tools,
                 excluded_tools,
+                approval: None,
                 model_switch_callback: None,
             };
             // One id for the observer events and the stream pair, as the
@@ -1594,6 +1595,7 @@ mod tests {
                 tools_registry: registry,
                 activated_tools: None,
                 excluded_tools: excluded,
+                approval: None,
                 model_switch_callback: None,
             },
             &meta,
