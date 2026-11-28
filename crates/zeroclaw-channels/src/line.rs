@@ -58,7 +58,7 @@ pub struct LineChannel {
     /// Base URL for the LINE Content API (audio/file downloads). Overrideable in tests.
     content_api_base_url: String,
     /// Optional transcription manager for voice/audio messages.
-    transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
+    transcription_manager: Option<Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
 }
 
 /// Response from `GET /v2/bot/info`.
@@ -104,7 +104,7 @@ struct LineState {
     /// Fetched icon URL from `/v2/bot/info`, shared with the channel handle.
     sender_icon: Arc<parking_lot::RwLock<Option<String>>>,
     /// Optional transcription manager — `None` when transcription is disabled.
-    transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
+    transcription_manager: Option<Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
 }
 
 async fn send_loading_indicator(
@@ -932,7 +932,7 @@ impl LineChannel {
     /// otherwise leaves the choice unbound (see
     /// `transcription::manager_from_snapshot`).
     pub fn with_transcription(self, config: zeroclaw_config::schema::TranscriptionConfig) -> Self {
-        let manager = super::transcription::manager_from_snapshot(&config);
+        let manager = zeroclaw_providers::transcription::manager_from_snapshot(&config);
         self.with_transcription_manager(config, manager)
     }
 
@@ -942,7 +942,7 @@ impl LineChannel {
     pub(crate) fn with_transcription_manager(
         mut self,
         _config: zeroclaw_config::schema::TranscriptionConfig,
-        manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+        manager: Option<std::sync::Arc<zeroclaw_providers::transcription::TranscriptionManager>>,
     ) -> Self {
         if let Some(manager) = manager {
             self.transcription_manager = Some(manager);
