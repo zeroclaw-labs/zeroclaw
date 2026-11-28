@@ -100,10 +100,15 @@ async function mountMeter() {
       await act(async () => { assert.equal(current?.goToSession('next-meter-session'), true); });
     },
     meter(): string | null {
-      // AgentChat's visible meter is the span containing its token bar.
+      // AgentChat's visible meter is the span containing the usage label.
       return [...container.querySelectorAll('span')]
         .map((span) => span.textContent ?? '')
         .find((text) => text.includes(' / ') && text.includes('[') && text.includes('%')) ?? null;
+    },
+    trimMarker(): string | null {
+      // The bar draws its trim threshold as a CSS divider, not a text glyph.
+      return container.querySelector('[data-context-bar-trim]')
+        ?.getAttribute('data-context-bar-trim') ?? null;
     },
     async unmount() { await act(async () => { root.unmount(); }); container.remove(); },
   };
@@ -144,7 +149,7 @@ test('actual web meter retains a real terminal trim and canonical limits', async
 
     await mounted.receive(trim());
     assertCount(mounted.meter(), 90_000);
-    assert.ok(mounted.meter()?.includes('│'), 'the emergency event threshold cannot erase the canonical trim marker');
+    assert.ok(mounted.trimMarker(), 'the emergency event threshold cannot erase the canonical trim marker');
     const after = mounted.meter();
     await mounted.receive(done({ context_input_tokens: 90_000, context_input_tokens_source: 'calibrated' }));
     assert.equal(mounted.meter(), after, 'done cannot restore the old measured prompt');
@@ -171,7 +176,7 @@ test('actual web meter retains a real terminal trim and canonical limits', async
     await mounted.receive(done({ max_context_tokens: 0 }));
     await mounted.receive(trim());
     assertCount(mounted.meter(), 90_000);
-    assert.ok(!mounted.meter()?.includes('│'), 'disabled trimming has no threshold marker');
+    assert.equal(mounted.trimMarker(), null, 'disabled trimming has no threshold marker');
   } finally { await mounted.unmount(); }
 });
 

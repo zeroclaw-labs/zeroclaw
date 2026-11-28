@@ -24,7 +24,7 @@ import ChatWorkspace from '@/pages/ChatWorkspace';
 
 import ToolCallCard from '@/components/ToolCallCard';
 import ApprovalBanner from '@/components/ApprovalBanner';
-import { resolveContextBarState } from '@/lib/contextBar';
+import { CONTEXT_BAR_WIDTH, resolveContextBarState } from '@/lib/contextBar';
 import SessionPicker from '@/components/SessionPicker';
 import { isNearBottom } from './agentChatScroll';
 
@@ -60,14 +60,38 @@ function ContextBar({ contextMaxTokens, contextModelWindow, contextInputTokens, 
   );
   if (!state) return null;
 
-  // Reuse the separator cells so measured and derived labels have equal width.
+  // Keep the approx marker in a fixed slot so measured and derived labels have
+  // equal width.
   const approx = contextInputTokensSource === 'estimate' || contextInputTokensSource === 'calibrated' ? '~' : ' ';
-  const label = `${t('agent.context_usage')}:${approx}${fmtTokens(state.used).padStart(7)} / ${fmtTokens(state.denominator).padStart(7)}  [${state.cells}] ${approx}${state.percent.toFixed(0)}%`;
+  const counts = `${t('agent.context_usage')}:${approx}${fmtTokens(state.used).padStart(7)} / ${fmtTokens(state.denominator).padStart(7)}`;
 
   return (
     <div className="px-4 py-1.5 border-b text-[11px] font-mono flex items-center gap-2" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
       <BarChart2 className="h-3 w-3 shrink-0" style={{ color: 'var(--pc-text-muted)' }} />
-      <span style={{ color: 'var(--pc-text-secondary)' }}>{label}</span>
+      <span style={{ color: 'var(--pc-text-secondary)' }}>
+        {counts}  [
+        {/* Draw the meter with CSS cells: the █/░ glyphs are missing from the
+            bundled web font, so Chrome falls back per glyph and the filled and
+            empty blocks can end up different heights. */}
+        <span
+          aria-hidden="true"
+          data-context-bar-trim={state.trimMarkerIndex ?? undefined}
+          className="inline-flex align-middle mx-[0.15em]"
+          style={{ height: '0.8em', gap: '1px' }}
+        >
+          {Array.from({ length: CONTEXT_BAR_WIDTH }, (_, index) => (
+            <span
+              key={index}
+              style={{
+                width: '0.5em',
+                background: index < state.filled ? 'var(--pc-text-secondary)' : 'var(--pc-hover-strong)',
+                borderLeft: index === state.trimMarkerIndex ? '1px solid var(--pc-text-primary)' : undefined,
+              }}
+            />
+          ))}
+        </span>
+        ] {approx}{state.percent.toFixed(0)}%
+      </span>
     </div>
   );
 }

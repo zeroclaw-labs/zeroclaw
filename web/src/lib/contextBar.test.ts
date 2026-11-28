@@ -8,8 +8,8 @@ test('uses model window as denominator and marks the trim budget', () => {
   assert.ok(state);
   assert.equal(state.denominator, 200_000);
   assert.equal(state.percent, 50);
+  assert.equal(state.filled, 8);
   assert.equal(state.trimMarkerIndex, 14);
-  assert.equal(state.cells[14], '│');
 });
 
 test('falls back to the legacy absolute budget when capacity is absent', () => {
