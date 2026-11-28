@@ -1882,6 +1882,11 @@ mod accept_error_tests {
         tokio::time::timeout(Duration::from_secs(2), fixture.provider_started.notified())
             .await
             .expect("running prompt should reach the provider");
+        assert_eq!(
+            fixture.ctx.agent_lifecycle.active_turn_count("test-agent"),
+            1,
+            "a provider-backed RPC turn must retain the lifecycle activity lease"
+        );
 
         client_sink
             .send(Message::Text(
@@ -1935,6 +1940,11 @@ mod accept_error_tests {
             "only the deliberate test holder should remain queued"
         );
         assert!(!fixture.ctx.sessions.has_inflight_turn(RUNNING_SID));
+        assert_eq!(
+            fixture.ctx.agent_lifecycle.active_turn_count("test-agent"),
+            0,
+            "cancellation must release the RPC lifecycle activity lease"
+        );
         drop(queued_guard);
     }
 

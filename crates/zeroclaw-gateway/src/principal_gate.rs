@@ -1222,6 +1222,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_oidc_principal_can_read_config_activity() {
+        let idp = introspection_idp(&["ops"]).await;
+        let router = router_for(oidc_config_with_reader_profile(&idp.uri()));
+        let (status, body) = send(
+            &router,
+            "GET",
+            "/api/config/activity",
+            Some("opaque-token"),
+            Some("oidc.test"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"busy": false}));
+    }
+
+    #[tokio::test]
     async fn oidc_identity_with_no_mapped_profile_is_refused() {
         let idp = introspection_idp(&["unmapped-group"]).await;
         let router = router_for(oidc_config_with_reader_profile(&idp.uri()));

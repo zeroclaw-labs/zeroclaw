@@ -6804,6 +6804,20 @@ impl RpcDispatcher {
             .get_agent_alias(sid)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+        // The session lease keeps the alias published, but an idle session is
+        // deliberately not activity. Retain the ordinary turn lease until the
+        // provider/tool future and terminal writes finish so deferred config
+        // work cannot reload the daemon under an active RPC caller.
+        let _lifecycle_turn = self
+            .ctx
+            .agent_lifecycle
+            .reserve_turn(agent_alias.clone())
+            .map_err(|_| {
+                rpc_err(
+                    SESSION_BUSY,
+                    format!("Agent `{agent_alias}` changed while the prompt was being admitted"),
+                )
+            })?;
         let workspace = self.ctx.sessions.get_workspace_dir(sid).await;
         self.ensure_transport_can_use_session_agent(&agent).await?;
         let has_environment = self

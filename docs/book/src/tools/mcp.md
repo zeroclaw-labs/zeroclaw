@@ -36,6 +36,161 @@ mcp_bundles = ["files"]   # connects to `filesystem`; an agent without this gets
 
 This is the *connection* boundary (which servers an agent talks to at all). The `allowed_tools` / `excluded_tools` controls below are the per-tool *capability* boundary applied on top of whatever a granted server exposes.
 
+## Local configuration control bridge
+
+The optional Unix/Python stdio server at
+`scripts/mcp/config_control.py` lets an explicitly granted agent manage this
+installation through the existing gateway configuration API. It adds no
+runtime configuration writer: the gateway remains responsible for validation,
+atomic commits, encrypted credential persistence, publication and reload status.
+The bridge's connection URL selects the gateway to administer; update that
+argument if the gateway's address or path prefix changes.
+
+The script uses Python's standard library and needs no pip packages. It is
+separate from the Cargo binary: copy it to a stable local application directory,
+or keep its checkout path available, before configuring the MCP command.
+Refresh a separately installed copy when updating the checkout; rebuilding the
+Cargo binary does not update that copy.
+
+It exposes `list`, `get`, `create_alias`, `set`, `patch` and `status`, namespaced
+by the MCP server name. Reads use the API's masked property metadata. Mutations
+return saved paths rather than submitted values. `patch` accepts the gateway's
+`add`, `replace`, `remove` and `test` operations, using dotted paths or JSON
+Pointers. A `test` operation can protect a read-modify-write change from a
+concurrent editor. Use `create_alias` to create a named MCP server or another
+entry that requires the gateway's explicit map-key operation before setting
+its fields. Set leaf properties such as `mcp.servers.filesystem.command` and
+`mcp.servers.filesystem.args`; a server alias path is not a writable whole-object
+property. Lost mutation responses are reported as uncertain and are
+never retried automatically; read the current value before deciding what to do.
+
+Do not use a gateway pairing token for this bridge. A pairing token resolves to
+the shared operator, so it would make every configuration path model-writable.
+Configure an `oidc.<alias>` provider and a non-administrator permission profile
+whose `config_write_paths` covers only the settings this agent may change.
+Authenticate the bridge with a token from that provider and name the provider
+explicitly; the gateway enforces the profile's current Config grants and path
+selectors on every request. See [Authentication & principals](../security/authentication.md)
+for the provider and IdP requirements.
+
+The following example uses an IdP service client and permits updates to one
+schema-backed runtime leaf. Replace the issuer, audience, client ID and leaf
+with the operator's own values; the exact path is part of the trust boundary.
+Do not grant a `runtime_profiles.assistant.*` prefix: the runtime profile also
+contains delegation limits, action budgets, tool elicitation, deduplication
+exemptions, and tool-filter groups.
+
+```toml
+[oidc.config_control]
+issuer = "https://idp.example.com"
+audience = "https://zeroclaw.example.com"
+service_clients = ["config-control-client"]
+service_profile_map = { "config-control-client" = "mcp_config_writer" }
+
+[permission_profiles.mcp_config_writer]
+admin = false
+grants = { config = ["read", "update"] }
+config_write_paths = ["runtime_profiles.assistant.max_context_tokens"]
+```
+
+Obtain an access token for that service client from the IdP and store it in an
+owner-only regular file outside the repository (mode `0600`). Do not paste it
+into chat, command arguments or the MCP server's configuration. Configure the
+server and grant its bundle only to the intended agent; merge the bundle into
+any existing grants:
+
+```toml
+[[mcp.servers]]
+name = "config_control"
+transport = "stdio"
+deny_delegate_inheritance = true
+command = "python3"
+args = [
+  "/path/to/zeroclaw/scripts/mcp/config_control.py",
+  "--gateway-url", "http://127.0.0.1:42617",
+  "--auth-provider", "oidc.config_control",
+  "--token-file", "/private/config-control.token",
+  "--state-dir", "/private/config-control-state",
+]
+tool_timeout_secs = 60
+
+[mcp_bundles.config_admin]
+servers = ["config_control"]
+
+[agents.assistant]
+mcp_bundles = ["config_admin"]
+```
+
+The endpoint must use an explicit loopback IP and port; proxy environment
+variables and HTTP redirects are disabled. The bridge accepts only an
+`oidc.<alias>` provider selection, sends it in
+`X-ZeroClaw-Auth-Provider`, and never falls back to native pairing. Token
+material is read from its private file on each API call, so rotating the file
+does not require a bridge restart. Expiry and revocation are enforced by the
+gateway's OIDC policy.
+
+The profile, not this script, is the authorization boundary. Keep
+`admin = false`; do not grant `config_write_paths = ["*"]`; and do not include
+authority-bearing paths such as `permission_profiles`, `users`, `oidc`,
+`security`, `gateway.paired_tokens`, `gateway`, `risk_profiles`, agent tool or
+channel configuration, or the bundle that grants this bridge. A broad or
+authority-bearing selector is equivalent to giving the model operator access.
+The side-effect-free `test` operation is supported, but `remove` and creation
+still require the profile to hold the matching `delete` or `create` grant.
+
+`deny_delegate_inheritance = true` is enforced by tool assembly. The direct
+agent still receives the bridge, while bounded, independent, and spawned
+subagents cannot receive its tools or the `tool_search` and aggregate MCP
+capability tools that could expose them. This is required for authority-bearing
+servers because tool allowlists and risk-profile exclusions are filters, not a
+substitute for withholding the server at the delegation boundary.
+
+Channel configuration writes can retire the channel generation that is serving
+the requesting turn. To avoid cancelling their own caller, `set`, `patch` and
+`create_alias` return `queued=true`, `saved=false` while a channel, Web or RPC
+turn is active, admission is in progress, or an earlier write is waiting. A
+detached worker waits for 15 seconds without that activity before calling the
+gateway. Finish the requesting reply; do not poll or wait for the queued write
+within that turn, since this prevents idle. Check `status` and read back in a
+later turn. Queued patches are validated when they run, so rejection can occur
+after the tool returns. Related edits should use one atomic patch, with `test`
+operations to guard against intervening edits.
+
+Saving and applying are separate. `status` reports the gateway's canonical
+application/reload status and recent write requests. The bridge deliberately
+does not expose the daemon reload operation: a narrow `config_write_paths`
+credential must not gain the broader authority to apply unrelated on-disk
+changes. Request a reload through the normal operator controls after reviewing
+the saved value.
+
+Idle detection reads the runtime admission coordinator across channel, Web and
+RPC callers, including admission in progress and RPC provider/tool execution.
+It uses `GET /api/config/activity`, whose scoped route requires `Config:Read`,
+so probing idle does not load or reduce conversation history. It is a
+point-in-time check rather than an admission lock, and does not prove that
+every outbound voice delivery has completed. Request records in `--state-dir`
+contain metadata only; queued
+values pass through an anonymous pipe and remain in worker memory. A `saved`
+record means the gateway acknowledged the write, not that every subsystem
+applied it. Completed request metadata is retained for at most seven days and
+100 records; active requests are never removed by retention. HTTP 408 or lost
+mutation responses have an unknown outcome: read back before resubmitting.
+Workers are not resumed automatically after a process or machine
+restart; inspect status and read back before resubmitting uncertain changes.
+
+After installing the bridge, reload the daemon and reconnect the affected
+session to initialize its MCP tools. Example requests are "show your current
+context settings" or "queue this runtime profile's context limit at 200."
+Verify queued changes in a subsequent turn. Agent aliases remain
+operator-defined; use `list` to discover the actual paths.
+
+To roll back, remove the bundle from the agent and reload, revoke only this
+bridge's OIDC service credential at the IdP, and remove its local token file.
+Remove the dedicated profile and provider when they have no other consumers.
+Changes already saved through the tool remain saved. Restore individual values
+through the usual config controls if needed. Test the bridge without external
+services using `python3 scripts/mcp/config_control_test.py`.
+
 ## Transports
 
 A server is reached over one of three transports (the `transport` field):

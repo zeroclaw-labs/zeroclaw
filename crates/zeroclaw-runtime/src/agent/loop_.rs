@@ -1623,9 +1623,33 @@ pub async fn run_with_capabilities(
     .await
 }
 
+fn config_for_run(
+    mut config: Config,
+    agent_alias: &str,
+    admission: Option<&AgentExecutionAdmission>,
+    overrides: &AgentRunOverrides,
+) -> Result<Config> {
+    if let Some(admission) = admission {
+        admission.revalidate()?;
+        anyhow::ensure!(
+            admission.alias() == agent_alias,
+            "agent execution admission alias changed during construction"
+        );
+        config = admission.config().as_ref().clone();
+    }
+    // Admission selects the authoritative snapshot; narrow it before building child tools.
+    if overrides.is_subagent {
+        config = crate::tools::config_for_delegated_agent(&config);
+    }
+    if overrides.suppress_memory_auto_save {
+        config.memory.auto_save = false;
+    }
+    Ok(config)
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn run_inner(
-    mut config: Config,
+    config: Config,
     capabilities: Option<RuntimeCapabilities>,
     principal: Option<PrincipalId>,
     agent_alias: &str,
@@ -1652,17 +1676,12 @@ async fn run_inner(
         .as_ref()
         .map(AgentExecutionAdmission::capability)
         .or_else(|| overrides.execution_capability.clone());
-    if let Some(admission) = execution_admission.as_ref() {
-        admission.revalidate()?;
-        anyhow::ensure!(
-            admission.alias() == agent_alias,
-            "agent execution admission alias changed during construction"
-        );
-        config = admission.config().as_ref().clone();
-    }
-    if overrides.suppress_memory_auto_save {
-        config.memory.auto_save = false;
-    }
+    let config = config_for_run(
+        config,
+        agent_alias,
+        execution_admission.as_ref(),
+        &overrides,
+    )?;
     let capabilities = capabilities.unwrap_or_else(|| RuntimeCapabilities::config_backed(&config));
     let agent = resolved_agent_for_turn(&config, agent_alias)?;
     crate::agent::thinking::validate_thinking_config(&agent.resolved.thinking);
@@ -1857,7 +1876,9 @@ async fn run_inner(
         // (peripherals -> built-in filter -> MCP scope+gate -> skills), identical
         // to the behavior this path hand-rolled. `caller_allowed` carries the
         // run() per-run allowlist; connect_peripherals is true (execution path).
-        let assembled = scoped::ScopedToolRegistry::assemble_prepared(
+        // The assembly future owns the full MCP/skill construction pipeline.
+        // Keep it out of this already-deep turn future's stack state.
+        let assembled = Box::pin(scoped::ScopedToolRegistry::assemble_prepared(
             scoped::ScopedAssembly {
                 config: &config,
                 agent_alias,
@@ -1884,7 +1905,7 @@ async fn run_inner(
             },
             construction,
             supplied_tail,
-        )
+        ))
         .await;
         // run injects one combined MCP prompt block: deferred tool-search listing +
         // pinned resources, composed by the harness.
@@ -4439,6 +4460,49 @@ async fn process_message_inner(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn admitted_subagent_uses_only_inheritable_mcp_servers() {
+        use zeroclaw_config::schema::McpServerConfig;
+
+        let mut authoritative = Config::default();
+        authoritative
+            .agents
+            .insert("alpha".into(), Default::default());
+        for (name, withheld) in [("ordinary", false), ("private", true)] {
+            authoritative.mcp.servers.push(McpServerConfig {
+                name: name.into(),
+                deny_delegate_inheritance: withheld,
+                ..Default::default()
+            });
+        }
+        let authority = crate::LiveConfigAuthority::new(authoritative);
+        let admission = authority.execution_capability().admit("alpha").unwrap();
+        for (is_subagent, expected) in [
+            (true, vec!["ordinary"]),
+            (false, vec!["ordinary", "private"]),
+        ] {
+            let effective = super::config_for_run(
+                Config::default(),
+                "alpha",
+                Some(&admission),
+                &super::AgentRunOverrides {
+                    is_subagent,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                effective
+                    .mcp
+                    .servers
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
     /// A run over an owner's plane re-assembles its SOP steps under that
     /// owner; a run over shared memory carries none.
     #[test]
@@ -26235,28 +26299,30 @@ mod capability_entry_point_tests {
         );
         capabilities.providers = Arc::new(SkillHookProviders(Arc::clone(&chats), native_calls));
 
-        let reply = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            super::run_with_capabilities(
-                config,
-                capabilities,
-                None,
-                "skill-agent",
-                Some("probe the supplied tool twice".to_owned()),
-                None,
-                None,
-                None,
-                Vec::new(),
-                false,
-                None,
-                None,
-                TurnOrigin::Interactive,
-                super::AgentRunOverrides::default(),
-            ),
-        )
-        .await
-        .expect("bounded skill hook turn")
-        .expect("the supplied provider serves the turn");
+        // The complete turn future contains the provider, tool, and post-turn
+        // skill pipelines. Heap-pin it before the test harness polls it so
+        // parallel runtime regression runs do not keep that state on the test
+        // thread's stack.
+        let turn = Box::pin(super::run_with_capabilities(
+            config,
+            capabilities,
+            None,
+            "skill-agent",
+            Some("probe the supplied tool twice".to_owned()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            TurnOrigin::Interactive,
+            super::AgentRunOverrides::default(),
+        ));
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(30), turn)
+            .await
+            .expect("bounded skill hook turn")
+            .expect("the supplied provider serves the turn");
         assert_eq!(reply, SKILL_HOOK_REPLY);
         (
             chats.load(std::sync::atomic::Ordering::SeqCst),

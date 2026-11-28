@@ -362,6 +362,11 @@ mod tests {
         assert!(g.may_write_config("cron.enabled"));
         assert!(!g.may_write_config("cron.max_jobs"));
         assert!(!g.may_write_config("security.estop"));
+
+        g.config_write_paths = vec!["runtime_profiles.assistant.max_context_tokens".into()];
+        assert!(g.may_write_config("runtime_profiles.assistant.max_context_tokens"));
+        assert!(!g.may_write_config("runtime_profiles.assistant.max_delegation_depth"));
+        assert!(!g.may_write_config("runtime_profiles.assistant.max_context_tokens.sibling"));
     }
 
     #[test]

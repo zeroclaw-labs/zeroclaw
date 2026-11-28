@@ -300,6 +300,7 @@ impl UnrestrictedToolWithholding {
 struct OwnedParentTools {
     tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
     origins: crate::tools::NativeMemoryOrigins,
+    mcp_registry: Arc<std::sync::OnceLock<Arc<zeroclaw_tools::mcp_client::McpRegistry>>>,
     memory_policies: Option<Arc<BoundedMemoryPolicyChain>>,
 }
 
@@ -417,6 +418,7 @@ impl Default for OwnedParentTools {
         Self {
             tools: Arc::new(RwLock::new(Vec::new())),
             origins: Default::default(),
+            mcp_registry: Arc::new(std::sync::OnceLock::new()),
             memory_policies: None,
         }
     }
@@ -767,6 +769,7 @@ impl DelegateTool {
         self.parent_tools = OwnedParentTools {
             tools: parent_tools,
             origins: Default::default(),
+            mcp_registry: Arc::new(std::sync::OnceLock::new()),
             memory_policies: None,
         };
         self
@@ -780,9 +783,18 @@ impl DelegateTool {
         self.parent_tools = OwnedParentTools {
             tools,
             origins,
+            mcp_registry: Arc::new(std::sync::OnceLock::new()),
             memory_policies: None,
         };
         self
+    }
+
+    /// Bind the connected MCP registry that owns entries in this delegate's
+    /// parent-tool list. The same binding is carried by bounded and same-hop
+    /// child views, so late inheritance checks use dispatch ownership rather
+    /// than re-parsing overlapping server-name prefixes.
+    pub(crate) fn bind_mcp_registry(&self, registry: Arc<zeroclaw_tools::mcp_client::McpRegistry>) {
+        let _ = self.parent_tools.mcp_registry.set(registry);
     }
 
     /// Attach the runtime adapter used to build target-owned tools for
@@ -1686,6 +1698,7 @@ impl DelegateTool {
         OwnedParentTools {
             tools,
             origins: self.parent_tools.origins.clone(),
+            mcp_registry: Arc::clone(&self.parent_tools.mcp_registry),
             memory_policies: Some(self.memory_policies_for_target(target)),
         }
     }
@@ -1782,6 +1795,8 @@ impl DelegateTool {
         agent_name: &str,
         target_policy: Arc<SecurityPolicy>,
     ) -> anyhow::Result<IndependentTargetTools> {
+        let delegated_config = crate::tools::config_for_delegated_agent(config);
+        let config = &delegated_config;
         let runtime =
             self.runtime.as_ref().cloned().ok_or_else(|| {
                 anyhow::Error::msg("independent delegation requires runtime adapter")
@@ -2308,6 +2323,28 @@ impl DelegateTool {
             Some(list) if list.is_empty() => false,
             Some(list) => list.iter().any(|t| t == name) || name.contains("__"),
         }
+    }
+
+    fn config_withholds_delegate_tool(
+        config: Option<&Config>,
+        registry: Option<&zeroclaw_tools::mcp_client::McpRegistry>,
+        name: &str,
+    ) -> bool {
+        let Some(config) = config else {
+            return false;
+        };
+        let any_withheld = config
+            .mcp
+            .servers
+            .iter()
+            .any(|server| server.deny_delegate_inheritance);
+        if any_withheld && matches!(name, "tool_search" | "mcp_resources" | "mcp_prompts") {
+            return true;
+        }
+        config.mcp.servers.iter().any(|configured| {
+            configured.deny_delegate_inheritance
+                && crate::tools::mcp_tool_name_belongs_to_server(name, &configured.name, registry)
+        })
     }
 
     /// Resolve every configured skill bundle alias to its directory.
@@ -5378,6 +5415,7 @@ impl DelegateTool {
                 // `parent_tools` is the parent's build list, not its narrowed
                 // registry, so a withholding session filters it here too.
                 let withhold_unrestricted = self.withholds_unrestricted_tools();
+                let mcp_registry = self.parent_tools.mcp_registry.get().map(Arc::as_ref);
                 // Snapshot actual objects once, with parent -> origin lock order.
                 // Neither guard survives a source call or an await.
                 let snapshot = {
@@ -5387,6 +5425,13 @@ impl DelegateTool {
                 let inherited = snapshot
                     .into_iter()
                     .filter(|(tool, _)| tool.name() != Self::NAME)
+                    .filter(|(tool, _)| {
+                        !Self::config_withholds_delegate_tool(
+                            target_config.or(self.root_config.as_deref()),
+                            mcp_registry,
+                            tool.name(),
+                        )
+                    })
                     .filter(|(tool, _)| {
                         !withhold_unrestricted || !tool.requires_unrestricted_principal()
                     })
@@ -15183,6 +15228,68 @@ target = "memory_recall"
             DelegateTool::delegate_admits_with_mcp(&policy, "memory_recall"),
             "non-excluded entry must be admitted"
         );
+    }
+
+    #[test]
+    fn bounded_delegation_withholds_a_server_opted_out_of_inheritance() {
+        let mut config = Config::default();
+        config.mcp.servers = vec![
+            zeroclaw_config::schema::McpServerConfig {
+                name: "authority".into(),
+                deny_delegate_inheritance: true,
+                ..Default::default()
+            },
+            zeroclaw_config::schema::McpServerConfig {
+                name: "ordinary".into(),
+                ..Default::default()
+            },
+        ];
+
+        for name in [
+            "authority__read",
+            "tool_search",
+            "mcp_resources",
+            "mcp_prompts",
+        ] {
+            assert!(
+                DelegateTool::config_withholds_delegate_tool(Some(&config), None, name),
+                "`{name}` must not reach a bounded delegate"
+            );
+        }
+        for name in ["ordinary__read", "read_file"] {
+            assert!(
+                !DelegateTool::config_withholds_delegate_tool(Some(&config), None, name),
+                "`{name}` is unrelated to the withheld server"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_delegation_withholds_tools_from_separator_server_names() {
+        let mut config = Config::default();
+        config.mcp.servers = vec![
+            zeroclaw_config::schema::McpServerConfig {
+                name: "team__authority".into(),
+                deny_delegate_inheritance: true,
+                ..Default::default()
+            },
+            zeroclaw_config::schema::McpServerConfig {
+                name: "team__ordinary".into(),
+                ..Default::default()
+            },
+        ];
+
+        for (name, withheld) in [
+            ("team__authority__read", true),
+            ("team__ordinary__read", false),
+            ("team__authority_extra__read", false),
+        ] {
+            assert_eq!(
+                DelegateTool::config_withholds_delegate_tool(Some(&config), None, name),
+                withheld,
+                "unexpected bounded-delegation decision for `{name}`"
+            );
+        }
     }
 
     #[tokio::test]

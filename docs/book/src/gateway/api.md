@@ -129,6 +129,22 @@ verifies installed WASM payloads. Only one scan runs at a time; a concurrent
 request receives `503 Service Unavailable` and may retry. The endpoint does not
 cache admitted package state between requests.
 
+## Runtime activity
+
+`GET /api/config/activity` returns only `{"busy": boolean}` from the live
+admission coordinator, including admission in progress. It is registered on
+the configuration route group, so a scoped OIDC principal needs only the
+`Config:Read` grant to use it. Configuration helpers can therefore probe idle
+without presenting the shared pairing token.
+
+`GET /api/sessions/running?activity_only=true` exposes the same typing with the
+normal sessions endpoint's pairing authentication. Both projections skip
+transcript reads and history reduction. The result is a point-in-time
+observation, not an admission lock.
+
+Omitting `activity_only`, or setting it to `false`, preserves the running-session
+list response with its additional `busy` field.
+
 ## Per-property CRUD
 
 | Method | Path | Purpose |
