@@ -83,7 +83,9 @@ The pipeline from `[cost.rates.*]` to a recorded `cost_usd` value is:
    global catalog fill only gaps. A deliberate `0.0` input or output rate
    remains configured and free. A `0.0` cached-input rate is also configured,
    but it is not free: the existing cost constructor treats it as "no cache
-   discount" and bills cached tokens at the standard input rate. Negative,
+   discount" and bills cached tokens at the standard input rate. If that
+   standard rate is missing, the ledger marks the cached tokens as unpriced
+   and `zeroclaw status` includes them in its warning. Negative,
    non-finite, or implausibly large rates (above the shared `$1,000,000` per
    configured unit safety bound) are treated as unavailable at the recording
    boundary even if an older or permissive config-load path let them through.
