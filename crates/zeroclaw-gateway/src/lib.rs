@@ -4884,8 +4884,15 @@ async fn dispatch_gateway_turn_streaming_with_agent(
 ) -> anyhow::Result<String> {
     let config = state.config.read().clone();
     let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
+    // Same lifecycle authority the WebSocket turn passes: tools built for this
+    // turn, notably a plugin's `dispatch.wake`, admit and pin their targets
+    // against it rather than running without a lease.
+    let execution_capability = zeroclaw_runtime::AgentExecutionCapability::from_parts(
+        state.config.clone(),
+        state.agent_lifecycle.clone(),
+    );
     let mut agent =
-        zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
+        zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
             state.config.clone(),
             &agent_alias,
             None,
@@ -4895,6 +4902,7 @@ async fn dispatch_gateway_turn_streaming_with_agent(
             state.sop_engine.clone(),
             state.sop_audit.clone(),
             Some(state.canvas_store.clone()),
+            Some(execution_capability),
         )
         .await?;
     #[cfg(test)]
@@ -11179,6 +11187,164 @@ data: [DONE]\n\n";
         let stats = by_agent.get("web").expect("agent alias attribution");
         assert_eq!(stats.total_tokens, 15);
         assert!(stats.cost_usd > 0.0);
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_production_agent_tools_admit_against_the_gateway_lifecycle() {
+        // The streamed constructor must hand its tools the gateway's lifecycle
+        // authority, as the WebSocket turn does. A plugin's `dispatch.wake`
+        // pins and leases its target through it; `send_message_to_peer` admits
+        // its recipient through the same capability, which this fixture can
+        // drive without a WASM backend. With the recipient reserved for
+        // deletion the send must be refused; without the capability it was
+        // queued for an agent that is being deleted.
+        use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig};
+        use zeroclaw_config::policy::AutonomyLevel;
+
+        let peer_tool_stream = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_peer\",\"type\":\"function\",\"function\":{\"name\":\"send_message_to_peer\",\"arguments\":\"{\\\"channel\\\":\\\"telegram.prod\\\",\\\"target\\\":\\\"peer\\\",\\\"message\\\":\\\"hello\\\"}\"}}]}}]}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+data: [DONE]\n\n";
+        let request_bodies = Arc::new(parking_lot::Mutex::new(Vec::<serde_json::Value>::new()));
+        let responses = Arc::new(vec![
+            peer_tool_stream.to_string(),
+            PRODUCTION_FIXTURE_FINAL_STREAM.to_string(),
+            peer_tool_stream.to_string(),
+            PRODUCTION_FIXTURE_FINAL_STREAM.to_string(),
+        ]);
+        let app = {
+            let request_bodies = Arc::clone(&request_bodies);
+            Router::new().route(
+                "/v1/chat/completions",
+                post(
+                    move |axum::extract::Json(request): axum::extract::Json<serde_json::Value>| {
+                        let request_bodies = Arc::clone(&request_bodies);
+                        let responses = Arc::clone(&responses);
+                        async move {
+                            let index = {
+                                let mut bodies = request_bodies.lock();
+                                bodies.push(request);
+                                bodies.len() - 1
+                            };
+                            let body = responses
+                                .get(index)
+                                .or_else(|| responses.last())
+                                .cloned()
+                                .unwrap_or_default();
+                            (
+                                [(
+                                    header::CONTENT_TYPE,
+                                    HeaderValue::from_static("text/event-stream"),
+                                )],
+                                Body::from(body),
+                            )
+                                .into_response()
+                        }
+                    },
+                ),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind recording provider fixture");
+        let address = listener.local_addr().expect("recording fixture address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve recording provider fixture");
+        });
+
+        // The recipient answers from its own provider, so a delivered message's
+        // turn cannot consume the sender's scripted responses.
+        let peer_provider = spawn_chat_completion_fixture(PRODUCTION_FIXTURE_STREAM).await;
+        let tmp = tempfile::tempdir().expect("production gateway temp dir");
+        let (state, _tracker) =
+            production_sse_state(&tmp, &format!("http://{address}/v1"), 1.0, false);
+        {
+            let mut config = state.config.read().clone();
+            config.tools.optional = vec!["send_message_to_peer".to_string()];
+            let risk = config
+                .risk_profiles
+                .get_mut("fixture")
+                .expect("fixture risk profile");
+            risk.level = AutonomyLevel::Full;
+            risk.allowed_tools = vec!["send_message_to_peer".to_string()];
+            config
+                .runtime_profiles
+                .get_mut("fixture")
+                .expect("fixture runtime profile")
+                .max_tool_iterations = 2;
+            let web = config.agents.get_mut("web").expect("web agent");
+            web.channels = vec!["telegram.prod".into()];
+            let mut peer = web.clone();
+            peer.workspace.path = Some(tmp.path().join("peer-workspace"));
+            peer.model_provider = "custom.peer".into();
+            config.agents.insert("peer".to_string(), peer);
+            let mut peer_provider_config = config
+                .providers
+                .models
+                .custom
+                .get("fixture")
+                .expect("fixture provider")
+                .clone();
+            peer_provider_config.base.uri = Some(peer_provider.base_url());
+            config
+                .providers
+                .models
+                .custom
+                .insert("peer".to_string(), peer_provider_config);
+            config.peer_groups.insert(
+                "mesh".to_string(),
+                PeerGroupConfig {
+                    channel: "telegram".into(),
+                    agents: vec![AgentAlias::new("web"), AgentAlias::new("peer")],
+                    ..PeerGroupConfig::default()
+                },
+            );
+            state.config_authority.publish_for_test(config);
+        }
+
+        // The fixture does not echo tool results back into the next request,
+        // so the send is observed through its durable effect: a delivered
+        // peer message registers an inbox task for the recipient before the
+        // tool returns.
+        let data_dir = state.config.read().data_dir.clone();
+        let peer_tasks = || async {
+            zeroclaw_runtime::control_plane::ControlPlaneHandle::open(&data_dir)
+                .expect("open the gateway task store")
+                .store
+                .list_by_agent("peer")
+                .await
+                .expect("list peer tasks")
+        };
+
+        let deletion = state
+            .agent_lifecycle
+            .begin_delete("peer")
+            .expect("an idle peer can be reserved for deletion");
+        let text = collect_production_sse(&state, "message the peer", "peer-delete").await;
+        assert!(text.contains("event: done"), "{text}");
+        assert_eq!(
+            request_bodies.lock().len(),
+            2,
+            "one tool round, then the answer"
+        );
+        assert!(
+            peer_tasks().await.is_empty(),
+            "a peer reserved for deletion must not be sent a message"
+        );
+
+        // Control: with the reservation rolled back the same turn delivers,
+        // so the refusal above came from admission, not from a tool that
+        // never ran.
+        drop(deletion);
+        let text = collect_production_sse(&state, "message the peer", "peer-delete").await;
+        assert!(text.contains("event: done"), "{text}");
+        assert_eq!(
+            peer_tasks().await.len(),
+            1,
+            "an admitted peer send registers one inbox task"
+        );
+        server.abort();
     }
 
     #[tokio::test]

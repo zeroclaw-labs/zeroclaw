@@ -452,6 +452,11 @@ fn scrub_agent_refs(cfg: &mut Config, alias: &str) {
     for group in cfg.peer_groups.values_mut() {
         group.agents.retain(|m| m.as_str() != alias); // raw
     }
+    for entry in cfg.plugins.entries.iter_mut() {
+        entry
+            .dispatch_agents
+            .retain(|grant| !dispatch_grant_names_agent(grant, alias));
+    }
 }
 
 fn delete_channel(
@@ -773,6 +778,22 @@ fn rewrite_agent_refs(cfg: &mut Config, old: &str, new: &str) -> Vec<String> {
         }
         if touched {
             dirty.push(format!("permission_profiles.{pname}"));
+        }
+    }
+    // plugins.entries.<key>.dispatch_agents[] — written as the canonical
+    // alias; the wildcard and unrelated grants are left as they are. Only the
+    // grant field is marked dirty, so the save does not rewrite the rest of
+    // the row.
+    for entry in cfg.plugins.entries.iter_mut() {
+        let mut touched = false;
+        for grant in entry.dispatch_agents.iter_mut() {
+            if dispatch_grant_names_agent(grant, old) {
+                *grant = new.to_string();
+                touched = true;
+            }
+        }
+        if touched {
+            dirty.push(format!("plugins.entries.{}.dispatch_agents", entry.name));
         }
     }
     dirty
@@ -1224,6 +1245,15 @@ fn profile_selector_names_agent(selector: &str, alias: &str) -> bool {
     !trimmed.is_empty() && trimmed != zeroclaw_api::grants::WILDCARD && trimmed == alias
 }
 
+/// Whether a `plugins.entries.<key>.dispatch_agents` grant names agent
+/// `alias`, by the rule the plugin wake backend applies when it admits a wake:
+/// the grant is compared ASCII case-insensitively and is not trimmed
+/// (`Config::validate` rejects padding), and the `"*"` wildcard names no
+/// particular agent.
+fn dispatch_grant_names_agent(grant: &str, alias: &str) -> bool {
+    grant != zeroclaw_api::grants::WILDCARD && grant.eq_ignore_ascii_case(alias)
+}
+
 fn collect_agent_refs(cfg: &Config, alias: &str, sites: &mut Vec<RefSite>) {
     if cfg.heartbeat.agent.trim() == alias {
         let raw = cfg.heartbeat.agent.as_str();
@@ -1308,6 +1338,21 @@ fn collect_agent_refs(cfg: &Config, alias: &str, sites: &mut Vec<RefSite>) {
             }
         }
     }
+    // plugins.entries.<key>.dispatch_agents[] — validate() checks a grant's
+    // grammar, not that the agent it names exists, so deletion drops the grant
+    // rather than refusing. Left behind, it would attach to any later agent
+    // created under the same alias.
+    for entry in &cfg.plugins.entries {
+        for (i, grant) in entry.dispatch_agents.iter().enumerate() {
+            if dispatch_grant_names_agent(grant, alias) {
+                sites.push(RefSite::soft(
+                    format!("plugins.entries.{}.dispatch_agents[{i}]", entry.name),
+                    ScrubAction::DropFromVec { index: i },
+                    grant,
+                ));
+            }
+        }
+    }
     if let Some(target) = cfg.agents.get(alias)
         && target.enabled
     {
@@ -1349,7 +1394,7 @@ mod tests {
     use crate::multi_agent::{AccessMode, AgentAlias, PeerGroupConfig};
     use crate::schema::{
         AliasedAgentConfig, Config, DelegateTargetConfig, EmbeddingRouteConfig, ModelRouteConfig,
-        PermissionProfileConfig,
+        PermissionProfileConfig, PluginEntryConfig,
     };
 
     /// Empty config with the alias-keyed containers cleared so Config::default
@@ -2701,6 +2746,225 @@ mod tests {
             .expect("no selector names the old alias, so auth validation accepts the result");
     }
 
+    fn plugin_entry(name: &str, dispatch_agents: &[&str]) -> PluginEntryConfig {
+        PluginEntryConfig {
+            name: name.to_string(),
+            dispatch_agents: dispatch_agents.iter().map(|a| (*a).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rename_agent_rewrites_plugin_dispatch_grants_and_keeps_wildcards() {
+        let mut cfg = empty_config();
+        cfg.agents
+            .insert("bot".to_string(), AliasedAgentConfig::default());
+        cfg.agents
+            .insert("other".to_string(), AliasedAgentConfig::default());
+        cfg.plugins.entries = vec![
+            // `Bot` names `bot` too: the wake backend matches a grant ASCII
+            // case-insensitively.
+            plugin_entry("zpi1_wake", &["bot", "Bot", "*", "other"]),
+            plugin_entry("zpi1_other", &["other"]),
+            plugin_entry("zpi1_ungranted", &[]),
+        ];
+
+        let report = rename_with_cascade(&mut cfg, &AliasKind::Agent, "bot", "bot2")
+            .expect("renaming a plugin-wakeable agent succeeds");
+        // The grant follows the rename; the wildcard and the unrelated grant
+        // keep their text and position.
+        assert_eq!(
+            cfg.plugins.entries[0].dispatch_agents,
+            vec!["bot2", "bot2", "*", "other"]
+        );
+        assert_eq!(cfg.plugins.entries[1].dispatch_agents, vec!["other"]);
+        assert!(cfg.plugins.entries[2].dispatch_agents.is_empty());
+        assert!(
+            report
+                .dirty_paths
+                .iter()
+                .any(|p| p == "plugins.entries.zpi1_wake.dispatch_agents"),
+            "{:?}",
+            report.dirty_paths
+        );
+        assert!(
+            !report
+                .dirty_paths
+                .iter()
+                .any(|p| p.starts_with("plugins.entries.zpi1_other")
+                    || p.starts_with("plugins.entries.zpi1_ungranted")),
+            "an untouched plugin row is not rewritten: {:?}",
+            report.dirty_paths
+        );
+        assert!(find_all_references(&cfg, &AliasKind::Agent, "bot").is_empty());
+    }
+
+    #[test]
+    fn agent_delete_scrubs_plugin_dispatch_grants_and_keeps_wildcards() {
+        let mut cfg = empty_config();
+        cfg.agents
+            .insert("bot".to_string(), AliasedAgentConfig::default());
+        cfg.agents
+            .insert("other".to_string(), AliasedAgentConfig::default());
+        cfg.plugins.entries = vec![
+            plugin_entry("zpi1_wake", &["other", "Bot", "*", "bot"]),
+            plugin_entry("zpi1_only", &["bot"]),
+            plugin_entry("zpi1_other", &["other"]),
+        ];
+
+        // A wake grant is not load-validated against the roster, so it never
+        // blocks the delete: it is listed as a scrub.
+        let plan = plan_delete(&cfg, &AliasKind::Agent, "bot");
+        assert!(plan.allowed, "{:?}", plan.blockers);
+        let scrubbed: Vec<_> = plan
+            .scrubs
+            .iter()
+            .map(|site| (site.path.as_str(), &site.action, site.raw_value.as_str()))
+            .collect();
+        assert_eq!(
+            scrubbed,
+            vec![
+                (
+                    "plugins.entries.zpi1_wake.dispatch_agents[1]",
+                    &ScrubAction::DropFromVec { index: 1 },
+                    "Bot"
+                ),
+                (
+                    "plugins.entries.zpi1_wake.dispatch_agents[3]",
+                    &ScrubAction::DropFromVec { index: 3 },
+                    "bot"
+                ),
+                (
+                    "plugins.entries.zpi1_only.dispatch_agents[0]",
+                    &ScrubAction::DropFromVec { index: 0 },
+                    "bot"
+                ),
+            ]
+        );
+        // The wildcard names no particular agent.
+        assert!(find_all_references(&cfg, &AliasKind::Agent, "*").is_empty());
+
+        let report = delete_with_cascade(
+            &mut cfg,
+            &AliasKind::Agent,
+            "bot",
+            CascadePolicy::RefuseOnHard,
+        )
+        .expect("a wake grant does not block the delete");
+        // No grant survives to attach to a later agent created as `bot`.
+        assert_eq!(cfg.plugins.entries[0].dispatch_agents, vec!["other", "*"]);
+        assert!(cfg.plugins.entries[1].dispatch_agents.is_empty());
+        assert_eq!(cfg.plugins.entries[2].dispatch_agents, vec!["other"]);
+        let dirty = report.dirty_paths();
+        for expected in [
+            "plugins.entries.zpi1_wake.dispatch_agents",
+            "plugins.entries.zpi1_only.dispatch_agents",
+        ] {
+            assert!(
+                dirty.iter().any(|p| p == expected),
+                "missing dirty path {expected:?} in {dirty:?}"
+            );
+        }
+        assert!(
+            !dirty
+                .iter()
+                .any(|p| p.starts_with("plugins.entries.zpi1_other")),
+            "an untouched plugin row is not rewritten: {dirty:?}"
+        );
+    }
+
+    /// The dirty paths the cascade reports must be ones the incremental save
+    /// can address, or the grant is rewritten in memory and left stale on disk.
+    #[tokio::test]
+    async fn plugin_dispatch_grant_cascade_persists_through_save_dirty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [agents.alpha]\n\
+             enabled = true\n\n\
+             [[plugins.entries]]\n\
+             name = \"zpi1_wake\"\n\
+             egress_hosts = [\"api.example.com\"]\n\
+             dispatch_agents = [\"alpha\", \"*\"]\n\n\
+             [[plugins.entries]]\n\
+             name = \"zpi1_only\"\n\
+             dispatch_agents = [\"alpha\"]\n\
+             dispatch_rate_per_min = 5\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut cfg = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        cfg.agents
+            .insert("alpha".to_string(), AliasedAgentConfig::default());
+        let mut wake = plugin_entry("zpi1_wake", &["alpha", "*"]);
+        wake.egress_hosts = vec!["api.example.com".to_string()];
+        let mut only = plugin_entry("zpi1_only", &["alpha"]);
+        only.dispatch_rate_per_min = Some(5);
+        cfg.plugins.entries = vec![wake, only];
+
+        let report = rename_with_cascade(&mut cfg, &AliasKind::Agent, "alpha", "beta")
+            .expect("rename succeeds");
+        for path in &report.dirty_paths {
+            cfg.mark_dirty(path);
+        }
+        cfg.save_dirty().await.unwrap();
+
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        let disk = crate::migration::migrate_to_current(&saved).unwrap();
+        assert_eq!(
+            disk.plugins.entries[0].dispatch_agents,
+            vec!["beta", "*"],
+            "{saved}"
+        );
+        assert_eq!(
+            disk.plugins.entries[0].egress_hosts,
+            vec!["api.example.com"],
+            "the rest of the row is left as the operator wrote it: {saved}"
+        );
+        assert_eq!(
+            disk.plugins.entries[1].dispatch_agents,
+            vec!["beta"],
+            "{saved}"
+        );
+        assert!(!saved.contains("alpha"), "{saved}");
+
+        let report = delete_with_cascade(
+            &mut cfg,
+            &AliasKind::Agent,
+            "beta",
+            CascadePolicy::RefuseOnHard,
+        )
+        .expect("delete succeeds");
+        for path in report.dirty_paths() {
+            cfg.mark_dirty(&path);
+        }
+        cfg.save_dirty().await.unwrap();
+
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        let disk = crate::migration::migrate_to_current(&saved).unwrap();
+        assert_eq!(disk.plugins.entries.len(), 2, "{saved}");
+        assert_eq!(
+            disk.plugins.entries[0].dispatch_agents,
+            vec!["*"],
+            "{saved}"
+        );
+        assert!(
+            disk.plugins.entries[1].dispatch_agents.is_empty(),
+            "a row whose only grant named the agent is back to deny-all: {saved}"
+        );
+        assert_eq!(
+            disk.plugins.entries[1].dispatch_rate_per_min,
+            Some(5),
+            "{saved}"
+        );
+        assert!(!saved.contains("beta"), "{saved}");
+    }
+
     #[test]
     fn rename_agent_not_found() {
         let mut cfg = empty_config();
@@ -2990,6 +3254,12 @@ mod tests {
         assert_eq!(
             dirty_entry_for("model_routes[0].model_provider"),
             "model_routes"
+        );
+        // A plugin wake grant → the row's own grant field, so the save leaves
+        // the rest of the row (its secret `config` map included) untouched.
+        assert_eq!(
+            dirty_entry_for("plugins.entries.zpi1_wake.dispatch_agents[2]"),
+            "plugins.entries.zpi1_wake.dispatch_agents"
         );
         // provider entry → the 4-segment entry path.
         assert_eq!(

@@ -26,6 +26,11 @@ pub struct WasmTool {
     /// service rather than a resolved allowlist so an operator's config edit
     /// applies on the next request without rebuilding the tool.
     egress: Option<crate::egress::EgressHostService>,
+    /// The host-owned alias of the agent whose turn runs this tool, when one
+    /// does. Forwarded to each store the tool builds so the guest's `dispatch`
+    /// import cannot misattribute a wake to an agent that never asked for it.
+    /// `None` is the metadata/verification case: no turn, no caller.
+    caller_alias: Option<String>,
 }
 
 impl Attributable for WasmTool {
@@ -68,6 +73,7 @@ impl WasmTool {
             services,
             limits,
             egress: None,
+            caller_alias: None,
         })
     }
 
@@ -78,6 +84,18 @@ impl WasmTool {
     #[must_use]
     pub fn with_egress_policy(mut self, egress: Option<crate::egress::EgressHostService>) -> Self {
         self.egress = egress;
+        self
+    }
+
+    /// Attach the host-owned alias of the agent whose turn runs this tool.
+    ///
+    /// Without one, a `dispatch` call from the guest reports no caller, which
+    /// the runtime treats as "no agent turn behind this call". Omission is
+    /// therefore safe: it never widens attribution, it only declines to claim
+    /// one.
+    #[must_use]
+    pub fn with_caller_alias(mut self, alias: impl Into<String>) -> Self {
+        self.caller_alias = Some(alias.into());
         self
     }
 
@@ -122,6 +140,7 @@ impl WasmTool {
             services,
             limits,
             egress,
+            caller_alias: None,
         })
     }
 }
@@ -149,6 +168,18 @@ where
 
 #[async_trait]
 impl Tool for WasmTool {
+    /// A dispatch-granted plugin starts turns on other agents. Wake dispatch
+    /// carries the caller's identity into that turn but not its live agent and
+    /// tool selectors, so a restricted principal must not hold the tool. This
+    /// matches `send_message_to_peer` and stays until `dispatch.wake` enforces
+    /// the caller's live authority itself. Plugins without the grant are
+    /// unaffected.
+    fn requires_unrestricted_principal(&self) -> bool {
+        self.scope
+            .grants()
+            .allows(crate::PluginPermission::AgentDispatch)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -165,13 +196,16 @@ impl Tool for WasmTool {
         let args_json = serde_json::to_vec(&args)?;
         self.services.resolve_config(&self.scope)?;
         // The authority handle travels to the fresh store; the *decision* is not
-        // read here. It is read inside the hooks, per request.
-        let mut plugin = runtime::create_plugin_with_egress(
+        // read here. It is read inside the hooks, per request. The caller alias
+        // travels the same way: it is the host's attribution for this turn, not
+        // a value the guest can substitute.
+        let mut plugin = runtime::create_plugin_with_egress_and_caller(
             &self.component,
             &self.scope,
             &self.services,
             self.limits,
             self.egress.clone(),
+            self.caller_alias.clone(),
         )
         .await?;
         runtime::call_execute(&mut plugin, &args_json).await
@@ -217,6 +251,64 @@ mod tests {
         assert_eq!(tool.scope.id().package(), "fixture");
         assert_eq!(tool.scope.id().capability(), PluginCapability::Tool);
         assert_eq!(tool.scope.id().binding(), "redaction-primary");
+    }
+
+    /// Only a dispatch grant marks the adapter: it starts turns on other agents
+    /// without carrying the caller's live selectors, so restricted principals
+    /// must not hold it. An ordinary plugin keeps the default.
+    #[test]
+    fn only_a_dispatch_grant_requires_an_unrestricted_principal() {
+        let build = |scope| {
+            WasmTool::new(
+                "probe".to_string(),
+                "probe".to_string(),
+                serde_json::json!({}),
+                component(),
+                scope,
+                crate::services::test_host_services(),
+                crate::component::test_limits(1_000),
+            )
+            .expect("tool scope matches adapter")
+        };
+
+        assert!(
+            !build(tool_scope()).requires_unrestricted_principal(),
+            "an ordinary plugin stays available to restricted principals"
+        );
+        let dispatching = crate::instance::test_scope(
+            PluginCapability::Tool,
+            "redaction-primary",
+            [crate::PluginPermission::AgentDispatch],
+        );
+        assert!(
+            build(dispatching).requires_unrestricted_principal(),
+            "a dispatch-granted plugin starts turns on other agents"
+        );
+    }
+
+    #[test]
+    fn caller_alias_is_opt_in_and_never_guest_supplied() {
+        let tool = WasmTool::new(
+            "waker".to_string(),
+            "wakes agents".to_string(),
+            serde_json::json!({}),
+            component(),
+            tool_scope(),
+            crate::services::test_host_services(),
+            crate::component::test_limits(1_000),
+        )
+        .expect("tool scope matches adapter");
+        assert!(
+            tool.caller_alias.is_none(),
+            "an adapter built without an agent turn claims no caller"
+        );
+
+        let tool = tool.with_caller_alias("redaction-primary");
+        assert_eq!(
+            tool.caller_alias.as_deref(),
+            Some("redaction-primary"),
+            "the host-owned alias travels to every store the tool builds"
+        );
     }
 
     #[test]

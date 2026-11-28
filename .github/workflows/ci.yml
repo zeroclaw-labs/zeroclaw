@@ -864,7 +864,7 @@ jobs:
         run: cargo check --locked -p zeroclaw-plugins --no-default-features --features ${{ matrix.features }}
       - name: Run plugin component tests
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'components'
-        run: cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e --test egress_plugin_e2e --test memory_plugin_e2e --test tool_plugin_timeout_e2e --test reference_plugin --test reference_plugin_e2e --test tool_plugin_e2e --test socket_plugin_e2e --test websocket_plugin_e2e
+        run: cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e --test egress_plugin_e2e --test memory_plugin_e2e --test tool_plugin_timeout_e2e --test reference_plugin --test reference_plugin_e2e --test tool_plugin_e2e --test socket_plugin_e2e --test websocket_plugin_e2e --test dispatch_plugin_e2e
       - name: Run plugins lib unit tests
         if: steps.changed.outputs.run == 'true' && matrix.suite == 'components'
         run: cargo test --locked -p zeroclaw-plugins --no-default-features --features plugins-wasm-cranelift --lib
@@ -880,6 +880,13 @@ jobs:
         # the receipt-bound late_tool_search tests ignore themselves without the
         # fixture receipt the next step prepares.
         run: cargo test --locked -p zeroclaw-runtime --features plugins-wasm-cranelift --lib agent::plugin_live_config
+      - name: Run runtime plugin wake dispatch tests
+        if: steps.changed.outputs.run == 'true' && matrix.suite == 'runtime'
+        # Module filter: tools::plugin_wake holds the wake backend's grant,
+        # rate-limit, coalescing, hop-depth and cost regressions, the compiled
+        # dispatch-fixture end-to-end path, and the restricted-principal
+        # boundary. The default-feature Test job never compiles them.
+        run: cargo test --locked -p zeroclaw-runtime --features plugins-wasm-cranelift --lib tools::plugin_wake
       # Feature-gated admission proofs. These only compile under plugins-wasm, so
       # the default-feature workspace Test job never runs them: the activation
       # plan (plugin_runtime), the shared instance ceiling, the auto_discover
@@ -1251,7 +1258,7 @@ jobs:
           inputs = ['Cargo.toml', 'Cargo.lock', 'crates/zeroclaw-plugins/tests/fixtures/tool-fixture/Cargo.toml',
                     'crates/zeroclaw-plugins/tests/fixtures/tool-fixture/src/lib.rs']
           inputs += [str(path.relative_to(workspace)) for path in sorted((workspace / 'wit/v0').iterdir()) if path.is_file()]
-          if len(inputs) != 17:
+          if len(inputs) != 18:
               raise RuntimeError('unexpected WIT input inventory')
           input_rows = [{'path': path, **digest(workspace / path, 4 * 1024 * 1024)} for path in inputs]
           components = {}
