@@ -23,7 +23,7 @@ record; the date above is the date this ADR was added to the
 architecture docs.
 
 This record was drafted from
-[FND-002 §6.3](../../foundations/fnd-002-documentation-standards.md#63-foundational-adr-backlog),
+[FND-002 §6.3](../../foundations/fnd-002-documentation-standards.md#63-foundational-adr-set),
 the current `zeroclaw-api` trait surfaces, and the crate and
 tool-boundary docs. It was not recovered from an older ADR file.
 
