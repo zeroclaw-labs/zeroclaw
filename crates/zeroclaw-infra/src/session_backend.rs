@@ -468,6 +468,42 @@ pub trait SessionBackend: Send + Sync {
     fn list_stuck_sessions(&self, _threshold_secs: u64) -> Vec<SessionMetadata> {
         Vec::new()
     }
+
+    /// Store a peer-to-peer session message event. Backends without a
+    /// message store return [`std::io::ErrorKind::Unsupported`] rather than
+    /// dropping the message, and so do the read and admit defaults below:
+    /// override all three together. A target session that does not exist
+    /// returns [`std::io::ErrorKind::NotFound`].
+    fn store_session_message(
+        &self,
+        _message: &zeroclaw_api::session_message::SessionMessage,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session backend has no message store",
+        ))
+    }
+
+    /// The oldest message addressed to `target_session_key` that the
+    /// receiver has not admitted yet. Reading it does not admit it.
+    fn next_pending_session_message(
+        &self,
+        _target_session_key: &str,
+    ) -> std::io::Result<Option<zeroclaw_api::session_message::SessionMessage>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session backend has no message store",
+        ))
+    }
+
+    /// Record that the receiver admitted a message into one of its turns.
+    /// Returns `false` when the message is unknown or already admitted.
+    fn mark_session_message_admitted(&self, _delivery_id: &str) -> std::io::Result<bool> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session backend has no message store",
+        ))
+    }
 }
 
 /// Session state information.

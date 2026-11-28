@@ -156,6 +156,20 @@ impl SqliteSessionBackend {
                 name         TEXT
              );
 
+             CREATE TABLE IF NOT EXISTS session_messages (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                delivery_id        TEXT NOT NULL UNIQUE,
+                source_session_key TEXT NOT NULL,
+                target_session_key TEXT NOT NULL,
+                body               TEXT NOT NULL,
+                accepted_at        TEXT NOT NULL,
+                source_agent_alias TEXT,
+                target_agent_alias TEXT,
+                admitted_at        TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_session_messages_pending
+                ON session_messages(target_session_key, admitted_at, id);
+
              CREATE TABLE IF NOT EXISTS jsonl_import_receipts (
                 source_name  TEXT PRIMARY KEY,
                 session_key  TEXT NOT NULL,
@@ -1292,11 +1306,18 @@ impl SessionBackend for SqliteSessionBackend {
 
         let count = stale_keys.len();
         for key in &stale_keys {
-            let _ = conn.execute("DELETE FROM sessions WHERE session_key = ?1", params![key]);
-            let _ = conn.execute(
+            conn.execute("DELETE FROM sessions WHERE session_key = ?1", params![key])
+                .map_err(std::io::Error::other)?;
+            conn.execute(
                 "DELETE FROM session_metadata WHERE session_key = ?1",
                 params![key],
-            );
+            )
+            .map_err(std::io::Error::other)?;
+            conn.execute(
+                "DELETE FROM session_messages WHERE target_session_key = ?1",
+                params![key],
+            )
+            .map_err(std::io::Error::other)?;
         }
 
         Ok(count)
@@ -1352,6 +1373,13 @@ impl SessionBackend for SqliteSessionBackend {
         // Delete metadata
         conn.execute(
             "DELETE FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
+
+        // A deleted session keeps none of its messages, received or pending.
+        conn.execute(
+            "DELETE FROM session_messages WHERE target_session_key = ?1",
             params![session_key],
         )
         .map_err(std::io::Error::other)?;
@@ -1412,6 +1440,11 @@ impl SessionBackend for SqliteSessionBackend {
             params![session_key, expected_owner],
         )
         .map_err(std::io::Error::other)?;
+        tx.execute(
+            "DELETE FROM session_messages WHERE target_session_key = ?1",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
         tx.commit().map_err(std::io::Error::other)?;
         Ok(true)
     }
@@ -1469,7 +1502,101 @@ impl SessionBackend for SqliteSessionBackend {
             params![session_key],
         )
         .map_err(std::io::Error::other)?;
+        conn.execute(
+            "DELETE FROM session_messages WHERE target_session_key = ?1",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
         Ok(true)
+    }
+
+    fn store_session_message(
+        &self,
+        message: &zeroclaw_api::session_message::SessionMessage,
+    ) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        // Check the target and insert in one statement under the connection
+        // lock that session deletion also holds, so a message cannot land
+        // after its recipient is deleted.
+        let rows = conn.execute(
+            "INSERT INTO session_messages (delivery_id, source_session_key, target_session_key, \
+             body, accepted_at, source_agent_alias, target_agent_alias, admitted_at) \
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 \
+             WHERE EXISTS (SELECT 1 FROM session_metadata WHERE session_key = ?3)",
+            params![
+                message.delivery_id,
+                message.source_session_key,
+                message.target_session_key,
+                message.body,
+                message.accepted_at.to_rfc3339(),
+                message.source_agent_alias,
+                message.target_agent_alias,
+                message.admitted_at.map(|at| at.to_rfc3339()),
+            ],
+        )
+        .map_err(std::io::Error::other)?;
+        if rows == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "target session does not exist",
+            ));
+        }
+        Ok(())
+    }
+
+    fn next_pending_session_message(
+        &self,
+        target_session_key: &str,
+    ) -> std::io::Result<Option<zeroclaw_api::session_message::SessionMessage>> {
+        let conn = self.conn.lock();
+        let row = conn
+            .query_row(
+                "SELECT delivery_id, source_session_key, body, accepted_at, \
+                 source_agent_alias, target_agent_alias FROM session_messages \
+                 WHERE target_session_key = ?1 AND admitted_at IS NULL ORDER BY id LIMIT 1",
+                params![target_session_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(std::io::Error::other)?;
+        let Some((delivery_id, source, body, accepted_at, source_alias, target_alias)) = row else {
+            return Ok(None);
+        };
+        let accepted_at = DateTime::parse_from_rfc3339(&accepted_at)
+            .map(|at| at.with_timezone(&Utc))
+            .map_err(std::io::Error::other)?;
+        Ok(Some(zeroclaw_api::session_message::SessionMessage {
+            delivery_id,
+            source_session_key: source,
+            target_session_key: target_session_key.to_string(),
+            body,
+            accepted_at,
+            source_agent_alias: source_alias,
+            target_agent_alias: target_alias,
+            admitted: false,
+            admitted_at: None,
+        }))
+    }
+
+    fn mark_session_message_admitted(&self, delivery_id: &str) -> std::io::Result<bool> {
+        let conn = self.conn.lock();
+        let rows = conn
+            .execute(
+                "UPDATE session_messages SET admitted_at = ?2 \
+                 WHERE delivery_id = ?1 AND admitted_at IS NULL",
+                params![delivery_id, Utc::now().to_rfc3339()],
+            )
+            .map_err(std::io::Error::other)?;
+        Ok(rows == 1)
     }
 
     fn clear_agent_attribution(&self, agent_alias: &str) -> std::io::Result<usize> {
@@ -1978,6 +2105,276 @@ mod tests {
     use std::sync::{Arc, mpsc};
     use std::time::Duration as StdDuration;
     use tempfile::TempDir;
+
+    fn peer_message(
+        id: &str,
+        target: &str,
+        body: &str,
+    ) -> zeroclaw_api::session_message::SessionMessage {
+        zeroclaw_api::session_message::SessionMessage::new(
+            id,
+            "source_session",
+            target,
+            body,
+            Some("agent".into()),
+            Some("agent".into()),
+        )
+    }
+
+    #[test]
+    fn session_messages_are_pending_in_order_until_admitted() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("target", &ChatMessage::user("hi")).unwrap();
+        backend.append("other", &ChatMessage::user("hi")).unwrap();
+        backend
+            .store_session_message(&peer_message("d1", "target", "first"))
+            .unwrap();
+        backend
+            .store_session_message(&peer_message("d2", "target", "second"))
+            .unwrap();
+        backend
+            .store_session_message(&peer_message("d3", "other", "elsewhere"))
+            .unwrap();
+
+        let next = backend
+            .next_pending_session_message("target")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (next.delivery_id.as_str(), next.body.as_str()),
+            ("d1", "first")
+        );
+        assert_eq!(next.source_session_key, "source_session");
+        assert!(!next.admitted);
+        // Reading does not admit.
+        assert_eq!(
+            backend
+                .next_pending_session_message("target")
+                .unwrap()
+                .unwrap()
+                .delivery_id,
+            "d1"
+        );
+
+        assert!(backend.mark_session_message_admitted("d1").unwrap());
+        assert!(
+            !backend.mark_session_message_admitted("d1").unwrap(),
+            "admitted once"
+        );
+        assert_eq!(
+            backend
+                .next_pending_session_message("target")
+                .unwrap()
+                .unwrap()
+                .delivery_id,
+            "d2"
+        );
+        assert!(backend.mark_session_message_admitted("d2").unwrap());
+        assert!(
+            backend
+                .next_pending_session_message("target")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            backend
+                .next_pending_session_message("other")
+                .unwrap()
+                .unwrap()
+                .delivery_id,
+            "d3"
+        );
+    }
+
+    #[test]
+    fn session_messages_survive_reopen_and_duplicate_delivery_ids_are_rejected() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+            backend.append("target", &ChatMessage::user("hi")).unwrap();
+            backend
+                .store_session_message(&peer_message("d1", "target", "durable"))
+                .unwrap();
+            assert!(
+                backend
+                    .store_session_message(&peer_message("d1", "target", "again"))
+                    .is_err()
+            );
+        }
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let next = reopened
+            .next_pending_session_message("target")
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.body, "durable");
+    }
+
+    #[test]
+    fn a_message_for_a_missing_or_deleted_session_is_not_stored() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        let missing = backend
+            .store_session_message(&peer_message("d0", "target", "early"))
+            .unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+
+        backend.append("target", &ChatMessage::user("hi")).unwrap();
+        assert!(backend.delete_session("target").unwrap());
+        let deleted = backend
+            .store_session_message(&peer_message("d1", "target", "late"))
+            .unwrap_err();
+        assert_eq!(deleted.kind(), std::io::ErrorKind::NotFound);
+
+        backend
+            .append("target", &ChatMessage::user("recreated"))
+            .unwrap();
+        assert!(
+            backend
+                .next_pending_session_message("target")
+                .unwrap()
+                .is_none(),
+            "a recreated session does not inherit a message sent to the deleted one"
+        );
+    }
+
+    /// Every row addressed to `target`, received or pending.
+    fn stored_message_rows(backend: &SqliteSessionBackend, target: &str) -> i64 {
+        backend
+            .conn
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM session_messages WHERE target_session_key = ?1",
+                params![target],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// A session `target` owned by Alice holding one received and one
+    /// pending message.
+    fn session_with_received_and_pending_messages(backend: &SqliteSessionBackend) {
+        backend.append("target", &ChatMessage::user("hi")).unwrap();
+        backend
+            .set_session_principal("target", "user:alice")
+            .unwrap();
+        backend
+            .store_session_message(&peer_message("d-read", "target", "already read"))
+            .unwrap();
+        assert!(backend.mark_session_message_admitted("d-read").unwrap());
+        backend
+            .store_session_message(&peer_message("d-new", "target", "not read yet"))
+            .unwrap();
+        assert_eq!(stored_message_rows(backend, "target"), 2);
+    }
+
+    #[test]
+    fn delete_session_removes_received_and_pending_messages() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        session_with_received_and_pending_messages(&backend);
+        assert!(backend.delete_session("target").unwrap());
+        assert_eq!(stored_message_rows(&backend, "target"), 0);
+    }
+
+    #[test]
+    fn authorized_delete_removes_received_and_pending_messages() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        session_with_received_and_pending_messages(&backend);
+        let authorize = |_owner: Option<&str>| -> std::io::Result<
+            Box<dyn crate::session_backend::SessionEffectGuard>,
+        > { Ok(Box::new(())) };
+        assert!(
+            backend
+                .delete_session_authorized("target", Some("user:alice"), &authorize)
+                .unwrap()
+        );
+        assert_eq!(stored_message_rows(&backend, "target"), 0);
+    }
+
+    #[test]
+    fn owned_delete_removes_received_and_pending_messages() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        session_with_received_and_pending_messages(&backend);
+        assert!(
+            backend
+                .delete_session_owned("target", "user:alice")
+                .unwrap()
+        );
+        assert_eq!(stored_message_rows(&backend, "target"), 0);
+    }
+
+    #[test]
+    fn stale_cleanup_removes_messages_so_a_reused_id_starts_empty() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        session_with_received_and_pending_messages(&backend);
+        {
+            let conn = backend.conn.lock();
+            let old_time = (Utc::now() - Duration::hours(100)).to_rfc3339();
+            conn.execute(
+                "UPDATE session_metadata SET last_activity = ?1 WHERE session_key = 'target'",
+                params![old_time],
+            )
+            .unwrap();
+        }
+        assert_eq!(backend.cleanup_stale(48).unwrap(), 1);
+        assert_eq!(stored_message_rows(&backend, "target"), 0);
+
+        backend
+            .append("target", &ChatMessage::user("a new session"))
+            .unwrap();
+        assert!(
+            backend
+                .next_pending_session_message("target")
+                .unwrap()
+                .is_none(),
+            "the reused id does not inherit the expired session's inbox"
+        );
+    }
+
+    #[test]
+    fn stale_cleanup_reports_a_failed_delete() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        session_with_received_and_pending_messages(&backend);
+        {
+            let conn = backend.conn.lock();
+            let old_time = (Utc::now() - Duration::hours(100)).to_rfc3339();
+            conn.execute(
+                "UPDATE session_metadata SET last_activity = ?1 WHERE session_key = 'target'",
+                params![old_time],
+            )
+            .unwrap();
+            conn.execute("DROP TABLE session_messages", []).unwrap();
+        }
+        assert!(
+            backend.cleanup_stale(48).is_err(),
+            "a delete that fails is reported, not counted as cleaned"
+        );
+    }
+
+    #[test]
+    fn deleting_a_session_drops_its_pending_messages() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("target", &ChatMessage::user("hi")).unwrap();
+        backend
+            .store_session_message(&peer_message("d1", "target", "pending"))
+            .unwrap();
+        assert!(backend.delete_session("target").unwrap());
+        backend
+            .append("target", &ChatMessage::user("recreated"))
+            .unwrap();
+        assert!(
+            backend
+                .next_pending_session_message("target")
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn round_trip_sqlite() {

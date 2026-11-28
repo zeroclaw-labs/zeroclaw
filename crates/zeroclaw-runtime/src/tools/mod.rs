@@ -139,7 +139,7 @@ pub use zeroclaw_tools::send_via::{
 };
 pub use zeroclaw_tools::sessions::{
     AcpSessionReadView, SessionDeleteTool, SessionResetTool, SessionsCurrentTool,
-    SessionsHistoryTool, SessionsListTool, SessionsSendTool,
+    SessionsHistoryTool, SessionsListTool, SessionsMessageTool, SessionsSendTool,
 };
 #[cfg(feature = "tools-external")]
 pub use zeroclaw_tools::text_browser::TextBrowserTool;
@@ -517,8 +517,12 @@ pub fn default_tools_with_runtime(
 /// requires an unrestricted principal; tests use the names to check that a
 /// non-admin registry holds none of them.
 #[cfg(test)]
-pub(crate) const SESSION_DATA_TOOL_NAMES: &[&str] =
-    &["sessions_list", "sessions_history", "sessions_send"];
+pub(crate) const SESSION_DATA_TOOL_NAMES: &[&str] = &[
+    "sessions_list",
+    "sessions_history",
+    "sessions_send",
+    "sessions_message",
+];
 
 #[cfg(test)]
 pub(crate) fn register_skill_tools(
@@ -3290,6 +3294,7 @@ fn all_tools_with_runtime_on_thread(
         "sessions_list",
         "sessions_history",
         "sessions_send",
+        "sessions_message",
     ]
     .iter()
     .map(|name| select_tool!(name))
@@ -3297,6 +3302,14 @@ fn all_tools_with_runtime_on_thread(
         && let Ok(backend) =
             zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels.session_backend)
     {
+        register_tool!(
+            "sessions_message",
+            Arc::new(SessionsMessageTool::new(
+                backend.clone(),
+                security.clone(),
+                Some(agent_alias.to_string()),
+            ))
+        );
         if let Some(acp_sessions) = acp_sessions {
             register_tool!(
                 "sessions_current",

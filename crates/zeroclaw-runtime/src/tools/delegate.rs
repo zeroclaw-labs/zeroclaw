@@ -20227,6 +20227,7 @@ target = "spawn_subagent"
                     "sessions_list",
                     "sessions_history",
                     "sessions_send",
+                    "sessions_message",
                     "sessions_current",
                 ]
                 .map(String::from)
@@ -20641,6 +20642,7 @@ target = "sessions_history"
                     "sessions_list",
                     "sessions_history",
                     "sessions_send",
+                    "sessions_message",
                     "sessions_current",
                 ]
                 .map(String::from)
