@@ -284,7 +284,7 @@ fn migration_converges_upstream_v8_without_losing_terminal_settlement_schema() {
         verify
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .expect("read schema version"),
-        14
+        15
     );
     let columns: Vec<String> = verify
         .prepare("PRAGMA table_info(tasks)")
@@ -1371,7 +1371,7 @@ async fn migration_fails_nonterminal_legacy_goals_but_keeps_terminal_audit_rows(
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .expect("read migrated schema version");
     assert_eq!(
-        schema_version, 14,
+        schema_version, 15,
         "migration records the final control-plane schema"
     );
     let running: (String, Option<String>, Option<String>) = verify
