@@ -445,9 +445,9 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
     }
     // Final forward may null delta_sender on send failure; mark it read.
     let _ = delta_sender;
-    outcome.suppressed_protocol = text_guard.suppressed_protocol;
-    if text_guard.suppressed_protocol
-        && let Some(diagnostic) = text_guard.suppression
+    outcome.suppressed_protocol = text_guard.suppressed_protocol();
+    if text_guard.suppressed_protocol()
+        && let Some(diagnostic) = text_guard.suppression()
     {
         // Attributes carry only the detector and the candidate offset so a
         // false positive can be diagnosed without logging the withheld text.

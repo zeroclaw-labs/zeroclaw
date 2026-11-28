@@ -886,6 +886,34 @@ impl WireApi {
     }
 }
 
+/// Wire protocol used by a typed decision model.
+///
+/// `openai_decisions` is OpenAI's dedicated Decisions API (`POST
+/// /v1/decisions`). OpenAI-compatible gateways and local servers can expose
+/// the same contract. `system_one` keeps the existing Jev / Laya contract
+/// available for legacy decision entries. Chat Completions and Responses are
+/// chat wire APIs and are intentionally represented by [`WireApi`] instead.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionWireApi {
+    #[serde(rename = "openai_decisions")]
+    OpenAiDecisions,
+    SystemOne,
+}
+
+impl DecisionWireApi {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiDecisions => "openai_decisions",
+            Self::SystemOne => "system_one",
+        }
+    }
+}
+
 /// Policy for images a native tool-result carrier declared in its
 /// `attachments` array.
 #[derive(
@@ -12432,6 +12460,32 @@ pub fn apply_runtime_proxy_to_builder(
     service_key: &str,
 ) -> reqwest::ClientBuilder {
     runtime_proxy_config().apply_to_reqwest_builder(builder, service_key)
+}
+
+/// Reuse a customized client for the current proxy generation. `profile` must
+/// identify all transport settings supplied by `configure`, without secrets.
+/// Proxy changes invalidate this cache through the existing runtime authority.
+pub fn try_build_runtime_proxy_client_with(
+    service_key: &str,
+    profile: &str,
+    configure: impl FnOnce(reqwest::ClientBuilder) -> anyhow::Result<reqwest::ClientBuilder>,
+) -> anyhow::Result<reqwest::Client> {
+    let cache_key = format!("custom|{service_key}|{profile}");
+    if let Some(client) = runtime_proxy_cached_client(&cache_key) {
+        return Ok(client);
+    }
+    let (generation, proxy) = runtime_proxy_config_snapshot();
+    if proxy.should_apply_to_service(service_key) {
+        proxy.validate().map_err(|_| {
+            anyhow::Error::msg(format!(
+                "Invalid runtime proxy configuration for {service_key}"
+            ))
+        })?;
+    }
+    let builder = proxy.try_apply_to_reqwest_builder(reqwest::Client::builder(), service_key)?;
+    let client = configure(builder)?.build()?;
+    set_runtime_proxy_cached_client(cache_key, generation, client.clone());
+    Ok(client)
 }
 
 pub fn build_runtime_proxy_client(service_key: &str) -> reqwest::Client {
@@ -42362,6 +42416,36 @@ api_token = "tok"
                 "NO_PROXY should bypass {bypassed}"
             );
         }
+    }
+
+    #[test]
+    async fn customized_proxy_client_reuses_pool_and_rebuilds_after_proxy_change() {
+        let _env_guard = env_override_lock().await;
+        let previous = runtime_proxy_config();
+        let builds = std::cell::Cell::new(0);
+        let build = || {
+            try_build_runtime_proxy_client_with("memory.embeddings", "reuse-test", |builder| {
+                builds.set(builds.get() + 1);
+                Ok(builder.redirect(reqwest::redirect::Policy::none()))
+            })
+            .unwrap()
+        };
+        set_runtime_proxy_config(ProxyConfig::default());
+        let _first = build();
+        let _second = build();
+        assert_eq!(
+            builds.get(),
+            1,
+            "unchanged transports reuse the client pool"
+        );
+        set_runtime_proxy_config(ProxyConfig::default());
+        let _third = build();
+        assert_eq!(
+            builds.get(),
+            2,
+            "proxy publication invalidates cached clients"
+        );
+        set_runtime_proxy_config(previous);
     }
 
     #[test]
