@@ -1306,6 +1306,35 @@ mod tests {
     }
 
     #[test]
+    fn local_refs_decode_tilde_escapes_once_without_aliasing_definition_names() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "slash": { "$ref": "#/$defs/shape~1name" },
+                "literal_escape": { "$ref": "#/$defs/shape~01name" }
+            },
+            "$defs": {
+                "shape/name": { "type": "boolean" },
+                "shape~1name": { "type": "integer" }
+            }
+        });
+        let expected = json!({
+            "type": "object",
+            "properties": {
+                "slash": { "type": "boolean" },
+                "literal_escape": { "type": "integer" }
+            }
+        });
+
+        for clean in [
+            SchemaCleanr::clean_for_anthropic as fn(Value) -> Value,
+            SchemaCleanr::clean_for_gemini,
+        ] {
+            assert_eq!(clean(schema.clone()), expected);
+        }
+    }
+
+    #[test]
     fn test_flatten_literal_union() {
         let schema = json!({
             "anyOf": [
