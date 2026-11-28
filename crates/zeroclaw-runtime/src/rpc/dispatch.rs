@@ -8565,7 +8565,7 @@ impl RpcDispatcher {
 
     /// Set a session's display name.
     async fn handle_session_rename(&self, params: &Value) -> RpcResult {
-        const MAX_SESSION_NAME_CHARS: usize = 200;
+        use zeroclaw_api::session_keys::MAX_SESSION_NAME_CHARS;
         let req: SessionRenameParams = parse_params(params)?;
         let name = req.name.trim();
         if name.is_empty() {

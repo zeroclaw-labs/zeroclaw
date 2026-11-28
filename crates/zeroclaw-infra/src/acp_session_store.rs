@@ -13,6 +13,18 @@ use zeroclaw_log::{Action, EventOutcome};
 
 const MAX_PERSISTED_TOOL_OUTPUT_BYTES: usize = 16 * 1024;
 
+/// A session already owns the requested ACP session ID.
+#[derive(Debug)]
+pub struct AcpSessionIdConflict;
+
+impl std::fmt::Display for AcpSessionIdConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ACP session ID already exists")
+    }
+}
+
+impl std::error::Error for AcpSessionIdConflict {}
+
 /// Internal discriminator for `acp_tool_calls.event_kind`. The 'in' row
 /// records the call args; the 'out' row records the result. Two append-only
 /// rows per call, correlated by the provider-issued `tool_call_id`.
@@ -188,6 +200,93 @@ const ACP_SESSION_CURSOR_VERSION: u8 = 1;
 const ACP_SESSION_MAX_PAGE_SIZE: usize = 1_000;
 
 impl AcpSessionStore {
+    /// Copy legacy gateway sessions at cutover, after legacy writers have stopped.
+    /// Record each processed key with its destination row and transcript in
+    /// one transaction. Existing ACP rows take precedence, including killed
+    /// sessions. Deleting a destination row does not make the key eligible
+    /// for import again.
+    pub fn import_legacy_gateway_sessions(
+        &self,
+        legacy: &dyn crate::session_backend::SessionBackend,
+        resolve_agent: impl Fn(Option<&str>) -> (String, std::path::PathBuf),
+    ) -> Result<usize> {
+        let mut imported = 0;
+        for metadata in legacy.list_sessions_with_metadata() {
+            let Some(id) = metadata.key.strip_prefix("gw_").filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            let mut conn = self.conn.lock();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let marked = tx.execute(
+                "INSERT INTO acp_legacy_gateway_imports (legacy_key)
+                 VALUES (?1) ON CONFLICT(legacy_key) DO NOTHING",
+                params![metadata.key],
+            )?;
+            if marked == 0 {
+                continue;
+            }
+            let (alias, workspace) = resolve_agent(metadata.agent_alias.as_deref());
+            let changed = tx.execute(
+                "INSERT INTO acp_sessions
+                    (session_uuid, agent_alias, workspace_dir, name, interaction_surface,
+                     created_at, last_activity, principal_id)
+                 VALUES (?1, ?2, ?3, ?4, 'webchat', ?5, ?6, ?7)
+                 ON CONFLICT(session_uuid) DO NOTHING",
+                params![
+                    id,
+                    alias,
+                    workspace.to_string_lossy(),
+                    metadata.name,
+                    metadata.created_at.to_rfc3339(),
+                    metadata.last_activity.to_rfc3339(),
+                    metadata.principal_id,
+                ],
+            )?;
+            if changed == 0 {
+                tx.commit()?;
+                continue;
+            }
+            let session_row = tx.last_insert_rowid();
+            let messages = legacy.try_load(&metadata.key)?;
+            let timestamped = legacy.load_with_timestamps(&metadata.key);
+            anyhow::ensure!(
+                messages.len() == timestamped.len()
+                    && messages.iter().zip(&timestamped).all(|(message, row)| {
+                        message.role == row.message.role && message.content == row.message.content
+                    }),
+                "Legacy transcript changed or could not be read for session {id}"
+            );
+            // Legacy WebChat restores an unrecorded flag as false. ACP reserves NULL
+            // for old ACP rows whose provenance must be inferred from message text.
+            let breadcrumb = legacy
+                .get_session_trim_breadcrumb(&metadata.key)?
+                .unwrap_or(false);
+            for row in timestamped {
+                let timestamp = row
+                    .created_at
+                    .unwrap_or(metadata.last_activity)
+                    .to_rfc3339();
+                tx.execute(
+                    "INSERT INTO acp_messages (session_id, role, content, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        session_row,
+                        row.message.role,
+                        row.message.content,
+                        timestamp
+                    ],
+                )?;
+            }
+            tx.execute(
+                "UPDATE acp_sessions SET trim_breadcrumb = ?1 WHERE id = ?2",
+                params![breadcrumb, session_row],
+            )?;
+            tx.commit()?;
+            imported += 1;
+        }
+        Ok(imported)
+    }
+
     pub fn new(workspace_dir: &Path) -> Result<Self> {
         let sessions_dir = workspace_dir.join("sessions");
         std::fs::create_dir_all(&sessions_dir).context("Failed to create sessions directory")?;
@@ -213,6 +312,7 @@ impl AcpSessionStore {
                  session_uuid  TEXT NOT NULL UNIQUE,
                  agent_alias   TEXT NOT NULL,
                  workspace_dir TEXT NOT NULL,
+                 name          TEXT,
                  interaction_surface TEXT,
                  token_count   INTEGER NOT NULL DEFAULT 0,
                  killed_at     TEXT,
@@ -223,6 +323,10 @@ impl AcpSessionStore {
              );
              CREATE INDEX IF NOT EXISTS idx_acp_sessions_uuid  ON acp_sessions(session_uuid);
              CREATE INDEX IF NOT EXISTS idx_acp_sessions_alias ON acp_sessions(agent_alias);
+
+             CREATE TABLE IF NOT EXISTS acp_legacy_gateway_imports (
+                 legacy_key TEXT PRIMARY KEY NOT NULL
+             );
 
              CREATE TABLE IF NOT EXISTS acp_messages (
                  id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -280,6 +384,7 @@ impl AcpSessionStore {
 
         Self::ensure_interaction_surface_column(&conn)
             .context("Failed to migrate ACP session interaction surface")?;
+        Self::ensure_name_column(&conn).context("Failed to migrate ACP session name")?;
 
         Self::ensure_projected_message_count_columns(&conn)
             .context("Failed to migrate ACP session projected message count")?;
@@ -407,6 +512,29 @@ impl AcpSessionStore {
                 Ok(())
             }
             Err(e) => Err(e).context("Failed to add ACP session plan column"),
+        }
+    }
+
+    fn ensure_name_column(conn: &Connection) -> Result<()> {
+        if conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('acp_sessions') WHERE name = 'name'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Ok(());
+        }
+        match conn.execute("ALTER TABLE acp_sessions ADD COLUMN name TEXT", []) {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref message)))
+                if message == "duplicate column name: name" =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -672,7 +800,8 @@ impl AcpSessionStore {
     }
 
     /// Record a session with an optional host-validated interaction surface,
-    /// stamped with its owning principal (RFC 7141).
+    /// stamped with its owning principal (RFC 7141). A duplicate ID returns
+    /// [`AcpSessionIdConflict`].
     pub fn create_session_with_interaction_surface(
         &self,
         session_uuid: &str,
@@ -683,10 +812,11 @@ impl AcpSessionStore {
     ) -> Result<i64> {
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock();
-        conn.execute(
+        let inserted = conn.execute(
             "INSERT INTO acp_sessions
                (session_uuid, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, trim_breadcrumb, principal_id)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, 0, ?6)",
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?5, 0, ?6)
+             ON CONFLICT(session_uuid) DO NOTHING",
             params![
                 session_uuid,
                 agent_alias,
@@ -697,6 +827,7 @@ impl AcpSessionStore {
             ],
         )
         .context("Failed to create ACP session")?;
+        anyhow::ensure!(inserted != 0, AcpSessionIdConflict);
         Ok(conn.last_insert_rowid())
     }
 
@@ -722,6 +853,27 @@ impl AcpSessionStore {
             )
             .optional()?
             .flatten())
+    }
+
+    /// Rename a live session under the same exact-owner check as deletion.
+    pub fn rename_session_authorized<G>(
+        &self,
+        session_uuid: &str,
+        name: &str,
+        expected_owner: Option<&str>,
+        authorize: impl FnOnce(Option<&str>) -> Result<G>,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner = Self::effect_owner(&tx, session_uuid)?;
+        let _authority = authorize(owner.as_deref())?;
+        let rows = tx.execute(
+            "UPDATE acp_sessions SET name = ?1
+             WHERE session_uuid = ?2 AND principal_id IS ?3 AND killed_at IS NULL",
+            params![name, session_uuid, expected_owner],
+        )?;
+        tx.commit()?;
+        Ok(rows > 0)
     }
 
     /// Exact-owner deletion with a caller-owned guard at the write boundary.
@@ -1216,7 +1368,37 @@ impl AcpSessionStore {
     /// for runtime restore paths.
     pub fn load_session_for_restore(&self, session_uuid: &str) -> Result<AcpSessionRestore> {
         let conn = self.conn.lock();
+        Self::load_restorable_session(&conn, session_uuid)
+    }
 
+    /// `None` means the row belongs to another principal. A missing row is
+    /// reported separately so callers can safely decide whether to create it.
+    pub fn load_session_for_restore_owned(
+        &self,
+        session_uuid: &str,
+        expected_owner: Option<&str>,
+    ) -> Result<Option<AcpSessionRestore>> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let owner = tx
+            .query_row(
+                "SELECT principal_id FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        let result = match owner {
+            None => Some(AcpSessionRestore::Missing),
+            Some(owner) if owner.as_deref() == expected_owner => {
+                Some(Self::load_restorable_session(&tx, session_uuid)?)
+            }
+            Some(_) => None,
+        };
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn load_restorable_session(conn: &Connection, session_uuid: &str) -> Result<AcpSessionRestore> {
         let row = conn.query_row(
             "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, killed_at, trim_breadcrumb, principal_id
              FROM acp_sessions WHERE session_uuid = ?1",
@@ -1260,13 +1442,13 @@ impl AcpSessionStore {
 
         let created_at = parse_ts(&created_at_s, "created_at", session_uuid);
         let last_activity = parse_ts(&last_activity_s, "last_activity", session_uuid);
-        let messages = Self::load_messages(&conn, session_id)?;
-        let retained_context = Self::load_retained_context(&conn, session_id)?;
+        let messages = Self::load_messages(conn, session_id)?;
+        let retained_context = Self::load_retained_context(conn, session_id)?;
         let trim_breadcrumb = match trim_breadcrumb_raw {
             Some(v) => v != 0,
             None => {
                 let inferred = Self::infer_legacy_trim_breadcrumb(&messages);
-                Self::record_inferred_trim_breadcrumb(&conn, session_uuid, inferred)?;
+                Self::record_inferred_trim_breadcrumb(conn, session_uuid, inferred)?;
                 inferred
             }
         };
@@ -1293,6 +1475,21 @@ impl AcpSessionStore {
     /// Stale projected counts are rescored from the rows first, so the listing
     /// never reports a cache another writer left behind.
     pub fn list_sessions(&self) -> Result<Vec<AcpSessionSummary>> {
+        self.list_live_sessions(None)
+            .map(|rows| rows.into_iter().map(|(summary, _)| summary).collect())
+    }
+
+    pub fn list_sessions_owned(
+        &self,
+        owner: Option<&str>,
+    ) -> Result<Vec<(AcpSessionSummary, Option<String>)>> {
+        self.list_live_sessions(Some(owner))
+    }
+
+    fn list_live_sessions(
+        &self,
+        owner_filter: Option<Option<&str>>,
+    ) -> Result<Vec<(AcpSessionSummary, Option<String>)>> {
         let mut conn = self.conn.lock();
         Self::refresh_stale_projected_counts(&mut conn, ProjectedCountScope::Live)?;
         let mut stmt = conn
@@ -1304,26 +1501,31 @@ impl AcpSessionStore {
                         s.created_at,
                         s.last_activity,
                         s.projected_message_count AS message_count,
-                        s.principal_id
+                        s.principal_id,
+                        s.name
                  FROM acp_sessions s
-                 WHERE s.killed_at IS NULL
-                 ORDER BY s.last_activity DESC",
+                 WHERE s.killed_at IS NULL AND (NOT ?1 OR s.principal_id IS ?2)
+                 ORDER BY s.last_activity DESC, s.session_uuid",
             )
             .context("Failed to prepare ACP session list query")?;
 
         let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                ))
-            })
+            .query_map(
+                params![owner_filter.is_some(), owner_filter.flatten()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                    ))
+                },
+            )
             .context("Failed to query ACP sessions")?;
 
         let mut out = Vec::new();
@@ -1337,17 +1539,21 @@ impl AcpSessionStore {
                 activity_s,
                 msg_count,
                 principal_id,
+                name,
             ) = row.context("Failed to read ACP session row")?;
-            out.push(AcpSessionSummary {
-                created_at: parse_ts(&created_s, "created_at", &session_uuid),
-                last_activity: parse_ts(&activity_s, "last_activity", &session_uuid),
-                session_uuid,
-                principal_id,
-                agent_alias,
-                workspace_dir,
-                token_count: token_count.max(0) as u64,
-                message_count: msg_count.max(0) as usize,
-            });
+            out.push((
+                AcpSessionSummary {
+                    created_at: parse_ts(&created_s, "created_at", &session_uuid),
+                    last_activity: parse_ts(&activity_s, "last_activity", &session_uuid),
+                    session_uuid,
+                    principal_id,
+                    agent_alias,
+                    workspace_dir,
+                    token_count: token_count.max(0) as u64,
+                    message_count: msg_count.max(0) as usize,
+                },
+                name,
+            ));
         }
         Ok(out)
     }
@@ -4068,6 +4274,364 @@ mod tests {
         assert_eq!(data.interaction_surface, None);
         assert_eq!(data.token_count, 0);
         assert!(data.messages.is_empty());
+    }
+
+    #[test]
+    fn legacy_gateway_import_is_repeatable_and_preserves_history() {
+        use crate::session_backend::SessionBackend;
+        let (dir, store) = open_store();
+        let legacy = crate::session_sqlite::SqliteSessionBackend::new(dir.path()).unwrap();
+        legacy
+            .append("gw_team_alpha", &ChatMessage::user("question"))
+            .unwrap();
+        legacy
+            .append("gw_team_alpha", &ChatMessage::assistant("answer"))
+            .unwrap();
+        legacy
+            .append("discord_other", &ChatMessage::user("unrelated"))
+            .unwrap();
+        let import = || {
+            store.import_legacy_gateway_sessions(&legacy, |alias| {
+                (alias.unwrap_or("alpha").to_owned(), "/workspace".into())
+            })
+        };
+        assert_eq!(import().unwrap(), 1);
+        let data = store.load_session("team_alpha").unwrap().unwrap();
+        assert_eq!(data.agent_alias, "alpha");
+        assert_eq!(data.workspace_dir, "/workspace");
+        assert_eq!(data.interaction_surface.as_deref(), Some("webchat"));
+        assert_eq!(data.messages.len(), 2);
+        for (message, expected) in data.messages.iter().zip(["question", "answer"]) {
+            assert!(matches!(message, ConversationMessage::Chat(chat) if chat.content == expected));
+        }
+        store
+            .append_turn(
+                "team_alpha",
+                &[ConversationMessage::Chat(ChatMessage::user("new"))],
+            )
+            .unwrap();
+        assert_eq!(import().unwrap(), 0);
+        assert_eq!(
+            store
+                .load_session("team_alpha")
+                .unwrap()
+                .unwrap()
+                .messages
+                .len(),
+            3
+        );
+        assert_eq!(legacy.try_load("gw_team_alpha").unwrap().len(), 2);
+        assert!(store.load_session("discord_other").unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_gateway_import_preserves_owner_name_and_timestamps() {
+        use crate::session_backend::SessionBackend;
+        use crate::session_sqlite::SqliteSessionBackend;
+
+        let (dir, store) = open_store();
+        let legacy = SqliteSessionBackend::new(dir.path()).unwrap();
+        let key = "gw_private";
+        let created = "2026-01-01T10:00:00+00:00";
+        let replied = "2026-01-01T10:02:00+00:00";
+        legacy.append(key, &ChatMessage::user("question")).unwrap();
+        legacy
+            .append(key, &ChatMessage::assistant("answer"))
+            .unwrap();
+        legacy.set_session_principal(key, "owner").unwrap();
+        legacy.set_session_name(key, "Project").unwrap();
+        let fixture = Connection::open(SqliteSessionBackend::db_path(dir.path())).unwrap();
+        fixture.execute(
+            "UPDATE sessions SET created_at = CASE role WHEN 'user' THEN ?2 ELSE ?3 END WHERE session_key = ?1",
+            params![key, created, replied],
+        ).unwrap();
+        fixture.execute(
+            "UPDATE session_metadata SET created_at = ?2, last_activity = ?3 WHERE session_key = ?1",
+            params![key, created, replied],
+        ).unwrap();
+
+        assert_eq!(
+            store
+                .import_legacy_gateway_sessions(&legacy, |_| ("alpha".into(), "/workspace".into()))
+                .unwrap(),
+            1
+        );
+        assert!(store.list_sessions_owned(None).unwrap().is_empty());
+        assert!(
+            store
+                .load_session_for_restore_owned("private", None)
+                .unwrap()
+                .is_none()
+        );
+        let sessions = store.list_sessions_owned(Some("owner")).unwrap();
+        let [(session, name)] = sessions.as_slice() else {
+            panic!("expected the imported session for its owner");
+        };
+        assert_eq!(session.session_uuid, "private");
+        assert_eq!(name.as_deref(), Some("Project"));
+        assert_eq!(session.created_at.to_rfc3339(), created);
+        assert_eq!(session.last_activity.to_rfc3339(), replied);
+
+        let conn = store.conn.lock();
+        let times = conn
+            .prepare(
+                "SELECT m.created_at FROM acp_messages m JOIN acp_sessions s ON s.id = m.session_id
+             WHERE s.session_uuid = 'private' ORDER BY m.id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(times, [created, replied]);
+    }
+
+    #[test]
+    fn legacy_gateway_import_does_not_restore_deleted_sessions() {
+        use crate::session_backend::SessionBackend;
+
+        let (dir, store) = open_store();
+        let legacy = crate::session_sqlite::SqliteSessionBackend::new(dir.path()).unwrap();
+        for key in ["gw_deleted", "gw_agent_deleted"] {
+            legacy.append(key, &ChatMessage::user("original")).unwrap();
+        }
+        let resolve = |_: Option<&str>| ("alpha".into(), dir.path().into());
+        assert_eq!(
+            store
+                .import_legacy_gateway_sessions(&legacy, resolve)
+                .unwrap(),
+            2
+        );
+        assert!(
+            store
+                .delete_session_authorized("deleted", None, |_| Ok(()))
+                .unwrap()
+        );
+        assert_eq!(store.delete_sessions_by_agent("alpha").unwrap(), 1);
+        drop(store);
+
+        let reopened = AcpSessionStore::new(dir.path()).unwrap();
+        assert_eq!(
+            reopened
+                .import_legacy_gateway_sessions(&legacy, resolve)
+                .unwrap(),
+            0
+        );
+        assert!(reopened.list_sessions().unwrap().is_empty());
+        assert_eq!(legacy.try_load("gw_deleted").unwrap().len(), 1);
+        assert_eq!(legacy.try_load("gw_agent_deleted").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn legacy_gateway_import_preserves_trim_breadcrumb_provenance() {
+        use crate::session_backend::SessionBackend;
+
+        let (dir, store) = open_store();
+        let legacy = crate::session_sqlite::SqliteSessionBackend::new(dir.path()).unwrap();
+        let cases = [
+            ("absent", None),
+            ("user", Some(false)),
+            ("trim", Some(true)),
+        ];
+        for (id, flag) in cases {
+            let key = format!("gw_{id}");
+            legacy
+                .append(&key, &ChatMessage::user(HISTORY_TRIM_BREADCRUMB_CANONICAL))
+                .unwrap();
+            if let Some(flag) = flag {
+                legacy.set_session_trim_breadcrumb(&key, flag).unwrap();
+            }
+        }
+
+        store
+            .import_legacy_gateway_sessions(&legacy, |_| ("alpha".into(), dir.path().into()))
+            .unwrap();
+        for (id, flag) in cases {
+            let session = store.load_session(id).unwrap().unwrap();
+            assert_eq!(session.trim_breadcrumb, flag.unwrap_or(false), "{id}");
+        }
+    }
+
+    #[test]
+    fn legacy_gateway_import_preserves_existing_live_and_killed_collisions() {
+        use crate::session_backend::SessionBackend;
+        let (dir, store) = open_store();
+        let legacy = crate::session_sqlite::SqliteSessionBackend::new(dir.path()).unwrap();
+
+        // Pre-existing live ACP session colliding with gw_live_id.
+        store
+            .create_session_with_interaction_surface(
+                "live_id",
+                "acp-agent",
+                "/acp/ws",
+                Some("webchat"),
+                None,
+            )
+            .unwrap();
+        store
+            .append_turn(
+                "live_id",
+                &[ConversationMessage::Chat(ChatMessage::user("acp-only"))],
+            )
+            .unwrap();
+
+        // Pre-existing killed ACP session colliding with gw_killed_id.
+        store
+            .create_session("killed_id", "acp-agent", "/acp/ws", None)
+            .unwrap();
+        assert!(store.mark_session_killed("killed_id").unwrap());
+
+        legacy
+            .append("gw_live_id", &ChatMessage::user("legacy-live"))
+            .unwrap();
+        legacy
+            .append("gw_killed_id", &ChatMessage::user("legacy-killed"))
+            .unwrap();
+        legacy
+            .append("gw_fresh_id", &ChatMessage::user("legacy-fresh"))
+            .unwrap();
+
+        let imported = store
+            .import_legacy_gateway_sessions(&legacy, |alias| {
+                (alias.unwrap_or("alpha").to_owned(), "/workspace".into())
+            })
+            .unwrap();
+        assert_eq!(imported, 1, "only the non-colliding gw_fresh_id imports");
+
+        // Existing live session keeps its ACP transcript intact.
+        let live = store.load_session("live_id").unwrap().unwrap();
+        assert_eq!(live.messages.len(), 1);
+        assert!(matches!(
+            &live.messages[0],
+            ConversationMessage::Chat(c) if c.content == "acp-only"
+        ));
+
+        // Existing killed session stays killed and is not resurrected.
+        assert!(matches!(
+            store
+                .load_session_for_restore_owned("killed_id", None)
+                .unwrap(),
+            Some(AcpSessionRestore::Killed)
+        ));
+
+        // Fresh session imported cleanly.
+        let fresh = store.load_session("fresh_id").unwrap().unwrap();
+        assert_eq!(fresh.messages.len(), 1);
+    }
+
+    #[test]
+    fn legacy_gateway_import_rolls_back_session_row_when_transcript_load_fails() {
+        use crate::session_backend::{SessionBackend, SessionMetadata, TimestampedMessage};
+        struct FailingLegacyBackend;
+        impl SessionBackend for FailingLegacyBackend {
+            fn load(&self, _session_id: &str) -> Vec<ChatMessage> {
+                Vec::new()
+            }
+            fn try_load(&self, _session_id: &str) -> std::io::Result<Vec<ChatMessage>> {
+                Err(std::io::Error::other("simulated legacy read failure"))
+            }
+            fn load_with_timestamps(&self, _session_id: &str) -> Vec<TimestampedMessage> {
+                Vec::new()
+            }
+            fn append(&self, _session_id: &str, _message: &ChatMessage) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn remove_last(&self, _session_id: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+            fn delete_session(&self, _session_id: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                vec!["gw_broken".into()]
+            }
+            fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
+                let now = chrono::Utc::now();
+                vec![SessionMetadata {
+                    key: "gw_broken".into(),
+                    created_at: now,
+                    last_activity: now,
+                    message_count: 1,
+                    name: Some("Broken".into()),
+                    agent_alias: Some("alpha".into()),
+                    channel_id: None,
+                    room_id: None,
+                    sender_id: None,
+                    principal_id: None,
+                }]
+            }
+            fn cleanup_stale(&self, _max_age_hours: u32) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+
+        let (dir, store) = open_store();
+        let err = store
+            .import_legacy_gateway_sessions(&FailingLegacyBackend, |alias| {
+                (alias.unwrap_or("alpha").to_owned(), "/workspace".into())
+            })
+            .expect_err("failed legacy read must fail the import");
+        assert!(err.to_string().contains("simulated legacy read failure"));
+        assert!(
+            store.load_session("broken").unwrap().is_none(),
+            "transaction rollback must leave no partial acp_sessions row"
+        );
+
+        let legacy = crate::session_sqlite::SqliteSessionBackend::new(dir.path()).unwrap();
+        legacy
+            .append("gw_broken", &ChatMessage::user("readable on retry"))
+            .unwrap();
+        assert_eq!(
+            store
+                .import_legacy_gateway_sessions(&legacy, |_| ("alpha".into(), dir.path().into()))
+                .unwrap(),
+            1,
+            "the failed transaction must not mark the legacy key processed"
+        );
+    }
+
+    #[test]
+    fn rename_session_requires_exact_owner_and_authority() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session_with_interaction_surface(
+                "named",
+                "alpha",
+                "/tmp/proj",
+                Some("webchat"),
+                Some("owner"),
+            )
+            .unwrap();
+        assert!(
+            !store
+                .rename_session_authorized("named", "wrong", None, |_| Ok(()))
+                .unwrap()
+        );
+        assert!(
+            store
+                .rename_session_authorized("named", "denied", Some("owner"), |_| {
+                    Err::<(), _>(anyhow::Error::msg("denied"))
+                })
+                .is_err()
+        );
+        assert!(
+            store
+                .rename_session_authorized("named", "Project", Some("owner"), |owner| {
+                    assert_eq!(owner, Some("owner"));
+                    Ok(())
+                })
+                .unwrap()
+        );
+        let name: String = store
+            .conn
+            .lock()
+            .query_row(
+                "SELECT name FROM acp_sessions WHERE session_uuid = 'named'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "Project");
     }
 
     #[test]

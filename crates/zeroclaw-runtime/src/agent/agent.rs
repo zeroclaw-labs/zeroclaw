@@ -3049,6 +3049,49 @@ impl Agent {
         .await
     }
 
+    /// Compose an ACP backchannel agent from its session's capability sources.
+    /// The prepared memory belongs to this agent. Delegates inherit the capability
+    /// sources and resolve their target agent's memory at admission.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn from_acp_session_with_capabilities(
+        config: &Config,
+        agent_alias: &str,
+        workspace: &Path,
+        session_memory: Arc<dyn Memory>,
+        initialize_mcp: bool,
+        exclude_memory: bool,
+        capabilities: &crate::composition::RuntimeCapabilities,
+        sop_engine: Option<Arc<std::sync::Mutex<SopEngine>>>,
+        sop_audit: Option<Arc<SopAuditLogger>>,
+        canvas: Option<tools::CanvasStore>,
+        store: Option<Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
+        live_config: Option<zeroclaw_config::live::LiveConfigHandle>,
+        execution: Option<AgentExecutionCapability>,
+    ) -> Result<Self> {
+        Self::build_with_capabilities(
+            config,
+            agent_alias,
+            capabilities,
+            Some(session_memory),
+            CapabilityOrigin::Adapter,
+            Some(workspace),
+            initialize_mcp,
+            true,
+            exclude_memory,
+            true,
+            None,
+            sop_engine,
+            sop_audit,
+            canvas,
+            store,
+            live_config,
+            None,
+            None,
+            execution,
+        )
+        .await
+    }
+
     /// Build an agent whose provider, memory, observer and supplied tools come
     /// from `capabilities` rather than from config factories.
     ///
@@ -3068,6 +3111,7 @@ impl Agent {
             config,
             agent_alias,
             capabilities,
+            None,
             CapabilityOrigin::Supplied { principal },
             None,
             true,
@@ -3255,6 +3299,7 @@ impl Agent {
             config,
             agent_alias,
             &capabilities,
+            None,
             origin,
             session_cwd,
             initialize_mcp,
@@ -3279,6 +3324,7 @@ impl Agent {
         config: &Config,
         agent_alias: &str,
         capabilities: &crate::composition::RuntimeCapabilities,
+        session_memory: Option<Arc<dyn Memory>>,
         origin: CapabilityOrigin<'_>,
         session_cwd: Option<&Path>,
         initialize_mcp: bool,
@@ -3372,7 +3418,10 @@ impl Agent {
                     );
                 }
             };
-        let memory: Arc<dyn Memory> = capabilities.agent_memory(config, agent_alias).await?;
+        let memory = match session_memory {
+            Some(memory) => memory,
+            None => capabilities.agent_memory(config, agent_alias).await?,
+        };
 
         let tool_config = Arc::new(config.clone());
         let tool_request = crate::composition::ToolRequest {
