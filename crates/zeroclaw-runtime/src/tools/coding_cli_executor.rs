@@ -1,4 +1,5 @@
 use crate::platform::RuntimeAdapter;
+use crate::security::SecurityPolicy;
 use crate::security::traits::Sandbox;
 use crate::util::shell_escape;
 use async_trait::async_trait;
@@ -13,6 +14,7 @@ use zeroclaw_tools::coding_cli::{
 pub(crate) struct RuntimeCodingCliExecutor {
     runtime: Arc<dyn RuntimeAdapter>,
     sandbox: Arc<dyn Sandbox>,
+    security: Arc<SecurityPolicy>,
     use_native_argv: bool,
 }
 
@@ -20,11 +22,13 @@ impl RuntimeCodingCliExecutor {
     pub(crate) fn shared(
         runtime: Arc<dyn RuntimeAdapter>,
         sandbox: Arc<dyn Sandbox>,
+        security: Arc<SecurityPolicy>,
         use_native_argv: bool,
     ) -> Arc<dyn CodingCliExecutor> {
         Arc::new(Self {
             runtime,
             sandbox,
+            security,
             use_native_argv,
         })
     }
@@ -60,8 +64,9 @@ impl CodingCliExecutor for RuntimeCodingCliExecutor {
                 .map(|key| key.as_os_str())
                 .collect();
             self.runtime
-                .build_shell_command_with_env_keys(
+                .build_coding_cli_shell_command(
                     &shell_command(&command),
+                    &self.security.workspace_dir,
                     &command.working_dir,
                     &env_keys,
                 )
@@ -358,6 +363,57 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn one_shot_coding_cli_passes_the_policy_workspace_to_docker() {
+        use std::os::unix::fs::PermissionsExt;
+        use zeroclaw_config::schema::{RuntimeConfig, RuntimeKind};
+
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("packages/app")).unwrap();
+        let launcher_dir = tempfile::tempdir().unwrap();
+        let launcher = launcher_dir.path().join("docker");
+        std::fs::write(&launcher, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut config = RuntimeConfig {
+            kind: RuntimeKind::Docker,
+            ..RuntimeConfig::default()
+        };
+        config.docker.mount_workspace = true;
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::from(
+            crate::platform::create_runtime_with_path(
+                &config,
+                Some(launcher_dir.path().as_os_str()),
+            )
+            .unwrap(),
+        );
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: root.clone(),
+            ..SecurityPolicy::default()
+        });
+        let executor = RuntimeCodingCliExecutor::shared(
+            runtime,
+            Arc::new(NoopSandbox),
+            security.clone(),
+            false,
+        );
+        let tool = CodexCliTool::new_with_executor(security, CodexCliConfig::default(), executor);
+        let result = tool
+            .execute(json!({"prompt":"inspect the project", "working_directory":"packages/app"}))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        let args: Vec<_> = result.output.lines().collect();
+        let volume = format!("{}:/workspace:rw", root.display());
+        assert!(args.windows(2).any(|parts| parts == ["--volume", &volume]));
+        assert!(
+            args.windows(2)
+                .any(|parts| parts == ["--workdir", "/workspace/packages/app"])
+        );
+    }
+
     #[tokio::test]
     #[cfg(not(target_os = "windows"))]
     async fn codex_cli_uses_runtime_and_sandbox_executor() {
@@ -366,12 +422,17 @@ mod tests {
         let runtime = Arc::new(FakeRuntime {
             seen_command: Arc::clone(&seen_command),
         });
-        let executor = RuntimeCodingCliExecutor::shared(runtime, Arc::new(FakeSandbox), false);
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Full,
             workspace_dir: workspace.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
+        let executor = RuntimeCodingCliExecutor::shared(
+            runtime,
+            Arc::new(FakeSandbox),
+            Arc::clone(&security),
+            false,
+        );
         let tool = CodexCliTool::new_with_executor(
             security,
             CodexCliConfig {
@@ -408,7 +469,12 @@ mod tests {
         let runtime = Arc::new(FakeRuntime {
             seen_command: Arc::new(Mutex::new(None)),
         });
-        let executor = RuntimeCodingCliExecutor::shared(runtime, Arc::new(FakeSandbox), true);
+        let executor = RuntimeCodingCliExecutor::shared(
+            runtime,
+            Arc::new(FakeSandbox),
+            Arc::new(SecurityPolicy::default()),
+            true,
+        );
         let mut command = CodingCliCommand::new("/bin/echo", workspace.path().to_path_buf(), 5);
         command.arg("hello; exit 7");
 
@@ -432,8 +498,12 @@ mod tests {
         let runtime = Arc::new(FakeRuntime {
             seen_command: Arc::clone(&seen_command),
         });
-        let executor =
-            RuntimeCodingCliExecutor::shared(runtime, Arc::new(UnsupportedSandbox), false);
+        let executor = RuntimeCodingCliExecutor::shared(
+            runtime,
+            Arc::new(UnsupportedSandbox),
+            Arc::new(SecurityPolicy::default()),
+            false,
+        );
         let command = CodingCliCommand::new("codex", workspace.path().to_path_buf(), 5);
 
         let error = executor
@@ -467,8 +537,12 @@ mod tests {
         let runtime = Arc::new(FakeRuntime {
             seen_command: Arc::new(Mutex::new(None)),
         });
-        let executor =
-            RuntimeCodingCliExecutor::shared(runtime, Arc::new(ReplacingPwdSandbox), true);
+        let executor = RuntimeCodingCliExecutor::shared(
+            runtime,
+            Arc::new(ReplacingPwdSandbox),
+            Arc::new(SecurityPolicy::default()),
+            true,
+        );
         let executable = std::env::current_exe().expect("current test executable");
         let command = CodingCliCommand::new(executable, workspace_path.clone(), 5);
 
@@ -492,7 +566,12 @@ mod tests {
         let runtime = Arc::new(EnvForwardingRuntime {
             seen_env_keys: Arc::clone(&seen_env_keys),
         });
-        let executor = RuntimeCodingCliExecutor::shared(runtime, Arc::new(NoopSandbox), false);
+        let executor = RuntimeCodingCliExecutor::shared(
+            runtime,
+            Arc::new(NoopSandbox),
+            Arc::new(SecurityPolicy::default()),
+            false,
+        );
         let mut command = CodingCliCommand::new("codex", workspace.path().to_path_buf(), 5);
         command.env("ZC_CLI_TOKEN", "secret-value-visible-only-to-child-env");
         command.runtime_env_key("ZC_CLI_TOKEN");
@@ -521,7 +600,12 @@ mod tests {
         let runtime = Arc::new(EnvForwardingRuntime {
             seen_env_keys: Arc::clone(&seen_env_keys),
         });
-        let executor = RuntimeCodingCliExecutor::shared(runtime, Arc::new(NoopSandbox), false);
+        let executor = RuntimeCodingCliExecutor::shared(
+            runtime,
+            Arc::new(NoopSandbox),
+            Arc::new(SecurityPolicy::default()),
+            false,
+        );
         let mut command = CodingCliCommand::new("codex", workspace.path().to_path_buf(), 5);
         command.env("PATH", "/host/bin");
         command.env("HOME", "/host/home");
