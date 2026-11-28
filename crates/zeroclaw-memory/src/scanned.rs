@@ -621,6 +621,23 @@ impl<M: Memory> Memory for ScannedMemory<M> {
             .await
     }
 
+    async fn store_with_options_and_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        options: StoreOptions,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let content = self.process_content(key, content, options.namespace.as_deref())?;
+        self.enforce_policy(key, options.namespace.as_deref(), &category)
+            .await?;
+        self.inner
+            .store_with_options_and_agent(key, &content, category, session_id, options, agent_id)
+            .await
+    }
+
     async fn store_with_agent(
         &self,
         key: &str,
@@ -714,6 +731,51 @@ mod tests {
         assert_eq!(entry.content, "favorite color is teal");
         let hits = mem.recall("teal", 10, None, None, None).await.unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn typed_agent_write_preserves_metadata_and_enforces_policy() {
+        use zeroclaw_api::memory_traits::MemoryKind;
+
+        let tmp = TempDir::new().unwrap();
+        let mem = scanned(
+            &tmp,
+            &MemoryPolicyConfig {
+                redact_on_write: true,
+                read_only_namespaces: vec!["archive".into()],
+                ..Default::default()
+            },
+        );
+        let agent_id = mem.ensure_agent_uuid("web").await.unwrap();
+        let write = |key, content, namespace: Option<&str>| {
+            mem.store_with_options_and_agent(
+                key,
+                content,
+                MemoryCategory::Daily,
+                None,
+                StoreOptions {
+                    kind: Some(MemoryKind::Episodic),
+                    namespace: namespace.map(str::to_owned),
+                    ..Default::default()
+                },
+                Some(&agent_id),
+            )
+        };
+
+        write("clean", INLINE_API_KEY, None).await.unwrap();
+        let entry = mem.inner.get("clean").await.unwrap().unwrap();
+        assert_eq!(entry.kind, Some(MemoryKind::Episodic));
+        assert_eq!(entry.agent_id.as_deref(), Some(agent_id.as_str()));
+        assert_eq!(entry.content, "[REDACTED:api_key]");
+
+        let scan_error = write("flagged", FLAGGED, None).await.unwrap_err();
+        assert!(scan_error.to_string().contains("content scan"));
+        assert!(
+            write("blocked", "clean text", Some("archive"))
+                .await
+                .is_err()
+        );
+        assert_eq!(mem.inner.count().await.unwrap(), 1);
     }
 
     #[tokio::test]

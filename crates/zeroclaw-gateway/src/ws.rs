@@ -3653,17 +3653,34 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 post(move |Json(request): Json<serde_json::Value>| {
                     let request_seen_tx = request_seen_tx.clone();
                     let mut released_rx = released_rx.clone();
-                    let index = arrivals.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                    let tail_text = mock_tails
-                        .lock()
-                        .remove(&index)
-                        .unwrap_or_else(parked_stream_tail);
+                    let arrivals = Arc::clone(&arrivals);
+                    let mock_tails = Arc::clone(&mock_tails);
                     async move {
-                        assert_eq!(
-                            request["stream"].as_bool(),
-                            Some(true),
-                            "gateway chat turns stream from the provider"
-                        );
+                        if request["stream"].as_bool() != Some(true) {
+                            assert!(
+                                request["system"]
+                                    .to_string()
+                                    .contains("memory consolidation engine")
+                            );
+                            return Json(serde_json::json!({
+                                "model": "claude-test",
+                                "stop_reason": "end_turn",
+                                "content": [{"type": "text", "text":
+                                    serde_json::json!({
+                                        "history_entry": "Discussed local deployment.",
+                                        "memory_update": "Prefer staged releases.",
+                                        "kind": "preference",
+                                        "facts": ["The test cache stores JSON."]
+                                    }).to_string()
+                                }]
+                            }))
+                            .into_response();
+                        }
+                        let index = arrivals.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        let tail_text = mock_tails
+                            .lock()
+                            .remove(&index)
+                            .unwrap_or_else(parked_stream_tail);
                         let head = futures_util::stream::once(async move {
                             let _ = request_seen_tx.send(request);
                             let head = match context {
@@ -3683,6 +3700,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                             [(header::CONTENT_TYPE, "text/event-stream")],
                             axum::body::Body::from_stream(head.chain(tail)),
                         )
+                            .into_response()
                     }
                 }),
             );
@@ -3705,6 +3723,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 ..Default::default()
             };
             config.memory.backend = "none".to_string();
+            config.memory.auto_save = false;
             config.reliability.provider_retries = 0;
             config.providers.models.anthropic.insert(
                 "fixture".to_string(),
@@ -3764,6 +3783,7 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                 .expect("sqlite session backend");
             if sign_in.is_none() {
                 let state = AppState {
+                    auto_save: config.memory.auto_save,
                     session_backend: Some(backend.clone()),
                     ..crate::api::tests::test_state(config)
                 };
@@ -4092,6 +4112,73 @@ data: {\"type\":\"message_stop\"}\n\n",
                 break frame;
             }
         }
+    }
+
+    #[test]
+    fn websocket_consolidation_persists_agent_attributed_typed_memory() {
+        use zeroclaw_api::memory_traits::{MemoryCategory, MemoryKind, SemanticSubtype};
+        use zeroclaw_config::multi_agent::MemoryBackendKind;
+
+        run_ws_regression("ws-typed-memory", || async {
+            let mut fixture = ParkedTurnFixture::spawn_with(None, None, |config| {
+                config.memory.backend = "sqlite.default".into();
+                config.memory.auto_save = true;
+                config.memory.types.enabled = true;
+                config.memory.consolidation_extract_facts = true;
+                config.agents.get_mut("web").unwrap().memory.backend = MemoryBackendKind::Sqlite;
+            })
+            .await;
+            let (mut client, _) = fixture.connect("typed-memory-session").await;
+            fixture
+                .start_parked_turn(&mut client, "What did we decide about deploying?")
+                .await;
+            fixture.release_next();
+            next_frame_of(&mut client, "done").await;
+
+            let config = fixture.state.config.read().clone();
+            let memory = resolve_ws_memory_handle(&config, "web")
+                .await
+                .unwrap()
+                .unwrap();
+            for (category, content, kind) in [
+                (
+                    MemoryCategory::Daily,
+                    "Discussed local deployment.",
+                    MemoryKind::Episodic,
+                ),
+                (
+                    MemoryCategory::Core,
+                    "Prefer staged releases.",
+                    MemoryKind::Semantic(SemanticSubtype::Preference),
+                ),
+                (
+                    MemoryCategory::Core,
+                    "The test cache stores JSON.",
+                    MemoryKind::Semantic(SemanticSubtype::Fact),
+                ),
+            ] {
+                // Consolidation happens in a detached task after the chat completes.
+                let entry = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if let Some(entry) = memory
+                            .list(Some(&category), None)
+                            .await
+                            .unwrap()
+                            .into_iter()
+                            .find(|entry| entry.content == content)
+                        {
+                            return entry;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("missing consolidated memory: {content}"));
+                assert_eq!(entry.kind, Some(kind));
+                assert_eq!(entry.agent_alias.as_deref(), Some("web"));
+            }
+            fixture.shutdown();
+        });
     }
 
     async fn send_raw(client: &mut WsClient, frame: serde_json::Value) {
