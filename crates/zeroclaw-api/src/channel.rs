@@ -120,6 +120,11 @@ pub struct ChannelApprovalRequest {
     /// count.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<ApprovalPosition>,
+    /// Thread of the originating conversation, for channels that post the
+    /// prompt inside it. Only meaningful for the origin recipient: routed
+    /// approvals clear it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_ts: Option<String>,
 }
 
 impl ChannelApprovalRequest {
