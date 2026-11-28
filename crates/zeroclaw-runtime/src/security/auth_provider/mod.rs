@@ -31,6 +31,7 @@ pub mod enrollment;
 pub mod native;
 pub mod oidc;
 pub mod peercred;
+pub mod refresh_grant;
 
 pub use enrollment::{
     DeviceGrantStart, DevicePollOutcome, EnrolledToken, Enrollment, LoopbackListener, PkceFlow,
@@ -38,6 +39,10 @@ pub use enrollment::{
 pub use native::NativeAuthProvider;
 pub use oidc::OidcAuthProvider;
 pub use peercred::{PeercredAuthProvider, UidRoster};
+pub use refresh_grant::{
+    GrantBinding, MAX_PENDING_GRANT_LIFETIME, MAX_PENDING_GRANTS, PendingGrant, PendingGrants,
+    SealedRefreshGrant, pending_lifetime,
+};
 
 use std::collections::HashMap;
 use std::sync::Arc;

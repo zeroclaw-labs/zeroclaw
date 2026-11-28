@@ -890,12 +890,26 @@ relay/relay_pin                    relay outer-leaf pin (--relay-tofu)
 ### Upgrading an existing issued-cert ledger
 
 `tls/ledger.db` carries a schema version. A ledger written by an earlier
-revision is rebuilt in place the first time the new daemon opens it, preserving
-every issued and revoked certificate along with its device id, validity and
-audit actor. The rebuild runs in a single transaction: if it cannot complete,
-the daemon refuses to start and leaves the original ledger untouched rather than
-half-migrated, and the error names the file. No operator action is required, and
-enrolled devices do not need to re-enroll.
+revision is upgraded in place the first time the new daemon opens it, preserving
+every issued and revoked certificate along with its device id, validity, audit
+actor and delivery state. The upgrade runs in a single transaction: if it cannot
+complete, the daemon refuses to start and leaves the original ledger untouched
+rather than half-migrated, and the error names the file. No operator action is
+required, and enrolled devices do not need to re-enroll.
+
+Schema version 3 adds the `refresh_grants` table, which holds device sign-in
+refresh tokens encrypted with the secrets key. A daemon older than the ledger it
+opens refuses to start rather than misread it. To go back to a release that
+expects schema version 2, stop the daemon and run:
+
+```bash
+sqlite3 <data_dir>/tls/ledger.db \
+  "DROP TABLE refresh_grants; PRAGMA user_version = 2;"
+```
+
+Dropping the table only
+ends device sign-in refresh: those devices sign in again once their access token
+expires. Every certificate and revocation is kept.
 
 ### Undelivered certificates
 
