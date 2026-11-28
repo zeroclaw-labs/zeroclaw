@@ -4694,6 +4694,10 @@ mod tests {
                 .is_some_and(|message| message.contains("strict validation")),
             "the refusal must come from strict validation, not parse or hydration: {body}"
         );
+        assert!(
+            body["message"].as_str().unwrap().contains("input_per_mtok"),
+            "{body}"
+        );
         // The original file is untouched — no replacement happened.
         assert_eq!(
             std::fs::read(&config_path).unwrap(),

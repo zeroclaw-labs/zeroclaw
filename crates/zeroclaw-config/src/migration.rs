@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
+use crate::api_error::{ConfigApiCode, ConfigApiError};
 use crate::schema::Config;
 use crate::schema::v1::V1Config;
 use crate::schema::v2::V2Config;
@@ -480,10 +481,10 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
             }
         },
         Some(toml::Value::Integer(n)) if *n >= 1 => u32::try_from(*n).map_err(|_| {
-            anyhow::Error::msg(format!(
-                "config schema_version {n} is newer than this binary supports \
-                 ({CURRENT_SCHEMA_VERSION})"
-            ))
+            ConfigApiError::new(ConfigApiCode::InvalidFormat, format!(
+                "config schema_version {n} is newer than this binary supports ({CURRENT_SCHEMA_VERSION})"
+            )).with_path("schema_version").into()
+
         }),
         Some(other) => {
             ::zeroclaw_log::record!(
@@ -493,7 +494,7 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
                     .with_attrs(::serde_json::json!({"found": other.to_string()})),
                 "config schema_version is not a positive integer"
             );
-            anyhow::bail!("schema_version must be a positive integer, got {other}")
+            crate::validation_bail!(InvalidFormat, "schema_version", "schema_version must be a positive integer, got {other}")
         }
     }
 }
@@ -1345,7 +1346,9 @@ fn migrate_toml(value: toml::Value) -> Result<Option<Migrated>> {
                 })),
             "config schema_version is newer than this binary supports"
         );
-        anyhow::bail!(
+        crate::validation_bail!(
+            InvalidFormat,
+            "schema_version",
             "config schema_version {from} is newer than this binary supports ({CURRENT_SCHEMA_VERSION})"
         );
     }
@@ -1622,8 +1625,15 @@ fn encrypt_in_place(value: &mut toml::Value, store: &crate::secrets::SecretStore
 pub fn migrate_to_current(input: &str) -> Result<Config> {
     let _attribution = ::zeroclaw_log::attribution_span!(&ConfigLoadAttribution).entered();
     let (final_value, _notices) = migrate_value(input)?;
-    final_value
-        .try_into()
+    serde_path_to_error::deserialize(final_value)
+        .map_err(|e| {
+            let field = ConfigApiError::new(
+                ConfigApiCode::ValueTypeMismatch,
+                "value does not match the current schema",
+            )
+            .with_path(e.path().to_string());
+            anyhow::Error::new(e.into_inner()).context(field)
+        })
         .context("migrated config failed to deserialize as current schema")
 }
 
