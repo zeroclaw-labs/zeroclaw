@@ -6507,6 +6507,7 @@ mod tests {
             sandbox_backend: Some("firejail".into()),
             firejail_args: vec!["--net=none".into()],
             sandbox_image: None,
+            computer_use: crate::schema::ComputerUseToolConfig::default(),
         };
 
         let policy = SecurityPolicy::from_profiles(&rp, None, Path::new("/ws"));

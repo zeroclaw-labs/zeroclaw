@@ -83,6 +83,7 @@ impl BuiltinToolCompilation {
                     OptInTool::ClaudeCodeRunner => cfg!(feature = "tool-claude-code-runner"),
                     OptInTool::CodexCli => cfg!(feature = "tool-codex-cli"),
                     OptInTool::OpenCodeCli => cfg!(feature = "tool-opencode-cli"),
+                    OptInTool::ComputerUse => cfg!(feature = "tool-computer-use"),
                     // Web search has no owner feature beyond its own: `compiled()`
                     // already carries `tools-external`.
                     OptInTool::WebSearch => true,
@@ -537,6 +538,12 @@ pub const BUILTIN_TOOLS: &[BuiltinToolSpec] = &[
         name: "claude_code_runner",
         tier: ToolTier::Optional,
         compilation: BuiltinToolCompilation::OptIn(OptInTool::ClaudeCodeRunner),
+    },
+    // Desktop automation.
+    BuiltinToolSpec {
+        name: "computer_use",
+        tier: ToolTier::Optional,
+        compilation: BuiltinToolCompilation::OptIn(OptInTool::ComputerUse),
     },
     // Ops.
     BuiltinToolSpec {

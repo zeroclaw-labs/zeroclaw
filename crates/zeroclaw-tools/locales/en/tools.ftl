@@ -48,6 +48,44 @@ tool-cloud-patterns = Cloud pattern library. Given a workload description, sugge
 
 tool-composio = Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to see available actions (includes parameter names). action='execute' with action_name/tool_slug and params to run an action. If you are unsure of the exact params, pass 'text' instead with a natural-language description of what you want (Composio will resolve the correct parameters via NLP). action='list_accounts' or action='connected_accounts' to list OAuth-connected accounts. action='connect' with app/auth_config_id to get OAuth URL. connected_account_id is auto-resolved when omitted.
 
+tool-computer-use = Observe and control the local desktop GUI. Supports screenshot, click, drag, move, scroll, type, key, and wait. Coordinates are in the pixel space of the downscaled screenshot returned by action="screenshot".
+tool-computer-use-error-read-only = Action '{ $action }' blocked: autonomy is read-only (only 'screenshot' and 'wait' are permitted in read-only mode)
+tool-computer-use-error-missing-action = Missing required 'action' parameter
+tool-computer-use-error-unknown-action = Unknown computer_use action '{ $action }'. Supported actions: screenshot, click, drag, move, scroll, type, key, wait
+tool-computer-use-error-secondary-display-blocked = Secondary display { $display } is blocked by policy. Set [risk_profiles.<alias>.computer_use].allow_secondary_displays = true in config.toml to enable secondary displays
+tool-computer-use-error-display-out-of-range = Display index { $display } is out of range (active displays: { $count })
+tool-computer-use-error-no-displays = No active displays detected
+tool-computer-use-error-param-required = Missing required '{ $param }' parameter
+tool-computer-use-error-param-must-be-string = Invalid '{ $param }' parameter: must be a string
+tool-computer-use-error-param-must-be-number = Invalid '{ $param }' parameter: must be a number
+tool-computer-use-error-param-must-be-finite-number = Invalid '{ $param }' parameter: must be a finite number
+tool-computer-use-error-param-must-be-integer = Invalid '{ $param }' parameter: must be an integer
+tool-computer-use-error-param-i32-overflow = Invalid '{ $param }' parameter: must fit in a 32-bit signed integer
+tool-computer-use-error-display-must-be-u32 = Invalid 'display' parameter: must be a non-negative integer
+tool-computer-use-error-display-u32-overflow = Invalid 'display' parameter: must be a non-negative integer that fits in 32 bits
+tool-computer-use-error-button-invalid = Invalid 'button' parameter: must be 'left', 'right', or 'middle'
+tool-computer-use-error-clicks-invalid = Invalid 'clicks' parameter: must be the integer 1 or 2
+tool-computer-use-error-steps-invalid = Invalid 'steps' parameter: must be an integer between 1 and { $max }
+tool-computer-use-error-key-empty = Invalid 'key' parameter: must not be empty
+tool-computer-use-error-key-missing-key = Invalid 'key' parameter: key specification names only modifiers; add the key to press
+tool-computer-use-error-key-unknown = Invalid 'key' parameter: unknown key '{ $key }'
+tool-computer-use-error-key-multiple = Invalid 'key' parameter: key specification names more than one key; a chord presses exactly one
+tool-computer-use-error-scale-invalid-display = Invalid display dimensions: width and height must be finite and positive
+tool-computer-use-error-scale-non-finite = Coordinate must be a finite number
+tool-computer-use-error-scale-out-of-bounds = Coordinate ({ $x }, { $y }) is outside the { $width }x{ $height } screenshot
+tool-computer-use-error-scale-invalid-png = Invalid screenshot PNG: { $err }
+tool-computer-use-error-backend-permission-denied = { $permission } permission denied: { $instructions }
+tool-computer-use-error-backend-unsupported = { $detail }
+tool-computer-use-error-backend-capture-failed = Screenshot capture failed: { $detail }
+tool-computer-use-error-backend-input-failed = Input synthesis failed: { $detail }
+tool-computer-use-error-backend-timeout = Action timed out: { $detail }
+tool-computer-use-error-scroll-zero = At least one of 'delta_x' or 'delta_y' must be non-zero
+tool-computer-use-error-text-empty = Parameter 'text' must not be empty
+tool-computer-use-error-text-too-long = Parameter 'text' exceeds maximum length of { $max } characters
+tool-computer-use-error-wait-range = Parameter 'seconds' must be a finite number between 0 and { $max }
+tool-computer-use-error-cancelled = computer_use action cancelled
+tool-computer-use-error-save-screenshot = Failed to save computer_use screenshot: { $err }
+
 tool-content-search = Search file contents by regex pattern within the workspace. Supports ripgrep (rg) with grep or internal fallback. Output modes: 'content' (matching lines with context), 'files_with_matches' (file paths only), 'count' (match counts per file). Example: pattern='fn main', include='*.rs', output_mode='content'.
 
 tool-cron-add = Create a scheduled cron job (shell or agent) with cron/at/every schedules. Use job_type='agent' with a prompt to run the AI agent on schedule. To deliver output to a channel (Discord, Telegram, Slack, Mattermost, Matrix), set delivery={"{"}"mode":"announce","channel":"discord","to":"<channel_id_or_chat_id>"{"}"}. This is the preferred tool for sending scheduled/delayed messages to users via channels.

@@ -14790,6 +14790,7 @@ dependencies = [
  "futures-util",
  "glob",
  "hex",
+ "image",
  "infer",
  "libc",
  "mail-parser",

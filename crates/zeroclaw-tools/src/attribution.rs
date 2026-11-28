@@ -27,6 +27,8 @@ use crate::cloud_patterns::CloudPatternsTool;
 use crate::codex_cli::CodexCliTool;
 #[cfg(feature = "tool-composio")]
 use crate::composio::ComposioTool;
+#[cfg(feature = "tool-computer-use")]
+use crate::computer_use::ComputerUseTool;
 use crate::content_search::ContentSearchTool;
 use crate::data_management::DataManagementTool;
 use crate::discord_search::DiscordSearchTool;
@@ -114,6 +116,8 @@ tool_attribution!(CloudPatternsTool, ToolKind::Plugin);
 tool_attribution!(CodexCliTool, ToolKind::Plugin);
 #[cfg(feature = "tool-composio")]
 tool_attribution!(ComposioTool, ToolKind::Plugin);
+#[cfg(feature = "tool-computer-use")]
+tool_attribution!(ComputerUseTool, ToolKind::Plugin);
 tool_attribution!(ContentSearchTool, ToolKind::Search);
 tool_attribution!(DataManagementTool, ToolKind::Plugin);
 tool_attribution!(DiscordSearchTool, ToolKind::Search);

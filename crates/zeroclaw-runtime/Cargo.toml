@@ -141,6 +141,7 @@ tool-claude-code = ["zeroclaw-tools/tool-claude-code"]
 tool-claude-code-runner = ["zeroclaw-tools/tool-claude-code-runner"]
 tool-codex-cli = ["zeroclaw-tools/tool-codex-cli"]
 tool-opencode-cli = ["zeroclaw-tools/tool-opencode-cli"]
+tool-computer-use = ["zeroclaw-tools/tool-computer-use"]
 sandbox-bubblewrap = []
 # Exposes test-only helpers (including `ScopedToolRegistry::from_raw_for_test`
 # and the deterministic Agent clock seam) to OTHER crates' test builds (e.g.

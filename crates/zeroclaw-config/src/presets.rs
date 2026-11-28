@@ -90,6 +90,7 @@ fn locked_down_risk() -> RiskProfileConfig {
         sandbox_backend: None,
         sandbox_image: None,
         firejail_args: vec![],
+        computer_use: crate::schema::ComputerUseToolConfig::default(),
     }
 }
 
@@ -116,6 +117,7 @@ fn balanced_risk() -> RiskProfileConfig {
         sandbox_backend: None,
         sandbox_image: None,
         firejail_args: vec![],
+        computer_use: crate::schema::ComputerUseToolConfig::default(),
     }
 }
 
@@ -142,6 +144,7 @@ fn yolo_risk() -> RiskProfileConfig {
         sandbox_backend: None,
         sandbox_image: None,
         firejail_args: vec![],
+        computer_use: crate::schema::ComputerUseToolConfig::default(),
     }
 }
 

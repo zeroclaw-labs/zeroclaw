@@ -70,6 +70,8 @@ pub use zeroclaw_tools::cloud_patterns::CloudPatternsTool;
 pub use zeroclaw_tools::codex_cli::CodexCliTool;
 #[cfg(feature = "tool-composio")]
 pub use zeroclaw_tools::composio::ComposioTool;
+#[cfg(feature = "tool-computer-use")]
+pub use zeroclaw_tools::computer_use::ComputerUseTool;
 pub use zeroclaw_tools::content_search::ContentSearchTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
@@ -3265,6 +3267,43 @@ fn all_tools_with_runtime_on_thread(
                     security.clone(),
                     root_config.opencode_cli.clone(),
                     coding_cli_executor.clone(),
+                ),
+                security.clone(),
+            ))
+        );
+    }
+
+    // Native desktop computer-use tool (feature- and risk-profile-gated)
+    #[cfg(not(feature = "tool-computer-use"))]
+    if risk_profile.computer_use.enabled {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "code": zeroclaw_config::validation_warnings::TOOL_COMPILED_OUT,
+                    "section": zeroclaw_config::opt_in_tools::OptInTool::ComputerUse.section(),
+                    "feature": zeroclaw_config::opt_in_tools::OptInTool::ComputerUse.feature(),
+                })),
+            "a tool is enabled in config but this build was compiled without its feature; skipping it"
+        );
+    }
+    #[cfg(feature = "tool-computer-use")]
+    if risk_profile.computer_use.enabled && select_tool!("computer_use") {
+        // Screenshots land in the canonical per-agent workspace, not the
+        // session's `security.workspace_dir`, so ACP/Code sessions never
+        // litter git repositories with untracked screenshot directories.
+        let agent_workspace_dir = root_config.agent_workspace_dir(agent_alias);
+        register_tool!(
+            "computer_use",
+            Arc::new(RateLimitedTool::new(
+                ComputerUseTool::new(
+                    security.clone(),
+                    risk_profile.computer_use.clone(),
+                    agent_workspace_dir,
+                    zeroclaw_tools::computer_use::default_backend(
+                        risk_profile.computer_use.action_timeout_secs,
+                    ),
                 ),
                 security.clone(),
             ))
@@ -8534,10 +8573,12 @@ permissions = ["http_client"]
         let sop_engine = Arc::new(Mutex::new(SopEngine::new(cfg.sop.clone())));
         let sop_audit = Arc::new(crate::sop::SopAuditLogger::new(Arc::clone(&mem)));
 
+        let mut maximal_risk = zeroclaw_config::schema::RiskProfileConfig::default();
+        maximal_risk.computer_use.enabled = true;
         let built = all_tools_with_runtime(
             Arc::new(cfg.clone()),
             &security,
-            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            &maximal_risk,
             "test-agent",
             Arc::new(NativeRuntime::new()),
             mem,
@@ -8656,6 +8697,82 @@ permissions = ["http_client"]
             now_constructible.is_empty(),
             "allowlisted tools now register under the maximal config; drop them from the \
              allowlist: {now_constructible:?}"
+        );
+    }
+
+    /// `computer_use` needs both gates: the build feature and
+    /// `[risk_profiles.<alias>.computer_use].enabled`. It is off by default,
+    /// so a compiled-in build whose risk profile never opts in must stay
+    /// silent — no tool, no registry name.
+    #[test]
+    fn computer_use_registers_only_when_feature_and_config_enabled() {
+        let build = |enabled: bool| {
+            let tmp = TempDir::new().unwrap();
+            let security = Arc::new(SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Full,
+                workspace_dir: tmp.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            });
+            let mem: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(
+                    &MemoryConfig {
+                        backend: "markdown".into(),
+                        ..MemoryConfig::default()
+                    },
+                    tmp.path(),
+                    None,
+                )
+                .unwrap(),
+            );
+            let cfg = test_config(&tmp);
+            let mut risk_profile = zeroclaw_config::schema::RiskProfileConfig::default();
+            risk_profile.computer_use.enabled = enabled;
+
+            all_tools_with_runtime(
+                Arc::new(cfg.clone()),
+                &security,
+                &risk_profile,
+                "test-agent",
+                Arc::new(NativeRuntime::new()),
+                mem,
+                None,
+                None,
+                &BrowserConfig::default(),
+                &zeroclaw_config::schema::HttpRequestConfig::default(),
+                &zeroclaw_config::schema::WebFetchConfig::default(),
+                tmp.path(),
+                &HashMap::new(),
+                None,
+                &cfg,
+                None,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("tool registry builds")
+            .tools
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect::<Vec<String>>()
+        };
+
+        // Default risk profile: `computer_use.enabled = false` keeps the tool
+        // out of the registry even when this build carries the feature.
+        let disabled = build(false);
+        assert!(
+            !disabled.contains(&"computer_use".to_string()),
+            "computer_use must stay unregistered while risk_profile.computer_use.enabled is false"
+        );
+
+        // Enabled on the risk profile: registration follows the compiled feature.
+        let enabled = build(true);
+        assert_eq!(
+            enabled.contains(&"computer_use".to_string()),
+            cfg!(feature = "tool-computer-use"),
+            "an enabled risk_profile.computer_use registers computer_use only when \
+             `tool-computer-use` is compiled in"
         );
     }
 }

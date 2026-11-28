@@ -339,7 +339,7 @@ channels-full = [
 # distributions carry their implementations for minimal/full runtime selection.
 tools-external = ["zeroclaw-runtime/tools-external", "zeroclaw-tools/tools-external"]
 # Standard/source adapter bundle; registration still requires [tools].optional.
-tools-compat = ["tools-saas", "tools-coding-cli", "tools-external"]
+tools-compat = ["tools-saas", "tools-coding-cli", "tools-external", "tool-computer-use"]
 tools-saas = [
     "tool-jira",
     "tool-notion",
@@ -375,6 +375,11 @@ tool-codex-cli = ["zeroclaw-runtime/tool-codex-cli"]
 # release.
 tool-gemini-cli = []
 tool-opencode-cli = ["zeroclaw-runtime/tool-opencode-cli"]
+# Native desktop capture and input injection. Composed into `tools-compat`
+# rather than a SaaS/coding-CLI group of its own: the standard distribution and
+# the `ci-all` kitchen sink both carry it, and `OptInTool::ALL` requires every
+# `dist` artifact to compile it.
+tool-computer-use = ["zeroclaw-runtime/tool-computer-use"]
 
 # Major subsystems — each forwards to exactly ONE crate
 gateway = [
@@ -507,7 +512,7 @@ ci-all = [
     "browser-native", "probe",
     "plugins-wasm", "plugins-wasm-cranelift",
     "webauthn", "memory-postgres",
-    "tools-saas", "tools-coding-cli", "tools-external",
+    "tools-saas", "tools-coding-cli", "tools-external", "tool-computer-use",
 ]
 
 [profile.dev]

@@ -1205,7 +1205,8 @@ impl FamilyProviderFactory for OpenRouterModelProviderConfig {
     ) -> Result<Box<dyn ModelProvider>> {
         let mut b = crate::openrouter::OpenRouterModelProvider::builder(alias)
             .credential(key)
-            .max_tokens(opts.provider_max_tokens);
+            .max_tokens(opts.provider_max_tokens)
+            .tool_result_image_policy(opts.tool_result_image_policy);
         if let Some(t) = opts.provider_timeout_secs {
             b = b.timeout_secs(t);
         }

@@ -11556,6 +11556,57 @@ impl Default for OpenCodeCliConfig {
     }
 }
 
+// ── Computer Use ───────────────────────────────────────────────
+
+/// Native desktop computer-use tool configuration (`[risk_profiles.<alias>.computer_use]`).
+///
+/// Defaults closed (`enabled = false`) and restricts capture/input to the
+/// primary display unless `allow_secondary_displays = true` is set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "computer_use"]
+pub struct ComputerUseToolConfig {
+    /// Enable the `computer_use` tool (default: false)
+    #[serde(default)]
+    pub enabled: bool,
+    /// Allow targeting secondary displays (`display > 0`) (default: false)
+    #[serde(default)]
+    pub allow_secondary_displays: bool,
+    /// Maximum long-edge pixel dimension for downscaled screenshots (320..=3840)
+    #[serde(default = "default_computer_use_max_dimension")]
+    pub max_dimension: u32,
+    /// Per-action capture timeout in seconds (1..=120)
+    #[serde(default = "default_computer_use_action_timeout_secs")]
+    pub action_timeout_secs: u64,
+    /// Maximum duration in seconds accepted by the `wait` action (1..=300)
+    #[serde(default = "default_computer_use_max_wait_secs")]
+    pub max_wait_secs: u64,
+}
+
+fn default_computer_use_max_dimension() -> u32 {
+    1280
+}
+
+fn default_computer_use_action_timeout_secs() -> u64 {
+    15
+}
+
+fn default_computer_use_max_wait_secs() -> u64 {
+    30
+}
+
+impl Default for ComputerUseToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_secondary_displays: false,
+            max_dimension: default_computer_use_max_dimension(),
+            action_timeout_secs: default_computer_use_action_timeout_secs(),
+            max_wait_secs: default_computer_use_max_wait_secs(),
+        }
+    }
+}
+
 // ── Proxy ───────────────────────────────────────────────────────
 
 /// Proxy application scope — determines which outbound traffic uses the proxy.
@@ -15662,6 +15713,14 @@ pub struct RiskProfileConfig {
     /// Set this to pin a digest or a specific tag so the sandbox stops
     /// tracking whatever the default tag moves to.
     pub sandbox_image: Option<String>,
+    /// Native desktop computer-use tool policy (`[risk_profiles.<alias>.computer_use]`).
+    ///
+    /// Defaults closed (`enabled = false`, `allow_secondary_displays = false`)
+    /// so desktop GUI capture and synthetic input are granted only to profiles
+    /// that explicitly opt in.
+    #[serde(default)]
+    #[nested]
+    pub computer_use: ComputerUseToolConfig,
 }
 
 impl Default for RiskProfileConfig {
@@ -15686,6 +15745,7 @@ impl Default for RiskProfileConfig {
             sandbox_backend: None,
             firejail_args: Vec::new(),
             sandbox_image: None,
+            computer_use: ComputerUseToolConfig::default(),
         }
     }
 }
@@ -24693,6 +24753,29 @@ impl Config {
             if tool.compiled() || !tool.enabled_in(self) {
                 continue;
             }
+            if tool == crate::opt_in_tools::OptInTool::ComputerUse {
+                let feature = tool.feature();
+                let mut aliases: Vec<&String> = self
+                    .risk_profiles
+                    .iter()
+                    .filter(|(_, profile)| profile.computer_use.enabled)
+                    .map(|(alias, _)| alias)
+                    .collect();
+                aliases.sort();
+                for alias in aliases {
+                    warnings.push(crate::validation_warnings::ValidationWarning::new(
+                        crate::validation_warnings::TOOL_COMPILED_OUT,
+                        format!(
+                            "[risk_profiles.{alias}.computer_use] is enabled, but this build was \
+                             compiled without the `{feature}` feature, so the tool is unavailable \
+                             and its settings are not checked. Use a build that includes \
+                             `{feature}`, or disable the section."
+                        ),
+                        format!("risk_profiles.{alias}.computer_use.enabled"),
+                    ));
+                }
+                continue;
+            }
             let (section, feature) = (tool.section(), tool.feature());
             warnings.push(crate::validation_warnings::ValidationWarning::new(
                 crate::validation_warnings::TOOL_COMPILED_OUT,
@@ -25883,6 +25966,31 @@ impl Config {
                 anyhow::bail!(
                     "risk_profiles.{profile_alias}.deny_all_tools cannot be combined with a non-empty allowed_tools list: deny_all_tools denies every tool, while allowed_tools = [] alone means unrestricted"
                 );
+            }
+            if crate::opt_in_tools::OptInTool::ComputerUse.compiled()
+                && profile.computer_use.enabled
+            {
+                if !(320..=3840).contains(&profile.computer_use.max_dimension) {
+                    validation_bail!(
+                        InvalidNumericRange,
+                        format!("risk_profiles.{profile_alias}.computer_use.max_dimension"),
+                        "risk_profiles.{profile_alias}.computer_use.max_dimension must be between 320 and 3840"
+                    );
+                }
+                if !(1..=120).contains(&profile.computer_use.action_timeout_secs) {
+                    validation_bail!(
+                        InvalidNumericRange,
+                        format!("risk_profiles.{profile_alias}.computer_use.action_timeout_secs"),
+                        "risk_profiles.{profile_alias}.computer_use.action_timeout_secs must be between 1 and 120"
+                    );
+                }
+                if !(1..=300).contains(&profile.computer_use.max_wait_secs) {
+                    validation_bail!(
+                        InvalidNumericRange,
+                        format!("risk_profiles.{profile_alias}.computer_use.max_wait_secs"),
+                        "risk_profiles.{profile_alias}.computer_use.max_wait_secs must be between 1 and 300"
+                    );
+                }
             }
         }
 
@@ -41759,6 +41867,124 @@ runtime_profile = "default"
             assert!(compiled_out.is_empty(), "{compiled_out:?}");
         } else {
             assert_eq!(compiled_out, ["web_search.enabled"]);
+        }
+    }
+
+    #[test]
+    async fn computer_use_config_defaults_and_serde_roundtrip() {
+        let config = ComputerUseToolConfig::default();
+        assert!(!config.enabled, "computer_use must default to disabled");
+        assert!(
+            !config.allow_secondary_displays,
+            "secondary displays must default to disallowed"
+        );
+        assert_eq!(config.max_dimension, 1280);
+        assert_eq!(config.action_timeout_secs, 15);
+        assert_eq!(config.max_wait_secs, 30);
+
+        // An empty table must round-trip to the same defaults, so a saved
+        // config that omits the section reloads identically.
+        let empty: ComputerUseToolConfig = toml::from_str("").expect("empty section parses");
+        assert_eq!(empty.enabled, config.enabled);
+        assert_eq!(
+            empty.allow_secondary_displays,
+            config.allow_secondary_displays
+        );
+        assert_eq!(empty.max_dimension, config.max_dimension);
+        assert_eq!(empty.action_timeout_secs, config.action_timeout_secs);
+        assert_eq!(empty.max_wait_secs, config.max_wait_secs);
+
+        let custom = ComputerUseToolConfig {
+            enabled: true,
+            allow_secondary_displays: true,
+            max_dimension: 2560,
+            action_timeout_secs: 45,
+            max_wait_secs: 120,
+        };
+        let toml_str = toml::to_string(&custom).expect("computer_use serializes");
+        let parsed: ComputerUseToolConfig =
+            toml::from_str(&toml_str).expect("computer_use deserializes");
+        assert!(parsed.enabled);
+        assert!(parsed.allow_secondary_displays);
+        assert_eq!(parsed.max_dimension, 2560);
+        assert_eq!(parsed.action_timeout_secs, 45);
+        assert_eq!(parsed.max_wait_secs, 120);
+    }
+
+    #[test]
+    async fn computer_use_config_validation_and_compiled_out_warning() {
+        use crate::opt_in_tools::OptInTool;
+
+        let computer_use_compiled_out = |config: &Config| -> Vec<String> {
+            config
+                .collect_warnings()
+                .into_iter()
+                .filter(|warning| {
+                    warning.code == crate::validation_warnings::TOOL_COMPILED_OUT
+                        && warning.path.ends_with(".computer_use.enabled")
+                })
+                .map(|warning| warning.path)
+                .collect()
+        };
+
+        type Break = fn(&mut ComputerUseToolConfig);
+        let cases: [(&str, Break); 6] = [
+            ("risk_profiles.desktop.computer_use.max_dimension", |c| {
+                c.max_dimension = 100;
+            }),
+            ("risk_profiles.desktop.computer_use.max_dimension", |c| {
+                c.max_dimension = 5000;
+            }),
+            (
+                "risk_profiles.desktop.computer_use.action_timeout_secs",
+                |c| {
+                    c.action_timeout_secs = 0;
+                },
+            ),
+            (
+                "risk_profiles.desktop.computer_use.action_timeout_secs",
+                |c| {
+                    c.action_timeout_secs = 121;
+                },
+            ),
+            ("risk_profiles.desktop.computer_use.max_wait_secs", |c| {
+                c.max_wait_secs = 0;
+            }),
+            ("risk_profiles.desktop.computer_use.max_wait_secs", |c| {
+                c.max_wait_secs = 301;
+            }),
+        ];
+
+        for (field, break_field) in cases {
+            let mut config = Config::default();
+            let mut profile = RiskProfileConfig::default();
+            profile.computer_use.enabled = true;
+            break_field(&mut profile.computer_use);
+            config.risk_profiles.insert("desktop".into(), profile);
+
+            if OptInTool::ComputerUse.compiled() {
+                let err = config
+                    .validate()
+                    .expect_err("a build with the tool checks its settings")
+                    .to_string();
+                assert!(
+                    err.contains(field),
+                    "expected an error on {field}, got: {err}"
+                );
+                assert!(
+                    computer_use_compiled_out(&config).is_empty(),
+                    "{field}: a compiled-in tool is not reported as compiled out"
+                );
+            } else {
+                config
+                    .validate()
+                    .expect("a build without the tool does not check its settings");
+                assert_eq!(
+                    computer_use_compiled_out(&config),
+                    ["risk_profiles.desktop.computer_use.enabled"],
+                    "{field}: the enabled section is reported as compiled out"
+                );
+            }
         }
     }
 

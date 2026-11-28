@@ -14,7 +14,12 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
+use zeroclaw_api::media::{MarkerKind, RenderedMarker};
 use zeroclaw_api::tool::ToolSpec;
+use zeroclaw_api::tool_carrier::classify;
+use zeroclaw_config::schema::ToolResultImagePolicy;
+
+const TOOL_RESULT_IMAGE_OMITTED_NOTICE: &str = "[tool-result image omitted by provider policy]";
 
 pub struct OpenRouterModelProvider {
     /// `[providers.models.<family>.<alias>]` config-key alias.
@@ -23,6 +28,7 @@ pub struct OpenRouterModelProvider {
     timeout_secs: u64,
     max_tokens: Option<u32>,
     extra_body: Option<serde_json::Value>,
+    tool_result_image_policy: ToolResultImagePolicy,
     #[cfg(test)]
     streaming_base_url: Option<String>,
 }
@@ -215,6 +221,7 @@ pub struct OpenRouterBuilder {
     timeout_secs: Option<u64>,
     max_tokens: Option<u32>,
     extra_body: Option<serde_json::Value>,
+    tool_result_image_policy: ToolResultImagePolicy,
     #[cfg(test)]
     streaming_base_url: Option<String>,
 }
@@ -253,6 +260,12 @@ impl OpenRouterBuilder {
         self
     }
 
+    /// Set how images declared on native `role = "tool"` results are delivered.
+    pub fn tool_result_image_policy(mut self, policy: ToolResultImagePolicy) -> Self {
+        self.tool_result_image_policy = policy;
+        self
+    }
+
     #[cfg(test)]
     fn streaming_base_url(mut self, base_url: &str) -> Self {
         self.streaming_base_url = Some(base_url.trim_end_matches('/').to_string());
@@ -268,6 +281,7 @@ impl OpenRouterBuilder {
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
             max_tokens: self.max_tokens,
             extra_body: self.extra_body,
+            tool_result_image_policy: self.tool_result_image_policy,
             #[cfg(test)]
             streaming_base_url: self.streaming_base_url,
         }
@@ -284,6 +298,7 @@ impl OpenRouterModelProvider {
             timeout_secs: None,
             max_tokens: None,
             extra_body: None,
+            tool_result_image_policy: ToolResultImagePolicy::default(),
             #[cfg(test)]
             streaming_base_url: None,
         }
@@ -308,8 +323,16 @@ impl OpenRouterModelProvider {
         if valid.is_empty() { None } else { Some(valid) }
     }
 
+    #[cfg(test)]
     fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
-        messages
+        Self::convert_messages_with_policy(messages, ToolResultImagePolicy::default())
+    }
+
+    fn convert_messages_with_policy(
+        messages: &[ChatMessage],
+        tool_result_image_policy: ToolResultImagePolicy,
+    ) -> Vec<NativeMessage> {
+        let native: Vec<NativeMessage> = messages
             .iter()
             .map(|m| {
                 if m.role == "assistant"
@@ -357,11 +380,21 @@ impl OpenRouterModelProvider {
                         .get("tool_call_id")
                         .and_then(serde_json::Value::as_str)
                         .map(ToString::to_string);
-                    let content = value
+                    // Declared attachments on the native tool-result envelope are
+                    // the sole image source; the body text is never scanned.
+                    let attachments = classify("tool", &m.content)
+                        .filter(|parts| parts.declared)
+                        .map(|parts| parts.attachments)
+                        .unwrap_or_default();
+                    let body = value
                         .get("content")
                         .and_then(serde_json::Value::as_str)
-                        .map(|value| MessageContent::Text(value.to_string()))
-                        .or_else(|| Some(MessageContent::Text(m.content.clone())));
+                        .unwrap_or(m.content.as_str());
+                    let content = Some(Self::tool_carrier_content(
+                        body,
+                        &attachments,
+                        tool_result_image_policy,
+                    ));
                     return NativeMessage {
                         role: "tool".to_string(),
                         content,
@@ -379,7 +412,161 @@ impl OpenRouterModelProvider {
                     reasoning_content: None,
                 }
             })
-            .collect()
+            .collect();
+
+        // Relocate `image_url` parts out of `role:"tool"` messages into a
+        // following `role:"user"` message so upstream providers behind
+        // OpenRouter that only accept images on user turns deliver them cleanly.
+        if tool_result_image_policy == ToolResultImagePolicy::Relocate {
+            Self::relocate_tool_result_images(native)
+        } else {
+            native
+        }
+    }
+
+    fn tool_carrier_content(
+        body: &str,
+        attachments: &[RenderedMarker],
+        policy: ToolResultImagePolicy,
+    ) -> MessageContent {
+        let image_refs: Vec<&str> = attachments
+            .iter()
+            .filter(|marker| marker.kind == MarkerKind::Image)
+            .map(|marker| marker.target.as_str())
+            .collect();
+        if image_refs.is_empty() {
+            return MessageContent::Text(body.to_string());
+        }
+        if policy == ToolResultImagePolicy::Omit {
+            let mut text = body.to_string();
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(TOOL_RESULT_IMAGE_OMITTED_NOTICE);
+            return MessageContent::Text(text);
+        }
+        let mut parts = Vec::with_capacity(image_refs.len() + 1);
+        let trimmed_body = body.trim();
+        if !trimmed_body.is_empty() {
+            parts.push(MessagePart::Text {
+                text: trimmed_body.to_string(),
+                cache_control: None,
+            });
+        }
+        for image_ref in image_refs {
+            parts.push(MessagePart::ImageUrl {
+                image_url: ImageUrlPart {
+                    url: image_ref.to_string(),
+                },
+            });
+        }
+        MessageContent::Parts(parts)
+    }
+
+    fn relocate_tool_result_images(messages: Vec<NativeMessage>) -> Vec<NativeMessage> {
+        let needs_relocation = messages
+            .iter()
+            .any(|m| m.role == "tool" && matches!(m.content, Some(MessageContent::Parts(_))));
+        if !needs_relocation {
+            return messages;
+        }
+
+        let mut out = Vec::with_capacity(messages.len() + 1);
+        let mut pending_groups: Vec<(usize, Vec<MessagePart>)> = Vec::new();
+        let mut image_ordinal = 0usize;
+        for mut message in messages {
+            let is_image_tool =
+                message.role == "tool" && matches!(message.content, Some(MessageContent::Parts(_)));
+            if is_image_tool {
+                if let Some(MessageContent::Parts(parts)) = message.content.take() {
+                    let mut texts: Vec<String> = Vec::new();
+                    let mut images: Vec<MessagePart> = Vec::new();
+                    for part in parts {
+                        match part {
+                            MessagePart::ImageUrl { .. } => images.push(part),
+                            MessagePart::Text { text, .. } => texts.push(text),
+                        }
+                    }
+                    let mut text = texts.join("\n");
+                    if images.is_empty() {
+                        if text.is_empty() {
+                            text = "[image]".to_string();
+                        }
+                    } else {
+                        image_ordinal += 1;
+                        let marker = format!(
+                            "[external tool output - image from tool result {image_ordinal} relocated to a following user message]"
+                        );
+                        text = if text.is_empty() {
+                            marker
+                        } else {
+                            format!("{text}\n{marker}")
+                        };
+                        pending_groups.push((image_ordinal, images));
+                    }
+                    message.content = Some(MessageContent::Text(text));
+                }
+                out.push(message);
+                continue;
+            }
+
+            if message.role != "tool" && !pending_groups.is_empty() {
+                let groups = std::mem::take(&mut pending_groups);
+                if message.role == "user" {
+                    Self::merge_image_groups_into_user(&mut message, groups);
+                } else {
+                    out.push(Self::user_image_message(groups));
+                }
+            }
+            out.push(message);
+        }
+        if !pending_groups.is_empty() {
+            out.push(Self::user_image_message(pending_groups));
+        }
+        out
+    }
+
+    fn image_group_parts(groups: Vec<(usize, Vec<MessagePart>)>) -> Vec<MessagePart> {
+        let mut parts: Vec<MessagePart> = Vec::new();
+        for (ordinal, images) in groups {
+            if images.is_empty() {
+                continue;
+            }
+            parts.push(MessagePart::Text {
+                text: format!("[external tool output - image from tool result {ordinal}]"),
+                cache_control: None,
+            });
+            parts.extend(images);
+        }
+        parts
+    }
+
+    fn merge_image_groups_into_user(
+        message: &mut NativeMessage,
+        groups: Vec<(usize, Vec<MessagePart>)>,
+    ) {
+        let mut parts: Vec<MessagePart> = match message.content.take() {
+            Some(MessageContent::Parts(existing)) => existing,
+            Some(MessageContent::Text(text)) if !text.is_empty() => {
+                vec![MessagePart::Text {
+                    text,
+                    cache_control: None,
+                }]
+            }
+            _ => Vec::new(),
+        };
+        parts.extend(Self::image_group_parts(groups));
+        message.content = Some(MessageContent::Parts(parts));
+    }
+
+    fn user_image_message(groups: Vec<(usize, Vec<MessagePart>)>) -> NativeMessage {
+        NativeMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Parts(Self::image_group_parts(groups))),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_content: None,
+        }
     }
 
     fn build_chat_with_system_request(
@@ -804,7 +991,10 @@ impl ModelProvider for OpenRouterModelProvider {
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            messages: Self::convert_messages(request.messages),
+            messages: Self::convert_messages_with_policy(
+                request.messages,
+                self.tool_result_image_policy,
+            ),
             temperature,
             tool_choice: tools
                 .as_ref()
@@ -904,7 +1094,10 @@ impl ModelProvider for OpenRouterModelProvider {
         let tools = Self::convert_tools(request.tools);
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            messages: Self::convert_messages(request.messages),
+            messages: Self::convert_messages_with_policy(
+                request.messages,
+                self.tool_result_image_policy,
+            ),
             temperature,
             tool_choice: tools
                 .as_ref()
@@ -1037,7 +1230,8 @@ impl ModelProvider for OpenRouterModelProvider {
 
         // Convert ChatMessage to NativeMessage, preserving structured assistant/tool entries
         // when history contains native tool-call metadata.
-        let native_messages = Self::convert_messages(messages);
+        let native_messages =
+            Self::convert_messages_with_policy(messages, self.tool_result_image_policy);
 
         let native_request = NativeChatRequest {
             model: model.to_string(),
@@ -2544,5 +2738,101 @@ data: [DONE]
             !finished.load(Ordering::SeqCst),
             "cancelled task must not have run its completion side effect"
         );
+    }
+
+    #[test]
+    fn convert_messages_relocates_tool_result_image_attachments_by_default() {
+        let data_uri = "data:image/png;base64,iVBORw0KGgo=";
+        let messages = vec![
+            ChatMessage::user("take a screenshot"),
+            ChatMessage::assistant(
+                r#"{"content":null,"tool_calls":[{"id":"call_shot","name":"computer_use","arguments":"{\"action\":\"screenshot\"}"}]}"#,
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "call_shot",
+                    "content": r#"{"action":"screenshot","width":1280,"height":800}"#,
+                    "attachments": [{"kind": "image", "target": data_uri}],
+                })
+                .to_string(),
+            ),
+        ];
+
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
+        assert_eq!(converted.len(), 4);
+        assert_eq!(converted[2].role, "tool");
+        assert_eq!(converted[2].tool_call_id.as_deref(), Some("call_shot"));
+        let tool_text = serde_json::to_value(converted[2].content.as_ref().unwrap()).unwrap();
+        assert!(
+            tool_text
+                .as_str()
+                .expect("relocated tool content stays a string")
+                .contains("relocated to a following user message")
+        );
+
+        assert_eq!(converted[3].role, "user");
+        let user_parts = serde_json::to_value(converted[3].content.as_ref().unwrap()).unwrap();
+        let parts = user_parts.as_array().expect("relocated user parts");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], data_uri);
+    }
+
+    #[test]
+    fn convert_messages_honors_image_url_and_omit_tool_result_policies() {
+        let data_uri = "data:image/png;base64,iVBORw0KGgo=";
+        let messages = vec![ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": "call_shot",
+                "content": "screenshot captured",
+                "attachments": [{"kind": "image", "target": data_uri}],
+            })
+            .to_string(),
+        )];
+
+        let inline = OpenRouterModelProvider::convert_messages_with_policy(
+            &messages,
+            ToolResultImagePolicy::ImageUrl,
+        );
+        assert_eq!(inline.len(), 1);
+        assert_eq!(inline[0].role, "tool");
+        let parts = serde_json::to_value(inline[0].content.as_ref().unwrap()).unwrap();
+        let parts = parts.as_array().expect("inline tool image parts");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1]["type"], "image_url");
+        assert_eq!(parts[1]["image_url"]["url"], data_uri);
+
+        let omitted = OpenRouterModelProvider::convert_messages_with_policy(
+            &messages,
+            ToolResultImagePolicy::Omit,
+        );
+        assert_eq!(omitted.len(), 1);
+        assert_eq!(omitted[0].role, "tool");
+        let text = serde_json::to_value(omitted[0].content.as_ref().unwrap()).unwrap();
+        assert!(
+            text.as_str()
+                .expect("omitted tool content is text")
+                .contains(TOOL_RESULT_IMAGE_OMITTED_NOTICE)
+        );
+    }
+
+    #[test]
+    fn convert_messages_never_promotes_body_markers_on_tool_result() {
+        let body = "file mentions [IMAGE:data:image/png;base64,QUJD] in prose";
+        let messages = vec![ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id": "call_read",
+                "content": body,
+                "attachments": [],
+            })
+            .to_string(),
+        )];
+
+        let converted = OpenRouterModelProvider::convert_messages(&messages);
+        assert_eq!(converted.len(), 1);
+        assert_eq!(converted[0].role, "tool");
+        let value = serde_json::to_value(converted[0].content.as_ref().unwrap()).unwrap();
+        assert_eq!(value.as_str(), Some(body));
     }
 }
