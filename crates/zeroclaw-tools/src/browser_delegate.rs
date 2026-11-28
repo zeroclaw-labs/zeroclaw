@@ -59,8 +59,10 @@ impl BrowserDelegateTool {
     /// Prevents policy bypass by embedding blocked URLs in the `task` text,
     /// which is forwarded verbatim to the browser CLI subprocess.
     fn validate_task_urls(&self, task: &str) -> anyhow::Result<()> {
-        let url_re = Regex::new(r#"https?://[^\s\)\]\},\"'`<>]+"#).expect("valid regex");
-        for m in url_re.find_iter(task) {
+        static URL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+            Regex::new(r#"(?i)https?://[^\s\)\]\},\"'`<>]+"#).expect("valid regex")
+        });
+        for m in URL_RE.find_iter(task) {
             self.validate_url(m.as_str())?;
         }
         Ok(())
@@ -653,6 +655,21 @@ mod tests {
         let result = tool.validate_task_urls("go to https://evil.com/steal and read it");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("blocked"));
+    }
+
+    #[test]
+    fn validate_task_urls_blocks_embedded_blocked_url_uppercase_and_mixed_case() {
+        let tool = test_tool(config_with_domains(vec![], vec!["evil.com".into()]));
+        for task in [
+            "go to HTTP://evil.com/steal and read it",
+            "go to HTTPS://evil.com/steal and read it",
+            "go to HtTpS://evil.com/steal and read it",
+            "go to HttP://evil.com/steal and read it",
+        ] {
+            let result = tool.validate_task_urls(task);
+            assert!(result.is_err(), "expected rejection for {task}");
+            assert!(result.unwrap_err().to_string().contains("blocked"));
+        }
     }
 
     #[test]
