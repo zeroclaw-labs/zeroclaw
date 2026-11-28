@@ -2833,7 +2833,8 @@ impl Tool for DelegateTool {
     fn description(&self) -> &str {
         "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model \
          (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single \
-         prompt by default; with agentic=true it can iterate with a filtered tool-call loop. \
+         prompt by default; a target whose runtime profile is agentic can iterate with a filtered \
+         tool-call loop. \
          Supports background execution (returns a task_id immediately), batched background waits \
          (await_sessions), and parallel execution (runs multiple agents concurrently). Bounded \
          sub-agents receive the delegate tool only when their risk profile's delegation_policy \
@@ -2950,6 +2951,16 @@ impl Tool for DelegateTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        // The schema is closed. Refuse an undeclared key before action
+        // dispatch or admission of the requested target, so a caller learns
+        // that an option it sent was not applied.
+        if let Some(refusal) = crate::tools::undeclared_arguments::refuse_undeclared_arguments(
+            &self.parameters_schema(),
+            &args,
+        ) {
+            return Ok(refusal);
+        }
+
         let action_value = args
             .get("action")
             .and_then(|v| v.as_str())
@@ -16270,6 +16281,82 @@ target = "memory_recall"
 
         assert!(!result.success);
         assert!(result.error.unwrap().contains("Unknown action"));
+    }
+
+    #[tokio::test]
+    async fn undeclared_argument_rejected_before_target_lookup() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let args = json!({
+            "agent": "nonexistent",
+            "prompt": "test",
+            "model": "requested-model-id"
+        });
+        // The wording follows the active locale, so compare with what the
+        // entry check itself returns for this call.
+        let expected = crate::tools::undeclared_arguments::refuse_undeclared_arguments(
+            &tool.parameters_schema(),
+            &args,
+        )
+        .expect("the undeclared `model` argument is refused")
+        .error
+        .unwrap();
+
+        let result = tool.execute(args).await.unwrap();
+
+        assert!(!result.success);
+        let error = result.error.unwrap();
+        // The whole error is the refusal: target lookup never ran, so
+        // `nonexistent` was not resolved.
+        assert_eq!(error, expected);
+        // The key's value is not echoed.
+        assert!(!error.contains("requested-model-id"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn undeclared_argument_rejected_for_management_and_parallel_calls() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        for args in [
+            json!({"action": "list_results", "model": "x"}),
+            json!({"parallel": ["researcher"], "prompt": "test", "effort": "high"}),
+        ] {
+            let expected = crate::tools::undeclared_arguments::refuse_undeclared_arguments(
+                &tool.parameters_schema(),
+                &args,
+            )
+            .expect("the undeclared argument is refused")
+            .error
+            .unwrap();
+            let result = tool.execute(args.clone()).await.unwrap();
+            assert!(!result.success, "{args}");
+            assert_eq!(result.error.unwrap(), expected, "{args}");
+        }
+    }
+
+    #[tokio::test]
+    async fn every_advertised_argument_passes_the_entry_check() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let schema = tool.parameters_schema();
+        let advertised: serde_json::Map<String, serde_json::Value> = schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|key| (key.clone(), json!(null)))
+            .collect();
+        assert!(!advertised.is_empty());
+
+        assert!(
+            crate::tools::undeclared_arguments::refuse_undeclared_arguments(
+                &schema,
+                &serde_json::Value::Object(advertised)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn description_names_no_argument_the_schema_does_not_declare() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        assert!(!tool.description().contains("agentic=true"));
     }
 
     #[tokio::test]

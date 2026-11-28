@@ -1694,6 +1694,23 @@ tool-shell-killed-by-signal = killed by signal { $signal }
 tool-shell-exited-unsuccessfully = exited unsuccessfully
 tool-shell-failure-with-detail = { $status }: { $detail }
 
+# ── Tool arguments a tool's schema does not declare ──
+# Returned to the model when a call carries a top-level argument the tool does
+# not accept. $names lists the undeclared names, each in single quotes,
+# separated by ", "; $declared lists the accepted names separated by ", ".
+# $count_plural is "one" for a single undeclared name, otherwise "other".
+tool-error-undeclared-arguments =
+    { $count_plural ->
+        [one] Unknown argument { $names }. Use { $declared }.
+       *[other] Unknown arguments { $names }. Use { $declared }.
+    }
+# The same refusal for a tool that accepts no arguments at all.
+tool-error-undeclared-arguments-none-declared =
+    { $count_plural ->
+        [one] Unknown argument { $names }. This tool takes no arguments.
+       *[other] Unknown arguments { $names }. This tool takes no arguments.
+    }
+
 # ── Terminal tool approval ──
 # The ASCII shortcut tokens stay aligned with the Rust-owned response parser.
 cli-approval-request = 🔧 Agent wants to execute: {$tool}
