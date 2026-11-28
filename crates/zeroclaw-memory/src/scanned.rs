@@ -525,6 +525,17 @@ impl<M: Memory> Memory for ScannedMemory<M> {
         self.inner.health_check().await
     }
 
+    async fn supersede_for_agent(
+        &self,
+        superseded_ids: &[String],
+        replacement: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .supersede_for_agent(superseded_ids, replacement, agent_id)
+            .await
+    }
+
     async fn supersede(&self, superseded_ids: &[String], new_id: &str) -> anyhow::Result<()> {
         self.inner.supersede(superseded_ids, new_id).await
     }

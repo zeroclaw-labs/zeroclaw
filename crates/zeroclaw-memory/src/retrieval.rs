@@ -541,6 +541,22 @@ impl Memory for RetrievalPipeline {
         self.memory.health_check().await
     }
 
+    async fn supersede_for_agent(
+        &self,
+        superseded_ids: &[String],
+        replacement: &str,
+        agent_id: &str,
+    ) -> anyhow::Result<()> {
+        let result = self
+            .memory
+            .supersede_for_agent(superseded_ids, replacement, agent_id)
+            .await;
+        if !superseded_ids.is_empty() || result.is_err() {
+            self.invalidate_cache();
+        }
+        result
+    }
+
     async fn supersede(&self, superseded_ids: &[String], new_id: &str) -> anyhow::Result<()> {
         let result = self.memory.supersede(superseded_ids, new_id).await;
         // A real supersede (non-empty ids) or an uncertain outcome (error)

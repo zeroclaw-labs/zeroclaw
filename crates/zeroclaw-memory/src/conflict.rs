@@ -1,6 +1,7 @@
 //! Conflict resolution for memory entries.
 
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use zeroclaw_api::attribution::{MemoryKind, Role};
 
 /// Check for conflicting memories and mark old ones as superseded.
 /// Returns the list of entry IDs that were superseded.
@@ -13,6 +14,14 @@ pub async fn check_and_resolve_conflicts(
 ) -> anyhow::Result<Vec<String>> {
     // Only check conflicts for Core memories
     if !matches!(category, MemoryCategory::Core) {
+        return Ok(Vec::new());
+    }
+
+    // A named handle can explicitly retire its own rows. Its ordinary recall
+    // also includes read grants and ranking scores (e.g. BM25), not write
+    // authority or evidence of replacement. Keep automatic retirement disabled
+    // there until an owner-scoped conflict-evidence query is available.
+    if memory.role() == Role::Memory(MemoryKind::AgentScoped) {
         return Ok(Vec::new());
     }
 
