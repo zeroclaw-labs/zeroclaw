@@ -23,6 +23,7 @@
   <a href="docs/book/src/philosophy/index.md">Philosophy</a> ·
   <a href="docs/book/src/getting-started/quickstart.md">Quick start</a> ·
   <a href="docs/book/src/architecture/overview.md">Architecture</a> ·
+  <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/12712">Roadmap</a> ·
   <a href="https://www.zeroclaw.com/discord">Discord</a>
 </p>
 
@@ -146,7 +147,7 @@ Full detail with Mermaid diagrams: [Architecture overview](docs/book/src/archite
 
 ## Contributing
 
-Start with [how to contribute](docs/book/src/contributing/how-to.md). Larger changes go through the [RFC process](docs/book/src/contributing/rfcs.md). Real-time chat lives on [Discord](https://www.zeroclaw.com/discord) (the best way to reach the team); durable work tracking is on [GitHub issues](https://github.com/zeroclaw-labs/zeroclaw/issues).
+Start with [how to contribute](docs/book/src/contributing/how-to.md). The [roadmap](https://github.com/zeroclaw-labs/zeroclaw/issues/12712) shows what is planned for each release up to v1.0.0. Larger changes go through the [RFC process](docs/book/src/contributing/rfcs.md). Real-time chat lives on [Discord](https://www.zeroclaw.com/discord) (the best way to reach the team); durable work tracking is on [GitHub issues](https://github.com/zeroclaw-labs/zeroclaw/issues).
 
 Good places to start:
 

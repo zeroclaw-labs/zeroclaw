@@ -1,8 +1,8 @@
 # FND-001: Intentional Architecture: ZeroClaw Microkernel Transition
 
-> Starting v0.7.0 · Type: Architecture · Rev. 10
+> Starting v0.7.0 · Type: Architecture · Rev. 11
 >
-> **Canonical reference** · Ratified by the team · Rev. 10
+> **Canonical reference** · Ratified by the team · Rev. 11
 > Original RFC discussion and draft history: [#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574)
 
 ---
@@ -42,6 +42,7 @@
 | 8 | 2026-07-20 | Made root `AGENTS.md` the compact project contract, routed maintained detail through the architecture map and coding-agent guidelines, and prevented crate policy from weakening project safety, privacy, or authorization requirements ([#9050](https://github.com/zeroclaw-labs/zeroclaw/pull/9050)) |
 | 9 | 2026-08-11 | Removed WATI from the current-state gateway inventory and v0.9.0 plugin-migration target after the channel was retired in [#9571](https://github.com/zeroclaw-labs/zeroclaw/pull/9571); the generic webhook/plugin boundary remains unchanged |
 | 10 | 2026-08-19 | Removed `aardvark-sys` and `zeroclaw-robot-kit` from the workspace-inheritance and independent-release guidance after both crates were retired in [#9853](https://github.com/zeroclaw-labs/zeroclaw/pull/9853); the published 0.1.0 releases stay on crates.io and are unaffected |
+| 11 | 2026-11-25 | Added the pre-1.0 release rule to §4.4.1: a change listed as MAJOR ships in the next minor release, and every other change ships in a patch release. §6 now points to the pinned roadmap tracker, [#12712](https://github.com/zeroclaw-labs/zeroclaw/issues/12712), for the release order, target dates and the v1.0.0 checklist |
 
 Revision numbers in this canonical document follow the ratified repository
 history. The linked RFC issue also labels a configuration-discipline edit as
@@ -299,6 +300,8 @@ Because application crates share a unified version, the team needs a product-lev
 | **MINOR** | New capabilities anywhere in the workspace; new plugins available in the registry; new stable APIs; stability tier promotions; deprecation announcements (not removals) |
 | **PATCH** | Bug fixes; security patches; documentation corrections; no new capabilities and no deprecations |
 
+**Before 1.0.0.** Until v1.0.0, a change listed as MAJOR above ships in the next minor release (for example 0.9.x → 0.10.0). Every other change, new capabilities included, ships in a patch release (0.9.x → 0.9.x+1). So a 0.x patch release never needs a config migration, a plugin rebuild or a changed CLI command. From v1.0.0 on, the table applies as written.
+
 ---
 
 ##### Stability tiers
@@ -519,6 +522,8 @@ These are already in place and should be maintained:
 Each phase follows the Vision → Architecture → Design → Implementation → Testing → Documentation → Release hierarchy. No phase begins implementation until its design is reviewed and agreed upon.
 
 The overall migration strategy is the **Strangler Fig Pattern**: we grow the new architecture around the edges of the existing code, migrating inward steadily, until the old structure is fully replaced. We never have a "stop the world" rewrite. The application is always shippable.
+
+**Current plan.** This section records the architectural direction. The pinned roadmap tracker, [#12712](https://github.com/zeroclaw-labs/zeroclaw/issues/12712), keeps the release order, the target dates and the v1.0.0 checklist, and is updated after each release. Delivery hasn't followed the version numbers below exactly, so check the tracker for what is planned. The tracker proposes which Phase 4 success metrics v1.0.0 requires; once the team agrees, this section will be revised to match.
 
 ---
 
