@@ -30,7 +30,7 @@ pub struct OpenRouterModelProvider {
     extra_body: Option<serde_json::Value>,
     tool_result_image_policy: ToolResultImagePolicy,
     #[cfg(test)]
-    streaming_base_url: Option<String>,
+    test_base_url: Option<String>,
 }
 
 /// OpenRouter's public aggregator endpoint.
@@ -223,7 +223,7 @@ pub struct OpenRouterBuilder {
     extra_body: Option<serde_json::Value>,
     tool_result_image_policy: ToolResultImagePolicy,
     #[cfg(test)]
-    streaming_base_url: Option<String>,
+    test_base_url: Option<String>,
 }
 
 impl OpenRouterBuilder {
@@ -267,8 +267,8 @@ impl OpenRouterBuilder {
     }
 
     #[cfg(test)]
-    fn streaming_base_url(mut self, base_url: &str) -> Self {
-        self.streaming_base_url = Some(base_url.trim_end_matches('/').to_string());
+    fn test_base_url(mut self, base_url: &str) -> Self {
+        self.test_base_url = Some(base_url.trim_end_matches('/').to_string());
         self
     }
 
@@ -283,7 +283,7 @@ impl OpenRouterBuilder {
             extra_body: self.extra_body,
             tool_result_image_policy: self.tool_result_image_policy,
             #[cfg(test)]
-            streaming_base_url: self.streaming_base_url,
+            test_base_url: self.test_base_url,
         }
     }
 }
@@ -300,7 +300,7 @@ impl OpenRouterModelProvider {
             extra_body: None,
             tool_result_image_policy: ToolResultImagePolicy::default(),
             #[cfg(test)]
-            streaming_base_url: None,
+            test_base_url: None,
         }
     }
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
@@ -760,13 +760,13 @@ impl OpenRouterModelProvider {
         )
     }
 
-    fn streaming_endpoint_url(&self, path: &str) -> String {
+    fn chat_completions_url(&self) -> String {
         #[cfg(test)]
-        if let Some(base_url) = self.streaming_base_url.as_deref() {
-            return format!("{base_url}/{}", path.trim_start_matches('/'));
+        if let Some(base_url) = self.test_base_url.as_deref() {
+            return format!("{base_url}/chat/completions");
         }
 
-        endpoint_url(path)
+        endpoint_url("chat/completions")
     }
 }
 
@@ -860,7 +860,7 @@ impl ModelProvider for OpenRouterModelProvider {
         let body = self.merge_extra_body(&request)?;
         let response = self
             .http_client()
-            .post(endpoint_url("chat/completions"))
+            .post(self.chat_completions_url())
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
@@ -915,25 +915,20 @@ impl ModelProvider for OpenRouterModelProvider {
             )
         })?;
 
-        let api_messages: Vec<Message> = messages
-            .iter()
-            .map(|m| Message {
-                role: m.role.clone(),
-                content: Self::to_message_content(&m.role, &m.content),
-            })
-            .collect();
-
-        let request = ChatRequest {
+        let request = NativeChatRequest {
             model: model.to_string(),
-            messages: api_messages,
+            messages: Self::convert_messages_with_policy(messages, self.tool_result_image_policy),
             temperature,
+            tools: None,
+            tool_choice: None,
             max_tokens: self.max_tokens,
+            stream: None,
         };
 
         let body = self.merge_extra_body(&request)?;
         let response = self
             .http_client()
-            .post(endpoint_url("chat/completions"))
+            .post(self.chat_completions_url())
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
@@ -1007,7 +1002,7 @@ impl ModelProvider for OpenRouterModelProvider {
         let body = self.merge_extra_body(&native_request)?;
         let response = self
             .http_client()
-            .post(endpoint_url("chat/completions"))
+            .post(self.chat_completions_url())
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
@@ -1119,7 +1114,7 @@ impl ModelProvider for OpenRouterModelProvider {
         };
 
         let client = self.streaming_http_client();
-        let endpoint_url = self.streaming_endpoint_url("chat/completions");
+        let endpoint_url = self.chat_completions_url();
         let count_tokens = options.count_tokens;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
@@ -1248,7 +1243,7 @@ impl ModelProvider for OpenRouterModelProvider {
         let body = self.merge_extra_body(&native_request)?;
         let response = self
             .http_client()
-            .post(endpoint_url("chat/completions"))
+            .post(self.chat_completions_url())
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
@@ -1478,7 +1473,7 @@ data: [DONE]
         let provider = OpenRouterModelProvider::builder("test")
             .credential(Some("test-key"))
             .timeout_secs(1)
-            .streaming_base_url(&format!("http://{addr}"))
+            .test_base_url(&format!("http://{addr}"))
             .build();
         let messages = vec![ChatMessage {
             role: "user".into(),
@@ -1767,36 +1762,89 @@ data: [DONE]
         assert_eq!(json["temperature"], 0.5);
     }
 
-    #[test]
-    fn chat_request_serializes_history_messages() {
-        let messages = [
-            ChatMessage {
-                role: "assistant".into(),
-                content: "Previous answer".into(),
-            },
-            ChatMessage {
-                role: "user".into(),
-                content: "Follow-up".into(),
-            },
+    #[tokio::test]
+    async fn chat_with_history_sends_declared_images_according_to_policy() -> anyhow::Result<()> {
+        use axum::{Json, Router, routing::post};
+        use serde_json::{Value, json};
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|Json(body): Json<Value>| async move {
+                Json(json!({"choices": [{"message": {"content": body.to_string()}}]}))
+            }),
+        );
+        let server = zeroclaw_spawn::spawn!(async move { axum::serve(listener, app).await });
+        let image = "data:image/png;base64,QUJD";
+        let history = [
+            ChatMessage::user("preview"),
+            ChatMessage::assistant(
+                json!({"tool_calls": [{"id": "c1", "name": "preview", "arguments": "{}"}]})
+                    .to_string(),
+            ),
+            ChatMessage::tool(
+                json!({"tool_call_id": "c1", "content": "ready",
+                       "attachments": [{"kind": "image", "target": image}]})
+                .to_string(),
+            ),
         ];
 
-        let request = ChatRequest {
-            model: "google/gemini-2.5-pro".into(),
-            messages: messages
-                .iter()
-                .map(|msg| Message {
-                    role: msg.role.clone(),
-                    content: MessageContent::Text(msg.content.clone()),
-                })
-                .collect(),
-            temperature: Some(0.0),
-            max_tokens: None,
-        };
-
-        let json = serde_json::to_string(&request).unwrap();
-        assert!(json.contains("\"role\":\"assistant\""));
-        assert!(json.contains("\"role\":\"user\""));
-        assert!(json.contains("google/gemini-2.5-pro"));
+        for policy in [
+            ToolResultImagePolicy::Omit,
+            ToolResultImagePolicy::Relocate,
+            ToolResultImagePolicy::ImageUrl,
+        ] {
+            let provider = OpenRouterModelProvider::builder("test")
+                .test_base_url(&base)
+                .credential(Some("test-key"))
+                .tool_result_image_policy(policy)
+                .max_tokens(Some(64))
+                .build();
+            let echoed = provider
+                .chat_with_history(&history, "test/model", Some(0.0))
+                .await?;
+            let body: Value = serde_json::from_str(&echoed)?;
+            assert_eq!(body["model"], "test/model");
+            assert_eq!(body["max_tokens"], 64);
+            assert_eq!(body["temperature"], 0.0);
+            for field in ["tools", "tool_choice", "stream"] {
+                assert!(body.get(field).is_none());
+            }
+            let messages = body["messages"].as_array().expect("wire messages");
+            assert_eq!(messages[0], json!({"role": "user", "content": "preview"}));
+            assert_eq!(messages[1]["tool_calls"][0]["id"], "c1");
+            assert_eq!(messages[2]["role"], "tool");
+            assert_eq!(messages[2]["tool_call_id"], "c1");
+            let content = &messages[2]["content"];
+            match policy {
+                ToolResultImagePolicy::Omit => {
+                    assert_eq!(messages.len(), 3);
+                    assert_eq!(
+                        content,
+                        &json!(format!("ready\n\n{TOOL_RESULT_IMAGE_OMITTED_NOTICE}"))
+                    );
+                    assert!(!echoed.contains(image));
+                }
+                ToolResultImagePolicy::Relocate => {
+                    assert_eq!(messages.len(), 4);
+                    assert!(content.as_str().expect("tool text").contains("ready"));
+                    assert_eq!(messages[3]["role"], "user");
+                    assert_eq!(messages[3]["content"][1]["image_url"]["url"], image);
+                    assert_eq!(echoed.matches(image).count(), 1);
+                }
+                ToolResultImagePolicy::ImageUrl => {
+                    assert_eq!(messages.len(), 3);
+                    assert_eq!(content[0]["text"], "ready");
+                    assert_eq!(content[1]["type"], "image_url");
+                    assert_eq!(content[1]["image_url"]["url"], image);
+                    assert_eq!(echoed.matches(image).count(), 1);
+                }
+            }
+        }
+        server.abort();
+        Ok(())
     }
 
     #[test]
