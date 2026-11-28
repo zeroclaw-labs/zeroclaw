@@ -584,9 +584,10 @@ use zeroclaw_config::schema::{
     QianfanModelProviderConfig, QwenModelProviderConfig, RekaModelProviderConfig,
     SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
     StepfunModelProviderConfig, SyntheticModelProviderConfig, TelnyxModelProviderConfig,
-    TogetherModelProviderConfig, UpstageModelProviderConfig, VeniceModelProviderConfig,
-    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
-    YiModelProviderConfig, ZaiModelProviderConfig, ZerorouterModelProviderConfig,
+    TogetherModelProviderConfig, TrustedRouterModelProviderConfig, UpstageModelProviderConfig,
+    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
+    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    ZerorouterModelProviderConfig,
 };
 
 #[must_use]
@@ -667,6 +668,12 @@ impl CompatFamilySpec for CheaperInferenceModelProviderConfig {
     const DEFAULT_URL: &'static str =
         zeroclaw_config::schema::CheaperInferenceEndpoint::DEFAULT_URI;
     const AUTH: AuthStyle = AuthStyle::Bearer;
+}
+impl CompatFamilySpec for TrustedRouterModelProviderConfig {
+    const DISPLAY: &'static str = "TrustedRouter";
+    const DEFAULT_URL: &'static str = zeroclaw_config::schema::TrustedRouterEndpoint::DEFAULT_URI;
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+    const PUBLIC_MODEL_LISTING: bool = true;
 }
 impl CompatFamilySpec for ZerorouterModelProviderConfig {
     const DISPLAY: &'static str = "ZeroRouter";
@@ -2654,6 +2661,159 @@ mod tests {
             CheaperInferenceEndpoint::default().uri(),
             "schema CheaperInferenceEndpoint and factory DEFAULT_URL disagree"
         );
+    }
+
+    #[test]
+    fn trustedrouter_default_url_matches_schema_endpoint() {
+        use zeroclaw_config::schema::{ModelEndpoint, TrustedRouterEndpoint};
+        assert_eq!(
+            <TrustedRouterModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+            TrustedRouterEndpoint::default().uri(),
+            "schema TrustedRouterEndpoint and factory DEFAULT_URL disagree"
+        );
+        assert!(
+            !TrustedRouterModelProviderConfig::default()
+                .fallback_auth_ready(None, &ModelProviderRuntimeOptions::default()),
+            "keyless inference must not be viable for TrustedRouter"
+        );
+    }
+
+    #[tokio::test]
+    async fn trustedrouter_public_catalog_needs_no_credential() {
+        use axum::http::HeaderMap;
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let authorized = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&requests);
+        let with_header = Arc::clone(&authorized);
+        let app = Router::new().route(
+            "/v1/models",
+            get(move |headers: HeaderMap| {
+                let seen = Arc::clone(&seen);
+                let with_header = Arc::clone(&with_header);
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    if headers.contains_key(axum::http::header::AUTHORIZATION) {
+                        with_header.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Json(serde_json::json!({
+                        "data": [
+                            {
+                                "id": "trustedrouter/auto",
+                                "pricing": {
+                                    "prompt": "0.000000026375",
+                                    "completion": "0.00000007385",
+                                    "prompt_max": "0.000003165",
+                                    "completion_max": "0.000015825"
+                                }
+                            },
+                            {
+                                "id": "trustedrouter/zdr",
+                                "pricing": {
+                                    "prompt": "0.00000003165",
+                                    "completion": "0.0000001266"
+                                }
+                            },
+                            {
+                                "id": "trustedrouter/e2e",
+                                "pricing": {
+                                    "prompt": "0.00000001055",
+                                    "completion": "0.00000007385"
+                                }
+                            },
+                            {
+                                "id": "trustedrouter/fast",
+                                "pricing": {
+                                    "prompt": "0.00000036925",
+                                    "completion": "0.00000079125"
+                                }
+                            },
+                            {
+                                "id": "trustedrouter/cheap",
+                                "pricing": {
+                                    "prompt": "0.00000001",
+                                    "completion": "0.00000001"
+                                }
+                            },
+                            {
+                                "id": "trustedrouter/free",
+                                "pricing": {
+                                    "prompt": "0",
+                                    "completion": "0"
+                                }
+                            },
+                            {
+                                "id": "anthropic/claude-sonnet-4.6",
+                                "pricing": {
+                                    "prompt": "0.000003",
+                                    "completion": "0.000015"
+                                }
+                            }
+                        ]
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind public catalog fixture");
+        let addr = listener.local_addr().expect("read fixture address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve public catalog fixture");
+        });
+
+        let provider = TrustedRouterModelProviderConfig::default()
+            .create_provider(
+                "public",
+                None,
+                Some(&format!("http://{addr}/v1")),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .expect("construct a keyless TrustedRouter catalog client");
+
+        let models = provider.list_models().await.expect("list public models");
+        assert_eq!(
+            models,
+            vec![
+                "anthropic/claude-sonnet-4.6".to_string(),
+                "trustedrouter/auto".to_string(),
+                "trustedrouter/cheap".to_string(),
+                "trustedrouter/e2e".to_string(),
+                "trustedrouter/fast".to_string(),
+                "trustedrouter/free".to_string(),
+                "trustedrouter/zdr".to_string(),
+            ]
+        );
+        let priced = provider
+            .list_models_with_pricing()
+            .await
+            .expect("list public model pricing");
+        assert_eq!(priced.len(), 7);
+        let auto_model = priced
+            .iter()
+            .find(|m| m.id == "trustedrouter/auto")
+            .expect("trustedrouter/auto present in priced listing");
+        let pricing = auto_model
+            .pricing
+            .as_ref()
+            .expect("public catalog pricing must be preserved");
+        assert_eq!(pricing.prompt.as_deref(), Some("0.000000026375"));
+        assert_eq!(pricing.completion.as_deref(), Some("0.00000007385"));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            authorized.load(Ordering::SeqCst),
+            0,
+            "public TrustedRouter catalog requests must omit Authorization"
+        );
+
+        server.abort();
     }
 
     #[test]
