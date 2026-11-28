@@ -1,6 +1,7 @@
 import type { components } from "../lib/api-generated";
 
 export type StatusResponse = components["schemas"]["StatusResponse"];
+export type OpenRouterCredits = components["schemas"]["OpenRouterCreditsResponse"];
 
 export interface ProcessStats {
   rss_bytes: number;
