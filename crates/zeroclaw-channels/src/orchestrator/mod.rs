@@ -129,7 +129,7 @@ use zeroclaw_runtime::agent::execution_tree_budget::ExecutionTreeBudget;
 use zeroclaw_runtime::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
-    build_tool_instructions_from_specs, is_model_switch_requested, run_tool_call_loop,
+    build_tool_instructions_for_names, is_model_switch_requested, run_tool_call_loop,
     scope_session_key, scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::agent::system_prompt::build_skills_prompt_with_effective_tools;
@@ -1902,8 +1902,7 @@ fn is_stop_command(content: &str) -> bool {
 }
 
 fn stop_reply_message(msg: &ChannelMessage, reply: impl Into<String>) -> SendMessage {
-    // Operational /stop acks are system text, not conversational replies.
-    SendMessage::reply_to(msg, reply).suppress_voice()
+    SendMessage::reply_to(msg, reply)
 }
 
 /// Every XML-ish element name that opens a tool-CALL envelope, longest first so
@@ -3593,16 +3592,56 @@ fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -
     const SKILLS_END: &str = "</available_skills>";
     const WORKSPACE_HEADER: &str = "## Workspace\n\n";
 
-    if let Some(start) = base_prompt.find(SKILLS_HEADER)
-        && let Some(rel_end) = base_prompt[start..].find(SKILLS_END)
-    {
-        let end = start + rel_end + SKILLS_END.len();
-        let tail = base_prompt[end..]
-            .strip_prefix("\n\n")
-            .unwrap_or(&base_prompt[end..]);
+    if let Some(start) = base_prompt.find(SKILLS_HEADER) {
+        if let Some(rel_end) = base_prompt[start..].find(SKILLS_END) {
+            let end = start + rel_end + SKILLS_END.len();
+            let tail = base_prompt[end..]
+                .strip_prefix("\n\n")
+                .unwrap_or(&base_prompt[end..]);
+
+            let mut refreshed = String::with_capacity(
+                base_prompt.len().saturating_sub(end.saturating_sub(start))
+                    + refreshed_skills.len()
+                    + 2,
+            );
+            refreshed.push_str(&base_prompt[..start]);
+            if !refreshed_skills.is_empty() {
+                refreshed.push_str(refreshed_skills);
+                refreshed.push_str("\n\n");
+            }
+            refreshed.push_str(tail);
+            return refreshed;
+        }
+
+        // Truncated skills section: a startup-time cap landed inside it, so
+        // the closing marker (and usually the Workspace heading) is gone.
+        // Replace the remnant in place — up to the next known section
+        // boundary — so the refreshed section never migrates behind the
+        // mandatory additions: the turn-time cap reserves the whole tail from
+        // the delivery instructions or tool protocol onward, and optional
+        // skill bodies inside that reservation would blow the budget with
+        // the documented reserve-or-exceed fallback. Without a recognizable
+        // boundary the legacy append behavior stays: a prompt with no
+        // mandatory tail takes the plain cap, so nothing is reserved over
+        // the budget.
+        let remnant_end = [
+            base_prompt[start..]
+                .find(WORKSPACE_HEADER)
+                .map(|rel| start + rel),
+            channel_delivery_tail_start(base_prompt).filter(|&offset| offset > start),
+            base_prompt[start..]
+                .find(TEXT_TOOL_PROTOCOL_HEADER)
+                .map(|rel| start + rel),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(base_prompt.len());
 
         let mut refreshed = String::with_capacity(
-            base_prompt.len().saturating_sub(end.saturating_sub(start))
+            base_prompt
+                .len()
+                .saturating_sub(remnant_end.saturating_sub(start))
                 + refreshed_skills.len()
                 + 2,
         );
@@ -3611,7 +3650,7 @@ fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -
             refreshed.push_str(refreshed_skills);
             refreshed.push_str("\n\n");
         }
-        refreshed.push_str(tail);
+        refreshed.push_str(&base_prompt[remnant_end..]);
         return refreshed;
     }
 
@@ -3625,6 +3664,37 @@ fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -
         refreshed.push_str(refreshed_skills);
         refreshed.push_str("\n\n");
         refreshed.push_str(&base_prompt[workspace_start..]);
+        return refreshed;
+    }
+
+    // Neither the skills header nor the Workspace heading survived the
+    // startup cap: earlier tool, safety, or bootstrap content filled the
+    // retained budget, and the post-builder additions (text tool protocol,
+    // channel delivery instructions) were appended after the cut. Appending
+    // the refreshed skills after the cached prompt would place them behind
+    // that mandatory tail; the turn-time cap reserves the whole tail, and
+    // optional skill bodies inside the reservation would take the
+    // reserve-or-exceed fallback and blow the budget. Insert the refreshed
+    // section before the earliest mandatory block instead. Without a
+    // recognizable mandatory tail the legacy append behavior stays: a prompt
+    // with no mandatory tail takes the plain cap, so nothing is reserved
+    // over the budget.
+    let mandatory_start = [
+        channel_delivery_tail_start(base_prompt),
+        base_prompt.find(TEXT_TOOL_PROTOCOL_HEADER),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+    if let Some(start) = mandatory_start {
+        let mut refreshed = String::with_capacity(base_prompt.len() + refreshed_skills.len() + 2);
+        refreshed.push_str(&base_prompt[..start]);
+        if !refreshed.ends_with("\n\n") {
+            refreshed.push_str("\n\n");
+        }
+        refreshed.push_str(refreshed_skills);
+        refreshed.push_str("\n\n");
+        refreshed.push_str(&base_prompt[start..]);
         return refreshed;
     }
 
@@ -3862,6 +3932,182 @@ fn system_prompt_for_channel_turn(
     }
 }
 
+/// Heading that opens the text tool-call instructions appended after the
+/// base builder at startup (`build_tool_instructions_for_names`). The channel
+/// turn path never re-adds them, so they must survive every re-cap.
+const TEXT_TOOL_PROTOCOL_HEADER: &str = "## Tool Use Protocol\n\n";
+
+/// Heading that opens the tool listing inside the text tool-call
+/// instructions. An `rfind` hit on [`TEXT_TOOL_PROTOCOL_HEADER`] is only
+/// trusted when the tail after it actually carries this listing — skill or
+/// personality content can quote the bare header literal without being the
+/// runtime instruction block.
+const TEXT_TOOL_TOOLS_HEADER: &str = "### Available Tools\n\n";
+
+/// Opener of the per-channel delivery instructions block (`channel_delivery_
+/// instructions`). Native-tool providers have no text tool protocol tail, so
+/// these instructions are the mandatory tail the cap must reserve on their
+/// own — they carry the attachment/button formats the model must emit.
+const CHANNEL_DELIVERY_HEADER_PREFIX: &str = "When responding on ";
+
+/// Byte offset where the channel delivery instructions tail starts, or
+/// `None` when the prompt does not carry them. An `rfind` hit on the bare
+/// opener is only trusted when the tail actually carries the marker contract
+/// every channel block shares — skill or personality content can quote the
+/// opener literal without being the runtime instruction block.
+fn channel_delivery_tail_start(prompt: &str) -> Option<usize> {
+    let start = prompt.rfind(CHANNEL_DELIVERY_HEADER_PREFIX)?;
+    let tail = &prompt[start..];
+    ["attachment markers", "attachments use markers", "[IMAGE:"]
+        .iter()
+        .any(|marker| tail.contains(marker))
+        .then_some(start)
+}
+
+fn finalize_channel_system_prompt(ctx: &ChannelRuntimeContext, prompt: String) -> String {
+    cap_channel_system_prompt(
+        prompt,
+        ctx.agent_cfg.resolved.max_system_prompt_chars,
+        ctx.agent_alias.as_str(),
+    )
+}
+
+/// Re-apply the agent's `max_system_prompt_chars` budget to a channel system
+/// prompt that was modified after its startup-time finalization.
+///
+/// The cached channel prompt is finalized once at startup, but the turn path
+/// splices refreshed skill bodies (`system_prompt_for_channel_turn`) and
+/// appends per-message sections (channel signal, peer map, thinking prefix)
+/// without re-applying the cap. An agent whose skill catalogue overflows the
+/// cap therefore blew the context-budget guard on fresh sessions while
+/// established sessions kept using the in-cap cached prompt.
+/// `finalize_system_prompt` is a no-op when the prompt already fits and treats
+/// `max_chars == 0` as unlimited, so the established-session path is unchanged.
+///
+/// A plain head-retaining cap can land inside the startup-appended text
+/// tool-call instructions when a refreshed skill section grows the prompt past
+/// the budget, and nothing on the channel path restores them before the
+/// request reaches a non-native-spec provider. The tail from the last tool
+/// protocol heading (the instructions, plus the per-channel signal and peer
+/// map that follow them) is therefore reserved before capping — the same
+/// mechanism `finalize_base_reserving_additions` uses at startup, including
+/// its reserve-or-exceed fallback: a tail that alone meets the cap cannot be
+/// helped by a reservation, so the base keeps the full-budget cap and the
+/// whole tail is appended regardless, deliberately exceeding the cap rather
+/// than truncating the tool-call format away. A tail is only trusted as the
+/// instruction block when it actually carries the tool listing, so a skill or
+/// personality file that quotes the bare protocol heading collides with the
+/// sentinel harmlessly and takes the plain cap.
+///
+/// The same reservation covers the channel delivery instructions (attachment
+/// markers, Discord embed/button formats): they precede the protocol
+/// additions in every assembled prompt, and a native-tool provider has no
+/// text tool protocol tail at all — without the reservation the plain cap
+/// would cut exactly the output formats native tool schemas do not replace.
+/// The reserved tail starts at the earliest verified mandatory block.
+fn cap_channel_system_prompt(prompt: String, max_chars: usize, agent_alias: &str) -> String {
+    if max_chars > 0 {
+        let delivery_start = channel_delivery_tail_start(&prompt);
+        let protocol_start = prompt
+            .rfind(TEXT_TOOL_PROTOCOL_HEADER)
+            .filter(|&start| prompt[start..].contains(TEXT_TOOL_TOOLS_HEADER));
+        let tail_start = match (delivery_start, protocol_start) {
+            (Some(delivery), Some(protocol)) => Some(delivery.min(protocol)),
+            (Some(delivery), None) => Some(delivery),
+            (None, Some(protocol)) => Some(protocol),
+            (None, None) => None,
+        };
+        if let Some(start) = tail_start {
+            let (head, tail) = prompt.split_at(start);
+            return finalize_base_reserving_additions(
+                head.to_string(),
+                tail,
+                max_chars,
+                agent_alias,
+            );
+        }
+    }
+    zeroclaw_runtime::agent::system_prompt::finalize_system_prompt(prompt, max_chars)
+}
+
+/// Sections appended after the base prompt builder at startup: the text
+/// tool-call instructions, the deferred built-in section, and the
+/// tool-receipts addendum.
+///
+/// The base is capped with their length reserved
+/// (`finalize_base_reserving_additions`) so the head-retaining truncation
+/// never lands inside them — the channel turn path does not re-add them, and
+/// losing the text tool-call format would leave a non-native-spec provider
+/// without any call syntax.
+fn build_post_builder_additions(
+    expose_text_tool_protocol: bool,
+    tools_registry: &[Box<dyn Tool>],
+    effective_tool_names: &HashSet<&str>,
+    deferred_section: &str,
+    tool_receipts: &zeroclaw_config::schema::ToolReceiptsConfig,
+) -> String {
+    let mut additions = String::new();
+    if expose_text_tool_protocol {
+        additions.push_str(&build_tool_instructions_for_names(
+            tools_registry,
+            effective_tool_names,
+        ));
+    }
+    if !deferred_section.is_empty() {
+        additions.push('\n');
+        additions.push_str(deferred_section);
+    }
+    if tool_receipts.enabled && tool_receipts.inject_system_prompt {
+        additions.push_str(zeroclaw_runtime::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
+    }
+    additions
+}
+
+/// Finalize `base_prompt` against `max_system_prompt_chars` with enough budget
+/// reserved for `additions`, then append them intact.
+///
+/// The startup channel prompt appends text tool-call instructions, the
+/// deferred built-in section, and the tool-receipts addendum after the base
+/// prompt builder has already finalized, and the channel turn path re-applies
+/// the cap to a prompt whose protocol tail ends in the same instructions.
+/// Capping after the append would let the head-retaining truncation land
+/// inside those instructions, and the channel turn path never re-adds them —
+/// the model would silently lose the tool-call format. Reserving their length
+/// caps the base first so the additions survive whole. When the additions
+/// alone meet the cap no reservation can help and the base keeps the
+/// full-budget cap; the result may then exceed the cap, as it did before any
+/// capping existed. `max_chars == 0` is unlimited.
+fn finalize_base_reserving_additions(
+    base_prompt: String,
+    additions: &str,
+    max_chars: usize,
+    agent_alias: &str,
+) -> String {
+    let reserved = additions.chars().count();
+    let base_cap = max_chars.saturating_sub(reserved);
+    if max_chars > 0 && base_cap == 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "error_key": "prompt_cap_over_budget_overflow",
+                    "agent_alias": agent_alias,
+                    "budget_chars": max_chars,
+                    "reserved_chars": reserved,
+                })),
+            "Post-builder additions alone meet the prompt cap; keeping them whole exceeds the budget"
+        );
+    }
+    let capped = zeroclaw_runtime::agent::system_prompt::finalize_system_prompt(
+        base_prompt,
+        if base_cap > 0 { base_cap } else { max_chars },
+    );
+    let mut prompt = capped;
+    prompt.push_str(additions);
+    prompt
+}
+
 fn callable_protocol_exposed_for_channel_turn(
     native_tool_specs_present: bool,
     strict_tool_parsing: bool,
@@ -3883,17 +4129,14 @@ fn channel_tool_available_for_turn(
 }
 
 fn text_tool_protocol_advertised(system_prompt: &str) -> bool {
-    const PROTOCOL_HEADER: &str = "## Tool Use Protocol\n\n";
-    const TOOLS_HEADER: &str = "### Available Tools\n\n";
-
-    let Some(protocol_start) = system_prompt.rfind(PROTOCOL_HEADER) else {
+    let Some(protocol_start) = system_prompt.rfind(TEXT_TOOL_PROTOCOL_HEADER) else {
         return false;
     };
-    let protocol = &system_prompt[protocol_start + PROTOCOL_HEADER.len()..];
-    let Some(tools_start) = protocol.find(TOOLS_HEADER) else {
+    let protocol = &system_prompt[protocol_start + TEXT_TOOL_PROTOCOL_HEADER.len()..];
+    let Some(tools_start) = protocol.find(TEXT_TOOL_TOOLS_HEADER) else {
         return false;
     };
-    protocol[tools_start + TOOLS_HEADER.len()..]
+    protocol[tools_start + TEXT_TOOL_TOOLS_HEADER.len()..]
         .lines()
         .any(|line| line.starts_with("**") && line.contains("**:"))
 }
@@ -3915,7 +4158,7 @@ fn refresh_channel_history_skills(
     // has no room in scope, so re-deriving would drop the section entirely.
     let rendered_purpose =
         rendered_channel_purpose(system_message.content.as_str()).map(str::to_string);
-    system_message.content = system_prompt_for_channel_turn(
+    let refreshed = system_prompt_for_channel_turn(
         ctx,
         system_message.content.as_str(),
         force_refresh,
@@ -3923,6 +4166,9 @@ fn refresh_channel_history_skills(
         excluded_tools,
         rendered_purpose.as_deref(),
     );
+    // The splice above can exceed the agent's prompt cap the same way the
+    // fresh-session turn path can; re-apply it (no-op when within the cap).
+    system_message.content = finalize_channel_system_prompt(ctx, refreshed);
 }
 
 fn effective_non_cli_tool_names<'a>(
@@ -5214,7 +5460,7 @@ fn build_scope_override_summary(
         let scope_line = |scope: OverrideScope| -> String {
             overrides
                 .get(&scope_override_key(scope, msg, ctx.agent_alias.as_str()))
-                .map(fmt_sel)
+                .map(&fmt_sel)
                 .unwrap_or_else(|| "—".to_string())
         };
         (
@@ -5655,10 +5901,7 @@ async fn handle_runtime_command_for_delivery(
         ),
     };
 
-    if let Err(err) = channel
-        .send(&SendMessage::reply_to(msg, response).suppress_voice())
-        .await
-    {
+    if let Err(err) = channel.send(&SendMessage::reply_to(msg, response)).await {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -9850,6 +10093,11 @@ async fn process_channel_message_body(
     if let Some(ref prefix) = thinking.params.system_prompt_prefix {
         system_prompt = format!("{prefix}\n\n{system_prompt}");
     }
+    // Re-apply the agent's prompt cap after every post-startup modification
+    // (skill refresh splice, channel signal, peer map, thinking prefix). The
+    // startup prompt is finalized once, but the splices above can grow it far
+    // past the cap on fresh sessions; finalize is a no-op when it still fits.
+    let system_prompt = finalize_channel_system_prompt(ctx.as_ref(), system_prompt);
     // Captured before the tool-call loop can drop whole turns, so the
     // post-loop resync below can detect that a trim happened.
     let prior_turns_len_before_loop = prior_turns.len();
@@ -14069,7 +14317,11 @@ fn build_channel_by_id(
         "voice-call" => {
             #[cfg(feature = "channel-voice-call")]
             {
-                let (alias, vc) = bare_voice_call_instance(&config)
+                let (alias, vc) = config
+                    .channels
+                    .voice_call
+                    .iter()
+                    .next()
                     .context("Voice Call channel is not configured")?;
                 Ok(Arc::new(VoiceCallChannel::new(alias.clone(), vc.clone())))
             }
@@ -14082,22 +14334,6 @@ fn build_channel_by_id(
     }
 }
 
-/// The voice-call instance a bare `voice-call` id names. Voice call has no
-/// `default` alias convention, so the one-shot builder and the off-switch
-/// check both resolve it here: the first enabled instance by alias, else the
-/// first configured one, so a setup whose only instance is off is refused by
-/// name rather than reported as missing.
-fn bare_voice_call_instance(
-    config: &Config,
-) -> Option<(&String, &zeroclaw_config::scattered_types::VoiceCallConfig)> {
-    let instances = &config.channels.voice_call;
-    instances
-        .iter()
-        .filter(|(_, vc)| vc.enabled)
-        .min_by_key(|(alias, _)| alias.as_str())
-        .or_else(|| instances.iter().min_by_key(|(alias, _)| alias.as_str()))
-}
-
 /// Send a one-off message to a configured channel.
 pub async fn send_channel_message(
     config: &Config,
@@ -14105,22 +14341,6 @@ pub async fn send_channel_message(
     recipient: &str,
     message: &str,
 ) -> Result<()> {
-    // A bare id names the instance the one-shot builder uses: `default`, or
-    // for voice call the instance `bare_voice_call_instance` picks.
-    let (channel_type, alias) = match channel_id.split_once('.') {
-        Some((channel_type, alias)) => (channel_type.to_ascii_lowercase(), alias.to_string()),
-        None => {
-            let channel_type = channel_id.to_ascii_lowercase();
-            let alias = if matches!(channel_type.as_str(), "voice-call" | "voice_call") {
-                bare_voice_call_instance(config)
-                    .map_or_else(|| "default".to_string(), |(alias, _)| alias.clone())
-            } else {
-                "default".to_string()
-            };
-            (channel_type, alias)
-        }
-    };
-    refuse_disabled_channel_instance(config, &channel_type, &alias)?;
     // Wrap into a private one-shot storage for the builder; the snapshot
     // is dropped immediately after send and never enters a supervised
     // publication domain.
@@ -17098,23 +17318,6 @@ tokio::task_local! {
     static CHANNEL_STARTUP_PROBE: Arc<ChannelStartupProbe>;
 }
 
-fn channel_prompt_tool_spec(tool: &dyn Tool) -> zeroclaw_api::tool::ToolSpec {
-    let spec = tool.spec();
-    zeroclaw_runtime::tools::SendViaTool::channel_prompt_spec(&spec).unwrap_or(spec)
-}
-
-fn build_channel_text_tool_instructions(
-    tools: &[Box<dyn Tool>],
-    effective_tool_names: &HashSet<&str>,
-) -> String {
-    build_tool_instructions_from_specs(
-        tools
-            .iter()
-            .filter(|tool| effective_tool_names.contains(tool.name()))
-            .map(|tool| channel_prompt_tool_spec(tool.as_ref())),
-    )
-}
-
 /// Start supervised channels with the shared live-config authority and the
 /// daemon generation's plugin-webhook route registry.
 #[allow(clippy::too_many_lines)]
@@ -17340,10 +17543,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
 
         let tool_specs: Vec<(String, String)> = built_tools
             .iter()
-            .map(|t| {
-                let spec = channel_prompt_tool_spec(t.as_ref());
-                (spec.name, spec.description)
-            })
+            .map(|t| (t.name().to_string(), t.description().to_string()))
             .collect();
 
         let tools_registry = Arc::new(built_tools);
@@ -17479,7 +17679,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             &pinned_section,
         );
         let callable_protocol_exposed = native_tools || expose_text_tool_protocol;
-        let mut system_prompt = build_system_prompt_with_mode_and_effective_tools(
+        let system_prompt = build_system_prompt_with_mode_and_effective_tools(
             &workspace,
             &model,
             &tool_descs,
@@ -17496,20 +17696,19 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             config.channels.show_tool_calls,
             runtime.shell_profile().as_ref(),
         );
-        if expose_text_tool_protocol {
-            system_prompt.push_str(&build_channel_text_tool_instructions(
-                tools_registry.as_ref(),
-                &effective_tool_names,
-            ));
-        }
-        if !deferred_section.is_empty() {
-            system_prompt.push('\n');
-            system_prompt.push_str(&deferred_section);
-        }
-        if agent.resolved.tool_receipts.enabled && agent.resolved.tool_receipts.inject_system_prompt
-        {
-            system_prompt.push_str(zeroclaw_runtime::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
-        }
+        let post_builder_additions = build_post_builder_additions(
+            expose_text_tool_protocol,
+            tools_registry.as_ref(),
+            &effective_tool_names,
+            &deferred_section,
+            &agent.resolved.tool_receipts,
+        );
+        let system_prompt = finalize_base_reserving_additions(
+            system_prompt,
+            &post_builder_additions,
+            agent.resolved.max_system_prompt_chars,
+            agent_alias,
+        );
 
         if channels_by_name_shared.is_none() {
             if !skills.is_empty() {
@@ -17998,47 +18197,6 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
     Ok(())
 }
 
-/// Refuse an outbound send through a channel instance whose config block
-/// says `enabled = false`. The listener collector skips such an instance, but
-/// cron announcements and one-off sends build a transport from config without
-/// a live instance, so the switch is honoured here, once for every channel
-/// type. An instance with no config block passes, and is left to the
-/// caller's own "not configured" error.
-fn refuse_disabled_channel_instance(
-    config: &Config,
-    channel_type: &str,
-    alias: &str,
-) -> anyhow::Result<()> {
-    // The `[channels.<table>]` a delivery name reads: Feishu is configured
-    // under Lark, and the WhatsApp spellings under `whatsapp`.
-    let table = match channel_type {
-        "feishu" => "lark",
-        "whatsapp-web" | "whatsapp_web" => "whatsapp",
-        other => other,
-    }
-    .replace('-', "_");
-    let disabled = config.channels_by_alias().iter().any(|info| {
-        info.channel_type.replace('-', "_") == table && info.alias == alias && !info.enabled
-    });
-    if !disabled {
-        return Ok(());
-    }
-    ::zeroclaw_log::record!(
-        ERROR,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-            .with_attrs(::serde_json::json!({"channel": format!("{table}.{alias}")})),
-        &format!("[channels.{table}.{alias}] is disabled; set enabled = true to deliver")
-    );
-    anyhow::bail!(
-        "{}",
-        channel_runtime_cli_string_with_args(
-            "cli-channels-delivery-disabled",
-            &[("table", table.as_str()), ("alias", alias)],
-        )
-    )
-}
-
 pub async fn deliver_announcement(
     config: &zeroclaw_config::schema::Config,
     channel: &str,
@@ -18077,7 +18235,6 @@ pub async fn deliver_announcement(
         ))
     })?;
     let channel_type = raw_type.to_ascii_lowercase();
-    refuse_disabled_channel_instance(config, &channel_type, alias)?;
     #[allow(unused_variables)]
     let not_configured = || {
         ::zeroclaw_log::record!(
@@ -18220,6 +18377,21 @@ pub async fn deliver_announcement(
         #[cfg(feature = "channel-qq")]
         "qq" => {
             let qq = config.channels.qq.get(alias).ok_or_else(not_configured)?;
+            // The listener collector skips a disabled alias, but cron and
+            // one-off delivery reach this arm without a live instance, so the
+            // off switch has to be honored here before the transport is built.
+            if !qq.enabled {
+                let message =
+                    format!("[channels.qq.{alias}] is disabled; set enabled = true to deliver");
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"channel": format!("qq.{alias}")})),
+                    &message
+                );
+                anyhow::bail!("{message}");
+            }
             let peers = config.channel_external_peers("qq", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
@@ -20432,82 +20604,6 @@ fn channel_trim_resync_preserves_a_concurrent_workers_later_turn_across_eviction
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-
-    #[test]
-    fn non_native_channel_prompt_keeps_send_via_routing_without_faking_a_turn() {
-        let workspace = make_workspace();
-        let tool = zeroclaw_runtime::tools::SendViaTool::new(
-            Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
-            Arc::new(parking_lot::RwLock::new(HashMap::new())),
-            Arc::new(HashMap::new),
-        );
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(tool)];
-        let names: HashSet<&str> = tools.iter().map(|tool| tool.name()).collect();
-        let before = tools[0].parameters_schema();
-        assert_eq!(before["required"], serde_json::json!(["target", "body"]));
-        let owned: Vec<_> = tools
-            .iter()
-            .map(|tool| channel_prompt_tool_spec(tool.as_ref()))
-            .collect();
-        let mut descriptions: Vec<(&str, &str)> = owned
-            .iter()
-            .map(|spec| (spec.name.as_str(), spec.description.as_str()))
-            .collect();
-        let mut deferred = String::new();
-        assert!(apply_text_tool_prompt_policy(
-            false,
-            false,
-            &mut descriptions,
-            &mut deferred
-        ));
-        let mut prompt = build_system_prompt_with_mode_and_autonomy(
-            workspace.path(),
-            "fixture-model",
-            &descriptions,
-            &[],
-            None,
-            None,
-            None,
-            false,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
-            false,
-            0,
-            false,
-            false,
-            None,
-        );
-        prompt.push_str(&build_channel_text_tool_instructions(&tools, &names));
-        assert!(prompt.contains("Without `body`"));
-        assert!(prompt.contains("routing instruction"));
-        assert!(!prompt.contains("this task has no active channel"));
-        let parameters = prompt
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix("Parameters: `")
-                    .and_then(|s| s.strip_suffix('`'))
-            })
-            .expect("rendered parameters");
-        let schema: serde_json::Value = serde_json::from_str(parameters).expect("valid schema");
-        assert!(
-            schema.get("required").is_none(),
-            "channel routing can omit body"
-        );
-        // Static projection must not alter shared tool metadata or install a
-        // routing owner. Gateway WebSocket/background builders stay headless.
-        assert_eq!(tools[0].parameters_schema(), before);
-        let background =
-            zeroclaw_runtime::agent::loop_::build_tool_instructions_for_names(&tools, &names);
-        assert!(background.contains("this task has no active channel"));
-        assert_eq!(
-            tools[0].parameters_schema()["required"],
-            serde_json::json!(["target", "body"])
-        );
-        assert!(
-            !zeroclaw_runtime::tools::TURN_ROUTING
-                .try_with(|handle| handle.is_some())
-                .unwrap_or(false)
-        );
-    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn ingress_task_tracker_reaps_completed_tasks_before_spawning() {
@@ -22808,52 +22904,10 @@ temperature = 0.3
             },
         );
 
-        // A predecessor still serving `first`: an instance that is cancelled
-        // or fails before publishing must neither replace nor remove it.
-        struct PredecessorOwner;
-        impl zeroclaw_api::conversation_binding::ConversationBindingOwner for PredecessorOwner {
-            fn load(
-                &self,
-                _binding: &zeroclaw_api::conversation_binding::ConversationBinding,
-            ) -> anyhow::Result<Vec<zeroclaw_api::model_provider::ChatMessage>> {
-                Ok(Vec::new())
-            }
-            fn append(
-                &self,
-                _binding: &zeroclaw_api::conversation_binding::ConversationBinding,
-                _messages: &[zeroclaw_api::model_provider::ChatMessage],
-            ) -> anyhow::Result<()> {
-                Ok(())
-            }
-        }
-        let first_owner = || {
-            zeroclaw_infra::conversation_owners::conversation_owner(
-                zeroclaw_api::conversation_binding::ConversationSurface::Channel,
-                "first",
-            )
-        };
-        let same_owner = |a: &Arc<
-            dyn zeroclaw_api::conversation_binding::ConversationBindingOwner,
-        >,
-                          b: &Arc<
-            dyn zeroclaw_api::conversation_binding::ConversationBindingOwner,
-        >| {
-            std::ptr::eq(Arc::as_ptr(a).cast::<()>(), Arc::as_ptr(b).cast::<()>())
-        };
-
         // Exercise preparation cancellation, cancellation at the writer wait,
         // a later agent's failure, and a clean retry through the same entrypoint.
         for scenario in ["preparing", "writer-wait", "later-agent-failure", "retry"] {
             prepare_live_channel_registry(true);
-            let predecessor: Arc<dyn zeroclaw_api::conversation_binding::ConversationBindingOwner> =
-                Arc::new(PredecessorOwner);
-            let mut predecessor_lease = Some(
-                zeroclaw_infra::conversation_owners::publish_conversation_owner(
-                    zeroclaw_api::conversation_binding::ConversationSurface::Channel,
-                    "first",
-                    Arc::clone(&predecessor),
-                ),
-            );
             let mut attempt_config = config.clone();
             if scenario == "later-agent-failure" {
                 let mut invalid = attempt_config.agents["first"].clone();
@@ -22907,10 +22961,6 @@ temperature = 0.3
                 0,
                 "{scenario}: listener started during preparation"
             );
-            assert!(
-                first_owner().is_some_and(|owner| same_owner(&owner, &predecessor)),
-                "{scenario}: conversation owner replaced during preparation"
-            );
             if scenario == "preparing" || scenario == "writer-wait" {
                 let lock = zeroclaw_config::write_lock::shared_config_write_lock();
                 let guard = lock.lock().await;
@@ -22932,10 +22982,6 @@ temperature = 0.3
                     .unwrap();
                 assert!(live_channel_map().is_empty());
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
-                assert!(
-                    first_owner().is_some_and(|owner| same_owner(&owner, &predecessor)),
-                    "{scenario}: a cancelled instance replaced or removed the serving owner"
-                );
                 drop(guard);
             } else if scenario == "later-agent-failure" {
                 probe.release.notify_one();
@@ -22947,10 +22993,6 @@ temperature = 0.3
                 assert!(format!("{error:#}").contains("second"));
                 assert!(live_channel_map().is_empty());
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
-                assert!(
-                    first_owner().is_some_and(|owner| same_owner(&owner, &predecessor)),
-                    "{scenario}: a failed instance replaced or removed the serving owner"
-                );
             } else {
                 probe.release.notify_one();
                 tokio::time::timeout(Duration::from_secs(5), async {
@@ -22962,18 +23004,6 @@ temperature = 0.3
                 .unwrap();
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
                 assert!(live_channel_map().contains_key("startup-probe.startup-probe"));
-                assert!(
-                    first_owner().is_some_and(|owner| !same_owner(&owner, &predecessor)),
-                    "a published instance serves `first` itself"
-                );
-                // The order that matters in production: the successor is
-                // serving when the replaced instance shuts down and drops its
-                // lease. The successor must stay published.
-                drop(predecessor_lease.take());
-                assert!(
-                    first_owner().is_some_and(|owner| !same_owner(&owner, &predecessor)),
-                    "the replaced instance's lease removed its successor"
-                );
                 cancel.cancel();
                 tokio::time::timeout(Duration::from_secs(5), task)
                     .await
@@ -22981,18 +23011,7 @@ temperature = 0.3
                     .unwrap()
                     .unwrap();
                 assert!(live_channel_map().is_empty());
-                assert!(
-                    first_owner().is_none(),
-                    "a stopped instance leaves no owner behind"
-                );
             }
-            // Cleanup: where the stand-in was never replaced, its still-current
-            // lease removes it, so no owner leaks into the next scenario.
-            drop(predecessor_lease.take());
-            assert!(
-                first_owner().is_none(),
-                "{scenario}: an owner was left published"
-            );
         }
     }
 
@@ -39225,7 +39244,7 @@ BTC is currently around $65,000 based on latest tool output."#
             let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
             let effective_tool_names: HashSet<&str> =
                 tools_registry.iter().map(|tool| tool.name()).collect();
-            prompt.push_str(&build_channel_text_tool_instructions(
+            prompt.push_str(&build_tool_instructions_for_names(
                 &tools_registry,
                 &effective_tool_names,
             ));
@@ -46690,72 +46709,6 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_full_email_reply_chain(&reply);
     }
 
-    #[test]
-    fn stop_reply_message_suppresses_voice() {
-        let message = zeroclaw_api::channel::ChannelMessage {
-            id: "msg-stop".to_string(),
-            sender: "alice".to_string(),
-            reply_target: "chat-42".to_string(),
-            content: "/stop".to_string(),
-            channel: "telegram".into(),
-            channel_alias: None,
-            timestamp: 1,
-            thread_ts: None,
-            interruption_scope_id: None,
-            attachments: vec![],
-            subject: None,
-            ..Default::default()
-        };
-        let reply = stop_reply_message(&message, "stop requested");
-        assert!(
-            reply.suppress_voice,
-            "/stop acknowledgements must stay out of conversational TTS"
-        );
-        assert_eq!(reply.recipient, "chat-42");
-        assert!(!reply.force_voice);
-    }
-
-    #[tokio::test]
-    async fn runtime_command_responses_suppress_voice() {
-        // /thinking and other operational replies share one send site; they
-        // must not enter conversational voice routing (Telegram TTS / voice-
-        // only peers).
-        let channel_impl = Arc::new(SendMessageRecordingChannel::telegram(false));
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut ctx = channel_runtime_context_for_defaults_test(
-            tmp.path(),
-            "agentX",
-            "openrouter.default",
-            "default-model",
-        );
-        ctx.channels_by_name = Arc::new(HashMap::from([(
-            channel.name().to_string(),
-            Arc::clone(&channel),
-        )]));
-
-        let mut msg = scope_test_msg("alice", "telegram", None);
-        msg.content = "/thinking high".into();
-        assert!(
-            handle_runtime_command_if_needed(&ctx, &msg, Some(&channel)).await,
-            "runtime command should be handled"
-        );
-
-        let sent = channel_impl.sent_messages.lock().await;
-        assert_eq!(
-            sent.len(),
-            1,
-            "expected one operational reply, got {sent:?}"
-        );
-        assert!(
-            sent[0].suppress_voice,
-            "runtime-command reply must suppress voice, got {:?}",
-            sent[0]
-        );
-        assert!(!sent[0].force_voice);
-        assert_eq!(sent[0].recipient, msg.reply_target);
-    }
-
     #[tokio::test]
     async fn dispatch_agent_scope_rejects_when_no_peer_groups_configured() {
         // Default config (no peer_groups) — every sender must be denied.
@@ -47881,6 +47834,801 @@ BTC is currently around $65,000 based on latest tool output."#
         run_channel_dispatch_test(|| {
             Box::pin(assert_process_channel_message_refreshes_available_skills_after_new_session())
         });
+    }
+
+    async fn assert_process_channel_message_reapplies_prompt_cap_after_skill_refresh() {
+        const PROMPT_CAP: usize = 4_000;
+
+        let workspace = make_workspace();
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            ..Default::default()
+        };
+        config.skills.open_skills_enabled = false;
+        config.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+
+        // Startup state: no skills on disk yet, so the cached prompt is built
+        // under the cap and finalized once, exactly like a running daemon.
+        // The provider is a non-native-spec capture mock with strict tool
+        // parsing disabled and no deferred built-ins, so the startup path
+        // appends the text tool-call instructions after the base builder and
+        // caps the base with their length reserved — the exact production
+        // shape this test guards.
+        let raw_tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedMockTool("read_skill"))];
+        let effective_tool_names: HashSet<&str> = HashSet::from(["read_skill"]);
+        let initial_skills =
+            zeroclaw_runtime::skills::load_skills_with_config(workspace.path(), &config);
+        let startup_base_prompt = build_system_prompt_with_mode_and_effective_tools(
+            workspace.path(),
+            "test-model",
+            &[],
+            |_| false,
+            &initial_skills,
+            None,
+            None,
+            None,
+            false,
+            config.skills.prompt_injection_mode,
+            false,
+            PROMPT_CAP,
+            true,
+            false,
+            None,
+        );
+        let startup_additions =
+            build_tool_instructions_for_names(&raw_tools, &effective_tool_names);
+        assert!(
+            !startup_additions.is_empty(),
+            "scenario setup: the startup additions must carry the text tool protocol"
+        );
+        let initial_system_prompt = finalize_base_reserving_additions(
+            startup_base_prompt,
+            &startup_additions,
+            PROMPT_CAP,
+            "test-agent",
+        );
+        assert!(
+            initial_system_prompt.chars().count() <= PROMPT_CAP,
+            "startup prompt must respect the cap"
+        );
+        assert!(
+            text_tool_protocol_advertised(&initial_system_prompt),
+            "startup prompt must advertise the complete text tool protocol"
+        );
+        assert_eq!(
+            initial_system_prompt
+                .matches("This is an interactive conversation with a user")
+                .count(),
+            1,
+            "startup prompt must carry exactly one timestamp orientation"
+        );
+
+        // After startup, a skill lands whose inlined Full-mode body far
+        // exceeds the cap — the 27.10.2026 incident shape: a fresh session
+        // splices all skill bodies into the cached prompt without re-applying
+        // the cap and the context-budget guard rejects the turn.
+        let skill_dir = workspace.path().join("skills").join("oversized");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let bulky_instructions = format!(
+            "Oversized skill instructions.\n{}",
+            "detail line ".repeat(2_000)
+        );
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            format!(
+                "prompts = [{bulky_instructions:?}]\n\
+                 [skill]\n\
+                 name = \"oversized\"\n\
+                 description = \"A skill whose body exceeds the prompt cap\"\n\
+                 version = \"1\"\n"
+            ),
+        )
+        .unwrap();
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: provider_impl.clone(),
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig {
+                resolved: zeroclaw_config::schema::ResolvedRuntime {
+                    max_system_prompt_chars: PROMPT_CAP,
+                    strict_tool_parsing: false,
+                    ..zeroclaw_config::schema::ResolvedRuntime::default()
+                },
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            }),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(raw_tools),
+            ),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new(initial_system_prompt),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
+            ))),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(config.data_dir.clone()),
+            prompt_config: Arc::new(config.clone()),
+            live_config: zeroclaw_config::live::LiveConfig::new(config.clone()).handle(),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(vec!["read_skill".to_string()]),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
+            security: Arc::new(SecurityPolicy::default()),
+            sop_driver_sink: None,
+        });
+
+        // Reproduce the incident shape: the per-turn refresh splices the
+        // oversized skill body into the cached prompt and the result exceeds
+        // the agent's cap — this is the prompt that previously reached the
+        // provider unchecked.
+        let refreshed = refreshed_skills_system_prompt(
+            runtime_ctx.as_ref(),
+            runtime_ctx.system_prompt.as_str(),
+            false,
+            &[],
+        );
+        assert!(
+            refreshed.contains("Oversized skill instructions."),
+            "the refresh must splice the oversized skill body"
+        );
+        assert!(
+            refreshed.chars().count() > PROMPT_CAP,
+            "scenario setup: the refreshed prompt ({} chars) must exceed the cap",
+            refreshed.chars().count()
+        );
+
+        // Provider-switch re-splices (refresh_channel_history_skills) must
+        // respect the cap too, not only the fresh-turn assembly path.
+        let mut switched_history = vec![ChatMessage::system(
+            runtime_ctx.system_prompt.as_str().to_string(),
+        )];
+        refresh_channel_history_skills(
+            runtime_ctx.as_ref(),
+            &mut switched_history,
+            true,
+            false,
+            &[],
+        );
+        let switched_prompt = &switched_history[0].content;
+        assert!(
+            switched_prompt.chars().count() <= PROMPT_CAP,
+            "provider-switch refresh must re-apply the prompt cap; got {} chars",
+            switched_prompt.chars().count()
+        );
+        assert!(
+            text_tool_protocol_advertised(switched_prompt),
+            "the provider-switch re-cap must retain the complete text tool protocol"
+        );
+        assert!(
+            switched_prompt.contains("**read_skill**"),
+            "the provider-switch re-cap must retain the whole tool listing"
+        );
+        assert_eq!(
+            switched_prompt
+                .matches("This is an interactive conversation with a user")
+                .count(),
+            1,
+            "the provider-switch-refreshed prompt must carry exactly one timestamp orientation"
+        );
+
+        // Fresh sender: the turn path splices the oversized skill section and
+        // must hand the provider a capped system prompt.
+        Box::pin(process_channel_message(
+            runtime_ctx.clone(),
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-fresh".to_string(),
+                sender: "new-sender".to_string(),
+                reply_target: "chat-cap".to_string(),
+                content: "hello".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        ))
+        .await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // De-brittled: assert on the last provider call instead of assuming
+        // exactly one, and on its first message being the system prompt.
+        let last_call = calls
+            .last()
+            .expect("the fresh turn should reach the provider at least once");
+        let (role, delivered_prompt) = &last_call[0];
+        assert_eq!(
+            role, "system",
+            "the first message of the last call must be the system prompt"
+        );
+        assert!(
+            delivered_prompt.chars().count() <= PROMPT_CAP,
+            "system prompt delivered to the provider ({} chars) must respect the \
+             {PROMPT_CAP}-char cap after the skill refresh splice",
+            delivered_prompt.chars().count()
+        );
+        assert!(
+            text_tool_protocol_advertised(delivered_prompt),
+            "the turn-time re-cap must retain the complete text tool protocol"
+        );
+        assert!(
+            delivered_prompt.contains("**read_skill**"),
+            "the turn-time re-cap must retain the whole tool listing"
+        );
+        assert_eq!(
+            delivered_prompt
+                .matches("This is an interactive conversation with a user")
+                .count(),
+            1,
+            "the capped prompt must carry exactly one timestamp orientation"
+        );
+    }
+
+    #[test]
+    fn process_channel_message_reapplies_prompt_cap_after_skill_refresh() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_reapplies_prompt_cap_after_skill_refresh())
+        });
+    }
+
+    #[test]
+    fn startup_prompt_cap_reserves_post_builder_tool_instructions() {
+        const PROMPT_CAP: usize = 2_000;
+        const TOOL_FORMAT_OPEN: &str = "TOOL_FORMAT_OPEN";
+        const TOOL_FORMAT_CLOSE: &str = "TOOL_FORMAT_CLOSE";
+
+        // A finalized base prompt that already fills the cap, like the startup
+        // builder produces for a heavy Full-mode skill catalogue.
+        let workspace = make_workspace();
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            ..Default::default()
+        };
+        config.skills.open_skills_enabled = false;
+        config.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+        let skill_dir = workspace.path().join("skills").join("cap-filler");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let bulky_instructions = format!(
+            "Cap filler skill instructions.\n{}",
+            "filler line ".repeat(2_000)
+        );
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            format!(
+                "prompts = [{bulky_instructions:?}]\n\
+                 [skill]\n\
+                 name = \"cap-filler\"\n\
+                 description = \"Fills the prompt cap\"\n\
+                 version = \"1\"\n"
+            ),
+        )
+        .unwrap();
+        let skills = zeroclaw_runtime::skills::load_skills_with_config(workspace.path(), &config);
+        let base = build_system_prompt_with_mode_and_effective_tools(
+            workspace.path(),
+            "test-model",
+            &[],
+            |_| false,
+            &skills,
+            None,
+            None,
+            None,
+            false,
+            config.skills.prompt_injection_mode,
+            false,
+            PROMPT_CAP,
+            true,
+            false,
+            None,
+        );
+        assert_eq!(
+            base.chars().count(),
+            PROMPT_CAP,
+            "scenario setup: the finalized base prompt must fill the cap"
+        );
+
+        // What the startup path appends after the builder: the text tool-call
+        // format instructions for a provider without native tool specs.
+        let additions = format!(
+            "{TOOL_FORMAT_OPEN}\nCall tools as **tool_name**: {{\"arg\": \"value\"}}\n\
+             Every call must use this exact format.\n{TOOL_FORMAT_CLOSE}"
+        );
+        assert!(
+            base.chars().count() > PROMPT_CAP - additions.chars().count(),
+            "scenario setup: appending the instructions must exceed the cap"
+        );
+
+        let prompt = finalize_base_reserving_additions(base, &additions, PROMPT_CAP, "test-agent");
+
+        assert!(
+            prompt.chars().count() <= PROMPT_CAP,
+            "assembled prompt ({} chars) must stay within the cap",
+            prompt.chars().count()
+        );
+        assert!(
+            prompt.contains(TOOL_FORMAT_OPEN) && prompt.contains(TOOL_FORMAT_CLOSE),
+            "the tool-call format instructions must survive the cap whole"
+        );
+        assert!(
+            prompt.ends_with(&additions),
+            "the additions must be appended intact after the capped base"
+        );
+        assert_eq!(
+            prompt
+                .matches("This is an interactive conversation with a user")
+                .count(),
+            1,
+            "the capped prompt must carry exactly one timestamp orientation"
+        );
+    }
+
+    #[test]
+    fn channel_prompt_cap_ignores_tool_protocol_header_quoted_in_skill_content() {
+        const PROMPT_CAP: usize = 2_000;
+
+        // A skill or personality body that quotes the bare protocol heading
+        // collides with the sentinel. The split must not treat it as the
+        // runtime instruction block, so the prompt takes the plain cap like
+        // any other content.
+        let quoted = format!(
+            "Skill body quoting the heading.\n\n{TEXT_TOOL_PROTOCOL_HEADER}\
+             This is a user-authored literal without a tool listing."
+        );
+        let mut prompt = "x".repeat(PROMPT_CAP);
+        prompt.push_str(&quoted);
+        assert!(
+            prompt.chars().count() > PROMPT_CAP,
+            "scenario setup: the assembled prompt must exceed the cap"
+        );
+
+        let capped = cap_channel_system_prompt(prompt, PROMPT_CAP, "test-agent");
+
+        assert!(
+            capped.chars().count() <= PROMPT_CAP,
+            "a tail without the tool listing is content, not instructions; the \
+             plain cap applies (got {} chars)",
+            capped.chars().count()
+        );
+        assert!(
+            !capped.contains("## Tool Use Protocol"),
+            "the quoted heading must not be reserved as the runtime protocol tail"
+        );
+    }
+
+    #[test]
+    fn channel_prompt_cap_keeps_whole_tool_protocol_tail_at_or_over_cap() {
+        const PROMPT_CAP: usize = 500;
+
+        // A tail carrying the actual tool listing is the instruction block
+        // even when it alone meets or exceeds the cap: the base is capped on
+        // the full budget and the tail is appended whole (reserve-or-exceed),
+        // never head-cut through the protocol.
+        let mut tail_at_cap = String::from(TEXT_TOOL_PROTOCOL_HEADER);
+        tail_at_cap.push_str(TEXT_TOOL_TOOLS_HEADER);
+        tail_at_cap.push_str("**read_skill**: Read a skill.\nParameters: `{}`\n");
+        let pad = PROMPT_CAP - tail_at_cap.chars().count();
+        tail_at_cap.push_str(&"y".repeat(pad));
+        assert_eq!(
+            tail_at_cap.chars().count(),
+            PROMPT_CAP,
+            "scenario setup: the tail must land exactly on the cap"
+        );
+        let mut tail_over_cap = String::from(TEXT_TOOL_PROTOCOL_HEADER);
+        tail_over_cap.push_str(TEXT_TOOL_TOOLS_HEADER);
+        tail_over_cap.push_str(&format!(
+            "**read_skill**: Read a skill.\nParameters: `{}`\n{}",
+            "{}",
+            "detail ".repeat(120)
+        ));
+
+        for (label, tail) in [("at the cap", tail_at_cap), ("over the cap", tail_over_cap)] {
+            let prompt = "z".repeat(101) + tail.as_str();
+            let capped = cap_channel_system_prompt(prompt, PROMPT_CAP, "test-agent");
+            assert!(
+                capped.ends_with(&tail),
+                "{label}: the protocol tail must survive whole (reserve-or-exceed)"
+            );
+            assert!(
+                text_tool_protocol_advertised(&capped),
+                "{label}: the capped prompt must still advertise the complete text tool protocol"
+            );
+            assert!(
+                capped.chars().count() > PROMPT_CAP,
+                "{label}: the documented over-budget result must exceed the cap \
+                 rather than truncate the protocol"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_startup_skills_section_replaces_in_place_before_protocol() {
+        const PROMPT_CAP: usize = 2_000;
+
+        // Startup for a heavy Full-mode catalogue: the base fills the cap,
+        // and reserving the post-builder additions truncates the cached base
+        // inside the skills section — the closing marker is gone.
+        let workspace = make_workspace();
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            ..Default::default()
+        };
+        config.skills.open_skills_enabled = false;
+        config.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+        let skill_dir = workspace.path().join("skills").join("cap-filler");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let bulky_instructions = format!(
+            "Cap filler skill instructions.\n{}",
+            "filler line ".repeat(2_000)
+        );
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            format!(
+                "prompts = [{bulky_instructions:?}]\n\
+                 [skill]\n\
+                 name = \"cap-filler\"\n\
+                 description = \"Fills the prompt cap\"\n\
+                 version = \"1\"\n"
+            ),
+        )
+        .unwrap();
+        let skills = zeroclaw_runtime::skills::load_skills_with_config(workspace.path(), &config);
+        let base = build_system_prompt_with_mode_and_effective_tools(
+            workspace.path(),
+            "test-model",
+            &[],
+            |_| false,
+            &skills,
+            None,
+            None,
+            None,
+            false,
+            config.skills.prompt_injection_mode,
+            false,
+            PROMPT_CAP,
+            true,
+            false,
+            None,
+        );
+        let additions = format!(
+            "{TEXT_TOOL_PROTOCOL_HEADER}{TEXT_TOOL_TOOLS_HEADER}\
+             **read_skill**: Read a skill.\nParameters: {{`args`}}\n"
+        );
+        let cached = finalize_base_reserving_additions(base, &additions, PROMPT_CAP, "test-agent");
+        assert!(
+            cached.contains("## Available Skills"),
+            "scenario setup: the skills header must survive the startup cap"
+        );
+        assert!(
+            !cached.contains("</available_skills>"),
+            "scenario setup: the startup cap must truncate the skills section \
+             before its closing marker"
+        );
+
+        // Turn time: the refresh replaces the remnant in place, ahead of the
+        // tool protocol, instead of appending after it.
+        let refreshed = "## Available Skills\n\n<available_skills>\n\n- **tiny**: A tiny skill.\n\n\
+             </available_skills>\n\n";
+        let spliced = replace_available_skills_section(&cached, refreshed);
+        let skills_at = spliced.find("## Available Skills").unwrap();
+        let protocol_at = spliced.find(TEXT_TOOL_PROTOCOL_HEADER).unwrap();
+        assert!(
+            skills_at < protocol_at,
+            "the refreshed skills must stay ahead of the tool protocol, not \
+             migrate into the reserved tail"
+        );
+        assert!(
+            !spliced.contains("filler line"),
+            "the truncated remnant between the skills header and the protocol \
+             must be replaced, not preserved"
+        );
+
+        // The re-cap then reserves only the mandatory tail: protocol intact,
+        // total within the cap because the mandatory additions fit.
+        let capped = cap_channel_system_prompt(spliced, PROMPT_CAP, "test-agent");
+        assert!(
+            text_tool_protocol_advertised(&capped),
+            "the re-cap must retain the complete text tool protocol"
+        );
+        assert!(
+            capped.chars().count() <= PROMPT_CAP,
+            "the spliced and re-capped prompt ({} chars) must respect the cap \
+             when the mandatory additions fit",
+            capped.chars().count()
+        );
+    }
+
+    #[test]
+    fn truncated_startup_prompt_before_skills_header_inserts_refresh_before_protocol() {
+        const PROMPT_CAP: usize = 2_000;
+
+        // Startup where earlier content fills the retained budget: the base
+        // builder's tool catalogue (one tool carrying a long description)
+        // pushes the skills section past the cap, so the startup reservation
+        // cuts before the skills header — neither `## Available Skills` nor
+        // `## Workspace` survives — and appends the tool protocol after.
+        let workspace = make_workspace();
+        let mut config = Config {
+            data_dir: workspace.path().to_path_buf(),
+            ..Default::default()
+        };
+        config.skills.open_skills_enabled = false;
+        config.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full;
+        let skill_dir = workspace.path().join("skills").join("tiny");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            "prompts = [\"Tiny skill instructions.\"]\n\
+             [skill]\n\
+             name = \"tiny\"\n\
+             description = \"A tiny skill\"\n\
+             version = \"1\"\n",
+        )
+        .unwrap();
+        let skills = zeroclaw_runtime::skills::load_skills_with_config(workspace.path(), &config);
+        let bulky_description = "tool detail ".repeat(300);
+        let tools = [("shell", bulky_description.as_str())];
+        let base = build_system_prompt_with_mode_and_effective_tools(
+            workspace.path(),
+            "test-model",
+            &tools,
+            |_| false,
+            &skills,
+            None,
+            None,
+            None,
+            false,
+            config.skills.prompt_injection_mode,
+            false,
+            PROMPT_CAP,
+            true,
+            false,
+            None,
+        );
+        let additions = format!(
+            "{TEXT_TOOL_PROTOCOL_HEADER}{TEXT_TOOL_TOOLS_HEADER}\
+             **read_skill**: Read a skill.\nParameters: {{`args`}}\n"
+        );
+        let cached = finalize_base_reserving_additions(base, &additions, PROMPT_CAP, "test-agent");
+        assert!(
+            !cached.contains("## Available Skills"),
+            "scenario setup: the startup cap must cut before the skills header"
+        );
+        assert!(
+            !cached.contains("## Workspace"),
+            "scenario setup: the startup cap must cut before the Workspace heading"
+        );
+        assert!(
+            cached.ends_with(&additions),
+            "scenario setup: the reserved protocol must be appended after the capped base"
+        );
+
+        // Turn time: an oversized refresh must insert the refreshed section
+        // ahead of the mandatory tail, not append it behind the protocol —
+        // otherwise the re-cap's reservation swallows the optional skill
+        // bodies and the reserve-or-exceed fallback exceeds the budget.
+        let refreshed = format!(
+            "## Available Skills\n\n<available_skills>\n\n- **bulky**: A bulky skill.\n\n{}\
+             </available_skills>\n\n",
+            "skill body ".repeat(300)
+        );
+        let spliced = replace_available_skills_section(&cached, &refreshed);
+        let skills_at = spliced.find("## Available Skills").unwrap();
+        let protocol_at = spliced.find(TEXT_TOOL_PROTOCOL_HEADER).unwrap();
+        assert!(
+            skills_at < protocol_at,
+            "the refreshed skills must stay ahead of the tool protocol even \
+             when neither startup header survived"
+        );
+        assert!(
+            !spliced[protocol_at..].contains("</available_skills>"),
+            "no refreshed skill content may migrate behind the reserved protocol tail"
+        );
+        assert!(
+            spliced.chars().count() > PROMPT_CAP,
+            "scenario setup: the oversized refresh must exceed the cap so the \
+             re-cap has to cut"
+        );
+
+        let capped = cap_channel_system_prompt(spliced, PROMPT_CAP, "test-agent");
+        assert!(
+            text_tool_protocol_advertised(&capped),
+            "the re-cap must retain the complete text tool protocol"
+        );
+        assert!(
+            capped.ends_with(&additions),
+            "the re-cap must keep the whole protocol tail, not cut into it"
+        );
+        assert!(
+            capped.chars().count() <= PROMPT_CAP,
+            "the spliced and re-capped prompt ({} chars) must respect the cap \
+             when the mandatory additions fit",
+            capped.chars().count()
+        );
+    }
+
+    #[test]
+    fn channel_prompt_cap_reserves_delivery_instructions_without_text_tool_protocol() {
+        const PROMPT_CAP: usize = 2_000;
+
+        // A native-tool provider has no text tool protocol tail: a cap-filling
+        // cached prompt plus the Telegram delivery block must still keep the
+        // attachment markers — the plain head cap would cut exactly the output
+        // formats native tool schemas do not replace. The cap is sized above
+        // the delivery block so the reservation fits inside the budget; the
+        // reserve-or-exceed fallback for a tail that alone meets the cap is
+        // covered by the protocol test above.
+        let delivery = channel_delivery_instructions("telegram")
+            .expect("telegram delivery instructions must exist");
+        assert!(
+            delivery.chars().count() < PROMPT_CAP,
+            "scenario setup: the cap must accommodate the delivery block"
+        );
+        let mut prompt = "n".repeat(PROMPT_CAP);
+        prompt.push_str("\n\n");
+        prompt.push_str(delivery);
+        assert!(
+            prompt.chars().count() > PROMPT_CAP,
+            "scenario setup: the assembled prompt must exceed the cap"
+        );
+
+        let capped = cap_channel_system_prompt(prompt, PROMPT_CAP, "test-agent");
+
+        assert!(
+            capped.chars().count() <= PROMPT_CAP,
+            "the capped prompt ({} chars) must respect the cap",
+            capped.chars().count()
+        );
+        assert!(
+            capped.contains("[IMAGE:<path-or-url>]"),
+            "the delivery instructions' attachment markers must survive the cap whole"
+        );
+        assert!(
+            capped.contains("When responding on Telegram:"),
+            "the delivery instructions opener must survive the cap whole"
+        );
+    }
+
+    #[test]
+    fn channel_prompt_cap_ignores_delivery_opener_quoted_without_markers() {
+        const PROMPT_CAP: usize = 500;
+
+        // A skill or personality body that quotes the bare delivery opener
+        // collides with the sentinel. Without the marker contract the tail is
+        // content, not instructions, so the plain cap applies.
+        let mut prompt = "x".repeat(PROMPT_CAP);
+        prompt.push_str(
+            "\n\nSkill body quoting the opener.\n\nWhen responding on nothing in particular.",
+        );
+        assert!(
+            prompt.chars().count() > PROMPT_CAP,
+            "scenario setup: the assembled prompt must exceed the cap"
+        );
+
+        let capped = cap_channel_system_prompt(prompt, PROMPT_CAP, "test-agent");
+
+        assert!(
+            capped.chars().count() <= PROMPT_CAP,
+            "a quoted opener without the marker contract must not be reserved \
+             (got {} chars)",
+            capped.chars().count()
+        );
+        assert!(
+            !capped.contains("quoting the opener"),
+            "the plain cap keeps the head and cuts the quoted tail"
+        );
+    }
+
+    #[test]
+    fn startup_prompt_composition_builds_additions_reserved_against_cap() {
+        const PROMPT_CAP: usize = 2_000;
+
+        // The production startup composition builds its post-builder additions
+        // through one function; the cap must reserve that function's output so
+        // the text tool protocol survives whole.
+        let raw_tools: Vec<Box<dyn Tool>> = vec![Box::new(NamedMockTool("read_skill"))];
+        let effective_tool_names: HashSet<&str> = HashSet::from(["read_skill"]);
+        let additions = build_post_builder_additions(
+            true,
+            &raw_tools,
+            &effective_tool_names,
+            "",
+            &zeroclaw_config::schema::ToolReceiptsConfig::default(),
+        );
+        assert!(
+            additions.contains(TEXT_TOOL_PROTOCOL_HEADER)
+                && additions.contains("### Available Tools"),
+            "the composed additions must carry the text tool protocol"
+        );
+
+        let base = "b".repeat(PROMPT_CAP);
+        let prompt = finalize_base_reserving_additions(base, &additions, PROMPT_CAP, "test-agent");
+        assert!(
+            prompt.ends_with(&additions),
+            "the startup composition must reserve the additions so they survive whole"
+        );
+        assert!(
+            prompt.chars().count() <= PROMPT_CAP,
+            "the assembled prompt ({} chars) must stay within the cap",
+            prompt.chars().count()
+        );
     }
 
     #[tokio::test]
@@ -58291,174 +59039,6 @@ Done."#;
             !msg.contains("unsupported delivery channel"),
             "disabled alias must reach the QQ arm; got: {msg}"
         );
-    }
-
-    /// A config whose email, Telegram and webhook `work` instances are set
-    /// up but switched off. Every endpoint is a refused loopback port, so a
-    /// regressed guard fails the send instead of reaching a real service.
-    fn config_with_disabled_work_instances(enabled: bool) -> zeroclaw_config::schema::Config {
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.channels.email.insert(
-            "work".to_string(),
-            zeroclaw_config::scattered_types::EmailConfig {
-                enabled,
-                smtp_host: Some("127.0.0.1".to_string()),
-                smtp_port: 1,
-                smtp_tls: false,
-                from_address: Some("bot@example.invalid".to_string()),
-                ..Default::default()
-            },
-        );
-        config.channels.telegram.insert(
-            "work".to_string(),
-            zeroclaw_config::schema::TelegramConfig {
-                enabled,
-                bot_token: "123:test".to_string(),
-                api_base_url: "http://127.0.0.1:1".to_string(),
-                ..Default::default()
-            },
-        );
-        config.channels.webhook.insert(
-            "work".to_string(),
-            zeroclaw_config::schema::WebhookConfig {
-                enabled,
-                send_url: Some("http://127.0.0.1:1/out".to_string()),
-                max_retries: Some(0),
-                ..Default::default()
-            },
-        );
-        config
-    }
-
-    #[tokio::test]
-    async fn deliver_announcement_rejects_a_disabled_instance_of_every_type() {
-        let config = config_with_disabled_work_instances(false);
-        for (channel, table) in [
-            ("email.work", "[channels.email.work]"),
-            ("telegram.work", "[channels.telegram.work]"),
-            ("webhook.work", "[channels.webhook.work]"),
-        ] {
-            let err = deliver_announcement(&config, channel, "someone@example.invalid", None, "hi")
-                .await
-                .expect_err("a disabled instance must not be delivered to");
-            let msg = format!("{err:#}");
-            assert!(
-                msg.contains(&format!(
-                    "{table} is disabled; set enabled = true to deliver"
-                )),
-                "{channel}: {msg}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn deliver_announcement_still_sends_through_an_enabled_instance() {
-        let config = config_with_disabled_work_instances(true);
-        for channel in ["email.work", "telegram.work", "webhook.work"] {
-            // The refused loopback port fails the send itself; what matters
-            // is that the off-switch refusal is not what stopped it.
-            let msg =
-                match deliver_announcement(&config, channel, "someone@example.invalid", None, "hi")
-                    .await
-                {
-                    Ok(()) => String::new(),
-                    Err(err) => format!("{err:#}"),
-                };
-            assert!(!msg.contains("is disabled"), "{channel}: {msg}");
-        }
-    }
-
-    #[test]
-    fn the_off_switch_is_read_from_the_table_a_delivery_name_uses() {
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.channels.lark.insert(
-            "work".to_string(),
-            zeroclaw_config::schema::LarkConfig {
-                enabled: false,
-                ..Default::default()
-            },
-        );
-        config.channels.whatsapp.insert(
-            "default".to_string(),
-            zeroclaw_config::schema::WhatsAppConfig {
-                enabled: false,
-                ..Default::default()
-            },
-        );
-        for (channel_type, alias, table) in [
-            ("lark", "work", "[channels.lark.work]"),
-            ("feishu", "work", "[channels.lark.work]"),
-            ("whatsapp", "default", "[channels.whatsapp.default]"),
-            ("whatsapp-web", "default", "[channels.whatsapp.default]"),
-            ("whatsapp_web", "default", "[channels.whatsapp.default]"),
-        ] {
-            let err = refuse_disabled_channel_instance(&config, channel_type, alias)
-                .expect_err("a disabled instance is refused");
-            assert!(
-                err.to_string().contains(&format!("{table} is disabled")),
-                "{channel_type}.{alias}: {err}"
-            );
-        }
-        // No config block: left to the arm's own "not configured" error.
-        refuse_disabled_channel_instance(&config, "telegram", "work")
-            .expect("an unconfigured instance is not refused here");
-    }
-
-    #[tokio::test]
-    async fn a_bare_voice_call_send_honours_the_switch_of_the_instance_it_would_use() {
-        // Voice call has no `default` alias: a bare `voice-call` id names the
-        // instance the builder picks, so the switch is read from that one.
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.channels.voice_call.insert(
-            "main".to_string(),
-            zeroclaw_config::scattered_types::VoiceCallConfig {
-                enabled: false,
-                ..Default::default()
-            },
-        );
-        let err = send_channel_message(&config, "voice-call", "+15550100", "hi")
-            .await
-            .expect_err("the only voice-call instance is off");
-        assert!(
-            format!("{err:#}").contains("[channels.voice_call.main] is disabled"),
-            "{err:#}"
-        );
-
-        // An enabled instance is preferred over a disabled one.
-        config.channels.voice_call.insert(
-            "backup".to_string(),
-            zeroclaw_config::scattered_types::VoiceCallConfig {
-                enabled: true,
-                ..Default::default()
-            },
-        );
-        assert_eq!(
-            bare_voice_call_instance(&config).map(|(alias, _)| alias.as_str()),
-            Some("backup")
-        );
-    }
-
-    #[tokio::test]
-    async fn a_one_off_send_by_bare_id_honours_the_default_instance_switch() {
-        let mut config = zeroclaw_config::schema::Config::default();
-        config.channels.telegram.insert(
-            "default".to_string(),
-            zeroclaw_config::schema::TelegramConfig {
-                enabled: false,
-                bot_token: "123:test".to_string(),
-                api_base_url: "http://127.0.0.1:1".to_string(),
-                ..Default::default()
-            },
-        );
-        for channel_id in ["telegram", "telegram.default"] {
-            let err = send_channel_message(&config, channel_id, "12345", "hi")
-                .await
-                .expect_err("a disabled instance must not be sent to");
-            assert!(
-                format!("{err:#}").contains("[channels.telegram.default] is disabled"),
-                "{channel_id}: {err:#}"
-            );
-        }
     }
 
     #[tokio::test]
