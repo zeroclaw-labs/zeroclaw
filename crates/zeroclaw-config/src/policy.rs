@@ -3994,6 +3994,29 @@ fn split_powershell_pipeline_syntax(command: &str) -> Option<Vec<String>> {
                     segments.push(segment.to_string());
                     current.clear();
                 }
+                // PowerShell also ends a token at vertical tab, form feed, NEL,
+                // and every Unicode space, line, or paragraph separator, and it
+                // reads U+2018-U+201B as single quotes and U+201C-U+201E as
+                // double quotes. This grammar and the checks after it only know
+                // ASCII spaces, tabs, and quotes, so they would disagree with
+                // PowerShell about where a token starts. Fail closed.
+                ch if ch.is_whitespace() || ('\u{2018}'..='\u{201e}').contains(&ch) => {
+                    return None;
+                }
+                // `@` starts splatting, an array subexpression, a hashtable, or
+                // a here-string only where PowerShell starts a token: at the
+                // start of an argument, after a `-Name:` parameter, after a `,`
+                // array separator, or after a `$name.member` read. Inside a bare
+                // argument it is literal text (`user@example.com`); a following
+                // `(`, `{`, or quote is still rejected by its own arm or the
+                // mixed-token check.
+                '@' if token_has_bare
+                    && !token_body.ends_with([',', ':'])
+                    && !token_body.contains('$') =>
+                {
+                    token_body.push(ch);
+                    current.push(ch);
+                }
                 // These characters introduce expressions, statements,
                 // redirection, splatting, or alternate invocation forms.
                 ';' | '\r' | '\n' | '&' | '(' | ')' | '{' | '}' | '[' | ']' | '<' | '>' | '@' => {
@@ -7268,6 +7291,112 @@ mod tests {
         assert!(split_powershell_pipeline_syntax("cat \"env:path\"").is_some());
         assert!(split_powershell_pipeline_syntax("cat 'env:path'").is_some());
         assert!(split_powershell_pipeline_syntax("cat \"my file.txt\"").is_some());
+    }
+
+    #[test]
+    fn powershell_grammar_accepts_at_sign_inside_a_bare_argument() {
+        // PowerShell treats `@` as splatting, an array subexpression, a
+        // hashtable, or a here-string only where a token starts. Inside a bare
+        // argument it is ordinary text, so an email address or a `user@host`
+        // target reaches the native command unchanged.
+        for command in [
+            "himalaya message compose --to user@example.com --body test",
+            "git log --author=dev@example.com",
+            "ssh deploy@build-host uptime",
+            "echo a@b@c",
+            "echo -to=@literal",
+        ] {
+            assert!(
+                split_powershell_pipeline_syntax(command).is_some(),
+                "a mid-argument `@` is literal text: {command}"
+            );
+        }
+
+        // Where PowerShell starts a new token at `@`, the grammar still fails
+        // closed: at the start of an argument or command, after a `-Name:`
+        // parameter, and after the `,` array separator.
+        for command in [
+            "echo @args",
+            "@args",
+            "echo hi | @args",
+            "echo @'",
+            "echo -InputObject:@args",
+            "echo a,@args",
+            "echo @(Get-Item env:path)",
+            "echo @{a=1}",
+            "echo a@(Get-Item env:path)",
+            "echo a@{a=1}",
+            "echo a@\"x\"",
+            // PowerShell ends a token at these whitespace characters and at a
+            // typographic quote, and after a `$name.member` read, so the `@`
+            // that follows starts a splat.
+            "ls\u{a0}@HOME",
+            "ls\u{b}@HOME",
+            "ls\u{c}@HOME",
+            "ls\u{3000}@HOME",
+            "ls \u{2018}x\u{2019}@HOME",
+            "echo $a.b@HOME",
+        ] {
+            assert_eq!(
+                split_powershell_pipeline_syntax(command),
+                None,
+                "`@` that starts a PowerShell token must be rejected: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_treats_powershell_email_argument_like_any_other_argument() {
+        // An allowlisted command that takes an email address must reach the
+        // same gates as the command without it, not fail the allowlist.
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["himalaya".into()],
+            require_approval_for_medium_risk: true,
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+        let plain = "himalaya message compose --body test";
+        let with_email = "himalaya message compose --to user@example.com --body test";
+
+        for approved in [false, true] {
+            let expected =
+                p.validate_command_execution_for_shell(plain, approved, ShellDialect::PowerShell);
+            let actual = p.validate_command_execution_for_shell(
+                with_email,
+                approved,
+                ShellDialect::PowerShell,
+            );
+            assert_eq!(actual, expected, "approved={approved}");
+            if let Err(error) = actual {
+                assert!(
+                    !error.contains("not allowed by security policy"),
+                    "an email address argument must not fail the allowlist: {error}"
+                );
+            }
+        }
+        assert!(
+            p.validate_command_execution_for_shell(with_email, true, ShellDialect::PowerShell)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_blocks_powershell_splat_after_unicode_whitespace() {
+        // PowerShell splits `ls<U+00A0>@HOME` into `ls` and the splat `@HOME`.
+        // The default policy must refuse it rather than see one bare argument.
+        let p = default_policy();
+        for approved in [false, true] {
+            let denied = p.validate_command_execution_for_shell(
+                "ls\u{a0}@HOME",
+                approved,
+                ShellDialect::PowerShell,
+            );
+            assert!(
+                denied.is_err(),
+                "a splat after U+00A0 must be refused, approved={approved}, got {denied:?}"
+            );
+        }
     }
 
     #[test]
