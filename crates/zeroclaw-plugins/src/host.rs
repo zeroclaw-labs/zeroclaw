@@ -241,6 +241,34 @@ impl PluginHost {
             std::fs::create_dir_all(plugins_dir)?;
         }
 
+        Self::discover_with_filter(plugins_dir, signature_mode, trusted_publisher_keys, |_| {
+            true
+        })
+    }
+
+    /// Admit only the requested package names under the normal discovery policy.
+    /// Other packages' manifests can be read to identify them, but their
+    /// components are neither read nor retained.
+    pub fn from_selected_plugins(
+        plugins_dir: &Path,
+        signature_mode: SignatureMode,
+        trusted_publisher_keys: Vec<String>,
+        packages: &HashSet<&str>,
+    ) -> Result<Self, PluginError> {
+        Self::discover_with_filter(
+            plugins_dir,
+            signature_mode,
+            trusted_publisher_keys,
+            |name| packages.contains(name),
+        )
+    }
+
+    fn discover_with_filter(
+        plugins_dir: &Path,
+        signature_mode: SignatureMode,
+        trusted_publisher_keys: Vec<String>,
+        include: impl Fn(&str) -> bool,
+    ) -> Result<Self, PluginError> {
         let mut host = Self {
             plugins_dir: plugins_dir.to_path_buf(),
             recovery_root: std::sync::OnceLock::new(),
@@ -248,8 +276,7 @@ impl PluginHost {
             signature_mode,
             trusted_publisher_keys,
         };
-
-        host.discover()?;
+        host.loaded = host.discovered_matching(include)?;
         Ok(host)
     }
 
@@ -295,25 +322,15 @@ impl PluginHost {
         })
     }
 
-    /// Discover plugins in the plugins directory.
-    fn discover(&mut self) -> Result<(), PluginError> {
-        self.loaded = self.discovered()?;
-        Ok(())
-    }
-
     /// The packages discovery admits from the plugins directory as it is now.
     fn discovered(&self) -> Result<HashMap<String, LoadedPlugin>, PluginError> {
-        self.discovered_named(None)
+        self.discovered_matching(|_| true)
     }
 
-    /// What [`Self::discovered`] admits, restricted to the entries whose
-    /// manifest names `only` when it is given. Every check after a manifest is
-    /// read is keyed by that manifest's name, so skipping the other names
-    /// leaves the outcome for `only` as full discovery decides it, without
-    /// reading any other package's component.
-    fn discovered_named(
+    /// Filter by manifest name before reading or verifying a component.
+    fn discovered_matching(
         &self,
-        only: Option<&str>,
+        include: impl Fn(&str) -> bool,
     ) -> Result<HashMap<String, LoadedPlugin>, PluginError> {
         let mut loaded = HashMap::new();
         if !self.plugins_dir.exists() {
@@ -336,7 +353,7 @@ impl PluginHost {
                 if manifest_path.exists()
                     && let Ok((manifest, manifest_toml)) = self.load_manifest(&manifest_path)
                 {
-                    if only.is_some_and(|only| manifest.name != only) {
+                    if !include(&manifest.name) {
                         continue;
                     }
                     if let Err(e) = validate_manifest_shape(&manifest, &path) {
@@ -408,7 +425,9 @@ impl PluginHost {
     /// now, judged as discovery would judge it, without reading any other
     /// package. [`set_loaded`] records it.
     fn rediscovered(&self, name: &str) -> Result<Option<LoadedPlugin>, PluginError> {
-        Ok(self.discovered_named(Some(name))?.remove(name))
+        Ok(self
+            .discovered_matching(|candidate| candidate == name)?
+            .remove(name))
     }
 
     fn load_manifest(&self, path: &Path) -> Result<(PluginManifest, String), PluginError> {
@@ -4529,6 +4548,22 @@ capabilities = ["tool"]
         );
         assert_eq!(details[0].0.name, "with-wasm");
         assert_eq!(details[0].1.bytes(), b"\0asm");
+    }
+
+    #[test]
+    fn selected_discovery_admits_only_requested_packages() {
+        let dir = tempdir().unwrap();
+        write_unsigned_tool_plugin(dir.path(), "requested");
+        write_unsigned_tool_plugin(dir.path(), "unrelated");
+        let host = PluginHost::from_selected_plugins(
+            dir.path(),
+            SignatureMode::Disabled,
+            Vec::new(),
+            &HashSet::from(["requested"]),
+        )
+        .unwrap();
+        assert!(host.admitted_component("requested").is_some());
+        assert!(host.manifest("unrelated").is_none());
     }
 
     #[test]

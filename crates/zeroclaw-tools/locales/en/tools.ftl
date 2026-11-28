@@ -290,6 +290,18 @@ tool-a2a-cancel-desc-peer = Configured peer name hosting the task.
 tool-a2a-cancel-desc-task-id = The task id to cancel.
 tool-a2a-cancel-desc-agent = Optional agent alias or tenant that created the task (from a2a_send). Helps route the cancel to the correct interface when discovery is re-run (the cached route is used first).
 
+# Scoped HTTP credentials
+tool-http-credential-store = Credential store unavailable
+tool-http-credential-missing = Scoped HTTP credential unavailable
+tool-http-credential-invalid = Invalid stored HTTP credential
+tool-http-credential-origin = Scoped HTTP credential does not allow this HTTPS origin
+tool-http-credential-argument = 'credential' must be a string
+tool-http-credential-host = A custom Host header is forbidden when using a scoped credential.
+tool-http-credential-alias = Credential alias must contain 1 to 64 ASCII letters, numbers, underscores, or hyphens.
+tool-http-credential-not-granted = HTTP Request is not authorized to use this credential
+tool-http-request-authenticated-response-truncated = [Truncated authenticated response omitted]
+tool-http-credential-exclusive = Choose credential or auth_secret, not both
+
 tool-send-via-error-no-active-reply = No active channel reply to redirect. To start or resume a conversation, call send_via with both `target` and a non-empty `body`.
 
 tool-send-via-description-background =

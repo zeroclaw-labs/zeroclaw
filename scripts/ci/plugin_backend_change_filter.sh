@@ -46,6 +46,8 @@ while IFS= read -r path; do
         tests/channel_egress_e2e.rs|\
         tests/component/plugin_info_cli.rs|tests/component/plugin_update_cli.rs|\
         crates/zeroclaw-gateway/src/plugin_webhook*|\
+        crates/zeroclaw-gateway/src/api_config.rs|\
+        crates/zeroclaw-gateway/src/principal_gate.rs|\
         crates/zeroclaw-gateway/src/lib.rs|\
         crates/zeroclaw-gateway/Cargo.toml|\
         crates/zeroclaw-gateway/tests/golden*|\

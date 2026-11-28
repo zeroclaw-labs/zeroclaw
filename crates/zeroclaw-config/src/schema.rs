@@ -9336,6 +9336,77 @@ pub struct HttpRequestConfig {
     #[credential_class = "encrypted_secret"]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub secrets: HashMap<String, String>,
+    /// Encrypted, origin-bound HTTP credentials managed by the operator.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub scoped_credentials: HashMap<String, String>,
+}
+
+/// The plaintext record exists only inside the operator endpoint and HTTP tool.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopedHttpCredential {
+    pub origin: String,
+    #[serde(default)]
+    pub http_allowed: bool,
+    pub auth: ScopedHttpAuth,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ScopedHttpAuth {
+    ApiKey {
+        value: String,
+        #[serde(default)]
+        header: ScopedApiKeyHeader,
+    },
+    UserPassword {
+        username: String,
+        password: String,
+    },
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopedApiKeyHeader {
+    #[default]
+    Bearer,
+    XApiKey,
+    Token,
+}
+
+impl ScopedHttpCredential {
+    pub fn https_origin(raw: &str) -> Option<String> {
+        let mut url = url::Url::parse(raw).ok()?;
+        if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+            return None;
+        }
+        // Match the HTTP destination policy's DNS-root normalization before
+        // the encrypted record is saved and whenever an origin is compared.
+        let host = url.host_str()?.trim_end_matches('.').to_string();
+        if host.is_empty() {
+            return None;
+        }
+        url.set_host(Some(&host)).ok()?;
+        Some(url.origin().ascii_serialization())
+    }
+
+    pub fn configured_https_origin(raw: &str) -> Option<String> {
+        let url = url::Url::parse(raw).ok()?;
+        if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+            return None;
+        }
+        Self::https_origin(raw)
+    }
+
+    pub fn valid_name(name: &str) -> bool {
+        (1..=64).contains(&name.len())
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    }
 }
 
 impl Default for HttpRequestConfig {
@@ -9348,6 +9419,7 @@ impl Default for HttpRequestConfig {
             allow_private_hosts: false,
             allowed_private_hosts: vec![],
             secrets: HashMap::new(),
+            scoped_credentials: HashMap::new(),
         }
     }
 }
@@ -28294,6 +28366,18 @@ fn apply_dirty_path(
         return apply_dirty_map_key_path(root, &section, dotted, full_table, default_table);
     }
 
+    // Credential aliases are opaque and case-sensitive. An alias deleted
+    // from memory must not resolve to a differently spelled sibling.
+    if let ["http_request", "scoped_credentials", alias] = raw.as_slice() {
+        write_or_delete_leaf(
+            root,
+            full_table,
+            default_table,
+            &["http_request", "scoped_credentials", alias],
+        );
+        return Ok(());
+    }
+
     // Resolve each segment against the in-memory table: struct fields
     // serialize as snake_case (so `input-per-mtok` → `input_per_mtok`), but
     // HashMap keys are preserved verbatim and may legitimately carry hyphens
@@ -28513,10 +28597,19 @@ fn apply_dirty_natural_key_path(
         // because two parallel walks (in-memory vs on-disk) drifted apart;
         // a forked copy here would recreate exactly that hazard, so any
         // future fix to dash handling lands in both code paths at once.
-        let inner_segments: Vec<String> = match mem_entry {
-            Some(table) => resolve_dirty_segments(table, &inner_raw),
-            None => inner_raw.iter().map(|s| (*s).to_string()).collect(),
-        };
+        // A deleted dotted map key is only present in the persisted entry.
+        let disk_entry = find_array_of_tables_entry_mut(
+            root,
+            parent_segs,
+            array_key,
+            section.natural_key_field,
+            alias,
+        );
+        let inner_segments = resolve_dirty_segments_from_sources(
+            mem_entry,
+            disk_entry.map(|table| table as &dyn toml_edit::TableLike),
+            &inner_raw,
+        );
         let inner_segs: Vec<&str> = inner_segments.iter().map(String::as_str).collect();
 
         let mem_inner_val = mem_entry.and_then(|t| lookup_path_in_table(t, &inner_segs));
@@ -56778,5 +56871,57 @@ model_provider = \"ollama.default\"
         duplicate_route
             .validate()
             .expect("legacy duplicate route hints remain valid");
+    }
+}
+
+#[cfg(test)]
+mod scoped_credential_dirty_paths {
+    use super::apply_dirty_path;
+
+    #[test]
+    fn deleting_dash_alias_preserves_underscore_sibling() {
+        let mut document =
+            "[http_request.scoped_credentials]\nTEST-KEY = 'old'\nTEST_KEY = 'neighbor'\n"
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap();
+        let memory = "[http_request.scoped_credentials]\nTEST_KEY = 'neighbor'\n"
+            .parse::<toml::Table>()
+            .unwrap();
+        apply_dirty_path(
+            document.as_table_mut(),
+            "http_request.scoped_credentials.TEST-KEY",
+            &memory,
+            &toml::Table::new(),
+        )
+        .unwrap();
+        let aliases = &document["http_request"]["scoped_credentials"];
+        assert!(aliases.get("TEST-KEY").is_none());
+        assert_eq!(aliases["TEST_KEY"].as_str(), Some("neighbor"));
+    }
+}
+
+#[cfg(test)]
+mod scoped_http_origin_regressions {
+    use super::ScopedHttpCredential;
+
+    #[test]
+    fn trailing_dns_root_dots_share_the_runtime_http_origin() {
+        for (raw, expected) in [
+            ("https://API.EXAMPLE.COM./", "https://api.example.com"),
+            (
+                "https://api.example.com...:8443/",
+                "https://api.example.com:8443",
+            ),
+            ("https://[::1]:8443/", "https://[::1]:8443"),
+        ] {
+            assert_eq!(
+                ScopedHttpCredential::https_origin(raw).as_deref(),
+                Some(expected)
+            );
+        }
+        assert!(
+            ScopedHttpCredential::configured_https_origin("https://api.example.com./v1").is_none()
+        );
+        assert!(ScopedHttpCredential::https_origin("https://./").is_none());
     }
 }

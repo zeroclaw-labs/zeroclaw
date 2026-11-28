@@ -1383,6 +1383,63 @@ export interface MapKeyResponse {
   created: boolean;
 }
 
+export type HttpCredentialKind = "user_password" | "api_key";
+export type HttpCredentialRow = {
+  name: string;
+  origin: string;
+  kind: HttpCredentialKind;
+  header?: "bearer" | "x_api_key" | "token" | null;
+  http_allowed: boolean;
+};
+type HttpCredentialAuth =
+  | { kind: "user_password"; username: string; password: string }
+  | { kind: "api_key"; value: string; header: "bearer" | "x_api_key" | "token" };
+
+const httpCredentialsPath = "/api/config/http-credentials";
+
+export function listHttpCredentials() {
+  return apiFetch<{ encryption_enabled: boolean; credentials: HttpCredentialRow[] }>(
+    httpCredentialsPath,
+  );
+}
+
+export function changeHttpCredential(mutation:
+  | { name: string; operation: "create" | "replace"; credential: { origin: string; auth: HttpCredentialAuth } }
+  | { name: string; operation: "replace"; permissions: { http_allowed: boolean } }
+  | { name: string; operation: "delete" }
+) {
+  return apiFetch<void>(httpCredentialsPath, { method: "POST", body: JSON.stringify(mutation) });
+}
+
+export interface PluginTlsCredential {
+  instance: string;
+  property: string;
+  configured: boolean;
+  profiles: Record<string, string[]>;
+}
+
+const pluginTlsCredentialsPath = "/api/config/plugin-tls-credentials";
+
+export function listPluginTlsCredentials() {
+  return apiFetch<{ encryption_enabled: boolean; credentials: PluginTlsCredential[] }>(
+    pluginTlsCredentialsPath,
+  );
+}
+
+export function changePluginTlsCredential(
+  credential: Pick<PluginTlsCredential, "instance" | "property">,
+  mutation: { operation: "create" | "replace"; value: string } | { operation: "delete" },
+) {
+  return apiFetch<{ configured: boolean }>(pluginTlsCredentialsPath, {
+    method: "POST",
+    body: JSON.stringify({
+      instance: credential.instance,
+      property: credential.property,
+      ...mutation,
+    }),
+  });
+}
+
 // ── Shared workspace browse ────────────────────────────────────────
 // Hard-scoped to `<install>/shared/`. The gateway adapter at
 // `crates/zeroclaw-gateway/src/api_browse.rs` defers all containment

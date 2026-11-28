@@ -451,6 +451,15 @@ pub struct RequestAuth {
 /// or published then.
 pub type RequestPrincipal = Option<axum::Extension<RequestAuth>>;
 
+pub(crate) fn request_principal_id(request: &RequestPrincipal) -> Option<&str> {
+    request
+        .as_ref()?
+        .0
+        .principal
+        .as_ref()
+        .map(|auth| auth.principal.id.as_str())
+}
+
 /// One config mutation's complete write set: every dotted path the
 /// mutation persists, each with the verb its effect requires.
 #[derive(Clone, Debug, Default)]
@@ -617,6 +626,22 @@ fn current_grants(
         .inner
         .current_grants(conn)
         .map_err(WriteDenied::authority_lost)
+}
+
+/// Require an authenticated administrator under the current config revision.
+pub(crate) fn require_config_operator(
+    request: &RequestPrincipal,
+    guard: &ConfigWriteGuard,
+) -> Result<(), WriteDenied> {
+    if let Some(axum::Extension(request)) = request
+        && let Some(conn) = &request.principal
+        && current_grants(request, conn, guard)?.admin
+    {
+        return Ok(());
+    }
+    Err(WriteDenied::forbidden(
+        "An authenticated operator is required".to_owned(),
+    ))
 }
 
 /// Authorize one mutation's complete write set for the request's
@@ -1245,6 +1270,376 @@ mod tests {
 
     const SCOPED: (Option<&str>, Option<&str>) = (Some("opaque-token"), Some("oidc.test"));
     const OPERATOR: (Option<&str>, Option<&str>) = (Some("zc_paired"), None);
+
+    #[tokio::test]
+    async fn http_credential_api_is_operator_only_and_defaults_to_denied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let mut config = editor_config(
+            &tmp,
+            &idp.uri(),
+            &[Verb::Read, Verb::Create, Verb::Update, Verb::Delete],
+            &["*"],
+        );
+        config.secrets.encrypt = true;
+        zeroclaw_config::secrets::SecretStore::new(tmp.path(), true)
+            .encrypt("initialize-fixture-key")
+            .unwrap();
+        let router = router_for(config);
+        let url = "/api/config/http-credentials";
+        let create = serde_json::json!({
+            "name": "TEST_HTTP",
+            "operation": "create",
+            "credential": {
+                "origin": "https://example.com",
+                "http_allowed": true,
+                "auth": { "kind": "api_key", "value": "synthetic-credential", "header": "bearer" }
+            }
+        });
+
+        assert_eq!(
+            send(&router, "GET", url, SCOPED.0, SCOPED.1, None).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send(
+                &router,
+                "POST",
+                url,
+                SCOPED.0,
+                SCOPED.1,
+                Some(create.clone())
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send(&router, "POST", url, OPERATOR.0, OPERATOR.1, Some(create))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        let (status, body) = send(&router, "GET", url, OPERATOR.0, OPERATOR.1, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["credentials"][0]["http_allowed"], false);
+        assert!(!body.to_string().contains("synthetic-credential"));
+        let disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(disk.contains("enc2:"));
+        assert!(!disk.contains("synthetic-credential"));
+
+        for allowed in [true, false] {
+            let update = serde_json::json!({
+                "name": "TEST_HTTP",
+                "operation": "replace",
+                "permissions": { "http_allowed": allowed }
+            });
+            assert_eq!(
+                send(&router, "POST", url, OPERATOR.0, OPERATOR.1, Some(update))
+                    .await
+                    .0,
+                StatusCode::NO_CONTENT
+            );
+            let (status, body) = send(&router, "GET", url, OPERATOR.0, OPERATOR.1, None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["credentials"][0]["http_allowed"], allowed);
+        }
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[tokio::test]
+    async fn plugin_tls_credential_api_is_operator_only_and_write_only() {
+        use zeroclaw_config::schema::{PluginEntryConfig, PluginTlsProfileConfig};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let mut config = editor_config(
+            &tmp,
+            &idp.uri(),
+            &[Verb::Read, Verb::Create, Verb::Update, Verb::Delete],
+            &["*"],
+        );
+        config.plugins.plugins_dir = tmp.path().join("plugins").to_string_lossy().into_owned();
+        config.plugins.security.signature_mode = "disabled".into();
+        let plugin = tmp.path().join("plugins/test-plugin");
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(plugin.join("plugin.wasm"), b"\0asm").unwrap();
+        std::fs::write(
+            plugin.join("manifest.toml"),
+            r#"
+name = "test-plugin"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["config_read"]
+
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+additionalProperties = false
+
+[config_schema.properties."ca.pem"]
+type = "string"
+x-secret = true
+
+[config_schema.properties.unrelated]
+type = "string"
+"#,
+        )
+        .unwrap();
+        let instance = "zpi1_WyJ0ZXN0LXBsdWdpbiIsInRvb2wiLCJ0ZXN0LXBsdWdpbiJd";
+        let property = "ca.pem";
+        config.secrets.encrypt = true;
+        config.plugins.entries.push(PluginEntryConfig {
+            name: instance.into(),
+            egress_hosts: vec!["example.com".into()],
+            tls_profiles: vec![
+                PluginTlsProfileConfig {
+                    name: "custom".into(),
+                    hosts: vec!["example.com".into()],
+                    system_roots: true,
+                    custom_ca_secret: Some(property.into()),
+                    client_certificate_secret: None,
+                    client_private_key_secret: None,
+                },
+                PluginTlsProfileConfig {
+                    name: "public-slot".into(),
+                    hosts: vec!["example.com".into()],
+                    system_roots: true,
+                    custom_ca_secret: Some("unrelated".into()),
+                    client_certificate_secret: None,
+                    client_private_key_secret: None,
+                },
+            ],
+            config: HashMap::from([("unrelated".into(), "synthetic-neighbor".into())]),
+            ..PluginEntryConfig::default()
+        });
+        let router = router_for(config);
+        let url = "/api/config/plugin-tls-credentials";
+        let create = serde_json::json!({
+            "instance": instance, "property": property,
+            "operation": "create", "value": "synthetic-credential"
+        });
+        assert_eq!(
+            send(&router, "GET", url, SCOPED.0, SCOPED.1, None).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send(
+                &router,
+                "POST",
+                url,
+                SCOPED.0,
+                SCOPED.1,
+                Some(create.clone())
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            send(
+                &router,
+                "POST",
+                url,
+                OPERATOR.0,
+                OPERATOR.1,
+                Some(create.clone())
+            )
+            .await
+            .0,
+            StatusCode::PRECONDITION_FAILED
+        );
+        zeroclaw_config::secrets::SecretStore::new(tmp.path(), true)
+            .encrypt("initialize-fixture-key")
+            .unwrap();
+        let mut public_write = create.clone();
+        public_write["property"] = serde_json::json!("unrelated");
+        public_write["operation"] = serde_json::json!("replace");
+        assert_eq!(
+            send(
+                &router,
+                "POST",
+                url,
+                OPERATOR.0,
+                OPERATOR.1,
+                Some(public_write)
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        let (status, body) = send(&router, "GET", url, OPERATOR.0, OPERATOR.1, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["credentials"].as_array().unwrap().len(), 1);
+        assert_eq!(body["credentials"][0]["property"], property);
+        assert_eq!(body["credentials"][0]["configured"], false);
+        let (status, body) = send(
+            &router,
+            "POST",
+            url,
+            OPERATOR.0,
+            OPERATOR.1,
+            Some(create.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"configured": true}));
+        let disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(disk.contains("enc2:"));
+        assert!(!disk.contains("synthetic-credential"));
+        assert_eq!(
+            send(&router, "POST", url, OPERATOR.0, OPERATOR.1, Some(create))
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        let (status, body) = send(&router, "GET", url, OPERATOR.0, OPERATOR.1, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["credentials"][0]["configured"], true);
+        assert!(!body.to_string().contains("synthetic-credential"));
+        let first: toml::Value = toml::from_str(&disk).unwrap();
+        let neighbor = first["plugins"]["entries"][0]["config"]["unrelated"].clone();
+        let replace = serde_json::json!({
+            "instance": instance, "property": property,
+            "operation": "replace", "value": "rotated-synthetic-credential"
+        });
+        let (status, body) =
+            send(&router, "POST", url, OPERATOR.0, OPERATOR.1, Some(replace)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"configured": true}));
+        let disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        assert!(!disk.contains("rotated-synthetic-credential"));
+        let delete =
+            serde_json::json!({"instance": instance, "property": property, "operation": "delete"});
+        let (status, body) = send(&router, "POST", url, OPERATOR.0, OPERATOR.1, Some(delete)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"configured": false}));
+        let disk = std::fs::read_to_string(tmp.path().join("config.toml")).unwrap();
+        let config: toml::Value = toml::from_str(&disk).unwrap();
+        let entry = &config["plugins"]["entries"][0];
+        assert_eq!(entry["config"]["unrelated"], neighbor);
+        assert_eq!(
+            entry["tls_profiles"][0]["custom_ca_secret"].as_str(),
+            Some(property)
+        );
+        assert!(
+            entry
+                .get("config")
+                .and_then(|map| map.get(property))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_http_rotation_preserves_only_same_origin_grants() {
+        use zeroclaw_config::secrets::SecretStore;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = paired_config();
+        config.config_path = tmp.path().join("config.toml");
+        config.data_dir = tmp.path().join("data");
+        config.secrets.encrypt = true;
+        SecretStore::new(tmp.path(), true)
+            .encrypt("fixture")
+            .unwrap();
+        let router = router_for(config);
+        let path = "/api/config/http-credentials";
+        let mut expected = Vec::new();
+        for (operation, origin, value, allowed) in [
+            ("create", "https://one.example", "initial", false),
+            ("replace", "https://one.example:443", "rotated", true),
+            ("replace", "https://two.example", "different", false),
+        ] {
+            let (status, body) = send(&router, "POST", path, Some("zc_paired"), None, Some(
+                serde_json::json!({"operation": operation, "name": "example", "credential": {
+                    "origin": origin, "http_allowed": true, "auth": {"kind": "api_key", "value": value, "header": "token"}
+                }}),
+            )).await;
+            assert!(status.is_success(), "{status}: {body}");
+            let (status, body) = send(&router, "GET", path, Some("zc_paired"), None, None).await;
+            assert_eq!(status, StatusCode::OK);
+            expected.push((body["credentials"][0]["http_allowed"].clone(), allowed));
+            assert!(body["credentials"][0].get("auth").is_none());
+            assert_eq!(body["credentials"][0]["header"], "token");
+            if operation == "create" {
+                let (status, body) = send(&router, "POST", path, Some("zc_paired"), None, Some(
+                    serde_json::json!({"operation": "replace", "name": "example", "permissions": {"http_allowed": true}}),
+                )).await;
+                assert!(status.is_success(), "{status}: {body}");
+            }
+        }
+        for (actual, allowed) in expected {
+            assert_eq!(actual, serde_json::json!(allowed));
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_http_catalog_refuses_generic_gateway_writes() {
+        use zeroclaw_config::secrets::SecretStore;
+        let tmp = tempfile::tempdir().unwrap();
+        let idp = introspection_idp(&["ops"]).await;
+        let mut config = editor_config(
+            &tmp,
+            &idp.uri(),
+            &[Verb::Read, Verb::Create, Verb::Update, Verb::Delete],
+            &["http_request.*"],
+        );
+        config.secrets.encrypt = true;
+        let fixture = SecretStore::new(tmp.path(), true).encrypt(
+            r#"{"origin":"https://one.example","http_allowed":false,"auth":{"kind":"api_key","value":"fixture","header":"token"}}"#,
+        ).unwrap();
+        config
+            .http_request
+            .scoped_credentials
+            .insert("example".into(), fixture);
+        config.save().await.unwrap();
+        let file = config.config_path.clone();
+        let original = std::fs::read(&file).unwrap();
+        let router = router_for(config);
+        for (method, path, body) in [
+            (
+                "PUT",
+                "/api/config/prop",
+                Some(serde_json::json!({
+                    "path":"http_request.scoped_credentials.example","value":"replacement"
+                })),
+            ),
+            (
+                "DELETE",
+                "/api/config/prop?path=http_request.scoped_credentials.example",
+                None,
+            ),
+            (
+                "PATCH",
+                "/api/config",
+                Some(serde_json::json!([
+                    {"op":"remove","path":"/http_request/scoped_credentials/example"}
+                ])),
+            ),
+            (
+                "POST",
+                "/api/config/map-key?path=http_request.scoped_credentials&key=another",
+                None,
+            ),
+            (
+                "DELETE",
+                "/api/config/map-key?path=http_request.scoped_credentials&key=example",
+                None,
+            ),
+        ] {
+            let (status, body) = send(
+                &router,
+                method,
+                path,
+                Some("opaque-token"),
+                Some("oidc.test"),
+                body,
+            )
+            .await;
+            assert!(!status.is_success(), "{method} {path}: {status} {body}");
+            assert_eq!(std::fs::read(&file).unwrap(), original, "{method} {path}");
+        }
+    }
 
     /// The mapped profile with the given Config verbs and path selectors,
     /// on a configuration that persists into `tmp` rather than the home
