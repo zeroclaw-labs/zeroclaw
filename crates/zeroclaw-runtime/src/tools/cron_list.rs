@@ -1,4 +1,4 @@
-use super::cron_common::cron_job_output;
+use super::cron_common::{BoundOutput, bound_output, cron_job_output};
 use crate::cron;
 use async_trait::async_trait;
 use serde_json::json;
@@ -18,6 +18,21 @@ impl CronListTool {
             config,
             agent_alias: agent_alias.into(),
         }
+    }
+
+    /// The job as listed. A job bound to a conversation lists its last
+    /// output only in that conversation; the store keeps no output from a
+    /// bound run on a job that has lost its binding.
+    fn job_view(&self, job: &cron::CronJob) -> serde_json::Result<serde_json::Value> {
+        let mut view = cron_job_output(job)?;
+        if job.last_output.is_some()
+            && bound_output(&self.config, &job.id, &self.agent_alias) == BoundOutput::Withheld
+            && let serde_json::Value::Object(ref mut object) = view
+        {
+            object.insert("last_output".to_string(), serde_json::Value::Null);
+            object.insert("last_output_withheld".to_string(), json!(true));
+        }
+        Ok(view)
     }
 }
 
@@ -59,7 +74,7 @@ impl Tool for CronListTool {
                 output: serde_json::to_string_pretty(
                     &jobs
                         .iter()
-                        .map(cron_job_output)
+                        .map(|job| self.job_view(job))
                         .collect::<serde_json::Result<Vec<_>>>()?,
                 )?
                 .into(),
@@ -217,5 +232,73 @@ mod tests {
             !rendered.contains(&theirs.id),
             "another agent's job must not be listed"
         );
+    }
+
+    fn telegram_binding(key: &str) -> zeroclaw_api::conversation_binding::ConversationBinding {
+        zeroclaw_api::conversation_binding::ConversationBinding {
+            surface: zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+            route: "telegram".to_string(),
+            key: key.to_string(),
+        }
+    }
+
+    fn serving(
+        key: Option<&str>,
+    ) -> Option<zeroclaw_api::conversation_binding::ActiveConversation> {
+        key.map(
+            |key| zeroclaw_api::conversation_binding::ActiveConversation {
+                surface: zeroclaw_api::conversation_binding::ConversationSurface::Channel,
+                route: "telegram".to_string(),
+                key: key.to_string(),
+                agent_alias: TEST_AGENT.to_string(),
+            },
+        )
+    }
+
+    fn bound_job(cfg: &Config) -> cron::CronJob {
+        cron::add_agent_job_bound(
+            cfg,
+            TEST_AGENT,
+            Some("reminder".into()),
+            cron::Schedule::Every { every_ms: 60_000 },
+            "Remind me to call Sam",
+            cron::SessionTarget::Main,
+            None,
+            None,
+            false,
+            None,
+            true,
+            Some(&telegram_binding("telegram_42_42")),
+        )
+        .unwrap()
+    }
+
+    async fn listed_from(cfg: &Arc<Config>, key: Option<&str>) -> serde_json::Value {
+        let tool = CronListTool::new(cfg.clone(), TEST_AGENT);
+        let result = zeroclaw_api::TOOL_LOOP_ACTIVE_CONVERSATION
+            .scope(serving(key), tool.execute(json!({})))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        serde_json::from_str::<serde_json::Value>(&result.output).unwrap()[0].clone()
+    }
+
+    #[tokio::test]
+    async fn bound_job_lists_its_last_output_only_in_its_conversation() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = bound_job(&cfg);
+        cron::record_last_run(&cfg, &job.id, chrono::Utc::now(), true, "Sam said six").unwrap();
+
+        let inside = listed_from(&cfg, Some("telegram_42_42")).await;
+        assert_eq!(inside["last_output"], "Sam said six");
+        assert!(inside.get("last_output_withheld").is_none(), "{inside}");
+
+        for outside in [Some("telegram_99_99"), None] {
+            let seen = listed_from(&cfg, outside).await;
+            assert_eq!(seen["last_output"], serde_json::Value::Null, "{seen}");
+            assert_eq!(seen["last_output_withheld"], true, "{seen}");
+            assert_eq!(seen["last_status"], "ok", "{seen}");
+        }
     }
 }

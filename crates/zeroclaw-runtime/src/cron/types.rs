@@ -188,6 +188,14 @@ pub struct CronJob {
     pub last_output: Option<String>,
 }
 
+/// Whether a run with this persistence outcome was tied to a conversation:
+/// it ran with that conversation's history, or was meant to and could not
+/// reach it. Its output may then repeat what was said there, so only that
+/// conversation may read it back.
+pub(crate) fn persistence_ties_output(persistence: &str) -> bool {
+    persistence != "not_bound"
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CronRun {
     pub id: i64,
@@ -205,8 +213,8 @@ pub struct CronRun {
     /// `None` on rows recorded before the triple existed.
     #[serde(default)]
     pub delivery: Option<String>,
-    /// Persistence axis (`not_bound | persisted | failed`). `None` on rows
-    /// recorded before the triple existed.
+    /// Persistence axis (`not_bound | persisted | skipped | failed`). `None`
+    /// on rows recorded before the triple existed.
     #[serde(default)]
     pub persistence: Option<String>,
     /// The initiating principal stamped at dispatch, verbatim — immune to
@@ -235,6 +243,16 @@ pub struct CronRun {
     pub owner_agent: Option<String>,
 }
 
+impl CronRun {
+    /// Whether this run was tied to a conversation. Rows recorded before the
+    /// persistence outcome existed predate bound jobs and are not.
+    pub fn ties_output_to_a_conversation(&self) -> bool {
+        self.persistence
+            .as_deref()
+            .is_some_and(persistence_ties_output)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CronJobPatch {
     pub schedule: Option<Schedule>,
@@ -249,6 +267,14 @@ pub struct CronJobPatch {
     pub allowed_tools: Option<Vec<String>>,
     pub uses_memory: Option<bool>,
     pub shell_output_format: Option<CronShellOutputFormat>,
+    /// The conversation this patch is being made from. Set by the calling
+    /// surface from its own turn state; never read from a request or from
+    /// tool arguments, and never written out. A patch that redirects a job
+    /// bound to a conversation keeps that binding only when this names the
+    /// same conversation; left `None`, as every caller outside a conversation
+    /// leaves it, such a patch unbinds the job.
+    #[serde(skip)]
+    pub edited_from: Option<zeroclaw_api::conversation_binding::ConversationBinding>,
 }
 
 impl ::zeroclaw_api::attribution::Attributable for CronJob {
