@@ -1,5 +1,6 @@
 use super::cron_common::{
     AT_DESCRIPTION, CRON_TZ_DESCRIPTION, cron_job_output, deserialize_patch_arg,
+    patch_requests_owner_change,
 };
 use crate::cron;
 use crate::security::SecurityPolicy;
@@ -264,6 +265,18 @@ impl Tool for CronUpdateTool {
             }
         };
 
+        // An agent may edit its own job but never move it into another agent's
+        // execution context; owner changes stay on the operator CLI path.
+        if patch_requests_owner_change(&patch_val) {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string(
+                    "cli-cron-update-owner-forbidden",
+                )),
+            });
+        }
+
         let patch = match deserialize_patch_arg(&patch_val) {
             Ok(patch) => patch,
             Err(error) => {
@@ -373,6 +386,52 @@ mod tests {
 
         assert!(result.success, "{:?}", result.error);
         assert!(result.output.contains("\"enabled\": false"));
+    }
+
+    #[tokio::test]
+    async fn rejects_owner_change_and_keeps_stored_owner() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        config.agents.insert(
+            "other-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: format!("openrouter.{TEST_AGENT}").into(),
+                risk_profile: TEST_AGENT.into(),
+                runtime_profile: TEST_AGENT.into(),
+                ..Default::default()
+            },
+        );
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let cfg = Arc::new(config);
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        for patch in [
+            json!({ "agent_alias": "other-agent", "name": "moved" }),
+            json!("{\"agent_alias\": \"other-agent\"}"),
+        ] {
+            let result = tool
+                .execute(json!({ "job_id": job.id, "patch": patch }))
+                .await
+                .unwrap();
+            assert!(!result.success, "owner change must be rejected");
+            assert_eq!(
+                result.error.as_deref(),
+                Some(
+                    crate::i18n::get_required_cli_string("cli-cron-update-owner-forbidden")
+                        .as_str()
+                )
+            );
+        }
+
+        let stored = cron::get_job(&cfg, &job.id).unwrap();
+        assert_eq!(stored.agent_alias, TEST_AGENT);
+        assert_ne!(stored.name.as_deref(), Some("moved"));
     }
 
     #[tokio::test]
