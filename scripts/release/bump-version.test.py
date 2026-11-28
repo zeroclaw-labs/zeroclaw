@@ -1,5 +1,6 @@
-"""Exercise release-mode failures through the actual version-bump script."""
+"""Exercise release and local mode through the actual version-bump script."""
 
+import json
 import os
 from pathlib import Path
 import shutil
@@ -35,7 +36,7 @@ class ReleaseBumpTests(unittest.TestCase):
         # A closed PATH makes missing prerequisites deterministic even on hosts
         # with a complete release toolchain. Generators and the modern-Bash
         # capability probe are mocked; the Python/TOML probe uses real Python.
-        for name in ("dirname", "sed", "head", "awk", "grep", "perl", "sha256sum", "find", "cat", "mv"):
+        for name in ("dirname", "sed", "head", "awk", "grep", "perl", "sha256sum", "find", "cat", "mv", "rm"):
             executable = shutil.which(name)
             self.assertIsNotNone(executable, f"test needs {name}")
             (self.bin / name).symlink_to(executable)
@@ -207,15 +208,37 @@ esac
         self.assertIn("Done.", result.stdout)
         self.assertEqual((self.root / "docs/book/stable-version.txt").read_text(), "v0.8.5\n")
 
-    def test_tauri_generation_error_is_fatal_in_release_mode(self):
+    def test_tauri_generation_reports_only_successful_writes(self):
+        jq_executable = shutil.which("jq")
+        if jq_executable is None:
+            self.skipTest("Tauri JSON regression requires jq")
+        jq = self.bin / "jq"
+        jq.unlink()
+        jq.symlink_to(jq_executable)
         config = self.root / "apps/tauri/tauri.conf.json"
         config.parent.mkdir(parents=True)
+        updated = "updated: apps/tauri/tauri.conf.json"
+        for args in ((), ("--release",)):
+            with self.subTest(args=args):
+                self.calls.unlink(missing_ok=True)
+                config.write_text("{\n")
+                result = self.run_bump(*args, "0.8.6")
+                if args:
+                    self.assert_incomplete(result, "Tauri version update failed")
+                    self.assertFalse(self.calls.exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stdout)
+                    self.assertIn("warn: Tauri version update failed", result.stdout)
+                self.assertEqual(config.read_text(), "{\n")
+                self.assertEqual(
+                    (len(list(config.parent.glob(f"{config.name}.*"))), result.stdout.count(updated)),
+                    (0, 0), result.stdout,
+                )
         config.write_text('{"version":"0.8.5"}\n')
-        self.stub("jq", "exit 1")
         result = self.run_bump("--release", "0.8.6")
-        self.assert_incomplete(result, "Tauri version update failed")
-        self.assertEqual(config.read_text(), '{"version":"0.8.5"}\n')
-        self.assertFalse(self.calls.exists())
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(result.stdout.count(updated), 1)
+        self.assertEqual(json.loads(config.read_text())["version"], "0.8.6")
 
 
 if __name__ == "__main__":
