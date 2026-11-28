@@ -169,15 +169,20 @@ struct TuiIdentity {
 /// leaves the place taken while the creation is still under way. A creation
 /// the chat stopped waiting for lets go of the session's place but keeps the
 /// account's share until the core's answer settles it.
-type Place = Arc<PlaceGuard>;
+pub(crate) type Place = Arc<PlaceGuard>;
 
-struct PlaceGuard {
+pub(crate) struct PlaceGuard {
     binding: Arc<CoreBinding>,
     core_id: parking_lot::Mutex<Option<String>>,
     account: parking_lot::Mutex<Option<AccountPlace>>,
 }
 
 impl PlaceGuard {
+    /// Whether this place is charged to the given dashboard sign-in.
+    pub(crate) fn belongs_to_sign_in(&self, binding: &Arc<CoreBinding>) -> bool {
+        Arc::ptr_eq(&self.binding, binding)
+    }
+
     fn hold(&self, core_id: &str, chat: OpenChat) {
         self.binding
             .held
@@ -1275,6 +1280,15 @@ pub(crate) fn core_caller(
     })
 }
 
+/// Share the sign-in and account conversation budgets across dashboard transports.
+pub(crate) fn take_conversation_place(
+    core: &CoreRpc,
+    binding: &Arc<CoreBinding>,
+    principal: &str,
+) -> Result<Place, CoreFailure> {
+    binding.take_place(core.accounts.take(principal)?)
+}
+
 impl CoreCaller {
     /// A connection of its own presenting `credential`, and `identity` when
     /// there is one. A refusal ends the session, without asking the identity
@@ -1328,11 +1342,11 @@ impl CoreCaller {
         if self.session.ended.is_cancelled() {
             return Err(CoreFailure::SessionEnded);
         }
-        let account = self
-            .core
-            .accounts
-            .take(self.session.principal().id.as_str())?;
-        let place = self.binding.take_place(account)?;
+        let place = take_conversation_place(
+            &self.core,
+            &self.binding,
+            self.session.principal().id.as_str(),
+        )?;
         let credential = self
             .auth
             .core_credential(&self.session)
@@ -1697,16 +1711,101 @@ pub(crate) fn agent_not_allowed() -> Response {
 // serves goes to the core, anything else (an administrator's session
 // included) to the handler unchanged.
 
+use zeroclaw_infra::acp_session_store::AcpSessionStore;
+
+#[derive(Clone)]
+pub(crate) struct CutoverWebChat {
+    pub(crate) store: Arc<AcpSessionStore>,
+    pub(crate) turns: Arc<crate::acp::AcpTurnHub>,
+}
+
+pub(crate) type Cutover = Option<Extension<CutoverWebChat>>;
+
+fn is_legacy_session(state: &AppState, headers: &HeaderMap, id: &str) -> bool {
+    !id.starts_with(crate::GW_SESSION_PREFIX)
+        && crate::api::require_auth(state, headers).is_ok()
+        && state
+            .session_backend
+            .as_ref()
+            .is_some_and(|store| store.session_exists(id))
+}
+
+async fn operator_webchat_id(
+    store: &Arc<AcpSessionStore>,
+    id: String,
+) -> anyhow::Result<Option<String>> {
+    let store = Arc::clone(store);
+    tokio::task::spawn_blocking(move || store.operator_webchat_id(&id)).await?
+}
+
+fn webchat_store_error(error: impl std::fmt::Display) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": error.to_string()})),
+    )
+        .into_response()
+}
+
+async fn webchat_store_result(
+    state: &AppState,
+    headers: &HeaderMap,
+    store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    op: impl FnOnce(
+        &zeroclaw_infra::acp_session_store::AcpSessionStore,
+    ) -> anyhow::Result<Option<Value>>
+    + Send
+    + 'static,
+) -> Response {
+    if let Err(e) = crate::api::require_auth(state, headers) {
+        return e.into_response();
+    }
+    match tokio::task::spawn_blocking(move || op(&store)).await {
+        Ok(Ok(Some(value))) => Json(value).into_response(),
+        Ok(Ok(None)) => CoreFailure::NotFound.into_response(),
+        Ok(Err(e)) => webchat_store_error(e),
+        Err(e) => webchat_store_error(e),
+    }
+}
+
 /// `GET /api/sessions`.
-pub async fn sessions_list(
+pub(crate) async fn sessions_list(
     State(state): State<AppState>,
+    cutover: Cutover,
     core: Option<Extension<CoreRpc>>,
     dashboard: Option<Extension<Arc<DashboardAuth>>>,
     headers: HeaderMap,
 ) -> Response {
-    match core_caller(&state, &headers, core, dashboard, Reach::ScopedOnly) {
-        Some(caller) => caller.sessions_list(),
-        None => crate::api::handle_api_sessions_list(State(state), headers)
+    match (
+        core_caller(&state, &headers, core, dashboard, Reach::ScopedOnly),
+        cutover,
+    ) {
+        (Some(caller), _) => caller.sessions_list(),
+        (None, Some(Extension(CutoverWebChat { store, .. }))) => {
+            let legacy_state = state.clone();
+            webchat_store_result(&state, &headers, store, move |s| {
+                let mut sessions = s
+                    .operator_webchats()?
+                    .into_iter()
+                    .map(|(session, name)| {
+                        json!({
+                            "session_id": session.session_uuid,
+                            "session_key": format!("{}{}", crate::GW_SESSION_PREFIX, session.session_uuid),
+                            "channel_id": null,
+                            "agent_alias": session.agent_alias,
+                            "created_at": session.created_at,
+                            "last_activity": session.last_activity,
+                            "message_count": session.message_count,
+                            "name": name,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                sessions.extend(crate::api::legacy_session_list(&legacy_state, false));
+                sessions.sort_by(|a, b| b["last_activity"].as_str().cmp(&a["last_activity"].as_str()));
+                Ok(Some(json!({"sessions":sessions})))
+            })
+            .await
+        }
+        (None, None) => crate::api::handle_api_sessions_list(State(state), headers)
             .await
             .into_response(),
     }
@@ -1714,69 +1813,301 @@ pub async fn sessions_list(
 
 /// `GET /api/sessions/{id}/messages`. A scoped session's conversation ends
 /// with its chat and is never reopened, so it has no transcript to load.
-pub async fn session_messages(
+pub(crate) async fn session_messages(
     State(state): State<AppState>,
+    cutover: Cutover,
     core: Option<Extension<CoreRpc>>,
     dashboard: Option<Extension<Arc<DashboardAuth>>>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    match core_caller(&state, &headers, core, dashboard, Reach::ScopedOnly) {
-        Some(_) => CoreFailure::NotFound.into_response(),
-        None => crate::api::handle_api_session_messages(State(state), headers, Path(id))
+    match (
+        core_caller(&state, &headers, core, dashboard, Reach::ScopedOnly),
+        cutover,
+    ) {
+        (Some(_), _) => CoreFailure::NotFound.into_response(),
+        (None, Some(Extension(CutoverWebChat { store, .. })))
+            if !is_legacy_session(&state, &headers, &id) =>
+        {
+            webchat_store_result(&state, &headers, store, move |s| {
+                let rows = match s.operator_webchat_id(&id)? {
+                    Some(session_id) => s.operator_webchat_history(&session_id)?,
+                    None => Vec::new(),
+                };
+                let messages = rows
+                    .into_iter()
+                    .map(|row| {
+                        json!({
+                            "role": row.message.role,
+                            "content": row.message.content,
+                            "created_at": row.created_at,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(Some(
+                    json!({"session_id":id,"messages":messages,"session_persistence":true}),
+                ))
+            })
+            .await
+        }
+        (None, _) => crate::api::handle_api_session_messages(State(state), headers, Path(id))
             .await
             .into_response(),
     }
 }
 
 /// `PUT /api/sessions/{id}`. Not offered for a scoped session's chats.
-pub async fn session_rename(
+pub(crate) async fn session_rename(
     State(state): State<AppState>,
+    cutover: Cutover,
     core: Option<Extension<CoreRpc>>,
     dashboard: Option<Extension<Arc<DashboardAuth>>>,
     headers: HeaderMap,
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> Response {
-    match core_caller(&state, &headers, core, dashboard, Reach::ScopedOnly) {
-        Some(_) => CoreFailure::NotFound.into_response(),
-        None => crate::api::handle_api_session_rename(State(state), headers, Path(id), Json(body))
+    match (
+        core_caller(&state, &headers, core, dashboard, Reach::ScopedOnly),
+        cutover,
+    ) {
+        (Some(_), _) => CoreFailure::NotFound.into_response(),
+        (None, Some(Extension(CutoverWebChat { store, .. })))
+            if !is_legacy_session(&state, &headers, &id) =>
+        {
+            let Some(name) = body["name"]
+                .as_str()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(str::to_owned)
+            else {
+                return StatusCode::BAD_REQUEST.into_response();
+            };
+            webchat_store_result(&state, &headers, store, move |s| {
+                let Some(session_id) = s.operator_webchat_id(&id)? else {
+                    return Ok(None);
+                };
+                Ok(s.rename_operator_webchat(&session_id, &name)?
+                    .then(|| json!({"session_id":id,"name":name})))
+            })
             .await
-            .into_response(),
+        }
+        (None, _) => {
+            crate::api::handle_api_session_rename(State(state), headers, Path(id), Json(body))
+                .await
+                .into_response()
+        }
     }
 }
 
 /// `DELETE /api/sessions/{id}`. Not offered for a scoped session's chats,
 /// whose conversations close when the chat does.
-pub async fn session_delete(
+pub(crate) async fn session_delete(
     State(state): State<AppState>,
+    cutover: Cutover,
     core: Option<Extension<CoreRpc>>,
     dashboard: Option<Extension<Arc<DashboardAuth>>>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    match core_caller(&state, &headers, core, dashboard, Reach::ScopedOnly) {
-        Some(_) => CoreFailure::NotFound.into_response(),
-        None => crate::api::handle_api_session_delete(State(state), headers, Path(id))
+    match (
+        core_caller(&state, &headers, core, dashboard, Reach::ScopedOnly),
+        cutover,
+    ) {
+        (Some(_), _) => CoreFailure::NotFound.into_response(),
+        (None, Some(Extension(CutoverWebChat { store, turns })))
+            if !is_legacy_session(&state, &headers, &id) =>
+        {
+            if let Err(e) = crate::api::require_auth(&state, &headers) {
+                return e.into_response();
+            }
+            let id = match operator_webchat_id(&store, id).await {
+                Ok(Some(id)) => id,
+                Ok(None) => return CoreFailure::NotFound.into_response(),
+                Err(error) => return webchat_store_error(error),
+            };
+            let Ok(permit) = turns.acquire_for_webchat_delete(&id).await else {
+                return StatusCode::CONFLICT.into_response();
+            };
+            let queue = Arc::clone(&state.session_queue);
+            let legacy = state.session_backend.clone();
+            webchat_store_result(&state, &headers, store, move |s| {
+                Ok(s.delete_operator_webchat(&id, legacy.as_deref())?.then(|| {
+                    turns.forget_deleted_webchat(&permit);
+                    queue.advance_generation(&id);
+                    json!({"session_id":id,"deleted":true})
+                }))
+            })
+            .await
+        }
+        (None, _) => crate::api::handle_api_session_delete(State(state), headers, Path(id))
             .await
             .into_response(),
     }
 }
 
-/// `POST /api/sessions/{id}/abort`.
-pub async fn session_abort(
+/// `POST /api/sessions/{id}/messages`.
+pub(crate) async fn session_message_post(
     State(state): State<AppState>,
+    cutover: Cutover,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<crate::api::SessionMessagePostBody>,
+) -> Response {
+    let Some(Extension(CutoverWebChat { store, .. })) =
+        cutover.filter(|_| !is_legacy_session(&state, &headers, &id))
+    else {
+        return crate::api::handle_api_session_message_post(
+            State(state),
+            headers,
+            Path(id),
+            Json(body),
+        )
+        .await
+        .into_response();
+    };
+    if let Err(denied) = crate::api::require_auth(&state, &headers) {
+        return denied.into_response();
+    }
+    if body.content.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":"content is required"})),
+        )
+            .into_response();
+    }
+    let id = match operator_webchat_id(&store, id).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return CoreFailure::NotFound.into_response(),
+        Err(error) => return webchat_store_error(error),
+    };
+    let permit = match state.session_queue.acquire(&id).await {
+        Ok(permit) => permit,
+        Err(e) => {
+            let status = match e {
+                crate::session_queue::SessionQueueError::QueueFull { .. } => {
+                    StatusCode::TOO_MANY_REQUESTS
+                }
+                crate::session_queue::SessionQueueError::Timeout { .. } => {
+                    StatusCode::REQUEST_TIMEOUT
+                }
+            };
+            return (status, Json(json!({"error":e.to_string()}))).into_response();
+        }
+    };
+    let queue = Arc::clone(&state.session_queue);
+    let events = state.event_tx.clone();
+    webchat_store_result(&state, &headers, store, move |store| {
+        let _permit = permit;
+        if !store.append_operator_webchat_message(&id, &body.content)? {
+            return Ok(None);
+        }
+        queue.advance_generation(&id);
+        let _ = events.send(json!({
+            "type": "message",
+            "session_id": id,
+            "role": "assistant",
+            "content": body.content,
+            "source": "api",
+            "chat_transport": "acp",
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        }));
+        Ok(Some(json!({
+            "status": "ok",
+            "session_id": id,
+            "message": {"role": "assistant", "content": body.content},
+            "session_persistence": true,
+        })))
+    })
+    .await
+}
+
+/// `GET /api/sessions/running`.
+pub(crate) async fn sessions_running(
+    State(state): State<AppState>,
+    cutover: Cutover,
+    headers: HeaderMap,
+) -> Response {
+    let Some(Extension(CutoverWebChat { store, turns })) = cutover else {
+        return crate::api::handle_api_sessions_running(State(state), headers)
+            .await
+            .into_response();
+    };
+    webchat_store_result(&state, &headers, store, move |store| {
+        let sessions: Vec<_> = store
+            .operator_webchats()?
+            .into_iter()
+            .filter(|(session, _)| turns.operator_running_turn(&session.session_uuid).is_some())
+            .map(|(session, _)| {
+                json!({
+                    "session_id": session.session_uuid,
+                    "created_at": session.created_at,
+                    "last_activity": session.last_activity,
+                    "message_count": session.message_count,
+                })
+            })
+            .collect();
+        Ok(Some(json!({"sessions": sessions})))
+    })
+    .await
+}
+
+/// `GET /api/sessions/{id}/state`.
+pub(crate) async fn session_state(
+    State(state): State<AppState>,
+    cutover: Cutover,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(Extension(CutoverWebChat { store, turns })) =
+        cutover.filter(|_| !is_legacy_session(&state, &headers, &id))
+    else {
+        return crate::api::handle_api_session_state(State(state), headers, Path(id))
+            .await
+            .into_response();
+    };
+    webchat_store_result(&state, &headers, store, move |store| {
+        let Some(session_id) = store.operator_webchat_id(&id)? else { return Ok(None); };
+        Ok(Some(match turns.operator_running_turn(&session_id) {
+            Some((turn_id, started_at)) => json!({
+                "session_id": id, "state": "running", "turn_id": turn_id.to_string(), "turn_started_at": started_at.to_rfc3339(),
+            }),
+            None => json!({"session_id": id, "state": "idle"}),
+        }))
+    })
+    .await
+}
+
+/// `POST /api/sessions/{id}/abort`.
+pub(crate) async fn session_abort(
+    State(state): State<AppState>,
+    cutover: Cutover,
     core: Option<Extension<CoreRpc>>,
     dashboard: Option<Extension<Arc<DashboardAuth>>>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    match core_caller(&state, &headers, core, dashboard, Reach::ScopedOnly) {
-        Some(caller) => caller.session_abort(&id).await,
-        None => crate::api::handle_api_session_abort(State(state), headers, Path(id))
-            .await
-            .into_response(),
+    if let Some(caller) = core_caller(&state, &headers, core, dashboard, Reach::ScopedOnly) {
+        return caller.session_abort(&id).await;
     }
+    let Some(Extension(CutoverWebChat { store, turns })) =
+        cutover.filter(|_| !is_legacy_session(&state, &headers, &id))
+    else {
+        return crate::api::handle_api_session_abort(State(state), headers, Path(id))
+            .await
+            .into_response();
+    };
+    webchat_store_result(&state, &headers, store, move |store| {
+        let aborted = store
+            .operator_webchat_id(&id)?
+            .is_some_and(|id| turns.cancel_turn(&id, None) == Ok(true));
+        let status = if aborted {
+            "aborted"
+        } else {
+            "no_active_response"
+        };
+        Ok(Some(json!({"status": status})))
+    })
+    .await
 }
 
 /// `GET /api/status`.
@@ -2485,6 +2816,12 @@ mod tests {
                 .route("/api/sessions/{id}/abort", post(session_abort))
                 .route("/api/status", get(status))
                 .route("/api/agents/available", get(agents_available))
+                .route(
+                    "/acp",
+                    get(crate::acp::handle_ws_acp).layer(Extension(Arc::new(
+                        crate::acp::AcpTurnHub::new(Arc::clone(&self.state.session_queue)),
+                    ))),
+                )
                 .route("/ws/chat", get(crate::ws::handle_ws_chat))
                 .with_state(self.state.clone())
                 .layer(Extension(self.core.clone()))
@@ -2570,6 +2907,333 @@ mod tests {
         addr
     }
 
+    async fn open_scoped_acp(
+        addr: SocketAddr,
+        cookie: &str,
+        agent: Option<&str>,
+        resume: Option<&str>,
+    ) -> Result<ChatSocket, tokio_tungstenite::tungstenite::Error> {
+        let mut path =
+            agent.map_or_else(|| "/acp".to_owned(), |agent| format!("/acp?agent={agent}"));
+        if let Some(sid) = resume {
+            path.push_str(&format!("&resumeSession={sid}"));
+        }
+        let mut request = dashboard_ws_request(addr, cookie, &path);
+        request
+            .headers_mut()
+            .insert("sec-websocket-protocol", "zeroclaw.acp.v1".parse().unwrap());
+        connect_async(request).await.map(|(socket, _)| socket)
+    }
+
+    async fn send_acp(socket: &mut ChatSocket, id: u64, method: &str, params: Value) {
+        socket
+            .send(ClientMessage::Text(
+                json!({"jsonrpc":"2.0","id":id,"method":method,"params":params})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn receive_acp(socket: &mut ChatSocket, id: u64) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let message = socket.next().await.unwrap().unwrap();
+                let frame: Value = serde_json::from_str(&message.into_text().unwrap()).unwrap();
+                if frame["id"] == id {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("ACP response")
+    }
+
+    async fn call_acp(socket: &mut ChatSocket, id: u64, method: &str, params: Value) -> Value {
+        send_acp(socket, id, method, params).await;
+        receive_acp(socket, id).await
+    }
+
+    #[tokio::test]
+    async fn scoped_acp_preserves_owner_and_tool_grants_and_closes_when_grants_narrow() {
+        let fixture = Fixture::new().await;
+        let addr = serve(fixture.router()).await;
+        let (alice, _) = fixture.sign_in("alice").await;
+        let (bob, _) = fixture.sign_in("bob").await;
+        let mut alice = open_scoped_acp(addr, &alice, Some("support"), None)
+            .await
+            .unwrap();
+        let mut bob = open_scoped_acp(addr, &bob, Some("support"), None)
+            .await
+            .unwrap();
+        let created = call_acp(
+            &mut alice,
+            1,
+            "session/new",
+            json!({
+                "interactionSurface": "webchat",
+            }),
+        )
+        .await;
+        let sid = created["result"]["sessionId"].as_str().unwrap();
+        let restore = call_acp(&mut bob, 1, "session/resume", json!({"sessionId":sid})).await;
+        assert_eq!(restore["error"]["code"], FORBIDDEN, "{restore}");
+
+        let marker = "scoped-acp-tool-ceiling";
+        let prompt = call_acp(
+            &mut alice,
+            2,
+            "session/prompt",
+            json!({
+                "sessionId":sid,"prompt":[{"type":"text","text":marker}],
+            }),
+        )
+        .await;
+        assert_eq!(prompt["result"]["stopReason"], "end_turn", "{prompt}");
+        assert!(prompt.get("_meta").is_none(), "{prompt}");
+        assert_eq!(prompt["result"]["_meta"]["zeroclawTurn"]["sessionId"], sid);
+        assert!(model_requests_with(&fixture._model, marker).await > 0);
+        assert!(offered_tools(&fixture._model, marker).await.is_empty());
+
+        fixture.narrow_profile("chat-user", |profile| {
+            profile
+                .grants
+                .get_mut(&Resource::Sessions)
+                .unwrap()
+                .retain(|verb| *verb != Verb::Delete);
+        });
+        send_acp(&mut alice, 3, "session/list", json!({})).await;
+        let (frames, code) = read_to_close(&mut alice).await;
+        assert!(frames.is_empty(), "{frames:?}");
+        assert_eq!(code, Some(crate::dashboard_session::WS_CLOSE_ACCESS_LOST));
+    }
+
+    #[tokio::test]
+    async fn scoped_acp_shares_the_sign_in_budget_and_denies_steering() {
+        use zeroclaw_api::jsonrpc::error_codes::{SESSION_BUSY, SESSION_LIMIT_REACHED};
+
+        let fixture = Fixture::new().await;
+        let addr = serve(fixture.router()).await;
+        let (cookie, _) = fixture.sign_in("alice").await;
+        let mut legacy = open_chat(addr, &cookie, "support", "web-1").await.unwrap();
+        let _ = legacy.next().await.unwrap().unwrap();
+        let mut sockets = Vec::new();
+        for _ in 1..MAX_LIVE_CONVERSATIONS {
+            sockets.push(
+                open_scoped_acp(addr, &cookie, Some("support"), None)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut over_budget = open_scoped_acp(addr, &cookie, Some("support"), None)
+            .await
+            .unwrap();
+        let (_, code) = read_to_close(&mut over_budget).await;
+        assert_eq!(code, Some(WS_CLOSE_CONVERSATION_LIMIT));
+
+        let socket = sockets.first_mut().unwrap();
+        let missing = call_acp(
+            socket,
+            1,
+            "session/prompt",
+            json!({
+                "sessionId":"missing","prompt":[{"type":"text","text":"hello"}],
+            }),
+        )
+        .await;
+        assert_eq!(missing["error"]["code"], SESSION_NOT_FOUND, "{missing}");
+        let created = call_acp(socket, 2, "session/new", json!({})).await;
+        let sid = created["result"]["sessionId"].as_str().unwrap();
+        let over_limit = call_acp(socket, 3, "session/new", json!({})).await;
+        assert_eq!(
+            over_limit["error"]["code"], SESSION_LIMIT_REACHED,
+            "{over_limit}"
+        );
+
+        send_acp(
+            socket,
+            4,
+            "session/prompt",
+            json!({
+                "sessionId":sid,"prompt":[{"type":"text","text":"slow please"}],
+            }),
+        )
+        .await;
+        let busy = call_acp(
+            socket,
+            5,
+            "session/prompt",
+            json!({
+                "sessionId":sid,"prompt":[{"type":"text","text":"second prompt"}],
+            }),
+        )
+        .await;
+        assert_eq!(busy["error"]["code"], SESSION_BUSY, "{busy}");
+        let denied = call_acp(
+            socket,
+            6,
+            "_zeroclaw/session/steer",
+            json!({
+                "sessionId":sid,"content":"another step",
+            }),
+        )
+        .await;
+        assert_eq!(denied["error"]["code"], FORBIDDEN, "{denied}");
+        assert_eq!(
+            receive_acp(socket, 4).await["result"]["stopReason"],
+            "end_turn"
+        );
+        assert_eq!(
+            model_requests_with(&fixture._model, "second prompt").await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_acp_limits_the_websocket_message_before_decoding() {
+        let fixture = Fixture::new().await;
+        let addr = serve(fixture.router()).await;
+        let (cookie, _) = fixture.sign_in("alice").await;
+        for (agent, status) in [(None, 400), (Some("forbidden"), 403)] {
+            let refused = open_scoped_acp(addr, &cookie, agent, None)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                refused,
+                tokio_tungstenite::tungstenite::Error::Http(response)
+                    if response.status().as_u16() == status
+            ));
+        }
+        let mut socket = open_scoped_acp(addr, &cookie, Some("support"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            call_acp(&mut socket, 1, "initialize", json!({"protocolVersion":1})).await["result"]["protocolVersion"],
+            1
+        );
+        let oversized = json!({
+            "jsonrpc":"2.0","id":2,"method":"initialize",
+            "params":{"protocolVersion":1,"padding":"x".repeat(MAX_FRAME_BYTES as usize)},
+        });
+        if let Err(error) = socket
+            .send(ClientMessage::Text(oversized.to_string().into()))
+            .await
+        {
+            assert!(matches!(
+                error,
+                tokio_tungstenite::tungstenite::Error::Io(error)
+                    if matches!(error.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe)
+            ));
+            return;
+        }
+        let (frames, _) = read_to_close(&mut socket).await;
+        assert!(frames.is_empty(), "{frames:?}");
+    }
+
+    async fn receive_acp_method(socket: &mut ChatSocket, method: &str) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let message = socket.next().await.unwrap().unwrap();
+                let frame: Value = serde_json::from_str(&message.into_text().unwrap()).unwrap();
+                if frame["method"] == method {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("ACP method")
+    }
+
+    #[tokio::test]
+    async fn scoped_acp_reconnects_at_capacity_and_answers_pending_approval() {
+        let fixture = Fixture::with_config(asking_file_read).await;
+        let note = fixture
+            .config
+            .agent_workspace_dir("support")
+            .join("note.txt");
+        std::fs::create_dir_all(note.parent().unwrap()).unwrap();
+        let marker = "reconnected ACP read this fixture note";
+        std::fs::write(note, marker).unwrap();
+        let addr = serve(fixture.router()).await;
+        let (cookie, _) = fixture.sign_in("alice").await;
+        let mut sockets = Vec::new();
+        for _ in 0..MAX_LIVE_CONVERSATIONS {
+            sockets.push(
+                open_scoped_acp(addr, &cookie, Some("support"), None)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let mut origin = sockets.pop().unwrap();
+        let created = call_acp(&mut origin, 1, "session/new", json!({})).await;
+        let sid = created["result"]["sessionId"].as_str().unwrap();
+        send_acp(
+            &mut origin,
+            2,
+            "session/prompt",
+            json!({
+                "sessionId":sid,"prompt":[{"type":"text","text":"please read the note"}],
+            }),
+        )
+        .await;
+        let original = receive_acp_method(&mut origin, "session/request_permission").await;
+        origin.close(None).await.unwrap();
+        read_to_close(&mut origin).await;
+
+        let mut replacement = open_scoped_acp(addr, &cookie, Some("support"), Some(sid))
+            .await
+            .unwrap();
+        let forbidden = call_acp(&mut replacement, 3, "session/new", json!({})).await;
+        assert_eq!(forbidden["error"]["code"], FORBIDDEN);
+        let resume = call_acp(
+            &mut replacement,
+            4,
+            "session/resume",
+            json!({"sessionId":sid}),
+        )
+        .await;
+        assert!(resume["result"].is_object(), "{resume}");
+        let reattach = call_acp(
+            &mut replacement,
+            5,
+            "_zeroclaw/session/reattach",
+            json!({"sessionId":sid}),
+        )
+        .await;
+        assert_eq!(reattach["result"]["inFlight"], true, "{reattach}");
+        let replay = receive_acp_method(&mut replacement, "session/request_permission").await;
+        assert_eq!(replay["id"], original["id"]);
+        let mut duplicate = open_scoped_acp(addr, &cookie, Some("support"), Some(sid))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_to_close(&mut duplicate).await.1,
+            Some(WS_CLOSE_CONVERSATION_LIMIT)
+        );
+
+        let allowed = replay["params"]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|option| option["kind"] == "allow_once")
+            .unwrap();
+        replacement
+            .send(ClientMessage::Text(
+                json!({
+                    "jsonrpc":"2.0","id":replay["id"],
+                    "result":{"outcome":{"outcome":"selected","optionId":allowed["optionId"]}}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let done = receive_acp_method(&mut replacement, "_zeroclaw/turn_complete").await;
+        assert_eq!(done["params"]["result"]["stopReason"], "end_turn", "{done}");
+        assert!(model_requests_with(&fixture._model, marker).await > 0);
+    }
+
     /// Drive `open` until the core has started creating its session behind
     /// the armed start gate, then drop it there, as a caller that gives up
     /// mid-creation does. Waiting on the gate, not a fixed timeout, keeps a
@@ -2606,7 +3270,28 @@ mod tests {
         agent: &str,
         session_id: &str,
     ) -> tokio_tungstenite::tungstenite::handshake::client::Request {
-        let mut request = format!("ws://{addr}/ws/chat?agent={agent}&session_id={session_id}")
+        dashboard_ws_request(
+            addr,
+            cookie,
+            &format!("/ws/chat?agent={agent}&session_id={session_id}"),
+        )
+    }
+
+    fn dashboard_ws_request(
+        addr: SocketAddr,
+        cookie: &str,
+        path: &str,
+    ) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+        assert!(
+            addr.ip().is_loopback(),
+            "the test fixture serves only loopback"
+        );
+        let mut request = axum::http::Uri::builder()
+            .scheme("ws")
+            .authority(addr.to_string())
+            .path_and_query(path)
+            .build()
+            .unwrap()
             .into_client_request()
             .unwrap();
         let headers = request.headers_mut();

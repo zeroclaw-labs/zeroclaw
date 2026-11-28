@@ -353,7 +353,7 @@ fn principal_tool_ceiling(grants: &zeroclaw_api::grants::ResolvedGrants) -> Opti
 /// prompts and steering. A wildcard tool or agent selector does not grant
 /// ownership of other sessions, or authority for work that runs later, on
 /// another agent or as SOP steps without the caller's principal.
-fn principal_tool_posture(
+pub fn principal_tool_posture(
     grants: &zeroclaw_api::grants::ResolvedGrants,
 ) -> crate::agent::SteeringPosture {
     crate::agent::SteeringPosture {
@@ -8565,7 +8565,7 @@ impl RpcDispatcher {
 
     /// Set a session's display name.
     async fn handle_session_rename(&self, params: &Value) -> RpcResult {
-        const MAX_SESSION_NAME_CHARS: usize = 200;
+        use zeroclaw_api::session_keys::MAX_SESSION_NAME_CHARS;
         let req: SessionRenameParams = parse_params(params)?;
         let name = req.name.trim();
         if name.is_empty() {

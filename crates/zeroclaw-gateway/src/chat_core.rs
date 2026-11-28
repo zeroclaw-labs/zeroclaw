@@ -1133,7 +1133,7 @@ impl ContextMeter {
         {
             done["model_context_window"] = Value::from(window);
         }
-        self.display.add_to_done(&mut done);
+        crate::ws::add_trim_to_done(&self.display, &mut done);
         done
     }
 }

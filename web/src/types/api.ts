@@ -225,6 +225,8 @@ export interface SSEEvent {
 export interface WsMessage {
   type:
     | "message"
+    | "session_message"
+    | "turn_reset"
     | "chunk"
     | "chunk_reset"
     | "thinking"
@@ -241,6 +243,8 @@ export interface WsMessage {
     | "aborted";
   content?: string;
   full_response?: string;
+  /** ACP replay finished a turn whose transcript was already persisted. */
+  replayed_completion?: boolean;
   name?: string;
   args?: any;
   output?: string;
@@ -271,6 +275,7 @@ export interface WsMessage {
   tool?: string;
   arguments_summary?: string;
   timeout_secs?: number;
+  approval_options?: Array<{ optionId: string; name?: string; kind?: string }>;
   dropped_messages?: number;
   dropped_turns?: number;
   kept_turns?: number;
@@ -298,13 +303,20 @@ export interface WsMessage {
   context_input_tokens_source?: string;
 }
 
-export type ApprovalDecision = "approve" | "deny" | "always";
+export type ApprovalDecision = "approve" | "deny" | "always" | `choice:${string}`;
+
+export interface ApprovalOption {
+  optionId: string;
+  name?: string;
+  kind?: string;
+}
 
 export interface PendingApproval {
   requestId: string;
   toolName: string;
   argumentsSummary: string;
   timeoutSecs: number;
+  options?: ApprovalOption[];
   /** Wall-clock millis when the request arrived; used to compute remaining time. */
   receivedAt: number;
 }

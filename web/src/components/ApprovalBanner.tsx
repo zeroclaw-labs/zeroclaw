@@ -68,33 +68,45 @@ export default function ApprovalBanner({ pending, onRespond }: ApprovalBannerPro
           </div>
         </div>
 
-        <div className="flex items-center gap-2 justify-end">
-          <Button
-            size="sm"
-            variant="danger"
-            onClick={() => onRespond('deny')}
-          >
-            <X className="h-3.5 w-3.5" />
-            {t('agent.approval_deny')}
-          </Button>
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => onRespond('always')}
-            title={t('agent.approval_always_hint')}
-          >
-            <ShieldCheck className="h-3.5 w-3.5" />
-            {t('agent.approval_always')}
-          </Button>
-          <Button
-            size="sm"
-            variant="primary"
-            onClick={() => onRespond('approve')}
-          >
-            <Check className="h-3.5 w-3.5" />
-            {t('agent.approval_approve')}
-          </Button>
-        </div>
+        {pending.options?.length && !pending.options.some((option) => option.optionId === 'allow-once') ? (
+          <div className="flex items-center gap-2 justify-end flex-wrap">
+            <Button size="sm" variant="ghost" onClick={() => onRespond('deny')}>
+              <X className="h-3.5 w-3.5" />
+              {t('acp.dismiss')}
+            </Button>
+            {pending.options.map((option) => (
+              <Button
+                key={option.optionId}
+                size="sm"
+                variant={option.kind === 'reject_once' ? 'danger' : 'primary'}
+                onClick={() => onRespond(`choice:${option.optionId}`)}
+              >
+                <Check className="h-3.5 w-3.5" />
+                {option.name ?? option.optionId}
+              </Button>
+            ))}
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 justify-end">
+            <Button size="sm" variant="danger" onClick={() => onRespond('deny')}>
+              <X className="h-3.5 w-3.5" />
+              {t('agent.approval_deny')}
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => onRespond('always')}
+              title={t('agent.approval_always_hint')}
+            >
+              <ShieldCheck className="h-3.5 w-3.5" />
+              {t('agent.approval_always')}
+            </Button>
+            <Button size="sm" variant="primary" onClick={() => onRespond('approve')}>
+              <Check className="h-3.5 w-3.5" />
+              {t('agent.approval_approve')}
+            </Button>
+          </div>
+        )}
       </div>
     </div>
   );

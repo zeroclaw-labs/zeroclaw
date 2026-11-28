@@ -182,6 +182,7 @@ class FakeSocket implements SessionSocket {
   onOpen: (() => void) | null = null;
   onClose: ((ev: CloseEvent) => void) | null = null;
   onError: ((ev: Event) => void) | null = null;
+  closeSession?: () => Promise<void>;
   connectCalls = 0;
   disconnectCalls = 0;
   sent: string[] = [];
@@ -595,6 +596,7 @@ test('switch resets capability, hydrates the target, and ignores the old socket'
   assert.deepEqual(mounted.context().messages, []);
   assert.equal(mounted.context().hydrated, false);
   assert.equal(mounted.context().sessionPersistence, null);
+  assert.equal(mounted.context().connected, false);
   assert.equal(runtime.sockets[0]?.disconnectCalls, 1);
   assert.equal(runtime.sockets[1]?.sessionId, 'B');
 
@@ -609,6 +611,7 @@ test('switch resets capability, hydrates the target, and ignores the old socket'
   assert.equal(mounted.context().sessionId, 'B');
   assert.equal(mounted.context().sessionPersistence, true);
   assert.equal(mounted.context().hydrated, true);
+  assert.equal(mounted.context().connected, true);
   assert.deepEqual(mounted.context().messages.map((message) => message.content), ['from B']);
   await unmount(mounted.renderer);
 });
@@ -1300,6 +1303,60 @@ const answered = (...contents: string[]): SessionMessagesResponse => ({
 
 const stateCallsFor = (runtime: FakeSessionRuntime, id: string) =>
   runtime.stateCalls.filter((call) => call.id === id).length;
+
+for (const historyIncludesReply of [false, true]) {
+  test(`an ACP replay uses saved history when the initial load ${historyIncludesReply ? 'already included' : 'missed'} its reply`, async () => {
+    const runtime = new FakeSessionRuntime();
+    Object.defineProperty(runtime, 'getState', { value: undefined });
+    const timestamp = '2026-08-05T00:00:00Z';
+    storage.setItem('zeroclaw_chat_history_v1:A', JSON.stringify({ messages: [
+      { id: 'old-prompt', role: 'user', content: 'earlier', timestamp },
+      {
+        id: 'old-tool', role: 'agent', content: 'read a file', timestamp,
+        toolCall: { id: 'old-call', name: 'file_read', output: 'old output' },
+      },
+      { id: 'old-answer', role: 'agent', content: 'same answer', thinking: 'earlier reasoning', timestamp },
+    ] }));
+    const committed = answered('earlier', 'same answer', 'resumed prompt', 'same answer');
+    const initial = historyIncludesReply ? committed : answered('earlier', 'same answer');
+    runtime.queueMessages('A', () => Promise.resolve(initial));
+    const replayHistory = new Deferred<SessionMessagesResponse>();
+    runtime.queueMessages('A', () => replayHistory.promise);
+    const mounted = await mountChat(runtime, true);
+    try {
+      await openSocket(runtime, 0);
+      await settle();
+      const socket = runtime.sockets[0]!;
+      await act(async () => {
+        socket.emitMessage({ type: 'thinking', content: 'replayed reasoning' });
+        socket.emitMessage({ type: 'tool_call', id: 'replayed-call', name: 'shell', args: { command: 'pwd' } });
+        socket.emitMessage({ type: 'tool_result', id: 'replayed-call', name: 'shell', output: '/workspace' });
+        socket.emitMessage({ type: 'chunk', content: 'same answer' });
+        socket.emitMessage({ type: 'done', full_response: 'same answer', replayed_completion: true });
+      });
+      assert.deepEqual(
+        mounted.context().messages.filter((message) => !message.toolCall).map((message) => message.content),
+        initial.messages.map((row) => row.content),
+      );
+      assert.equal(mounted.context().hydrated, false);
+      await act(async () => { replayHistory.resolve(committed); });
+      await settle();
+      const messages = mounted.context().messages;
+      assert.deepEqual(messages.map((message) => message.toolCall?.id ?? message.content), [
+        'earlier', 'old-call', 'same answer', 'resumed prompt', 'replayed-call', 'same answer',
+      ]);
+      assert.deepEqual(messages.filter((message) => message.thinking).map((message) => message.thinking), [
+        'earlier reasoning', 'replayed reasoning',
+      ]);
+      assert.equal(messages[4]?.toolCall?.output, '/workspace');
+      assert.equal(mounted.context().hydrated, true);
+      assert.equal(mounted.context().typing, false);
+      assert.deepEqual(runtime.messageCalls, ['A', 'A']);
+    } finally {
+      await unmount(mounted.renderer);
+    }
+  });
+}
 
 test('a socket that reopens while its turn still runs shows the turn and loads the answer once it ends', async () => {
   const runtime = new FakeSessionRuntime();
@@ -3010,9 +3067,47 @@ test('a new conversation closes this one, clears the page, and deletes nothing',
     assert.deepEqual(runtime.deleteCalls, []);
     assert.equal(requestedUrls.some((u) => u.startsWith('DELETE')), false);
     // The next message starts the next conversation.
-    await startConversation(mounted, runtime, 'fresh', 'core-2');
+    const next = await startConversation(mounted, runtime, 'fresh', 'core-2');
+    assert.notEqual(next.sessionId, socket.sessionId);
+    assert.notEqual(socket.sessionId, mounted.context().sessionId);
     assert.equal(runtime.sockets.length, 2);
     await unmount(mounted.renderer);
+  });
+});
+
+test('scoped ACP Clear waits for the active conversation to close before discarding it', async () => {
+  await withSession(scopedSession, async () => {
+    const runtime = new FakeSessionRuntime();
+    const mounted = await mountChat(runtime);
+    const socket = await startConversation(mounted, runtime, 'running work', 'acp-1');
+    const close = new Deferred<void>();
+    let closeCalls = 0;
+    socket.closeSession = () => {
+      closeCalls += 1;
+      return close.promise;
+    };
+    try {
+      await act(async () => { mounted.context().clearAllMessages(); });
+      await act(async () => {
+        mounted.context().clearAllMessages();
+        mounted.context().sendMessage('too early');
+      });
+      assert.equal(closeCalls, 1);
+      assert.equal(socket.disconnectCalls, 0);
+      assert.deepEqual(socket.sent, ['running work']);
+      assert.equal(mounted.context().startsConversationOnSend, false);
+      assert.equal(mounted.context().messages[0]?.content, 'running work');
+
+      await act(async () => { close.resolve(); });
+      await settle();
+      assert.ok(socket.disconnectCalls > 0);
+      assert.deepEqual(mounted.context().messages, []);
+      assert.deepEqual(runtime.deleteCalls, []);
+      const next = await startConversation(mounted, runtime, 'fresh', 'acp-2');
+      assert.notEqual(next.sessionId, socket.sessionId);
+    } finally {
+      await unmount(mounted.renderer);
+    }
   });
 });
 

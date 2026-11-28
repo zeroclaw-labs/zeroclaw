@@ -1798,21 +1798,32 @@ pub async fn handle_api_sessions_list(
         return e.into_response();
     }
 
-    let Some(ref backend) = state.session_backend else {
+    if state.session_backend.is_none() {
         return Json(serde_json::json!({
             "sessions": [],
             "message": "Session persistence is disabled"
         }))
         .into_response();
-    };
+    }
 
+    Json(serde_json::json!({ "sessions": legacy_session_list(&state, true) })).into_response()
+}
+
+pub(crate) fn legacy_session_list(
+    state: &AppState,
+    include_webchat: bool,
+) -> Vec<serde_json::Value> {
+    let Some(backend) = &state.session_backend else {
+        return Vec::new();
+    };
     // Include every session that's attributable (agent_alias stamped,
     // or a channel_id that resolves to an owning agent).
     // Pre-migration rows with neither set are skipped as orphans.
     let config = state.config.read().clone();
     let all_metadata = backend.list_sessions_with_metadata();
-    let sessions: Vec<serde_json::Value> = all_metadata
+    all_metadata
         .into_iter()
+        .filter(|meta| include_webchat || !meta.key.starts_with(GW_SESSION_PREFIX))
         .filter(|meta| meta.agent_alias.is_some() || meta.channel_id.is_some())
         .map(|meta| {
             // Resolve owning agent: prefer the stamped alias, otherwise
@@ -1848,9 +1859,7 @@ pub async fn handle_api_sessions_list(
             }
             entry
         })
-        .collect();
-
-    Json(serde_json::json!({ "sessions": sessions })).into_response()
+        .collect()
 }
 
 /// Resolve a path `{id}` to the persisted session key.

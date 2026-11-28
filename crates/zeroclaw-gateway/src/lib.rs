@@ -815,7 +815,7 @@ pub struct AppState {
     pub path_prefix: String,
     /// Filesystem path to `web/dist/` for serving the dashboard (None = API-only)
     pub web_dist_dir: Option<std::path::PathBuf>,
-    /// Session backend for persisting gateway WS chat sessions
+    /// Session backend for legacy WebChat and non-WebChat conversations.
     pub session_backend: Option<Arc<dyn SessionBackend>>,
     /// Per-session actor queue for serializing concurrent turns
     pub session_queue: Arc<session_queue::SessionActorQueue>,
@@ -2137,6 +2137,28 @@ pub async fn run_gateway_with_plugin_webhooks(
         None
     };
 
+    let cutover_store = if config.gateway.acp_webchat_cutover {
+        let legacy = session_backend.as_deref().ok_or_else(|| {
+            anyhow::Error::msg("ACP WebChat cutover requires an available legacy session backend")
+        })?;
+        // The listener is bound but the router is not serving yet. With the
+        // previous gateway stopped, no legacy chat writes can race the copy.
+        let store = Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(
+            &config.data_dir,
+        )?);
+        store.import_legacy_gateway_sessions(legacy, |persisted| {
+            let alias =
+                zeroclaw_channels::orchestrator::acp_server::AcpServer::resolve_restore_agent_alias(
+                    &config,
+                    persisted.unwrap_or(""),
+                );
+            let workspace = config.agent_workspace_dir(&alias);
+            (alias, workspace)
+        })?;
+        Some(store)
+    } else {
+        None
+    };
     // ── Pairing guard ──────────────────────────────────────
     // Supervised runs share the daemon's live authority so pairing and
     // revocation reach RPC authentication too; standalone constructs its
@@ -2765,13 +2787,13 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/api/health", get(api::handle_api_health))
         .route("/api/tuis", get(api::handle_api_tuis))
         .route("/api/sessions", get(dashboard_core::sessions_list))
-        .route("/api/sessions/running", get(api::handle_api_sessions_running))
+        .route("/api/sessions/running", get(dashboard_core::sessions_running))
         .route(
             "/api/sessions/{id}/messages",
-            get(dashboard_core::session_messages).post(api::handle_api_session_message_post),
+            get(dashboard_core::session_messages).post(dashboard_core::session_message_post),
         )
         .route("/api/sessions/{id}", delete(dashboard_core::session_delete).put(dashboard_core::session_rename))
-        .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
+        .route("/api/sessions/{id}/state", get(dashboard_core::session_state))
         .route("/api/sessions/{id}/abort", post(dashboard_core::session_abort))
         .route("/api/agents/available", get(dashboard_core::agents_available))
         // ── Pairing + Device management API ──
@@ -2849,15 +2871,19 @@ pub async fn run_gateway_with_plugin_webhooks(
     // The read-only package catalog remains discoverable in every gateway
     // build; WASM-specific sources degrade explicitly when support is absent.
     let inner = inner.route("/api/plugins", get(api_plugins::list_plugins));
+    let inner = if config.gateway.acp_webchat_cutover {
+        inner.route("/ws/chat", get(|| async { StatusCode::GONE }))
+    } else {
+        inner.route("/ws/chat", get(ws::handle_ws_chat))
+    };
 
+    let acp_turns = Arc::new(acp::AcpTurnHub::new(Arc::clone(&state.session_queue)));
     let inner = inner
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
         .route("/api/events/history", get(sse::handle_events_history))
         // ── ACP client bridge ──
-        .route("/acp", get(acp::handle_ws_acp))
-        // ── WebSocket agent chat ──
-        .route("/ws/chat", get(ws::handle_ws_chat))
+        .route("/acp", get(acp::handle_ws_acp).layer(axum::Extension(Arc::clone(&acp_turns))))
         // ── WebSocket SOP runs feed ──
         .route("/ws/sops/runs", get(ws_sop_runs::handle_ws_sop_runs))
         // ── WebSocket canvas updates ──
@@ -2874,6 +2900,15 @@ pub async fn run_gateway_with_plugin_webhooks(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
         ));
+
+    let inner = if let Some(store) = cutover_store {
+        inner.layer(axum::Extension(dashboard_core::CutoverWebChat {
+            store,
+            turns: acp_turns,
+        }))
+    } else {
+        inner
+    };
 
     // The dashboard image upload lives on its own sub-router so it can opt out
     // of the 64 KB gateway-wide RequestBodyLimitLayer, which is sized for JSON
@@ -3306,12 +3341,16 @@ fn public_health_snapshot() -> serde_json::Value {
 }
 
 /// GET /health — always public (no secrets leaked)
-async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
+async fn handle_health(
+    State(state): State<AppState>,
+    cutover: dashboard_core::Cutover,
+) -> impl IntoResponse {
     let body = serde_json::json!({
         "status": "ok",
         "paired": state.pairing.is_paired(),
         "require_pairing": state.pairing.require_pairing(),
         "runtime": public_health_snapshot(),
+        "chat_transport": if cutover.is_some() { "acp" } else { "legacy" },
     });
     Json(body)
 }
@@ -6328,7 +6367,7 @@ mod tests {
         zeroclaw_runtime::health::mark_component_error(&component, sensitive_error);
 
         let tmp = tempfile::TempDir::new().unwrap();
-        let response = handle_health(State(admin_paircode_state(&tmp, false, false)))
+        let response = handle_health(State(admin_paircode_state(&tmp, false, false)), None)
             .await
             .into_response();
         assert_eq!(response.status(), StatusCode::OK);
@@ -6676,7 +6715,7 @@ path = "{trigger_path}"
         path: &'static str,
         state: AppState,
     ) -> axum::response::Response {
-        static_files::handle_spa_fallback(State(state), Uri::from_static(path)).await
+        static_files::handle_spa_fallback(State(state), None, Uri::from_static(path)).await
     }
 
     async fn static_route_response(

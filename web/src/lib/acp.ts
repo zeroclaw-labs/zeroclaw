@@ -10,6 +10,18 @@ export interface JsonRpcError {
   data?: unknown;
 }
 
+export class AcpError extends Error {
+  readonly code: number;
+  readonly data?: unknown;
+
+  constructor(error: JsonRpcError) {
+    super(error.message);
+    this.name = 'AcpError';
+    this.code = error.code;
+    this.data = error.data;
+  }
+}
+
 export interface AcpRequest {
   jsonrpc: '2.0';
   method: string;
@@ -51,10 +63,17 @@ export interface AcpSessionNewResult {
   workspaceDir?: string;
 }
 
+export interface AcpSessionResumeResult {
+  messageCount?: number;
+}
+
 export interface AcpSessionPromptResult {
   sessionId?: string;
   stopReason?: string;
   content?: string;
+  _meta?: {
+    zeroclaw?: Record<string, unknown>;
+  };
 }
 
 export interface AcpSessionUpdateParams {
@@ -80,7 +99,7 @@ export interface AcpClientHandlers {
 interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
-  timeout: ReturnType<typeof setTimeout>;
+  timeout: ReturnType<typeof setTimeout> | null;
 }
 
 const ACP_PROTOCOL = 'zeroclaw.acp.v1';
@@ -115,13 +134,17 @@ export class AcpWebSocketClient {
 
   constructor(private readonly handlers: AcpClientHandlers = {}) {}
 
-  connect(): void {
+  connect(agentAlias?: string, resumeSession?: string): void {
     if (this.ws?.readyState === WebSocket.OPEN || this.ws?.readyState === WebSocket.CONNECTING) {
       return;
     }
 
     const token = getToken();
-    const url = `${acpWebSocketBaseUrl()}${basePath}/acp`;
+    const query = new URLSearchParams();
+    if (agentAlias) query.set('agent', agentAlias);
+    if (resumeSession) query.set('resumeSession', resumeSession);
+    const search = query.toString();
+    const url = `${acpWebSocketBaseUrl()}${basePath}/acp${search ? `?${search}` : ''}`;
     const protocols = token ? [ACP_PROTOCOL, `bearer.${token}`] : [ACP_PROTOCOL];
 
     this.ws = new WebSocket(url, protocols);
@@ -165,10 +188,12 @@ export class AcpWebSocketClient {
     };
 
     return new Promise<T>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`${method} timed out`));
-      }, timeoutMs);
+      const timeout = timeoutMs > 0
+        ? setTimeout(() => {
+            this.pending.delete(id);
+            reject(new Error(`${method} timed out`));
+          }, timeoutMs)
+        : null;
 
       this.pending.set(id, {
         resolve: (value) => resolve(value as T),
@@ -178,7 +203,7 @@ export class AcpWebSocketClient {
       try {
         this.ws?.send(JSON.stringify(frame));
       } catch (err) {
-        clearTimeout(timeout);
+        if (timeout !== null) clearTimeout(timeout);
         this.pending.delete(id);
         reject(err instanceof Error ? err : new Error(String(err)));
       }
@@ -234,11 +259,11 @@ export class AcpWebSocketClient {
   private resolveResponse(frame: AcpResponse): void {
     const pending = this.pending.get(frame.id);
     if (!pending) return;
-    clearTimeout(pending.timeout);
+    if (pending.timeout !== null) clearTimeout(pending.timeout);
     this.pending.delete(frame.id);
 
     if (frame.error) {
-      pending.reject(new Error(frame.error.message));
+      pending.reject(new AcpError(frame.error));
     } else {
       pending.resolve(frame.result);
     }
@@ -246,7 +271,7 @@ export class AcpWebSocketClient {
 
   private rejectPending(error: Error): void {
     for (const pending of this.pending.values()) {
-      clearTimeout(pending.timeout);
+      if (pending.timeout !== null) clearTimeout(pending.timeout);
       pending.reject(error);
     }
     this.pending.clear();

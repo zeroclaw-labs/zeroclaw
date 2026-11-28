@@ -123,6 +123,20 @@ impl SessionActorQueue {
     /// Acquire exclusive access to a session. Blocks until the session is free
     /// or the timeout expires. Returns a guard that releases on drop.
     pub async fn acquire(&self, session_id: &str) -> Result<SessionGuard, SessionQueueError> {
+        self.acquire_with_wait(session_id, true).await
+    }
+
+    /// Acquire exclusive access without waiting for another operation to finish.
+    /// A busy session returns a queue error immediately.
+    pub async fn try_acquire(&self, session_id: &str) -> Result<SessionGuard, SessionQueueError> {
+        self.acquire_with_wait(session_id, false).await
+    }
+
+    async fn acquire_with_wait(
+        &self,
+        session_id: &str,
+        wait: bool,
+    ) -> Result<SessionGuard, SessionQueueError> {
         let registration = {
             let mut slots = self.slots.lock().await;
             let slot = slots
@@ -160,21 +174,24 @@ impl SessionActorQueue {
             registration
         };
 
-        // Acquire owned permit with timeout
-        let sem = registration.slot.semaphore.clone();
-        match tokio::time::timeout(self.lock_timeout, sem.acquire_owned()).await {
-            Ok(Ok(permit)) => {
-                *registration.slot.last_active.lock().await = Instant::now();
-                Ok(SessionGuard {
-                    _permit: permit,
-                    _registration: registration,
-                    session_id: session_id.to_string(),
-                })
-            }
-            Ok(Err(_)) | Err(_) => Err(SessionQueueError::Timeout {
-                session_id: session_id.to_string(),
-            }),
+        let semaphore = Arc::clone(&registration.slot.semaphore);
+        let permit = if wait {
+            tokio::time::timeout(self.lock_timeout, semaphore.acquire_owned())
+                .await
+                .ok()
+                .and_then(Result::ok)
+        } else {
+            semaphore.try_acquire_owned().ok()
         }
+        .ok_or_else(|| SessionQueueError::Timeout {
+            session_id: session_id.to_string(),
+        })?;
+        *registration.slot.last_active.lock().await = Instant::now();
+        Ok(SessionGuard {
+            _permit: permit,
+            _registration: registration,
+            session_id: session_id.to_string(),
+        })
     }
 
     #[cfg(test)]
