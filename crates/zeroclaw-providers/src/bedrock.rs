@@ -4,6 +4,7 @@ use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     ModelProvider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall, ToolsPayload,
 };
+use anyhow::Context;
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use reqwest::Client;
@@ -331,10 +332,6 @@ impl AwsCredentials {
             return Ok(creds);
         }
         Self::from_imds().await
-    }
-
-    fn host(&self) -> String {
-        format!("{ENDPOINT_PREFIX}.{}.amazonaws.com", self.region)
     }
 
     /// Returns `true` if credentials have a known expiry that has passed
@@ -732,6 +729,9 @@ pub struct BedrockModelProvider {
     /// `[providers.models.<family>.<alias>]` config-key alias.
     alias: String,
     auth: Option<BedrockAuth>,
+    /// Explicit connection region; ambient credentials remain independently resolved.
+    region: Option<String>,
+    api_url: Option<String>,
     max_tokens: u32,
     /// Cached SigV4 credentials from `credential_process` (with expiry).
     cred_cache: Mutex<Option<AwsCredentials>>,
@@ -752,10 +752,24 @@ pub struct BedrockModelProvider {
 pub struct BedrockBuilder {
     alias: String,
     bearer_token: Option<String>,
+    region: Option<String>,
+    api_url: Option<String>,
     max_tokens: Option<u32>,
 }
 
 impl BedrockBuilder {
+    /// Override the regional service root, for example a private Bedrock endpoint.
+    pub fn api_url(mut self, api_url: Option<&str>) -> Self {
+        self.api_url = api_url.map(|uri| uri.trim_end_matches('/').to_owned());
+        self
+    }
+
+    /// Pin the AWS region for both Bearer-token requests and SigV4 signing.
+    pub fn region(mut self, region: Option<&str>) -> Self {
+        self.region = region.map(str::to_owned);
+        self
+    }
+
     /// Set an explicit Bearer token. When set, [`Self::build`] uses it
     /// directly and skips every AWS credential probe (including the
     /// `credential_process` command that would otherwise spawn a shell).
@@ -788,6 +802,8 @@ impl BedrockBuilder {
         BedrockModelProvider {
             alias: self.alias,
             auth,
+            region: self.region,
+            api_url: self.api_url,
             max_tokens: self
                 .max_tokens
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_MAX_TOKENS),
@@ -807,6 +823,8 @@ impl BedrockBuilder {
         BedrockModelProvider {
             alias: self.alias,
             auth,
+            region: self.region,
+            api_url: self.api_url,
             max_tokens: self
                 .max_tokens
                 .unwrap_or(zeroclaw_api::model_provider::BASELINE_MAX_TOKENS),
@@ -846,7 +864,9 @@ impl BedrockModelProvider {
     pub fn builder(alias: &str) -> BedrockBuilder {
         BedrockBuilder {
             alias: alias.to_string(),
+            api_url: None,
             bearer_token: None,
+            region: None,
             max_tokens: None,
         }
     }
@@ -878,6 +898,19 @@ impl BedrockModelProvider {
         format!("https://{ENDPOINT_PREFIX}.{region}.amazonaws.com/model/{model_id}/converse")
     }
 
+    fn request_url(&self, region: &str, model_id: &str) -> anyhow::Result<reqwest::Url> {
+        let uri = self.api_url.as_ref().map_or_else(
+            || Self::endpoint_url(region, model_id),
+            |base| format!("{base}/model/{model_id}/converse"),
+        );
+        let url = reqwest::Url::parse(&uri)?;
+        anyhow::ensure!(
+            url.query().is_none() && url.fragment().is_none(),
+            "Bedrock connection URI must not contain a query or fragment"
+        );
+        Ok(url)
+    }
+
     /// Build the canonical URI for SigV4 signing. Must URI-encode the path
     /// per SigV4 spec: colons become `%3A`. AWS verifies the signature against
     /// the encoded form even though the wire request uses raw colons.
@@ -905,6 +938,14 @@ impl BedrockModelProvider {
 
     /// Resolve pinned/cached auth, then bearer env, SigV4 env, credential_process, and IMDS.
     async fn resolve_auth(&self) -> anyhow::Result<BedrockAuth> {
+        let mut auth = self.resolve_ambient_auth().await?;
+        if let (Some(region), BedrockAuth::SigV4(credentials)) = (&self.region, &mut auth) {
+            credentials.region.clone_from(region);
+        }
+        Ok(auth)
+    }
+
+    async fn resolve_ambient_auth(&self) -> anyhow::Result<BedrockAuth> {
         // If we already have auth cached, re-resolve from the same source.
         if let Some(ref auth) = self.auth {
             match auth {
@@ -1569,11 +1610,11 @@ impl BedrockModelProvider {
 
         let response: reqwest::Response = match auth {
             BedrockAuth::BearerToken(token) => {
-                let region = Self::resolve_region();
-                let url = Self::endpoint_url(&region, model);
+                let region = self.region.clone().unwrap_or_else(Self::resolve_region);
+                let url = self.request_url(&region, model)?;
 
                 self.http_client()
-                    .post(&url)
+                    .post(url)
                     .header("content-type", "application/json")
                     .header("Authorization", format!("Bearer {token}"))
                     .body(payload)
@@ -1581,10 +1622,21 @@ impl BedrockModelProvider {
                     .await?
             }
             BedrockAuth::SigV4(credentials) => {
-                let url = Self::endpoint_url(&credentials.region, model);
-                let canonical_uri = Self::canonical_uri(model);
+                let url = self.request_url(&credentials.region, model)?;
+                let prefix = url
+                    .path()
+                    .rsplit_once("/model/")
+                    .map(|(prefix, _)| prefix)
+                    .unwrap_or_default();
+                let canonical_uri = format!("{prefix}{}", Self::canonical_uri(model));
                 let now = chrono::Utc::now();
-                let host = credentials.host();
+                let mut host = url
+                    .host()
+                    .context("Bedrock connection URI has no host")?
+                    .to_string();
+                if let Some(port) = url.port() {
+                    host.push_str(&format!(":{port}"));
+                }
                 let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
 
                 let mut headers_to_sign = vec![
@@ -1610,7 +1662,7 @@ impl BedrockModelProvider {
 
                 let mut request = self
                     .http_client()
-                    .post(&url)
+                    .post(url)
                     .header("content-type", "application/json")
                     .header("x-amz-date", &amz_date)
                     .header("authorization", &authorization);
@@ -1827,7 +1879,11 @@ impl ModelProvider for BedrockModelProvider {
             Some(BedrockAuth::BearerToken(_)) => Self::resolve_region(),
             None => return Ok(()),
         };
-        let url = format!("https://{ENDPOINT_PREFIX}.{region}.amazonaws.com/");
+        let region = self.region.as_deref().unwrap_or(&region);
+        let url = self
+            .api_url
+            .clone()
+            .unwrap_or_else(|| format!("https://{ENDPOINT_PREFIX}.{region}.amazonaws.com/"));
         let _ = self.http_client().get(&url).send().await;
         Ok(())
     }
@@ -1987,15 +2043,25 @@ mod tests {
     // ── Credential tests ────────────────────────────────────────
 
     #[test]
-    fn credentials_host_formats_correctly() {
-        let creds = AwsCredentials {
-            access_key_id: "AKID".to_string(),
-            secret_access_key: "secret".to_string(),
-            session_token: None,
-            region: "us-west-2".to_string(),
-            expires_at: None,
-        };
-        assert_eq!(creds.host(), "bedrock-runtime.us-west-2.amazonaws.com");
+    fn request_url_honors_private_service_root_and_default_region() {
+        let provider = BedrockModelProvider::builder("test")
+            .bearer_token("key")
+            .api_url(Some("https://bedrock.internal/prefix/"))
+            .build();
+        let url = provider
+            .request_url("us-west-2", "anthropic.model:v1")
+            .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://bedrock.internal/prefix/model/anthropic.model:v1/converse"
+        );
+        let provider = BedrockModelProvider::builder("test")
+            .bearer_token("key")
+            .build();
+        assert_eq!(
+            provider.request_url("us-west-2", "model").unwrap().as_str(),
+            "https://bedrock-runtime.us-west-2.amazonaws.com/model/model/converse"
+        );
     }
 
     // ── ModelProvider construction tests ─────────────────────────────
@@ -2022,6 +2088,8 @@ mod tests {
             alias: "test".to_string(),
             auth: None,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+            region: None,
+            api_url: None,
             cred_cache: Mutex::new(None),
         };
         let result = model_provider
@@ -2060,6 +2128,32 @@ mod tests {
         assert!(
             matches!(model_provider.auth, Some(BedrockAuth::BearerToken(ref t)) if t == "test-api-key")
         );
+    }
+
+    #[tokio::test]
+    async fn configured_region_overrides_sigv4_credentials_and_bearer_routing() {
+        let provider = BedrockModelProvider::builder("gateway.prod")
+            .bearer_token("explicit-token")
+            .region(Some("eu-west-1"))
+            .build();
+        assert_eq!(provider.region.as_deref(), Some("eu-west-1"));
+        assert!(
+            matches!(provider.resolve_auth().await.unwrap(), BedrockAuth::BearerToken(token) if token == "explicit-token")
+        );
+
+        // Cached credentials retain their credential-source region; the
+        // connection override is applied to each resolved signing identity.
+        let future = chrono::Utc::now() + chrono::Duration::hours(1);
+        let credentials = make_creds(Some(future));
+        let source_region = credentials.region.clone();
+        let mut provider = provider;
+        provider.auth = Some(BedrockAuth::SigV4(credentials.clone()));
+        provider.cache_credentials(&credentials);
+        let BedrockAuth::SigV4(resolved) = provider.resolve_auth().await.unwrap() else {
+            panic!("cached SigV4 credentials must retain their auth mode");
+        };
+        assert_eq!(resolved.region, "eu-west-1");
+        assert_eq!(provider.cached_credentials().unwrap().region, source_region);
     }
 
     /// Regression for the factory-side explicit-API-key path.
@@ -2720,6 +2814,8 @@ mod tests {
             alias: "test".to_string(),
             auth: None,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+            region: None,
+            api_url: None,
             cred_cache: Mutex::new(None),
         };
         let result = model_provider.warmup().await;
@@ -2732,6 +2828,8 @@ mod tests {
             alias: "test".to_string(),
             auth: None,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+            region: None,
+            api_url: None,
             cred_cache: Mutex::new(None),
         };
         let caps = model_provider.capabilities();
@@ -3093,6 +3191,8 @@ credential_process=some-command
             alias: "test".to_string(),
             auth: None,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+            region: None,
+            api_url: None,
             cred_cache: Mutex::new(None),
         };
         assert!(model_provider.cached_credentials().is_none());
@@ -3105,6 +3205,8 @@ credential_process=some-command
             alias: "test".to_string(),
             auth: None,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+            region: None,
+            api_url: None,
             cred_cache: Mutex::new(Some(make_creds(Some(future)))),
         };
         let cached = model_provider.cached_credentials();
@@ -3119,6 +3221,8 @@ credential_process=some-command
             alias: "test".to_string(),
             auth: None,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+            region: None,
+            api_url: None,
             cred_cache: Mutex::new(Some(make_creds(Some(past)))),
         };
         assert!(model_provider.cached_credentials().is_none());
@@ -3131,6 +3235,8 @@ credential_process=some-command
             alias: "test".to_string(),
             auth: None,
             max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
+            region: None,
+            api_url: None,
             cred_cache: Mutex::new(None),
         };
         assert!(model_provider.cached_credentials().is_none());

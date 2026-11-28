@@ -14533,10 +14533,12 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "windows-sys 0.61.2",
+ "wiremock",
  "zeroclaw-api",
  "zeroclaw-config",
  "zeroclaw-log",
  "zeroclaw-spawn",
+ "zeroclaw-tool-call-parser",
 ]
 
 [[package]]

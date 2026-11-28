@@ -6,7 +6,7 @@ Every model provider lives at `[providers.models.<type>.<alias>]`. `<type>` is a
 
 The smallest config that loads clean has four section headers: a provider entry, an agent that references it, and a risk profile the agent gates against. Configure them through the gateway, zerocode, or `zeroclaw config set`; the [config reference](../reference/config.md#providers) has the full field index.
 
-If you write `config.toml` by hand, make `schema_version = 4` its first line. The tools above add it for you. Without it, ZeroClaw has to guess the file's version: it reads a file whose sections are plainly in the current shape as version 3, migrates it from there and warns you to add the key (`zeroclaw config migrate` writes it), but any other file is read as the oldest version and migrated.
+If you write `config.toml` by hand, make `schema_version = 5` its first line. The tools above add it for you. Without it, ZeroClaw has to guess the file's version: it reads a file whose sections are plainly in the current shape as version 3, migrates it from there and warns you to add the key (`zeroclaw config migrate` writes it), but any other file is read as the oldest version and migrated.
 
 ## Field reference: provider entry
 
@@ -148,7 +148,9 @@ For most families, the URL is resolved in this order:
 2. **Family endpoint**: the family's `*Endpoint` enum supplies the URL (e.g. `OpenAIEndpoint::Default` -> `https://api.openai.com/v1`). Multi-region families have an `endpoint` field on the alias entry that picks the variant (e.g. `endpoint = "cn"` for Moonshot).
 3. **Templated families**: Azure takes typed inputs (`resource`, `deployment`, `api_version`) and substitutes them into the family's URI template. Missing fields fail loud at runtime.
 
-Bedrock is an exception: its endpoint hostname is constructed at request time from the signing region resolved through the AWS credential chain (`AWS_REGION`, `AWS_DEFAULT_REGION`, or the `region` from the active `credential_process` or IMDS profile). The `uri` alias field and the schema-level `providers.models.bedrock.<alias>.region` field have no effect in the current implementation.
+Gemini now honors the alias `uri` for both OAuth project discovery and generation. Older versions ignored this override for Gemini and Bedrock; remove any stale `uri` from those entries before upgrading if you intend to keep using the default service endpoint.
+
+Bedrock uses the alias `uri` as an optional service-root override and appends the model's Converse path. Without an override, its endpoint hostname is constructed at request time from the signing region resolved through the AWS credential chain (`AWS_REGION`, `AWS_DEFAULT_REGION`, or the `region` from the active `credential_process` or IMDS profile). A URI override does not change the signing region. The schema-level `providers.models.bedrock.<alias>.region` field has no effect in the current implementation.
 
 ## Family slots
 

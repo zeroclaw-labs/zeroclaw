@@ -59,11 +59,15 @@ impl ResponseMessage {
     }
 }
 
-/// String-only completions have no native tool-call escape hatch. An empty or
-/// reasoning-only result is therefore a typed terminal failure, not a valid
-/// string result for direct callers that do not use the structured chat API.
+/// Validate blank wire content. Candidate-specific interpretation belongs to
+/// Reliable, which knows the exact configured reference rather than only the
+/// upstream deployment ID.
 fn require_terminal_text(content: String) -> anyhow::Result<String> {
-    if zeroclaw_api::model_provider::strip_think_tags(&content).is_empty() {
+    if content.trim().is_empty()
+        || zeroclaw_api::model_provider::strip_think_tags(&content)
+            .trim()
+            .is_empty()
+    {
         return Err(anyhow::Error::new(
             zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
         ));

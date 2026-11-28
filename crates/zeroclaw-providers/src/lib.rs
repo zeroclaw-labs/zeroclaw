@@ -10,10 +10,16 @@ pub mod bedrock;
 pub mod catalog;
 pub mod compatible;
 pub mod copilot;
+pub mod decision;
 pub mod dispatch;
+pub mod embedding;
 pub mod factory;
 pub mod gemini;
 pub mod grok_cli;
+pub mod transcription;
+pub(crate) mod transport;
+pub mod tts;
+mod vendors;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod hailo_ollama;
 pub mod kilocli;
@@ -28,6 +34,7 @@ pub mod opencode_session;
 pub mod openrouter;
 pub mod openrouter_catalog;
 pub mod pricing;
+mod protocols;
 pub mod reliable;
 pub mod router;
 pub mod safeguard_notice;
@@ -682,11 +689,11 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelProviderRuntimeOptions {
     pub auth_profile_override: Option<String>,
-    /// Explicit provider implementation from `[providers.models.<family>.<alias>].kind`.
-    /// When unset, provider resolution falls back to the configured family.
+    /// Provider implementation materialized from the selected connection's kind.
+    /// Direct provider construction may supply a built-in kind instead.
     pub provider_kind: Option<String>,
     pub provider_api_url: Option<String>,
     pub zeroclaw_dir: Option<PathBuf>,
@@ -701,6 +708,14 @@ pub struct ModelProviderRuntimeOptions {
     /// HTTP request timeout in seconds for LLM model_provider API calls.
     /// `None` uses the model_provider's built-in default (120s for compatible model_providers).
     pub provider_timeout_secs: Option<u64>,
+    /// Explicitly disable the adapter's total request timeout.
+    pub provider_timeout_disabled: bool,
+    /// Optional per-read idle timeout for streaming and HTTP response bodies.
+    /// `None` keeps the adapter's existing idle policy unless disabled below.
+    pub provider_read_timeout_secs: Option<u64>,
+    /// Explicitly disable the adapter's read-idle timeout. This is distinct
+    /// from `None`, which means inherit the adapter baseline.
+    pub provider_read_timeout_disabled: bool,
     /// Extra HTTP headers to include in model_provider API requests.
     pub extra_headers: std::collections::HashMap<String, String>,
     /// Custom API path suffix for OpenAI-compatible model_providers
@@ -709,6 +724,9 @@ pub struct ModelProviderRuntimeOptions {
     /// Maximum output tokens for LLM model_provider API requests.
     /// `None` uses the model_provider's built-in default.
     pub provider_max_tokens: Option<u32>,
+    /// Construction-time projection of the selected model capacity.
+    /// Config remains canonical; rebuilt bindings rematerialize this value.
+    pub provider_context_window: Option<usize>,
     /// When true, system messages are merged into the first user message before
     /// sending. Propagated from `ModelProviderConfig::merge_system_into_user`.
     pub merge_system_into_user: bool,
@@ -784,9 +802,13 @@ impl Default for ModelProviderRuntimeOptions {
             reasoning_effort: None,
             reasoning_effort_passthrough: false,
             provider_timeout_secs: None,
+            provider_timeout_disabled: false,
+            provider_read_timeout_secs: None,
+            provider_read_timeout_disabled: false,
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
             provider_max_tokens: None,
+            provider_context_window: None,
             merge_system_into_user: false,
             provider_extra: None,
             replay_assistant_reasoning: None,
@@ -852,10 +874,14 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         reasoning_enabled: config.runtime.reasoning_enabled,
         reasoning_effort: config.runtime.reasoning_effort.clone(),
         reasoning_effort_passthrough: entry.is_some_and(|e| e.reasoning_effort_passthrough),
-        provider_timeout_secs: Some(entry.and_then(|e| e.timeout_secs).unwrap_or(120)),
+        provider_timeout_secs: entry.and_then(|e| e.timeout_secs),
+        provider_timeout_disabled: false,
+        provider_read_timeout_secs: None,
+        provider_read_timeout_disabled: false,
         extra_headers: entry.map(|e| e.extra_headers.clone()).unwrap_or_default(),
         api_path: None,
         provider_max_tokens: entry.and_then(|e| e.max_tokens),
+        provider_context_window: entry.and_then(|e| e.context_window),
         merge_system_into_user,
         provider_extra: entry.and_then(|e| e.provider_extra.clone()),
         replay_assistant_reasoning: entry.and_then(|e| e.replay_assistant_reasoning),
@@ -1245,6 +1271,8 @@ pub(crate) enum StreamIdleBound {
     /// `max(STREAM_IDLE_TIMEOUT, timeout_secs)`: `timeout_secs` governs the
     /// bound, so idle-timeout errors also name the knob that raises it.
     Configurable(std::time::Duration),
+    /// The independent canonical `read_timeout_secs` setting.
+    Read(std::time::Duration),
     /// A fixed client constant: no configuration knob moves it, so
     /// idle-timeout errors name the bound without knob advice.
     Fixed(std::time::Duration),
@@ -1254,8 +1282,71 @@ impl StreamIdleBound {
     /// The bound's duration, regardless of whether it is configurable.
     pub(crate) fn duration(self) -> std::time::Duration {
         match self {
-            StreamIdleBound::Configurable(duration) | StreamIdleBound::Fixed(duration) => duration,
+            StreamIdleBound::Configurable(duration)
+            | StreamIdleBound::Read(duration)
+            | StreamIdleBound::Fixed(duration) => duration,
         }
+    }
+}
+
+/// Resolved request deadlines, shared by client construction and diagnostics.
+#[derive(Clone, Copy)]
+pub(crate) struct StreamTimeouts {
+    pub(crate) request: Option<std::time::Duration>,
+    pub(crate) read: Option<StreamIdleBound>,
+}
+
+impl From<StreamIdleBound> for StreamTimeouts {
+    fn from(read: StreamIdleBound) -> Self {
+        Self {
+            request: None,
+            read: Some(read),
+        }
+    }
+}
+
+impl StreamTimeouts {
+    pub(crate) fn start(self) -> StreamDeadline {
+        StreamDeadline {
+            timeouts: self,
+            started: tokio::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn error_message(
+        self,
+        error: &reqwest::Error,
+        elapsed: std::time::Duration,
+    ) -> String {
+        // Reqwest uses the same error type for both deadlines. Its total-body
+        // guard runs first once the request budget expires, even after reads.
+        if error.is_timeout()
+            && !error.is_connect()
+            && let Some(limit) = self.request.filter(|limit| elapsed >= *limit)
+        {
+            return format!(
+                "request exceeded {}s (request_timeout_secs); increase request_timeout_secs to wait longer: {}",
+                limit.as_secs_f64(),
+                format_error_chain(error)
+            );
+        }
+        self.read.map_or_else(
+            || format_error_chain(error),
+            |read| stream_idle_error_message(error, read),
+        )
+    }
+}
+
+/// A request's actual start time, retained when headers hand off to an SSE parser.
+#[derive(Clone, Copy)]
+pub(crate) struct StreamDeadline {
+    timeouts: StreamTimeouts,
+    started: tokio::time::Instant,
+}
+
+impl StreamDeadline {
+    pub(crate) fn error_message(self, error: &reqwest::Error) -> String {
+        self.timeouts.error_message(error, self.started.elapsed())
     }
 }
 
@@ -1271,20 +1362,20 @@ pub(crate) fn stream_idle_timeout(timeout_secs: u64) -> StreamIdleBound {
 }
 
 /// Error text for a failed streaming read. A read/idle timeout names the bound
-/// that fired instead of reqwest's bare "operation timed out"; when
-/// `timeout_secs` governs the bound the message also says that raising it
-/// waits longer. Every other error, including connect failures, keeps the
-/// sanitized reqwest chain unchanged.
+/// that fired instead of reqwest's bare "operation timed out", together with
+/// the applicable configuration setting. Every other error, including connect
+/// failures, keeps the sanitized reqwest chain unchanged.
 pub(crate) fn stream_idle_error_message(
     error: &reqwest::Error,
     idle_timeout: StreamIdleBound,
 ) -> String {
     if error.is_timeout() && !error.is_connect() {
-        let secs = idle_timeout.duration().as_secs();
+        let secs = idle_timeout.duration().as_secs_f64();
         let advice = match idle_timeout {
             StreamIdleBound::Configurable(_) => {
                 format!("; raise timeout_secs above {secs}s to wait longer")
             }
+            StreamIdleBound::Read(_) => "; increase read_timeout_secs to wait longer".to_owned(),
             StreamIdleBound::Fixed(_) => String::new(),
         };
         format!(
@@ -3092,6 +3183,21 @@ mod tests {
                     "{name}: factory-created leaves must attest to a stable request identity"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn legacy_timeout_projection_preserves_omission_and_explicit_values() {
+        use zeroclaw_config::schema::{Config, ModelProviderConfig};
+        let config = Config::default();
+        for timeout_secs in [None, Some(30), Some(600)] {
+            let entry = ModelProviderConfig {
+                timeout_secs,
+                ..Default::default()
+            };
+            let options =
+                model_provider_runtime_options_from_model_provider_entry(&config, Some(&entry));
+            assert_eq!(options.provider_timeout_secs, timeout_secs);
         }
     }
 

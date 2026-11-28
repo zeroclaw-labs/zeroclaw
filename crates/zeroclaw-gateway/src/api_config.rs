@@ -95,7 +95,12 @@ pub struct PatchResponse {
 /// served by a newer gateway.
 pub async fn handle_config_get(State(state): State<AppState>) -> Response {
     let mut cfg = state.config.read().clone();
-    cfg.mask_secrets();
+    if let Err(error) = cfg.mask_secrets() {
+        return error_response(ConfigApiError::new(
+            ConfigApiCode::ValidationFailed,
+            format!("failed to mask configuration secrets: {error}"),
+        ));
+    }
     Json(cfg).into_response()
 }
 
