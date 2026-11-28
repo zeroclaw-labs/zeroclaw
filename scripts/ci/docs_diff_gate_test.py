@@ -80,14 +80,15 @@ fi
 exec {shlex.quote(git)} "$@"
 """)
         # Make the quality gate enter its changed-line filter without Node or the network.
-        write_command("npx", f"""\
-printf '%s\\n' '{cls.PAGE}:1 error MD001/heading-increment fixture issue on an unchanged line'
+        write_command("npx", """\
+printf '%s\\n' "$DOCS_TEST_LINT_OUTPUT"
 exit 1
 """)
         cls.env["PATH"] = f"{bin_dir}{os.pathsep}{cls.env['PATH']}"
 
     def run_gate(
-        self, gate: str, *, fail_diff: str = "", empty: bool = False, files: str = ""
+        self, gate: str, *, fail_diff: str = "", empty: bool = False, files: str = "",
+        lint_output: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["bash", f"scripts/ci/{gate}"],
@@ -97,6 +98,9 @@ exit 1
                 "BASE_SHA": self.head if empty else self.base,
                 "DOCS_FILES": files,
                 "DOCS_TEST_FAIL_DIFF": fail_diff,
+                "DOCS_TEST_LINT_OUTPUT": lint_output if lint_output is not None else (
+                    f"{self.PAGE}:1 error MD001/heading-increment fixture issue on an unchanged line"
+                ),
             },
             capture_output=True,
             text=True,
@@ -120,6 +124,20 @@ exit 1
                 result = self.run_gate(gate, empty=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(expected, result.stdout)
+
+    def test_classifies_markdownlint_columns_by_the_source_line(self) -> None:
+        changed = f"{self.PAGE}:3:10 error MD034/no-bare-urls Bare URL used"
+        baseline = f"{self.PAGE}:1:4 error MD010/no-hard-tabs Hard tabs"
+        result = self.run_gate(self.GATES[0], lint_output=f"{baseline}\n{changed}")
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"  - {self.PAGE}:1:4 MD010/no-hard-tabs", result.stdout)
+        self.assertIn(f"  - {self.PAGE}:3:10 MD034/no-bare-urls", result.stdout)
+        self.assertIn("Blocking markdown issues: 1", result.stdout)
+
+        control = self.run_gate(self.GATES[0], lint_output=baseline)
+        self.assertEqual(control.returncode, 0, control.stdout + control.stderr)
+        self.assertIn("No blocking markdown issues on changed lines.", control.stdout)
 
     def test_successful_empty_content_diff_passes_both_gates(self) -> None:
         for gate, expected in zip(self.GATES, (

@@ -234,7 +234,7 @@ changed_file = sys.argv[2]
 with open(changed_file, "r", encoding="utf-8") as f:
     changed = json.load(f)
 
-line_re = re.compile(r"^(.+?):(\d+)\s+error\s+(MD\d+(?:/[^\s]+)?)\s+(.*)$")
+line_re = re.compile(r"^(.+?):(\d+)(:\d+)?\s+error\s+(MD\d+(?:/[^\s]+)?)\s+(.*)$")
 
 blocking = []
 baseline = []
@@ -248,12 +248,12 @@ with open(lint_file, "r", encoding="utf-8") as f:
             other_lines.append(line)
             continue
 
-        path, line_no_s, rule, msg = m.groups()
+        path, line_no_s, column, rule, msg = m.groups()
         line_no = int(line_no_s)
         ranges = changed.get(path, [])
 
         is_changed_line = any(start <= line_no <= end for start, end in ranges)
-        entry = f"{path}:{line_no} {rule} {msg}"
+        entry = f"{path}:{line_no}{column or ''} {rule} {msg}"
         if is_changed_line:
             blocking.append(entry)
         else:
