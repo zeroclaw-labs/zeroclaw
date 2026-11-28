@@ -1029,6 +1029,13 @@ impl Channel for EmailChannel {
         "email"
     }
 
+    /// Outbound attachments become MIME parts of the sent message, so a
+    /// mailbox that cannot send takes none, and `send_via` refuses before
+    /// reading any file for it.
+    fn supports_outbound_attachments(&self) -> bool {
+        self.supports_outbound_send()
+    }
+
     /// Inbound-only email (no `smtp_host`/`from_address`) cannot deliver
     /// anything, so surfaces that must actually deliver — SOP approval routes,
     /// no-reply notices, escalations, text polls — refuse it up front instead
@@ -2433,6 +2440,7 @@ mod tests {
             references: Vec::new(),
             suppress_voice: false,
             force_voice: false,
+            inline_attachments: true,
         }
     }
 
@@ -2452,6 +2460,14 @@ mod tests {
     fn outbound_supported_with_relay_and_from_address() {
         let channel = outbound_test_channel(Some("smtp.example.com"), Some("bot@example.com"));
         assert!(Channel::supports_outbound_send(&channel));
+    }
+
+    #[test]
+    fn attachments_need_a_mailbox_that_can_send() {
+        let sending = outbound_test_channel(Some("smtp.example.com"), Some("bot@example.com"));
+        assert!(Channel::supports_outbound_attachments(&sending));
+        let inbound_only = outbound_test_channel(None, None);
+        assert!(!Channel::supports_outbound_attachments(&inbound_only));
     }
 
     #[test]

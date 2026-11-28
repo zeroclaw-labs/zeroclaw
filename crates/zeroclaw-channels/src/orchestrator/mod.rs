@@ -43933,6 +43933,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ignore: Vec::new(),
             output_modality: OutputModality::default(),
             admin_for_agent_scope,
+            attachments_enabled: false,
         }
     }
 
@@ -45057,6 +45058,7 @@ BTC is currently around $65,000 based on latest tool output."#
             ignore: Vec::new(),
             output_modality: OutputModality::default(),
             admin_for_agent_scope,
+            attachments_enabled: false,
         }
     }
 

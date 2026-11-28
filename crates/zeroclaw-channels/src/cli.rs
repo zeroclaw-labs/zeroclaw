@@ -112,6 +112,7 @@ mod tests {
                 references: Vec::new(),
                 suppress_voice: false,
                 force_voice: false,
+                inline_attachments: true,
             })
             .await;
         assert!(result.is_ok());
@@ -132,6 +133,7 @@ mod tests {
                 references: Vec::new(),
                 suppress_voice: false,
                 force_voice: false,
+                inline_attachments: true,
             })
             .await;
         assert!(result.is_ok());
