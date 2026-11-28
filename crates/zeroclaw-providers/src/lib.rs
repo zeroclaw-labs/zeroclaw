@@ -2388,6 +2388,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("cloudflare", "Cloudflare AI", false),
             ("atlascloud", "Atlas Cloud", false),
             ("cheaperinference", "Cheaper Inference", false),
+            ("obscurify", "Obscurify.ai", false),
             ("moonshot", "Moonshot", false),
             ("synthetic", "Synthetic", false),
             ("opencode", "OpenCode", false),
@@ -2662,6 +2663,24 @@ mod tests {
         assert!(
             create_model_provider("atlascloud", Some("provider-test-credential")).is_ok(),
             "Atlas Cloud should construct through the OpenAI-compatible family factory"
+        );
+    }
+
+    #[test]
+    fn obscurify_provider_is_listed_and_constructible() {
+        let providers = list_model_providers();
+        let obscurify = providers
+            .iter()
+            .find(|provider| provider.name == "obscurify")
+            .expect("Obscurify.ai provider should be listed");
+        assert_eq!(obscurify.display_name, "Obscurify.ai");
+        assert_eq!(
+            canonicalize_v2_model_provider_name("obscurify"),
+            "obscurify"
+        );
+        assert!(
+            create_model_provider("obscurify", Some("provider-test-credential")).is_ok(),
+            "Obscurify.ai should construct through the OpenAI-compatible family factory"
         );
     }
 

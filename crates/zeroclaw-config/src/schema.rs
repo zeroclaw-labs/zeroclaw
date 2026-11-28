@@ -2773,6 +2773,41 @@ model = "gpt-5.4-mini"
     }
 }
 
+// ── Obscurify.ai ──
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ObscurifyEndpoint {
+    #[default]
+    Default,
+}
+
+impl ObscurifyEndpoint {
+    /// Canonical Obscurify.ai endpoint. `CompatFamilySpec::DEFAULT_URL` for
+    /// `ObscurifyModelProviderConfig` references this const so the schema and
+    /// factory surfaces never drift.
+    pub const DEFAULT_URI: &'static str = "https://obscurify.ai/v1";
+}
+
+impl ModelEndpoint for ObscurifyEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::Default => Self::DEFAULT_URI,
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.obscurify"]
+pub struct ObscurifyModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+}
+
 // ── OVH ──
 
 #[derive(
@@ -3987,6 +4022,7 @@ impl_default_family_endpoint! {
     CloudflareModelProviderConfig,
     AtlasCloudModelProviderConfig,
     CheaperInferenceModelProviderConfig,
+    ObscurifyModelProviderConfig,
     OvhModelProviderConfig,
     CopilotModelProviderConfig,
     DoubaoModelProviderConfig,
