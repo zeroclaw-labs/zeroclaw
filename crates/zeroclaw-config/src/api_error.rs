@@ -99,6 +99,10 @@ pub struct ConfigApiError {
     /// error is whole-config (e.g. `ReloadFailed`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Optional second schema field for a cross-field check. Internal diagnostic
+    /// metadata, not a change to the HTTP CRUD error format.
+    #[serde(skip)]
+    pub related_setting: Option<&'static str>,
     /// Index into the JSON Patch operation array, when the error originated
     /// from a specific op in a `PATCH /api/config` batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,12 +115,18 @@ impl ConfigApiError {
             code,
             message: message.into(),
             path: None,
+            related_setting: None,
             op_index: None,
         }
     }
 
     pub fn with_path(mut self, path: impl Into<String>) -> Self {
         self.path = Some(path.into());
+        self
+    }
+
+    pub fn with_related_setting(mut self, path: &'static str) -> Self {
+        self.related_setting = Some(path);
         self
     }
 
@@ -193,12 +203,12 @@ impl std::error::Error for ConfigApiError {}
 
 #[macro_export]
 macro_rules! validation_bail {
-    ($code:ident, $path:expr, $($msg:tt)*) => {{
+    ($code:ident, $path:expr $(=> $related:expr)?, $($msg:tt)*) => {{
         let err = $crate::api_error::ConfigApiError::new(
             $crate::api_error::ConfigApiCode::$code,
             format!($($msg)*),
         )
-        .with_path($path);
+        .with_path($path)$(.with_related_setting($related))?;
         return Err(::anyhow::Error::from(err));
     }};
 }

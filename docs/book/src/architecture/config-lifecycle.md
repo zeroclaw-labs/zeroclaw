@@ -125,7 +125,9 @@ stays the same, but listeners briefly rebind. Before signalling, the HTTP
 endpoint strictly prepares and validates the on-disk config, including
 per-agent settings. A rejected request returns HTTP 400 without stopping the
 listeners, clearing the pending-reload flag, or rewriting the file. Fix the
-reported setting and retry. The supervisor still reads the file again after
+reported setting and retry. If preflight outlasts `gateway.request_timeout_secs`
+(for example, waiting for a secret resolver), the gateway returns HTTP 408
+without scheduling a reload. Once the resolver is responsive, retry. The supervisor still reads the file again after
 drain: do not edit it between an accepted request and the new gateway becoming
 ready. This preflight does not change cold-start recovery or other reload triggers.
 

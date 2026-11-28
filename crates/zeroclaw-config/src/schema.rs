@@ -11653,7 +11653,13 @@ impl ProxyConfig {
             ("all_proxy", self.all_proxy.as_deref()),
         ] {
             if let Some(url) = normalize_proxy_url_option(value) {
-                validate_proxy_url(field, &url)?;
+                validate_proxy_url(field, &url).with_context(|| {
+                    crate::api_error::ConfigApiError::new(
+                        crate::api_error::ConfigApiCode::InvalidFormat,
+                        "invalid proxy URL",
+                    )
+                    .with_path(format!("proxy.{field}"))
+                })?;
             }
         }
 
@@ -24488,7 +24494,6 @@ impl Config {
         // file and the published pair are unchanged.
         config
             .validate()
-            .map_err(crate::api_error::ConfigApiError::from_validation)
             .context("migrated config failed strict validation")?;
         Ok(config)
     }
@@ -25676,7 +25681,7 @@ impl Config {
             if backend_kind != "sqlite" {
                 validation_bail!(
                     InvalidFormat,
-                    flag_path,
+                    flag_path => "memory.backend",
                     "{flag_path} = true requires memory.backend = \"sqlite\" (typed memory storage is SQLite-only), but memory.backend = {:?}",
                     self.memory.backend
                 );
@@ -25686,7 +25691,7 @@ impl Config {
                     let agent_backend = agent.memory.backend;
                     validation_bail!(
                         InvalidFormat,
-                        format!("agents.{alias}.memory.backend"),
+                        format!("agents.{alias}.memory.backend") => flag_path,
                         "{flag_path} = true requires every agent on the sqlite memory backend (typed memory storage is SQLite-only), but agents.{alias}.memory.backend = {agent_backend:?}",
                     );
                 }
@@ -25882,7 +25887,9 @@ impl Config {
             // allowlist is contradictory — reject it instead of silently
             // preferring one side.
             if profile.deny_all_tools && !profile.allowed_tools.is_empty() {
-                anyhow::bail!(
+                validation_bail!(
+                    InvalidFormat,
+                    format!("risk_profiles.{profile_alias}.deny_all_tools"),
                     "risk_profiles.{profile_alias}.deny_all_tools cannot be combined with a non-empty allowed_tools list: deny_all_tools denies every tool, while allowed_tools = [] alone means unrestricted"
                 );
             }

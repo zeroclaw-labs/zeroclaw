@@ -5620,6 +5620,51 @@ fn admin_reload_gate(
     }
 }
 
+// A validator's text can contain arbitrary values. Even its dotted path may
+// contain a name taken from a value rather than a TOML key (e.g. a plugin).
+fn reload_field_error(field: &zeroclaw_config::api_error::ConfigApiError, raw: &str) -> String {
+    use zeroclaw_config::api_error::ConfigApiCode;
+    let Some(path) = field.path.as_deref() else {
+        return "config validation failed".into();
+    };
+    if path == "schema_version" {
+        return "schema_version: expected a supported schema version".into();
+    }
+    // A deserialization path identifies the input, not its expected type.
+    // Use the schema's generated property metadata, never the parser message.
+    if field.code == ConfigApiCode::ValueTypeMismatch {
+        let name = path.replace('_', "-");
+        if let Some(prop) = Config::default()
+            .prop_fields()
+            .into_iter()
+            .find(|f| f.name == name)
+        {
+            return format!("{path}: expected {}", prop.kind.wire_name());
+        }
+    }
+    let present = toml::from_str::<toml::Value>(raw).is_ok_and(|doc| {
+        path.split('.')
+            .try_fold(&doc, |parent, key| parent.get(key))
+            .is_some()
+    });
+    if !present {
+        return zeroclaw_config::sections::section_for_path(path).map_or_else(
+            || "config validation failed".into(),
+            |s| format!("invalid setting in {}", s.key()),
+        );
+    }
+    if let Some(related) = field.related_setting {
+        return format!("{path}: conflicts with {related}");
+    }
+    let reason = match field.code {
+        ConfigApiCode::DanglingReference => "referenced entry does not exist",
+        ConfigApiCode::InvalidNumericRange => "number is outside the allowed range",
+        ConfigApiCode::RequiredFieldEmpty => "value is required",
+        _ => "invalid setting",
+    };
+    format!("{path}: {reason}")
+}
+
 // Unlike cold start, reload must not create a missing config, salvage bad
 // sections or publish process-wide settings just to check the candidate.
 async fn preflight_reload(state: &AppState) -> Result<(), String> {
@@ -5632,11 +5677,9 @@ async fn preflight_reload(state: &AppState) -> Result<(), String> {
         .map_err(|e| format!("cannot read config.toml: {e}"))?;
     let prepare = Config::prepare_from_migrated_toml(&raw, &config_path, &data_dir);
     Box::pin(prepare).await.map_err(|e| {
-        // TOML errors can quote whole credential-bearing lines; secret
-        // resolution errors can include external command output. Only
-        // semantic validation diagnostics are suitable for direct display.
+        // TOML source and resolver chains can contain credentials.
         if let Some(field) = e.downcast_ref::<zeroclaw_config::api_error::ConfigApiError>() {
-            zeroclaw_providers::sanitize_api_error(&field.message)
+            reload_field_error(field, &raw)
         } else if let Some(span) = e.downcast_ref::<toml::de::Error>().and_then(|e| e.span()) {
             format!("invalid TOML at byte {} in config.toml", span.start)
         } else {
@@ -15137,12 +15180,20 @@ data: [DONE]\n\n";
     async fn admin_reload_loopback_no_token_reloads() {
         let tmp = tempfile::tempdir().unwrap();
         let state = admin_reload_state(&tmp, false, true, &[]);
+        let mut shutdown = state.shutdown_tx.subscribe();
+        let mut reload = state.reload_tx.as_ref().unwrap().reload_tx.subscribe();
         let resp =
             handle_admin_reload(State(state), ConnectInfo(loopback_peer()), HeaderMap::new())
                 .await
                 .unwrap()
                 .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            shutdown.wait_for(|&stop| stop).await.unwrap();
+            reload.wait_for(|&requested| requested).await.unwrap();
+        })
+        .await
+        .expect("accepted reload must signal both gateway and daemon");
     }
 
     #[tokio::test]
@@ -15198,22 +15249,45 @@ backend = "markdown"
         let tmp = tempfile::tempdir().unwrap();
         let state = admin_reload_state(&tmp, false, true, &[]);
         let path = tmp.path().join("config.toml");
-        for (section, expected) in [
-            // This conflict is a plain anyhow validation error, not validation_bail!.
+        for (candidate, expected) in [
             (
-                "[risk_profiles.probe]\ndeny_all_tools = true\nallowed_tools = ['weather']",
+                "schema_version = 4\n[risk_profiles.probe]\ndeny_all_tools = true\nallowed_tools = ['weather']",
                 "risk_profiles.probe.deny_all_tools",
             ),
             (
-                "[proxy]\nhttp_proxy = 'not-a-url-secret-marker'",
+                "schema_version = 4\n[heartbeat]\nenabled = true\nagent = 'secret-marker'",
+                "heartbeat.agent: referenced entry does not exist",
+            ),
+            (
+                "schema_version = 4\n[proxy]\nhttp_proxy = 'not-a-url-secret-marker'",
                 "proxy.http_proxy",
             ),
-            ("[gateway]\nport = secret-marker", "invalid TOML"),
+            (
+                "schema_version = 4\n[gateway]\nport = secret-marker",
+                "invalid TOML at byte",
+            ),
+            (
+                "schema_version = 4\n[gateway]\nport = 'secret-marker'",
+                "gateway.port: expected integer",
+            ),
+            (
+                "schema_version = 1000000",
+                "schema_version: expected a supported schema version",
+            ),
         ] {
-            std::fs::write(&path, format!("schema_version = 4\n{section}\n")).unwrap();
-            let error = preflight_reload(&state).await.unwrap_err();
+            std::fs::write(&path, candidate).unwrap();
+            let (status, Json(body)) = handle_admin_reload(
+                State(state.clone()),
+                ConnectInfo(loopback_peer()),
+                HeaderMap::new(),
+            )
+            .await
+            .err()
+            .expect("bad candidate must be refused");
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let error = body["error"].as_str().unwrap();
             assert!(error.contains(expected), "{error}");
-            assert!(!error.contains("secret-marker"));
+            assert!(!error.contains("secret-marker") && !error.contains("1000000"));
         }
     }
 
