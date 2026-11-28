@@ -1315,7 +1315,8 @@ impl AuthProviderFlow for OpenaiCodexFlow {
         match ctx
             .auth_service
             .get_valid_openai_access_token(profile_override)
-            .await?
+            .await
+            .map_err(|error| codex_refresh_cli_error(error, ctx.format_cli))?
         {
             Some(_) => Ok(RefreshStatus::Refreshed {
                 profile: profile_override.unwrap_or("default").to_string(),
@@ -1323,6 +1324,22 @@ impl AuthProviderFlow for OpenaiCodexFlow {
             None => Ok(RefreshStatus::NoProfile),
         }
     }
+}
+
+fn codex_refresh_cli_error(error: anyhow::Error, format_cli: &CliFormatter) -> anyhow::Error {
+    if error
+        .downcast_ref::<openai_oauth::TokenRequestError>()
+        .is_some_and(openai_oauth::TokenRequestError::refresh_token_reused)
+    {
+        let command =
+            "zeroclaw auth login --model-provider openai-codex --import ~/.codex/auth.json";
+        return anyhow::Error::msg(format_cli(
+            "cli-auth-codex-refresh-reused",
+            &[("command", command)],
+            "This OpenAI Codex refresh token was already used. If you imported your Codex CLI login, run `{$command}` again. For a named profile, add `--profile <name>`. Otherwise, sign in again.",
+        ));
+    }
+    error
 }
 
 // ── Gemini impl ────────────────────────────────────────────────────────

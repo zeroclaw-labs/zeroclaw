@@ -418,11 +418,38 @@ pub fn extract_expiry_from_jwt(token: &str) -> Option<chrono::DateTime<Utc>> {
     chrono::DateTime::<Utc>::from_timestamp(exp, 0)
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("OpenAI OAuth token request failed ({status}): {body}")]
+pub(super) struct TokenRequestError {
+    status: reqwest::StatusCode,
+    body: String,
+}
+
+impl TokenRequestError {
+    pub(super) fn refresh_token_reused(&self) -> bool {
+        if self.status != reqwest::StatusCode::UNAUTHORIZED {
+            return false;
+        }
+        let Ok(body) = serde_json::from_str::<serde_json::Value>(&self.body) else {
+            return false;
+        };
+        let error = &body["error"];
+        match error["code"].as_str() {
+            Some(code) => code == "refresh_token_reused",
+            None => {
+                error["type"] == "invalid_request_error"
+                    && error["message"]
+                        == "Your refresh token has already been used to generate a new access token. Please try signing in again."
+            }
+        }
+    }
+}
+
 async fn parse_token_response(response: reqwest::Response) -> Result<TokenSet> {
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("OpenAI OAuth token request failed ({status}): {body}");
+        return Err(TokenRequestError { status, body }.into());
     }
 
     let token: TokenResponse = response
@@ -537,6 +564,34 @@ async fn import_codex_auth_profile_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn codex_refresh_reimport_hint_only_for_a_consumed_token() {
+        const USED: &str = "Your refresh token has already been used to generate a new access token. Please try signing in again.";
+        for (status, body, expected_hint) in [
+            (401, r#"{"error":{"code":"refresh_token_reused"}}"#.to_owned(), true),
+            (401, serde_json::json!({"error":{"type":"invalid_request_error","message":USED}}).to_string(), true),
+            (401, serde_json::json!({"error":{"type":"invalid_request_error","message":USED,"code":"refresh_token_revoked"}}).to_string(), false),
+            (401, r#"{"error":"invalid_grant"}"#.into(), false),
+            (401, "malformed response".into(), false),
+            (429, r#"{"error":{"code":"refresh_token_reused"}}"#.into(), false),
+        ] {
+            let response = axum::http::Response::builder().status(status).body(body).unwrap();
+            let error = parse_token_response(response.into()).await.unwrap_err();
+            let original = error.to_string();
+            assert_eq!(super::super::is_non_retryable_oauth_refresh_error(&error), status == 401);
+            let error = super::super::codex_refresh_cli_error(error, &|key, args, _| {
+                assert_eq!(key, "cli-auth-codex-refresh-reused");
+                assert_eq!(args[0].0, "command");
+                args[0].1.to_owned()
+            });
+            if expected_hint {
+                assert_eq!(error.to_string(), "zeroclaw auth login --model-provider openai-codex --import ~/.codex/auth.json");
+            } else {
+                assert_eq!(error.to_string(), original);
+            }
+        }
+    }
 
     #[test]
     fn pkce_generation_is_valid() {
