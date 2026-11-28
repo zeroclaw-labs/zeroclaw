@@ -74,10 +74,32 @@ pub struct GatewayStatus {
 pub fn build_report(config: &Config, agent_alias: &str) -> Result<SecurityStatusReport> {
     let resolved = resolve_agent_context(config, agent_alias)?;
     let sandbox_config = sandbox_config_from_policy(&resolved.policy);
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    let forbidden = resolved
+        .policy
+        .forbidden_paths
+        .iter()
+        .map(|raw| {
+            if let Some(rest) = raw.strip_prefix("~/") {
+                match &home {
+                    Some(home) => home.join(rest),
+                    None => std::path::PathBuf::from(raw),
+                }
+            } else if raw == "~" {
+                home.clone()
+                    .unwrap_or_else(|| std::path::PathBuf::from(raw))
+            } else {
+                std::path::PathBuf::from(raw)
+            }
+        })
+        .collect();
     let sandbox_extra_roots = zeroclaw_runtime::security::SandboxExtraRoots {
         read_write: resolved.policy.allowed_roots.clone(),
         read_only: resolved.policy.allowed_roots_read_only.clone(),
         write_only: resolved.policy.allowed_roots_write_only.clone(),
+        forbidden,
     };
     let sandbox = zeroclaw_runtime::security::sandbox_posture(
         &sandbox_config,
