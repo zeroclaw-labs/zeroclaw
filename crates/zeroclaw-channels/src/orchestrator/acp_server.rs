@@ -12,6 +12,7 @@ use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 use zeroclaw_api::agent::ToolArtifact;
 use zeroclaw_api::elicitation::ElicitationCapabilities;
+use zeroclaw_api::ingress::{IngressContext, SourceClass, Transport, TrustClass, TurnOrigin};
 pub use zeroclaw_api::jsonrpc::RpcOutbound;
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
@@ -19,12 +20,20 @@ use zeroclaw_api::jsonrpc::{
 };
 use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall};
 use zeroclaw_api::plan::PlanEntry;
-use zeroclaw_config::schema::Config;
+use zeroclaw_config::schema::{Config, ResolvedContextLimits};
 use zeroclaw_infra::acp_session_store::AcpSessionStore;
+use zeroclaw_memory::Memory;
+use zeroclaw_providers::SafeguardFallbackNotice;
+use zeroclaw_providers::turn_accounting::{
+    ContextDisplay, SafeguardFallbackDisplay, UsageFold, done_frame_context_limits,
+};
+use zeroclaw_runtime::agent::SteeringInput;
 use zeroclaw_runtime::agent::agent::{Agent, TurnEvent};
+use zeroclaw_runtime::cost::CostTracker;
 use zeroclaw_runtime::tools::CanvasStore;
 
 use super::acp_embedded;
+use super::consolidation::build_consolidation_model;
 use crate::acp_channel::AcpChannel;
 
 /// Tool name of the structured, replay-only cancellation event a client-cancel
@@ -66,6 +75,13 @@ type SeededMessage = (ConversationMessage, usize);
 enum TerminalOutcome {
     Success {
         response: String,
+        provider_name: String,
+        model: String,
+        live_provider_ref: String,
+        final_context_limits: Option<ResolvedContextLimits>,
+        fallback_limits: Option<ResolvedContextLimits>,
+        safeguard_fallback: Option<SafeguardFallbackNotice>,
+        consolidation_target: Option<(Arc<dyn Memory>, String, String)>,
     },
     Cancelled {
         persist_error: Option<String>,
@@ -102,9 +118,72 @@ impl Default for AcpServerConfig {
     }
 }
 
+/// Per-session runtime policy controlling long-term memory, MCP initialization,
+/// external channel seeding, and persisted `interaction_surface`.
+///
+/// [`Default`] preserves the existing standalone/IDE ACP defaults:
+/// - `exclude_memory = true` (context comes from persisted session history)
+/// - `enable_mcp = None` (follows `[agents.<alias>].acp_enable_mcp`)
+/// - `seed_external_channels = false`
+/// - `interaction_surface = None`
+///
+/// [`Self::webchat`] gives WebChat sessions the agent's full configured runtime
+/// (memory, MCP bundles, external channels) while tagging the session with
+/// `interaction_surface = Some("webchat")` so `session/load` and
+/// `session/resume` restore the exact same policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcpSessionPolicy {
+    pub exclude_memory: bool,
+    /// `Some(true)` forces MCP initialization for the session; `Some(false)`
+    /// disables it; `None` defers to `[agents.<alias>].acp_enable_mcp`.
+    pub enable_mcp: Option<bool>,
+    pub seed_external_channels: bool,
+    pub interaction_surface: Option<&'static str>,
+}
+
+impl Default for AcpSessionPolicy {
+    fn default() -> Self {
+        Self {
+            exclude_memory: true,
+            enable_mcp: None,
+            seed_external_channels: false,
+            interaction_surface: None,
+        }
+    }
+}
+
+impl AcpSessionPolicy {
+    /// Policy for WebChat sessions: runs the agent with its configured
+    /// long-term memory, MCP bundles, and external channel tools.
+    pub const fn webchat() -> Self {
+        Self {
+            exclude_memory: false,
+            enable_mcp: Some(true),
+            seed_external_channels: true,
+            interaction_surface: Some("webchat"),
+        }
+    }
+
+    /// Map a known, allowlisted `interaction_surface` string back to its
+    /// runtime policy. Unknown values return `None` so untrusted input cannot
+    /// inject arbitrary surface strings.
+    pub fn from_interaction_surface(surface: Option<&str>) -> Option<Self> {
+        match surface.map(str::trim) {
+            Some("webchat") => Some(Self::webchat()),
+            _ => None,
+        }
+    }
+
+    fn resolved_enable_mcp(self, config: &Config, agent_alias: &str) -> bool {
+        self.enable_mcp
+            .unwrap_or_else(|| config.agent(agent_alias).is_some_and(|a| a.acp_enable_mcp))
+    }
+}
+
 // ── Session state ────────────────────────────────────────────────
 
 struct Session {
+    consolidation_memory: Option<Arc<dyn Memory>>,
     agent: Agent,
     _lifecycle_lease: zeroclaw_runtime::live_config_authority::AgentSessionLease,
     last_active: Instant,
@@ -137,6 +216,9 @@ pub struct AcpServer {
     /// first time `run()` starts the writer loop.
     writer_rx: std::sync::Mutex<Option<mpsc::Receiver<String>>>,
     cancel_tokens: Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
+    /// Active mid-turn steering senders keyed by `session_id`. Populated while
+    /// a `session/prompt` turn is in flight and removed when the turn ends.
+    steering_senders: Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<SteeringInput>>>>,
     /// Tracks session IDs currently being loaded/resumed (between the initial
     /// check and the final insert into `sessions`). Used to prevent duplicate
     /// concurrent restores of the same session and to count in-flight slots
@@ -161,6 +243,18 @@ pub struct AcpServer {
     /// build their own engine from config.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    /// Shared cost tracker from the gateway. When `None`, turns fall back to
+    /// `CostTracker::get_or_init_global`.
+    cost_tracker: Option<Arc<CostTracker>>,
+    /// Default runtime policy for new sessions (and restores whose persisted
+    /// `interaction_surface` is absent). Defaults to standalone/IDE behavior so
+    /// existing ACP clients are unaffected.
+    default_session_policy: AcpSessionPolicy,
+    /// Whether callers may opt into [`AcpSessionPolicy::webchat`] via
+    /// `interactionSurface: "webchat"` on `session/new`. Defaults to `false`
+    /// (closed) so standalone/IDE ACP servers do not let untrusted clients
+    /// escalate into persistent memory, MCP bundles, and external channels.
+    allow_webchat_policy: bool,
     /// Process- or connection-scoped default agent alias (`--agent` for
     /// standalone ACP or `?agent=` on the gateway endpoint). Slots into the
     /// `session/new` alias precedence chain between an explicit `agentAlias`
@@ -304,12 +398,16 @@ impl AcpServer {
             rpc: Arc::new(RpcOutbound::new(writer_tx)),
             writer_rx: std::sync::Mutex::new(writer_rx),
             cancel_tokens: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            steering_senders: Arc::new(std::sync::Mutex::new(HashMap::new())),
             loading_sessions: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
             session_gates: Arc::new(std::sync::Mutex::new(HashMap::new())),
             store,
             canvas_store: None,
             sop_engine: None,
             sop_audit: None,
+            cost_tracker: None,
+            default_session_policy: AcpSessionPolicy::default(),
+            allow_webchat_policy: false,
             connection_default_agent: None,
             client_elicitation_caps: std::sync::RwLock::new(ElicitationCapabilities::default()),
         }
@@ -337,81 +435,134 @@ impl AcpServer {
         *current = capabilities;
     }
 
+    fn resolve_new_session_policy(
+        &self,
+        params: &Value,
+    ) -> std::result::Result<AcpSessionPolicy, RpcError> {
+        let requested_surface = params
+            .get("interactionSurface")
+            .or_else(|| params.get("interaction_surface"))
+            .or_else(|| {
+                params
+                    .get("_meta")
+                    .and_then(|m| m.get("zeroclaw"))
+                    .and_then(|z| z.get("surface"))
+            })
+            .and_then(Value::as_str);
+        match AcpSessionPolicy::from_interaction_surface(requested_surface) {
+            Some(policy) if policy == AcpSessionPolicy::webchat() => {
+                if self.allow_webchat_policy
+                    || self.default_session_policy == AcpSessionPolicy::webchat()
+                {
+                    Ok(policy)
+                } else {
+                    Err(RpcError {
+                        code: FORBIDDEN,
+                        message: "WebChat session policy is not enabled on this ACP endpoint"
+                            .to_string(),
+                        data: None,
+                    })
+                }
+            }
+            Some(policy) => Ok(policy),
+            None => Ok(self.default_session_policy),
+        }
+    }
+
+    fn resolve_restored_session_policy(&self, persisted_surface: Option<&str>) -> AcpSessionPolicy {
+        match AcpSessionPolicy::from_interaction_surface(persisted_surface) {
+            Some(policy)
+                if policy == AcpSessionPolicy::webchat()
+                    && !self.allow_webchat_policy
+                    && self.default_session_policy != AcpSessionPolicy::webchat() =>
+            {
+                self.default_session_policy
+            }
+            Some(policy) => policy,
+            None => self.default_session_policy,
+        }
+    }
+
     async fn build_agent(
         &self,
         config: &Config,
         agent_alias: &str,
         workspace_dir: &std::path::Path,
-        enable_mcp: bool,
-    ) -> Result<Agent> {
-        let Some(store) = self.store.as_ref() else {
-            return if let ConfigSource::Live(live_config) = &self.config_source {
-                Agent::from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
-                    live_config.clone(),
-                    agent_alias,
-                    Some(workspace_dir),
-                    enable_mcp,
-                    true,
-                    true,
-                    self.sop_engine.clone(),
-                    self.sop_audit.clone(),
-                    self.canvas_store.clone(),
-                    Some(zeroclaw_runtime::AgentExecutionCapability::from_parts(
-                        live_config.clone(),
-                        self.agent_lifecycle.clone(),
-                    )),
-                )
-                .await
-            } else {
-                Agent::from_config_with_session_cwd_and_mcp_backchannel(
-                    config,
-                    agent_alias,
-                    Some(workspace_dir),
-                    enable_mcp,
-                    true,
-                    true,
-                    self.sop_engine.clone(),
-                    self.sop_audit.clone(),
-                    self.canvas_store.clone(),
-                )
-                .await
-            };
-        };
-        if let ConfigSource::Live(live_config) = &self.config_source {
-            let execution_capability = zeroclaw_runtime::AgentExecutionCapability::from_parts(
-                live_config.clone(),
-                self.agent_lifecycle.clone(),
-            );
-            Agent::from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions_with_capability(
-                live_config.clone(),
-                agent_alias,
-                Some(workspace_dir),
-                enable_mcp,
-                true,
-                // ACP turns transport the typed file attachment `deliver_file` emits.
-                true,
-                self.sop_engine.clone(),
-                self.sop_audit.clone(),
-                self.canvas_store.clone(),
-                Arc::clone(store),
-                Some(execution_capability),
-            )
-            .await
-        } else {
-            Agent::from_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
+        policy: AcpSessionPolicy,
+    ) -> Result<(Agent, Option<Arc<dyn Memory>>)> {
+        use zeroclaw_runtime::composition::{MemoryRequest, RuntimeCapabilities};
+        let capabilities = RuntimeCapabilities::config_backed(config);
+        let memory = capabilities
+            .memory
+            .memory(&MemoryRequest {
                 config,
                 agent_alias,
-                Some(workspace_dir),
-                enable_mcp,
-                true,
-                // ACP turns transport the typed file attachment `deliver_file` emits.
-                true,
-                self.sop_engine.clone(),
-                self.sop_audit.clone(),
-                self.canvas_store.clone(),
-                Arc::clone(store),
+            })
+            .await?;
+        let consolidation_memory =
+            (!policy.exclude_memory && config.memory.auto_save && memory.name() != "none")
+                .then(|| Arc::clone(&memory));
+        let live = match &self.config_source {
+            ConfigSource::Live(handle) => Some(handle.clone()),
+            ConfigSource::Standalone(_) => None,
+        };
+        let execution = live.as_ref().map(|handle| {
+            zeroclaw_runtime::AgentExecutionCapability::from_parts(
+                handle.clone(),
+                self.agent_lifecycle.clone(),
             )
-            .await
+        });
+        let agent = Agent::from_acp_session_with_capabilities(
+            config,
+            agent_alias,
+            workspace_dir,
+            memory,
+            policy.resolved_enable_mcp(config, agent_alias),
+            policy.exclude_memory,
+            &capabilities,
+            self.sop_engine.clone(),
+            self.sop_audit.clone(),
+            self.canvas_store.clone(),
+            self.store.clone(),
+            live,
+            execution,
+        )
+        .await?;
+        Ok((agent, consolidation_memory))
+    }
+
+    fn apply_session_policy_to_agent(
+        &self,
+        config: &Config,
+        agent_alias: &str,
+        agent: &mut Agent,
+        session_id: &str,
+        policy: AcpSessionPolicy,
+    ) {
+        if !policy.exclude_memory {
+            agent.set_memory_session_id(Some(zeroclaw_api::session_keys::sanitize_session_key(
+                session_id,
+            )));
+        }
+        if policy.seed_external_channels {
+            let ch = agent.channel_handles();
+            let published = super::CRON_CHANNEL_REGISTRY
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let available = published.unwrap_or_else(|| {
+                let live = match &self.config_source {
+                    ConfigSource::Live(live) => live.clone(),
+                    ConfigSource::Standalone(_) => {
+                        zeroclaw_config::live::LiveConfig::new(config.clone()).handle()
+                    }
+                };
+                let clients = super::collect_configured_channels(&live, "", &[], None, None, None);
+                Arc::new(super::configured_channel_map(&clients))
+            });
+            for (name, channel) in super::channel_map_for_agent(config, agent_alias, &available) {
+                ch.register_channel(name, channel);
+            }
         }
     }
 
@@ -446,6 +597,28 @@ impl AcpServer {
     ) -> Self {
         self.sop_engine = sop_engine;
         self.sop_audit = sop_audit;
+        self
+    }
+
+    /// Attach the shared gateway [`CostTracker`] so ACP turns record spend into
+    /// the same tracker instance the rest of the gateway reads from.
+    pub fn with_cost_tracker(mut self, cost_tracker: Option<Arc<CostTracker>>) -> Self {
+        self.cost_tracker = cost_tracker;
+        self
+    }
+
+    /// Override the default [`AcpSessionPolicy`] for sessions created or
+    /// restored without an explicit persisted `interaction_surface`.
+    pub fn with_default_session_policy(mut self, policy: AcpSessionPolicy) -> Self {
+        self.default_session_policy = policy;
+        self
+    }
+
+    /// Allow callers on this endpoint to opt into [`AcpSessionPolicy::webchat`]
+    /// via `interactionSurface: "webchat"`. Disabled by default for standalone
+    /// stdio/IDE ACP servers; enabled by the gateway `/acp` handler.
+    pub fn with_allow_webchat_policy(mut self, allow: bool) -> Self {
+        self.allow_webchat_policy = allow;
         self
     }
 
@@ -657,6 +830,7 @@ impl AcpServer {
             "session/stop" => self.handle_session_stop(&request.params).await,
             "session/cancel" => self.handle_session_cancel(&request.params).await,
             "session/event" | "session/update" => self.handle_session_event(&request.params).await,
+            "_zeroclaw/session/steer" => self.handle_session_steer(&request.params).await,
             _ => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -691,7 +865,8 @@ impl AcpServer {
                             })),
                         "ACP request failed"
                     );
-                    self.write_error(id, e.code, &e.message).await;
+                    self.write_error_with_data(id, e.code, &e.message, e.wire_data())
+                        .await;
                 }
             }
         }
@@ -700,6 +875,8 @@ impl AcpServer {
     // ── Method handlers ──────────────────────────────────────────
 
     fn handle_initialize(&self, params: &Value) -> RpcResult {
+        // ACP negotiation returns the latest supported version when the
+        // client's requested version is unavailable. This server supports v1.
         let elicitation = params
             .get("clientCapabilities")
             .and_then(|c| c.get("elicitation"));
@@ -869,6 +1046,31 @@ impl AcpServer {
 
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let config = self.config_snapshot();
+        let session_policy = self.resolve_new_session_policy(params)?;
+
+        // WebChat operator sessions surface a structured `NEEDS_ONBOARDING`
+        // error before agent/alias resolution when no model is configured yet,
+        // matching the dashboard's first-run quickstart redirect contract.
+        if session_policy.interaction_surface == Some("webchat")
+            && config
+                .resolve_default_model()
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        {
+            return Err(RpcError {
+                code: INVALID_PARAMS,
+                message: zeroclaw_runtime::i18n::get_required_cli_string(
+                    "channel-needs-quickstart-reply",
+                ),
+                data: Some(serde_json::json!({
+                    "code": "NEEDS_ONBOARDING",
+                    "error": "needs_onboarding",
+                    "url": "/onboard",
+                })),
+            });
+        }
 
         // Every ACP session is bound to an explicit agent alias.
         // Accept `agentAlias` (camelCase) or `agent_alias` / `agent`,
@@ -944,11 +1146,20 @@ impl AcpServer {
         .to_string_lossy()
         .into_owned();
 
-        let session_id = Uuid::new_v4().to_string();
+        let requested_id = Self::requested_webchat_session_id(params, session_policy)?;
+        let client_chose_id = requested_id.is_some();
+        let session_id = requested_id.unwrap_or_else(|| Uuid::new_v4().to_string());
 
         {
             let sessions = self.sessions.lock().await;
             let mut loading = self.loading_sessions.lock().await;
+            if sessions.contains_key(&session_id) || loading.contains(&session_id) {
+                return Err(RpcError {
+                    code: INVALID_PARAMS,
+                    message: format!("Session already active: {session_id}"),
+                    data: None,
+                });
+            }
             if sessions.len() + loading.len() >= self.acp_config.max_sessions {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -977,18 +1188,17 @@ impl AcpServer {
         // Build agent from global config, with the session's cwd pinned as
         // the file/shell sandbox boundary. The agent's data directory
         // (identity, scheduled tasks) still lives under `config.data_dir`.
-        // ACP sessions exclude persistent memory — context comes from the
-        // persisted session history, not the agent's long-term memory store.
-        // MCP init is opt-in per agent (`[agents.<alias>].acp_enable_mcp`): off
-        // by default to keep `session/new` prompt; on to load this agent's
-        // `mcp_bundles` tools. Runs without the sessions lock held (see above).
-        let enable_mcp = config.agent(&agent_alias).is_some_and(|a| a.acp_enable_mcp);
-        let mut agent = match self
+        // Standalone/IDE sessions keep the default policy (exclude_memory =
+        // true, MCP opt-in per agent via `[agents.<alias>].acp_enable_mcp`).
+        // WebChat sessions resolve `AcpSessionPolicy::webchat()` so they run
+        // with configured long-term memory, MCP bundles, and external channels.
+        // Runs without the sessions lock held (see above).
+        let (mut agent, consolidation_memory) = match self
             .build_agent(
                 &config,
                 &agent_alias,
                 std::path::Path::new(&workspace_dir),
-                enable_mcp,
+                session_policy,
             )
             .await
         {
@@ -1051,6 +1261,13 @@ impl AcpServer {
         ));
         agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
+        self.apply_session_policy_to_agent(
+            &config,
+            &agent_alias,
+            &mut agent,
+            &session_id,
+            session_policy,
+        );
 
         // Persist before publishing the session, so a failed write never
         // leaves a live-but-unpersisted session; release the reservation on
@@ -1061,25 +1278,41 @@ impl AcpServer {
             let sid = session_id.clone();
             let alias = agent_alias.clone();
             let wsd = workspace_dir.clone();
+            let surface = session_policy.interaction_surface;
             // The orchestrator ACP transport (CLI/IDE-native) carries no
             // authenticated gateway principal, so these sessions are stamped
             // with a NULL owner -- visible only to unscoped connections, never
             // to a scoped gateway principal (RFC 7141 F2).
-            let created =
-                tokio::task::spawn_blocking(move || store.create_session(&sid, &alias, &wsd, None))
-                    .await;
+            let created = tokio::task::spawn_blocking(move || {
+                store.create_session_with_interaction_surface(&sid, &alias, &wsd, surface, None)
+            })
+            .await;
             let error = match created {
                 Ok(Ok(_)) => None,
-                Ok(Err(e)) => Some(e.to_string()),
-                Err(join) => Some(join.to_string()),
-            };
-            if let Some(detail) = error {
-                self.loading_sessions.lock().await.remove(&session_id);
-                return Err(RpcError {
+                Ok(Err(e))
+                    if client_chose_id
+                        && e.is::<zeroclaw_infra::acp_session_store::AcpSessionIdConflict>() =>
+                {
+                    Some(RpcError {
+                        code: INVALID_PARAMS,
+                        message: "Requested WebChat session ID is unavailable".into(),
+                        data: None,
+                    })
+                }
+                Ok(Err(e)) => Some(RpcError {
                     code: INTERNAL_ERROR,
-                    message: format!("Failed to persist session: {detail}"),
+                    message: format!("Failed to persist session: {e}"),
                     data: None,
-                });
+                }),
+                Err(join) => Some(RpcError {
+                    code: INTERNAL_ERROR,
+                    message: format!("Failed to persist session: {join}"),
+                    data: None,
+                }),
+            };
+            if let Some(error) = error {
+                self.loading_sessions.lock().await.remove(&session_id);
+                return Err(error);
             }
         }
 
@@ -1105,6 +1338,7 @@ impl AcpServer {
                 session_id.clone(),
                 Arc::new(Mutex::new(Session {
                     agent,
+                    consolidation_memory,
                     _lifecycle_lease: lifecycle_lease,
                     last_active: now,
                     agent_alias: agent_alias.clone(),
@@ -1272,13 +1506,13 @@ impl AcpServer {
             }
         };
 
-        // MCP init follows the restored agent's own opt-in
-        // (`[agents.<alias>].acp_enable_mcp`), matching `session/new`.
-        let enable_mcp = config
-            .agent(&restore_alias)
-            .is_some_and(|a| a.acp_enable_mcp);
+        // Restore runtime policy from persisted `interaction_surface` (e.g.
+        // `"webchat"` restores memory, MCP bundles, and external channels;
+        // absent/unrecognized surface preserves standalone/IDE defaults).
+        let session_policy =
+            self.resolve_restored_session_policy(data.interaction_surface.as_deref());
         let agent_result = self
-            .build_agent(&config, &restore_alias, &workspace_dir, enable_mcp)
+            .build_agent(&config, &restore_alias, &workspace_dir, session_policy)
             .await
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
@@ -1286,7 +1520,7 @@ impl AcpServer {
                 data: None,
             });
 
-        let mut agent = match agent_result {
+        let (mut agent, consolidation_memory) = match agent_result {
             Ok(a) => a,
             Err(e) => {
                 self.loading_sessions.lock().await.remove(&session_id);
@@ -1399,6 +1633,13 @@ impl AcpServer {
         ));
         agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
+        self.apply_session_policy_to_agent(
+            &config,
+            &restore_alias,
+            &mut agent,
+            &session_id,
+            session_policy,
+        );
 
         let lifecycle_lease = match admission.publish() {
             Ok(lease) => lease,
@@ -1420,6 +1661,7 @@ impl AcpServer {
                 session_id.clone(),
                 Arc::new(Mutex::new(Session {
                     agent,
+                    consolidation_memory,
                     _lifecycle_lease: lifecycle_lease,
                     last_active: now,
                     agent_alias: restore_alias.clone(),
@@ -1609,13 +1851,13 @@ impl AcpServer {
             }
         };
 
-        // MCP init follows the restored agent's own opt-in
-        // (`[agents.<alias>].acp_enable_mcp`), matching `session/new`.
-        let enable_mcp = config
-            .agent(&restore_alias)
-            .is_some_and(|a| a.acp_enable_mcp);
+        // Restore runtime policy from persisted `interaction_surface` (e.g.
+        // `"webchat"` restores memory, MCP bundles, and external channels;
+        // absent/unrecognized surface preserves standalone/IDE defaults).
+        let session_policy =
+            self.resolve_restored_session_policy(data.interaction_surface.as_deref());
         let agent_result = self
-            .build_agent(&config, &restore_alias, &workspace_dir, enable_mcp)
+            .build_agent(&config, &restore_alias, &workspace_dir, session_policy)
             .await
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
@@ -1623,7 +1865,7 @@ impl AcpServer {
                 data: None,
             });
 
-        let mut agent = match agent_result {
+        let (mut agent, consolidation_memory) = match agent_result {
             Ok(a) => a,
             Err(e) => {
                 self.loading_sessions.lock().await.remove(&session_id);
@@ -1636,6 +1878,7 @@ impl AcpServer {
         // interrupted native-tool exchange and drop the replay-only cancellation
         // sentinel, otherwise the next native-provider prompt would receive the
         // unmatched tool call / re-entered cancellation the repair prevents.
+        let message_count = data.messages.len();
         let (_stored_messages, seed_pairs, repaired_tool_calls) =
             Self::sanitize_restored_history(data.messages);
         let seed_messages: Vec<ConversationMessage> = seed_pairs
@@ -1695,6 +1938,13 @@ impl AcpServer {
         ));
         agent.set_channel_name("acp".to_string());
         agent.channel_handles().register_channel("acp", acp_channel);
+        self.apply_session_policy_to_agent(
+            &config,
+            &restore_alias,
+            &mut agent,
+            &session_id,
+            session_policy,
+        );
 
         let lifecycle_lease = match admission.publish() {
             Ok(lease) => lease,
@@ -1716,6 +1966,7 @@ impl AcpServer {
                 session_id.clone(),
                 Arc::new(Mutex::new(Session {
                     agent,
+                    consolidation_memory,
                     _lifecycle_lease: lifecycle_lease,
                     last_active: now,
                     agent_alias: restore_alias.clone(),
@@ -1773,7 +2024,11 @@ impl AcpServer {
                 })),
             "ACP session resumed"
         );
-        Ok(serde_json::json!({}))
+        if session_policy.interaction_surface == Some("webchat") {
+            Ok(serde_json::json!({ "messageCount": message_count }))
+        } else {
+            Ok(serde_json::json!({}))
+        }
     }
     async fn handle_session_close(&self, params: &Value) -> RpcResult {
         let session_id = params
@@ -1876,6 +2131,33 @@ impl AcpServer {
             .or_else(|| params.get("workspace_dir"))
             .and_then(|v| v.as_str())
             .map(PathBuf::from)
+    }
+
+    fn requested_webchat_session_id(
+        params: &Value,
+        policy: AcpSessionPolicy,
+    ) -> Result<Option<String>, RpcError> {
+        let requested = params
+            .get("_meta")
+            .and_then(|meta| meta.get("zeroclaw"))
+            .and_then(|meta| meta.get("sessionId"))
+            .and_then(Value::as_str);
+        let Some(requested) = requested else {
+            return Ok(None);
+        };
+        if policy.interaction_surface != Some("webchat") {
+            return Err(RpcError {
+                code: INVALID_PARAMS,
+                message: "Client-selected session ids require interactionSurface=webchat".into(),
+                data: None,
+            });
+        }
+        let uuid = Uuid::parse_str(requested).map_err(|_| RpcError {
+            code: INVALID_PARAMS,
+            message: "WebChat sessionId must be a UUID".into(),
+            data: None,
+        })?;
+        Ok(Some(uuid.to_string()))
     }
 
     async fn handle_session_prompt(&self, params: &Value, _request_id: &Value) -> RpcResult {
@@ -2008,13 +2290,15 @@ impl AcpServer {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(100);
 
         let config = self.config_snapshot();
-        let cost_tracker = zeroclaw_runtime::cost::CostTracker::get_or_init_global(
-            config.cost.clone(),
-            &config.data_dir,
-        );
+        let cost_tracker = self.cost_tracker.clone().or_else(|| {
+            CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir)
+        });
         let cost_pricing = std::sync::Arc::new(
             zeroclaw_runtime::agent::cost::build_model_provider_pricing(&config),
         );
+
+        let (steering_tx, mut steering_rx) = tokio::sync::mpsc::channel::<SteeringInput>(32);
+        self.register_steering_sender(&session_id, steering_tx);
 
         // Move the Arc into the spawned task and lock inside it.  The inner
         // Mutex stays locked for the duration of the turn, preventing
@@ -2026,6 +2310,7 @@ impl AcpServer {
         let session_id_for_task = session_id.clone();
         let persist_store = self.store.clone();
         let persist_session_id = session_id.clone();
+        let user_prompt_for_consolidation = prompt.clone();
         let turn_handle = zeroclaw_spawn::spawn!(async move {
             let mut session = session_arc.lock().await;
             let (turn_alias, turn_provider, turn_model) = session.agent.attribution_fields();
@@ -2061,7 +2346,7 @@ impl AcpServer {
                                 &prompt,
                                 event_tx,
                                 Some(cancel_token),
-                                None,
+                                Some(&mut steering_rx),
                             )
                             .instrument(span),
                     ),
@@ -2112,8 +2397,24 @@ impl AcpServer {
                         Self::append_transcript(persist_store, persist_session_id, success.new_messages)
                             .await
                     };
+                    let (_, live_provider_ref, live_model) = session.agent.attribution_fields();
+                    let fallback_limits = success.final_context_limits.is_none().then(|| {
+                        session
+                            .agent
+                            .context_limits_for_route(&success.provider_name, &success.model)
+                    });
+                    let consolidation_target = session.consolidation_memory.as_ref().map(|memory| {
+                        (Arc::clone(memory), live_provider_ref.clone(), live_model)
+                    });
                     TerminalOutcome::Success {
                         response: success.response,
+                        provider_name: success.provider_name,
+                        model: success.model,
+                        live_provider_ref,
+                        final_context_limits: success.final_context_limits,
+                        fallback_limits,
+                        safeguard_fallback: success.safeguard_fallback,
+                        consolidation_target,
                     }
                 }
                 Err(failure) if was_cancelled => {
@@ -2225,6 +2526,8 @@ impl AcpServer {
 
         let mut accumulated_text = String::new();
         let mut tool_call_count: u32 = 0;
+        let mut usage_fold = UsageFold::default();
+        let mut context_display = ContextDisplay::default();
         // Titles announced on `tool_call` must be restated on `tool_call_update`.
         // ACP clients replace the displayed title with the update's title, and
         // the result event does not carry the original arguments.
@@ -2234,12 +2537,14 @@ impl AcpServer {
         // resume/restart replay the daemon RPC bridge already provides.
         let mut latest_plan: Option<Vec<PlanEntry>> = None;
         while let Some(event) = event_rx.recv().await {
+            context_display.observe(&event);
             if let TurnEvent::Usage {
                 input_tokens,
                 accepted,
                 ..
             } = &event
             {
+                usage_fold.apply_ref(&event);
                 if let Some(store) = &self.store {
                     let (tokens, is_accepted) = (*input_tokens, *accepted);
                     persist_acp_usage_snapshot_ordered(store, &session_id, tokens, is_accepted)
@@ -2303,9 +2608,10 @@ impl AcpServer {
             }
         }
 
-        // Remove the cancel token regardless of outcome — the turn is over.
-        // Lock poisoned invariant: same as the insert site above.
+        // Remove the cancel token and steering sender regardless of outcome —
+        // the turn is over. Lock poisoned invariant: same as the insert sites.
         self.remove_cancel_token(&session_id);
+        self.remove_steering_sender(&session_id);
 
         let outcome = turn_handle.await.map_err(|e| RpcError {
             code: INTERNAL_ERROR,
@@ -2316,8 +2622,35 @@ impl AcpServer {
         // The terminal transcript was already persisted inside the turn task,
         // under the session lock. Here we only render the client-facing result,
         // notifications, and logs for each outcome.
-        let result_text = match outcome {
-            TerminalOutcome::Success { response } => response,
+        let (
+            result_text,
+            active_provider,
+            active_model,
+            live_provider_ref,
+            final_context_limits,
+            fallback_limits,
+            safeguard_fallback,
+            consolidation_target,
+        ) = match outcome {
+            TerminalOutcome::Success {
+                response,
+                provider_name,
+                model,
+                live_provider_ref,
+                final_context_limits,
+                fallback_limits,
+                safeguard_fallback,
+                consolidation_target,
+            } => (
+                response,
+                provider_name,
+                model,
+                live_provider_ref,
+                final_context_limits,
+                fallback_limits,
+                safeguard_fallback,
+                consolidation_target,
+            ),
             TerminalOutcome::Cancelled { persist_error } => {
                 ::zeroclaw_log::record!(
                     INFO,
@@ -2372,6 +2705,48 @@ impl AcpServer {
             }
         };
 
+        // Fire-and-forget post-turn memory consolidation for sessions with a
+        // real memory store and `auto_save` enabled (e.g. WebChat sessions).
+        if let Some((mem, consolidation_provider_ref, consolidation_model)) = consolidation_target {
+            let consolidation_config = self.config_snapshot();
+            let memory_config = consolidation_config.memory.clone();
+            let assistant_resp = result_text.clone();
+            zeroclaw_spawn::spawn!(async move {
+                let Some((model_provider, model, temperature)) = build_consolidation_model(
+                    &consolidation_config,
+                    &consolidation_provider_ref,
+                    &consolidation_model,
+                ) else {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Channel),
+                        "ACP memory consolidation skipped"
+                    );
+                    return;
+                };
+                if let Err(e) = zeroclaw_memory::consolidation::consolidate_turn(
+                    model_provider.as_ref(),
+                    &model,
+                    temperature,
+                    mem.as_ref(),
+                    &memory_config,
+                    &user_prompt_for_consolidation,
+                    &assistant_resp,
+                )
+                .await
+                {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Channel)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "ACP memory consolidation skipped"
+                    );
+                }
+            });
+        }
+
         // Durably persist the latest TodoWrite plan for this turn so it
         // replays on session/resume (best-effort; the live emission above
         // already reached the client). Whole-list replace, including an
@@ -2400,6 +2775,61 @@ impl AcpServer {
             }
         }
 
+        // Surface an at-most-one safety-safeguard downgrade notice just before
+        // returning the terminal `session/prompt` result. Display-only and
+        // privacy-preserving: `SafeguardFallbackDisplay` omits `category`.
+        if let Some(notification) =
+            Self::safeguard_fallback_notification(&session_id, safeguard_fallback.as_ref())
+        {
+            self.write_notification(&notification).await;
+        }
+
+        let total_tokens = usage_fold.total_tokens();
+        let usage_by_provider_vec = usage_fold.take_sorted_entries();
+        let cost_usd = UsageFold::total_cost_usd(&usage_by_provider_vec);
+        let (max_context_tokens, model_context_window) = done_frame_context_limits(
+            final_context_limits,
+            usage_fold.last_context_token_budget,
+            usage_fold.last_model_context_window,
+            fallback_limits,
+        );
+        let effective_model = usage_fold.last_model.as_deref().unwrap_or(&active_model);
+        let provider_ref_full = usage_fold
+            .last_provider_ref
+            .as_deref()
+            .unwrap_or(&active_provider);
+
+        let mut zeroclaw_meta = serde_json::json!({
+            "inputTokens": usage_fold.total_input_tokens,
+            "outputTokens": usage_fold.total_output_tokens,
+            "tokensUsed": total_tokens,
+            "costUsd": cost_usd,
+            "model": effective_model,
+            "provider": live_provider_ref,
+            "providerRef": provider_ref_full,
+            "maxContextTokens": max_context_tokens,
+            "lastInputTokens": usage_fold.last_input_tokens,
+            "lastServingProviderRef": usage_fold.last_provider_ref,
+            "lastServingModel": usage_fold.last_model,
+            "usageByProvider": usage_by_provider_vec.iter().map(|e| serde_json::json!({
+                "providerRef": e.provider_ref,
+                "model": e.model,
+                "inputTokens": e.input_tokens,
+                "outputTokens": e.output_tokens,
+                "cachedInputTokens": e.cached_input_tokens,
+                "costUsd": e.cost_usd,
+            })).collect::<Vec<_>>(),
+        });
+        if let Some(window) = model_context_window {
+            zeroclaw_meta["modelContextWindow"] = serde_json::Value::from(window);
+        }
+        if let Some((input, source)) = context_display.trimmed_input() {
+            zeroclaw_meta["contextInputTokens"] = input.into();
+            if let Some(source) = source {
+                zeroclaw_meta["contextInputTokensSource"] = source.into();
+            }
+        }
+
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete).with_category(::zeroclaw_log::EventCategory::Channel)
@@ -2408,11 +2838,21 @@ impl AcpServer {
                     "tool_calls": tool_call_count,
                     "response_len": result_text.len(),
                     "stop_reason": "end_turn",
+                    "input_tokens": usage_fold.total_input_tokens,
+                    "output_tokens": usage_fold.total_output_tokens,
+                    "tokens_used": total_tokens,
+                    "cost_usd": cost_usd,
+                    "last_input_tokens": usage_fold.last_input_tokens,
                 })),
             "ACP session/prompt turn complete"
         );
 
-        Ok(Self::prompt_result(session_id, "end_turn", result_text))
+        Ok(Self::prompt_result_with_meta(
+            session_id,
+            "end_turn",
+            result_text,
+            zeroclaw_meta,
+        ))
 
         }).await
     }
@@ -2449,6 +2889,20 @@ impl AcpServer {
         self.cancel_tokens
             .lock()
             .expect("cancel_tokens lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
+            .remove(session_id);
+    }
+
+    fn register_steering_sender(&self, session_id: &str, tx: mpsc::Sender<SteeringInput>) {
+        self.steering_senders
+            .lock()
+            .expect("steering_senders lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
+            .insert(session_id.to_string(), tx);
+    }
+
+    fn remove_steering_sender(&self, session_id: &str) {
+        self.steering_senders
+            .lock()
+            .expect("steering_senders lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
             .remove(session_id);
     }
 
@@ -2894,6 +3348,39 @@ impl AcpServer {
         })
     }
 
+    fn prompt_result_with_meta(
+        session_id: String,
+        stop_reason: &'static str,
+        text: String,
+        zeroclaw_meta: Value,
+    ) -> Value {
+        serde_json::json!({
+            "sessionId": session_id,
+            "stopReason": stop_reason,
+            "content": text,
+            "_meta": {
+                "zeroclaw": zeroclaw_meta,
+            }
+        })
+    }
+
+    fn safeguard_fallback_notification(
+        session_id: &str,
+        notice: Option<&SafeguardFallbackNotice>,
+    ) -> Option<JsonRpcNotification> {
+        let display = SafeguardFallbackDisplay::from_notice(notice)?;
+        Some(JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: "_zeroclaw/safeguard_fallback",
+            params: serde_json::json!({
+                "sessionId": session_id,
+                "fallbackKind": display.fallback_kind.as_str(),
+                "requestedModel": display.requested_model,
+                "servedModel": display.served_model,
+            }),
+        })
+    }
+
     fn cancelled_prompt_result(session_id: String, accumulated_text: &str) -> Value {
         let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-cancelled-client-rpc");
         let content = if accumulated_text.is_empty() {
@@ -3205,6 +3692,77 @@ impl AcpServer {
         }
     }
 
+    async fn handle_session_steer(&self, params: &Value) -> RpcResult {
+        let session_id = params
+            .get("sessionId")
+            .or_else(|| params.get("session_id"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| RpcError {
+                code: INVALID_PARAMS,
+                message: "Missing required parameter: sessionId".to_string(),
+                data: None,
+            })?;
+
+        let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if content.is_empty() {
+            return Err(RpcError {
+                code: INVALID_PARAMS,
+                message: "Message content cannot be empty".to_string(),
+                data: Some(serde_json::json!({ "code": "EMPTY_CONTENT" })),
+            });
+        }
+
+        {
+            let sessions = self.sessions.lock().await;
+            if !sessions.contains_key(session_id) {
+                return Err(RpcError {
+                    code: SESSION_NOT_FOUND,
+                    message: format!("Session not found: {session_id}"),
+                    data: None,
+                });
+            }
+        }
+
+        let tx = self
+            .steering_senders
+            .lock()
+            .expect("steering_senders lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
+            .get(session_id)
+            .cloned();
+
+        let Some(tx) = tx else {
+            return Err(RpcError {
+                code: INVALID_PARAMS,
+                message: "Running turn is no longer accepting steering messages".to_string(),
+                data: Some(serde_json::json!({ "code": "STEERING_CLOSED" })),
+            });
+        };
+
+        let steering_input = SteeringInput::new(content.to_string()).with_ingress(IngressContext {
+            message_id: None,
+            source_class: SourceClass::External,
+            sender: None,
+            transport: Transport::Gateway,
+            trust: TrustClass::Untrusted,
+            origin: TurnOrigin::Interactive,
+            internal_principal: None,
+        });
+
+        match tx.try_send(steering_input) {
+            Ok(()) => Ok(serde_json::json!({ "accepted": true })),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Err(RpcError {
+                code: SESSION_BUSY,
+                message: "Steering queue is full for the running turn".to_string(),
+                data: Some(serde_json::json!({ "code": "STEERING_QUEUE_FULL" })),
+            }),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(RpcError {
+                code: INVALID_PARAMS,
+                message: "Running turn is no longer accepting steering messages".to_string(),
+                data: Some(serde_json::json!({ "code": "STEERING_CLOSED" })),
+            }),
+        }
+    }
+
     // ── I/O helpers ──────────────────────────────────────────────
 
     async fn write_result(&self, id: Value, result: Value) {
@@ -3218,13 +3776,23 @@ impl AcpServer {
     }
 
     async fn write_error(&self, id: Value, code: i32, message: &str) {
+        self.write_error_with_data(id, code, message, None).await;
+    }
+
+    async fn write_error_with_data(
+        &self,
+        id: Value,
+        code: i32,
+        message: &str,
+        data: Option<Value>,
+    ) {
         let response = JsonRpcResponse {
             jsonrpc: "2.0",
             result: None,
             error: Some(JsonRpcError {
                 code,
                 message: message.to_string(),
-                data: None,
+                data,
             }),
             id,
         };
@@ -3716,6 +4284,20 @@ fn notification_for_turn_event_titled(
                 }
             }),
         },
+        TurnEvent::BudgetWarning {
+            current_usd,
+            limit_usd,
+            period,
+        } => JsonRpcNotification {
+            jsonrpc: "2.0",
+            method: "_zeroclaw/budget_warning",
+            params: serde_json::json!({
+                "sessionId": session_id,
+                "currentUsd": current_usd,
+                "limitUsd": limit_usd,
+                "period": period,
+            }),
+        },
         // ACP has no `session/update` shape for usage; the cost tracker records
         // it out-of-band. Keep this helper total even if a caller omits its
         // fast-path filter.
@@ -3857,9 +4439,12 @@ fn history_notifications_for_message(
 struct RpcError {
     code: i32,
     message: String,
-    /// Reserved for JSON-RPC structured error data. The ACP writer currently
-    /// deliberately omits it, so terminal-turn failures use it internally to
-    /// retain their stable diagnostic while `message` carries localized text.
+    /// Optional structured error data.
+    ///
+    /// - `Value::String(_)` is reserved for internal diagnostics (never sent
+    ///   over the wire, read by [`Self::diagnostic`] for structured logs).
+    /// - `Value::Object(_)` carries safe wire metadata (such as `code` on
+    ///   steering failures) serialized as JSON-RPC `error.data`.
     data: Option<Value>,
 }
 
@@ -3869,6 +4454,10 @@ impl RpcError {
             .as_ref()
             .and_then(Value::as_str)
             .unwrap_or(&self.message)
+    }
+
+    fn wire_data(&self) -> Option<Value> {
+        self.data.as_ref().filter(|v| v.is_object()).cloned()
     }
 }
 
@@ -11047,5 +11636,432 @@ mod tests {
             "second resume must fail with INTERNAL_ERROR, not INVALID_PARAMS (leaked slot); got: {:?}",
             second_err
         );
+    }
+
+    #[test]
+    fn handle_initialize_negotiates_acp_v1() {
+        let standalone = AcpServer::new(Config::default(), AcpServerConfig::default());
+        let gateway = AcpServer::new(Config::default(), AcpServerConfig::default())
+            .with_allow_webchat_policy(true);
+        for server in [standalone, gateway] {
+            for params in [
+                serde_json::json!({}),
+                serde_json::json!({ "protocolVersion": 0 }),
+                serde_json::json!({ "protocolVersion": 1 }),
+                serde_json::json!({ "protocolVersion": 2 }),
+            ] {
+                let response = server.handle_initialize(&params).unwrap();
+                assert_eq!(response["protocolVersion"], ACP_PROTOCOL_VERSION);
+            }
+        }
+    }
+
+    #[test]
+    fn session_policy_defaults_closed_for_webchat_and_allows_when_enabled() {
+        let standalone = AcpServer::new(Config::default(), AcpServerConfig::default());
+
+        assert_eq!(
+            standalone
+                .resolve_new_session_policy(&serde_json::json!({}))
+                .unwrap(),
+            AcpSessionPolicy::default()
+        );
+        assert_eq!(
+            standalone
+                .resolve_new_session_policy(&serde_json::json!({
+                    "interactionSurface": "untrusted-surface"
+                }))
+                .unwrap(),
+            AcpSessionPolicy::default()
+        );
+        let denied = standalone
+            .resolve_new_session_policy(&serde_json::json!({
+                "interactionSurface": "webchat"
+            }))
+            .expect_err("standalone ACP server must reject webchat policy escalation");
+        assert_eq!(denied.code, FORBIDDEN);
+        assert_eq!(
+            standalone.resolve_restored_session_policy(Some("webchat")),
+            AcpSessionPolicy::default(),
+            "standalone server must not elevate restored sessions into webchat policy"
+        );
+
+        let gateway = AcpServer::new(Config::default(), AcpServerConfig::default())
+            .with_allow_webchat_policy(true);
+        assert_eq!(
+            gateway
+                .resolve_new_session_policy(&serde_json::json!({
+                    "interactionSurface": "webchat"
+                }))
+                .unwrap(),
+            AcpSessionPolicy::webchat()
+        );
+        assert_eq!(
+            gateway
+                .resolve_new_session_policy(&serde_json::json!({
+                    "_meta": { "zeroclaw": { "surface": "webchat" } }
+                }))
+                .unwrap(),
+            AcpSessionPolicy::webchat()
+        );
+        assert_eq!(
+            gateway.resolve_restored_session_policy(Some("webchat")),
+            AcpSessionPolicy::webchat()
+        );
+        assert_eq!(
+            gateway.resolve_restored_session_policy(None),
+            AcpSessionPolicy::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn webchat_session_new_reports_a_persisted_id_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(dir.path()).unwrap());
+        let session_id = Uuid::new_v4().to_string();
+        store
+            .create_session(&session_id, "other-agent", "/original", Some("owner"))
+            .unwrap();
+        let (writer_tx, _rx) = mpsc::channel(1);
+        let server = AcpServer::new_with_writer_and_store(
+            make_test_config(dir.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        )
+        .with_allow_webchat_policy(true);
+
+        let error = server
+            .handle_session_new(&serde_json::json!({
+                "interactionSurface": "webchat",
+                "_meta": { "zeroclaw": { "sessionId": session_id } },
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, INVALID_PARAMS);
+        assert_eq!(error.message, "Requested WebChat session ID is unavailable");
+        assert!(server.loading_sessions.lock().await.is_empty());
+        assert_eq!(
+            store
+                .load_session(&session_id)
+                .unwrap()
+                .unwrap()
+                .agent_alias,
+            "other-agent"
+        );
+    }
+
+    #[cfg(feature = "channel-webhook")]
+    #[tokio::test]
+    async fn webchat_session_new_seeds_only_the_agents_bound_channels() {
+        use super::super::tests::{CronChannelRegistryRestore, STARTUP_REGISTRY_TEST_LOCK};
+
+        let _serial = STARTUP_REGISTRY_TEST_LOCK.lock().await;
+        let previous = super::super::CRON_CHANNEL_REGISTRY
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let _restore = CronChannelRegistryRestore(previous);
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = make_test_config(dir.path());
+        cfg.agents.get_mut("test-agent").unwrap().channels = vec!["webhook.sales".into()];
+        let mut other = dispatchable_test_agent("anthropic.default");
+        other.channels = vec!["webhook.support".into()];
+        cfg.agents.insert("other".into(), other);
+        for alias in ["sales", "support"] {
+            cfg.channels.webhook.insert(
+                alias.into(),
+                zeroclaw_config::schema::WebhookConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let server =
+            AcpServer::new(cfg, AcpServerConfig::default()).with_allow_webchat_policy(true);
+        for (agent, selected, foreign) in [
+            ("test-agent", "webhook.sales", "webhook.support"),
+            ("other", "webhook.support", "webhook.sales"),
+        ] {
+            let created = server
+                .handle_session_new(&serde_json::json!({
+                    "agentAlias": agent,
+                    "interactionSurface": "webchat",
+                }))
+                .await
+                .unwrap();
+            let sessions = server.sessions.lock().await;
+            let session = sessions
+                .get(created["sessionId"].as_str().unwrap())
+                .unwrap()
+                .lock()
+                .await;
+            let channels = session.agent.channel_handles();
+            let admitted = channels.get_channel(selected).expect("bound channel");
+            assert!(Arc::ptr_eq(
+                &admitted,
+                &channels.get_channel("webhook").unwrap()
+            ));
+            assert!(channels.get_channel(foreign).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn webchat_session_new_enables_memory_and_persists_surface_while_default_excludes_memory()
+    {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let mut cfg = make_test_config(cwd.path());
+        cfg.memory.backend = "sqlite".to_string();
+        cfg.memory.auto_save = true;
+
+        let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(16);
+        let server = Arc::new(
+            AcpServer::new_with_writer_and_store(
+                cfg,
+                AcpServerConfig::default(),
+                writer_tx,
+                Arc::clone(&store),
+            )
+            .with_allow_webchat_policy(true),
+        );
+
+        // Vanilla IDE/CLI ACP session preserves exclude_memory = true.
+        let ide_res = server
+            .handle_session_new(&serde_json::json!({ "agentAlias": "test-agent" }))
+            .await
+            .unwrap();
+        let ide_sid = ide_res["sessionId"].as_str().unwrap().to_string();
+        {
+            let sessions = server.sessions.lock().await;
+            let session = sessions.get(&ide_sid).unwrap().lock().await;
+            assert_eq!(
+                session
+                    .consolidation_memory
+                    .as_ref()
+                    .map(|memory| memory.name()),
+                None,
+                "vanilla ACP session must preserve exclude_memory = true"
+            );
+        }
+        assert_eq!(
+            store
+                .load_session(&ide_sid)
+                .unwrap()
+                .unwrap()
+                .interaction_surface,
+            None
+        );
+
+        // WebChat ACP session enables the agent's configured memory backend
+        // and persists interaction_surface = "webchat" for session/load restore.
+        let web_res = server
+            .handle_session_new(&serde_json::json!({
+                "agentAlias": "test-agent",
+                "interactionSurface": "webchat"
+            }))
+            .await
+            .unwrap();
+        let web_sid = web_res["sessionId"].as_str().unwrap().to_string();
+        {
+            let sessions = server.sessions.lock().await;
+            let session = sessions.get(&web_sid).unwrap().lock().await;
+            assert_ne!(
+                session
+                    .consolidation_memory
+                    .as_ref()
+                    .map(|memory| memory.name()),
+                None,
+                "webchat ACP session must attach configured persistent memory"
+            );
+        }
+        assert_eq!(
+            store
+                .load_session(&web_sid)
+                .unwrap()
+                .unwrap()
+                .interaction_surface
+                .as_deref(),
+            Some("webchat")
+        );
+
+        // Closing and loading the webchat session restores persistent memory.
+        server
+            .handle_session_close(&serde_json::json!({ "sessionId": web_sid }))
+            .await
+            .unwrap();
+        server
+            .handle_session_load(&serde_json::json!({ "sessionId": web_sid }))
+            .await
+            .unwrap();
+        {
+            let sessions = server.sessions.lock().await;
+            let session = sessions.get(&web_sid).unwrap().lock().await;
+            assert_ne!(
+                session
+                    .consolidation_memory
+                    .as_ref()
+                    .map(|memory| memory.name()),
+                None,
+                "reloaded webchat session must restore persistent memory policy"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn webchat_session_new_returns_needs_onboarding_when_unconfigured() {
+        let server = AcpServer::new(Config::default(), AcpServerConfig::default())
+            .with_allow_webchat_policy(true);
+        let err = server
+            .handle_session_new(&serde_json::json!({
+                "interactionSurface": "webchat"
+            }))
+            .await
+            .expect_err("unconfigured webchat session/new must return NEEDS_ONBOARDING");
+        assert_eq!(err.code, INVALID_PARAMS);
+        assert_eq!(
+            err.wire_data(),
+            Some(serde_json::json!({
+                "code": "NEEDS_ONBOARDING",
+                "error": "needs_onboarding",
+                "url": "/onboard",
+            }))
+        );
+    }
+
+    #[test]
+    fn safeguard_fallback_and_budget_warning_notifications_match_contract() {
+        let notice = SafeguardFallbackNotice {
+            kind: zeroclaw_providers::SafeguardFallbackKind::ClientAndServer,
+            requested_model: "claude-sonnet-4-6".to_string(),
+            served_model: "claude-haiku-4-5".to_string(),
+            category: Some("internal-classifier-secret".to_string()),
+        };
+        let notif = AcpServer::safeguard_fallback_notification("sid-1", Some(&notice))
+            .expect("notification must be emitted");
+        assert_eq!(notif.method, "_zeroclaw/safeguard_fallback");
+        assert_eq!(notif.params["sessionId"], "sid-1");
+        assert_eq!(notif.params["fallbackKind"], "client_server");
+        assert_eq!(notif.params["requestedModel"], "claude-sonnet-4-6");
+        assert_eq!(notif.params["servedModel"], "claude-haiku-4-5");
+        assert!(
+            notif.params.get("category").is_none(),
+            "classifier category must never cross the wire"
+        );
+        assert!(AcpServer::safeguard_fallback_notification("sid-1", None).is_none());
+
+        let warning = notification_for_turn_event(
+            "sid-1",
+            &TurnEvent::BudgetWarning {
+                current_usd: 8.5,
+                limit_usd: 10.0,
+                period: zeroclaw_api::agent::BudgetWarningPeriod::Day,
+            },
+        )
+        .expect("budget warning notification must be emitted");
+        assert_eq!(warning.method, "_zeroclaw/budget_warning");
+        assert_eq!(warning.params["sessionId"], "sid-1");
+        assert_eq!(warning.params["currentUsd"], 8.5);
+        assert_eq!(warning.params["limitUsd"], 10.0);
+        assert_eq!(warning.params["period"], "day");
+    }
+
+    #[tokio::test]
+    async fn session_steer_validates_state_enqueues_input_and_reports_full_queue() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (writer_tx, _rx) = tokio::sync::mpsc::channel::<String>(16);
+        let server = Arc::new(AcpServer::new_with_writer(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+        ));
+
+        let sid = server
+            .handle_session_new(&serde_json::json!({ "agentAlias": "test-agent" }))
+            .await
+            .unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Empty content -> EMPTY_CONTENT.
+        let empty_err = server
+            .handle_session_steer(&serde_json::json!({ "sessionId": sid, "content": "" }))
+            .await
+            .expect_err("empty content must fail");
+        assert_eq!(empty_err.code, INVALID_PARAMS);
+        assert_eq!(
+            empty_err.wire_data(),
+            Some(serde_json::json!({ "code": "EMPTY_CONTENT" }))
+        );
+
+        // No running turn -> STEERING_CLOSED.
+        let idle_err = server
+            .handle_session_steer(&serde_json::json!({ "sessionId": sid, "content": "pivot" }))
+            .await
+            .expect_err("idle session must reject steering");
+        assert_eq!(idle_err.code, INVALID_PARAMS);
+        assert_eq!(
+            idle_err.wire_data(),
+            Some(serde_json::json!({ "code": "STEERING_CLOSED" }))
+        );
+
+        // Register a 1-slot steering channel simulating an in-flight turn.
+        let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel::<SteeringInput>(1);
+        server.register_steering_sender(&sid, steer_tx);
+
+        let accepted = server
+            .handle_session_steer(&serde_json::json!({
+                "sessionId": sid,
+                "content": "focus on tests"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(accepted["accepted"], true);
+
+        // Second message fills the 1-slot queue -> STEERING_QUEUE_FULL.
+        let full_err = server
+            .handle_session_steer(&serde_json::json!({
+                "sessionId": sid,
+                "content": "overflow"
+            }))
+            .await
+            .expect_err("full steering queue must fail");
+        assert_eq!(full_err.code, SESSION_BUSY);
+        assert_eq!(
+            full_err.wire_data(),
+            Some(serde_json::json!({ "code": "STEERING_QUEUE_FULL" }))
+        );
+
+        let received = steer_rx.recv().await.expect("steering input delivered");
+        assert_eq!(received.text(), "focus on tests");
+        server.remove_steering_sender(&sid);
+    }
+
+    #[test]
+    fn webchat_requested_session_id_is_scoped_and_validated() {
+        let requested = "123e4567-e89b-12d3-a456-426614174000";
+        let params = serde_json::json!({
+            "_meta": { "zeroclaw": { "sessionId": requested } }
+        });
+        assert_eq!(
+            AcpServer::requested_webchat_session_id(&params, AcpSessionPolicy::webchat()).unwrap(),
+            Some(requested.to_string())
+        );
+        let error = AcpServer::requested_webchat_session_id(&params, AcpSessionPolicy::default())
+            .expect_err("IDE clients must not select session ids");
+        assert_eq!(error.code, INVALID_PARAMS);
+        let error = AcpServer::requested_webchat_session_id(
+            &serde_json::json!({
+                "_meta": { "zeroclaw": { "sessionId": "not-a-uuid" } }
+            }),
+            AcpSessionPolicy::webchat(),
+        )
+        .expect_err("WebChat session ids must be UUIDs");
+        assert_eq!(error.code, INVALID_PARAMS);
     }
 }

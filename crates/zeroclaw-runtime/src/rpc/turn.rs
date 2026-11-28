@@ -8,6 +8,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::model_provider::ConversationMessage;
+use zeroclaw_providers::turn_accounting::UsageFold;
 
 pub enum TurnOutcome {
     Completed {
@@ -455,80 +456,16 @@ where
 }
 
 /// Per-turn fold of `TurnEvent::Usage` into the totals carried on
-/// `TurnComplete`. It follows the `TurnEvent::Usage` contract: billing totals
-/// and the per-provider breakdown count every billable attempt, while the
-/// serving snapshot (`last_*`, context limits) advances on accepted events
-/// only, so a billed rejected attempt cannot re-point the terminal identity.
+/// `TurnComplete`. Backed by [`UsageFold`] so RPC and gateway paths share the
+/// exact same billing accumulation and accepted-serving snapshot rules.
 #[derive(Debug, Default)]
 pub(crate) struct TurnUsageFold {
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
-    last_provider_ref: Option<String>,
-    last_model: Option<String>,
-    last_input_tokens: Option<u64>,
-    last_context_token_budget: Option<u64>,
-    last_model_context_window: Option<u64>,
-    by_provider: std::collections::HashMap<(String, String), ProviderUsageTotals>,
-    saw_usage: bool,
+    inner: UsageFold,
 }
 
 impl TurnUsageFold {
     pub(crate) fn apply(&mut self, event: &TurnEvent) {
-        let TurnEvent::Usage {
-            input_tokens,
-            cached_input_tokens,
-            output_tokens,
-            cost_usd,
-            context_token_budget,
-            model_context_window,
-            provider_ref,
-            model,
-            accepted,
-            // Billing totals and the accepted-serving snapshot describe
-            // provider-measured usage only. The display estimate is a
-            // context-meter concern and is labelled on the RPC
-            // `context_usage` surface, not folded into TurnComplete.
-            estimated_input_tokens: _,
-        } = event
-        else {
-            return;
-        };
-        self.saw_usage = true;
-        if let Some(it) = input_tokens {
-            self.input_tokens = Some(self.input_tokens.unwrap_or(0).saturating_add(*it));
-        }
-        if let Some(ot) = output_tokens {
-            self.output_tokens = Some(self.output_tokens.unwrap_or(0).saturating_add(*ot));
-        }
-        if *accepted {
-            self.last_provider_ref = Some(provider_ref.clone());
-            self.last_model = Some(model.clone());
-            self.last_context_token_budget = *context_token_budget;
-            self.last_model_context_window = *model_context_window;
-            // An accepted call without usage clears the previous route's
-            // snapshot rather than rendering it against this route's window.
-            self.last_input_tokens = *input_tokens;
-        }
-        let entry = self
-            .by_provider
-            .entry((provider_ref.clone(), model.clone()))
-            .or_insert_with_key(|(provider_ref, model)| ProviderUsageTotals {
-                provider_ref: provider_ref.clone(),
-                model: model.clone(),
-                ..Default::default()
-            });
-        if let Some(it) = input_tokens {
-            entry.input_tokens = entry.input_tokens.saturating_add(*it);
-        }
-        if let Some(ot) = output_tokens {
-            entry.output_tokens = entry.output_tokens.saturating_add(*ot);
-        }
-        if let Some(ct) = cached_input_tokens {
-            entry.cached_input_tokens = entry.cached_input_tokens.saturating_add(*ct);
-        }
-        if let Some(cu) = cost_usd {
-            entry.cost_usd += cu;
-        }
+        self.inner.apply_ref(event);
     }
 
     /// Build the wire totals. `final_limits` is the serving route's resolved
@@ -538,41 +475,41 @@ impl TurnUsageFold {
         &self,
         final_limits: Option<zeroclaw_config::schema::ResolvedContextLimits>,
     ) -> Option<TurnUsageTotals> {
-        if !self.saw_usage && final_limits.is_none() {
+        if !self.inner.saw_usage() && final_limits.is_none() {
             return None;
         }
-        // Sorted so the wire order, and the float sum below, are stable.
-        let mut usage_by_provider: Vec<ProviderUsageTotals> =
-            self.by_provider.values().cloned().collect();
-        usage_by_provider.sort_by(|a, b| {
-            (a.provider_ref.as_str(), a.model.as_str())
-                .cmp(&(b.provider_ref.as_str(), b.model.as_str()))
-        });
-        // Same rule as the gateway `done` frame: an unpriced turn has no cost.
-        let cost_sum: f64 = usage_by_provider.iter().map(|e| e.cost_usd).sum();
-        let cost_usd = (cost_sum > 0.0).then_some(cost_sum);
-        let tokens_used = match (self.input_tokens, self.output_tokens) {
-            (None, None) => None,
-            (i, o) => Some(i.unwrap_or(0).saturating_add(o.unwrap_or(0))),
-        };
+        let entries = self.inner.sorted_entries();
+        let cost_usd = UsageFold::total_cost_usd(&entries);
+        let tokens_used = self.inner.total_tokens();
+        let usage_by_provider = entries
+            .into_iter()
+            .map(|entry| ProviderUsageTotals {
+                provider_ref: entry.provider_ref,
+                model: entry.model,
+                input_tokens: entry.input_tokens,
+                output_tokens: entry.output_tokens,
+                cached_input_tokens: entry.cached_input_tokens,
+                cost_usd: entry.cost_usd,
+            })
+            .collect();
         let (max_context_tokens, model_context_window) = match final_limits {
             Some(limits) => (
                 Some(limits.context_token_budget as u64),
                 limits.configured_model_context_window().map(|w| w as u64),
             ),
             None => (
-                self.last_context_token_budget,
-                self.last_model_context_window,
+                self.inner.last_context_token_budget,
+                self.inner.last_model_context_window,
             ),
         };
         Some(TurnUsageTotals {
-            input_tokens: self.input_tokens,
-            output_tokens: self.output_tokens,
+            input_tokens: self.inner.total_input_tokens,
+            output_tokens: self.inner.total_output_tokens,
             tokens_used,
             cost_usd,
-            provider_ref: self.last_provider_ref.clone(),
-            model: self.last_model.clone(),
-            last_input_tokens: self.last_input_tokens,
+            provider_ref: self.inner.last_provider_ref.clone(),
+            model: self.inner.last_model.clone(),
+            last_input_tokens: self.inner.last_input_tokens,
             max_context_tokens,
             model_context_window,
             usage_by_provider,

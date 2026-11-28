@@ -4,6 +4,7 @@
 pub mod acp_embedded;
 #[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
+pub mod consolidation;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
@@ -22512,9 +22513,10 @@ temperature = 0.3
         );
     }
 
-    struct CronChannelRegistryRestore(Option<CronChannelRegistry>);
+    pub(super) struct CronChannelRegistryRestore(pub(super) Option<CronChannelRegistry>);
 
-    static STARTUP_REGISTRY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub(super) static STARTUP_REGISTRY_TEST_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
     impl Drop for CronChannelRegistryRestore {
         fn drop(&mut self) {
