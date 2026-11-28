@@ -1,3 +1,4 @@
+pub(crate) mod deadman;
 pub mod engine;
 pub mod store;
 
