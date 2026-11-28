@@ -7751,7 +7751,11 @@ pub struct CostConfig {
     #[serde(default = "default_warn_percent")]
     pub warn_at_percent: u8,
 
-    /// Allow requests to exceed budget with --override flag (default: false)
+    /// When a shared daily or monthly limit is exceeded, pause the turn and
+    /// ask the operator (on channels that answer approvals) whether to
+    /// lift that shared cap daemon-wide, including unattended jobs, until
+    /// UTC rollover or daemon restart. Other limits remain enforced
+    /// (default: false).
     #[tab(Limits)]
     #[serde(default)]
     pub allow_override: bool,
@@ -17873,6 +17877,14 @@ pub struct TelegramConfig {
     #[serde(default = "default_telegram_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
 
+    /// Numeric Telegram user IDs permitted to override shared cost limits in
+    /// group chats. Also requires normal peer authorization. Empty denies all
+    /// group overrides; wildcards and usernames do not grant this role.
+    /// Private-chat approvals are unaffected. Resolved from live config per reply.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub cost_override_operators: Vec<String>,
+
     /// Tools excluded from this channel's tool spec. When set, these tools
     /// are not exposed to the model when responding via this channel.
     #[tab(Behavior)]
@@ -17909,6 +17921,7 @@ impl Default for TelegramConfig {
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: default_telegram_approval_timeout_secs(),
+            cost_override_operators: Vec::new(),
             excluded_tools: Vec::new(),
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
@@ -36114,6 +36127,7 @@ auto_save = true
                         ack_reactions: None,
                         proxy_url: None,
                         approval_timeout_secs: default_telegram_approval_timeout_secs(),
+                        cost_override_operators: Vec::new(),
                         excluded_tools: vec![],
                         reply_min_interval_secs: 0,
                         reply_queue_depth_max: 0,
@@ -38179,6 +38193,7 @@ default_temperature = 0.7
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: 120,
+            cost_override_operators: Vec::new(),
             excluded_tools: vec![],
             reply_min_interval_secs: 0,
             reply_queue_depth_max: 0,
@@ -45327,6 +45342,7 @@ high_entropy_tokens = false
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: default_telegram_approval_timeout_secs(),
+                cost_override_operators: Vec::new(),
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
