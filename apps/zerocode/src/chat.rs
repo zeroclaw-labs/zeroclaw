@@ -889,6 +889,121 @@ struct LagReattach {
     prompt_error: Option<String>,
 }
 
+/// Only the native running-turn window: a second lag or cancellation can
+/// supersede the turn's recovery ticket without erasing rows the user saw.
+#[derive(Debug, Default)]
+struct ReattachJournal {
+    notices: Vec<Arc<str>>,
+    stream: Vec<ReplySpan>,
+    flushed: VecDeque<(Arc<str>, Vec<ReplySpan>)>,
+    captured: Option<Vec<(ChatEntry, Vec<ReplySpan>)>>,
+}
+
+#[derive(Debug)]
+struct ReplySpan {
+    bytes: std::ops::Range<usize>,
+    occurrence: String,
+}
+
+impl ReattachJournal {
+    fn mark(&mut self, bytes: std::ops::Range<usize>, occurrence: Option<&str>) {
+        let Some(id) = occurrence.filter(|id| !id.is_empty()) else {
+            return;
+        };
+        if bytes.is_empty() || self.captured.is_some() {
+            return;
+        }
+        if let Some(previous) = self.stream.last_mut()
+            && previous.occurrence == id
+            && previous.bytes.end == bytes.start
+        {
+            previous.bytes.end = bytes.end;
+        } else {
+            self.stream.push(ReplySpan {
+                bytes,
+                occurrence: id.to_owned(),
+            });
+        }
+    }
+
+    fn capture(&mut self, entries: &[ChatEntry], text: &str, thought: &str) {
+        if self.captured.is_some() {
+            return;
+        }
+        let Some(boundary) = self.notices.first() else {
+            return;
+        };
+        let Some(start) = entries.iter().position(
+            |row| matches!(row, ChatEntry::SystemMessage(value) if Arc::ptr_eq(value, boundary)),
+        ) else {
+            return;
+        };
+        let mut rows = Vec::new();
+        for row in &entries[start + 1..] {
+            let spans = match row {
+                ChatEntry::UserMessage { .. } => continue,
+                ChatEntry::SystemMessage(value)
+                    if self
+                        .notices
+                        .iter()
+                        .skip(1)
+                        .any(|notice| Arc::ptr_eq(notice, value)) =>
+                {
+                    continue;
+                }
+                ChatEntry::AgentMessage(value)
+                    if self
+                        .flushed
+                        .front()
+                        .is_some_and(|(marked, _)| Arc::ptr_eq(value, marked)) =>
+                {
+                    self.flushed
+                        .pop_front()
+                        .map_or_else(Vec::new, |(_, spans)| spans)
+                }
+                _ => Vec::new(),
+            };
+            rows.push((row.clone(), spans));
+        }
+        // Snapshot the buffers without settling the turn or executing any
+        // of the live notifications again.
+        if !text.is_empty() {
+            rows.push((
+                ChatEntry::AgentMessage(text.into()),
+                std::mem::take(&mut self.stream),
+            ));
+        }
+        if !thought.is_empty() {
+            rows.push((ChatEntry::AgentThought(thought.into()), Vec::new()));
+        }
+        self.captured = Some(rows);
+    }
+
+    fn restore(self, entries: &mut Vec<ChatEntry>, installed: &HashSet<String>) {
+        for (row, spans) in self.captured.into_iter().flatten() {
+            let mut omit = spans
+                .into_iter()
+                .filter(|s| installed.contains(&s.occurrence))
+                .peekable();
+            if let ChatEntry::AgentMessage(text) = &row
+                && omit.peek().is_some()
+            {
+                let mut visible = String::new();
+                let mut from = 0;
+                for span in omit {
+                    visible.push_str(&text[from..span.bytes.start]);
+                    from = span.bytes.end;
+                }
+                visible.push_str(&text[from..]);
+                if !visible.is_empty() {
+                    entries.push(ChatEntry::AgentMessage(visible.into()));
+                }
+            } else {
+                entries.push(row);
+            }
+        }
+    }
+}
 /// Which resync notice a reloaded transcript opens with. Decided in
 /// `apply_session_resync_result` from the resync mode; the in-flight map
 /// (`session_resync_in_flight`, keyed by session id) is the single source of
@@ -3081,7 +3196,8 @@ impl Chat {
                 // this reattached pane has not committed any live text.
                 let represented = reply_occurrence
                     .is_some_and(|id| state.installed_reply_occurrences.contains(id));
-                state.finish_goal_output(if represented { "" } else { candidate });
+                state
+                    .finish_goal_output(if represented { "" } else { candidate }, reply_occurrence);
             }
             GoalUpdate::Completed { .. } => {
                 state
@@ -3305,6 +3421,7 @@ impl Chat {
             } else {
                 QueuePauseReason::MissingCompletion
             };
+            state.capture_reattached_presentation();
             state.settle_turn_from_prompt_response(pause_reason);
             let prompt_error = completion.error.clone();
             if let Some(error) = completion.error {
@@ -3638,7 +3755,7 @@ impl Chat {
                         // terminal signal — its `session/prompt` response or
                         // its terminal frame — fires the wholesale reload it
                         // owes.
-                        state.reattach_to_running_turn();
+                        state.reattach_to_running_turn(!strip_runtime_enrichment);
                         if let Some(plan) = snapshot.plan {
                             state.todo_tracker.set_plan(plan);
                         }
@@ -3673,6 +3790,7 @@ impl Chat {
                         // hold a prompt error recorded while it was gated),
                         // and a stale carrier must not survive into the
                         // next turn.
+                        state.capture_reattached_presentation();
                         let lag = state.lag_reattach.take();
                         let carried = if terminal_followup {
                             lag.as_ref().and_then(|l| l.carried.clone())
@@ -3732,6 +3850,7 @@ impl Chat {
                     self.session_resync_in_flight.remove(&update.session_id);
                     return;
                 };
+                state.reattach_journal = None;
                 if matches!(
                     mode,
                     Some(SessionResyncMode::Reattach | SessionResyncMode::ReattachTerminal)
@@ -10942,6 +11061,7 @@ pub struct ChatState {
     /// reload finishes (success or failure) and when a fresh `Reattach` or
     /// `Cancel` resync supersedes it.
     lag_reattach: Option<LagReattach>,
+    reattach_journal: Option<ReattachJournal>,
     show_thoughts: bool,
     /// Browse mode cursor (most-recently moved position).
     browse_cursor: Option<usize>,
@@ -11087,6 +11207,7 @@ impl ChatState {
             turn_status: TurnStatus::Idle,
             turn_started_at: Instant::now(),
             lag_reattach: None,
+            reattach_journal: None,
             show_thoughts: true,
             browse_cursor: None,
             browse_anchor: None,
@@ -12660,8 +12781,16 @@ impl ChatState {
     fn flush_streaming_text(&mut self) -> bool {
         let text = std::mem::take(&mut self.streaming_text);
         if !text.is_empty() {
-            self.entries
-                .push(ChatEntry::AgentMessage(Arc::<str>::from(text)));
+            let text: Arc<str> = text.into();
+            if let Some(journal) = self.reattach_journal.as_mut()
+                && !journal.stream.is_empty()
+                && journal.captured.is_none()
+            {
+                journal
+                    .flushed
+                    .push_back((Arc::clone(&text), std::mem::take(&mut journal.stream)));
+            }
+            self.entries.push(ChatEntry::AgentMessage(text));
             self.goal_join_state.record_text_commit();
             self.mark_dirty_append();
             true
@@ -12714,14 +12843,26 @@ impl ChatState {
         may_suppress: bool,
     ) {
         let represented = may_suppress && self.reply_already_installed(params);
-        self.apply_update_with_reply_membership(update, represented);
+        self.apply_update_with_reply_membership(
+            update,
+            represented,
+            params
+                .get("reply_occurrence")
+                .and_then(serde_json::Value::as_str),
+        );
     }
 
-    pub fn apply_update(&mut self, update: SessionUpdate) {
-        self.apply_update_with_reply_membership(update, false);
+    #[cfg(test)]
+    fn apply_update(&mut self, update: SessionUpdate) {
+        self.apply_update_with_reply_membership(update, false, None);
     }
 
-    fn apply_update_with_reply_membership(&mut self, update: SessionUpdate, represented: bool) {
+    fn apply_update_with_reply_membership(
+        &mut self,
+        update: SessionUpdate,
+        represented: bool,
+        occurrence: Option<&str>,
+    ) {
         // Ignore notifications that belong to a different session.
         let update_sid = match &update {
             SessionUpdate::AgentMessageChunk { session_id, .. }
@@ -12763,6 +12904,10 @@ impl ChatState {
                     presentation_from.get_or_insert(self.streaming_text.len());
                 }
                 self.streaming_text.push_str(&text);
+                if !presentation_only && let Some(journal) = &mut self.reattach_journal {
+                    let end = self.streaming_text.len();
+                    journal.mark(end - text.len()..end, occurrence);
+                }
                 // Guard: don't mutate turn_status after commit_turn has already
                 // set us back to Idle. Late-arriving notifications (broadcast
                 // channel lag) can otherwise flip the input bar back to the
@@ -13039,6 +13184,7 @@ impl ChatState {
                         } else {
                             ""
                         },
+                        occurrence,
                     );
                     if outcome != TurnEndOutcome::Completed {
                         self.present_turn_error(&content);
@@ -13066,7 +13212,12 @@ impl ChatState {
                 match outcome {
                     TurnEndOutcome::Completed => {
                         self.last_error = None;
-                        self.commit_turn_with_reply_membership(content, true, represented);
+                        self.commit_turn_with_reply_membership(
+                            content,
+                            true,
+                            represented,
+                            occurrence,
+                        );
                     }
                     TurnEndOutcome::Cancelled | TurnEndOutcome::Failed => {
                         if outcome == TurnEndOutcome::Failed {
@@ -13097,7 +13248,7 @@ impl ChatState {
     // Goal and ordinary parent streams are ordered by the session permit.
     // Finishing the Goal's presentation cannot settle an ordinary prompt
     // that the UI has submitted but the daemon has not yet admitted.
-    fn finish_goal_output(&mut self, fallback: &str) {
+    fn finish_goal_output(&mut self, fallback: &str, occurrence: Option<&str>) {
         if let GoalJoinState::Joined { presentation_from } =
             std::mem::take(&mut self.goal_join_state)
             && !fallback.is_empty()
@@ -13109,6 +13260,12 @@ impl ChatState {
             );
             if let Some(tail) = tail {
                 if !self.streaming_text.is_empty() {
+                    if let Some(journal) = self.reattach_journal.as_mut() {
+                        // The replacement supplies all answer bytes; the remaining
+                        // presentation-only tail must never inherit their identity.
+                        journal.stream.clear();
+                        journal.mark(0..fallback.len(), occurrence);
+                    }
                     if tail.is_empty() {
                         fallback.clone_into(&mut self.streaming_text);
                     } else {
@@ -13124,16 +13281,31 @@ impl ChatState {
         let streamed = self.flush_streaming_text() || self.turn_had_streaming_text;
         self.flush_streaming_thought();
         if !streamed && !fallback.is_empty() {
-            self.entries
-                .push(ChatEntry::AgentMessage(Arc::<str>::from(fallback)));
-            self.mark_dirty_append();
+            self.push_reply_fallback(fallback.into(), occurrence);
         }
         self.turn_had_streaming_text = false;
         self.turn_had_tool_calls = false;
     }
 
     pub fn commit_turn(&mut self, full_text: String, clean: bool) {
-        self.commit_turn_with_reply_membership(full_text, clean, false);
+        self.commit_turn_with_reply_membership(full_text, clean, false, None);
+    }
+
+    fn push_reply_fallback(&mut self, text: Arc<str>, occurrence: Option<&str>) {
+        if let Some(journal) = self.reattach_journal.as_mut()
+            && journal.captured.is_none()
+            && let Some(id) = occurrence.filter(|id| !id.is_empty())
+        {
+            journal.flushed.push_back((
+                Arc::clone(&text),
+                vec![ReplySpan {
+                    bytes: 0..text.len(),
+                    occurrence: id.to_owned(),
+                }],
+            ));
+        }
+        self.entries.push(ChatEntry::AgentMessage(text));
+        self.mark_dirty_append();
     }
 
     fn commit_turn_with_reply_membership(
@@ -13141,6 +13313,7 @@ impl ChatState {
         full_text: String,
         clean: bool,
         represented: bool,
+        occurrence: Option<&str>,
     ) {
         self.freeze_prompt_settled_stream();
         if self.flush_streaming_text() {
@@ -13151,9 +13324,7 @@ impl ChatState {
         // daemon-provided final text as a fallback so the turn is never
         // invisible to the user.
         if !represented && !self.turn_had_streaming_text && !full_text.is_empty() {
-            self.entries
-                .push(ChatEntry::AgentMessage(Arc::<str>::from(full_text)));
-            self.mark_dirty_append();
+            self.push_reply_fallback(full_text.into(), occurrence);
         } else if !represented
             && clean
             && !self.turn_had_streaming_text
@@ -13265,6 +13436,7 @@ impl ChatState {
 
     pub fn push_user_message(&mut self, text: Option<String>, attachments: Vec<String>) {
         self.freeze_prompt_settled_stream();
+        self.reattach_journal = None;
         // A new prompt supersedes the previous failure: the red dot clears
         // until the daemon reports otherwise.
         self.last_error = None;
@@ -13676,6 +13848,17 @@ impl ChatState {
     /// Cancel-mode resync: the cancel is already on its way, so abandon the
     /// displayed turn immediately and announce the reload.
     fn prepare_for_notification_resync(&mut self) {
+        // Cancel abandons the live buffers now. Keep their displayed values
+        // in the journal's window until the replace, including any subsequent
+        // withdrawal notices from cancelling outstanding elicitations.
+        if self
+            .reattach_journal
+            .as_ref()
+            .is_some_and(|journal| journal.captured.is_none())
+        {
+            self.flush_streaming_text();
+            self.flush_streaming_thought();
+        }
         self.reset_turn_for_resync_reload();
         // A fresh cancel supersedes any reload a kept turn still owed; the
         // new snapshot decides the outcome instead.
@@ -13736,15 +13919,20 @@ impl ChatState {
     /// Entries the pane missed are reconciled by the terminal follow-up
     /// reload (`lag_reattach`). Append-only: caches and the reading
     /// position survive.
-    fn reattach_to_running_turn(&mut self) {
+    fn reattach_to_running_turn(&mut self, native_chat: bool) {
         if self.flush_streaming_text() {
             self.turn_had_streaming_text = true;
         }
         self.flush_streaming_thought();
+        let boundary: Arc<str> = crate::i18n::t("zc-chat-resynced-turn-running").into();
         self.entries
-            .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                "zc-chat-resynced-turn-running",
-            ))));
+            .push(ChatEntry::SystemMessage(boundary.clone()));
+        if native_chat {
+            self.reattach_journal
+                .get_or_insert_with(Default::default)
+                .notices
+                .push(boundary);
+        }
         self.info_message = None;
         self.lag_reattach = Some(LagReattach {
             generation: self.turn_generation,
@@ -13752,6 +13940,14 @@ impl ChatState {
             prompt_error: None,
         });
         self.mark_dirty_append();
+    }
+
+    /// Carry rendered values, not notifications: replaying a tool event
+    /// here could execute its lifecycle twice.
+    fn capture_reattached_presentation(&mut self) {
+        if let Some(journal) = &mut self.reattach_journal {
+            journal.capture(&self.entries, &self.streaming_text, &self.streaming_thought);
+        }
     }
 
     /// The pane's own re-attached turn ended (`lag_reattach` is set for its
@@ -13764,13 +13960,14 @@ impl ChatState {
     /// carries nothing — the reload transcript is the whole story for a
     /// clean turn.
     fn intercept_terminal_frame_for_reload(&mut self, update: SessionUpdate, represented: bool) {
+        self.capture_reattached_presentation();
         let terminal = match &update {
             SessionUpdate::TurnComplete {
                 outcome, content, ..
             } => Some((*outcome, content.clone())),
             _ => None,
         };
-        self.apply_update_with_reply_membership(update, represented);
+        self.apply_update_with_reply_membership(update, represented, None);
         if let Some((outcome, content)) = terminal
             && outcome != crate::client::TurnEndOutcome::Completed
             && let Some(lag) = self.lag_reattach.as_mut()
@@ -13816,7 +14013,11 @@ impl ChatState {
                         && row.kind == crate::client::MessageEntryKind::Message
                         && !row.content.is_empty()
                 })
-                .filter_map(|row| row.reply_occurrence.clone())
+                // A malformed peer may repeat an empty marker on the live
+                // frame. It proves no more than a missing marker.
+                .filter_map(|row| row.reply_occurrence.as_ref())
+                .filter(|id| !id.is_empty())
+                .cloned()
                 .collect()
         };
         self.load_history(messages, strip_runtime_enrichment);
@@ -13826,6 +14027,9 @@ impl ChatState {
         };
         self.entries
             .push(ChatEntry::SystemMessage(Arc::<str>::from(notice_text)));
+        if let Some(journal) = self.reattach_journal.take() {
+            journal.restore(&mut self.entries, &self.installed_reply_occurrences);
+        }
         self.info_message = None;
         // The reload clears the connection-class errors: a stale
         // `ResyncFailed` from this very resync must not stick once the
@@ -14234,6 +14438,7 @@ impl ChatState {
     ) {
         self.session_id = session_id;
         self.resync_incarnation = Arc::new(());
+        self.reattach_journal = None;
         self.installed_reply_occurrences.clear();
         self.session_name = name;
         self.model_provider_ref = None;
@@ -21881,6 +22086,134 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn native_empty_reply_occurrence_cannot_suppress_received_replies() {
+        let (mut chat, _writer) = test_chat();
+        let mut state = state_for("sess-1", "myagent");
+        state.replace_history_after_notification_resync(
+            serde_json::from_value(serde_json::json!([
+                {"role":"assistant","content":"stored without proof","reply_occurrence":""},
+                {"role":"assistant","content":"legacy stored"},
+                {"role":"assistant","content":"stored with proof","reply_occurrence":"known"}
+            ]))
+            .unwrap(),
+            false,
+            ResyncNotice::Idle,
+            None,
+            None,
+        );
+        chat.phase = ChatPhase::Active(Box::new(state));
+        for (id, ordinary, goal) in [
+            (Some(""), "ordinary", "Goal"),
+            (None, "legacy ordinary", "legacy Goal"),
+            (Some("known"), "stored with proof", "stored with proof"),
+        ] {
+            let mark = |mut value: serde_json::Value| {
+                if let Some(id) = id {
+                    value["reply_occurrence"] = id.into();
+                }
+                value
+            };
+            chat.rpc.push_notification_for_test(
+                "session/update",
+                mark(serde_json::json!({
+                    "type":"agent_message_chunk","session_id":"sess-1","text":ordinary
+                })),
+            );
+            chat.rpc.push_notification_for_test("session/update", mark(serde_json::json!({
+                "type":"turn_complete","session_id":"sess-1","outcome":"completed","content":ordinary
+            })));
+            let candidate = mark(serde_json::json!({"session_id":"sess-1","candidate":goal}));
+            chat.rpc.push_notification_for_test(
+                "session/goal_update",
+                serde_json::json!({"verified_candidate":candidate}),
+            );
+        }
+        chat.drain_notifications();
+        let texts: Vec<_> = active_state(&mut chat)
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ChatEntry::AgentMessage(text) => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "stored without proof",
+                "legacy stored",
+                "stored with proof",
+                "ordinary",
+                "Goal",
+                "legacy ordinary",
+                "legacy Goal"
+            ]
+        );
+    }
+
+    #[test]
+    fn lag_reattach_second_running_reload_and_cancel_consume_only_native_presentation() {
+        for native in [true, false] {
+            let mut state = state_for("sess-1", "myagent");
+            state.push_user_message(Some("ask".into()), Vec::new());
+            state.reattach_to_running_turn(native);
+            let chunk = |state: &mut ChatState, text: &str, id: Option<&str>, presentation_only| {
+                state.apply_notification_update(
+                    SessionUpdate::AgentMessageChunk {
+                        session_id: "sess-1".into(),
+                        text: text.into(),
+                        presentation_only,
+                    },
+                    &serde_json::json!({"reply_occurrence":id}),
+                    true,
+                );
+            };
+            chunk(&mut state, "repeat", None, false);
+            chunk(&mut state, "saved", Some("seen"), false);
+            state.prepare_for_reattach_resync(SessionResyncMode::Reattach);
+            state.reattach_to_running_turn(native);
+            chunk(&mut state, "repeat", None, false);
+            chunk(&mut state, "!", Some("seen"), true);
+            state.prepare_for_notification_resync();
+            state.capture_reattached_presentation();
+            state.replace_history_after_notification_resync(
+                vec![
+                    serde_json::from_value(serde_json::json!({
+                        "role":"assistant", "content":"saved", "reply_occurrence":"seen"
+                    }))
+                    .unwrap(),
+                ],
+                !native,
+                ResyncNotice::Idle,
+                None,
+                None,
+            );
+            let texts: Vec<_> = state
+                .entries
+                .iter()
+                .filter_map(|row| match row {
+                    ChatEntry::AgentMessage(text) => Some(text.as_ref()),
+                    _ => None,
+                })
+                .collect();
+            if native {
+                assert_eq!(texts, ["saved", "repeat", "repeat!"]);
+            } else {
+                assert_eq!(texts, ["saved"]);
+            }
+            assert!(state.reattach_journal.is_none());
+            assert_eq!(
+                state
+                    .entries
+                    .iter()
+                    .filter(|row| matches!(row, ChatEntry::SystemMessage(_)))
+                    .count(),
+                1
+            );
+        }
+    }
+
     /// A kept-running turn whose terminal frame reports failure with the
     /// daemon's session-loss sentinel: the intercepted TurnComplete must
     /// still record `SessionLost` (re-attach before the next prompt), the
@@ -21949,6 +22282,21 @@ mod tests {
         // The surviving turn fails with the session-loss sentinel. Its
         // terminal frame is intercepted for the terminal reload, but the
         // outcome must still be recorded first.
+        let received_tool = p5_tool(&chat, "read_after_reattach");
+        for (text, id, presentation) in [
+            ("repeat", None, false),
+            ("repeat", None, false),
+            ("durable tail", Some("installed"), false),
+            ("tail", Some("installed"), true),
+            ("!", Some("distinct"), false),
+        ] {
+            let mut params = serde_json::json!({"type":"agent_message_chunk", "session_id":"sess-1", "text":text, "presentation_only":presentation});
+            if let Some(id) = id {
+                params["reply_occurrence"] = id.into();
+            }
+            chat.rpc
+                .push_notification_for_test("session/update", params);
+        }
         chat.rpc.push_notification_for_test(
             "session/update",
             serde_json::json!({
@@ -21990,7 +22338,7 @@ mod tests {
             serde_json::json!({
                 "messages": [
                     { "role": "user", "content": "kept running" },
-                    { "role": "assistant", "content": "durable tail" }
+                    { "role": "assistant", "content": "durable tail", "reply_occurrence":"installed" }
                 ]
             }),
         );
@@ -22012,6 +22360,24 @@ mod tests {
             Some(SessionError::SessionLost),
             "the sentinel must survive the terminal reload so the next prompt re-attaches"
         );
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .filter(|row| **row == received_tool)
+                .count(),
+            1,
+            "the follow-up page cannot contain the tool result received after reattachment"
+        );
+        let texts: Vec<_> = state
+            .entries
+            .iter()
+            .filter_map(|row| match row {
+                ChatEntry::AgentMessage(text) => Some(text.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["durable tail", "repeatrepeattail!"]);
         assert!(
             state
                 .entries
@@ -22832,6 +23198,15 @@ mod tests {
 
         // No TurnComplete is ever delivered: the errored prompt response is
         // the only terminal signal this pane gets.
+        assert!(state.optimistic_user_message.is_some());
+        let received_tool = p5_tool(&chat, "before_refusal");
+        chat.rpc.push_notification_for_test(
+            "session/update",
+            serde_json::json!({
+                "type":"agent_message_chunk", "session_id":"sess-1", "text":"unrecorded narration"
+            }),
+        );
+        chat.tick_transport_events();
         respond_err(&outbound, &prompt, -32000, "provider exploded");
         tokio::time::timeout(Duration::from_secs(2), async {
             while chat.prompt_completion_rx.is_empty() {
@@ -22846,6 +23221,13 @@ mod tests {
             panic!("session remains active after the prompt response");
         };
         assert!(!state.turn_in_flight, "the response settles the turn");
+        assert!(
+            !state
+                .entries
+                .iter()
+                .any(|entry| matches!(entry, ChatEntry::UserMessage { .. })),
+            "the refused optimistic row before the running notice was removed"
+        );
 
         // The terminal reload the kept turn owes — not a queued prompt,
         // which the gate holds back while it runs.
@@ -22903,6 +23285,15 @@ mod tests {
             .as_ref()
             .expect("the prompt error must survive the terminal reload");
         assert!(notice.text.contains("provider exploded"));
+        assert_eq!(
+            state
+                .entries
+                .iter()
+                .filter(|row| **row == received_tool)
+                .count(),
+            1
+        );
+        assert_eq!(state.entries.iter().filter(|row| matches!(row, ChatEntry::AgentMessage(text) if text.as_ref() == "unrecorded narration")).count(), 1);
     }
 
     /// Order B: the errored prompt response lands while the first reload is
