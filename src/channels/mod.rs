@@ -17,6 +17,12 @@ use zeroclaw_runtime::i18n::get_required_cli_string_with_args;
 
 pub async fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
     match command {
+        #[cfg(all(feature = "channel-xmpp", target_os = "linux"))]
+        crate::ChannelCommands::XmppInbox { args } => {
+            let result = zeroclaw_channels::xmpp::inbox_admin::run(&args)?;
+            println!("{}", serde_json::to_string(&result)?);
+            Ok(())
+        }
         crate::ChannelCommands::Start => {
             anyhow::bail!("Start must be handled in main.rs (requires async runtime)")
         }

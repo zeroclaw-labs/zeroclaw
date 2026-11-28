@@ -1,6 +1,6 @@
 [workspace]
 members = [".", "crates/zeroclaw-api", "crates/zeroclaw-buildinfo", "crates/zeroclaw-rpc-proto", "crates/zeroclaw-rpc-client", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-dist", "crates/zeroclaw-log", "crates/zeroclaw-log/tests/fixtures/attribution-macro-support", "crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer", "crates/zeroclaw-tls", "crates/zeroclaw-relay-proto", "apps/zerorelay", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-plugins/tests/fixtures/channel-fixture", "crates/zeroclaw-plugins/tests/fixtures/channel-egress-fixture", "crates/zeroclaw-plugins/tests/fixtures/channel-websocket-fixture", "crates/zeroclaw-plugins/tests/fixtures/egress-fixture", "crates/zeroclaw-plugins/tests/fixtures/memory-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-timeout-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-sequential-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-secret-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-socket-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-websocket-fixture", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask", "tests/fixtures/runtime-composition-consumer"]
-exclude = ["vendor/crossterm-0.29.0"]
+exclude = ["vendor/crossterm-0.29.0", "vendor/xmpp-parsers-0.23.0"]
 resolver = "2"
 
 [workspace.package]
@@ -327,7 +327,7 @@ channels-full = [
     "default-channels", "zeroclaw-channels/channels-full", "channel-lark",
     "channel-line",
     "channel-slack", "channel-signal",
-    "channel-mattermost", "channel-irc", "channel-imessage",
+    "channel-mattermost", "channel-irc", "channel-xmpp", "channel-imessage",
     "channel-dingtalk", "channel-qq", "channel-bluesky", "channel-git",
     "channel-twitch", "channel-twitter", "channel-reddit", "channel-notion", "channel-mqtt", "channel-amqp",
     "channel-linq", "channel-nextcloud",
@@ -394,6 +394,7 @@ channel-discord = ["zeroclaw-channels/channel-discord"]
 channel-slack = ["zeroclaw-channels/channel-slack"]
 channel-signal = ["zeroclaw-channels/channel-signal"]
 channel-mattermost = ["zeroclaw-channels/channel-mattermost"]
+channel-xmpp = ["zeroclaw-channels/channel-xmpp"]
 channel-irc = ["zeroclaw-channels/channel-irc"]
 channel-twitch = ["zeroclaw-channels/channel-twitch"]
 channel-imessage = ["zeroclaw-channels/channel-imessage"]
@@ -615,3 +616,6 @@ harness = false
 # Temporary upstream terminal EOF/error backport. See vendor/crossterm-0.29.0/PATCH.md.
 [patch.crates-io]
 crossterm = { path = "vendor/crossterm-0.29.0" }
+
+# Remove the XMPP chrono edge; provenance and API changes are in PATCH.md.
+xmpp-parsers = { path = "vendor/xmpp-parsers-0.23.0" }

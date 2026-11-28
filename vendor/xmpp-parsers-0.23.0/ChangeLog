@@ -1,0 +1,642 @@
+Local ZeroClaw security maintenance patch
+    * Replace the mandatory chrono date dependency with time.
+    * See PATCH.md for source provenance, API changes and validation.
+
+Version NEXT:
+XXXX-YY-ZZ RELEASER <releaser@domain.example>
+
+Version 0.23.0:
+2026-06-11 Jonas Schäfer <jonas@zombofant.net>
+    * New parsers/serialisers:
+        - MUC Affiliations Versioning (XEP-0463) (!668)
+        - Client Access Management (XEP-0494) (!641)
+        - Jingle Content Category (XEP-0507)
+        - Displayed markers (XEP-0333) (!669)
+    * Breaking
+        - The type of jingle_rtp::Description::ssrc has been changed from
+          Option<String> to Option<u32>, in accordance with XEP-0167 version
+          1.2.3 and RFC 3550. (!602)
+        - The ibr::Query struct has been split into FieldsQuery, RemoveQuery,
+          LegacyQuery and FormsQuery, to make it reflect more how it gets
+          used in XMPP.
+        - Remove the unnecessary SaslMechanisms struct, to directly extract
+          SASL mechanisms in a Vec<String> in StreamFeatures.
+        - The type of disco::DiscoInfoResult::features changed from
+          Vec<Feature> to BTreeSet<String>, this lets us remove Feature as
+          well.
+        - bind::BindFeature::required is now a bool, thanks to xso’s flag.
+        - jingle_rtp::Description::rtcp_mux is now a bool flag too.
+        - stream_limits::Limits now extract directly to NonZeroU32.
+        - Removed the `disable-validation` feature and made the behaviour the
+          new default. That way, unknown child elements and attributes will
+          not be rejected by xmpp-parsers by default anymore. The `pedantic`
+          feature can be used to opt into the previous default behaviour.
+    * Improvements:
+        - Take the Stanza type from tokio-xmpp, it’s an enum which can wrap
+          Message, Presence and Iq.
+        - Make Priority’s inner i8 pub, which had been broken since the
+          conversion to xso. (!632)
+        - ibr::LegacyQuery now implements Default, allowing users to more
+          easily construct it (!660)
+        - jingle_rtp::Description gained a bandwidth child.
+        - Fix cargo test for the disable-validation and component features.
+        - Structs of the bind module now have accessible inner pieces (!675).
+        - Add 'approved' field to roster item (!683).
+
+Version 0.22.0:
+2025-10-28 pep <pep@bouah.net>
+    * Breaking
+      - MIX (XEP-0369) has been removed, it has failed to gain any traction in
+        the XMPP ecosystem and is actively being replaced with better
+        alternatives based on MUC.
+      - The `alternate_address` field of
+        `xmpp_parsers::stanza_error::StanzaError` has been moved into the
+        corresponding enum variants of the
+        `xmpp_parsers::stanza_error::DefinedCondition` where it may occur.
+      - The `xmpp_parsers::mix::Participant::jid` and `..::Mix::jid` fields
+        are now of type `BareJid` (instead of `String`), as they should always
+        have been. This influences various other places, such as these
+        struct's constructors.
+      - The rtt module has been changed to make use of xso on enums. This
+        allows us to simplify the `Action` type to include all three possible
+        variants directly in the enum, rather than as separate types which are
+        then included in `Action`.  Also `Action::Erase::num` is now a wrapper
+        type around u32, which lets us implement a custom Default on it.
+        (!416)
+      - The cert_management module is now using `Option` instead of `bool` to
+        check whether a child element is present or not, as this is currently
+        implemented in xso.  We might revert that change if we implement flag
+        metas in xso before the next release.
+      - The forwarding module now hardcodes that its child is a message in the
+        jabber:client namespace.  It previously half-followed the schema, but
+        nothing so far uses it for anything but this message.  We can always
+        change it again once any other specification allows e.g. presences or
+        iqs.
+      - Module `jingle_thumnails` has been renamed to `jingle_thumbnails`.  It
+        now respect the latest version of the XEP, with the width and height
+        being limited to 0..65535 and the media-type being optional (!475).
+      - The bookmarks2 Conference `extensions` child is now an
+        `Option<Extensions>` instead of a `Vec<Element>`, to distinguish
+        between it being absent or empty (!472).
+      - Replace all boolean attributes with the `bool` type, so that we can
+        use them just like normal booleans. The following structs are removed:
+        `pubsub::pubsub::Notify`, `bookmarks2::Autojoin`, `extdisco::Restricted`,
+        `fast::Tls0Rtt`, `legacy_omemo::IsPreKey`, `mam::Complete`,
+        `sm::ResumeAttr` (!476)
+      - `cert_management::Append::no_cert_management`,
+        `cert_management::Item::no_cert_management`,
+        `ssm::StreamManagement::optional` and `starttls::StartTls::required` are
+        now proper bools, instead of `Option<ZeroSizedType>` (!518)
+      - `bookmarks::Conference` and `bookmarks2::Conference` use ResourcePart to store
+        the optional nickname instead of a String (!485)
+      - pubsub Item and pubsub#event Item are now distinct structs (!503)
+      - `message::Message` id field is now `Option<message::Id>` instead of
+        `Option<String>` (!504)
+      - `message_correction::Replace` id field is now Id instead of String (!504)
+      - `Caps::hash` has been split into `Caps::hash` (the algo) and
+        `Caps::ver` (the actual hash), to reflect the attributes (!517)
+      - `muc::MucUser` now has an `invite` field
+      - vCard-temp queries have been split into vcard::VCardQuery (!522)
+      - http_upload’s Header type has been split into HeaderName, an enum
+        containing only the name of the header, and the Header struct with
+        both a name and a value (!530)
+      - `pubsub::Event` is now the wrapper for the `pubsub::event::Payload` enum,
+        and the PublishedItems and RetractedItems have been merged into the
+        Items sub-struct.  These replace the previous PubSubEvent enum (!531)
+      - `Handshake::from_password_and_stream_id()` became
+        `Handshake::from_stream_id_and_password()`, with the two parameters
+        having been exchanged, and the stream_id is now a String instead of
+        &str.
+      - `pubsub::Owner` is now a wrapper for the `pubsub::owner::Paylolad` enum,
+        and all its direct children have been merged into this enum (!532)
+      - `time::TimeResult` has been ported to use xso. Use From/Into to convert
+        it to/from `chrono::DateTime` values. The numbered member `0` does not
+        exist anymore (!551).
+      - `stanza_error::StanzaError` has been ported to use xso (!552).
+      - data_forms has been ported to use xso. This introduces a couple subtle
+        breaking changes for `data_forms::DataForm`, in particular:
+
+          - the `from_type` member was replaced by a pair of functions.
+          - if the form contains a FORM_TYPE field, it will be part of the
+            `fields` member (unlike before, where that field was removed).
+      - `message::Message` has been ported to use xso (!560). This causes several
+        breaking changes:
+
+        1. the `message::Body` and `message::Subject` newtypes have been removed
+           and replaced by bare Strings
+        2. a `message::Lang` newtype has been introduced for the language of
+           message parts.
+        3. the `message::Thread` type was converted from a single-element
+           tuple-like struct to a struct with named fields to support the
+           optional `parent` attribute.
+      - `presence::Presence` has been ported to use xso (!477). It also uses the
+        `message::Lang` newtype since !561.
+      - `iq::Iq` has been ported to use xso (!572). That entails a couple
+        breaking changes:
+
+        - The IqType type has been removed and loosely replaced by the
+          IqPayload type.
+        - The Iq type is now an enum. Access to `from`, `to` and `id` needs
+          to happen via the provided accessor functions, by `match`-ing the
+          enum variant or by splitting the Iq into its IqHeader and IqPayload
+          using the `split()` method.
+        - The inverse is possible through the `assemble()` methods on
+          IqPayload, IqHeader and Iq, whichever is more convenient.
+    * New parsers/serialisers:
+      - Stream Features (RFC 6120) (!400)
+      - Spam Reporting (XEP-0377) (!506)
+      - Extensible SASL Profile (XEP-0388)
+      - SASL Channel-Binding Type Capability (XEP-0440)
+      - Stream Limits Advertisement (XEP-0478)
+      - Message Displayed Synchronization (XEP-0490)
+      - RFC 6120 stream errors and starttls nonzas
+      - XEP-0045 mediated invites
+      - Push Notifications (XEP-0357) (!543)
+      - JSON Containers (XEP-0335) (!546)
+      - Verifying HTTP Requests via XMPP (XEP-0070)
+    * Improvements:
+      - Add support for undocumented `<optional/> in XEP-0198 feature
+        advertisement, for compatibility with servers in the wild.
+      - Add support application-specific error conditions in XEP-0198
+      - Keep unsupported vCard elements as `minidom::Element`, so that they
+        get serialized back instead of being dropped.  We now also test for
+        the size of these elements (!472).
+      - Add `Message::extract_valid_payload` method to warn in case of failure
+        and return simply `Option<T>` instead of `Result<Option<T>>` (!497)
+      - Add `Message::get_best_body_cloned` and `Message::get_best_subject_cloned`
+        to clone automatically when performance is not an issue (!497)
+      - Fix compatibility to uuid 1.12
+      - Implement Default for Tune
+      - Re-export `xso::error::FromElementError`.
+      - Fix a few tests behind 'component' feature
+      - Fix some Clippy warnings
+
+Version 0.21.0:
+2024-07-25 Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * New parsers/serialisers:
+        - Private XML Storage (XEP-0049), only enough for bookmarks.
+        - vcard-temp (XEP-0054), only enough for the PHOTO element.
+        - Out of Band Data (XEP-0066), only the annotation part used for file
+          sharing in Conversations.
+        - Data Forms Validation (XEP-0122).
+        - vCard-Based Avatars (XEP-0153).
+        - Jingle Content Thumbnails (XEP-264).
+        - Bind 2 (XEP-0386).
+        - Fast Authentication Streamlining Tokens (XEP-0484).
+    * Improvements:
+        - Replace many usages of our custom macros with the new xso crate,
+          which will ultimately allow streaming directly from the rxml XML
+          parser (in a SAX way) into our parsed structs, without going through
+          minidom in the middle.
+        - Re-export the jid and minidom modules, not their inner symbols.
+        - Use edition 2021, no more use TryFrom/TryInto! \o/
+        - Add serde feature, passed to jid crate
+        - Update XEP-0084 avatars to 1.1.4, which allows for avatars bigger
+          than 64 KiB.
+        - Make it easy to convert from bookmarks1 to bookmarks2.
+        - Ignore the 'code' attribute on errors, deprecated with XEP-0086 in
+          2007 but still sent by some legacy clients or servers it seems.
+        - Implement flip-page and metadata for XEP-0313 (Message Archive
+          Management).
+        - Add support for XEP-0059 (Result Set Management) for XEP-0030
+          disco#items.
+        - When disable-validation is enable, stop validating XEP-0030 rules.
+        - Make TryFrom<Element> chainable.
+        - Add a Message::extract_payload() function.
+        - Add a PubSubEvent::node_name() function, to simplify matching on the
+          node name from any of the enum variants.
+        - PubSub elements can now be compared for equality.
+        - Ignore incorrect FORM_TYPE fields as per XEP-0068.
+        - Allow fixed fields and desc in XEP-0004 (Data Forms).
+        - Add constructors for DataForm and Field, to simplify their creation.
+        - Make it possible to specify an alternate JID on <gone/> and
+          <redirect/> stanza errors.
+    * Bugfixes:
+        - Fix XEP-0257 serialisation
+        - Fix stanza error parsing of multiple languages.
+        - Fix all typos in the codebase found by codespell.
+
+Version 0.20.0:
+2023-08-17 Maxime “pep” Buquet <pep@bouah.net>, Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * New parsers/serialisers:
+        - Message Reactions (XEP-0444)
+    * Improvements:
+        - Update dependencies
+        - muc::user::Item: Added with_ helpers
+        - Correct cargo doc warnings
+        - Presence now has constructors for each variant so you don't have to
+          import presence::Type, where Presence::available represents type None (#79)
+        - Presence::with_payload builds a payload into the presence (#79)
+        - Message now has constructors for each type ; Message::new still builds a Chat type (#78)
+        - Message::with_body builder method appends a body in a given language to the message (#78)
+        - Derive PartialEq on Iq
+        - impl MessagePayload for MucUser
+        - Add MucUser::with_statuses and ::with_items
+    * Breaking changes:
+        - Removed the 'serde' feature. Add it directly by using 'jid'.
+          `jid = { version = "*", features = ["serde"] }`.
+
+Version 0.19.2:
+2022-12-17  Maxime “pep” Buquet <pep@bouah.net>
+    * Improvements:
+        - Derive PartialEq on Presence
+        - impl PresencePayload for muc::user::MucUser.
+        - New muc::user::Status::ServiceErrorKick variant for the 333 status
+          code.
+        - Update deprecated chrono code (FixedOffset::{east,west} to
+          {east,west}_opt).
+
+Version 0.19.1:
+2022-07-13  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * New parsers/serialisers:
+        - Add In-Band Real Time Text support
+        - Add OMEMO support
+    * Improvements:
+        - bookmarks 2: uncomment test
+
+Version 0.19.0:
+2022-03-07  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * New parsers/serialisers:
+        - External Service Discovery (XEP-0215).
+        - HTTP File Upload (XEP-0363).
+        - Message Archive Management Preferences (XEP-0441), actually spun off
+          from XEP-0313.
+    * Improvements:
+        - Add constructor helpers for more structs.
+        - Impl Eq and Hash on disco::Feature (thanks Paul!).
+        - Impl MessagePayload for PubSubEvent (thanks Paul!).
+        - Bump minidom to 0.14.
+        - Bump the hash crates to their latest version.
+        - Run clippy.
+        - Rename the directory to parsers, to avoid colliding prefix with
+          xmpp-rs.
+    * Breaking changes:
+        - Bump bookmarks 2 to version 1.1.3.
+        - Use proper types in Jingle specs (XEP-0294 and XEP-0339).
+        - Move preferences from MAM to MAM prefs, following the spec split.
+
+Version 0.18.1:
+2021-01-13  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * Bugfixes:
+        - Bump minidom to 0.13, as 0.12.1 got yanked.
+
+Version 0.18.0:
+2021-01-13  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * New parsers/serialisers:
+        - Jingle Raw UDP Transport Method (XEP-0177).
+        - Jingle RTP Header Extensions Negotiation (XEP-0294).
+        - Jingle Grouping Framework (XEP-0338).
+        - Mediated Information eXchange (MIX) (XEP-0369).
+    * Improvements:
+        - Everything is now PartialEq!
+        - Add "serde" feature to enable "jid/serde".
+        - Implement more of XEP-0060.
+        - Bump XEP-0167 to version 1.2.0, adding rtcp-mux.
+        - Bump XEP-0176 to version 1.1, fixing interoperability with other
+          clients.
+        - Bump XEP-0402 to version 1.1.1, bumping its namespace and adding
+          support for extension data.
+        - Bump all dependencies to their latest version.
+        - Some more helper constructors.
+        - Make public some stuff that should have been public from the very
+          beginning.
+    * Bugfixes:
+        - Jingle::set_reason() does what it says now (copy/paste error).
+        - Bookmarks’ names are now optional like they should.
+
+Version 0.17.0:
+2020-02-15  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>, Maxime “pep” Buquet <pep@bouah.net>, Paul Fariello <paul@fariello.eu>
+    * Improvements:
+        - Add serialization tests where possible
+        - Use minidom's NSChoice API for Jingle parser
+        - Remove NamespaceAwareCompare. Move to minidom
+    * Breaking changes:
+        - Prevent generate_serializer macro from adding another layer of Node.
+          Fixes some serializers.
+        - ecaps2: Use the Error type instead of ()
+
+Version 0.16.0:
+2019-10-15  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * New parsers/serialisers:
+        - Client Certificate Management for SASL EXTERNAL (XEP-0257)
+        - JID Prep (XEP-0328)
+        - Client State Indication (XEP-0352)
+        - OpenPGP for XMPP (XEP-0373)
+        - Bookmarks 2 (This Time it's Serious) (XEP-0402)
+        - Anonymous unique occupant identifiers for MUCs (XEP-0421)
+        - Source-Specific Media Attributes in Jingle (XEP-0339)
+        - Jingle RTP Feedback Negotiation (XEP-0293)
+    * Breaking changes:
+        - Presence constructors now take Into<Jid> and assume Some.
+    * Improvements:
+        - CI: refactor, add caching
+        - Update jid-rs to 0.8
+
+Version 0.15.0:
+2019-09-06  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * New parsers/serialisers:
+        - XHTML-IM (XEP-0071)
+        - User Tune (XEP-0118)
+        - Bits of Binary (XEP-0231)
+        - Message Carbons (XEP-0280)
+    * Breaking changes:
+        - Stop reexporting TryFrom and TryInto, they are available in
+          std::convert nowadays.
+        - Bind has been split into BindQuery and BindResponse.
+    * Improvements:
+        - New DOAP file for a machine-readable description of the features.
+        - Add various parser and formatter helpers on Hash.
+
+Version 0.14.0:
+2019-07-13  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>, Maxime “pep” Buquet <pep@bouah.net>
+    * New parsers/serialisers:
+        - Entity Time (XEP-0202).
+    * Improvements:
+        - Microblog NS (XEP-0227).
+        - Update jid-rs dependency with jid split change (Jid, FullJid,
+          BareJid) and reexport them.
+        - Fix rustdoc options in Cargo.toml for docs.rs
+    * Breaking changes:
+        - Presence's show attribute is now Option<Show> and Show::None is no
+          more.
+
+Version 0.13.1:
+2019-04-12  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * Bugfixes:
+        - Fix invalid serialisation of priority in presence.
+        - Bump image size to u16 from u8, as per XEP-0084 version 1.1.2.
+    * Improvements:
+        - Drop try_from dependency, as std::convert::TryFrom got
+          stabilised.
+
+Version 0.13.0:
+2019-03-20  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * New parsers/serialisers:
+        - User Avatar (XEP-0084).
+        - Contact Addresses for XMPP Services (XEP-0157).
+        - Jingle RTP Sessions (XEP-0167).
+        - Jingle ICE-UDP Transport Method (XEP-0176).
+        - Use of DTLS-SRTP in Jingle Sessions (XEP-0320).
+    * Breaking changes:
+        - Make 'id' required on iq, as per RFC6120 §8.1.3.
+        - Refactor PubSub to have more type-safety.
+        - Treat FORM_TYPE as a special case in data forms, to avoid
+          duplicating it into a field.
+        - Add forgotten i18n to Jingle text element.
+    * Improvements:
+        - Add various helpers for hash representations.
+        - Add helpers constructors for multiple extensions (disco, caps,
+          pubsub, stanza_error).
+        - Use Into<String> in more constructors.
+        - Internal change on attribute declaration in macros.
+        - Reexport missing try_from::TryInto.
+
+Version 0.12.2:
+2019-01-16  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * Improvements:
+        - Reexport missing util::error::Error and try_from::TryFrom.
+
+Version 0.12.1:
+2019-01-16  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * Improvements:
+        - Reexport missing JidParseError from the jid crate.
+
+Version 0.12.0:
+2019-01-16  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * Breaking changes:
+        - Update dependencies.
+        - Switch to git, upstream is now available at
+          https://gitlab.com/xmpp-rs/xmpp-parsers
+        - Switch to Edition 2018, this removes support for rustc
+          versions older than 1.31.
+        - Implement support for XEP-0030 2.5rc3, relaxing the ordering
+          of children in disco#info.
+    * Improvements:
+        - Test for struct size, to keep them known and avoid bloat.
+        - Add various constructors to make the API easier to use.
+        - Reexport Jid from the jid crate, to avoid any weird issue on
+          using different incompatible versions of the same crate.
+        - Add forgotten 'ask' attribute on roster item (thanks O01eg!).
+        - Use cargo-fmt on the codebase, to lower the barrier of entry.
+        - Add a disable-validation feature, disabling many checks
+          xmpp-parsers is doing.  This should be used for software
+          which want to let invalid XMPP pass through instead of being
+          rejected as invalid (thanks Astro-!).
+
+Version 0.11.1:
+2018-09-20  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * Improvements:
+        - Document all of the modules.
+
+Version 0.11.0:
+2018-08-03  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * Breaking changes:
+        - Split Software Version (XEP-0092) into a query and response
+          elements.
+        - Split RSM (XEP-0059) into a query and response elements.
+        - Fix type safety and spec issues in RSM and MAM (XEP-0313).
+        - Remove item@node and EmptyItems from PubSub events
+          (XEP-0060).
+    * Improvements:
+        - Document many additional modules.
+        - Add the <failure/> SASL nonza, as well as the SCRAM-SHA-256
+          and the two -PLUS mechanisms.
+
+Version 0.10.0:
+2018-07-31  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * New parsers/serialisers:
+        - Added <stream:stream>, SASL and bind (RFC6120) parsers.
+        - Added a WebSocket <open/> (RFC7395) implementation.
+        - Added a Jabber Component <handshake/> (XEP-0114).
+        - Added support for User Nickname (XEP-0172).
+        - Added support for Stream Management (XEP-0198).
+        - Added support for Bookmarks (XEP-0048).
+        - Publish-Subscribe (XEP-0060) now supports requests in
+          addition to events.
+    * Breaking changes:
+        - Switch from std::error to failure to report better errors.
+        - Bump to minidom 0.9.1, and reexport minidom::Element.
+    * Improvements:
+        - Add getters for the best body and subject in message, to make
+          it easier to determine which one the user wants based on
+          their language preferences.
+        - Add constructors and setters for most Jingle elements, to
+          ease their creation.
+        - Add constructors for hash, MUC item, iq and more.
+        - Use more macros to simplify and factorise the code.
+        - Use traits to define iq payloads.
+        - Document more modules.
+
+Version 0.9.0:
+2017-10-31  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * New parsers/serialisers:
+        - Blocking Command (XEP-0191) has been added.
+        - Date and Time Profiles (XEP-0082) has been added, replacing
+          ad-hoc use of chrono in various places.
+        - User Mood (XEP-0107) has been added.
+    * Breaking changes:
+        - Fix subscription="none" not being the default.
+        - Add more type safety to pubsub#event.
+        - Reuse Jingle’s ContentId type in JingleFT.
+        - Import the disposition attribute values in Jingle.
+    * Improvements:
+        - Refactor a good part of the code using macros.
+        - Simplify the parsing code wherever it makes sense.
+        - Check for children ordering in disco#info result.
+        - Finish implementation of <received/>, <checksum/> and
+          <range/> in JingleFT.
+        - Correctly serialise <ping/>, and test it.
+
+Version 0.8.0:
+2017-08-27  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * New parsers/serialisers:
+        - iq:version (XEP-0092) has been added.
+        - Finally implement extension serialisation in disco.
+    * Breaking changes:
+        - Wrap even more elements into their own type, in jingle,
+          jingle_ft, roster, message.
+        - Split loose enums into multiple structs where it makes sense,
+          such as for IBB, StanzaId, Receipts.
+        - Split disco query and answer elements into their own struct,
+          to enforce more guarantees on both.
+    * Improvements:
+        - Use Vec::into_iter() more to avoid references and clones.
+        - Make data_forms propagate a media_element error.
+        - Document more of disco, roster, chatstates.
+        - Use the minidom feature of jid, for IntoAttributeValue.
+        - Add a component feature, changing the default namespace to
+          jabber:component:accept.
+        - Add support for indicating ranged transfers in jingle_ft.
+
+Version 0.7.1:
+2017-07-24  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * Hotfixes:
+        - Stub out blake2 support, since the blake2 crate broke its API
+          between their 0.6.0 and 0.6.1 releases…
+
+Version 0.7.0:
+2017-07-23  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * New parsers/serialisers:
+        - Jingle Message Initialisation (XEP-0353) was added.
+        - The disco#items query (XEP-0030) is now supported, in
+          addition to the existing disco#info one.
+    * Breaking changes:
+        - Replaced many type aliases with proper wrapping structs.
+        - Split Disco into a query and a result part, since they have
+          very different constraints.
+        - Split IqPayload in three to avoid parsing queries as results
+          for example.
+    * Improvements:
+        - Use TryFrom from the try_from crate, thus removing the
+          dependency on nightly!
+        - Always implement From instead of Into, the latter is
+          generated anyway.
+        - Add helpers to construct your Presence stanza.
+
+Version 0.6.0:
+2017-06-27  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * New parsers/serialisers:
+        - In-Band Registration (XEP-0077) was added.
+        - Multi-User Chat (XEP-0045) got expanded a lot, thanks pep.!
+    * Breaking changes:
+        - Added wrappers for Strings used as identifiers, to add type
+          safety.
+        - Use chrono’s DateTime for JingleFT’s date element.
+        - Use Jid for JingleS5B’s jid attribute.
+    * Improvements:
+        - Use more macros for common tasks.
+        - Add a constructor for Message and Presence.
+        - Implement std::fmt::Display and std::error::Error on our
+          error type.
+        - Fix DataForms serialisation.
+        - Fix roster group serialisation.
+        - Update libraries, notably chrono whose version 0.3.1 got
+          yanked.
+
+Version 0.5.0:
+2017-06-11  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * New parsers/serialisers:
+        - Implementation of the roster management protocol defined in
+          RFC 6121 §2.
+        - Implementation of PubSub events (except collections).
+        - Early implementation of MUC.
+    * Breaking changes:
+        - Rename presence enums to make them easier to use.
+    * Improvements:
+        - Make hashes comparable and hashable.
+        - Make data forms embeddable easily into minidom
+          Element::builder.
+
+Version 0.4.0:
+2017-05-28  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * Incompatible changes:
+        - Receipts now make the id optional, as per the specification.
+        - Hashes now expose their raw binary value, instead of staying
+          base64-encoded.
+        - Parse dates (XEP-0082) in delayed delivery (XEP-0203) and
+          last user interaction (XEP-0319), using the chrono crate.
+    * Improvements:
+        - Removal of most of the remaining clones, the only ones left
+          are due to minidom not exposing a draining iterator over the
+          children.
+        - Finish to parse all of the attributes using get_attr!().
+        - More attribute checks.
+        - Split more parsers into one parser per element.
+        - Rely on minidom 0.4.3 to serialise more standard types
+          automatically.
+        - Implement forgotten serialisation for data forms (XEP-0004).
+        - Implement legacy capabilities (XEP-0115) for compatibility
+          with older software.
+
+Version 0.3.0:
+2017-05-23  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * Big changes:
+        - All parsers and serialisers now consume their argument, this
+          makes the API way more efficient, but you will have to clone
+          before passing your structs in it if you want to keep them.
+        - Payloads of stanzas are not parsed automatically anymore, to
+          let applications which want to forward them as-is do so more
+          easily.  Parsing now always succeeds on unknown payloads, it
+          just puts them into an Unknown value containing the existing
+          minidom Element.
+    * New parsers/serialisers:
+        - Last User Interaction in Presence, XEP-0319.
+    * Improved parsers/serialisers:
+        - Message now supports subject, bodies and threads as per
+          RFC 6121 §5.2.
+        - Replace most attribute reads with a nice macro.
+        - Use enums for more enum-like things, for example Algo in
+          Hash, or FieldType in DataForm.
+        - Wire up stanza-id and origin-id to MessagePayload.
+        - Wire up MAM elements to message and iq payloads.
+        - Changes in the RSM API.
+        - Add support for more data forms elements, but still not the
+          complete set.
+        - Thanks to minidom 0.3.1, check for explicitly disallowed
+          extra attributes in some elements.
+    * Crate updates:
+        - minidom 0.4.1
+
+Version 0.2.0:
+2017-05-06  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * New parsers/serialisers:
+        - Stanza error, as per RFC 6120 §8.3.
+        - Jingle SOCKS5 Transport, XEP-0260.
+    * Incompatible changes:
+        - Parsers and serialisers now all implement TryFrom<Element>
+          and Into<Element>, instead of the old parse_* and serialise_*
+          functions.
+        - Presence has got an overhaul, it now hosts show, statuses and
+          priority in its struct.  The status module has also been
+          dropped.
+        - Message now supports multiple bodies, each in a different
+          language.  The body module has also been dropped.
+        - Iq now gets a proper StanzaError when the type is error.
+        - Fix bogus Jingle payload, which was requiring both
+          description and transport.
+    * Crate updates:
+        - minidom 0.3.0
+
+Version 0.1.0:
+2017-04-29  Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+    * Implement many extensions.

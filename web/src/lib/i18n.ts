@@ -550,6 +550,10 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   en: {
+    'xmpp.allowed_users': 'Allowed users',
+    'xmpp.create_policy': 'Create authorization policy for this channel',
+    'xmpp.allowed_users_help': 'Authorization uses peer groups for this channel. Add bare account JIDs to external_peers; ignore rules override grants. An empty list denies everyone. Bind the channel to an enabled agent separately.',
+    'xmpp.manage_peer_groups': 'Create or manage peer groups',
     "voice.playback_busy": "Browser audio is busy. Stop dictation or reading and try again.",
     "voice.remote_device_resources": "Choose and test a voice by opening these settings in the selected browser. Its available voices and local dictation support are reported by that browser. Other preferences can be changed here.",
     "voice.device_load_error": "Could not load preferences for this device. It may have been revoked.",
@@ -569,7 +573,6 @@ const translations: Record<Locale, Record<string, string>> = {
     "voice.help_privacy": "Local dictation is the default. If its language pack is missing, click Download local language pack when available. An unavailable local recognizer never switches to an online service automatically. Choosing Browser service explicitly may send microphone audio to the browser provider; ZeroClaw does not receive the audio.",
     "voice.help_limits": "Speech recognition requires HTTPS (or localhost), browser support and microphone permission. Available voices, including male voices, depend on what the system/browser provides; use Test voice to choose. Capture and chat reading stop when you switch conversation or hide the chat/tab.",
     "voice.help_identity": "Preferences are stored in ZeroClaw by paired-device ID, without browser preference storage. One browser may use one voice, another a different voice, and another may have voice disabled. Reloading preserves each device’s choices. A new pairing creates a new device identity with its own defaults.",
-
     "voice.settings": "Browser Voice and Audio",
     "voice.device_note": "Preferences are saved in ZeroClaw for the selected device. Chat controls in this browser always use the record marked “this browser”.",
     "voice.dictation": "Show microphone / enable dictation",
@@ -11555,6 +11558,10 @@ const translations: Record<Locale, Record<string, string>> = {
   },
 
   pt: {
+    'xmpp.allowed_users': 'Usuários autorizados',
+    'xmpp.create_policy': 'Criar política de autorização para este canal',
+    'xmpp.allowed_users_help': 'A autorização usa os peer groups deste canal. Adicione JIDs de contas, sem recurso, em external_peers; regras ignore prevalecem. Uma lista vazia nega todos. Vincule o canal separadamente a um agente habilitado.',
+    'xmpp.manage_peer_groups': 'Criar ou gerenciar peer groups',
     "voice.playback_busy": "O áudio do navegador está em uso. Pare o ditado ou a leitura e tente novamente.",
     "voice.remote_device_resources": "Para escolher e testar uma voz, abra estas configurações no navegador selecionado. As vozes disponíveis e o suporte ao ditado local são informados por ele. As demais preferências podem ser alteradas aqui.",
     "voice.device_load_error": "Não foi possível carregar as preferências deste dispositivo. O pareamento pode ter sido revogado.",
@@ -11574,7 +11581,6 @@ const translations: Record<Locale, Record<string, string>> = {
     "voice.help_privacy": "O ditado local é o padrão. Se faltar o pacote de idioma, clique em Baixar pacote de idioma local quando disponível. A indisponibilidade do modo local nunca provoca troca automática para um serviço online. A escolha explícita de Serviço do navegador pode enviar áudio ao provedor do navegador; o ZeroClaw não recebe esse áudio.",
     "voice.help_limits": "O ditado exige HTTPS (ou localhost), navegador compatível e permissão para usar o microfone. As vozes disponíveis, inclusive masculinas, dependem do sistema/navegador; use Testar voz para escolher. O ditado e a leitura do chat param ao trocar de conversa ou ocultar o chat/a aba.",
     "voice.help_identity": "As preferências ficam no ZeroClaw por ID do dispositivo pareado, sem armazenamento de preferências no navegador. Um navegador pode usar uma voz, outro uma voz diferente e outro ficar com a voz desativada. Recarregar preserva as escolhas de cada dispositivo. Um novo pareamento cria outra identidade, com seus próprios padrões.",
-
     "voice.settings": "Voz e áudio do navegador",
     "voice.device_note": "As preferências são salvas no ZeroClaw para o dispositivo selecionado. Os botões de fala deste navegador sempre usam o registro identificado como “este navegador”.",
     "voice.dictation": "Mostrar microfone / habilitar ditado",

@@ -9,6 +9,9 @@ homepage.workspace = true
 publish = true
 
 [dependencies]
+sasl = { version = "0.5", optional = true }
+tokio-xmpp = { version = "6.0", optional = true, default-features = false, features = ["direct-tls", "starttls", "ring", "rustls-native-certs"] }
+jid = { version = "0.12", optional = true }
 zeroclaw-api.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-infra.workspace = true
@@ -159,9 +162,9 @@ shellexpand = "3.1"
 # WeChat iLink (optional) — AES-128-ECB and MD5 are mandated by the iLink
 # Bot media encryption protocol. The CDN requires ECB-mode ciphertext and
 # MD5 file checksums in upload requests. Not our choice of primitives.
-aes = { version = "0.8", optional = true }
-cbc = { version = "0.1", optional = true }
-ecb = { version = "0.1", optional = true }
+aes = { version = "0.9", optional = true }
+cbc = { version = "0.2", optional = true }
+ecb = { version = "0.2", optional = true }
 md5 = { version = "0.8", optional = true }
 
 # GitHub App channel - RS256 JWT signing for app authentication. The
@@ -194,6 +197,7 @@ channels-full = [
   "channel-git",
   "channel-imessage",
   "channel-irc",
+  "channel-xmpp",
   "channel-lark",
   "channel-line",
   "channel-linq",
@@ -255,6 +259,26 @@ channel-discord = ["ws-transport"]
 channel-slack = ["ws-transport"]
 channel-signal = ["dep:mime_guess"]
 channel-mattermost = ["ws-transport"]
+channel-xmpp = [
+  "tokio-util/codec",
+  "dep:jid",
+  "dep:tokio-xmpp",
+  "dep:sasl",
+  "dep:getrandom",
+  "dep:x25519-dalek",
+  "dep:curve25519-dalek",
+  "dep:ed25519-dalek",
+  "dep:aes-gcm",
+  "dep:hkdf",
+  "dep:sha2_11",
+  "dep:zeroize",
+  "dep:roxmltree",
+  "dep:subtle",
+  "dep:rusqlite",
+  "dep:aes",
+  "dep:cbc",
+  "dep:thiserror",
+]
 channel-irc = ["tls-client"]
 channel-twitch = ["channel-irc"]
 channel-imessage = ["dep:rusqlite"]
@@ -325,3 +349,15 @@ wiremock = "0.6"
 # waits without the suite sleeping for it. Dev-only, and the same feature
 # zeroclaw-providers already carries for the same reason.
 tokio = { version = "1.50", features = ["macros", "rt-multi-thread", "test-util"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sha2_11 = { package = "sha2", version = "0.11", optional = true }
+subtle = { version = "2.6", optional = true }
+roxmltree = { version = "0.20", optional = true }
+zeroize = { version = "1", optional = true }
+hkdf = { version = "0.13", optional = true }
+aes-gcm = { version = "0.11", optional = true }
+ed25519-dalek = { version = "3", optional = true }
+curve25519-dalek = { version = "5", features = ["digest"], optional = true }
+x25519-dalek = { version = "3", features = ["static_secrets"], optional = true }
+getrandom = { version = "0.4", optional = true }
