@@ -303,22 +303,44 @@ mod enabled {
         Ok(())
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     mod tests {
         use super::*;
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
 
         fn helper(dir: &std::path::Path) -> std::path::PathBuf {
-            let file = dir.join("helper");
+            let file = dir.join(if cfg!(windows) {
+                "helper.cmd"
+            } else {
+                "helper"
+            });
             let marker = dir.join("lifecycle");
-            std::fs::write(&file, format!(r#"#!/bin/sh
+            #[cfg(windows)]
+            {
+                let script = r#"import { appendFileSync } from 'node:fs';
+import { createInterface } from 'node:readline';
+const marker = __MARKER__;
+appendFileSync(marker, `${process.pid} start\n`);
+for await (const line of createInterface({ input: process.stdin })) {
+  process.stdout.write('{"ok":true,"origin":"https://login.example.test","text":"synthetic-secret","cookies":"synthetic-session"}\n');
+}
+appendFileSync(marker, `${process.pid} close\n`);
+"#.replace("__MARKER__", &serde_json::to_string(&marker).unwrap());
+                std::fs::write(dir.join("fixture-helper.mjs"), script).unwrap();
+                std::fs::write(&file, "@echo off\r\nnode \"%~dp0fixture-helper.mjs\"\r\n").unwrap();
+            }
+            #[cfg(unix)]
+            {
+                std::fs::write(&file, format!(r#"#!/bin/sh
 printf '%s start\n' "$$" >> '{}'
 while IFS= read -r line; do
   printf '%s\n' '{{"ok":true,"origin":"https://login.example.test","text":"synthetic-secret","cookies":"synthetic-session"}}'
 done
 printf '%s close\n' "$$" >> '{}'
 "#, marker.display(), marker.display())).unwrap();
-            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
             file
         }
 

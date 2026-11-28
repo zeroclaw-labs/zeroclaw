@@ -69,7 +69,7 @@ The form helper accepts semantic visible top-level fields and a same-origin
 HTTPS POST action. Its result indicates a confirmed navigation following
 submission, not authentication. This implementation targets standard HTML forms
 and six-digit SHA-1 TOTP with a 30-second step. See the
-[helper setup and lifecycle contract](../../../../scripts/browser/README.md).
+[helper setup and lifecycle contract](https://github.com/zeroclaw-labs/zeroclaw/blob/2bfd66e13d683cef5bdae8bb811b515ef0abad48/scripts/browser/README.md).
 
 ### Multi-step and embedded forms
 
