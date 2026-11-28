@@ -115,6 +115,7 @@ pub mod method {
     // Session
     pub const SESSION_NEW: &str = "session/new";
     pub const SESSION_PROMPT: &str = "session/prompt";
+    pub const SESSION_GOAL: &str = "session/goal";
     pub const SESSION_CONFIGURE: &str = "session/configure";
     pub const SESSION_CANCEL: &str = "session/cancel";
     pub const SESSION_STATE: &str = "session/state";
@@ -259,6 +260,7 @@ pub enum SessionUpdate {
     AgentMessageChunk {
         session_id: String,
         text: String,
+        presentation_only: bool,
     },
     AgentThoughtChunk {
         session_id: String,
@@ -328,6 +330,7 @@ pub enum SessionUpdate {
         content: String,
         client_turn_generation: Option<u64>,
         message_count: Option<usize>,
+        goal_owned: bool,
     },
     /// Recorded spend reached `cost.warn_at_percent` of the daily or monthly
     /// limit. The turn continues; this is a heads-up only.
@@ -392,6 +395,10 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
         "agent_message_chunk" => Some(SessionUpdate::AgentMessageChunk {
             session_id: sid,
             text: params.get("text")?.as_str()?.to_string(),
+            presentation_only: params
+                .get("presentation_only")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
         }),
         "agent_thought_chunk" => Some(SessionUpdate::AgentThoughtChunk {
             session_id: sid,
@@ -465,6 +472,10 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
                 .get("message_count")
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize),
+            goal_owned: match params.get("goal_owned") {
+                Some(value) => value.as_bool()?,
+                None => false,
+            },
         }),
         "plan" => {
             let entries = params.get("entries")?.clone();
@@ -1834,7 +1845,8 @@ impl RpcClient {
             // `elicitation/create` requests via `route_inbound_frame` →
             // the chat widget's pending-elicitation modal.
             "clientCapabilities": {
-                "elicitation": { "form": {} }
+                "elicitation": { "form": {} },
+                "replyOccurrence": {}
             }
         });
         if let Some(id) = prev_tui_id {
@@ -2114,7 +2126,8 @@ impl RpcClient {
             // Advertise ACP elicitation form-mode support. See
             // `connect` above for the rationale.
             "clientCapabilities": {
-                "elicitation": { "form": {} }
+                "elicitation": { "form": {} },
+                "replyOccurrence": {}
             }
         });
         if let Some(id) = prev_tui_id {
@@ -2902,6 +2915,18 @@ impl RpcClient {
         self.call(
             method::SESSION_STATE,
             serde_json::json!({ "session_id": session_id }),
+        )
+        .await
+    }
+
+    pub async fn session_goal(
+        &self,
+        session_id: &str,
+        command: &str,
+    ) -> Result<crate::wire::SessionGoalResult> {
+        self.call(
+            method::SESSION_GOAL,
+            serde_json::json!({ "session_id": session_id, "command": command }),
         )
         .await
     }
@@ -4891,6 +4916,8 @@ pub struct MessageEntry {
     pub role: String,
     pub content: String,
     #[serde(default)]
+    pub reply_occurrence: Option<String>,
+    #[serde(default)]
     pub kind: MessageEntryKind,
     #[serde(default)]
     pub tool_call_id: Option<String>,
@@ -6418,11 +6445,45 @@ mod notification_tests {
         });
         let update = parse_session_update(&params).unwrap();
         match update {
-            SessionUpdate::AgentMessageChunk { session_id, text } => {
+            SessionUpdate::AgentMessageChunk {
+                session_id,
+                text,
+                presentation_only,
+            } => {
                 assert_eq!(session_id, "s1");
                 assert_eq!(text, "hello");
+                assert!(!presentation_only);
             }
             other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_agent_message_chunk_presentation_only_requires_boolean_true() {
+        for (marker, expected) in [
+            (serde_json::json!(true), true),
+            (serde_json::json!(false), false),
+            (serde_json::json!("true"), false),
+            (serde_json::json!("yes"), false),
+            (serde_json::json!(1), false),
+            (serde_json::Value::Null, false),
+        ] {
+            let params = serde_json::json!({
+                "type": "agent_message_chunk",
+                "session_id": "s1",
+                "text": "same visible text",
+                "presentation_only": marker,
+            });
+            assert!(matches!(
+                parse_session_update(&params),
+                Some(SessionUpdate::AgentMessageChunk {
+                    session_id,
+                    text,
+                    presentation_only,
+                }) if session_id == "s1"
+                    && text == "same visible text"
+                    && presentation_only == expected
+            ));
         }
     }
 

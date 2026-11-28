@@ -1,7 +1,9 @@
 use crate::compatible::{MAX_MODELS_RESPONSE_BYTES, read_body_capped};
 use crate::openai_codex::{
     ResponsesStreamApiError, ResponsesStreamState, ResponsesToolSpec, append_utf8_stream_chunk,
-    build_responses_input, convert_tools, first_nonempty, parse_responses_usage, process_sse_chunk,
+    build_responses_input, convert_tools, deserialize_present_responses_status, first_nonempty,
+    observe_rejected_responses_json, parse_responses_usage, process_sse_chunk, responses_api_error,
+    responses_status_error,
 };
 use crate::opencode_session::OPENCODE_SESSION_HEADER;
 use crate::stream_guard::AbortOnDrop;
@@ -54,6 +56,14 @@ struct Message {
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<serde_json::Value>,
+}
+
+impl crate::dispatch::accounting::ObserveRejectedStringWire for ChatResponse {
+    fn observe_rejected_usage(wire: &serde_json::Value) {
+        crate::dispatch::accounting::observe_raw_string_usage(wire.get("usage"), true);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -536,10 +546,13 @@ impl ModelProvider for OpenAiModelProvider {
             .await?;
 
         if !response.status().is_success() {
-            return Err(super::api_error("OpenAI", response).await);
+            return Err(super::string_wire_api_error::<ChatResponse>("OpenAI", response).await);
         }
 
-        let chat_response: ChatResponse = response.json().await?;
+        let crate::dispatch::accounting::StringWireResponse(chat_response) = response
+            .json::<crate::dispatch::accounting::StringWireResponse<ChatResponse>>()
+            .await?;
+        crate::dispatch::accounting::observe_raw_string_usage(chat_response.usage.as_ref(), true);
 
         chat_response
             .choices
@@ -825,6 +838,42 @@ struct ResponsesApiBody {
     output_text: Option<String>,
     #[serde(default)]
     usage: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_present_responses_status")]
+    status: Option<serde_json::Value>,
+    #[serde(default)]
+    error: Option<serde_json::Value>,
+    #[serde(default)]
+    incomplete_details: Option<serde_json::Value>,
+}
+
+/// A valid terminal failure is a response outcome, not a JSON decode error.
+struct StringResponsesApiBody(Result<ResponsesApiBody, ResponsesStreamApiError>);
+
+impl<'de> Deserialize<'de> for StringResponsesApiBody {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if !crate::dispatch::accounting::string_usage_observation_enabled() {
+            return ResponsesApiBody::deserialize(deserializer).map(|body| Self(Ok(body)));
+        }
+        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        match serde_json::from_str::<ResponsesApiBody>(raw.get()) {
+            Ok(body) => {
+                crate::dispatch::accounting::observe_responses_string_usage(body.usage.as_ref());
+                if let Some(error) = responses_status_error(
+                    body.status.as_ref(),
+                    body.error.as_ref(),
+                    body.incomplete_details.as_ref(),
+                ) {
+                    Ok(Self(Err(error)))
+                } else {
+                    Ok(Self(Ok(body)))
+                }
+            }
+            Err(decode_error) => match observe_rejected_responses_json(raw.get()) {
+                Some(terminal) => Ok(Self(Err(terminal))),
+                None => Err(serde::de::Error::custom(decode_error)),
+            },
+        }
+    }
 }
 
 fn extract_responses_api_text(body: &ResponsesApiBody) -> Option<String> {
@@ -1383,9 +1432,12 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             .send()
             .await?;
         if !response.status().is_success() {
-            return Err(super::api_error("OpenAI", response).await);
+            return Err(responses_api_error("OpenAI", response).await);
         }
-        let body: ResponsesApiBody = response.json().await?;
+        let StringResponsesApiBody(body) = response.json().await?;
+        let body = body.inspect_err(|_| {
+            crate::dispatch::accounting::finish_current_string_attempt_after_completed_response();
+        })?;
         extract_responses_api_text(&body)
             .ok_or_else(|| anyhow::Error::msg("No response from OpenAI"))
     }
@@ -1954,6 +2006,179 @@ mod tool_round_policy_tests {
     }
 
     #[tokio::test]
+    async fn goal_openai_string_raw_usage_is_optional_and_lossless() {
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        let replies = Arc::new(Mutex::new(std::collections::VecDeque::from(vec![
+            serde_json::json!({"choices":[{"message":{"content":"ok"}}]}),
+            serde_json::json!({"choices":[{"message":{"content":"ok"}}],"usage":null}),
+            serde_json::json!({"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":8}}),
+            serde_json::json!({"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":8,"completion_tokens":"bad"}}),
+            serde_json::json!({"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":8,"completion_tokens":"bad"}}),
+        ])));
+        let replies_for_route = Arc::clone(&replies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(_body): Json<serde_json::Value>| {
+                let replies = Arc::clone(&replies_for_route);
+                async move { Json(replies.lock().unwrap().pop_front().unwrap()) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = OpenAiModelProvider::builder("fixture")
+            .base_url(&url)
+            .credential(Some("test-key"))
+            .build();
+        let dispatch = ProviderDispatch::new(Arc::new(provider));
+        for case in 0..4 {
+            let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+            assert_eq!(
+                scope
+                    .scope(dispatch.chat_with_system(None, "hello", "model", None))
+                    .await
+                    .unwrap(),
+                "ok"
+            );
+            let report = scope.take();
+            let outcome = report.attempts()[0].outcome();
+            assert!(match case {
+                0 | 1 => matches!(outcome, crate::dispatch::AttemptUsageOutcome::Missing),
+                2 => matches!(
+                    outcome,
+                    crate::dispatch::AttemptUsageOutcome::Invalid {
+                        reason: crate::dispatch::InvalidUsageReason::MissingOutput,
+                        ..
+                    }
+                ),
+                _ =>
+                    matches!(outcome, crate::dispatch::AttemptUsageOutcome::Invalid { reason: crate::dispatch::InvalidUsageReason::MalformedUsage, observed } if observed.input_tokens == Some(8)),
+            });
+        }
+        let ordinary = crate::dispatch::AccountedChatScope::new();
+        assert_eq!(
+            ordinary
+                .scope(dispatch.chat_with_system(None, "hello", "model", None))
+                .await
+                .unwrap(),
+            "ok"
+        );
+        assert!(matches!(
+            ordinary.take().attempts()[0].outcome(),
+            crate::dispatch::AttemptUsageOutcome::Missing
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn goal_string_usage_preserves_openai_and_anthropic_wires() {
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        for wire in 0..6 {
+            let captured = Arc::new(Mutex::new(None));
+            let capture = Arc::clone(&captured);
+            let path = match wire {
+                0 | 4 => "/chat/completions",
+                1 | 3 | 5 => "/responses",
+                _ => "/v1/messages",
+            };
+            let app = Router::new().route(path, post(move |Json(body): Json<serde_json::Value>| {
+                let capture = Arc::clone(&capture);
+                async move {
+                    *capture.lock().unwrap() = Some(body);
+                    Json(match wire {
+                        0 => serde_json::json!({"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":8,"completion_tokens":3}}),
+                        1 => serde_json::json!({"output_text":"ok","output":[],"usage":{"input_tokens":8,"output_tokens":3}}),
+                        3 => serde_json::json!({"output_text":"ok","output":[],"usage":{"input_tokens":8,"output_tokens":3,"input_tokens_details":{"cached_tokens":"bad"}}}),
+                        4 => serde_json::json!({"choices":null,"usage":{"prompt_tokens":8,"completion_tokens":3}}),
+                        5 => serde_json::json!({"output":null,"usage":{"input_tokens":8,"output_tokens":3}}),
+                        _ => serde_json::json!({"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":8,"output_tokens":3}}),
+                    })
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let provider: Arc<dyn ModelProvider> = match wire {
+                0 | 4 => Arc::new(
+                    OpenAiModelProvider::builder("fixture")
+                        .base_url(&url)
+                        .credential(Some("test-key"))
+                        .build(),
+                ),
+                1 | 3 | 5 => Arc::new(
+                    OpenAiResponsesModelProvider::builder("fixture")
+                        .api_url(&url)
+                        .credential(Some("test-key"))
+                        .build(),
+                ),
+                _ => Arc::new(
+                    crate::anthropic::AnthropicModelProvider::builder("fixture")
+                        .base_url(&url)
+                        .credential(Some("test-key"))
+                        .build(),
+                ),
+            };
+            let dispatch = ProviderDispatch::new(provider);
+            let scope = crate::dispatch::AccountedChatScope::new_with_string_usage();
+            let text = scope
+                .scope(dispatch.chat_with_system(
+                    Some("system"),
+                    "hello",
+                    "fixture-model",
+                    Some(0.4),
+                ))
+                .await;
+            let report = scope.take();
+            server.abort();
+            if wire >= 4 {
+                assert!(text.is_err());
+                assert!(report.accepted_route().is_none());
+            } else {
+                assert_eq!(text.unwrap(), "ok");
+            }
+            match report.attempts()[0].outcome() {
+                crate::dispatch::AttemptUsageOutcome::Complete(usage) if wire < 3 => {
+                    assert_eq!(
+                        (usage.input_tokens, usage.output_tokens),
+                        (Some(8), Some(3))
+                    );
+                }
+                crate::dispatch::AttemptUsageOutcome::OutcomeUnknown {
+                    observed: Some(usage),
+                } if wire >= 4 => {
+                    assert_eq!(
+                        (usage.input_tokens, usage.output_tokens),
+                        (Some(8), Some(3))
+                    );
+                }
+                crate::dispatch::AttemptUsageOutcome::Invalid {
+                    observed,
+                    reason: crate::dispatch::InvalidUsageReason::MalformedUsage,
+                } if wire == 3 => {
+                    assert_eq!(
+                        (observed.input_tokens, observed.output_tokens),
+                        (Some(8), Some(3))
+                    );
+                    assert_eq!(observed.cached_input_tokens, None);
+                }
+                other => panic!("unexpected wire {wire} accounting: {other:?}"),
+            }
+            let body = captured.lock().unwrap().take().unwrap();
+            assert_eq!(body["model"], "fixture-model");
+            assert_eq!(body["temperature"], 0.4);
+            assert!(body.to_string().contains("system"));
+            assert!(body.to_string().contains("hello"));
+            if wire == 2 {
+                assert!(body.get("thinking").is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn native_tool_round_flags_reach_stream_and_chat_wires_without_changing_defaults() {
         for wire in 0..3 {
             for streaming in [false, true] {
@@ -2011,6 +2236,110 @@ mod tool_round_policy_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn goal_string_usage_rejects_unsuccessful_openai_responses_status() {
+        use crate::dispatch::{AccountedChatScope, AttemptUsageOutcome, ProviderDispatch};
+        use axum::{Json, Router, routing::post};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+        use serde_json::json;
+
+        for (status, malformed_output, failure_reason) in [
+            (Some(json!("incomplete")), false, Some("output limit")),
+            (Some(json!("failed")), false, Some("provider failed")),
+            (Some(json!("failed")), true, Some("provider failed")),
+            (Some(json!("cancelled")), false, None),
+            (Some(json!("in_progress")), false, None),
+            (Some(json!({"unexpected": true})), false, None),
+            (Some(serde_json::Value::Null), false, None),
+            (Some(json!("completed")), false, None),
+            (None, false, None),
+        ] {
+            let successful = status
+                .as_ref()
+                .is_none_or(|status| status.as_str() == Some("completed"));
+            let requests = Arc::new(AtomicUsize::new(0));
+            let app = Router::new().route("/responses", {
+                let requests = Arc::clone(&requests);
+                post(move || {
+                    let requests = Arc::clone(&requests);
+                    let status = status.clone();
+                    async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let mut response = json!({
+                            "output_text": "response text",
+                            "output": if malformed_output { serde_json::Value::Null } else { json!([]) },
+                            "usage": {"input_tokens": 8, "output_tokens": 3}
+                        });
+                        if let Some(status) = status {
+                            if status == "incomplete" {
+                                response["incomplete_details"] = json!({"reason": failure_reason});
+                            } else if let Some(reason) = failure_reason {
+                                response["error"] = json!({"message": reason});
+                            }
+                            response["status"] = status;
+                        }
+                        Json(response)
+                    }
+                })
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let provider = OpenAiResponsesModelProvider::builder("fixture")
+                .api_url(&url)
+                .credential(Some("test-key"))
+                .build();
+            let dispatch = ProviderDispatch::from_ref(&provider);
+            let scope = AccountedChatScope::new_with_string_usage();
+            let result = scope
+                .scope(dispatch.chat_with_system(None, "hello", "fixture-model", None))
+                .await;
+            if successful {
+                assert_eq!(result.unwrap(), "response text");
+                scope.mark_logical_success();
+            } else {
+                let error = result.unwrap_err();
+                let terminal = error.downcast_ref::<ResponsesStreamApiError>().unwrap();
+                assert_eq!(
+                    terminal.0,
+                    failure_reason.unwrap_or("response did not complete")
+                );
+            }
+            let report = scope.take();
+            assert_eq!(report.accepted_route().is_some(), successful);
+            assert_eq!(report.rejected_attempts().len(), usize::from(!successful));
+            let [attempt] = report.attempts() else {
+                panic!("expected one physical attempt");
+            };
+            assert!(matches!(
+                attempt.outcome(),
+                AttemptUsageOutcome::Complete(usage)
+                    if (usage.input_tokens, usage.output_tokens) == (Some(8), Some(3))
+            ));
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
+            let ordinary = provider
+                .chat_with_system(None, "hello", "fixture-model", None)
+                .await;
+            if malformed_output {
+                assert!(
+                    ordinary
+                        .unwrap_err()
+                        .downcast_ref::<reqwest::Error>()
+                        .is_some_and(reqwest::Error::is_decode)
+                );
+            } else {
+                assert_eq!(ordinary.unwrap(), "response text");
+            }
+            assert_eq!(requests.load(Ordering::SeqCst), 2);
+            server.abort();
+        }
+    }
 
     #[tokio::test]
     async fn responses_model_listing_parses_normal_body() {

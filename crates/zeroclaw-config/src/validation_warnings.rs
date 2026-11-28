@@ -37,6 +37,13 @@ pub const SECURITY_AUDIT_DISABLED_DROPS_CERTIFICATE_RECORD: &str =
 /// are not checked; see [`crate::opt_in_tools`].
 pub const TOOL_COMPILED_OUT: &str = "tool_compiled_out";
 
+/// Stable code for an invalid configuration diagnostic that predates and is
+/// demonstrably unrelated to the current editor mutation.
+pub const PRE_EXISTING_VALIDATION_ERROR: &str = "pre_existing_validation_error";
+
+/// Stable code for warnings whose details are withheld from a write-only client.
+pub const CONFIG_WARNING_DETAILS_HIDDEN: &str = "config_warning_details_hidden";
+
 /// Stable code for an enabled section of a tool that has been removed from
 /// ZeroClaw. `Config::validate()` refuses the same condition as an error; this
 /// is the non-fatal copy for surfaces that read only the warning list, such as
@@ -116,6 +123,11 @@ pub const EMAIL_SMTP_PARTIALLY_CONFIGURED: &str = "email_smtp_partially_configur
 /// - `tool_compiled_out`: a `[<tool>]` section is enabled, but this build was
 ///   compiled without the tool's `tool-*` feature, so the section has no
 ///   effect and its settings are not validated.
+/// - `pre_existing_validation_error`: the editor retained a structured
+///   validation error that existed before the edit, is outside the mutation
+///   set, and can be skipped without bypassing a related check.
+/// - `config_warning_details_hidden`: warnings exist, but their details are
+///   withheld because the editor lacks configuration read access.
 /// - `tool_removed`: a `[<tool>]` section is enabled for a tool ZeroClaw no
 ///   longer ships (currently `[gemini_cli]`). `Config::validate()` refuses
 ///   this condition; the warning carries the same removal notice and

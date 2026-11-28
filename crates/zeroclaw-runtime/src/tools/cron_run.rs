@@ -120,6 +120,14 @@ impl CronRunTool {
 
 #[async_trait]
 impl Tool for CronRunTool {
+    fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+        // A job ID does not encode its kind. The synchronous preflight must
+        // not query the cron DB; check the resolved kind at execution instead.
+        args.get("job_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| !id.trim().is_empty())
+    }
+
     fn requires_unrestricted_principal(&self) -> bool {
         // This path uses agent authority without carrying the session owner.
         true
@@ -206,6 +214,14 @@ impl Tool for CronRunTool {
                 });
             }
         };
+
+        if matches!(job.job_type, JobType::Agent)
+            && crate::goal_accounting::GoalForegroundContext::is_participating()
+        {
+            return Ok(ToolResult::err(crate::i18n::get_required_cli_string(
+                "goal-mode-child-route-unsupported",
+            )));
+        }
 
         if matches!(job.job_type, JobType::Shell)
             && let Err(reason) = cron::validate_shell_command_with_security(
@@ -558,6 +574,73 @@ mod tests {
         )
         .unwrap();
         (Arc::new(config), job)
+    }
+
+    #[tokio::test]
+    async fn goal_refuses_agent_cron_before_claim_or_run() {
+        use zeroclaw_api::tool::ToolExecutionContext;
+        use zeroclaw_config::schema::PipelineConfig;
+        use zeroclaw_tools::pipeline::PipelineTool;
+
+        let tmp = TempDir::new().unwrap();
+        let (config, agent_job) = agent_job_config(&tmp, "http://127.0.0.1:1");
+        let shell_job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo run-now").unwrap();
+        let tool = Arc::new(CronRunTool::new(
+            config.clone(),
+            test_security(&config),
+            TEST_AGENT,
+        ));
+        let goal = ToolExecutionContext::default().with_goal_foreground();
+        let args = json!({"job_id": agent_job.id});
+        assert!(tool.may_invoke_agent_child(&args));
+        let refused = tool
+            .execute_with_context(args.clone(), &goal)
+            .await
+            .unwrap();
+        assert_eq!(
+            refused.error.as_deref(),
+            Some(
+                crate::i18n::get_required_cli_string("goal-mode-child-route-unsupported").as_str()
+            )
+        );
+        let ok = tool
+            .execute_with_context(json!({"job_id": shell_job.id}), &goal)
+            .await
+            .unwrap();
+        assert!(ok.success, "{ok:?}");
+
+        let pipeline = PipelineTool::new(
+            PipelineConfig {
+                enabled: true,
+                max_steps: 2,
+                allowed_tools: vec!["cron_run".into()],
+            },
+            vec![tool],
+        );
+        let rejected = pipeline
+            .execute_with_context(
+                json!({"parallel":true,"steps":[{"tool":"cron_run","args":args}]}),
+                &goal,
+            )
+            .await
+            .unwrap();
+        assert!(!rejected.success);
+        assert!(
+            rejected
+                .error
+                .unwrap()
+                .contains("Goal Mode permits only synchronous foreground child execution.")
+        );
+        assert!(
+            cron::list_runs(&config, &agent_job.id, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            cron::claim_job_for_agent(&config, &agent_job.id, TEST_AGENT, chrono::Utc::now())
+                .unwrap()
+        );
+        cron::release_job(&config, &agent_job.id).unwrap();
     }
 
     /// Match the scheduler's same-binary isolation for process-global state.

@@ -11,6 +11,104 @@ use serde::{Deserialize, Serialize};
 
 pub use zeroclaw_rpc_proto::types::*;
 
+/// Project the controller reply without exposing any of its runtime types.
+pub(crate) fn goal_response_wire(
+    response: &zeroclaw_goal::control::GoalResponse,
+) -> GoalResponseWire {
+    use GoalResponseWire as W;
+    use zeroclaw_goal::control::{GoalPendingAction, GoalQueuedControl, GoalResponse as R};
+
+    match response {
+        R::Help => W::Help,
+        R::Disabled => W::Disabled,
+        R::NoCurrentGoal => W::NoCurrentGoal,
+        R::SessionUnavailable => W::SessionUnavailable,
+        R::AlreadyActive => W::AlreadyActive,
+        R::BudgetRequired => W::BudgetRequired,
+        R::Stale => W::Stale,
+        R::Queued(control) => W::Queued(match control {
+            GoalQueuedControl::Start => GoalQueuedControlWire::Start,
+            GoalQueuedControl::Resume => GoalQueuedControlWire::Resume,
+            GoalQueuedControl::Pause => GoalQueuedControlWire::Pause,
+            GoalQueuedControl::Budget => GoalQueuedControlWire::Budget,
+        }),
+        R::TransitionPending(action) => W::TransitionPending(match action {
+            GoalPendingAction::Pause => GoalPendingActionWire::Pause,
+            GoalPendingAction::Cancel => GoalPendingActionWire::Cancel,
+        }),
+        R::Started(status) => W::Started(goal_status_wire(status)),
+        R::Status(status) => W::Status(goal_status_wire(status)),
+        R::Budget(status) => W::Budget(goal_status_wire(status)),
+        R::BudgetUpdated(status) => W::BudgetUpdated(goal_status_wire(status)),
+        R::Paused(status) => W::Paused(goal_status_wire(status)),
+        R::AlreadyPaused(status) => W::AlreadyPaused(goal_status_wire(status)),
+        R::Resumed(status) => W::Resumed(goal_status_wire(status)),
+        R::Cancelled(status) => W::Cancelled(goal_status_wire(status)),
+        R::AlreadyCancelled(status) => W::AlreadyCancelled(goal_status_wire(status)),
+        R::Terminal(status) => W::Terminal(goal_status_wire(status)),
+    }
+}
+
+fn goal_status_wire(status: &zeroclaw_goal::control::GoalStatusProjection) -> GoalStatusWire {
+    use zeroclaw_api::task::TaskStatus;
+    use zeroclaw_goal::task::{GoalAccountingState, GoalPauseReason};
+
+    GoalStatusWire {
+        task_id: status.task_id.clone(),
+        status: match status.status {
+            TaskStatus::Running => GoalTaskStatusWire::Running,
+            TaskStatus::Paused => GoalTaskStatusWire::Paused,
+            TaskStatus::Completed => GoalTaskStatusWire::Completed,
+            TaskStatus::Failed => GoalTaskStatusWire::Failed,
+            TaskStatus::Cancelled => GoalTaskStatusWire::Cancelled,
+            TaskStatus::Lost => GoalTaskStatusWire::Lost,
+            TaskStatus::TimedOut => GoalTaskStatusWire::TimedOut,
+        },
+        execution_epoch: status.execution_epoch,
+        token_limit: status.token_limit,
+        cost_limit_usd: status.cost_limit_usd,
+        accounting_state: match status.accounting_state {
+            GoalAccountingState::Complete => GoalAccountingStateWire::Complete,
+            GoalAccountingState::Missing => GoalAccountingStateWire::Missing,
+            GoalAccountingState::Invalid => GoalAccountingStateWire::Invalid,
+            GoalAccountingState::OutcomeUnknown => GoalAccountingStateWire::OutcomeUnknown,
+        },
+        pause_reason: status.pause_reason.map(|reason| match reason {
+            GoalPauseReason::OperatorPaused => GoalPauseReasonWire::OperatorPaused,
+            GoalPauseReason::NeedsUserInput => GoalPauseReasonWire::NeedsUserInput,
+            GoalPauseReason::HumanEscalation => GoalPauseReasonWire::HumanEscalation,
+            GoalPauseReason::ExternalDependency => GoalPauseReasonWire::ExternalDependency,
+            GoalPauseReason::ProviderUnavailable => GoalPauseReasonWire::ProviderUnavailable,
+            GoalPauseReason::VerifierBlocked => GoalPauseReasonWire::VerifierBlocked,
+            GoalPauseReason::BudgetExhausted => GoalPauseReasonWire::BudgetExhausted,
+            GoalPauseReason::BudgetUnavailable => GoalPauseReasonWire::BudgetUnavailable,
+            GoalPauseReason::DaemonRestart => GoalPauseReasonWire::DaemonRestart,
+        }),
+        resumable: status.resumable,
+    }
+}
+
+pub(crate) fn goal_failure_reason_wire(
+    reason: zeroclaw_goal::control::GoalFailureReason,
+) -> GoalFailureReasonWire {
+    use GoalFailureReasonWire as W;
+    use zeroclaw_goal::control::GoalFailureReason as R;
+    match reason {
+        R::AgentOperationFailed => W::AgentOperationFailed,
+        R::ToolResultsUnpaired => W::ToolResultsUnpaired,
+        R::EmptyAgentResponse => W::EmptyAgentResponse,
+        R::VerifierOperationFailed => W::VerifierOperationFailed,
+        R::VerifierResponseInvalid => W::VerifierResponseInvalid,
+        R::AccountingIncomplete => W::AccountingIncomplete,
+        R::PricingIncomplete => W::PricingIncomplete,
+        R::OperationOutcomeUnknown => W::OperationOutcomeUnknown,
+        R::ExecutorStartFailed => W::ExecutorStartFailed,
+        R::ExecutorFailed => W::ExecutorFailed,
+        R::CandidatePersistenceFailed => W::CandidatePersistenceFailed,
+        R::Other => W::Other,
+    }
+}
+
 // ── Re-exports: runtime types that already derive Serialize + Deserialize ──
 
 pub use crate::cron::{CronJob, CronJobPatch, CronRun, DeliveryConfig, Schedule};
@@ -247,6 +345,81 @@ rpc_type! {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn session_goal_failure_serializes_stable_client_payload() {
+        let update = SessionGoalUpdate::Failed {
+            session_id: "sess-1".into(),
+            reason: goal_failure_reason_wire(
+                zeroclaw_goal::control::GoalFailureReason::ToolResultsUnpaired,
+            ),
+        };
+
+        assert_eq!(
+            serde_json::to_value(update).unwrap(),
+            json!({
+                "failed": {
+                    "session_id": "sess-1",
+                    "reason": "tool_results_unpaired"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn session_goal_current_variants_match_the_native_client_fixture() {
+        use zeroclaw_goal::control::{GoalFailureReason, GoalResponse};
+
+        // The RPC-only client consumes this same fixture without linking the
+        // daemon. Exercise both independent serde owners against identical bytes.
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/goal_wire_variants.json"
+        )))
+        .unwrap();
+        for value in fixture["failure_reasons"].as_array().unwrap() {
+            let reason: GoalFailureReason = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(reason).unwrap(), *value);
+            let update = SessionGoalUpdate::Failed {
+                session_id: "goal-session".into(),
+                reason: goal_failure_reason_wire(reason),
+            };
+            assert_eq!(
+                serde_json::to_value(update).unwrap()["failed"]["reason"],
+                *value
+            );
+        }
+        let mut values = Vec::new();
+        for kind in fixture["unit_responses"].as_array().unwrap() {
+            values.push(json!({"kind": kind}));
+        }
+        for kind in fixture["status_responses"].as_array().unwrap() {
+            values.push(json!({"kind": kind, "status": fixture["status"]}));
+        }
+        for control in fixture["queued_controls"].as_array().unwrap() {
+            values.push(json!({"kind": "queued", "status": control}));
+        }
+        for action in fixture["pending_actions"].as_array().unwrap() {
+            values.push(json!({"kind": "transition_pending", "status": action}));
+        }
+        for value in values {
+            let response: GoalResponse = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&response).unwrap(), value);
+            let response = goal_response_wire(&response);
+            let result = SessionGoalResult {
+                response: response.clone(),
+            };
+            let update = SessionGoalUpdate::Lifecycle {
+                session_id: "goal-session".into(),
+                response,
+            };
+            assert_eq!(
+                serde_json::to_value(update).unwrap()["lifecycle"]["response"],
+                value
+            );
+            assert_eq!(serde_json::to_value(result).unwrap()["response"], value);
+        }
+    }
 
     #[test]
     fn interaction_surface_is_closed_and_snake_case() {

@@ -1501,6 +1501,409 @@
           }
         ]
       },
+      "GoalAccountingStateWire": {
+        "enum": [
+          "complete",
+          "missing",
+          "invalid",
+          "outcome_unknown"
+        ],
+        "type": "string"
+      },
+      "GoalFailureReasonWire": {
+        "enum": [
+          "agent_operation_failed",
+          "tool_results_unpaired",
+          "empty_agent_response",
+          "verifier_operation_failed",
+          "verifier_response_invalid",
+          "accounting_incomplete",
+          "pricing_incomplete",
+          "operation_outcome_unknown",
+          "executor_start_failed",
+          "executor_failed",
+          "candidate_persistence_failed",
+          "other"
+        ],
+        "type": "string"
+      },
+      "GoalPauseReasonWire": {
+        "enum": [
+          "operator_paused",
+          "needs_user_input",
+          "human_escalation",
+          "external_dependency",
+          "provider_unavailable",
+          "verifier_blocked",
+          "budget_exhausted",
+          "budget_unavailable",
+          "daemon_restarted"
+        ],
+        "type": "string"
+      },
+      "GoalPendingActionWire": {
+        "enum": [
+          "pause",
+          "cancel"
+        ],
+        "type": "string"
+      },
+      "GoalQueuedControlWire": {
+        "enum": [
+          "start",
+          "resume",
+          "pause",
+          "budget"
+        ],
+        "type": "string"
+      },
+      "GoalResponseWire": {
+        "description": "Result tags shared by synchronous replies and lifecycle updates.",
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "help",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "disabled",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "no_current_goal",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "session_unavailable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "already_active",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "budget_required",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "stale",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "queued",
+                "type": "string"
+              },
+              "status": {
+                "$ref": "#/components/schemas/GoalQueuedControlWire"
+              }
+            },
+            "required": [
+              "kind",
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "transition_pending",
+                "type": "string"
+              },
+              "status": {
+                "$ref": "#/components/schemas/GoalPendingActionWire"
+              }
+            },
+            "required": [
+              "kind",
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "started",
+                "type": "string"
+              },
+              "status": {
+                "$ref": "#/components/schemas/GoalStatusWire"
+              }
+            },
+            "required": [
+              "kind",
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "status",
+                "type": "string"
+              },
+              "status": {
+                "$ref": "#/components/schemas/GoalStatusWire"
+              }
+            },
+            "required": [
+              "kind",
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "budget",
+                "type": "string"
+              },
+              "status": {
+                "$ref": "#/components/schemas/GoalStatusWire"
+              }
+            },
+            "required": [
+              "kind",
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "budget_updated",
+                "type": "string"
+              },
+              "status": {
+                "$ref": "#/components/schemas/GoalStatusWire"
+              }
+            },
+            "required": [
+              "kind",
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "paused",
+                "type": "string"
+              },
+              "status": {
+                "$ref": "#/components/schemas/GoalStatusWire"
+              }
+            },
+            "required": [
+              "kind",
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "already_paused",
+                "type": "string"
+              },
+              "status": {
+                "$ref": "#/components/schemas/GoalStatusWire"
+              }
+            },
+            "required": [
+              "kind",
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "resumed",
+                "type": "string"
+              },
+              "status": {
+                "$ref": "#/components/schemas/GoalStatusWire"
+              }
+            },
+            "required": [
+              "kind",
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "cancelled",
+                "type": "string"
+              },
+              "status": {
+                "$ref": "#/components/schemas/GoalStatusWire"
+              }
+            },
+            "required": [
+              "kind",
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "already_cancelled",
+                "type": "string"
+              },
+              "status": {
+                "$ref": "#/components/schemas/GoalStatusWire"
+              }
+            },
+            "required": [
+              "kind",
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "terminal",
+                "type": "string"
+              },
+              "status": {
+                "$ref": "#/components/schemas/GoalStatusWire"
+              }
+            },
+            "required": [
+              "kind",
+              "status"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "GoalStatusWire": {
+        "description": "Read-only Goal status presented to a native RPC client.",
+        "properties": {
+          "accounting_state": {
+            "$ref": "#/components/schemas/GoalAccountingStateWire"
+          },
+          "cost_limit_usd": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "execution_epoch": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "pause_reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/GoalPauseReasonWire"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "resumable": {
+            "type": "boolean"
+          },
+          "status": {
+            "$ref": "#/components/schemas/GoalTaskStatusWire"
+          },
+          "task_id": {
+            "type": "string"
+          },
+          "token_limit": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "task_id",
+          "status",
+          "execution_epoch",
+          "accounting_state",
+          "resumable"
+        ],
+        "type": "object"
+      },
+      "GoalTaskStatusWire": {
+        "enum": [
+          "running",
+          "paused",
+          "completed",
+          "failed",
+          "cancelled",
+          "lost",
+          "timed_out"
+        ],
+        "type": "string"
+      },
       "GraphDiagnostic": {
         "description": "A validation finding anchored to a step. Errors block saving\n(`validate_sop_strict`); warnings render but do not block.",
         "properties": {
@@ -2369,6 +2772,13 @@
               }
             ],
             "default": "message"
+          },
+          "reply_occurrence": {
+            "description": "When present, identifies this assistant reply across live and history delivery.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "role": {
             "type": "string"
@@ -3499,6 +3909,179 @@
         ],
         "type": "object"
       },
+      "SessionGoalParams": {
+        "description": "A transport-neutral Goal control command bound to an existing live\nZeroCode session. The daemon derives agent, route, and current TUI\nidentity from the session; clients cannot submit those authority facts.",
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "command"
+        ],
+        "type": "object"
+      },
+      "SessionGoalResult": {
+        "description": "Typed Goal lifecycle result for both local IPC and WSS clients.",
+        "properties": {
+          "response": {
+            "$ref": "#/components/schemas/GoalResponseWire"
+          }
+        },
+        "required": [
+          "response"
+        ],
+        "type": "object"
+      },
+      "SessionGoalUpdate": {
+        "description": "Asynchronous Goal lifecycle update. Ordinary agent events, including\nparent-turn chunks and failures, use the normal `session/update` stream.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "command_failed": {
+                "properties": {
+                  "session_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "session_id"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "command_failed"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Successful parent candidate presentation fallback after ordinary\nevents drain. The legacy name is not a verifier verdict or proof of\ndurable candidate persistence; lifecycle updates carry those outcomes.",
+            "properties": {
+              "verified_candidate": {
+                "properties": {
+                  "candidate": {
+                    "type": "string"
+                  },
+                  "reply_occurrence": {
+                    "description": "Opaque presentation identity, sent only to opted-in peers.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "session_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "session_id",
+                  "candidate"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "verified_candidate"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "completed": {
+                "properties": {
+                  "session_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "session_id"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "completed"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "paused_for_blocker": {
+                "properties": {
+                  "session_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "session_id"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "paused_for_blocker"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "failed": {
+                "properties": {
+                  "reason": {
+                    "$ref": "#/components/schemas/GoalFailureReasonWire"
+                  },
+                  "session_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "session_id",
+                  "reason"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "failed"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "lifecycle": {
+                "properties": {
+                  "response": {
+                    "$ref": "#/components/schemas/GoalResponseWire"
+                  },
+                  "session_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "session_id",
+                  "response"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "lifecycle"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "SessionIdParams": {
         "description": "Shared param for methods that only need a session ID:\n`session/close`, `session/cancel`, `session/messages`,\n`session/state`, `session/delete`.",
         "properties": {
@@ -3911,6 +4494,10 @@
         "oneOf": [
           {
             "properties": {
+              "presentation_only": {
+                "description": "Display-only text from a Goal parent turn, such as a model fallback\nnotice. It is shown alongside the answer but is not part of the\nsaved candidate. Ordinary text chunks omit this field.",
+                "type": "boolean"
+              },
               "session_id": {
                 "type": "string"
               },
@@ -4128,6 +4715,10 @@
                 "description": "Final assistant text (Completed) or partial accumulated text\nat cancel point (Cancelled).",
                 "type": "string"
               },
+              "goal_owned": {
+                "description": "Goal output is visible but does not settle a session/prompt.",
+                "type": "boolean"
+              },
               "message_count": {
                 "description": "Authoritative projected conversation-entry count after this turn.\nAbsent for legacy or missing-session terminal events.",
                 "format": "uint",
@@ -4305,6 +4896,23 @@
             "type": "object"
           }
         ]
+      },
+      "SessionUpdateNotification": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/SessionUpdateEvent"
+          }
+        ],
+        "description": "A session update with optional, negotiated reply identity. A missing\nidentity leaves the event in its original wire format.",
+        "properties": {
+          "reply_occurrence": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
       },
       "SkillBundleEntry": {
         "description": "Wire representation of a skill bundle. Consolidates gateway `BundleEntry`.",
@@ -4710,7 +5318,7 @@
         "type": "string"
       },
       "TurnUsageTotals": {
-        "description": "Turn-wide usage totals on `TurnComplete`, the RPC counterpart of the\ngateway chat socket's `done` frame. Totals and `usage_by_provider`\ninclude every billable attempt; the `last_*` fields and context\nlimits describe the accepted call that served the turn.",
+        "description": "Turn-wide usage totals on `TurnComplete`, the RPC counterpart of the\ngateway chat socket's `done` frame. Totals and `usage_by_provider`\ninclude recorded usage for billable attempts and may be incomplete.\nThe `model` and `last_*` fields describe the accepted attempt; an\nunknown model can be labelled `(unattributed)`. Context limits follow\nthe route used to dispatch that call, which can differ from the\nprovider-reported model after server-side fallback.",
         "properties": {
           "cost_usd": {
             "description": "Sum of `usage_by_provider[*].cost_usd`; absent when the sum is\nnot positive (an unpriced turn).",
@@ -4737,7 +5345,7 @@
             ]
           },
           "max_context_tokens": {
-            "description": "Proactive-trim budget of the serving route.",
+            "description": "Proactive-trim budget of the route used for the accepted call.",
             "format": "uint64",
             "minimum": 0,
             "type": [
@@ -4752,7 +5360,7 @@
             ]
           },
           "model_context_window": {
-            "description": "Configured context window of the serving model.",
+            "description": "Configured context window of the route used for the accepted call.",
             "format": "uint64",
             "minimum": 0,
             "type": [
@@ -5060,6 +5668,42 @@
       "x-zeroclaw-params": {
         "shape": "typed",
         "type": "SessionPromptParams"
+      }
+    },
+    {
+      "name": "session/goal",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "command",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "session_id",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionGoalResult"
+        },
+        "x-zeroclaw-shape": "typed"
+      },
+      "x-zeroclaw-authorization": {
+        "kind": "grant",
+        "resource": "sessions",
+        "verb": "execute"
+      },
+      "x-zeroclaw-params": {
+        "shape": "typed",
+        "type": "SessionGoalParams"
       }
     },
     {
@@ -8396,7 +9040,16 @@
       "params": {
         "name": "params",
         "schema": {
-          "$ref": "#/components/schemas/SessionUpdateEvent"
+          "$ref": "#/components/schemas/SessionUpdateNotification"
+        }
+      }
+    },
+    {
+      "name": "session/goal_update",
+      "params": {
+        "name": "params",
+        "schema": {
+          "$ref": "#/components/schemas/SessionGoalUpdate"
         }
       }
     },

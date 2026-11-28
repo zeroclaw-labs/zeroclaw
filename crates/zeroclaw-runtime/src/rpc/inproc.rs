@@ -670,6 +670,8 @@ mod tests {
         let init: InitializeResult = serde_json::from_value(frame["result"].clone()).unwrap();
         assert_eq!(init.protocol_version, 1);
         assert!(!init.server_version.is_empty());
+        assert!(!init.capabilities.iter().any(|name| name == "session/goal"));
+        assert!(!init.commands.iter().any(|command| command.id == "goal"));
 
         writer
             .write_all(rpc_request(Method::Status, &serde_json::json!({}), 2).as_bytes())
@@ -1484,6 +1486,45 @@ mod tests {
         let path = tmp.join("host-only.txt");
         std::fs::write(&path, "read by path from the daemon host").unwrap();
         path.canonicalize().unwrap().to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn duplex_refuses_native_goal_control_for_an_owned_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = agent_config(tmp.path());
+        config.goal.enabled = true;
+        let (cancel, _connector, mut reader, mut writer) =
+            operator_duplex(config, tmp.path()).await;
+        let session_id = open_session(&mut reader, &mut writer).await;
+        writer
+            .write_all(
+                rpc_request(
+                    Method::SessionGoal,
+                    &serde_json::json!({"session_id":session_id,"command":"/goal start --unlimited Test the boundary"}),
+                    3,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let frame = response_to(&mut reader, 3).await;
+        assert_eq!(
+            frame["error"]["code"],
+            zeroclaw_api::jsonrpc::error_codes::METHOD_NOT_FOUND
+        );
+        assert!(frame["result"].is_null());
+
+        writer
+            .write_all(rpc_request(Method::Status, &serde_json::json!({}), 4).as_bytes())
+            .await
+            .unwrap();
+        let frame = response_to(&mut reader, 4).await;
+        assert!(
+            frame["error"].is_null(),
+            "ordinary RPC still works: {frame}"
+        );
+        cancel.cancel();
+        drop(writer);
     }
 
     #[tokio::test]

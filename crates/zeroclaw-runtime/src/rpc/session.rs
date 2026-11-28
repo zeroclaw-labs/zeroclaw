@@ -1,13 +1,15 @@
 //! RPC session state.
 
+use super::dispatch::{GoalCloseHandoff, GoalFrameDestination};
 use crate::agent::agent::{Agent, TurnEvent};
 use crate::agent::dispatcher::ToolDispatcher;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 use tokio::sync::Mutex;
 use zeroclaw_api::plan::PlanEntry;
-use zeroclaw_infra::session_queue::SessionActorQueue;
+use zeroclaw_infra::session_queue::{SessionActorQueue, SessionEvictionGuard};
 use zeroclaw_providers::ModelProvider;
 
 /// Error returned by [`SessionStore::lock_model_provider_update_with_timeout`].
@@ -111,6 +113,7 @@ pub struct UploadEntry {
 struct SessionOwnerBinding {
     tui_id: Option<String>,
     revoked: tokio_util::sync::CancellationToken,
+    goal_recipient: Arc<GoalRecipient>,
 }
 
 impl SessionOwnerBinding {
@@ -126,6 +129,304 @@ impl SessionOwnerBinding {
 impl Drop for SessionOwnerBinding {
     fn drop(&mut self) {
         self.revoked.cancel();
+        self.goal_recipient.close();
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum GoalFrameClass {
+    ParentEvent,
+    Candidate,
+    Notice,
+}
+
+/// Pre-rendered alternatives; choose only once the actual recipient is admitted.
+pub(super) struct GoalWireFrame {
+    legacy: String,
+    negotiated: Option<String>,
+}
+
+impl GoalWireFrame {
+    pub(super) fn new(legacy: String, negotiated: Option<String>) -> Self {
+        Self { legacy, negotiated }
+    }
+
+    fn take_for(&mut self, reply_occurrence_enabled: bool) -> String {
+        if reply_occurrence_enabled && let Some(frame) = self.negotiated.take() {
+            return frame;
+        }
+        std::mem::take(&mut self.legacy)
+    }
+}
+
+impl From<String> for GoalWireFrame {
+    fn from(legacy: String) -> Self {
+        Self::new(legacy, None)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum GoalFrameDelivery {
+    Delivered,
+    NotDelivered,
+}
+
+enum GoalDestinationInstall {
+    Offer,
+    Launch,
+    Vacant,
+}
+
+/// Weak recipient registrations shared by one connection and its handles.
+#[derive(Default)]
+pub(super) struct GoalDestinationRegistry {
+    retired: tokio_util::sync::CancellationToken,
+    recipients: Vec<Weak<GoalRecipient>>,
+}
+
+impl GoalDestinationRegistry {
+    pub(super) fn register(&mut self, recipient: &Arc<GoalRecipient>) -> bool {
+        if self.is_closed() {
+            return false;
+        }
+        self.recipients
+            .retain(|recipient| recipient.strong_count() != 0);
+        let target = Arc::downgrade(recipient);
+        if !self
+            .recipients
+            .iter()
+            .any(|recipient| recipient.ptr_eq(&target))
+        {
+            self.recipients.push(target);
+        }
+        true
+    }
+
+    pub(super) fn retire(&mut self) -> Vec<Weak<GoalRecipient>> {
+        self.retired.cancel();
+        std::mem::take(&mut self.recipients)
+    }
+
+    pub(super) fn is_closed(&self) -> bool {
+        self.retired.is_cancelled()
+    }
+
+    pub(super) fn retired(&self) -> tokio_util::sync::CancellationToken {
+        self.retired.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn len_for_test(&self) -> usize {
+        self.recipients.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_closed_for_test(&self) -> bool {
+        self.is_closed()
+    }
+}
+
+/// Ephemeral presentation for this live incarnation; never used for worker admission.
+pub(super) struct GoalRecipient {
+    state: parking_lot::Mutex<GoalRecipientState>,
+    changed: tokio::sync::Notify,
+    reply_occurrence_scope: uuid::Uuid,
+}
+
+impl Default for GoalRecipient {
+    fn default() -> Self {
+        Self {
+            state: parking_lot::Mutex::default(),
+            changed: tokio::sync::Notify::new(),
+            reply_occurrence_scope: uuid::Uuid::new_v4(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct GoalRecipientState {
+    active: Option<Arc<GoalFrameDestination>>,
+    pending: Option<Arc<GoalFrameDestination>>,
+    closed: bool,
+    epoch: u64,
+    superseded: tokio_util::sync::CancellationToken,
+    unsaved_candidate: bool,
+    history_read: Option<Arc<GoalHistoryToken>>,
+}
+
+struct GoalHistoryToken(Arc<zeroclaw_api::jsonrpc::RpcOutbound>);
+
+impl GoalRecipientState {
+    fn replace_target(&mut self, active: Option<Arc<GoalFrameDestination>>) {
+        self.active = active;
+        self.epoch += 1;
+        self.superseded.cancel();
+        self.superseded = tokio_util::sync::CancellationToken::new();
+    }
+
+    fn finish_frame(&mut self, class: GoalFrameClass) {
+        match class {
+            GoalFrameClass::ParentEvent => {}
+            GoalFrameClass::Candidate => self.unsaved_candidate = true,
+            GoalFrameClass::Notice => self.unsaved_candidate = false,
+        }
+    }
+}
+
+impl GoalRecipient {
+    pub(super) fn allocate_reply_occurrence(&self) -> String {
+        format!(
+            "{}:{}",
+            self.reply_occurrence_scope.simple(),
+            uuid::Uuid::new_v4().simple()
+        )
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock();
+        state.closed = true;
+        state.pending = None;
+        state.history_read = None;
+        state.replace_target(None);
+        self.changed.notify_waiters();
+    }
+
+    pub(super) fn detach_connection(&self, outbound: &Arc<zeroclaw_api::jsonrpc::RpcOutbound>) {
+        let mut state = self.state.lock();
+        let pending = state
+            .pending
+            .as_ref()
+            .is_some_and(|target| target.matches(outbound));
+        let active = state
+            .active
+            .as_ref()
+            .is_some_and(|target| target.matches(outbound));
+        if pending {
+            state.pending = None;
+        }
+        if active {
+            state.replace_target(None);
+        }
+        if pending || active {
+            self.changed.notify_waiters();
+        }
+    }
+
+    pub(super) fn clear_unsaved_candidate(&self) {
+        self.state.lock().unsaved_candidate = false;
+        self.changed.notify_waiters();
+    }
+
+    #[cfg(test)]
+    pub(super) fn epoch_for_test(&self) -> (u64, tokio_util::sync::CancellationToken) {
+        let state = self.state.lock();
+        (state.epoch, state.superseded.clone())
+    }
+
+    #[cfg(test)]
+    pub(super) fn close_for_test(&self) {
+        self.close();
+    }
+
+    #[cfg(test)]
+    pub(super) fn destinations_for_test(
+        &self,
+    ) -> (
+        Option<Weak<GoalFrameDestination>>,
+        Option<Weak<GoalFrameDestination>>,
+    ) {
+        let state = self.state.lock();
+        (
+            state.active.as_ref().map(Arc::downgrade),
+            state.pending.as_ref().map(Arc::downgrade),
+        )
+    }
+
+    async fn begin_history(
+        self: &Arc<Self>,
+        outbound: &Arc<zeroclaw_api::jsonrpc::RpcOutbound>,
+        _store: &SessionStore,
+    ) -> Option<GoalHistoryRead> {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut state = self.state.lock();
+                if state.closed
+                    || state
+                        .history_read
+                        .as_ref()
+                        .is_some_and(|token| Arc::ptr_eq(&token.0, outbound))
+                    || !state
+                        .pending
+                        .as_ref()
+                        .is_some_and(|d| d.matches(outbound) && !d.cancelled().is_cancelled())
+                {
+                    return None;
+                }
+                if !state.unsaved_candidate && state.history_read.is_none() {
+                    let token = Arc::new(GoalHistoryToken(Arc::clone(outbound)));
+                    state.history_read = Some(Arc::clone(&token));
+                    return Some(GoalHistoryRead {
+                        recipient: Arc::clone(self),
+                        token,
+                    });
+                }
+            }
+            #[cfg(test)]
+            _store
+                .wait_test_effect_pause("goal-wait-candidate-save")
+                .await;
+            notified.await;
+        }
+    }
+}
+
+/// Dropping an unsent history response releases the gate without promoting its connection.
+pub(super) struct GoalHistoryRead {
+    recipient: Arc<GoalRecipient>,
+    token: Arc<GoalHistoryToken>,
+}
+
+impl GoalHistoryRead {
+    pub(super) fn promote(
+        &self,
+        live: &RpcSession,
+        outbound: &Arc<zeroclaw_api::jsonrpc::RpcOutbound>,
+    ) {
+        if !Arc::ptr_eq(&self.recipient, &live.owner_binding.goal_recipient) {
+            return;
+        }
+        let mut state = self.recipient.state.lock();
+        if state
+            .history_read
+            .as_ref()
+            .is_some_and(|token| Arc::ptr_eq(token, &self.token))
+            && state
+                .pending
+                .as_ref()
+                .is_some_and(|d| d.matches(outbound) && !d.cancelled().is_cancelled())
+        {
+            let target = state.pending.take();
+            state.replace_target(target);
+            state.history_read = None;
+            self.recipient.changed.notify_waiters();
+        }
+    }
+}
+
+impl Drop for GoalHistoryRead {
+    fn drop(&mut self) {
+        let mut state = self.recipient.state.lock();
+        if state
+            .history_read
+            .as_ref()
+            .is_some_and(|token| Arc::ptr_eq(token, &self.token))
+        {
+            state.history_read = None;
+            self.recipient.changed.notify_waiters();
+        }
     }
 }
 
@@ -138,6 +439,12 @@ pub struct RpcSession {
     /// Share the Agent's canonical channel map so steering can recheck live
     /// capabilities without acquiring the Agent mutex held by its turn.
     reaction_channels: crate::tools::PerToolChannelHandle,
+    /// Serializes Goal lifecycle commands for this exact live session. It is
+    /// session-owned so removal and same-ID replacement cannot leave a
+    /// daemon-lifetime lock entry behind.
+    goal_command: Arc<Mutex<()>>,
+    // The live generation owns these claims independently of its command lock.
+    goal_lifecycle_fences: Arc<GoalLifecycleFences>,
     /// Orders provider refreshes and configuration within this session.
     model_provider_update: Arc<Mutex<()>>,
     pub created_at: Instant,
@@ -150,6 +457,8 @@ pub struct RpcSession {
     pub chat_mode: crate::rpc::types::ChatMode,
     pub interaction_surface: Option<crate::agent::prompt::InteractionSurface>,
     owner_binding: SessionOwnerBinding,
+    // The latest accepted RPC handoff may still be waiting to install its route.
+    approval_rebind: Option<ApprovalRebindTicket>,
     /// Monotonic generation counter stamped by `SessionStore::insert`.
     /// Provider-refresh callers capture this before building a provider box
     /// and pass it to `SessionStore::apply_model_provider` so stale work
@@ -216,7 +525,12 @@ pub struct ResumedRpcSession {
     pub agent_alias: String,
     pub workspace_dir: String,
     pub message_count: usize,
+    pub(super) approval_rebind: Option<ApprovalRebindTicket>,
 }
+
+/// Process-local identity of an accepted approval-channel handoff.
+#[derive(Clone)]
+pub(super) struct ApprovalRebindTicket(Arc<()>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResumeExistingError {
@@ -225,6 +539,7 @@ pub(crate) enum ResumeExistingError {
     DifferentInteractionSurface,
     DifferentPrincipal,
     StaleIncarnation,
+    LifecyclePending,
 }
 
 impl ResumeExistingError {
@@ -237,11 +552,92 @@ impl ResumeExistingError {
             }
             Self::DifferentPrincipal => "session not found or not owned by this principal",
             Self::StaleIncarnation => "session changed while resuming",
+            Self::LifecyclePending => "session lifecycle change is pending",
         }
     }
 }
 
+/// The authoritative live-session facts required to admit a Goal command.
+///
+/// Goal admission must read these facts together: independent reads can span a
+/// same-ID replacement and accidentally combine the old generation with the
+/// successor's owner or agent. This remains a read-only projection of the
+/// canonical session store, not a second session registry.
+pub(crate) struct GoalSessionSnapshot {
+    pub(super) goal_recipient: Arc<GoalRecipient>,
+    pub(crate) agent: Arc<Mutex<Agent>>,
+    pub(crate) reaction_channels: crate::tools::PerToolChannelHandle,
+    pub(crate) agent_alias: String,
+    pub(crate) chat_mode: crate::rpc::types::ChatMode,
+    pub(crate) owner_tui_id: Option<String>,
+    pub(crate) generation: u64,
+    pub(crate) goal_command: Arc<Mutex<()>>,
+    goal_lifecycle_fences: Arc<GoalLifecycleFences>,
+}
+
+impl GoalSessionSnapshot {
+    pub(super) fn goal_admission_is_fenced(&self) -> bool {
+        self.goal_lifecycle_fences.admission.load(Ordering::Acquire) != 0
+    }
+}
+
+#[derive(Default)]
+struct GoalLifecycleFences {
+    admission: AtomicUsize,
+    binding: AtomicUsize,
+}
+
+/// Exact live generation's short command-lock claim. Convert it to a fence
+/// before waiting for any worker, actor permit, or lifecycle delivery.
+pub(crate) struct GoalLifecycleCommandGuard {
+    _command: tokio::sync::OwnedMutexGuard<()>,
+    fences: Arc<GoalLifecycleFences>,
+}
+
+impl GoalLifecycleCommandGuard {
+    /// Close Goal admission for this generation. Only a transition that
+    /// needs custody of an existing Goal binding also fences session rebinds.
+    pub(super) fn fence_for_binding(self, protect_binding: bool) -> GoalLifecycleFence {
+        if protect_binding {
+            self.fences.binding.fetch_add(1, Ordering::AcqRel);
+        }
+        self.fences.admission.fetch_add(1, Ordering::AcqRel);
+        GoalLifecycleFence {
+            fences: Arc::clone(&self.fences),
+            protect_binding,
+        }
+    }
+}
+
+/// Keeps Goal admissions closed until this transition has settled or lost
+/// custody. A dropped contender must not release another contender's fence.
+pub(super) struct GoalLifecycleFence {
+    fences: Arc<GoalLifecycleFences>,
+    protect_binding: bool,
+}
+
+impl Drop for GoalLifecycleFence {
+    fn drop(&mut self) {
+        if self.protect_binding {
+            self.fences.binding.fetch_sub(1, Ordering::AcqRel);
+        }
+        self.fences.admission.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl RpcSession {
+    pub(super) fn allocate_reply_occurrence(&self) -> String {
+        self.owner_binding
+            .goal_recipient
+            .allocate_reply_occurrence()
+    }
+
+    pub(super) fn has_approval_rebind(&self, expected: &ApprovalRebindTicket) -> bool {
+        self.approval_rebind
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.0, &expected.0))
+    }
+
     pub(crate) fn retained_environment(&self) -> Option<&crate::tools::ForwardedEnvironment> {
         self.forwarded_environment.as_ref()
     }
@@ -257,6 +653,8 @@ impl RpcSession {
             reaction_channels: Arc::clone(&agent.channel_handles().reaction),
             agent: Arc::new(Mutex::new(agent)),
             lifecycle_lease: None,
+            goal_command: Arc::new(Mutex::new(())),
+            goal_lifecycle_fences: Arc::new(GoalLifecycleFences::default()),
             model_provider_update: Arc::new(Mutex::new(())),
             created_at: Instant::now(),
             last_active: Instant::now(),
@@ -268,6 +666,7 @@ impl RpcSession {
             chat_mode,
             interaction_surface: None,
             owner_binding: SessionOwnerBinding::default(),
+            approval_rebind: None,
             generation: 0,
             pending_generation: None,
             owner_principal_id: None,
@@ -291,6 +690,10 @@ impl RpcSession {
 
     pub fn owner_tui_id(&self) -> Option<&str> {
         self.owner_binding.tui_id.as_deref()
+    }
+
+    pub(super) fn goal_reaction_channels(&self) -> &crate::tools::PerToolChannelHandle {
+        &self.reaction_channels
     }
 
     pub fn with_interaction_surface(
@@ -340,7 +743,20 @@ type RemovalSignalPause = (
     Arc<tokio::sync::Notify>,
 );
 
-type CancelTokenEntry = (u64, Option<u64>, tokio_util::sync::CancellationToken);
+struct CancelTokenEntry {
+    turn_generation: u64,
+    session_generation: Option<u64>,
+    token: tokio_util::sync::CancellationToken,
+    // A weak handoff: replacing or dropping this entry under the token lock
+    // must not drop the close operation that owns the durable custody.
+    goal_close: Option<GoalCloseHandoff>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SameModeSiblingEvictionCandidate {
+    pub(crate) id: String,
+    pub(crate) generation: u64,
+}
 
 #[cfg(test)]
 type RehydrateSeedPause = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
@@ -409,6 +825,10 @@ pub struct SessionStore {
     #[cfg(test)]
     pub(crate) test_construction_publication_pause:
         std::sync::Mutex<Option<PromptRegistrationPause>>,
+    /// Test-only gate after session/new captures its authorized incarnation.
+    #[cfg(test)]
+    pub(crate) test_goal_replacement_capture_pause:
+        std::sync::Mutex<Option<PromptRegistrationPause>>,
     #[cfg(test)]
     test_prompt_rehydration_pause: std::sync::Mutex<Option<PromptRehydrationPause>>,
     /// Test-only pause after a removal handler captures the target generation
@@ -425,6 +845,11 @@ pub struct SessionStore {
     /// that reaches it.
     #[cfg(test)]
     test_upload_commit_pause: std::sync::Mutex<Option<RehydrateSeedPause>>,
+    /// Test-only pause immediately before a Goal live commit takes the
+    /// session map. Taken by the first commit that reaches it.
+    #[cfg(test)]
+    test_goal_live_commit_before_map_pause:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, std::sync::mpsc::Receiver<()>)>>,
     /// Test-only hook an upload commit runs between its final authority
     /// check and its write, while it holds the authority lease. Taken by the
     /// first commit that reaches it.
@@ -464,12 +889,18 @@ pub(crate) struct CancelTokenRegistration<'a> {
 impl CancelTokenRegistration<'_> {
     /// Drain the turn's cancellation attribution before unregistering the
     /// token. `remove_cancel_token` intentionally clears any leftover cause.
-    pub(crate) fn finish(mut self) -> Option<CancelCause> {
-        let cause = self.store.take_cancel_cause(self.session_id);
-        if let Some(generation) = self.generation.take() {
-            self.store.remove_cancel_token(self.session_id, generation);
-        }
-        cause
+    pub(crate) fn finish(self) -> Option<CancelCause> {
+        self.finish_with_goal_close().0
+    }
+
+    /// Transfer an attached close only from this exact admitted turn.
+    pub(super) fn finish_with_goal_close(
+        mut self,
+    ) -> (Option<CancelCause>, Option<GoalCloseHandoff>) {
+        self.generation.take().map_or((None, None), |generation| {
+            self.store
+                .unregister_cancel_token(self.session_id, generation, true)
+        })
     }
 
     pub(crate) fn generation(&self) -> u64 {
@@ -523,6 +954,8 @@ impl SessionStore {
             #[cfg(test)]
             test_construction_publication_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
+            test_goal_replacement_capture_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
             test_prompt_rehydration_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_removal_signal_pause: std::sync::Mutex::new(None),
@@ -532,6 +965,8 @@ impl SessionStore {
             test_rehydrate_seed_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_upload_commit_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            test_goal_live_commit_before_map_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             test_upload_effect_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -688,13 +1123,58 @@ impl SessionStore {
     pub(crate) async fn publish_prepared_authorized<G, E>(
         &self,
         id: String,
-        mut session: RpcSession,
+        session: RpcSession,
         expected_generation: Option<u64>,
         expected_access: Option<(u64, Option<&str>)>,
         authorize: impl FnOnce(&RpcSession) -> Result<G, E>,
         failure: impl Fn(&'static str) -> E,
     ) -> Result<(), E> {
         let mut sessions = self.sessions.lock().await;
+        self.publish_prepared_under_lock(
+            &mut sessions,
+            (id, session),
+            expected_generation,
+            expected_access,
+            authorize,
+            failure,
+        )
+    }
+
+    /// Final publication from the blocking owner of a prepared disposition.
+    /// Take the session map before the callback obtains its authority lease
+    /// and waits for the task-store writer. The caller must not hold a
+    /// task-store connection.
+    pub(super) fn publish_prepared_with_commit<G, E>(
+        &self,
+        id: String,
+        session: RpcSession,
+        expected_generation: u64,
+        expected_access: Option<(u64, Option<&str>)>,
+        authorize_and_commit: impl FnOnce(&RpcSession) -> Result<G, E>,
+        failure: impl Fn(&'static str) -> E,
+    ) -> Result<(), E> {
+        self.wait_test_goal_live_commit_before_map();
+        let mut sessions = self.sessions.blocking_lock();
+        self.publish_prepared_under_lock(
+            &mut sessions,
+            (id, session),
+            Some(expected_generation),
+            expected_access,
+            authorize_and_commit,
+            failure,
+        )
+    }
+
+    fn publish_prepared_under_lock<G, E>(
+        &self,
+        sessions: &mut HashMap<String, RpcSession>,
+        candidate: (String, RpcSession),
+        expected_generation: Option<u64>,
+        expected_access: Option<(u64, Option<&str>)>,
+        authorize: impl FnOnce(&RpcSession) -> Result<G, E>,
+        failure: impl Fn(&'static str) -> E,
+    ) -> Result<(), E> {
+        let (id, mut session) = candidate;
         if let Some((generation, owner)) = expected_access
             && !sessions.get(&id).is_some_and(|current| {
                 current.generation == generation && current.owner_tui_id() == owner
@@ -756,11 +1236,10 @@ impl SessionStore {
             return Err(failure("session already exists"));
         }
         let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
-        let Some((registered_generation, registered_session_generation, _)) = tokens.get_mut(&id)
-        else {
+        let Some(registration) = tokens.get_mut(&id) else {
             return Err(failure("prompt cancellation registration missing"));
         };
-        if *registered_generation != cancel_generation {
+        if registration.turn_generation != cancel_generation {
             return Err(failure("prompt cancellation registration changed"));
         }
         let _authority = authorize(&session)?;
@@ -769,7 +1248,7 @@ impl SessionStore {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             .wrapping_add(1);
 
-        *registered_session_generation = Some(session_generation);
+        registration.session_generation = Some(session_generation);
         session.generation = session_generation;
         sessions.insert(id, session);
         Ok(())
@@ -797,6 +1276,7 @@ impl SessionStore {
                 owner_tui_id,
                 None,
                 expected_access,
+                false,
                 |_, _, _, _| Ok::<(), std::convert::Infallible>(()),
             )
             .await?;
@@ -826,6 +1306,9 @@ impl SessionStore {
     /// the caller may still run it. Receiving the owner lets a caller that
     /// resolves its authority inside `authorize` judge ownership by that same
     /// resolution, not only by an `expected_owner` computed before the lock.
+    ///
+    /// An accepted resume taking responsibility for the RPC approval channel
+    /// claims a new ticket here, even if the steering owner is unchanged.
     pub(crate) async fn resume_existing_authorized<E, G>(
         &self,
         id: &str,
@@ -835,6 +1318,7 @@ impl SessionStore {
         owner_tui_id: Option<String>,
         expected_principal: Option<&str>,
         expected_access: Option<(u64, Option<&str>)>,
+        rebind_approval: bool,
         authorize: impl FnOnce(
             &str,
             &str,
@@ -879,9 +1363,21 @@ impl SessionStore {
             Ok(guard) => guard,
             Err(refused) => return Ok(Some(Err(refused))),
         };
+        if session
+            .goal_lifecycle_fences
+            .binding
+            .load(Ordering::Acquire)
+            != 0
+        {
+            return Err(ResumeExistingError::LifecyclePending);
+        }
 
         if owner_tui_id.is_some() {
             session.owner_binding.rebind(owner_tui_id);
+        }
+        let approval_rebind = rebind_approval.then(|| ApprovalRebindTicket(Arc::new(())));
+        if let Some(ticket) = &approval_rebind {
+            session.approval_rebind = Some(ticket.clone());
         }
         session.last_active = Instant::now();
         let message_count = session
@@ -895,6 +1391,7 @@ impl SessionStore {
             agent_alias: session.agent_alias.clone(),
             workspace_dir: session.workspace_dir.clone(),
             message_count,
+            approval_rebind,
         })))
     }
 
@@ -1199,16 +1696,242 @@ impl SessionStore {
         self.sessions.lock().await.get(id).map(|s| s.generation)
     }
 
+    async fn set_goal_destination(
+        &self,
+        id: &str,
+        generation: u64,
+        tui_id: &str,
+        destination: Arc<GoalFrameDestination>,
+        install: GoalDestinationInstall,
+    ) -> bool {
+        self.with_session_effect(id, |live| {
+            let Some(live) =
+                live.filter(|s| s.generation == generation && s.owner_tui_id() == Some(tui_id))
+            else {
+                return false;
+            };
+            let recipient = &live.owner_binding.goal_recipient;
+            let mut state = recipient.state.lock();
+            if state.closed
+                || destination.cancelled().is_cancelled()
+                || (matches!(install, GoalDestinationInstall::Vacant)
+                    && (state.active.is_some() || state.pending.is_some()))
+                || !destination.register(recipient)
+            {
+                return false;
+            }
+            match install {
+                GoalDestinationInstall::Offer => state.pending = Some(destination),
+                GoalDestinationInstall::Launch => {
+                    state.pending = None;
+                    state.replace_target(Some(destination));
+                }
+                GoalDestinationInstall::Vacant => state.replace_target(Some(destination)),
+            }
+            recipient.changed.notify_waiters();
+            true
+        })
+        .await
+    }
+
+    pub(super) async fn attach_goal_recipient(
+        &self,
+        id: &str,
+        generation: u64,
+        tui_id: &str,
+        destination: Arc<GoalFrameDestination>,
+    ) -> bool {
+        self.set_goal_destination(
+            id,
+            generation,
+            tui_id,
+            destination,
+            GoalDestinationInstall::Launch,
+        )
+        .await
+    }
+
+    /// Attach the issuer for a failed launch only if no recipient has a prior claim.
+    pub(super) async fn attach_vacant_goal_recipient(
+        &self,
+        id: &str,
+        generation: u64,
+        tui_id: &str,
+        destination: Arc<GoalFrameDestination>,
+    ) -> bool {
+        self.set_goal_destination(
+            id,
+            generation,
+            tui_id,
+            destination,
+            GoalDestinationInstall::Vacant,
+        )
+        .await
+    }
+
+    pub(super) async fn offer_goal_recipient(
+        &self,
+        id: &str,
+        generation: u64,
+        tui_id: &str,
+        destination: Arc<GoalFrameDestination>,
+    ) -> bool {
+        self.set_goal_destination(
+            id,
+            generation,
+            tui_id,
+            destination,
+            GoalDestinationInstall::Offer,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn goal_candidate_unsaved_for_test(&self, id: &str) -> Option<bool> {
+        self.with_session_effect(id, |live| {
+            live.map(|s| {
+                s.owner_binding
+                    .goal_recipient
+                    .state
+                    .lock()
+                    .unsaved_candidate
+            })
+        })
+        .await
+    }
+
+    pub(super) async fn goal_history_read(
+        &self,
+        id: &str,
+        outbound: &Arc<zeroclaw_api::jsonrpc::RpcOutbound>,
+    ) -> Option<GoalHistoryRead> {
+        let recipient = self
+            .with_session_effect(id, |live| {
+                live.map(|s| Arc::clone(&s.owner_binding.goal_recipient))
+            })
+            .await?;
+        recipient.begin_history(outbound, self).await
+    }
+
+    /// Wait for capacity without a session or authority lock. Then recheck
+    /// both the live reader and its authorization at the actual enqueue.
+    pub(super) async fn publish_goal_frame(
+        &self,
+        id: &str,
+        recipient: &Arc<GoalRecipient>,
+        frame: impl Into<GoalWireFrame>,
+        class: GoalFrameClass,
+    ) -> GoalFrameDelivery {
+        let mut frame = frame.into();
+        loop {
+            let notified = recipient.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let snapshot = {
+                let mut state = recipient.state.lock();
+                if state.closed {
+                    return GoalFrameDelivery::NotDelivered;
+                }
+                if class != GoalFrameClass::ParentEvent && state.history_read.is_some() {
+                    None
+                } else if let Some(target) = &state.active {
+                    Some((state.epoch, Arc::clone(target), state.superseded.clone()))
+                } else {
+                    state.finish_frame(class);
+                    recipient.changed.notify_waiters();
+                    return GoalFrameDelivery::NotDelivered;
+                }
+            };
+            let Some((epoch, target, superseded)) = snapshot else {
+                #[cfg(test)]
+                self.wait_test_effect_pause("goal-wait-attach-gate").await;
+                notified.await;
+                continue;
+            };
+            #[cfg(test)]
+            if class == GoalFrameClass::Candidate {
+                self.wait_test_effect_pause("goal-before-candidate-reserve")
+                    .await;
+            }
+            let permit = tokio::select! {
+                biased;
+                () = superseded.cancelled() => continue,
+                () = target.cancelled().cancelled() => None,
+                permit = target.outbound().reserve_frame() => permit,
+            };
+            let outcome = self
+                .with_session_effect(id, |live| {
+                    let Some(live) =
+                        live.filter(|s| Arc::ptr_eq(&s.owner_binding.goal_recipient, recipient))
+                    else {
+                        return Some(GoalFrameDelivery::NotDelivered);
+                    };
+                    let authority = target.admit_frame(live);
+                    let mut state = recipient.state.lock();
+                    if state.epoch != epoch
+                        || (class != GoalFrameClass::ParentEvent && state.history_read.is_some())
+                    {
+                        return None;
+                    }
+                    let sent = permit.filter(|_| authority.is_ok()).is_some_and(|permit| {
+                        target
+                            .with_live_tui_registration(|| {
+                                permit.send(frame.take_for(target.reply_occurrence_enabled()))
+                            })
+                            .is_some()
+                    });
+                    let outcome = if sent {
+                        GoalFrameDelivery::Delivered
+                    } else {
+                        if let Err(error) = &authority {
+                            ::zeroclaw_log::record!(
+                                DEBUG,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Reject
+                                )
+                                .with_category(::zeroclaw_log::EventCategory::Session)
+                                .with_attrs(
+                                    serde_json::json!({"session_id":id, "code":error.code})
+                                ),
+                                "Goal frame recipient is no longer available"
+                            );
+                        }
+                        state.replace_target(None);
+                        GoalFrameDelivery::NotDelivered
+                    };
+                    state.finish_frame(class);
+                    recipient.changed.notify_waiters();
+                    Some(outcome)
+                })
+                .await;
+            if let Some(outcome) = outcome {
+                return outcome;
+            }
+        }
+    }
+
     /// Snapshot the live session identity under one map lock.
     pub async fn generation_and_mode(
         &self,
         id: &str,
     ) -> Option<(u64, crate::rpc::types::ChatMode)> {
-        self.sessions
-            .lock()
+        self.history_incarnation(id)
             .await
-            .get(id)
-            .map(|session| (session.generation, session.chat_mode.clone()))
+            .map(|(identity, _)| identity)
+    }
+
+    /// Capture the live generation and its presentation namespace together.
+    pub(super) async fn history_incarnation(
+        &self,
+        id: &str,
+    ) -> Option<((u64, crate::rpc::types::ChatMode), uuid::Uuid)> {
+        self.sessions.lock().await.get(id).map(|session| {
+            (
+                (session.generation, session.chat_mode.clone()),
+                session.owner_binding.goal_recipient.reply_occurrence_scope,
+            )
+        })
     }
 
     /// The owning principal and generation of the LIVE incarnation under
@@ -1245,11 +1968,73 @@ impl SessionStore {
         matches
     }
 
-    /// Await the test-only pause gate before validating a captured session
-    /// identity or generation. Returns the
-    /// `done` notifier which must be signalled after the generation check
-    /// (and any apply attempt) completes so tests don't observe the
-    /// successor before the stale work has run its course.
+    /// Read the exact Goal-admission facts under one session-store lock.
+    pub(crate) async fn goal_session_snapshot(&self, id: &str) -> Option<GoalSessionSnapshot> {
+        self.sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|session| GoalSessionSnapshot {
+                goal_recipient: Arc::clone(&session.owner_binding.goal_recipient),
+                agent: Arc::clone(&session.agent),
+                reaction_channels: Arc::clone(&session.reaction_channels),
+                agent_alias: session.agent_alias.clone(),
+                chat_mode: session.chat_mode.clone(),
+                owner_tui_id: session.owner_tui_id().map(str::to_owned),
+                generation: session.generation,
+                goal_command: Arc::clone(&session.goal_command),
+                goal_lifecycle_fences: Arc::clone(&session.goal_lifecycle_fences),
+            })
+    }
+
+    /// Serialize a lifecycle action with Goal commands for one exact live
+    /// session generation. The generation is checked both before waiting and
+    /// after acquiring the session-owned lock, so a caller that was delayed by
+    /// a same-ID replacement cannot act on the successor's Goal.
+    pub(crate) async fn lock_goal_lifecycle(
+        &self,
+        id: &str,
+        expected_generation: u64,
+    ) -> Option<GoalLifecycleCommandGuard> {
+        let lock = {
+            let sessions = self.sessions.lock().await;
+            let session = sessions.get(id)?;
+            if session.generation != expected_generation {
+                return None;
+            }
+            Arc::clone(&session.goal_command)
+        };
+        let guard = lock.lock_owned().await;
+        self.sessions
+            .lock()
+            .await
+            .get(id)
+            .filter(|session| session.generation == expected_generation)
+            .map(|session| GoalLifecycleCommandGuard {
+                _command: guard,
+                fences: Arc::clone(&session.goal_lifecycle_fences),
+            })
+    }
+
+    /// Skip busy or replaced sessions during incidental sibling cleanup.
+    pub(crate) async fn try_lock_goal_lifecycle(
+        &self,
+        id: &str,
+        expected_generation: u64,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions.get(id)?;
+        if session.generation != expected_generation {
+            return None;
+        }
+        Arc::clone(&session.goal_command).try_lock_owned().ok()
+    }
+
+    /// Await the test-only pause gate before validating captured session
+    /// identity/generation in `set_overrides_gated` and
+    /// `apply_model_provider`. Returns the `done` notifier which must be
+    /// signalled after the check (and any apply attempt) completes so tests
+    /// don't observe the successor before stale work has run its course.
     #[cfg(test)]
     async fn wait_test_gate(&self) -> Option<Arc<tokio::sync::Notify>> {
         let (entered, release, done) = {
@@ -1378,6 +2163,47 @@ impl SessionStore {
     #[cfg(not(test))]
     #[inline(always)]
     async fn wait_test_upload_commit_pause(&self) {}
+
+    /// Arm a one-shot test hook immediately before a Goal live commit takes
+    /// the session map. Returns `(arrived, release)`; sending on `release`
+    /// lets the commit proceed.
+    #[cfg(test)]
+    pub(crate) fn install_test_goal_live_commit_before_map_pause(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, std::sync::mpsc::Sender<()>) {
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let (release, release_rx) = std::sync::mpsc::channel();
+        *self.test_goal_live_commit_before_map_pause.lock().unwrap() =
+            Some((Arc::clone(&arrived), release_rx));
+        (arrived, release)
+    }
+
+    #[cfg(test)]
+    fn wait_test_goal_live_commit_before_map(&self) {
+        let pause = self
+            .test_goal_live_commit_before_map_pause
+            .lock()
+            .unwrap()
+            .take();
+        if let Some((arrived, release)) = pause {
+            arrived.notify_one();
+            release.recv().unwrap();
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn wait_test_goal_live_commit_before_map(&self) {}
+
+    #[cfg(test)]
+    pub(crate) async fn hold_test_session_map(&self) -> impl Drop + '_ {
+        self.sessions.lock().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_test_session_map(&self) -> bool {
+        self.sessions.try_lock().is_ok()
+    }
 
     /// Arm a test-only hook for the next upload commit, run between its final
     /// authority check and its write.
@@ -1815,14 +2641,14 @@ impl SessionStore {
     }
 
     pub async fn remove(&self, id: &str) -> bool {
-        if let Some((_, _, token)) = self
+        if let Some(registration) = self
             .cancel_tokens
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(id)
         {
             self.record_cancel_cause(id, CancelCause::SessionRemoved);
-            token.cancel();
+            registration.token.cancel();
         }
         let (removed, pending) = self
             .sessions
@@ -1857,19 +2683,56 @@ impl SessionStore {
         authorize: impl FnOnce(Option<&str>) -> Result<G, E>,
     ) -> Result<bool, E> {
         let mut sessions = self.sessions.lock().await;
+        self.remove_generation_under_lock(
+            &mut sessions,
+            id,
+            generation,
+            CancelCause::SessionRemoved,
+            authorize,
+            || Ok(()),
+        )
+    }
+
+    /// Final exact live removal from the blocking owner of a prepared Goal
+    /// disposition. Take the session map before the commit can wait for the
+    /// task-store writer. The caller must not hold a task-store connection.
+    /// Reject a stale incarnation before recording a commit.
+    pub(super) fn remove_generation_with_commit<G, E>(
+        &self,
+        id: &str,
+        generation: u64,
+        cause: CancelCause,
+        authorize: impl FnOnce(Option<&str>) -> Result<G, E>,
+        commit: impl FnOnce() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        self.wait_test_goal_live_commit_before_map();
+        let mut sessions = self.sessions.blocking_lock();
+        self.remove_generation_under_lock(&mut sessions, id, generation, cause, authorize, commit)
+    }
+
+    fn remove_generation_under_lock<G, E>(
+        &self,
+        sessions: &mut HashMap<String, RpcSession>,
+        id: &str,
+        generation: u64,
+        cause: CancelCause,
+        authorize: impl FnOnce(Option<&str>) -> Result<G, E>,
+        commit: impl FnOnce() -> Result<(), E>,
+    ) -> Result<bool, E> {
         let Some(session) = sessions.get(id).filter(|s| s.generation == generation) else {
             return Ok(false);
         };
         let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
         let mut causes = self.cancel_causes.lock().unwrap_or_else(|e| e.into_inner());
         let _authority = authorize(session.owner_principal_id.as_deref())?;
+        commit()?;
         if tokens
             .get(id)
-            .is_some_and(|(_, bound, _)| *bound == Some(generation))
-            && let Some((_, _, token)) = tokens.remove(id)
+            .is_some_and(|registration| registration.session_generation == Some(generation))
+            && let Some(registration) = tokens.remove(id)
         {
-            causes.insert(id.to_string(), CancelCause::SessionRemoved);
-            token.cancel();
+            causes.insert(id.to_string(), cause);
+            registration.token.cancel();
         }
         let pending = sessions
             .remove(id)
@@ -1880,12 +2743,12 @@ impl SessionStore {
         Ok(true)
     }
 
-    pub async fn evict_same_mode_sibling(
+    pub(crate) async fn same_mode_sibling_eviction_candidates(
         &self,
         tui_id: &str,
         chat_mode: &crate::rpc::types::ChatMode,
         except_id: &str,
-    ) -> Vec<(String, String)> {
+    ) -> Vec<SameModeSiblingEvictionCandidate> {
         let in_flight: std::collections::HashSet<String> = self
             .cancel_tokens
             .lock()
@@ -1893,8 +2756,9 @@ impl SessionStore {
             .keys()
             .cloned()
             .collect();
-        let mut sessions = self.sessions.lock().await;
-        let victims: Vec<String> = sessions
+        self.sessions
+            .lock()
+            .await
             .iter()
             .filter(|(key, s)| {
                 key.as_str() != except_id
@@ -1902,23 +2766,56 @@ impl SessionStore {
                     && &s.chat_mode == chat_mode
                     && !in_flight.contains(key.as_str())
             })
-            .map(|(key, _)| key.clone())
-            .collect();
-        let mut evicted = Vec::with_capacity(victims.len());
-        let mut pending = Vec::new();
-        for key in victims {
-            if let Some(s) = sessions.remove(&key) {
-                if let Some(notify) = s.pending_generation {
-                    pending.push(notify);
-                }
-                evicted.push((key, s.agent_alias));
-            }
+            .map(|(key, session)| SameModeSiblingEvictionCandidate {
+                id: key.clone(),
+                generation: session.generation,
+            })
+            .collect()
+    }
+
+    /// Remove one exact idle sibling while its actor queue is reserved for
+    /// eviction. Both the live generation and owner/mode stamps are checked
+    /// under the session-store lock; a later incarnation under the same id is
+    /// never removed by stale LRU work.
+    pub(crate) async fn evict_same_mode_sibling_candidate<G>(
+        &self,
+        guard: &SessionEvictionGuard,
+        candidate: &SameModeSiblingEvictionCandidate,
+        tui_id: &str,
+        chat_mode: &crate::rpc::types::ChatMode,
+        except_id: &str,
+        authorize: impl FnOnce(Option<&str>) -> Option<G>,
+    ) -> Option<(String, String)> {
+        debug_assert_eq!(guard.session_id(), candidate.id);
+        if guard.session_id() != candidate.id || candidate.id == except_id {
+            return None;
         }
+
+        let mut sessions = self.sessions.lock().await;
+        let has_cancel_token = self
+            .cancel_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&candidate.id);
+        if has_cancel_token {
+            return None;
+        }
+        let session = sessions.get(&candidate.id).filter(|session| {
+            session.generation == candidate.generation
+                && session.owner_tui_id() == Some(tui_id)
+                && &session.chat_mode == chat_mode
+        })?;
+        let authority = authorize(session.owner_principal_id.as_deref())?;
+
+        let session = sessions.remove(&candidate.id)?;
+        let pending = session.pending_generation;
+        let agent_alias = session.agent_alias;
+        drop(authority);
         drop(sessions);
-        for notify in pending {
+        if let Some(notify) = pending {
             notify.notify_waiters();
         }
-        evicted
+        Some((candidate.id.clone(), agent_alias))
     }
 
     /// Read the `owner_tui_id` stamp from a session. Returns `None` if the
@@ -2079,17 +2976,23 @@ impl SessionStore {
         session_generation: Option<u64>,
         token: tokio_util::sync::CancellationToken,
     ) -> u64 {
-        let generation = self
+        let turn_generation = self
             .cancel_generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             .wrapping_add(1);
-        if let Some((_, _, stale)) =
-            tokens.insert(id.to_string(), (generation, session_generation, token))
-        {
-            stale.cancel();
+        if let Some(stale) = tokens.insert(
+            id.to_string(),
+            CancelTokenEntry {
+                turn_generation,
+                session_generation,
+                token,
+                goal_close: None,
+            },
+        ) {
+            stale.token.cancel();
         }
         self.cancel_tokens_changed.notify_waiters();
-        generation
+        turn_generation
     }
 
     /// Complete admission and register its cancellation generation atomically
@@ -2332,30 +3235,36 @@ impl SessionStore {
     }
 
     pub fn remove_cancel_token(&self, id: &str, generation: u64) {
-        let removed = {
+        self.unregister_cancel_token(id, generation, false);
+    }
+
+    fn unregister_cancel_token(
+        &self,
+        id: &str,
+        generation: u64,
+        take_detached_cause: bool,
+    ) -> (Option<CancelCause>, Option<GoalCloseHandoff>) {
+        let (registration, cause) = {
             let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
             match tokens.get(id) {
-                Some((g, _, _)) if *g == generation => {
-                    tokens.remove(id);
-                    true
+                Some(entry) if entry.turn_generation == generation => {
+                    (tokens.remove(id), self.take_cancel_cause(id))
                 }
-                _ => false,
+                // An external session removal can detach the token but leave
+                // attribution for its finalizer. Never consume a successor's
+                // cause or close ticket when a different turn is registered.
+                None if take_detached_cause => return (self.take_cancel_cause(id), None),
+                _ => return (None, None),
             }
         };
-        if !removed {
-            return;
-        }
         {
             let mut steering = self.steering.lock().unwrap_or_else(|e| e.into_inner());
             if steering.get(id).is_some_and(|(g, _)| *g == generation) {
                 steering.remove(id);
             }
         }
-        self.cancel_causes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(id);
         self.cancel_tokens_changed.notify_waiters();
+        (cause, registration.and_then(|entry| entry.goal_close))
     }
 
     /// Cancel every active turn and wait until each owner has removed its
@@ -2374,7 +3283,7 @@ impl SessionStore {
                 let mut causes = self.cancel_causes.lock().unwrap_or_else(|e| e.into_inner());
                 let tokens: Vec<(String, tokio_util::sync::CancellationToken)> = token_guard
                     .iter()
-                    .map(|(id, (_, _, token))| (id.clone(), token.clone()))
+                    .map(|(id, registration)| (id.clone(), registration.token.clone()))
                     .collect();
                 for (id, _) in &tokens {
                     causes.entry(id.clone()).or_insert(cause);
@@ -2463,12 +3372,10 @@ impl SessionStore {
         let tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
         tokens
             .get(id)
-            .filter(|(_, registered_generation, _)| {
-                *registered_generation == Some(session_generation)
-            })
-            .map(|(_, _, token)| {
+            .filter(|registration| registration.session_generation == Some(session_generation))
+            .map(|registration| {
                 self.record_cancel_cause(id, cause);
-                token.cancel();
+                registration.token.cancel();
                 true
             })
             .unwrap_or(false)
@@ -2482,6 +3389,28 @@ impl SessionStore {
         expected_access: Option<(u64, Option<&str>)>,
         cause: CancelCause,
         authorize: impl FnOnce(Option<&str>) -> Result<G, E>,
+    ) -> Result<Option<bool>, E> {
+        self.signal_cancellation_authorized_with_close(
+            id,
+            generation,
+            expected_access,
+            cause,
+            authorize,
+            None,
+        )
+        .await
+    }
+
+    /// Install a close handoff only on the exact live turn this call cancels.
+    /// A second cancellation cannot adopt or overwrite an existing handoff.
+    pub(super) async fn signal_cancellation_authorized_with_close<G, E>(
+        &self,
+        id: &str,
+        generation: Option<u64>,
+        expected_access: Option<(u64, Option<&str>)>,
+        cause: CancelCause,
+        authorize: impl FnOnce(Option<&str>) -> Result<G, E>,
+        ticket: Option<GoalCloseHandoff>,
     ) -> Result<Option<bool>, E> {
         let sessions = self.sessions.lock().await;
         let current = sessions.get(id);
@@ -2497,15 +3426,23 @@ impl SessionStore {
         let Some(session) = current else {
             return Ok(Some(false));
         };
-        let tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
         let mut causes = self.cancel_causes.lock().unwrap_or_else(|e| e.into_inner());
         let _authority = authorize(session.owner_principal_id.as_deref())?;
-        let Some((_, _, token)) = tokens.get(id).filter(|(_, bound, _)| *bound == generation)
+        let Some(registration) = tokens
+            .get_mut(id)
+            .filter(|entry| entry.session_generation == generation)
         else {
             return Ok(Some(false));
         };
+        if ticket.is_some() {
+            if registration.goal_close.is_some() || registration.token.is_cancelled() {
+                return Ok(Some(false));
+            }
+            registration.goal_close = ticket;
+        }
         causes.insert(id.to_string(), cause);
-        token.cancel();
+        registration.token.cancel();
         Ok(Some(true))
     }
 
@@ -2519,9 +3456,9 @@ impl SessionStore {
         let tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
         tokens
             .get(id)
-            .map(|(_, _, token)| {
+            .map(|registration| {
                 self.record_cancel_cause(id, cause);
-                token.cancel();
+                registration.token.cancel();
                 true
             })
             .unwrap_or(false)
@@ -2558,16 +3495,16 @@ impl SessionStore {
         };
         // Lock order: cancel tokens, then steering (the only nesting).
         let tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
-        let Some((turn_generation, _, _)) = tokens
+        let Some(registration) = tokens
             .get(id)
-            .filter(|(_, registered, _)| *registered == Some(session_generation))
+            .filter(|entry| entry.session_generation == Some(session_generation))
         else {
             return SteerOutcome::NoActiveTurn;
         };
         let steering = self.steering.lock().unwrap_or_else(|e| e.into_inner());
         let Some((_, sender)) = steering
             .get(id)
-            .filter(|(generation, _)| generation == turn_generation)
+            .filter(|(generation, _)| *generation == registration.turn_generation)
         else {
             return SteerOutcome::NoActiveTurn;
         };
@@ -2594,18 +3531,18 @@ impl SessionStore {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .get(id)
-            .map(|(generation, _, _)| *generation)
+            .map(|registration| registration.turn_generation)
     }
 
     pub async fn kill_session(&self, id: &str) -> bool {
-        if let Some((_, _, token)) = self
+        if let Some(registration) = self
             .cancel_tokens
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(id)
         {
             self.record_cancel_cause(id, CancelCause::AdminKill);
-            token.cancel();
+            registration.token.cancel();
         }
         let (removed, pending) = self
             .sessions
@@ -2640,27 +3577,14 @@ impl SessionStore {
         authorize: impl FnOnce(Option<&str>) -> Result<G, E>,
     ) -> Result<bool, E> {
         let mut sessions = self.sessions.lock().await;
-        let Some(session) = sessions.get(id).filter(|s| s.generation == generation) else {
-            return Ok(false);
-        };
-        let mut tokens = self.cancel_tokens.lock().unwrap_or_else(|e| e.into_inner());
-        let mut causes = self.cancel_causes.lock().unwrap_or_else(|e| e.into_inner());
-        let _authority = authorize(session.owner_principal_id.as_deref())?;
-        if tokens
-            .get(id)
-            .is_some_and(|(_, bound, _)| *bound == Some(generation))
-            && let Some((_, _, token)) = tokens.remove(id)
-        {
-            causes.insert(id.to_string(), CancelCause::AdminKill);
-            token.cancel();
-        }
-        let pending = sessions
-            .remove(id)
-            .and_then(|session| session.pending_generation);
-        if let Some(notify) = pending {
-            notify.notify_waiters();
-        }
-        Ok(true)
+        self.remove_generation_under_lock(
+            &mut sessions,
+            id,
+            generation,
+            CancelCause::AdminKill,
+            authorize,
+            || Ok(()),
+        )
     }
 
     /// Record the cause for an imminent cancel-token fire. Call immediately
@@ -2741,6 +3665,69 @@ mod tests {
 
     fn make_store(max: usize) -> SessionStore {
         SessionStore::new(max, Arc::new(SessionActorQueue::new(4, 10, 60)))
+    }
+
+    #[tokio::test]
+    async fn approval_rebind_claim_changes_only_on_accepted_rpc_handoffs() {
+        use crate::rpc::types::ChatMode;
+
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "test", ".", ChatMode::Chat)
+                    .with_owner(Some("same-tui".into())),
+            )
+            .await
+            .unwrap();
+        let resume = |rebind_approval, authorized| {
+            store.resume_existing_authorized(
+                "s",
+                "test",
+                &ChatMode::Chat,
+                None,
+                Some("same-tui".into()),
+                None,
+                None,
+                rebind_approval,
+                move |_, _, _, _| {
+                    if authorized { Ok(()) } else { Err("refused") }
+                },
+            )
+        };
+        let first = resume(true, true).await.unwrap().unwrap().unwrap();
+        let first_ticket = first.approval_rebind.unwrap();
+        let steering = store
+            .with_session_effect("s", |session| {
+                session.unwrap().owner_binding.revoked.clone()
+            })
+            .await;
+        assert!(matches!(
+            resume(true, false).await,
+            Ok(Some(Err("refused")))
+        ));
+        let non_rpc = resume(false, true).await.unwrap().unwrap().unwrap();
+        assert!(non_rpc.approval_rebind.is_none());
+        store
+            .with_session_effect("s", |session| {
+                assert!(session.unwrap().has_approval_rebind(&first_ticket));
+            })
+            .await;
+
+        let second = resume(true, true).await.unwrap().unwrap().unwrap();
+        assert_eq!(first.generation, second.generation);
+        let second_ticket = second.approval_rebind.unwrap();
+        store
+            .with_session_effect("s", |session| {
+                let session = session.unwrap();
+                assert!(!session.has_approval_rebind(&first_ticket));
+                assert!(session.has_approval_rebind(&second_ticket));
+                assert!(
+                    !steering.is_cancelled(),
+                    "same-TUI handoff changes approval custody, not steering ownership"
+                );
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -2973,6 +3960,120 @@ mod tests {
             "a queued generation must not inherit cancellation"
         );
         assert_eq!(registration.finish(), None);
+    }
+
+    #[tokio::test]
+    async fn goal_close_handoff_requires_and_stays_with_the_authorized_turn() {
+        const ID: &str = "s";
+        let store = make_store(4);
+        store
+            .insert(
+                ID.into(),
+                RpcSession::new(
+                    make_agent(),
+                    "agent",
+                    "/tmp",
+                    super::super::types::ChatMode::Acp,
+                ),
+            )
+            .await
+            .unwrap();
+        let session_generation = store.get_generation(ID).await;
+        let token = tokio_util::sync::CancellationToken::new();
+        let (guard, current) = store
+            .acquire_prompt(ID, session_generation, token.clone())
+            .await
+            .unwrap();
+        let stale = CancelTokenRegistration {
+            store: &store,
+            session_id: ID,
+            generation: Some(current.generation().wrapping_sub(1)),
+        };
+        assert_eq!(
+            store
+                .signal_cancellation_authorized_with_close(
+                    ID,
+                    None,
+                    None,
+                    CancelCause::SessionRemoved,
+                    |_| -> Result<(), ()> {
+                        panic!("a stale session generation cannot reach authorization")
+                    },
+                    Some(GoalCloseHandoff::detached_for_test()),
+                )
+                .await,
+            Ok::<_, ()>(None)
+        );
+        assert_eq!(
+            store
+                .signal_cancellation_authorized_with_close(
+                    ID,
+                    session_generation,
+                    None,
+                    CancelCause::SessionRemoved,
+                    |_| Err::<(), _>("revoked"),
+                    Some(GoalCloseHandoff::detached_for_test()),
+                )
+                .await,
+            Err("revoked")
+        );
+        assert!(!token.is_cancelled());
+
+        for attached in [true, false] {
+            assert_eq!(
+                store
+                    .signal_cancellation_authorized_with_close(
+                        ID,
+                        session_generation,
+                        None,
+                        CancelCause::SessionRemoved,
+                        |_| Ok::<_, ()>(()),
+                        Some(GoalCloseHandoff::detached_for_test()),
+                    )
+                    .await,
+                Ok(Some(attached))
+            );
+        }
+        assert!(token.is_cancelled());
+        // Later ordinary cancellation can change attribution, not custody.
+        assert!(store.cancel_session(ID));
+
+        let (cause, close) = stale.finish_with_goal_close();
+        assert_eq!(cause, None);
+        assert!(close.is_none());
+        assert!(store.has_inflight_turn(ID));
+        let (cause, close) = current.finish_with_goal_close();
+        assert_eq!(cause, Some(CancelCause::ClientRpc));
+        assert!(close.is_some());
+        assert!(!store.has_inflight_turn(ID));
+        drop(guard);
+
+        let (_guard, next) = store
+            .acquire_prompt(
+                ID,
+                session_generation,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(store.cancel_session(ID));
+        assert_eq!(
+            store
+                .signal_cancellation_authorized_with_close(
+                    ID,
+                    session_generation,
+                    None,
+                    CancelCause::SessionRemoved,
+                    |_| Ok::<_, ()>(()),
+                    Some(GoalCloseHandoff::detached_for_test()),
+                )
+                .await,
+            Ok(Some(false)),
+            "a close must not adopt an earlier ordinary cancellation"
+        );
+        let (cause, close) = next.finish_with_goal_close();
+        assert_eq!(cause, Some(CancelCause::ClientRpc));
+        assert!(close.is_none());
     }
 
     #[tokio::test]
@@ -3545,12 +4646,49 @@ mod tests {
             .await
             .unwrap();
 
-        let evicted = store
-            .evict_same_mode_sibling("tui1", &ChatMode::Chat, "new_chat")
+        let candidates = store
+            .same_mode_sibling_eviction_candidates("tui1", &ChatMode::Chat, "new_chat")
             .await;
-
-        let ids: Vec<&str> = evicted.iter().map(|(id, _)| id.as_str()).collect();
+        let ids: Vec<&str> = candidates
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect();
         assert_eq!(ids, vec!["old_chat"]);
+        assert!(
+            store.get_agent("old_chat").await.is_some(),
+            "candidate discovery must not remove a session"
+        );
+        let eviction_guard = store
+            .session_queue
+            .try_begin_eviction("old_chat")
+            .await
+            .expect("idle candidate can be reserved");
+        assert!(
+            store
+                .evict_same_mode_sibling_candidate(
+                    &eviction_guard,
+                    &candidates[0],
+                    "tui1",
+                    &ChatMode::Chat,
+                    "new_chat",
+                    |_| None::<()>,
+                )
+                .await
+                .is_none(),
+            "a denied final effect must retain the exact live sibling"
+        );
+        assert!(store.get_agent("old_chat").await.is_some());
+        let evicted = store
+            .evict_same_mode_sibling_candidate(
+                &eviction_guard,
+                &candidates[0],
+                "tui1",
+                &ChatMode::Chat,
+                "new_chat",
+                |_| Some(()),
+            )
+            .await;
+        assert_eq!(evicted, Some(("old_chat".to_string(), "a".to_string())));
         assert!(
             store.get_agent("new_chat").await.is_some(),
             "new session preserved"
@@ -3567,6 +4705,54 @@ mod tests {
             store.get_agent("old_chat").await.is_none(),
             "abandoned same-mode session evicted"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_same_mode_eviction_candidate_preserves_replacement_generation() {
+        use crate::rpc::types::ChatMode;
+        let store = make_store(8);
+        let mk = || {
+            RpcSession::new(make_agent(), "a", ".", ChatMode::Chat)
+                .with_owner(Some("tui1".to_string()))
+        };
+        store.insert("old_chat".into(), mk()).await.unwrap();
+        let candidate = store
+            .same_mode_sibling_eviction_candidates("tui1", &ChatMode::Chat, "new_chat")
+            .await
+            .remove(0);
+
+        let admission = store.session_queue.acquire("old_chat").await.unwrap();
+        assert!(
+            store
+                .remove_generation("old_chat", candidate.generation)
+                .await
+        );
+        store
+            .insert_admitted(&admission, "old_chat".to_string(), mk())
+            .await
+            .unwrap();
+        drop(admission);
+
+        let eviction_guard = store
+            .session_queue
+            .try_begin_eviction("old_chat")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .evict_same_mode_sibling_candidate(
+                    &eviction_guard,
+                    &candidate,
+                    "tui1",
+                    &ChatMode::Chat,
+                    "new_chat",
+                    |_| Some(()),
+                )
+                .await
+                .is_none(),
+            "stale LRU work must not remove a same-id successor"
+        );
+        assert!(store.get_agent("old_chat").await.is_some());
     }
 
     #[tokio::test]
@@ -3591,7 +4777,7 @@ mod tests {
         store.register_cancel_token("busy_chat", token.clone());
 
         let evicted = store
-            .evict_same_mode_sibling("tui1", &ChatMode::Chat, "new_chat")
+            .same_mode_sibling_eviction_candidates("tui1", &ChatMode::Chat, "new_chat")
             .await;
 
         assert!(
@@ -3605,6 +4791,36 @@ mod tests {
         assert!(
             !token.is_cancelled(),
             "eviction must not fire a mid-turn cancel token"
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_same_mode_sibling_skips_session_queue_owner() {
+        use crate::rpc::types::ChatMode;
+        let store = make_store(8);
+        let mk = |owner: &str| {
+            RpcSession::new(make_agent(), "a", ".", ChatMode::Chat)
+                .with_owner(Some(owner.to_string()))
+        };
+        store.insert("busy_chat".into(), mk("tui1")).await.unwrap();
+        store.insert("new_chat".into(), mk("tui1")).await.unwrap();
+        let _turn_guard = store.session_queue.acquire("busy_chat").await.unwrap();
+
+        let candidates = store
+            .same_mode_sibling_eviction_candidates("tui1", &ChatMode::Chat, "new_chat")
+            .await;
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            store
+                .session_queue
+                .try_begin_eviction(&candidates[0].id)
+                .await
+                .is_none()
+        );
+
+        assert!(
+            store.get_agent("busy_chat").await.is_some(),
+            "session must remain until its actor releases the queue"
         );
     }
 
@@ -3889,6 +5105,234 @@ mod tests {
         assert_ne!(
             g_a, g_a2,
             "replacing a same-ID session must bump the generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn goal_lifecycle_fences_release_command_lock_and_remain_generation_owned() {
+        use crate::rpc::types::ChatMode;
+
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "x", ".", ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let original = store.goal_session_snapshot("s").await.unwrap();
+        let first = store
+            .lock_goal_lifecycle("s", original.generation)
+            .await
+            .unwrap()
+            .fence_for_binding(true);
+        assert!(original.goal_admission_is_fenced());
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            store.lock_goal_lifecycle("s", original.generation),
+        )
+        .await
+        .expect("a fence must not retain the Goal command mutex")
+        .unwrap()
+        .fence_for_binding(true);
+        drop(first);
+        assert!(original.goal_admission_is_fenced());
+
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "x", ".", ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let successor = store.goal_session_snapshot("s").await.unwrap();
+        assert_ne!(successor.generation, original.generation);
+        assert!(!successor.goal_admission_is_fenced());
+        drop(second);
+        assert!(!original.goal_admission_is_fenced());
+        assert!(!successor.goal_admission_is_fenced());
+    }
+
+    #[tokio::test]
+    async fn admission_only_goal_fence_keeps_same_mode_rebind_available() {
+        use crate::rpc::types::ChatMode;
+
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "x", ".", ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let original = store.goal_session_snapshot("s").await.unwrap();
+        let admission = store
+            .lock_goal_lifecycle("s", original.generation)
+            .await
+            .unwrap()
+            .fence_for_binding(false);
+        let binding = store
+            .lock_goal_lifecycle("s", original.generation)
+            .await
+            .unwrap()
+            .fence_for_binding(true);
+        assert!(matches!(
+            store
+                .resume_existing("s", "x", &ChatMode::Chat, Some("new-client".into()), None)
+                .await,
+            Err(ResumeExistingError::LifecyclePending)
+        ));
+        assert_eq!(
+            store.session_access_snapshot("s").await,
+            Some((original.generation, None))
+        );
+
+        drop(binding);
+        assert!(original.goal_admission_is_fenced());
+        let rebound = store
+            .resume_existing("s", "x", &ChatMode::Chat, Some("new-client".into()), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rebound.generation, original.generation);
+        assert!(Arc::ptr_eq(&rebound.agent, &original.agent));
+        assert_eq!(
+            store.session_access_snapshot("s").await,
+            Some((original.generation, Some("new-client".into())))
+        );
+
+        drop(admission);
+        assert!(!original.goal_admission_is_fenced());
+    }
+
+    #[tokio::test]
+    async fn live_disposition_commits_only_after_final_authority_and_identity_checks() {
+        use crate::rpc::types::ChatMode;
+
+        let store = Arc::new(make_store(4));
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "first", ".", ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let original = store.get_generation("s").await.unwrap();
+        let effect_store = Arc::clone(&store);
+        tokio::task::spawn_blocking(move || {
+            let denied = effect_store.remove_generation_with_commit(
+                "s",
+                original,
+                CancelCause::SessionRemoved,
+                |_| Err::<(), _>("denied at effect"),
+                || panic!("a denied effect must not commit"),
+            );
+            assert_eq!(denied, Err("denied at effect"));
+            let durable_failure = effect_store.publish_prepared_with_commit(
+                "s".into(),
+                RpcSession::new(make_agent(), "second", ".", ChatMode::Acp),
+                original,
+                None,
+                |_| Err::<(), _>("disposition commit failed"),
+                |failure| failure,
+            );
+            assert_eq!(durable_failure, Err("disposition commit failed"));
+        })
+        .await
+        .unwrap();
+        assert_eq!(store.get_generation("s").await, Some(original));
+        assert_eq!(store.chat_mode("s").await, Some(ChatMode::Chat));
+
+        let effect_store = Arc::clone(&store);
+        let removed = tokio::task::spawn_blocking(move || {
+            let stale = effect_store
+                .remove_generation_with_commit(
+                    "s",
+                    original + 1,
+                    CancelCause::SessionRemoved,
+                    |_| Ok::<_, &'static str>(()),
+                    || panic!("a stale generation must not commit"),
+                )
+                .unwrap();
+            assert!(!stale);
+            effect_store
+                .remove_generation_with_commit(
+                    "s",
+                    original,
+                    CancelCause::SessionRemoved,
+                    |_| Ok::<_, &'static str>(()),
+                    || Ok(()),
+                )
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(removed);
+        assert_eq!(store.get_generation("s").await, None);
+    }
+
+    #[tokio::test]
+    async fn goal_snapshot_reads_one_generation_with_its_authority_facts() {
+        use crate::rpc::types::ChatMode;
+
+        let store = make_store(4);
+        store
+            .insert(
+                "goal".into(),
+                RpcSession::new(make_agent(), "first", ".", ChatMode::Chat)
+                    .with_owner(Some("tui-first".into())),
+            )
+            .await
+            .unwrap();
+        let first = store
+            .goal_session_snapshot("goal")
+            .await
+            .expect("first Goal session snapshot");
+        assert_eq!(first.agent_alias, "first");
+        assert_eq!(first.owner_tui_id.as_deref(), Some("tui-first"));
+        assert_eq!(first.chat_mode, ChatMode::Chat);
+        assert!(Arc::ptr_eq(
+            &first.reaction_channels,
+            &first.agent.lock().await.channel_handles().reaction,
+        ));
+
+        let first_goal_command = Arc::clone(&first.goal_command);
+        let reattached = store
+            .goal_session_snapshot("goal")
+            .await
+            .expect("reattached Goal session snapshot");
+        assert!(
+            Arc::ptr_eq(&first_goal_command, &reattached.goal_command),
+            "same live session must retain its Goal command lock"
+        );
+        assert!(Arc::ptr_eq(
+            &first.reaction_channels,
+            &reattached.reaction_channels,
+        ));
+
+        store
+            .insert(
+                "goal".into(),
+                RpcSession::new(make_agent(), "second", ".", ChatMode::Acp)
+                    .with_owner(Some("tui-second".into())),
+            )
+            .await
+            .unwrap();
+        let second = store
+            .goal_session_snapshot("goal")
+            .await
+            .expect("replacement Goal session snapshot");
+        assert_ne!(first.generation, second.generation);
+        assert_eq!(second.agent_alias, "second");
+        assert_eq!(second.owner_tui_id.as_deref(), Some("tui-second"));
+        assert_eq!(second.chat_mode, ChatMode::Acp);
+        assert!(!Arc::ptr_eq(
+            &first.reaction_channels,
+            &second.reaction_channels,
+        ));
+        assert!(
+            !Arc::ptr_eq(&first_goal_command, &second.goal_command),
+            "same-ID replacement must receive a fresh Goal command lock"
         );
     }
 

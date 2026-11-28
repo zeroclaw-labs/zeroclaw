@@ -267,6 +267,168 @@ rpc_type! {
 }
 
 rpc_type! {
+    /// A transport-neutral Goal control command bound to an existing live
+    /// ZeroCode session. The daemon derives agent, route, and current TUI
+    /// identity from the session; clients cannot submit those authority facts.
+    pub struct SessionGoalParams {
+        pub session_id: String,
+        pub command: String,
+    }
+}
+
+rpc_type! {
+    /// Typed Goal lifecycle result for both local IPC and WSS clients.
+    pub struct SessionGoalResult {
+        pub response: GoalResponseWire,
+    }
+}
+
+rpc_type! {
+    /// Asynchronous Goal lifecycle update. Ordinary agent events, including
+    /// parent-turn chunks and failures, use the normal `session/update` stream.
+    pub enum SessionGoalUpdate {
+        CommandFailed { session_id: String },
+        /// Successful parent candidate presentation fallback after ordinary
+        /// events drain. The legacy name is not a verifier verdict or proof of
+        /// durable candidate persistence; lifecycle updates carry those outcomes.
+        VerifiedCandidate {
+            session_id: String,
+            candidate: String,
+            /// Opaque presentation identity, sent only to opted-in peers.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            reply_occurrence: Option<String>,
+        },
+        Completed { session_id: String },
+        PausedForBlocker { session_id: String },
+        Failed {
+            session_id: String,
+            reason: GoalFailureReasonWire,
+        },
+        Lifecycle {
+            session_id: String,
+            response: GoalResponseWire,
+        },
+    }
+}
+
+rpc_type! {
+    /// Read-only Goal status presented to a native RPC client.
+    #[derive(PartialEq)]
+    pub struct GoalStatusWire {
+        pub task_id: String,
+        pub status: GoalTaskStatusWire,
+        pub execution_epoch: i64,
+        pub token_limit: Option<u64>,
+        pub cost_limit_usd: Option<f64>,
+        pub accounting_state: GoalAccountingStateWire,
+        pub pause_reason: Option<GoalPauseReasonWire>,
+        pub resumable: bool,
+    }
+}
+
+rpc_type! {
+    /// Result tags shared by synchronous replies and lifecycle updates.
+    #[serde(tag = "kind", content = "status")]
+    #[derive(PartialEq)]
+    pub enum GoalResponseWire {
+        Help,
+        Disabled,
+        NoCurrentGoal,
+        SessionUnavailable,
+        AlreadyActive,
+        BudgetRequired,
+        Stale,
+        Queued(GoalQueuedControlWire),
+        TransitionPending(GoalPendingActionWire),
+        Started(GoalStatusWire),
+        Status(GoalStatusWire),
+        Budget(GoalStatusWire),
+        BudgetUpdated(GoalStatusWire),
+        Paused(GoalStatusWire),
+        AlreadyPaused(GoalStatusWire),
+        Resumed(GoalStatusWire),
+        Cancelled(GoalStatusWire),
+        AlreadyCancelled(GoalStatusWire),
+        Terminal(GoalStatusWire),
+    }
+}
+
+rpc_type! {
+    #[derive(Copy, PartialEq, Eq)]
+    pub enum GoalFailureReasonWire {
+        AgentOperationFailed,
+        ToolResultsUnpaired,
+        EmptyAgentResponse,
+        VerifierOperationFailed,
+        VerifierResponseInvalid,
+        AccountingIncomplete,
+        PricingIncomplete,
+        OperationOutcomeUnknown,
+        ExecutorStartFailed,
+        ExecutorFailed,
+        CandidatePersistenceFailed,
+        Other,
+    }
+}
+
+rpc_type! {
+    #[derive(Copy, PartialEq, Eq)]
+    pub enum GoalAccountingStateWire {
+        Complete,
+        Missing,
+        Invalid,
+        OutcomeUnknown,
+    }
+}
+
+rpc_type! {
+    #[derive(Copy, PartialEq, Eq)]
+    pub enum GoalTaskStatusWire {
+        Running,
+        Paused,
+        Completed,
+        Failed,
+        Cancelled,
+        Lost,
+        TimedOut,
+    }
+}
+
+rpc_type! {
+    #[derive(Copy, PartialEq, Eq)]
+    pub enum GoalPauseReasonWire {
+        OperatorPaused,
+        NeedsUserInput,
+        HumanEscalation,
+        ExternalDependency,
+        ProviderUnavailable,
+        VerifierBlocked,
+        BudgetExhausted,
+        BudgetUnavailable,
+        #[serde(rename = "daemon_restarted", alias = "daemon_restart")]
+        DaemonRestart,
+    }
+}
+
+rpc_type! {
+    #[derive(Copy, PartialEq, Eq)]
+    pub enum GoalQueuedControlWire {
+        Start,
+        Resume,
+        Pause,
+        Budget,
+    }
+}
+
+rpc_type! {
+    #[derive(Copy, PartialEq, Eq)]
+    pub enum GoalPendingActionWire {
+        Pause,
+        Cancel,
+    }
+}
+
+rpc_type! {
     pub struct SessionConfigureParams {
         pub session_id: String,
         #[serde(default)]
@@ -463,6 +625,9 @@ rpc_type! {
     pub struct MessageEntry {
         pub role: String,
         pub content: String,
+        /// When present, identifies this assistant reply across live and history delivery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reply_occurrence: Option<String>,
         #[serde(default)]
         pub kind: MessageEntryKind,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1702,6 +1867,20 @@ rpc_type! {
 // ── Session update notifications ─────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════
 
+rpc_type! {
+    /// A session update with optional, negotiated reply identity. A missing
+    /// identity leaves the event in its original wire format.
+    pub struct SessionUpdateNotification {
+        #[serde(flatten)]
+        // Keep the published event component addressable when the envelope
+        // extends it. Serde still writes both as one flat object.
+        #[cfg_attr(feature = "schema-export", schemars(schema_with = "schemars::SchemaGenerator::subschema_for::<SessionUpdateEvent>"))]
+        pub event: SessionUpdateEvent,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reply_occurrence: Option<String>,
+    }
+}
+
 /// Typed session update events pushed via `session/update` notifications.
 /// Replaces the hand-built `notification_for_turn_event` function.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1711,6 +1890,11 @@ pub enum SessionUpdateEvent {
     AgentMessageChunk {
         session_id: String,
         text: String,
+        /// Display-only text from a Goal parent turn, such as a model fallback
+        /// notice. It is shown alongside the answer but is not part of the
+        /// saved candidate. Ordinary text chunks omit this field.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        presentation_only: bool,
     },
     AgentThoughtChunk {
         session_id: String,
@@ -1778,6 +1962,9 @@ pub enum SessionUpdateEvent {
         /// Absent for legacy callers that do not send one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_turn_generation: Option<u64>,
+        /// Goal output is visible but does not settle a session/prompt.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        goal_owned: bool,
         /// Authoritative projected conversation-entry count after this turn.
         /// Absent for legacy or missing-session terminal events.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1888,8 +2075,11 @@ rpc_type! {
 rpc_type! {
     /// Turn-wide usage totals on `TurnComplete`, the RPC counterpart of the
     /// gateway chat socket's `done` frame. Totals and `usage_by_provider`
-    /// include every billable attempt; the `last_*` fields and context
-    /// limits describe the accepted call that served the turn.
+    /// include recorded usage for billable attempts and may be incomplete.
+    /// The `model` and `last_*` fields describe the accepted attempt; an
+    /// unknown model can be labelled `(unattributed)`. Context limits follow
+    /// the route used to dispatch that call, which can differ from the
+    /// provider-reported model after server-side fallback.
     #[derive(Default, PartialEq)]
     pub struct TurnUsageTotals {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1908,10 +2098,10 @@ rpc_type! {
         pub model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub last_input_tokens: Option<u64>,
-        /// Proactive-trim budget of the serving route.
+        /// Proactive-trim budget of the route used for the accepted call.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub max_context_tokens: Option<u64>,
-        /// Configured context window of the serving model.
+        /// Configured context window of the route used for the accepted call.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub model_context_window: Option<u64>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2140,6 +2330,77 @@ mod tests {
     }
 
     #[test]
+    fn reply_occurrences_round_trip_without_changing_legacy_payloads() {
+        // A transcript row and its Goal fallback carry the same opaque token.
+        // Peers that omitted it must not acquire a null field on re-encoding.
+        for occurrence in [None, Some("fixture:1"), Some("fixture:2")] {
+            let mut row = json!({"role":"assistant", "content":"same reply", "kind":"message"});
+            let mut candidate = json!({"session_id":"s", "candidate":"same reply"});
+            if let Some(occurrence) = occurrence {
+                row["reply_occurrence"] = json!(occurrence);
+                candidate["reply_occurrence"] = json!(occurrence);
+            }
+            let fallback = json!({"verified_candidate": candidate});
+            let mut frame =
+                json!({"type":"agent_message_chunk", "session_id":"s", "text":"same reply"});
+            if let Some(occurrence) = occurrence {
+                frame["reply_occurrence"] = json!(occurrence);
+            }
+            let notification: SessionUpdateNotification =
+                serde_json::from_value(frame.clone()).unwrap();
+            if occurrence.is_none() {
+                assert_eq!(
+                    serde_json::to_vec(&notification).unwrap(),
+                    serde_json::to_vec(&notification.event).unwrap(),
+                    "adding an optional envelope must not change legacy chunk bytes"
+                );
+            }
+            assert_eq!(serde_json::to_value(notification).unwrap(), frame);
+            let message: MessageEntry = serde_json::from_value(row.clone()).unwrap();
+            let update: SessionGoalUpdate = serde_json::from_value(fallback.clone()).unwrap();
+            assert_eq!(serde_json::to_value(message).unwrap(), row);
+            assert_eq!(serde_json::to_value(update).unwrap(), fallback);
+        }
+    }
+
+    #[test]
+    fn agent_message_chunk_presentation_marker_preserves_ordinary_wire_bytes() {
+        const ORDINARY: &[u8] = br#"{"type":"agent_message_chunk","session_id":"s","text":"t"}"#;
+        const MARKED: &[u8] =
+            br#"{"type":"agent_message_chunk","session_id":"s","text":"t","presentation_only":true}"#;
+        const EXPLICIT_FALSE: &[u8] =
+            br#"{"type":"agent_message_chunk","session_id":"s","text":"t","presentation_only":false}"#;
+
+        for (wire, expected_marker, canonical) in [
+            (ORDINARY, false, ORDINARY),
+            (MARKED, true, MARKED),
+            (EXPLICIT_FALSE, false, ORDINARY),
+        ] {
+            let event = serde_json::from_slice::<SessionUpdateEvent>(wire).unwrap();
+            assert!(matches!(&event,
+                SessionUpdateEvent::AgentMessageChunk { session_id, text, presentation_only }
+                    if session_id == "s" && text == "t" && *presentation_only == expected_marker
+            ));
+            assert_eq!(serde_json::to_vec(&event).unwrap(), canonical);
+        }
+    }
+
+    #[test]
+    fn agent_message_chunk_requires_text_with_or_without_presentation_marker() {
+        for wire in [
+            r#"{"type":"agent_message_chunk","session_id":"s"}"#,
+            r#"{"type":"agent_message_chunk","session_id":"s","presentation_only":true}"#,
+            r#"{"type":"agent_message_chunk","session_id":"s","presentation_only":false}"#,
+        ] {
+            let error = serde_json::from_str::<SessionUpdateEvent>(wire).unwrap_err();
+            assert!(
+                error.to_string().contains("missing field `text`"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn session_update_event_uses_snake_case_variants() {
         // Variants stay PascalCase → wire is snake_case, including the
         // multi-word ones that historically drifted when serde flattened
@@ -2148,6 +2409,7 @@ mod tests {
         let evt = SessionUpdateEvent::AgentMessageChunk {
             session_id: "s".into(),
             text: "t".into(),
+            presentation_only: false,
         };
         let v = serde_json::to_value(evt).unwrap();
         assert_eq!(v["type"], json!("agent_message_chunk"));
@@ -2170,6 +2432,7 @@ mod tests {
             outcome: TurnCompletionOutcome::Cancelled,
             content: "cancelled".into(),
             client_turn_generation: Some(9),
+            goal_owned: false,
             message_count: Some(4),
             safeguard_fallback: None,
             usage: None,
@@ -2179,7 +2442,9 @@ mod tests {
         assert_eq!(v["client_turn_generation"], json!(9));
         assert_eq!(v["message_count"], json!(4));
         assert!(
-            v.get("safeguard_fallback").is_none() && v.get("usage").is_none(),
+            v.get("safeguard_fallback").is_none()
+                && v.get("usage").is_none()
+                && v.get("goal_owned").is_none(),
             "absent extras must not appear on the wire for older clients: {v}"
         );
     }
@@ -2191,6 +2456,7 @@ mod tests {
             outcome: TurnCompletionOutcome::Completed,
             content: "answer".into(),
             client_turn_generation: None,
+            goal_owned: false,
             message_count: Some(2),
             safeguard_fallback: Some(SafeguardFallbackWire {
                 fallback_kind: SafeguardFallbackKindWire::ClientServer,

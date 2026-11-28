@@ -36,6 +36,9 @@ impl<T: Tool> Attributable for RateLimitedTool<T> {
 
 #[async_trait]
 impl<T: Tool> Tool for RateLimitedTool<T> {
+    fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+        self.inner.may_invoke_agent_child(args)
+    }
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -146,6 +149,9 @@ impl<T: Tool> Attributable for PathGuardedTool<T> {
 
 #[async_trait]
 impl<T: Tool> Tool for PathGuardedTool<T> {
+    fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+        self.inner.may_invoke_agent_child(args)
+    }
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -219,6 +225,38 @@ mod tests {
     use zeroclaw_config::policy::SecurityPolicy;
 
     zeroclaw_api::mock_tool_attribution!(CountingTool);
+
+    struct ChildPredicateProbe;
+    zeroclaw_api::mock_tool_attribution!(ChildPredicateProbe);
+    #[async_trait]
+    impl Tool for ChildPredicateProbe {
+        fn name(&self) -> &str {
+            "predicate"
+        }
+        fn description(&self) -> &str {
+            "argument-sensitive predicate"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn may_invoke_agent_child(&self, args: &serde_json::Value) -> bool {
+            args.get("child").and_then(|v| v.as_bool()).unwrap_or(false)
+        }
+        async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult::ok("ok"))
+        }
+    }
+
+    #[test]
+    fn wrapper_predicates_forward_actual_arguments_without_reservation() {
+        let security = policy(AutonomyLevel::Full);
+        let rate = RateLimitedTool::new(ChildPredicateProbe, security.clone());
+        let path = PathGuardedTool::new(ChildPredicateProbe, security);
+        for tool in [&rate as &dyn Tool, &path as &dyn Tool] {
+            assert!(tool.may_invoke_agent_child(&serde_json::json!({"child": true})));
+            assert!(!tool.may_invoke_agent_child(&serde_json::json!({"child": false})));
+        }
+    }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 

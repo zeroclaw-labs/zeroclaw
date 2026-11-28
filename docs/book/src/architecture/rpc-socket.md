@@ -126,12 +126,105 @@ the operating system:
 | `session/kill` | client -> daemon | Remove the live session and tombstone its ACP durable history |
 | `session/delete` | client -> daemon | Remove the live session and its selected durable history |
 | `session/prompt` | client -> daemon | Run a turn (streamed via `session/update` notifications) |
+| `session/goal` | client -> daemon | Submit a typed Goal Mode control command for an existing session |
 | `session/cancel` | client -> daemon | Cancel an in-flight turn |
 | `session/state` | client -> daemon | Read live session lifecycle state, active turn identity, and the optional current plan; active or queued work is represented by `state: "running"` so recovery clients can confirm terminal status before releasing retained work |
 | `status` | client -> daemon | Server version, protocol version, active session list |
 | `file/upload/begin`, `file/upload/chunk`, `file/upload/commit` | client -> daemon | Upload one file in ordered chunks; see [Chunked uploads](#chunked-uploads) |
 | `session/update` | daemon -> client | Streaming notification during a turn (text chunks, tool calls, approvals) |
 | `elicitation/create` | daemon -> client | Request interactive input for ask-user and poll flows |
+
+### Goal controls and parent output
+
+`session/goal` uses the existing authenticated session and the same Goal control
+plane as Matrix. It is available through local IPC and WSS, not through Web
+chat or the in-process dashboard transport. The latter does not advertise the
+method or command. A TUI identity provides continuity; it is not a grant.
+`session/goal` requires `sessions:execute`.
+Session ownership and current permissions are rechecked after admission waits,
+before preparing a parent operation.
+
+Ordinary start, resume, pause and budget mutations acknowledge queued work
+promptly and apply at the current turn boundary. Cancel and `pause now`
+interrupt immediately while already admitted usage and cleanup settle. The
+channel-only `/stop` shortcut uses the same immediate-pause semantics.
+`resume [RESPONSE]` preserves multiline text in the same durable session before
+the next parent prepares its history. Plain resume inserts no user response.
+
+Parent thinking, drafts, text, tool calls, results and errors retain the normal
+`session/update` path. Goal lifecycle notices use the typed
+`session/goal_update` payload in the OpenRPC contract. A
+`session_unavailable` reply does not disclose a session's owner or Goal state;
+it is distinct from `no_current_goal`.
+Started/resumed notices precede execution; an agent's question precedes a
+verifier-blocked pause. The legacy `verified_candidate` update is a successful
+parent's presentation fallback after its ordinary event stream drains. It is
+not a verifier verdict or a persistence acknowledgement. A client that resumed
+while the parent was already running may use it to show the full response in
+place of the partial text it received. The daemon sets `presentation_only: true`
+on native `agent_message_chunk` events for a Goal parent's trailing tool
+receipts, model fallback notice, or safeguard notice. Clients display these
+chunks in arrival order after the answer; restoring the complete answer must
+not discard them. Ordinary text omits the field (equivalent to `false`).
+Clients that ignore the field still receive the notices as ordinary text.
+These notices are not part of the saved answer or the verifier input.
+
+If the pane has already displayed part of the answer before a tool call, it
+keeps that text and the tool in order instead of inserting the whole answer
+again. A client that joined midway through that text can therefore miss the
+beginning in the live view. The saved transcript contains the full candidate
+after the separate, once-only append succeeds. If the append fails, the client
+receives the original error and the typed `candidate_persistence_failed` reason.
+Native Goal core errors retain the ordinary `turn_complete` event with
+`goal_owned: true`. That provenance marks presentation only; it cannot
+finish a separately submitted `session/prompt`.
+
+The native parent has no additional overall Goal timeout. Existing finite
+tool, child, summary and Matrix turn bounds remain enforced. A daemon restart
+requires explicit authorized resume; an ordinary client disconnect does not
+cancel a durable Goal. With a control plane installed, orphan retirement
+keeps live sessions with active, resumable, or unsettled Goals. Opening
+another same-mode session also keeps siblings with any bound Goal, including
+terminal ones. If a Goal lookup fails, the sweep retains the live session.
+
+Goal output follows the client that currently holds the session once it has
+read the complete session history (a `session/messages` request without
+`limit`, `before_index` or `cursor`) and that history reads back without errors.
+After a client reattaches, the rest of a parent turn already under way is
+delivered live from that point; earlier events of that
+turn are not replayed. Each frame is sent only while that client may still read
+the session. Output produced before the attach is not replayed; the saved
+transcript and `/goal status` remain available. Over WSS, the client that already
+owns the session can resume it while its Goal runs; the resume is checked
+against the same current credentials, policy, ownership, environment and
+channel rules, and approvals move to it between turns.
+
+During initialization a native client can send
+`"clientCapabilities": {"replyOccurrence": {}}`. This opts in only that
+connection. Without the capability, the daemon omits `reply_occurrence`
+from notifications and history. An older daemon can ignore the capability;
+no echo or protocol-version change is required.
+
+The optional `reply_occurrence` identifies one ordinary or Goal assistant
+reply, not its text. Two identical answers can have different IDs. When
+ZeroCode reloads history after missing updates, it keeps events received
+during the reload in order. It skips replaying reply text only when that ID
+is already on an assistant row it actually displayed for the same session.
+Live text can carry an ID before the reply is saved. A discarded attempt
+or narration before a tool call does not share the saved answer's ID.
+Thoughts, tools, display-only notices and terminal bookkeeping still run.
+When replaying held events, ZeroCode shows text without a matching ID
+even if it could be a duplicate. An ID is not a grant, a verifier verdict,
+or proof of persistence. This does not replay events the client never received.
+
+An older ZeroCode client may show only the streamed tail of the final response
+until it reloads history. With an older daemon that does not deliver the live
+remainder, the current client still displays the response as it did before.
+
+If the daemon starts without control-plane supervision, ordinary live-session
+eviction can still run. Neither automatic sweep fences, settles, or deletes a
+durable Goal or deletes the durable transcript. Explicit session disposal and
+daemon-generation shutdown have their own fence-and-drain boundaries.
 
 ### Atomic configuration writes
 
@@ -220,7 +313,27 @@ The lifecycle operations have distinct durable meanings:
 - `session/kill` retains the history but marks the row as tombstoned, so it is not eligible for runtime rehydration.
 - `session/delete` removes the ACP row and its recoverable checkpoint before unregistering and removing the live session when the target is a live ACP session, or when no live mode exists and an ACP durable row is selected. A live same-ID Chat session remains isolated from ACP storage.
 
-Kill and delete signal cancellation before attempting their fallible SQLite operation. If that operation fails for an idle target, the RPC reports an internal error and preserves the live owner and channel registration. If hard cancellation has already removed an active owner, the RPC cannot restore that live generation; the durable row and recoverable checkpoint remain available once storage is working again.
+Kill and delete can signal cancellation before attempting the SQLite operation.
+A definite rejection before that operation commits leaves the ACP row and its
+recoverable checkpoint in place. It also preserves an idle live owner and its
+channel registration. An active owner already evicted for hard-cancel recovery
+cannot be restored in place.
+
+### Goal-bound session disposition
+
+A rejected replacement, close, kill, or delete does not dispose of the bound
+Goal. Disposal is bound to the authorized change to the exact session, not the
+request or an early cancellation signal. For live-only changes, exact Goal
+disposal commits before the live session changes. A storage failure rejects
+the change and preserves the Goal. A previously running Goal may remain paused
+if its turn was interrupted. After storage recovers, an authorized retry of the
+same live removal can clear an abandoned preparation without replaying it.
+
+If an independent session store commits the change but the previous Goal's
+cleanup fails, the RPC reports an error. Pending cleanup can block same-ID
+admission; it cannot attach the old Goal to a new session or remove a
+successor's Goal. Recovery does not replay the command. See
+[Goal-mode target contract](./background-work-lifecycle.md#goal-mode-target-contract).
 
 ### Chunked uploads
 
@@ -360,6 +473,15 @@ layer in `crates/zeroclaw-runtime/src/rpc/`:
 | `wss.rs` | WSS (WebSocket Secure) transport + TLS acceptor |
 | `attachments.rs` | File upload processing, dedup, marker generation |
 | `upload.rs` | Chunked-upload staging: ordering, per-connection and process-wide bounds |
+
+Long-running `session/prompt` and `session/goal` work belongs to the accepted
+connection generation. The dispatcher retains their task handles through
+connection teardown, and a ZeroCode Goal worker retains the generation's
+liveness token for its full lifetime. This prevents a replacement daemon
+generation from admitting work for the same durable session while old Goal
+work is still unwinding. An ordinary client disconnect still retains the
+session and its Goal; explicit session lifecycle operations remain responsible
+for Goal disposal.
 
 The `RpcTransport` trait is designed so that additional transports (vsock,
 custom IPC) slot in without touching the dispatch or session logic. The

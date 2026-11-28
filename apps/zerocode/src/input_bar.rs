@@ -46,6 +46,7 @@ enum SlashCommandId {
     ChangeDirectory,
     ClearQueue,
     Browse,
+    Goal,
     Help,
     LoadSession,
     Model,
@@ -164,6 +165,11 @@ impl SlashCommandRegistry {
     }
 
     fn parse<'a>(&self, input: &'a str) -> SlashCommand<'a> {
+        // Explicit Goal commands must not become model input if discovery is
+        // absent; the daemon still owns grammar and authorization.
+        if goal_command_tail(input).is_some() {
+            return SlashCommand::Goal;
+        }
         let trimmed = input.trim();
         let (head, argument) = trimmed
             .split_once(' ')
@@ -213,11 +219,23 @@ impl SlashCommandRegistry {
 /// Commands whose completion fills `"<command> "` and waits for an argument
 /// instead of submitting.
 fn command_takes_argument(choice: &str) -> bool {
-    matches!(choice, "/model" | "/model-provider" | "/load-session")
+    matches!(
+        choice,
+        "/goal" | "/model" | "/model-provider" | "/load-session"
+    )
+}
+
+pub(crate) fn goal_command_tail(input: &str) -> Option<&str> {
+    let mut parts = input.trim_start().splitn(2, char::is_whitespace);
+    let token = parts.next()?;
+    token
+        .eq_ignore_ascii_case("/goal")
+        .then(|| parts.next().unwrap_or_default().trim_start())
 }
 
 fn shared_command_id(id: &str) -> Option<SlashCommandId> {
     match id {
+        "goal" => Some(SlashCommandId::Goal),
         "help" => Some(SlashCommandId::Help),
         "model" => Some(SlashCommandId::Model),
         "new" => Some(SlashCommandId::RestartSession),
@@ -231,6 +249,8 @@ fn shared_command_id(id: &str) -> Option<SlashCommandId> {
 pub(crate) enum InputBarAction {
     /// Key consumed, no further action for parent.
     Consumed,
+    /// A daemon-owned Goal control; does not consume composer attachments.
+    GoalCommand(String),
     /// User submitted a message (Enter with text and/or attachments).
     Submit {
         text: Option<String>,
@@ -307,6 +327,7 @@ enum SlashCommand<'a> {
     /// `/change-directory` — open the directory picker for a new session.
     ChangeDirectory,
     EnterBrowseMode,
+    Goal,
     OpenHelp,
     /// `/load-session <query>` — resume a saved session by name or id.
     LoadSession(&'a str),
@@ -2043,6 +2064,7 @@ impl InputBarState {
                     InputBarAction::SetModelProvider(name.to_string())
                 }
                 SlashCommand::ModelProviderPicker => InputBarAction::OpenModelProviderPicker,
+                SlashCommand::Goal => InputBarAction::GoalCommand(msg),
                 SlashCommand::NotACommand => {
                     let attachments = self.take_attachments();
                     InputBarAction::Submit {
@@ -3998,6 +4020,49 @@ mod tests {
                 "{command} is advertised but not recognized by parse_slash_command"
             );
         }
+    }
+
+    #[test]
+    fn goal_discovery_and_explicit_commands_respect_the_token_boundary() {
+        let goal = crate::wire::CommandDescriptor {
+            id: "goal".into(),
+            name: "goal".into(),
+            aliases: vec![],
+        };
+        let registry = SlashCommandRegistry::new(&[goal]);
+        assert!(registry.command_names().any(|name| name == "/goal"));
+        assert!(command_takes_argument("/goal"));
+        let legacy = SlashCommandRegistry::new(&[]);
+        assert!(!legacy.command_names().any(|name| name == "/goal"));
+        for registry in [registry, legacy] {
+            assert!(matches!(
+                registry.parse("  /GOAL\tpause now"),
+                SlashCommand::Goal
+            ));
+            assert!(matches!(
+                registry.parse("/goalkeeper"),
+                SlashCommand::NotACommand
+            ));
+        }
+        assert_eq!(
+            goal_command_tail(" /GOAL RESUME first\n\nsecond"),
+            Some("RESUME first\n\nsecond")
+        );
+    }
+
+    #[test]
+    fn goal_inject_is_a_control_and_does_not_take_draft_attachments() {
+        let mut bar = InputBarState::with_shared_commands(&[]);
+        bar.insert_text("/GOAL cancel");
+        let directory = tempfile::tempdir().unwrap();
+        let attachment = directory.path().join("draft.png");
+        std::fs::write(&attachment, b"fixture").unwrap();
+        bar.add_attachment(PendingAttachment::from_path(attachment.to_str().unwrap()).unwrap());
+        assert!(
+            matches!(bar.handle_inject(), InputBarAction::GoalCommand(command) if command == "/GOAL cancel")
+        );
+        assert_eq!(bar.pending_attachments()[0].path, attachment);
+        assert!(attachment.exists());
     }
 
     /// Parity guard: unknown leading tokens are rejected (recognize ⊆

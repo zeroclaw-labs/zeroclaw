@@ -1,7 +1,12 @@
 //! SQLite-backed session persistence with FTS5 search.
 
 use crate::session_backend::{
-    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
+    SessionBackend, SessionContext, SessionEffectAuthorization, SessionMetadata, SessionQuery,
+    SessionState, SessionTranscriptRow,
+};
+use crate::session_disposition::{
+    SessionDispositionBackend, SessionDispositionEffect, SessionDispositionIdentity,
+    SessionDispositionObservation, SessionDispositionWitness, sqlite as disposition,
 };
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
@@ -128,8 +133,10 @@ impl SqliteSessionBackend {
             .context("Failed to set the session DB busy timeout")?;
 
         Self::enable_wal(&conn)?;
+        // Recovery can bind this identity before performing a witnessed
+        // deletion, so its first schema commit must survive a power loss.
         conn.execute_batch(
-            "PRAGMA synchronous = NORMAL;
+            "PRAGMA synchronous = FULL;
              PRAGMA temp_store = MEMORY;
              PRAGMA mmap_size = 4194304;",
         )?;
@@ -143,7 +150,8 @@ impl SqliteSessionBackend {
                 session_key TEXT NOT NULL,
                 role        TEXT NOT NULL,
                 content     TEXT NOT NULL,
-                created_at  TEXT NOT NULL
+                created_at  TEXT NOT NULL,
+                reply_occurrence TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_sessions_key ON sessions(session_key);
              CREATE INDEX IF NOT EXISTS idx_sessions_key_id ON sessions(session_key, id);
@@ -184,6 +192,15 @@ impl SqliteSessionBackend {
              END;",
         )
         .context("Failed to initialize session schema")?;
+        disposition::initialize(&tx, SessionDispositionBackend::ChatSqlite)
+            .context("Failed to initialize session disposition schema")?;
+
+        Self::ensure_column(
+            &tx,
+            "sessions",
+            "reply_occurrence",
+            "ALTER TABLE sessions ADD COLUMN reply_occurrence TEXT",
+        )?;
 
         for (column, ddl) in [
             ("name", "ALTER TABLE session_metadata ADD COLUMN name TEXT"),
@@ -224,7 +241,7 @@ impl SqliteSessionBackend {
                 "ALTER TABLE session_metadata ADD COLUMN principal_id TEXT",
             ),
         ] {
-            Self::ensure_metadata_column(&tx, column, ddl)?;
+            Self::ensure_column(&tx, "session_metadata", column, ddl)?;
         }
         for (index, ddl) in [
             (
@@ -257,10 +274,91 @@ impl SqliteSessionBackend {
                 .with_context(|| format!("Failed to create session index {index}"))?;
         }
         tx.commit().context("Failed to commit the session schema")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
 
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Inspect a persisted receipt even when Chat currently uses another backend.
+    /// The database must already exist; this cannot create or migrate it.
+    pub fn observe_session_disposition_at(
+        workspace_dir: &Path,
+        witness: &SessionDispositionWitness,
+    ) -> io::Result<SessionDispositionObservation> {
+        disposition::observe_at(
+            &Self::db_path(workspace_dir),
+            SessionDispositionBackend::ChatSqlite,
+            witness,
+        )
+    }
+
+    /// Acknowledge an exact receipt in the original database without
+    /// constructing a backend or touching any transcript.
+    pub fn acknowledge_session_disposition_at(
+        workspace_dir: &Path,
+        witness: &SessionDispositionWitness,
+    ) -> io::Result<()> {
+        disposition::acknowledge_at(
+            &Self::db_path(workspace_dir),
+            SessionDispositionBackend::ChatSqlite,
+            witness,
+        )
+    }
+
+    fn delete_session_authorized_inner(
+        conn: &mut Connection,
+        session_key: &str,
+        expected_owner: Option<&str>,
+        authorize: &SessionEffectAuthorization<'_>,
+        witness: Option<&SessionDispositionWitness>,
+    ) -> io::Result<bool> {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(io::Error::other)?;
+        if let Some(witness) = witness {
+            disposition::ensure_new(
+                &tx,
+                SessionDispositionBackend::ChatSqlite,
+                SessionDispositionEffect::Delete,
+                witness,
+            )?;
+        }
+        let row: Option<(i64, Option<String>)> = tx
+            .query_row(
+                "SELECT rowid, principal_id FROM session_metadata WHERE session_key = ?1",
+                [session_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(io::Error::other)?;
+        let _authority = authorize(row.as_ref().and_then(|(_, owner)| owner.as_deref()))?;
+        let Some((id, owner)) = row else {
+            return Ok(false);
+        };
+        if owner.as_deref() != expected_owner {
+            return Ok(false);
+        }
+        tx.execute("DELETE FROM sessions WHERE session_key = ?1", [session_key])
+            .map_err(io::Error::other)?;
+        let changed = tx
+            .execute(
+                "DELETE FROM session_metadata
+                 WHERE session_key = ?1 AND principal_id IS ?2 AND rowid = ?3",
+                params![session_key, expected_owner, id],
+            )
+            .map_err(io::Error::other)?;
+        if let Some(witness) = witness {
+            if changed != 1 {
+                return Err(io::Error::other(
+                    "session disposition deleted no metadata row",
+                ));
+            }
+            disposition::record(&tx, witness).map_err(io::Error::other)?;
+        }
+        tx.commit().map_err(io::Error::other)?;
+        Ok(true)
     }
 
     /// Switch the database to WAL, retrying while another connection holds it.
@@ -290,18 +388,17 @@ impl SqliteSessionBackend {
         }
     }
 
-    fn ensure_metadata_column(conn: &Connection, column: &str, ddl: &str) -> Result<()> {
+    fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> Result<()> {
         let present: bool = conn
             .query_row(
-                "SELECT COUNT(*) > 0 FROM pragma_table_info('session_metadata') \
-                 WHERE name = ?1",
-                params![column],
+                "SELECT COUNT(*) > 0 FROM pragma_table_info(?1) WHERE name = ?2",
+                params![table, column],
                 |row| row.get(0),
             )
-            .with_context(|| format!("Failed to inspect session metadata column {column}"))?;
+            .with_context(|| format!("Failed to inspect {table}.{column}"))?;
         if !present {
             conn.execute(ddl, [])
-                .with_context(|| format!("Failed to add session metadata column {column}"))?;
+                .with_context(|| format!("Failed to add {table}.{column}"))?;
         }
         Ok(())
     }
@@ -312,10 +409,43 @@ impl SqliteSessionBackend {
         message: &ChatMessage,
         now: &str,
     ) -> rusqlite::Result<()> {
+        Self::append_row_on(conn, session_key, message, None, now)
+    }
+
+    fn append_row(
+        &self,
+        session_key: &str,
+        message: &ChatMessage,
+        occurrence: Option<&str>,
+    ) -> std::io::Result<()> {
+        let mut conn = self.conn.lock();
+        // Take the write lock before either the row or its metadata changes,
+        // as in append_authorized. Both facts must commit or roll back together.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(std::io::Error::other)?;
+        Self::append_row_on(
+            &tx,
+            session_key,
+            message,
+            occurrence,
+            &Utc::now().to_rfc3339(),
+        )
+        .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)
+    }
+
+    fn append_row_on(
+        conn: &Connection,
+        session_key: &str,
+        message: &ChatMessage,
+        occurrence: Option<&str>,
+        now: &str,
+    ) -> rusqlite::Result<()> {
         conn.execute(
-            "INSERT INTO sessions (session_key, role, content, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![session_key, message.role, message.content, now],
+            "INSERT INTO sessions (session_key, role, content, created_at, reply_occurrence)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![session_key, message.role, message.content, now, occurrence],
         )?;
         conn.execute(
             "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count)
@@ -333,19 +463,89 @@ impl SqliteSessionBackend {
         session_key: &str,
         messages: &[ChatMessage],
     ) -> rusqlite::Result<()> {
+        Self::rewrite_rows_on(
+            conn,
+            session_key,
+            messages.iter().map(|message| (message, None)),
+        )
+    }
+
+    fn rewrite_rows_on<'a>(
+        conn: &Connection,
+        session_key: &str,
+        rows: impl ExactSizeIterator<Item = (&'a ChatMessage, Option<&'a str>)>,
+    ) -> rusqlite::Result<()> {
         conn.execute(
             "DELETE FROM sessions WHERE session_key = ?1",
             params![session_key],
         )?;
         let now = Utc::now().to_rfc3339();
-        for message in messages {
-            Self::append_on(conn, session_key, message, &now)?;
+        let count = rows.len();
+        for (message, occurrence) in rows {
+            Self::append_row_on(conn, session_key, message, occurrence, &now)?;
         }
         conn.execute(
             "UPDATE session_metadata SET message_count = ?2 WHERE session_key = ?1",
-            params![session_key, messages.len() as i64],
+            params![session_key, count as i64],
         )?;
         Ok(())
+    }
+
+    fn read_transcript_rows(
+        &self,
+        key: &str,
+        strict: bool,
+    ) -> rusqlite::Result<Vec<SessionTranscriptRow>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT role, content, reply_occurrence FROM sessions WHERE session_key = ?1 ORDER BY id"
+        )?;
+        let rows = stmt.query_map([key], |r| {
+            let occurrence = match r.get_ref(2)? {
+                rusqlite::types::ValueRef::Text(value) => std::str::from_utf8(value)
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned),
+                _ => None,
+            };
+            Ok(SessionTranscriptRow {
+                message: ChatMessage {
+                    role: r.get(0)?,
+                    content: r.get(1)?,
+                },
+                reply_occurrence: occurrence,
+            })
+        })?;
+        if strict {
+            rows.collect()
+        } else {
+            Ok(rows.filter_map(Result::ok).collect())
+        }
+    }
+
+    fn replace_existing_rows<'a>(
+        &self,
+        session_key: &str,
+        rows: impl ExactSizeIterator<Item = (&'a ChatMessage, Option<&'a str>)>,
+        breadcrumb_present: bool,
+    ) -> rusqlite::Result<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        let exists = tx
+            .query_row(
+                "SELECT 1 FROM session_metadata WHERE session_key = ?1 LIMIT 1",
+                [session_key],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !exists {
+            return Ok(false);
+        }
+        Self::rewrite_rows_on(&tx, session_key, rows)?;
+        Self::set_session_trim_breadcrumb_on(&tx, session_key, breadcrumb_present)?;
+        tx.commit()?;
+        Ok(true)
     }
 
     fn set_session_trim_breadcrumb_on(
@@ -364,8 +564,7 @@ impl SqliteSessionBackend {
     }
 
     fn source_fingerprint(path: &Path, name: &str) -> Result<(String, i64)> {
-        let mut file = std::fs::File::open(path)
-            .with_context(|| format!("Failed to open JSONL session {name}"))?;
+        let mut file = Self::open_import_transcript(path, name)?;
         let mut hasher = Sha256::new();
         let mut source_len = 0_i64;
         let mut buffer = [0_u8; 64 * 1024];
@@ -384,6 +583,20 @@ impl SqliteSessionBackend {
         Ok((format!("{:x}", hasher.finalize()), source_len))
     }
 
+    fn open_import_transcript(path: &Path, name: &str) -> Result<std::fs::File> {
+        use crate::session_disposition::jsonl::{self, Entry};
+
+        match jsonl::classify(path)
+            .with_context(|| format!("Failed to open JSONL session {name}"))?
+        {
+            Entry::Transcript(file) => Ok(file),
+            Entry::Missing => bail!("JSONL migration source {name} is absent"),
+            Entry::Marker(_) => {
+                bail!("Unexpected disposition marker in JSONL migration source {name}")
+            }
+        }
+    }
+
     /// Migrate JSONL session files into SQLite. Renames migrated files to `.jsonl.migrated`.
     pub fn migrate_from_jsonl(&self, workspace_dir: &Path) -> Result<usize> {
         self.migrate_from_jsonl_with_archive(workspace_dir, |from, to, expected| {
@@ -396,6 +609,7 @@ impl SqliteSessionBackend {
         migrated_path: &Path,
         expected: &(String, i64),
     ) -> Result<()> {
+        Self::open_import_transcript(staged_path, "staged source")?;
         std::fs::hard_link(staged_path, migrated_path).with_context(|| {
             format!(
                 "Failed to create no-clobber JSONL archive {}",
@@ -411,6 +625,7 @@ impl SqliteSessionBackend {
             let _ = std::fs::remove_file(migrated_path);
             bail!("JSONL archive changed during filesystem handoff");
         }
+        Self::open_import_transcript(staged_path, "staged source")?;
         std::fs::remove_file(staged_path).with_context(|| {
             format!(
                 "Failed to remove staged JSONL source {}",
@@ -449,24 +664,27 @@ impl SqliteSessionBackend {
     }
 
     fn sync_staged_jsonl(path: &Path, name: &str) -> Result<()> {
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
+        let file = Self::open_import_transcript(path, name)?;
         #[cfg(windows)]
-        options.write(true);
-        options
-            .open(path)
-            .with_context(|| format!("Failed to open staged JSONL session {name} for sync"))?
-            .sync_all()
+        let file = {
+            drop(file);
+            crate::session_disposition::jsonl::open_regular_for_sync(path)
+                .with_context(|| format!("Failed to open staged JSONL session {name} for sync"))?
+        };
+        file.sync_all()
             .with_context(|| format!("Failed to sync staged JSONL session {name}"))
     }
 
     fn restore_uncommitted_jsonl(staged_path: &Path, live_path: &Path) -> Result<()> {
-        if live_path.exists() {
+        use crate::session_disposition::jsonl::{self, Entry};
+
+        if !matches!(jsonl::classify(live_path)?, Entry::Missing) {
             bail!(
                 "Refusing to replace JSONL session created while {} was staged",
                 live_path.display()
             );
         }
+        Self::open_import_transcript(staged_path, "staged source")?;
         std::fs::rename(staged_path, live_path).with_context(|| {
             format!(
                 "Failed to restore empty JSONL session {}",
@@ -570,10 +788,14 @@ impl SqliteSessionBackend {
         R: FnMut(&Connection, &str) -> Result<Option<(String, String, i64)>>,
         F: FnMut(&Path, &Path, &(String, i64)) -> Result<()>,
     {
+        use crate::session_disposition::jsonl::{self, Entry};
+
         let sessions_dir = workspace_dir.join("sessions");
         let mutation_lock = crate::session_store::mutation_lock_for(&sessions_dir)
             .context("Failed to acquire JSONL session mutation lock")?;
         let mut mutation_guard = mutation_lock.lock();
+        let _directory_guard = jsonl::lock_directory(&sessions_dir, true)
+            .context("Failed to acquire interprocess JSONL session mutation lock")?;
         let receipt_inventory = committed_jsonl_import_receipts_exist(&self.conn.lock());
         let has_committed_import: bool = match receipt_inventory {
             Ok(has_committed_import) => has_committed_import,
@@ -652,22 +874,30 @@ impl SqliteSessionBackend {
         for (name, key, live_path, staged_path, migrated_path, staged) in candidates {
             let candidate_may_have_committed_receipt = staged && has_committed_import;
             if staged {
-                if live_path.exists() {
+                if !matches!(jsonl::classify(&live_path)?, Entry::Missing) {
                     bail!(
                         "Refusing ambiguous JSONL migration with both {} and {}",
                         live_path.display(),
                         staged_path.display()
                     );
                 }
+                Self::open_import_transcript(&staged_path, &name)?;
             } else {
-                if staged_path.exists() {
+                match jsonl::classify(&live_path)? {
+                    // This backend can be switched before task cleanup;
+                    // leave the original marker and its breadcrumb intact.
+                    Entry::Marker(_) => continue,
+                    Entry::Transcript(_) => {}
+                    Entry::Missing => bail!("JSONL migration source {name} disappeared"),
+                }
+                if !matches!(jsonl::classify(&staged_path)?, Entry::Missing) {
                     bail!(
                         "Refusing ambiguous JSONL migration with both {} and {}",
                         live_path.display(),
                         staged_path.display()
                     );
                 }
-                if migrated_path.exists() {
+                if !matches!(jsonl::classify(&migrated_path)?, Entry::Missing) {
                     bail!(
                         "Refusing to replace existing migrated JSONL session {}",
                         migrated_path.display()
@@ -767,16 +997,15 @@ impl SqliteSessionBackend {
                     );
                 }
 
-                let file = std::fs::File::open(&staged_path)
-                    .with_context(|| format!("Failed to open staged JSONL session {name}"))?;
+                let file = Self::open_import_transcript(&staged_path, &name)?;
                 let now = Utc::now().to_rfc3339();
                 let mut inserted = 0_i64;
                 let mut has_non_whitespace_source = false;
                 {
                     let mut insert = tx
                         .prepare(
-                            "INSERT INTO sessions (session_key, role, content, created_at) \
-                             VALUES (?1, ?2, ?3, ?4)",
+                            "INSERT INTO sessions (session_key, role, content, created_at, reply_occurrence) \
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
                         )
                         .with_context(|| format!("Failed to prepare JSONL import for {name}"))?;
                     for line in io::BufReader::new(file).split(b'\n') {
@@ -794,11 +1023,17 @@ impl SqliteSessionBackend {
                             continue;
                         }
                         has_non_whitespace_source = true;
-                        let Ok(message) = serde_json::from_str::<ChatMessage>(line) else {
+                        let Ok(row) = SessionTranscriptRow::from_json_line(line) else {
                             continue;
                         };
                         insert
-                            .execute(params![key, message.role, message.content, now])
+                            .execute(params![
+                                key,
+                                row.message.role,
+                                row.message.content,
+                                now,
+                                row.reply_occurrence
+                            ])
                             .with_context(|| format!("Failed to import JSONL session {name}"))?;
                         inserted += 1;
                     }
@@ -818,26 +1053,33 @@ impl SqliteSessionBackend {
                 // corruption, not a legitimate `false`, and importing it as
                 // one would let the migrated session mark an untrimmed
                 // transcript as trim-clean.
-                let trim_breadcrumb =
-                    match std::fs::read(sessions_dir.join(format!("{key}.trim_breadcrumb"))) {
-                        Ok(bytes) => match bytes.as_slice() {
-                            [b'0'] => Some(false),
-                            [b'1'] => Some(true),
-                            _ => {
-                                bail!(
-                                    "corrupt trim breadcrumb sidecar for JSONL session {name}: \
+                let trim_breadcrumb = match jsonl::open_regular(
+                    &sessions_dir.join(format!("{key}.trim_breadcrumb")),
+                    false,
+                )
+                .and_then(|file| {
+                    let mut bytes = Vec::new();
+                    file.take(2).read_to_end(&mut bytes)?;
+                    Ok(bytes)
+                }) {
+                    Ok(bytes) => match bytes.as_slice() {
+                        [b'0'] => Some(false),
+                        [b'1'] => Some(true),
+                        _ => {
+                            bail!(
+                                "corrupt trim breadcrumb sidecar for JSONL session {name}: \
                                      expected a single b'0' or b'1' byte, got {} byte(s)",
-                                    bytes.len()
-                                );
-                            }
-                        },
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                        Err(e) => {
-                            return Err(anyhow::Error::new(e).context(format!(
-                                "Failed to read trim breadcrumb sidecar for JSONL session {name}"
-                            )));
+                                bytes.len()
+                            );
                         }
-                    };
+                    },
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => {
+                        return Err(anyhow::Error::new(e).context(format!(
+                            "Failed to read trim breadcrumb sidecar for JSONL session {name}"
+                        )));
+                    }
+                };
                 tx.execute(
                     "INSERT INTO session_metadata \
                      (session_key, created_at, last_activity, message_count, trim_breadcrumb) \
@@ -905,7 +1147,7 @@ impl SqliteSessionBackend {
             .context("Failed to deactivate JSONL after committed SQLite import")?;
             drop(conn);
 
-            if migrated_path.exists() {
+            if !matches!(jsonl::classify(&migrated_path)?, Entry::Missing) {
                 if Self::source_fingerprint(&migrated_path, &name)? != expected {
                     bail!(
                         "Refusing incompatible migrated JSONL session {}",
@@ -913,6 +1155,7 @@ impl SqliteSessionBackend {
                     );
                 }
                 Self::sync_parent_directory(&migrated_path)?;
+                Self::open_import_transcript(&staged_path, &name)?;
                 std::fs::remove_file(&staged_path)
                     .with_context(|| format!("Failed to finish staged JSONL handoff for {name}"))?;
                 Self::sync_parent_directory(&staged_path)?;
@@ -934,6 +1177,34 @@ impl SqliteSessionBackend {
 }
 
 impl SessionBackend for SqliteSessionBackend {
+    fn load_transcript_rows(&self, key: &str) -> Vec<SessionTranscriptRow> {
+        self.read_transcript_rows(key, false).unwrap_or_default()
+    }
+
+    fn try_load_transcript_rows(&self, key: &str) -> std::io::Result<Vec<SessionTranscriptRow>> {
+        self.read_transcript_rows(key, true)
+            .map_err(std::io::Error::other)
+    }
+
+    fn append_transcript_row(&self, key: &str, row: &SessionTranscriptRow) -> std::io::Result<()> {
+        self.append_row(key, &row.message, row.reply_occurrence.as_deref())
+    }
+
+    fn replace_transcript_rows_if_exists(
+        &self,
+        key: &str,
+        rows: &[SessionTranscriptRow],
+        breadcrumb_present: bool,
+    ) -> std::io::Result<bool> {
+        self.replace_existing_rows(
+            key,
+            rows.iter()
+                .map(|row| (&row.message, row.reply_occurrence.as_deref())),
+            breadcrumb_present,
+        )
+        .map_err(std::io::Error::other)
+    }
+
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let conn = self.conn.lock();
         let mut stmt = match conn
@@ -1009,9 +1280,7 @@ impl SessionBackend for SqliteSessionBackend {
     }
 
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
-        let conn = self.conn.lock();
-        let now = Utc::now().to_rfc3339();
-        Self::append_on(&conn, session_key, message, &now).map_err(std::io::Error::other)
+        self.append_row(session_key, message, None)
     }
 
     fn append_authorized(
@@ -1120,25 +1389,12 @@ impl SessionBackend for SqliteSessionBackend {
         messages: &[ChatMessage],
         breadcrumb_present: bool,
     ) -> std::io::Result<bool> {
-        let mut conn = self.conn.lock();
-        let tx = conn.transaction().map_err(std::io::Error::other)?;
-        let exists = tx
-            .query_row(
-                "SELECT 1 FROM session_metadata WHERE session_key = ?1 LIMIT 1",
-                params![session_key],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(std::io::Error::other)?
-            .is_some();
-        if !exists {
-            return Ok(false);
-        }
-        Self::rewrite_messages_on(&tx, session_key, messages).map_err(std::io::Error::other)?;
-        Self::set_session_trim_breadcrumb_on(&tx, session_key, breadcrumb_present)
-            .map_err(std::io::Error::other)?;
-        tx.commit().map_err(std::io::Error::other)?;
-        Ok(true)
+        self.replace_existing_rows(
+            session_key,
+            messages.iter().map(|message| (message, None)),
+            breadcrumb_present,
+        )
+        .map_err(std::io::Error::other)
     }
 
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
@@ -1188,7 +1444,7 @@ impl SessionBackend for SqliteSessionBackend {
         };
 
         conn.execute(
-            "UPDATE sessions SET role = ?1, content = ?2 WHERE id = ?3",
+            "UPDATE sessions SET role = ?1, content = ?2, reply_occurrence = NULL WHERE id = ?3",
             params![message.role, message.content, id],
         )
         .map_err(std::io::Error::other)?;
@@ -1383,37 +1639,56 @@ impl SessionBackend for SqliteSessionBackend {
         expected_owner: Option<&str>,
         authorize: &crate::session_backend::SessionEffectAuthorization<'_>,
     ) -> std::io::Result<bool> {
-        let mut conn = self.conn.lock();
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(std::io::Error::other)?;
-        let owner: Option<Option<String>> = tx
-            .query_row(
-                "SELECT principal_id FROM session_metadata WHERE session_key = ?1",
-                params![session_key],
-                |row| row.get(0),
+        Self::delete_session_authorized_inner(
+            &mut self.conn.lock(),
+            session_key,
+            expected_owner,
+            authorize,
+            None,
+        )
+    }
+
+    fn session_disposition_identity(&self) -> io::Result<SessionDispositionIdentity> {
+        disposition::identity(&self.conn.lock(), SessionDispositionBackend::ChatSqlite)
+    }
+
+    fn delete_session_with_disposition(
+        &self,
+        witness: &SessionDispositionWitness,
+        expected_owner: Option<&str>,
+        authorize: &SessionEffectAuthorization<'_>,
+    ) -> io::Result<bool> {
+        disposition::with_full_sync(&mut self.conn.lock(), |conn| {
+            Self::delete_session_authorized_inner(
+                conn,
+                &witness.backend_key,
+                expected_owner,
+                authorize,
+                Some(witness),
             )
-            .optional()
-            .map_err(std::io::Error::other)?;
-        let _authority = authorize(owner.as_ref().and_then(|owner| owner.as_deref()))?;
-        if owner
-            .as_ref()
-            .is_none_or(|owner| owner.as_deref() != expected_owner)
-        {
-            return Ok(false);
-        }
-        tx.execute(
-            "DELETE FROM sessions WHERE session_key = ?1",
-            params![session_key],
+        })
+    }
+
+    fn observe_session_disposition(
+        &self,
+        witness: &SessionDispositionWitness,
+    ) -> io::Result<SessionDispositionObservation> {
+        disposition::observe(
+            &mut self.conn.lock(),
+            SessionDispositionBackend::ChatSqlite,
+            witness,
         )
-        .map_err(std::io::Error::other)?;
-        tx.execute(
-            "DELETE FROM session_metadata WHERE session_key = ?1 AND principal_id IS ?2",
-            params![session_key, expected_owner],
+    }
+
+    fn acknowledge_session_disposition(
+        &self,
+        witness: &SessionDispositionWitness,
+    ) -> io::Result<()> {
+        disposition::acknowledge(
+            &mut self.conn.lock(),
+            SessionDispositionBackend::ChatSqlite,
+            witness,
         )
-        .map_err(std::io::Error::other)?;
-        tx.commit().map_err(std::io::Error::other)?;
-        Ok(true)
     }
 
     fn set_session_state_authorized(
@@ -1980,6 +2255,215 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn witnessed_chat_delete_is_atomic_and_replay_observes_only_its_receipt() {
+        use crate::session_backend::SessionEffectGuard;
+        use SessionDispositionObservation::{Committed, Indeterminate, NotCommitted};
+
+        let workspace = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(workspace.path()).unwrap();
+        let witness = SessionDispositionWitness {
+            operation_id: "10000000-0000-4000-8000-000000000001".into(),
+            effect: SessionDispositionEffect::Delete,
+            backend_key: "chat".into(),
+            identity: backend.session_disposition_identity().unwrap(),
+        };
+        let authorize = |owner: Option<&str>| -> io::Result<Box<dyn SessionEffectGuard>> {
+            assert_eq!(owner, Some("user:alice"));
+            Ok(Box::new(()))
+        };
+        backend.set_session_principal("chat", "user:alice").unwrap();
+        backend
+            .append("chat", &ChatMessage::user("retained"))
+            .unwrap();
+        assert!(
+            !backend
+                .delete_session_with_disposition(&witness, Some("user:bob"), &authorize)
+                .unwrap()
+        );
+        let deny = |_: Option<&str>| -> io::Result<Box<dyn SessionEffectGuard>> {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "revoked"))
+        };
+        assert_eq!(
+            backend
+                .delete_session_with_disposition(&witness, Some("user:alice"), &deny)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        backend
+            .conn
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER reject_receipt BEFORE INSERT ON session_disposition_receipts
+             BEGIN SELECT RAISE(ABORT, 'receipt fault'); END;",
+            )
+            .unwrap();
+        assert!(
+            backend
+                .delete_session_with_disposition(&witness, Some("user:alice"), &authorize)
+                .is_err()
+        );
+        drop(backend);
+
+        let backend = SqliteSessionBackend::new(workspace.path()).unwrap();
+        assert_eq!(
+            backend.session_disposition_identity().unwrap(),
+            witness.identity
+        );
+        assert_eq!(backend.load("chat")[0].content, "retained");
+        assert_eq!(
+            backend.observe_session_disposition(&witness).unwrap(),
+            NotCommitted
+        );
+        backend
+            .conn
+            .lock()
+            .execute_batch("DROP TRIGGER reject_receipt")
+            .unwrap();
+        assert!(
+            backend
+                .delete_session_with_disposition(&witness, Some("user:alice"), &authorize)
+                .unwrap()
+        );
+        assert!(!backend.session_exists("chat"));
+        let absent = SessionDispositionWitness {
+            operation_id: "10000000-0000-4000-8000-000000000002".into(),
+            ..witness.clone()
+        };
+        let authorize_missing = |owner: Option<&str>| -> io::Result<Box<dyn SessionEffectGuard>> {
+            assert_eq!(owner, None);
+            Ok(Box::new(()))
+        };
+        assert!(
+            !backend
+                .delete_session_with_disposition(&absent, None, &authorize_missing)
+                .unwrap()
+        );
+        assert_eq!(
+            backend.observe_session_disposition(&absent).unwrap(),
+            NotCommitted
+        );
+        drop(backend);
+
+        assert_eq!(
+            SqliteSessionBackend::observe_session_disposition_at(workspace.path(), &witness)
+                .unwrap(),
+            Committed
+        );
+        let conflicting = SessionDispositionWitness {
+            backend_key: "another-chat".into(),
+            ..witness.clone()
+        };
+        assert_eq!(
+            SqliteSessionBackend::observe_session_disposition_at(workspace.path(), &conflicting)
+                .unwrap(),
+            Indeterminate
+        );
+        assert!(
+            SqliteSessionBackend::acknowledge_session_disposition_at(
+                workspace.path(),
+                &conflicting
+            )
+            .is_err()
+        );
+        let backend = SqliteSessionBackend::new(workspace.path()).unwrap();
+        backend.set_session_principal("chat", "user:alice").unwrap();
+        backend
+            .append("chat", &ChatMessage::user("new lifetime"))
+            .unwrap();
+        assert_eq!(
+            backend
+                .delete_session_with_disposition(&witness, Some("user:alice"), &authorize)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        for _ in 0..2 {
+            SqliteSessionBackend::acknowledge_session_disposition_at(workspace.path(), &witness)
+                .unwrap();
+        }
+        assert_eq!(backend.load("chat")[0].content, "new lifetime");
+        assert_eq!(
+            backend.observe_session_disposition(&witness).unwrap(),
+            NotCommitted
+        );
+    }
+
+    #[test]
+    fn chat_sqlite_disposition_probe_does_not_create_or_adopt_a_replacement_database() {
+        use SessionDispositionObservation::Indeterminate;
+
+        let workspace = TempDir::new().unwrap();
+        let db = SqliteSessionBackend::db_path(workspace.path());
+        let backend = SqliteSessionBackend::new(workspace.path()).unwrap();
+        let witness = SessionDispositionWitness {
+            operation_id: "10000000-0000-4000-8000-000000000001".into(),
+            effect: SessionDispositionEffect::Delete,
+            backend_key: "chat".into(),
+            identity: backend.session_disposition_identity().unwrap(),
+        };
+        drop(backend);
+        std::fs::rename(&db, db.with_extension("original")).unwrap();
+        assert_eq!(
+            SqliteSessionBackend::observe_session_disposition_at(workspace.path(), &witness)
+                .unwrap(),
+            Indeterminate
+        );
+        assert!(
+            SqliteSessionBackend::acknowledge_session_disposition_at(workspace.path(), &witness)
+                .is_err()
+        );
+        assert!(!db.exists());
+        // An existing pre-witness schema must remain pre-witness.
+        let legacy = Connection::open(&db).unwrap();
+        assert_eq!(
+            SqliteSessionBackend::observe_session_disposition_at(workspace.path(), &witness)
+                .unwrap(),
+            Indeterminate
+        );
+        let table_count: u64 = legacy
+            .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(table_count, 0);
+        drop(legacy);
+        let replacement = SqliteSessionBackend::new(workspace.path()).unwrap();
+        assert_ne!(
+            replacement.session_disposition_identity().unwrap(),
+            witness.identity
+        );
+        assert_eq!(
+            SqliteSessionBackend::observe_session_disposition_at(workspace.path(), &witness)
+                .unwrap(),
+            Indeterminate
+        );
+        assert!(
+            replacement
+                .delete_session_with_disposition(&witness, None, &|_| Ok(Box::new(())))
+                .is_err()
+        );
+
+        let current_witness = SessionDispositionWitness {
+            identity: replacement.session_disposition_identity().unwrap(),
+            ..witness
+        };
+        replacement
+            .conn
+            .lock()
+            .execute_batch("DROP TABLE session_disposition_receipts")
+            .unwrap();
+        drop(replacement);
+        assert_eq!(
+            SqliteSessionBackend::observe_session_disposition_at(
+                workspace.path(),
+                &current_witness
+            )
+            .unwrap(),
+            Indeterminate
+        );
+        assert!(SqliteSessionBackend::new(workspace.path()).is_err());
+    }
+
+    #[test]
     fn round_trip_sqlite() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
@@ -1995,6 +2479,61 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[1].role, "assistant");
+    }
+
+    #[test]
+    fn append_sqlite_rolls_back_message_if_metadata_update_fails() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("s1", &ChatMessage::user("first")).unwrap();
+
+        Connection::open(SqliteSessionBackend::db_path(tmp.path()))
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_append_metadata
+                 BEFORE UPDATE OF message_count ON session_metadata
+                 WHEN NEW.session_key = 's1'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected append metadata failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = backend
+            .append("s1", &ChatMessage::assistant("must not persist"))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected append metadata failure")
+        );
+
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        for store in [&backend, &reopened] {
+            let messages = store.try_load("s1").unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].content, "first");
+            assert_eq!(store.get_session_metadata("s1").unwrap().message_count, 1);
+        }
+    }
+
+    #[test]
+    fn append_sqlite_commits_message_and_metadata_once() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("s1", &ChatMessage::user("first")).unwrap();
+        backend
+            .append("s1", &ChatMessage::assistant("second"))
+            .unwrap();
+
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        for store in [&backend, &reopened] {
+            let messages = store.try_load("s1").unwrap();
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0].content, "first");
+            assert_eq!(messages[1].content, "second");
+            assert_eq!(store.get_session_metadata("s1").unwrap().message_count, 2);
+        }
     }
 
     #[test]
@@ -2366,6 +2905,50 @@ mod tests {
         let msgs = backend.load("test_user");
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "hello");
+    }
+
+    #[test]
+    fn native_rows_survive_jsonl_import_without_guessing_invalid_markers() {
+        let tmp = TempDir::new().unwrap();
+        let jsonl = crate::session_store::SessionStore::new(tmp.path()).unwrap();
+        let path = tmp.path().join("sessions/equal.jsonl");
+        std::fs::write(&path, concat!(
+            "{\"role\":\"assistant\",\"content\":\"same\",\"reply_occurrence\":\"one\"}\n",
+            "{\"role\":\"assistant\",\"content\":\"same\",\"reply_occurrence\":\"\"}\n",
+            "{\"role\":\"assistant\",\"content\":\"same\",\"reply_occurrence\":{\"unknown\":1}}\n",
+            "{\"role\":\"assistant\",\"content\":\"same\"}\n",
+            "{\"role\":\"assistant\",\"content\":\"same\",\"reply_occurrence\":\"a\",\"reply_occurrence\":\"b\"}\n",
+            "[\"assistant\",\"same\"]\n",
+            "{\"role\":\"assistant\",\"content\":\"same\",\"reply_occurrence\":\"two\"}",
+        )).unwrap();
+        let check = |backend: &dyn SessionBackend| {
+            let rows = backend.try_load_transcript_rows("equal").unwrap();
+            assert!(rows.iter().all(|row| row.message.content == "same"));
+            let ids: Vec<_> = rows
+                .iter()
+                .map(|row| row.reply_occurrence.as_deref())
+                .collect();
+            assert_eq!(
+                ids,
+                [Some("one"), None, None, None, None, None, Some("two")]
+            );
+        };
+        check(&jsonl);
+        let sqlite = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(sqlite.migrate_from_jsonl(tmp.path()).unwrap(), 1);
+        drop(sqlite);
+        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
+        check(&reopened);
+        // The dynamic SQLite type of an optional field cannot hide a valid reply.
+        reopened
+            .conn
+            .lock()
+            .execute(
+                "UPDATE sessions SET reply_occurrence = x'ff' WHERE reply_occurrence IS NULL",
+                [],
+            )
+            .unwrap();
+        check(&reopened);
     }
 
     #[test]
@@ -3576,6 +4159,11 @@ mod tests {
         // Create backend (runs migration)
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
         backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend
+            .conn
+            .lock()
+            .execute_batch("ALTER TABLE sessions DROP COLUMN reply_occurrence")
+            .unwrap();
 
         // Re-open (migration should be idempotent)
         drop(backend);
@@ -3583,6 +4171,9 @@ mod tests {
         let msgs = backend2.load("s1");
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "hello");
+        let rows = backend2.try_load_transcript_rows("s1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reply_occurrence, None);
 
         // State should default to idle
         let state = backend2.get_session_state("s1").unwrap().unwrap();
@@ -3843,7 +4434,13 @@ mod tests {
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
 
         backend
-            .append("s1", &ChatMessage::user("pre-replace turn"))
+            .append_transcript_row(
+                "s1",
+                &SessionTranscriptRow {
+                    message: ChatMessage::assistant("pre-replace turn"),
+                    reply_occurrence: Some("original".into()),
+                },
+            )
             .unwrap();
         backend.set_session_trim_breadcrumb("s1", false).unwrap();
 
@@ -3871,12 +4468,23 @@ mod tests {
             true,
         );
         assert!(result.is_err(), "the poisoned trigger must fail the call");
+        assert!(
+            backend
+                .replace_transcript_rows_if_exists("s1", &[], true)
+                .is_err()
+        );
 
         // The transcript half must have rolled back with the breadcrumb
         // half, not landed as a new transcript paired with the old flag.
         let messages = backend.load("s1");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "pre-replace turn");
+        assert_eq!(
+            backend.try_load_transcript_rows("s1").unwrap()[0]
+                .reply_occurrence
+                .as_deref(),
+            Some("original")
+        );
         assert_eq!(
             backend.get_session_trim_breadcrumb("s1").unwrap(),
             Some(false)

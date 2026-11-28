@@ -1,6 +1,8 @@
 //! Shared turn execution. Single source of truth for spawn-drain-cancel.
 
-use crate::agent::agent::{Agent, StreamedTurnError, StreamedTurnSuccess, TurnEvent};
+use crate::agent::agent::{
+    Agent, NativeStreamedTurnSuccess, StreamedTurnError, StreamedTurnSuccess, TurnEvent,
+};
 use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
 use crate::agent::loop_::is_tool_loop_cancelled;
 use crate::rpc::types::{ProviderUsageTotals, TurnUsageTotals};
@@ -142,6 +144,47 @@ where
         + Send,
 {
     let (prepare, on_event) = callbacks;
+    execute_turn_prepared_with_native_reply_occurrence(
+        agent,
+        prompt,
+        cancel,
+        attribution,
+        cost_context,
+        connection_activity,
+        steering_rx,
+        admission,
+        (
+            move |guard| async move { prepare(guard).await.map(|guard| (guard, None)) },
+            on_event,
+        ),
+    )
+    .await
+    .map(|(outcome, _)| outcome)
+}
+
+pub(crate) async fn execute_turn_prepared_with_native_reply_occurrence<F, Fut, P, Prep>(
+    agent: Arc<Mutex<Agent>>,
+    prompt: String,
+    cancel: CancellationToken,
+    attribution: TurnAttribution,
+    cost_context: Option<ToolLoopCostTrackingContext>,
+    connection_activity: Option<crate::rpc::ConnectionActivity>,
+    steering_rx: Option<mpsc::Receiver<crate::agent::SteeringInput>>,
+    admission: Option<TurnAdmission>,
+    callbacks: (P, F),
+) -> Result<(TurnOutcome, Option<String>), TurnError>
+where
+    F: Fn(TurnEvent) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+    P: FnOnce(tokio::sync::OwnedMutexGuard<Agent>) -> Prep + Send + 'static,
+    Prep: std::future::Future<
+            Output = Result<
+                (tokio::sync::OwnedMutexGuard<Agent>, Option<String>),
+                StreamedTurnError,
+            >,
+        > + Send,
+{
+    let (prepare, on_event) = callbacks;
     let (event_tx, mut event_rx) = mpsc::channel::<TurnEvent>(64);
     let cancel_clone = cancel.clone();
     let session_key = attribution.session_key.clone();
@@ -154,7 +197,7 @@ where
         let _connection_activity = connection_activity;
         let mut steering_rx = steering_rx;
         let guard = agent.lock_owned().await;
-        let mut guard = prepare(guard).await?;
+        let (mut guard, reply_occurrence) = prepare(guard).await?;
         // Judged on this guard, with no await before the turn starts under
         // it: every earlier check predates at least this lock wait.
         if let Some(admit) = admission
@@ -182,11 +225,12 @@ where
                 .scope(
                     cost_context,
                     guard
-                        .turn_streamed_with_steering_state(
+                        .turn_streamed_with_native_reply_occurrence(
                             &prompt,
                             event_tx,
                             Some(cancel_clone),
                             steering_rx.as_mut(),
+                            reply_occurrence,
                         )
                         .instrument(span),
                 )
@@ -239,22 +283,20 @@ where
                     // processed, the guard aborts what it still owns instead of
                     // leaving a detached task behind.
                     let _ = handle.await;
-                    Ok(TurnOutcome::Cancelled {
-                        partial_text: accumulated_text,
-                        messages: Vec::new(),
-                    })
+                    Ok((
+                        TurnOutcome::Cancelled {
+                            partial_text: accumulated_text,
+                            messages: Vec::new(),
+                        },
+                        None,
+                    ))
                 }
             }
         }
     }
 }
 
-type TurnJoinHandle = tokio::task::JoinHandle<
-    std::result::Result<
-        crate::agent::agent::StreamedTurnSuccess,
-        crate::agent::agent::StreamedTurnError,
-    >,
->;
+type TurnJoinHandle = tokio::task::JoinHandle<Result<NativeStreamedTurnSuccess, StreamedTurnError>>;
 
 /// Owner of the spawned turn task for the whole lifetime of
 /// [`execute_turn`].
@@ -328,7 +370,7 @@ where
                 // this return: bound each delivery and stop draining (but
                 // still report the join) once the deadline is reached.
                 while let Ok(event) = event_rx.try_recv() {
-                    if let TurnEvent::Chunk { ref delta } = event {
+                    if let TurnEvent::Chunk { ref delta } | TurnEvent::NativeReplyChunk { ref delta, .. } = event {
                         accumulated.push_str(delta);
                     }
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -341,7 +383,7 @@ where
             maybe_event = event_rx.recv(), if !event_rx_closed => {
                 match maybe_event {
                     Some(event) => {
-                        if let TurnEvent::Chunk { ref delta } = event {
+                        if let TurnEvent::Chunk { ref delta } | TurnEvent::NativeReplyChunk { ref delta, .. } = event {
                             accumulated.push_str(delta);
                         }
                         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -366,34 +408,44 @@ const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// `Completed`; a cooperative cancel yields `Cancelled` carrying the messages
 /// the task committed so persistence never depends on the abort/commit race.
 fn outcome_from_task_result(
-    joined: Result<StreamedTurnSuccess, StreamedTurnError>,
+    joined: Result<NativeStreamedTurnSuccess, StreamedTurnError>,
     accumulated_text: String,
-) -> Result<TurnOutcome, TurnError> {
+) -> Result<(TurnOutcome, Option<String>), TurnError> {
     match joined {
-        Ok(StreamedTurnSuccess {
-            response,
-            new_messages,
-            safeguard_fallback,
-            final_context_limits,
-            ..
-        }) => Ok(TurnOutcome::Completed {
-            text: response,
-            messages: new_messages,
-            safeguard_fallback,
-            final_context_limits,
-        }),
+        Ok(NativeStreamedTurnSuccess {
+            turn:
+                StreamedTurnSuccess {
+                    response,
+                    new_messages,
+                    safeguard_fallback,
+                    final_context_limits,
+                    ..
+                },
+            reply_occurrence,
+        }) => Ok((
+            TurnOutcome::Completed {
+                text: response,
+                messages: new_messages,
+                safeguard_fallback,
+                final_context_limits,
+            },
+            reply_occurrence,
+        )),
         Err(StreamedTurnError {
             error,
             committed_response,
             new_messages,
-        }) if is_tool_loop_cancelled(&error) => Ok(TurnOutcome::Cancelled {
-            partial_text: if committed_response.is_empty() {
-                accumulated_text
-            } else {
-                committed_response
+        }) if is_tool_loop_cancelled(&error) => Ok((
+            TurnOutcome::Cancelled {
+                partial_text: if committed_response.is_empty() {
+                    accumulated_text
+                } else {
+                    committed_response
+                },
+                messages: new_messages,
             },
-            messages: new_messages,
-        }),
+            None,
+        )),
         Err(StreamedTurnError { error, .. }) => {
             let error = match error.downcast::<TurnRefusal>() {
                 Ok(refusal) => return Err(TurnError::Refused(refusal)),
@@ -403,13 +455,18 @@ fn outcome_from_task_result(
                 crate::agent::terminal_completion_error_message(&error, None)
             {
                 return Err(TurnError::TerminalCompletion {
-                    diagnostic: error.to_string(),
+                    diagnostic: safe_turn_diagnostic(&error),
                     user_message,
                 });
             }
-            Err(TurnError::AgentError(error.to_string()))
+            Err(TurnError::AgentError(safe_turn_diagnostic(&error)))
         }
     }
+}
+
+/// Scrub the diagnostic shared by logs, turn-completion events, and RPC errors.
+fn safe_turn_diagnostic(error: &anyhow::Error) -> String {
+    crate::security::scrub(&crate::agent::loop_::scrub_credentials(&error.to_string()))
 }
 
 /// Why [`drain_until_done_or_cancelled`] returned. `ExplicitCancel` is an
@@ -442,7 +499,7 @@ where
             maybe_event = event_rx.recv() => {
                 match maybe_event {
                     Some(event) => {
-                        if let TurnEvent::Chunk { ref delta } = event {
+                        if let TurnEvent::Chunk { ref delta } | TurnEvent::NativeReplyChunk { ref delta, .. } = event {
                             accumulated.push_str(delta);
                         }
                         on_event(event).await;
@@ -936,11 +993,17 @@ mod tests {
 
         let sender = zeroclaw_spawn::spawn!(async move {
             for delta in ["he", "llo", " ", "world"] {
-                let _ = tx
-                    .send(TurnEvent::Chunk {
+                let event = if delta == "world" {
+                    TurnEvent::NativeReplyChunk {
                         delta: delta.to_string(),
-                    })
-                    .await;
+                        reply_occurrence: "scope:world".into(),
+                    }
+                } else {
+                    TurnEvent::Chunk {
+                        delta: delta.into(),
+                    }
+                };
+                let _ = tx.send(event).await;
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
         });
@@ -987,11 +1050,17 @@ mod tests {
                 // Blocks once the channel fills, exactly like a real
                 // cooperative unwind synthesizing one event per pending
                 // tool call after cancellation is observed.
-                let _ = tx
-                    .send(TurnEvent::Chunk {
+                let event = if i == EVENTS - 1 {
+                    TurnEvent::NativeReplyChunk {
                         delta: i.to_string(),
-                    })
-                    .await;
+                        reply_occurrence: "scope:final".into(),
+                    }
+                } else {
+                    TurnEvent::Chunk {
+                        delta: i.to_string(),
+                    }
+                };
+                let _ = tx.send(event).await;
             }
             "task-finished"
         });
@@ -1086,8 +1155,10 @@ mod tests {
             new_messages: msgs.clone(),
         };
 
-        let outcome = outcome_from_task_result(Err(err), "accumulated".to_string())
-            .expect("cooperative cancel maps to a Cancelled outcome, not an error");
+        let (outcome, reply_occurrence) =
+            outcome_from_task_result(Err(err), "accumulated".to_string())
+                .expect("cooperative cancel maps to a Cancelled outcome, not an error");
+        assert!(reply_occurrence.is_none());
 
         match outcome {
             TurnOutcome::Cancelled {
@@ -1122,18 +1193,22 @@ mod tests {
             served_model: "served-model".into(),
             category: Some("private-category".into()),
         };
-        let outcome = outcome_from_task_result(
-            Ok(StreamedTurnSuccess {
-                response: "accepted response".into(),
-                new_messages: messages.clone(),
-                provider_name: "requested-provider".into(),
-                model: "requested-model".into(),
-                final_context_limits: None,
-                safeguard_fallback: Some(safeguard),
+        let (outcome, reply_occurrence) = outcome_from_task_result(
+            Ok(NativeStreamedTurnSuccess {
+                turn: StreamedTurnSuccess {
+                    response: "accepted response".into(),
+                    new_messages: messages.clone(),
+                    provider_name: "requested-provider".into(),
+                    model: "requested-model".into(),
+                    final_context_limits: None,
+                    safeguard_fallback: Some(safeguard),
+                },
+                reply_occurrence: None,
             }),
             "accepted response".into(),
         )
         .expect("successful turn maps to RPC completion");
+        assert!(reply_occurrence.is_none());
 
         let TurnOutcome::Completed {
             text,
@@ -1163,11 +1238,92 @@ mod tests {
             new_messages: Vec::new(),
         };
         let outcome = outcome_from_task_result(Err(err), String::new());
-        assert!(
-            matches!(outcome, Err(TurnError::AgentError(_))),
-            "a genuine agent failure must surface as an error, not a silent \
-             cancel"
+        let Err(TurnError::AgentError(message)) = outcome else {
+            panic!("a genuine agent failure must surface as an error, not a silent cancel");
+        };
+        assert_eq!(message, "provider exploded");
+    }
+
+    #[test]
+    fn cancellation_with_settlement_failure_is_visible_as_an_error() {
+        let error = crate::agent::cost::with_settlement_failure(
+            anyhow::Error::new(crate::agent::loop_::ToolLoopCancelled),
+            anyhow::Error::msg("fixture settlement failed"),
         );
+        let outcome = outcome_from_task_result(
+            Err(StreamedTurnError {
+                error,
+                committed_response: String::new(),
+                new_messages: Vec::new(),
+            }),
+            String::new(),
+        );
+        let Err(TurnError::AgentError(message)) = outcome else {
+            panic!("combined failure must not become a silent cancellation");
+        };
+        assert!(message.contains("tool loop cancelled"));
+        assert!(message.contains("fixture settlement failed"));
+    }
+
+    #[test]
+    fn combined_turn_error_redacts_credentials_at_rpc_boundary() {
+        let error = crate::agent::cost::with_settlement_failure(
+            anyhow::Error::msg("provider failed token=QWxhZGRpbjpvcGVuIHNlc2FtZQ=="),
+            anyhow::Error::msg("fixture settlement failed"),
+        );
+        let outcome = outcome_from_task_result(
+            Err(StreamedTurnError {
+                error,
+                committed_response: String::new(),
+                new_messages: Vec::new(),
+            }),
+            String::new(),
+        );
+        let Err(TurnError::AgentError(message)) = outcome else {
+            panic!("combined failure must remain an error");
+        };
+        assert!(message.contains("provider failed"));
+        assert!(message.contains("fixture settlement failed"));
+        assert!(message.contains("[REDACTED"));
+        assert!(!message.contains("IHNlc2FtZQ"));
+    }
+
+    #[test]
+    fn ordinary_turn_diagnostics_redact_secrets_without_changing_clean_text() {
+        let secret = anyhow::Error::msg("provider failed token=QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+        let diagnostic = safe_turn_diagnostic(&secret);
+        assert!(diagnostic.contains("provider failed"));
+        assert!(diagnostic.contains("[REDACTED"));
+        assert!(!diagnostic.contains("IHNlc2FtZQ"));
+
+        let clean = "provider returned 400: max_tokens: 4096 exceeds limit";
+        assert_eq!(safe_turn_diagnostic(&anyhow::Error::msg(clean)), clean);
+    }
+
+    #[test]
+    fn terminal_completion_redacts_diagnostic_but_preserves_delivery_text() {
+        let expected = crate::agent::semantic_empty_terminal_completion_message(None);
+        let error =
+            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion)
+                .context("provider failed token=QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+        let outcome = outcome_from_task_result(
+            Err(StreamedTurnError {
+                error,
+                committed_response: String::new(),
+                new_messages: Vec::new(),
+            }),
+            String::new(),
+        );
+        let Err(TurnError::TerminalCompletion {
+            diagnostic,
+            user_message,
+        }) = outcome
+        else {
+            panic!("terminal completion must retain its delivery message");
+        };
+        assert!(diagnostic.contains("[REDACTED"));
+        assert!(!diagnostic.contains("IHNlc2FtZQ"));
+        assert_eq!(user_message, expected);
     }
 
     #[test]

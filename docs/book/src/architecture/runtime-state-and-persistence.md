@@ -57,7 +57,7 @@ new runtime state should be described in terms of `<install>/data/`,
 | Live RPC/TUI sessions | RPC `SessionStore` | none by itself | `crates/zeroclaw-runtime/src/rpc/session.rs` in-memory map | Process-local; session history persists only through the chat or ACP backend | Live session handles, uploads, cancel tokens, owners, and overrides are runtime state. |
 | Cron jobs | Declarative config membership plus cron SQLite store | `data/cron/jobs.db` | `zeroclaw-runtime::cron` scheduler/store | Read paths do not create `jobs.db`; scheduler owns due/lock state | Declarative jobs are reconciled from config, while run metadata and locks live in the cron DB. |
 | SOP runs | `SopEngine` plus `SopRunStore` | None by default; `data/sop/runs.db` when durable SQLite initialization succeeds | SOP engine active/finished run caches | The durable store owns admission claims and persisted revisions; the engine restores active and terminal state on startup | Store initialization failure logs a warning and falls back to memory. Memory-backed audit records are not the run-lifecycle source of truth. |
-| Background task supervision | Durable task control plane | `data/control_plane.db` | observer/producer handles plus the daemon-only recovery owner and reaper | Owner PID plus process-start identity prevents recovery from reclaiming live work; heartbeat timeout applies only to producers that emit heartbeats | Background delegates require a task row and atomically settle status, output reference, and error there. A process-local supervisor retries failed terminal writes with capped backoff. Their originating agent alias scopes new-row result and cancellation access; terminal pre-route rows retain exact-ID read compatibility only. Subagent registration remains best-effort and leaves route absent. Background delegate rows record the launching tool-loop session key as principal and refresh a heartbeat while running, leaving only the parent field absent; subagent rows leave heartbeat, parent, and principal fields absent. Goal APIs exist, but end-to-end goal execution is not yet wired. |
+| Background task supervision | Durable task control plane | `data/control_plane.db` | observer/producer handles plus the daemon-only recovery owner and reaper | Owner PID plus process-start identity prevents recovery from reclaiming live work; heartbeat timeout applies only to producers that emit heartbeats | Background delegates require a task row and atomically settle status, output reference, and error there. A process-local supervisor retries failed terminal writes with capped backoff. Their originating agent alias scopes new-row result and cancellation access; terminal pre-route rows retain exact-ID read compatibility only. Ordinary subagent registration remains best-effort and leaves route absent. Background delegate rows record the launching tool-loop session key as principal and refresh a heartbeat while running, leaving only the parent field absent; ordinary subagent rows leave heartbeat, parent, and principal fields absent. A Goal-spawned subagent instead requires an owner-bound row linked to its exact Goal parent and settles that row before return. Goal parent and verifier work now installs the operation-owned foreground root in Matrix and ZeroCode native IPC/WSS; the native overall timeout remains optional where no caller deadline exists, and cancellation/drain obligations remain. This candidate wiring does not establish validation or deployment readiness. |
 | Background delegate output | Delegate output artifact | `<workspace>/delegate_results/<task-id>.json` | delegate tool cancellation registry and running future | Output files survive restart; live cancellation handles do not | Current artifacts contain task identity and output but no lifecycle status, error, or timestamps. Reads take lifecycle state from the task row; legacy status-bearing files are fallback-only when no row exists. |
 | Runtime logs | `zeroclaw-log` event schema and subscriber layer | `data/state/runtime-trace.jsonl` when persistence is enabled | broadcast hook, JSONL writer, `/api/logs` reader, `Observer` bridge | Rolling/full/none persistence is config-controlled; dashboard SSE receives events even when JSONL is disabled | Logs are evidence and observability, not the source of user config or session state. |
 | Cost ledger | `CostTracker` plus rate config | `data/state/costs.jsonl` | process-global `CostTracker` | Reload hot-swaps `CostConfig`; the tracker is constructed on demand if cost tracking becomes enabled | Existing records keep their recorded price; rate edits affect future requests after reload. |
@@ -65,6 +65,12 @@ new runtime state should be described in terms of `<install>/data/`,
 | Paired device metadata | Device registry rows keyed by token hash | `data/devices.db` | `DeviceRegistry` cache plus SQLite | Registry reconciles metadata against the canonical paired-token set | This DB makes paired devices visible/manageable; it does not invent valid tokens. |
 | Health and component status | running subsystems report component state | none | gateway health/status state | Process-local; reset/rebuilt on daemon restart or reload | `/health`, `/api/health`, and `/api/status` are current observations, not durable configuration. |
 | Queues, debouncers, watchdogs | `zeroclaw-infra` process utilities | none unless a caller stores results elsewhere | in-memory queues/debouncers/watchdogs | Process-local; used to serialize, coalesce, or detect stalls | Treat these as coordination state. Persist only the domain data they protect, not the queue itself. |
+
+Goal calls reuse the ordinary daily/monthly tracker for admission while their Goal accountant writes the canonical usage rows exactly once. A refused next call creates no provider attempt or consumption row; earlier known usage remains durable. Explicit resume repeats admission rather than resetting the ordinary limits. A clean resumable refusal requires accounting, tool-phase, and exact-owner checks independently; known lower-bound totals alone do not establish eligibility. Goal-owned live SOP cleanup stays with `SopEngine` and its existing settlement queue, not the Goal usage ledger.
+
+Subagent lifecycle settlement is separate from both usage settlement and the parent's paired tool history. A failed Goal child terminal write preserves its actual row state and original cleanup diagnostic and blocks a new resumable budget pause; it creates no usage row or cleanup retry service. Unlike failed SOP settlement, a same-process Subagent row has no maintenance queue. Existing conservative prior-owner recovery may later mark it Lost, but does not replay its body or fabricate a successful terminal write.
+
+Unlaunched Goal cleanup belongs to the existing process-local execution supervisor, not a second durable task store. Its exact task/session/epoch custody survives command cancellation and host-reference release through coordinator retention. Failed cleanup preserves its actual error and is retried only by existing explicit control, drain, restart, or disposal entrypoints; it performs no model work or usage write. Canonical pause, terminal, absence, or an actually owned Running successor discharges the old lifecycle duty without overwriting the winner. Unresolved custody prevents retirement and restart reopening. It adds no persistent field and does not recreate execution after process death; later work still requires ordinary authorized explicit resume.
 
 ## Reload and restart
 
@@ -91,7 +97,30 @@ whenever it exists, whichever backend is configured.
 
 ## Session backend migration
 
-Selecting the SQLite session backend imports legacy `data/sessions/*.jsonl` files when a backend handle is constructed. The importer moves each source to a private `.jsonl.importing` generation while holding the process-local JSONL mutation lock, writes the messages, metadata, and a source-bound import receipt in one SQLite transaction, then retains the source as `.jsonl.migrated` for rollback.
+Selecting the SQLite session backend imports legacy `data/sessions/*.jsonl`
+files when a backend handle is constructed. Under the process-local and
+interprocess JSONL mutation locks, the importer stages each transcript as
+`.jsonl.importing`, writes its messages, metadata, and source-bound import
+receipt in one SQLite transaction, and keeps the source as `.jsonl.migrated`
+for rollback.
+
+On Unix, a witnessed Goal-bound deletion replaces the transcript atomically
+with a private tombstone at the same path. The tombstone contains no history.
+Reads, listings, and migration exclude it. Writers cannot reuse the path until
+the original cleanup acknowledges it. Non-Unix builds refuse this witnessed
+deletion before deleting the transcript.
+
+A Goal-bound deletion first reads the transcript strictly. If it cannot, the
+deletion is refused before any intent is recorded, and the Goal and session are
+kept. Only a strictly readable transcript at that path proves that a recorded
+deletion did not commit. Any other file there, including a damaged tombstone,
+leaves the deletion unresolved and its session fenced; recover it from backup
+as described below.
+
+Ordinary JSONL sessions still use the same transcript format. Writers take a
+cross-process directory lock and check SQLite import receipts before writing.
+Trim breadcrumb updates use a staged atomic rename. Metadata listings omit
+entries whose modification time cannot be read.
 
 The receipt binds the source filename, session key, SHA-256 digest, and byte length. Before the receipt transaction begins, the importer syncs the staged source file and, on Unix, the live-to-staged directory rename. Migration transactions use full SQLite synchronization for the import commit, then restore the normal runtime setting. Archive handoff likewise syncs directory metadata on Unix before removing the staged source. Backend construction restores the process-local inactive state from durable receipts before scanning source files. As soon as an import receipt is committed, JSONL mutations for that sessions directory remain inactive even if archive handoff or a later file fails. The next construction can verify the staged source against that receipt and finish the handoff without inserting duplicate messages. Empty and whitespace-only JSONL files are retained as zero-message SQLite sessions; a non-empty source with no valid messages still fails closed.
 
@@ -119,6 +148,14 @@ At minimum, include:
 Do not run two daemons against the same install root. Several stores use SQLite
 with a single-writer model, and the process-local caches assume one daemon owns
 the instance.
+
+Control-plane schema v15 adds `goal_session_dispositions`. Before downgrading,
+let a v15-aware daemon settle any pending records against the original session
+stores. Older writers do not honor these records or JSONL tombstones. If the
+records cannot settle and a rollback is unavoidable, stop the daemon and restore
+a consistent pre-upgrade backup of the control plane and the session stores.
+That discards changes made after the backup. Do not clear records or tombstones
+by hand or restore just one store.
 
 ## Source pointers
 

@@ -263,12 +263,24 @@ pub(crate) async fn emit_tool_call_pair(
 /// `TurnEvent` variant of [`stream_text_posthoc_chunks`]: when the final
 /// response was not streamed live, emit it as one post-hoc `Chunk`.
 pub(crate) async fn emit_posthoc_turn_chunk(event_tx: Option<&Sender<TurnEvent>>, text: &str) {
+    emit_posthoc_turn_chunk_with_occurrence(event_tx, text, None).await;
+}
+
+pub(super) async fn emit_posthoc_turn_chunk_with_occurrence(
+    event_tx: Option<&Sender<TurnEvent>>,
+    text: &str,
+    reply_occurrence: Option<String>,
+) {
     if let Some(tx) = event_tx {
-        let _ = tx
-            .send(TurnEvent::Chunk {
-                delta: text.to_string(),
-            })
-            .await;
+        let delta = text.to_owned();
+        let event = match reply_occurrence {
+            Some(reply_occurrence) => TurnEvent::NativeReplyChunk {
+                delta,
+                reply_occurrence,
+            },
+            None => TurnEvent::Chunk { delta },
+        };
+        let _ = tx.send(event).await;
     }
 }
 
@@ -311,6 +323,7 @@ mod tests {
             attachments: Vec::new(),
             success: true,
             error_reason: None,
+            terminal_error: None,
             duration: Duration::ZERO,
             receipt: None,
             output_data: None,
@@ -406,6 +419,7 @@ mod tests {
             attachments: Vec::new(),
             success: true,
             error_reason: None,
+            terminal_error: None,
             duration: Duration::ZERO,
             receipt: None,
             output_data: None,

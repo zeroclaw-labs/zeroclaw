@@ -6,6 +6,7 @@ pub mod conversation_owners;
 pub mod debounce;
 pub mod net_guard;
 pub mod session_backend;
+pub mod session_disposition;
 pub mod session_queue;
 pub mod session_sqlite;
 pub mod session_store;

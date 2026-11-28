@@ -1,8 +1,17 @@
 //! JSONL-based session persistence for channel conversations.
 
-use crate::session_backend::SessionBackend;
+#[cfg(unix)]
+use crate::session_backend::SessionEffectAuthorization;
+use crate::session_backend::{SessionBackend, SessionTranscriptRow};
+use crate::session_disposition::jsonl::{self, Entry};
+#[cfg(unix)]
+use crate::session_disposition::{
+    SessionDispositionBackend, SessionDispositionEffect, SessionDispositionIdentity, not_attempted,
+};
+use crate::session_disposition::{SessionDispositionObservation, SessionDispositionWitness};
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 use zeroclaw_api::model_provider::ChatMessage;
@@ -15,6 +24,9 @@ pub(crate) struct MutationState {
 }
 
 pub(crate) type MutationLock = parking_lot::Mutex<MutationState>;
+
+// Release the OS lock before the process-local lock.
+type MutationGuard<'a> = (File, parking_lot::MutexGuard<'a, MutationState>);
 
 struct MutationLockRecord {
     lock: Weak<MutationLock>,
@@ -38,16 +50,8 @@ impl SessionStore {
         let mutation_lock = mutation_lock_for(&sessions_dir)?;
         {
             let mut state = mutation_lock.lock();
-            match crate::session_sqlite::has_committed_jsonl_import_receipts(workspace_dir) {
-                Ok(true) => mark_session_directory_migrated(&sessions_dir, &mut state)?,
-                Ok(false) => state.receipt_state_uncertain = false,
-                Err(error) => {
-                    state.receipt_state_uncertain = true;
-                    return Err(std::io::Error::other(format!(
-                        "Failed to inspect durable JSONL migration state: {error:#}"
-                    )));
-                }
-            }
+            let _directory = jsonl::lock_directory(&sessions_dir, true)?;
+            refresh_migration_state(workspace_dir, &sessions_dir, &mut state)?;
         }
         Ok(Self {
             sessions_dir,
@@ -57,8 +61,7 @@ impl SessionStore {
 
     /// Compute the file path for a session key, sanitizing for filesystem safety.
     fn session_path(&self, session_key: &str) -> PathBuf {
-        self.sessions_dir
-            .join(format!("{}.jsonl", sanitize_session_key(session_key)))
+        session_path(&self.sessions_dir, session_key)
     }
 
     /// Sidecar file recording whether `session_key`'s transcript currently
@@ -66,10 +69,7 @@ impl SessionStore {
     /// next to the transcript so restore never has to infer provenance from
     /// message text.
     fn trim_breadcrumb_path(&self, session_key: &str) -> PathBuf {
-        self.sessions_dir.join(format!(
-            "{}.trim_breadcrumb",
-            sanitize_session_key(session_key)
-        ))
+        trim_breadcrumb_path(&self.sessions_dir, session_key)
     }
 
     /// Persist whether the session's transcript starts with the synthetic
@@ -77,10 +77,17 @@ impl SessionStore {
     /// store has been migrated to SQLite.
     pub fn set_trim_breadcrumb(&self, session_key: &str, present: bool) -> std::io::Result<()> {
         let _guard = self.mutation_guard()?;
-        std::fs::write(
-            self.trim_breadcrumb_path(session_key),
-            if present { b"1" as &[u8] } else { b"0" },
-        )
+        require_writable_session(&self.session_path(session_key))?;
+        self.write_breadcrumb_unlocked(session_key, present)
+    }
+
+    fn write_breadcrumb_unlocked(&self, session_key: &str, present: bool) -> io::Result<()> {
+        let mut staged =
+            tempfile::Builder::new().make_in(&self.sessions_dir, create_staging_file)?;
+        staged.write_all(if present { b"1" } else { b"0" })?;
+        // Do not truncate through a sidecar symlink or hard link into a
+        // different session's file; publication replaces only this name.
+        publish_staged_rewrite(staged, &self.trim_breadcrumb_path(session_key))
     }
 
     /// Read the persisted breadcrumb flag. `None` if never recorded.
@@ -93,19 +100,28 @@ impl SessionStore {
     /// correction. Callers must fail closed on this `Err`, the same as any
     /// other unreadable breadcrumb.
     pub fn get_trim_breadcrumb(&self, session_key: &str) -> std::io::Result<Option<bool>> {
-        match std::fs::read(self.trim_breadcrumb_path(session_key)) {
-            Ok(bytes) => match bytes.as_slice() {
-                [b'0'] => Ok(Some(false)),
-                [b'1'] => Ok(Some(true)),
-                _ => Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "corrupt trim breadcrumb for session {session_key}: expected a single \
-                         b'0' or b'1' byte, got {} byte(s)",
-                        bytes.len()
-                    ),
-                )),
-            },
+        if matches!(
+            classify_session(&self.session_path(session_key))?,
+            Entry::Marker(_)
+        ) {
+            return Ok(None);
+        }
+        match jsonl::open_regular(&self.trim_breadcrumb_path(session_key), false) {
+            Ok(file) => {
+                let mut bytes = Vec::new();
+                file.take(2).read_to_end(&mut bytes)?;
+                match bytes.as_slice() {
+                    [b'0'] => Ok(Some(false)),
+                    [b'1'] => Ok(Some(true)),
+                    _ => Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "corrupt trim breadcrumb for session {session_key}: expected a single \
+                         b'0' or b'1' byte"
+                        ),
+                    )),
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
@@ -115,28 +131,17 @@ impl SessionStore {
     /// Returns an empty vec if the path is not a regular JSONL session file or
     /// the file is unreadable.
     pub fn load(&self, session_key: &str) -> Vec<ChatMessage> {
-        let path = self.session_path(session_key);
-        match validate_jsonl_session_file_path(&path) {
-            Ok(false) => return Vec::new(),
-            Ok(true) => {}
-            Err(_) => return Vec::new(),
-        }
-        let Ok(file) = std::fs::File::open(&path) else {
+        self.load_rows(session_key)
+            .into_iter()
+            .map(|row| row.message)
+            .collect()
+    }
+
+    fn load_rows(&self, session_key: &str) -> Vec<SessionTranscriptRow> {
+        let Ok(Entry::Transcript(file)) = classify_session(&self.session_path(session_key)) else {
             return Vec::new();
         };
-        let reader = std::io::BufReader::new(file);
-        let mut messages = Vec::new();
-        for line in reader.lines() {
-            let Ok(line) = line else { continue };
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if let Ok(msg) = serde_json::from_str::<ChatMessage>(trimmed) {
-                messages.push(msg);
-            }
-        }
-        messages
+        load_transcript(file)
     }
 
     /// Like `load`, but fails closed: a missing file returns `Ok(empty)`,
@@ -145,62 +150,74 @@ impl SessionStore {
     /// transcript that could not be verified" instead of seeding a
     /// new-message-only cache over an existing transcript.
     pub fn try_load(&self, session_key: &str) -> std::io::Result<Vec<ChatMessage>> {
-        let path = self.session_path(session_key);
-        match validate_jsonl_session_file_path(&path) {
-            Ok(false) => return Ok(Vec::new()),
-            Ok(true) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        }
-        let file = std::fs::File::open(&path)?;
-        let reader = std::io::BufReader::new(file);
-        let mut messages = Vec::new();
-        for line in reader.lines() {
-            let line = line?;
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let msg: ChatMessage = serde_json::from_str(trimmed).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("corrupt session JSONL line: {e}"),
-                )
-            })?;
-            messages.push(msg);
-        }
-        Ok(messages)
+        Ok(self
+            .try_load_rows(session_key)?
+            .into_iter()
+            .map(|row| row.message)
+            .collect())
     }
 
-    /// Append a single message to the session JSONL file.
+    fn try_load_rows(&self, session_key: &str) -> io::Result<Vec<SessionTranscriptRow>> {
+        match classify_session(&self.session_path(session_key))? {
+            Entry::Missing | Entry::Marker(_) => Ok(Vec::new()),
+            Entry::Transcript(file) => {
+                let mut messages = Vec::new();
+                read_strict_transcript(file, |message| messages.push(message))?;
+                Ok(messages)
+            }
+        }
+    }
+
+    /// Append a message on its own JSONL line without modifying existing bytes.
+    /// A non-empty file without a final LF gets one separator before the new record.
+    /// A write error may leave a partial record; the error is returned without rollback.
+    /// The next append still starts on a new line.
     pub fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
         let _guard = self.mutation_guard()?;
         self.append_unlocked(session_key, message)
     }
 
-    fn mutation_guard(&self) -> std::io::Result<parking_lot::MutexGuard<'_, MutationState>> {
-        let guard = self.mutation_lock.lock();
-        if guard.migrated || guard.receipt_state_uncertain {
-            return Err(std::io::Error::other(
-                "JSONL session store is inactive after SQLite migration",
-            ));
+    fn mutation_guard(&self) -> io::Result<MutationGuard<'_>> {
+        let mut process = self.mutation_lock.lock();
+        if process.migrated || process.receipt_state_uncertain {
+            return Err(inactive_jsonl());
         }
-        Ok(guard)
+        let directory = jsonl::lock_directory(&self.sessions_dir, false)?;
+        // The OS lock serializes cooperating processes as well. An inactive
+        // flag cached by one process can't fence a writer in another.
+        let workspace_dir = self.sessions_dir.parent().unwrap_or_else(|| Path::new(""));
+        refresh_migration_state(workspace_dir, &self.sessions_dir, &mut process)?;
+        if process.migrated {
+            return Err(inactive_jsonl());
+        }
+        Ok((directory, process))
     }
 
-    fn append_unlocked(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
+    fn append_unlocked(
+        &self,
+        session_key: &str,
+        message: &impl serde::Serialize,
+    ) -> std::io::Result<()> {
         let path = self.session_path(session_key);
-        validate_jsonl_session_file_path(&path)?;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        validate_jsonl_suffix(&path)?;
+        let (mut file, needs_separator) = match jsonl::classify_append(&path)? {
+            Entry::Transcript(mut file) => {
+                let needs_separator = ends_without_lf(&mut file)?;
+                (file, needs_separator)
+            }
+            // Exclusive creation guarantees an empty file; its handle is write-only.
+            Entry::Missing => (jsonl::create_append(&path)?, false),
+            Entry::Marker(_) => return Err(unacknowledged_delete()),
+        };
 
-        let json = serde_json::to_string(message)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        writeln!(file, "{json}")?;
-        Ok(())
+        let mut record = Vec::new();
+        if needs_separator {
+            record.push(b'\n');
+        }
+        serde_json::to_writer(&mut record, message)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        record.push(b'\n');
+        file.write_all(&record)
     }
 
     /// Remove the last message from a session's JSONL file.
@@ -208,7 +225,10 @@ impl SessionStore {
     /// O(n) but rollbacks are rare.
     pub fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
         let _guard = self.mutation_guard()?;
-        let mut messages = self.load(session_key);
+        let Some(file) = open_writable_session(&self.session_path(session_key))? else {
+            return Ok(false);
+        };
+        let mut messages = load_transcript(file);
         if messages.is_empty() {
             return Ok(false);
         }
@@ -232,11 +252,14 @@ impl SessionStore {
         F: FnOnce(tempfile::NamedTempFile, &Path) -> std::io::Result<()>,
     {
         let _guard = self.mutation_guard()?;
-        let mut messages = self.load(session_key);
+        let Some(file) = open_writable_session(&self.session_path(session_key))? else {
+            return Ok(false);
+        };
+        let mut messages = load_transcript(file);
         let Some(last) = messages.last_mut() else {
             return Ok(false);
         };
-        *last = message.clone();
+        *last = message.clone().into();
         self.rewrite_with(session_key, &messages, persist)?;
         Ok(true)
     }
@@ -244,12 +267,15 @@ impl SessionStore {
     /// Compact a session file by rewriting only valid messages (removes corrupt lines).
     pub fn compact(&self, session_key: &str) -> std::io::Result<()> {
         let _guard = self.mutation_guard()?;
-        validate_jsonl_session_file_path(&self.session_path(session_key))?;
-        let messages = self.load(session_key);
+        let messages = self.load_rows(session_key);
         self.rewrite(session_key, &messages)
     }
 
-    fn rewrite(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+    fn rewrite<T: serde::Serialize>(
+        &self,
+        session_key: &str,
+        messages: &[T],
+    ) -> std::io::Result<()> {
         self.rewrite_with(session_key, messages, publish_staged_rewrite)
     }
 
@@ -258,23 +284,16 @@ impl SessionStore {
     /// `replace_conversation_state_if_exists` can probe-then-write under one
     /// guard acquisition (`parking_lot` mutexes are not reentrant, so the
     /// trait methods cannot call each other while holding it).
-    fn replace_locked(
+    fn replace_locked<T: serde::Serialize>(
         &self,
-        _guard: &parking_lot::MutexGuard<'_, MutationState>,
+        _guard: &MutationGuard<'_>,
         session_key: &str,
-        messages: &[ChatMessage],
+        messages: &[T],
         breadcrumb_present: bool,
     ) -> std::io::Result<()> {
-        let previous_messages = self.load(session_key);
+        let previous_messages = self.load_rows(session_key);
         self.rewrite(session_key, messages)?;
-        let breadcrumb_write = std::fs::write(
-            self.trim_breadcrumb_path(session_key),
-            if breadcrumb_present {
-                b"1" as &[u8]
-            } else {
-                b"0"
-            },
-        );
+        let breadcrumb_write = self.write_breadcrumb_unlocked(session_key, breadcrumb_present);
         if let Err(e) = breadcrumb_write {
             // Best-effort: if this rewrite also fails, the transcript is left
             // at the new value with the stale flag, and the caller must
@@ -286,16 +305,31 @@ impl SessionStore {
         Ok(())
     }
 
-    fn rewrite_with<F>(
+    fn replace_rows_if_exists<T: serde::Serialize>(
         &self,
         session_key: &str,
-        messages: &[ChatMessage],
+        rows: &[T],
+        breadcrumb_present: bool,
+    ) -> io::Result<bool> {
+        let guard = self.mutation_guard()?;
+        if !is_regular_jsonl_session_file(&self.session_path(session_key)) {
+            return Ok(false);
+        }
+        self.replace_locked(&guard, session_key, rows, breadcrumb_present)?;
+        Ok(true)
+    }
+
+    fn rewrite_with<F, T: serde::Serialize>(
+        &self,
+        session_key: &str,
+        messages: &[T],
         persist: F,
     ) -> std::io::Result<()>
     where
         F: FnOnce(tempfile::NamedTempFile, &Path) -> std::io::Result<()>,
     {
         let path = self.session_path(session_key);
+        require_writable_session(&path)?;
         let mut temp = tempfile::Builder::new().make_in(&self.sessions_dir, create_staging_file)?;
         for msg in messages {
             serde_json::to_writer(&mut temp, msg)
@@ -319,13 +353,14 @@ impl SessionStore {
     /// a `clear_messages` call and be misread by a later restore.
     pub fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
         let _guard = self.mutation_guard()?;
+        let file = open_writable_session_legacy(&self.session_path(session_key))?;
         let _ = std::fs::remove_file(self.trim_breadcrumb_path(session_key));
-        if !is_regular_jsonl_session_file(&self.session_path(session_key)) {
+        let Some(file) = file else {
             return Ok(0);
-        }
-        let count = self.load(session_key).len();
+        };
+        let count = load_transcript(file).len();
         if count > 0 {
-            self.rewrite(session_key, &[])?;
+            self.rewrite::<ChatMessage>(session_key, &[])?;
         }
         Ok(count)
     }
@@ -343,7 +378,7 @@ impl SessionStore {
     fn delete_session_unlocked(&self, session_key: &str) -> std::io::Result<bool> {
         let path = self.session_path(session_key);
         let crumb_path = self.trim_breadcrumb_path(session_key);
-        if !is_regular_jsonl_session_file(&path) {
+        if open_writable_session_legacy(&path)?.is_none() {
             let had_crumb = crumb_path.exists();
             let _ = std::fs::remove_file(&crumb_path);
             return Ok(had_crumb);
@@ -355,13 +390,13 @@ impl SessionStore {
 
     /// Return the modification time of a regular session JSONL file.
     pub fn session_mtime(&self, session_key: &str) -> Option<std::time::SystemTime> {
-        let path = self.session_path(session_key);
-        if !is_regular_jsonl_session_file(&path) {
-            return None;
+        if let Ok(Entry::Transcript(file)) = classify_session(&self.session_path(session_key)) {
+            file.metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+        } else {
+            None
         }
-        std::fs::symlink_metadata(path)
-            .and_then(|m| m.modified())
-            .ok()
     }
 
     /// List all session keys that have regular JSONL files on disk.
@@ -382,6 +417,255 @@ impl SessionStore {
             })
             .collect()
     }
+
+    #[cfg(unix)]
+    fn delete_with_disposition_using<P, S>(
+        &self,
+        witness: &SessionDispositionWitness,
+        expected_owner: Option<&str>,
+        authorize: &SessionEffectAuthorization<'_>,
+        publish: P,
+        sync_published: S,
+    ) -> io::Result<bool>
+    where
+        P: FnOnce(jsonl::Staged<'_>, &str) -> io::Result<()>,
+        S: FnOnce(&jsonl::Directory) -> io::Result<()>,
+    {
+        let guard = self.mutation_guard()?;
+        let _authority = authorize(None)?;
+        if expected_owner.is_some() {
+            return Ok(false);
+        }
+        let bytes = jsonl::encode(witness)?;
+        let directory = jsonl::Directory::for_lock(&self.sessions_dir, &guard.0)?;
+        if directory.read_identity()?.as_ref() != Some(&witness.identity) {
+            return Err(io::Error::other("JSONL backend instance changed"));
+        }
+        let name = session_filename(&witness.backend_key);
+        let file = match directory.classify(&name)? {
+            Entry::Missing => return Ok(false),
+            Entry::Marker(_) => return Err(unacknowledged_delete()),
+            Entry::Transcript(file) => file,
+        };
+        read_strict_transcript(file, |_| {}).map_err(not_attempted)?;
+
+        // Verify support for directory sync before changing either old fact.
+        directory.sync()?;
+        let staged = directory.stage(&bytes)?;
+        // Once rename is attempted, an error does not prove no effect. The
+        // transition owner must resolve it using the exact marker; never
+        // roll back by seeding a transcript or unlinking the destination.
+        publish(staged, &name)?;
+        sync_published(&directory)?;
+        Ok(true)
+    }
+
+    /// Inspect an original JSONL backend even if SQLite is now configured.
+    /// The probe never creates the directory, lock, identity or a backend.
+    #[cfg(unix)]
+    pub fn observe_original_session_disposition(
+        workspace_dir: &Path,
+        witness: &SessionDispositionWitness,
+    ) -> io::Result<SessionDispositionObservation> {
+        use SessionDispositionObservation::{Committed, Indeterminate, NotCommitted};
+        let observed = with_original_disposition(workspace_dir, witness, |directory| {
+            match directory.classify(&session_filename(&witness.backend_key))? {
+                Entry::Marker(actual) if actual == *witness => {
+                    // The original writer could have died or reported an
+                    // error after publishing but before syncing the rename.
+                    directory.sync()?;
+                    Ok(Committed)
+                }
+                Entry::Transcript(file) => {
+                    read_strict_transcript(file, |_| {})?;
+                    Ok(NotCommitted)
+                }
+                Entry::Marker(_) | Entry::Missing => Ok(Indeterminate),
+            }
+        })?;
+        Ok(observed.unwrap_or(Indeterminate))
+    }
+
+    /// Unsupported platforms cannot establish a crash-durable JSONL witness.
+    #[cfg(not(unix))]
+    pub fn observe_original_session_disposition(
+        _workspace_dir: &Path,
+        _witness: &SessionDispositionWitness,
+    ) -> io::Result<SessionDispositionObservation> {
+        Ok(SessionDispositionObservation::Indeterminate)
+    }
+
+    /// Remove only the marker belonging to a disposition already recorded as
+    /// committed in the task control plane. Does not activate JSONL.
+    #[cfg(unix)]
+    pub fn acknowledge_original_session_disposition(
+        workspace_dir: &Path,
+        witness: &SessionDispositionWitness,
+    ) -> io::Result<()> {
+        with_original_disposition(workspace_dir, witness, |directory| {
+            let name = session_filename(&witness.backend_key);
+            match directory.classify(&name)? {
+                Entry::Marker(actual) if actual == *witness => {
+                    let crumb = trim_breadcrumb_filename(&witness.backend_key);
+                    match directory.remove(&crumb) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                    // Make cleanup durable while reuse is still excluded.
+                    directory.sync()?;
+                    directory.remove(&name)?;
+                    directory.sync()
+                }
+                // A concurrent/retried acknowledgment must not touch a new
+                // session's transcript or independently created breadcrumb.
+                Entry::Missing | Entry::Transcript(_) => directory.sync(),
+                Entry::Marker(_) => Err(unacknowledged_delete()),
+            }
+        })?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "original JSONL backend unavailable",
+            )
+        })
+    }
+
+    /// Unsupported platforms cannot safely remove a crash-durable JSONL witness.
+    #[cfg(not(unix))]
+    pub fn acknowledge_original_session_disposition(
+        _workspace_dir: &Path,
+        _witness: &SessionDispositionWitness,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "crash-durable JSONL disposition is unsupported on this platform",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn with_original_disposition<T>(
+    workspace_dir: &Path,
+    witness: &SessionDispositionWitness,
+    effect: impl FnOnce(&jsonl::Directory) -> io::Result<T>,
+) -> io::Result<Option<T>> {
+    if witness.identity.backend != SessionDispositionBackend::ChatJsonl
+        || witness.effect != SessionDispositionEffect::Delete
+        || witness.backend_key.is_empty()
+        || witness.operation_id.is_empty()
+    {
+        return Ok(None);
+    }
+    let dir = workspace_dir.join("sessions");
+    let process = match mutation_lock_for(&dir) {
+        Ok(process) => process,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let _process = process.lock();
+    let lock = match jsonl::lock_directory(&dir, false) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let directory = jsonl::Directory::for_lock(&dir, &lock)?;
+    if directory.read_identity()?.as_ref() != Some(&witness.identity) {
+        return Ok(None);
+    }
+    effect(&directory).map(Some)
+}
+
+fn session_path(dir: &Path, key: &str) -> PathBuf {
+    dir.join(session_filename(key))
+}
+
+fn trim_breadcrumb_path(dir: &Path, key: &str) -> PathBuf {
+    dir.join(trim_breadcrumb_filename(key))
+}
+
+fn session_filename(key: &str) -> String {
+    format!("{}.jsonl", sanitize_session_key(key))
+}
+
+fn trim_breadcrumb_filename(key: &str) -> String {
+    format!("{}.trim_breadcrumb", sanitize_session_key(key))
+}
+
+// Read the final byte through the already-readable classified handle.
+fn ends_without_lf(file: &mut File) -> io::Result<bool> {
+    let len = file.seek(SeekFrom::End(0))?;
+    if len == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::Start(len - 1))?;
+    let mut last = [0];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
+}
+
+fn load_transcript(file: File) -> Vec<SessionTranscriptRow> {
+    let mut messages = Vec::new();
+    for line in BufReader::new(file).lines() {
+        if let Ok(line) = line
+            && let Ok(message) = SessionTranscriptRow::from_json_line(line.trim())
+        {
+            messages.push(message);
+        }
+    }
+    messages
+}
+
+fn read_strict_transcript(
+    file: File,
+    mut accept: impl FnMut(SessionTranscriptRow),
+) -> io::Result<()> {
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let message = SessionTranscriptRow::from_json_line(trimmed).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("corrupt session JSONL line: {error}"),
+            )
+        })?;
+        accept(message);
+    }
+    Ok(())
+}
+
+fn refresh_migration_state(
+    workspace_dir: &Path,
+    sessions_dir: &Path,
+    state: &mut MutationState,
+) -> io::Result<()> {
+    match crate::session_sqlite::has_committed_jsonl_import_receipts(workspace_dir) {
+        Ok(true) => mark_session_directory_migrated(sessions_dir, state),
+        Ok(false) => {
+            state.receipt_state_uncertain = false;
+            Ok(())
+        }
+        Err(error) => {
+            state.receipt_state_uncertain = true;
+            Err(io::Error::other(format!(
+                "Failed to inspect durable JSONL migration state: {error:#}"
+            )))
+        }
+    }
+}
+
+fn inactive_jsonl() -> io::Error {
+    io::Error::other("JSONL session store is inactive after SQLite migration")
+}
+
+fn unacknowledged_delete() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "JSONL session deletion has not been acknowledged",
+    )
 }
 
 /// Rename a staged rewrite over the live session file.
@@ -416,12 +700,10 @@ fn create_staging_file(path: &Path) -> std::io::Result<std::fs::File> {
 }
 
 fn is_regular_jsonl_session_file(path: &Path) -> bool {
-    matches!(validate_jsonl_session_file_path(path), Ok(true))
+    matches!(classify_session(path), Ok(Entry::Transcript(_)))
 }
 
-/// Validate that a JSONL session path is absent or an existing regular file.
-/// Returns whether the regular file already exists.
-fn validate_jsonl_session_file_path(path: &Path) -> std::io::Result<bool> {
+fn validate_jsonl_suffix(path: &Path) -> io::Result<()> {
     if path
         .extension()
         .is_none_or(|extension| extension != "jsonl")
@@ -432,15 +714,34 @@ fn validate_jsonl_session_file_path(path: &Path) -> std::io::Result<bool> {
         ));
     }
 
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
-        Ok(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "session path must be a regular file",
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
+    Ok(())
+}
+
+fn classify_session(path: &Path) -> io::Result<Entry> {
+    validate_jsonl_suffix(path)?;
+    jsonl::classify(path)
+}
+
+fn open_writable_session(path: &Path) -> io::Result<Option<File>> {
+    match classify_session(path)? {
+        Entry::Missing => Ok(None),
+        Entry::Transcript(file) => Ok(Some(file)),
+        Entry::Marker(_) => Err(unacknowledged_delete()),
     }
+}
+
+// Legacy reset and delete may clean a dangling breadcrumb without touching
+// an invalid transcript path. Tombstones (including malformed ones) are not
+// a dangling path: they must still protect their breadcrumb until ack.
+fn open_writable_session_legacy(path: &Path) -> io::Result<Option<File>> {
+    match open_writable_session(path) {
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(None),
+        other => other,
+    }
+}
+
+fn require_writable_session(path: &Path) -> io::Result<()> {
+    open_writable_session(path).map(drop)
 }
 
 pub(crate) fn mutation_lock_for(sessions_dir: &Path) -> std::io::Result<Arc<MutationLock>> {
@@ -514,6 +815,32 @@ impl SessionBackend for SessionStore {
         self.append(session_key, message)
     }
 
+    fn load_transcript_rows(&self, session_key: &str) -> Vec<SessionTranscriptRow> {
+        self.load_rows(session_key)
+    }
+
+    fn try_load_transcript_rows(&self, session_key: &str) -> io::Result<Vec<SessionTranscriptRow>> {
+        self.try_load_rows(session_key)
+    }
+
+    fn append_transcript_row(
+        &self,
+        session_key: &str,
+        row: &SessionTranscriptRow,
+    ) -> io::Result<()> {
+        let _guard = self.mutation_guard()?;
+        self.append_unlocked(session_key, row)
+    }
+
+    fn replace_transcript_rows_if_exists(
+        &self,
+        session_key: &str,
+        rows: &[SessionTranscriptRow],
+        breadcrumb_present: bool,
+    ) -> io::Result<bool> {
+        self.replace_rows_if_exists(session_key, rows, breadcrumb_present)
+    }
+
     fn append_authorized(
         &self,
         session_key: &str,
@@ -577,12 +904,7 @@ impl SessionBackend for SessionStore {
         // commit between the probe and the writes: once deletion wins, the
         // post-turn write is a no-op instead of recreating the transcript
         // and sidecar files the delete just removed.
-        let guard = self.mutation_guard()?;
-        if !is_regular_jsonl_session_file(&self.session_path(session_key)) {
-            return Ok(false);
-        }
-        self.replace_locked(&guard, session_key, messages, breadcrumb_present)?;
-        Ok(true)
+        self.replace_rows_if_exists(session_key, messages, breadcrumb_present)
     }
 
     fn get_session_trim_breadcrumb(&self, session_key: &str) -> std::io::Result<Option<bool>> {
@@ -601,12 +923,9 @@ impl SessionBackend for SessionStore {
         use chrono::{DateTime, Utc};
         self.list_sessions()
             .into_iter()
-            .map(|key| {
-                let last_activity: DateTime<Utc> = self
-                    .session_mtime(&key)
-                    .map(DateTime::<Utc>::from)
-                    .unwrap_or_else(Utc::now);
-                crate::session_backend::SessionMetadata {
+            .filter_map(|key| {
+                let last_activity = self.session_mtime(&key).map(DateTime::<Utc>::from)?;
+                Some(crate::session_backend::SessionMetadata {
                     name: None,
                     created_at: last_activity,
                     last_activity,
@@ -617,7 +936,7 @@ impl SessionBackend for SessionStore {
                     room_id: None,
                     sender_id: None,
                     principal_id: None,
-                }
+                })
             })
             .collect()
     }
@@ -651,6 +970,44 @@ impl SessionBackend for SessionStore {
             return Ok(false);
         }
         self.delete_session_unlocked(session_key)
+    }
+
+    #[cfg(unix)]
+    fn session_disposition_identity(&self) -> io::Result<SessionDispositionIdentity> {
+        let guard = self.mutation_guard()?;
+        jsonl::Directory::for_lock(&self.sessions_dir, &guard.0)?.install_identity()
+    }
+
+    #[cfg(unix)]
+    fn delete_session_with_disposition(
+        &self,
+        witness: &SessionDispositionWitness,
+        expected_owner: Option<&str>,
+        authorize: &SessionEffectAuthorization<'_>,
+    ) -> io::Result<bool> {
+        self.delete_with_disposition_using(
+            witness,
+            expected_owner,
+            authorize,
+            |staged, target| staged.replace(target),
+            jsonl::Directory::sync,
+        )
+    }
+
+    fn observe_session_disposition(
+        &self,
+        witness: &SessionDispositionWitness,
+    ) -> io::Result<SessionDispositionObservation> {
+        let workspace_dir = self.sessions_dir.parent().unwrap_or_else(|| Path::new(""));
+        Self::observe_original_session_disposition(workspace_dir, witness)
+    }
+
+    fn acknowledge_session_disposition(
+        &self,
+        witness: &SessionDispositionWitness,
+    ) -> io::Result<()> {
+        let workspace_dir = self.sessions_dir.parent().unwrap_or_else(|| Path::new(""));
+        Self::acknowledge_original_session_disposition(workspace_dir, witness)
     }
 
     fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
@@ -768,6 +1125,487 @@ mod tests {
     use tempfile::TempDir;
 
     #[cfg(unix)]
+    fn witness(store: &SessionStore, key: &str) -> SessionDispositionWitness {
+        SessionDispositionWitness {
+            operation_id: "operation-1".to_owned(),
+            effect: crate::session_disposition::SessionDispositionEffect::Delete,
+            backend_key: key.to_owned(),
+            identity: store.session_disposition_identity().unwrap(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jsonl_disposition_reopen_guards_legacy_writers_and_ack_retry() {
+        use SessionDispositionObservation::{Committed, Indeterminate, NotCommitted};
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "chat:user";
+        let alias = "chat/user";
+        let old = ChatMessage::user("private old transcript");
+        store.append(key, &old).unwrap();
+        store.set_trim_breadcrumb(key, true).unwrap();
+        let requested = witness(&store, key);
+        assert_eq!(
+            store.observe_session_disposition(&requested).unwrap(),
+            NotCommitted
+        );
+
+        assert!(
+            store
+                .delete_session_with_disposition(&requested, None, &|owner| {
+                    assert_eq!(owner, None);
+                    Ok(Box::new(()))
+                })
+                .unwrap()
+        );
+        drop(store);
+
+        let reopened = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &reopened;
+        assert_eq!(
+            backend.session_disposition_identity().unwrap(),
+            requested.identity
+        );
+        assert_eq!(
+            backend.observe_session_disposition(&requested).unwrap(),
+            Committed
+        );
+        let marker_path = reopened.session_path(key);
+        let marker = std::fs::read(&marker_path).unwrap();
+        assert_eq!(marker, jsonl::encode(&requested).unwrap());
+        assert_eq!(
+            std::fs::metadata(&marker_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(backend.load(alias).is_empty());
+        assert!(backend.try_load(alias).unwrap().is_empty());
+        assert!(!backend.session_exists(alias));
+        assert!(backend.list_sessions().is_empty());
+        assert!(backend.list_sessions_with_metadata().is_empty());
+        assert!(reopened.session_mtime(alias).is_none());
+        assert!(
+            backend
+                .get_session_trim_breadcrumb(alias)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !backend
+                .replace_conversation_state_if_exists(alias, &[], false)
+                .unwrap()
+        );
+        for error in [
+            backend.append(alias, &old).unwrap_err(),
+            backend
+                .set_session_trim_breadcrumb(alias, false)
+                .unwrap_err(),
+            backend.rewrite_messages(alias, &[]).unwrap_err(),
+            backend
+                .replace_conversation_state(alias, &[], false)
+                .unwrap_err(),
+            backend.compact(alias).unwrap_err(),
+            backend.clear_messages(alias).unwrap_err(),
+            backend.remove_last(alias).unwrap_err(),
+            backend.update_last(alias, &old).unwrap_err(),
+            backend.delete_session(alias).unwrap_err(),
+            backend
+                .delete_session_authorized(alias, None, &|_| Ok(Box::new(())))
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        }
+        assert_eq!(std::fs::read(&marker_path).unwrap(), marker);
+        assert_eq!(
+            std::fs::read(reopened.trim_breadcrumb_path(alias)).unwrap(),
+            b"1"
+        );
+
+        let mut foreign = requested.clone();
+        foreign.operation_id.push_str("-foreign");
+        assert_eq!(
+            backend.observe_session_disposition(&foreign).unwrap(),
+            Indeterminate
+        );
+        assert!(backend.acknowledge_session_disposition(&foreign).is_err());
+        assert_eq!(std::fs::read(&marker_path).unwrap(), marker);
+
+        backend.acknowledge_session_disposition(&requested).unwrap();
+        assert!(!marker_path.exists());
+        assert!(!reopened.trim_breadcrumb_path(alias).exists());
+        let new = ChatMessage::user("new-session");
+        backend.append(alias, &new).unwrap();
+        backend.set_session_trim_breadcrumb(alias, false).unwrap();
+        backend.acknowledge_session_disposition(&requested).unwrap();
+        assert_eq!(backend.try_load(alias).unwrap()[0].content, new.content);
+        assert_eq!(
+            backend.get_session_trim_breadcrumb(alias).unwrap(),
+            Some(false)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jsonl_disposition_observation_needs_strict_transcript_for_non_commit() {
+        use SessionDispositionObservation::{Committed, Indeterminate, NotCommitted};
+
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "strict-observation";
+        let requested = witness(&store, key);
+        let transcript = store.session_path(key);
+        let observe = || SessionStore::observe_original_session_disposition(tmp.path(), &requested);
+        store
+            .rewrite(
+                key,
+                &[
+                    ChatMessage::user("question"),
+                    ChatMessage::assistant("answer"),
+                ],
+            )
+            .unwrap();
+        let valid = std::fs::read(&transcript).unwrap();
+        assert_eq!(observe().unwrap(), NotCommitted);
+        std::fs::write(&transcript, b"").unwrap();
+        assert_eq!(observe().unwrap(), NotCommitted);
+
+        let marker = jsonl::encode(&requested).unwrap();
+        let corruptions = [
+            b"corrupt ordinary JSONL\n".to_vec(),
+            vec![0xff, 0xfe, b'\n'],
+            [valid.as_slice(), b"{\"role\":"].concat(),
+            [&[1], &marker[1..]].concat(),
+            [b"{", &marker[1..]].concat(),
+            b"\0ZC-SESSION-DISPOSITION".to_vec(),
+        ];
+        for bytes in corruptions {
+            std::fs::write(&transcript, &bytes).unwrap();
+            assert!(observe().is_err(), "unexpected proof from {bytes:?}");
+            assert_eq!(std::fs::read(&transcript).unwrap(), bytes);
+        }
+
+        std::fs::write(&transcript, marker).unwrap();
+        assert_eq!(observe().unwrap(), Committed);
+        let foreign = SessionDispositionWitness {
+            operation_id: "different-operation".into(),
+            ..requested.clone()
+        };
+        std::fs::write(&transcript, jsonl::encode(&foreign).unwrap()).unwrap();
+        assert_eq!(observe().unwrap(), Indeterminate);
+        std::fs::remove_file(&transcript).unwrap();
+        assert_eq!(observe().unwrap(), Indeterminate);
+
+        std::fs::rename(tmp.path().join("sessions"), tmp.path().join("original")).unwrap();
+        let replacement = SessionStore::new(tmp.path()).unwrap();
+        assert_ne!(
+            replacement.session_disposition_identity().unwrap(),
+            requested.identity
+        );
+        replacement
+            .append(key, &ChatMessage::user("replacement"))
+            .unwrap();
+        assert_eq!(observe().unwrap(), Indeterminate);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jsonl_disposition_strict_refusal_preserves_transcript_and_breadcrumb() {
+        use crate::session_disposition::SessionDispositionNotAttempted;
+
+        let is_not_attempted = |error: &io::Error| {
+            error
+                .get_ref()
+                .is_some_and(|inner| inner.is::<SessionDispositionNotAttempted>())
+        };
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "strict-refusal";
+        let requested = witness(&store, key);
+        let transcript = store.session_path(key);
+        let breadcrumb = store.trim_breadcrumb_path(key);
+        store.set_trim_breadcrumb(key, true).unwrap();
+        let mut damaged_marker = jsonl::encode(&requested).unwrap();
+        damaged_marker[0] = 1;
+        let authorize: &SessionEffectAuthorization<'_> = &|_| Ok(Box::new(()));
+        for bytes in [b"corrupt ordinary JSONL\n".as_slice(), &damaged_marker] {
+            std::fs::write(&transcript, bytes).unwrap();
+            let strict = store.try_load(key).unwrap_err();
+            let refused = store
+                .delete_session_with_disposition(&requested, None, authorize)
+                .unwrap_err();
+            assert!(is_not_attempted(&refused), "{refused:?}");
+            assert_eq!(refused.kind(), strict.kind());
+            assert_eq!(refused.to_string(), strict.to_string());
+            assert_eq!(std::fs::read(&transcript).unwrap(), bytes);
+            assert_eq!(std::fs::read(&breadcrumb).unwrap(), b"1");
+        }
+
+        store.rewrite(key, &[ChatMessage::user("valid")]).unwrap();
+        let valid = std::fs::read(&transcript).unwrap();
+        let rename_failure = store
+            .delete_with_disposition_using(
+                &requested,
+                None,
+                authorize,
+                |_, _| Err(io::Error::other("injected rename failure")),
+                |_| panic!("cannot sync after rename failure"),
+            )
+            .unwrap_err();
+        assert!(!is_not_attempted(&rename_failure));
+        assert_eq!(rename_failure.to_string(), "injected rename failure");
+
+        #[derive(Debug)]
+        struct Denied;
+        impl std::fmt::Display for Denied {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("fixture authorization refused")
+            }
+        }
+        impl std::error::Error for Denied {}
+        let denial = store
+            .delete_session_with_disposition(&requested, None, &|_| {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, Denied))
+            })
+            .unwrap_err();
+        assert!(!is_not_attempted(&denial));
+        assert!(denial.get_ref().is_some_and(|inner| inner.is::<Denied>()));
+        assert_eq!(denial.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(&transcript).unwrap(), valid);
+        assert_eq!(std::fs::read(&breadcrumb).unwrap(), b"1");
+
+        assert!(
+            store
+                .delete_session_with_disposition(&requested, None, authorize)
+                .unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&transcript).unwrap(),
+            jsonl::encode(&requested).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jsonl_disposition_faults_resolve_from_original_facts() {
+        use SessionDispositionObservation::{Committed, Indeterminate, NotCommitted};
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "fault-control";
+        let requested = witness(&store, key);
+        let authorize: &SessionEffectAuthorization<'_> = &|_| Ok(Box::new(()));
+        assert!(
+            !store
+                .delete_session_with_disposition(&requested, None, authorize)
+                .unwrap()
+        );
+        assert_eq!(
+            store.observe_session_disposition(&requested).unwrap(),
+            Indeterminate
+        );
+
+        let transcript = store.session_path(key);
+        let breadcrumb = store.trim_breadcrumb_path(key);
+        std::fs::write(&transcript, b"corrupt ordinary JSONL\n").unwrap();
+        store.set_trim_breadcrumb(key, true).unwrap();
+        assert!(
+            store
+                .delete_session_with_disposition(&requested, None, authorize)
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(&transcript).unwrap(),
+            b"corrupt ordinary JSONL\n"
+        );
+        assert_eq!(std::fs::read(&breadcrumb).unwrap(), b"1");
+        store
+            .rewrite(key, &[ChatMessage::user("original")])
+            .unwrap();
+        let old = std::fs::read(&transcript).unwrap();
+
+        let pre = store.delete_with_disposition_using(
+            &requested,
+            None,
+            authorize,
+            |_, _| Err(io::Error::other("injected before rename")),
+            |_| panic!("must not sync after failed publication"),
+        );
+        assert!(pre.is_err());
+        assert_eq!(std::fs::read(&transcript).unwrap(), old);
+        assert_eq!(std::fs::read(&breadcrumb).unwrap(), b"1");
+        assert_eq!(
+            store.observe_session_disposition(&requested).unwrap(),
+            NotCommitted
+        );
+
+        let post = store.delete_with_disposition_using(
+            &requested,
+            None,
+            authorize,
+            |staged, target| staged.replace(target),
+            |_| Err(io::Error::other("injected after rename")),
+        );
+        assert!(post.is_err());
+        assert_eq!(std::fs::read(&breadcrumb).unwrap(), b"1");
+        drop(store);
+        assert_eq!(
+            SessionStore::observe_original_session_disposition(tmp.path(), &requested).unwrap(),
+            Committed
+        );
+
+        // A still-held name is essential while cleanup is failing.
+        std::fs::remove_file(&breadcrumb).unwrap();
+        std::fs::create_dir(&breadcrumb).unwrap();
+        assert!(
+            SessionStore::acknowledge_original_session_disposition(tmp.path(), &requested).is_err()
+        );
+        assert!(transcript.exists());
+        std::fs::remove_dir(&breadcrumb).unwrap();
+        SessionStore::acknowledge_original_session_disposition(tmp.path(), &requested).unwrap();
+        assert!(!transcript.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jsonl_disposition_replace_is_bound_to_the_open_original_directory() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let replacement_tmp = TempDir::new().unwrap();
+        let replacement = SessionStore::new(replacement_tmp.path()).unwrap();
+        let key = "same-key";
+        store.append(key, &ChatMessage::user("original")).unwrap();
+        replacement
+            .append(key, &ChatMessage::user("replacement"))
+            .unwrap();
+        replacement.set_trim_breadcrumb(key, true).unwrap();
+        let requested = witness(&store, key);
+        let replacement_bytes = std::fs::read(replacement.session_path(key)).unwrap();
+        let detached = tmp.path().join("detached");
+        std::fs::create_dir(&detached).unwrap();
+
+        assert!(
+            store
+                .delete_with_disposition_using(
+                    &requested,
+                    None,
+                    &|_| Ok(Box::new(())),
+                    |staged, target| {
+                        std::fs::rename(&store.sessions_dir, detached.join("sessions"))?;
+                        std::fs::rename(&replacement.sessions_dir, &store.sessions_dir)?;
+                        staged.replace(target)
+                    },
+                    jsonl::Directory::sync,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            std::fs::read(store.session_path(key)).unwrap(),
+            replacement_bytes
+        );
+        assert_eq!(
+            std::fs::read(store.trim_breadcrumb_path(key)).unwrap(),
+            b"1"
+        );
+        assert_eq!(
+            SessionStore::observe_original_session_disposition(tmp.path(), &requested).unwrap(),
+            SessionDispositionObservation::Indeterminate
+        );
+        assert_eq!(
+            SessionStore::observe_original_session_disposition(&detached, &requested).unwrap(),
+            SessionDispositionObservation::Committed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jsonl_disposition_migration_skips_marker_but_can_probe_inactive_backend() {
+        use crate::session_sqlite::SqliteSessionBackend;
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "deleted";
+        store.append(key, &ChatMessage::user("deleted")).unwrap();
+        store.set_trim_breadcrumb(key, true).unwrap();
+        store
+            .append("remaining", &ChatMessage::user("preserved"))
+            .unwrap();
+        let requested = witness(&store, key);
+        assert!(
+            store
+                .delete_session_with_disposition(&requested, None, &|_| Ok(Box::new(())))
+                .unwrap()
+        );
+        let sqlite = SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(sqlite.migrate_from_jsonl(tmp.path()).unwrap(), 1);
+        assert!(!sqlite.session_exists(key));
+        assert!(sqlite.session_exists("remaining"));
+        assert!(store.append("inactive", &ChatMessage::user("no")).is_err());
+        assert_eq!(
+            SessionStore::observe_original_session_disposition(tmp.path(), &requested).unwrap(),
+            SessionDispositionObservation::Committed
+        );
+        assert_eq!(
+            std::fs::read(store.trim_breadcrumb_path(key)).unwrap(),
+            b"1"
+        );
+        SessionStore::acknowledge_original_session_disposition(tmp.path(), &requested).unwrap();
+        assert!(!store.session_path(key).exists());
+        assert!(!store.trim_breadcrumb_path(key).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jsonl_disposition_malformed_marker_and_replaced_instance_fail_closed() {
+        use crate::session_sqlite::SqliteSessionBackend;
+        let original_dir = TempDir::new().unwrap();
+        let original = SessionStore::new(original_dir.path()).unwrap();
+        let key = "key";
+        let requested = witness(&original, key);
+        original.append(key, &ChatMessage::user("old")).unwrap();
+        // Use the private original file but corrupt the reserved format.
+        let damage = b"\0ZC-SESSION-DISPOSITION";
+        let path = original.session_path(key);
+        std::fs::write(&path, damage).unwrap();
+        assert!(original.load(key).is_empty());
+        assert!(!original.session_exists(key));
+        assert!(original.try_load(key).is_err());
+        assert!(original.append(key, &ChatMessage::user("no")).is_err());
+        assert!(original.delete_session(key).is_err());
+        let sqlite = SqliteSessionBackend::new(original_dir.path()).unwrap();
+        assert!(sqlite.migrate_from_jsonl(original_dir.path()).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), damage);
+
+        let replacement_dir = TempDir::new().unwrap();
+        assert_eq!(
+            SessionStore::observe_original_session_disposition(replacement_dir.path(), &requested)
+                .unwrap(),
+            SessionDispositionObservation::Indeterminate
+        );
+        assert!(!replacement_dir.path().join("sessions").exists());
+        let replacement = SessionStore::new(replacement_dir.path()).unwrap();
+        assert_ne!(
+            replacement.session_disposition_identity().unwrap(),
+            requested.identity
+        );
+        replacement
+            .append(key, &ChatMessage::user("replacement"))
+            .unwrap();
+        assert_eq!(
+            replacement.observe_session_disposition(&requested).unwrap(),
+            SessionDispositionObservation::Indeterminate
+        );
+        assert!(
+            replacement
+                .acknowledge_session_disposition(&requested)
+                .is_err()
+        );
+        assert_eq!(replacement.try_load(key).unwrap()[0].content, "replacement");
+    }
+
+    #[cfg(unix)]
     fn symlink_file(original: &Path, link: &Path) -> std::io::Result<()> {
         std::os::unix::fs::symlink(original, link)
     }
@@ -824,6 +1662,233 @@ mod tests {
         assert_eq!(messages[0].content, "hello");
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].content, "hi there");
+    }
+
+    const PARTIAL_FRAMING_ROW: &str = r#"{"role":"assistant","content":"cut"#;
+
+    fn framing_messages() -> ([ChatMessage; 3], [String; 3]) {
+        let messages = [
+            ChatMessage::user("first question"),
+            ChatMessage::assistant("first answer"),
+            ChatMessage::user("second question"),
+        ];
+        let rows = messages
+            .each_ref()
+            .map(|message| serde_json::to_string(message).unwrap());
+        (messages, rows)
+    }
+
+    fn assert_framing_history(actual: &[ChatMessage], expected: &[ChatMessage]) {
+        fn pairs(messages: &[ChatMessage]) -> Vec<(&str, &str)> {
+            messages
+                .iter()
+                .map(|message| (message.role.as_str(), message.content.as_str()))
+                .collect()
+        }
+        assert_eq!(pairs(actual), pairs(expected));
+    }
+
+    // A complete final row without LF needs one separator, even with repeated appends.
+    #[test]
+    fn append_preserves_complete_jsonl_final_row_without_lf() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "append-framing";
+        let path = store.session_path(key);
+        let ([first, second, third], [j1, j2, j3]) = framing_messages();
+        let initial = format!("{j1}\n{j2}");
+        std::fs::write(&path, &initial).unwrap();
+        assert_framing_history(
+            &store.try_load(key).unwrap(),
+            &[first.clone(), second.clone()],
+        );
+
+        store.append(key, &third).unwrap();
+        store.append(key, &third).unwrap();
+        drop(store);
+        let reopened = SessionStore::new(tmp.path()).unwrap();
+        let strict = reopened.try_load(key);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{initial}\n{j3}\n{j3}\n"),
+            "strict reopen: {strict:?}",
+        );
+        let expected = [first, second, third.clone(), third];
+        assert_framing_history(&strict.unwrap(), &expected);
+        assert_framing_history(&reopened.load(key), &expected);
+    }
+
+    // Preserve LF, trailing blank lines and CRLF without inserting another separator.
+    #[test]
+    fn append_preserves_lf_terminated_jsonl_history() {
+        for ending in ["\n", "\n\n", "\r\n"] {
+            let tmp = TempDir::new().unwrap();
+            let store = SessionStore::new(tmp.path()).unwrap();
+            let key = "append-terminated";
+            let path = store.session_path(key);
+            let (messages, [j1, j2, j3]) = framing_messages();
+            let initial = format!("{j1}\n{j2}{ending}");
+            std::fs::write(&path, &initial).unwrap();
+
+            store.append(key, &messages[2]).unwrap();
+            drop(store);
+            let reopened = SessionStore::new(tmp.path()).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                format!("{initial}{j3}\n")
+            );
+            assert_framing_history(&reopened.try_load(key).unwrap(), &messages);
+        }
+    }
+
+    // Neither an existing empty file nor a newly created file needs a leading LF.
+    #[test]
+    fn append_to_empty_or_missing_session_adds_no_separator() {
+        for existing in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let store = SessionStore::new(tmp.path()).unwrap();
+            let key = "append-empty-or-missing";
+            let path = store.session_path(key);
+            let (messages, [j1, j2, _]) = framing_messages();
+            if existing {
+                std::fs::write(&path, b"").unwrap();
+            }
+            assert_eq!(path.exists(), existing);
+
+            store.append(key, &messages[0]).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{j1}\n"));
+            store.append(key, &messages[1]).unwrap();
+            drop(store);
+            let reopened = SessionStore::new(tmp.path()).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                format!("{j1}\n{j2}\n")
+            );
+            assert_framing_history(&reopened.try_load(key).unwrap(), &messages[..2]);
+        }
+    }
+
+    fn assert_append_leaves_damaged_tail(tail: &str, separator: &str) {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "append-damaged-tail";
+        let path = store.session_path(key);
+        let (messages, [j1, j2, _]) = framing_messages();
+        let initial = format!("{j1}\n{tail}");
+        std::fs::write(&path, &initial).unwrap();
+
+        store.append(key, &messages[1]).unwrap();
+        drop(store);
+        let reopened = SessionStore::new(tmp.path()).unwrap();
+        let best_effort = reopened.load(key);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{initial}{separator}{j2}\n"),
+            "best-effort reopen: {best_effort:?}",
+        );
+        assert_framing_history(&best_effort, &messages[..2]);
+        assert_eq!(
+            reopened.try_load(key).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    // A partial row stays damaged, but later good history must remain readable.
+    #[test]
+    fn append_after_partial_final_record_keeps_new_record_distinct() {
+        assert_append_leaves_damaged_tail(PARTIAL_FRAMING_ROW, "\n");
+    }
+
+    // An already terminated malformed row does not need repair or another separator.
+    #[test]
+    fn append_after_terminated_malformed_record_adds_no_separator() {
+        assert_append_leaves_damaged_tail("not json\n", "");
+    }
+
+    // Guarded append counts valid history, commits once, and uses the same framing.
+    #[test]
+    fn append_authorized_frames_unterminated_record() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "append-authorized-valid";
+        let path = store.session_path(key);
+        let (messages, [j1, j2, j3]) = framing_messages();
+        std::fs::write(&path, format!("{j1}\n{j2}")).unwrap();
+        let commits = std::cell::Cell::new(0);
+        let count = store
+            .append_authorized(
+                key,
+                &messages[2],
+                &|owner| {
+                    assert_eq!(owner, None);
+                    Ok(Box::new(()))
+                },
+                &mut || commits.set(commits.get() + 1),
+            )
+            .unwrap();
+        assert_eq!((count, commits.get()), (3, 1));
+        drop(store);
+        let reopened = SessionStore::new(tmp.path()).unwrap();
+        let strict = reopened.try_load(key);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{j1}\n{j2}\n{j3}\n"),
+            "strict reopen: {strict:?}",
+        );
+        assert_framing_history(&strict.unwrap(), &messages);
+    }
+
+    // Guarded append must still refuse damaged history without publishing any effect.
+    #[test]
+    fn append_authorized_refuses_malformed_tail_without_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "append-authorized-damaged";
+        let path = store.session_path(key);
+        let (messages, [j1, _, _]) = framing_messages();
+        let initial = format!("{j1}\n{PARTIAL_FRAMING_ROW}");
+        std::fs::write(&path, &initial).unwrap();
+        let committed = std::cell::Cell::new(false);
+        let error = store
+            .append_authorized(
+                key,
+                &messages[1],
+                &|owner| {
+                    assert_eq!(owner, None);
+                    Ok(Box::new(()))
+                },
+                &mut || committed.set(true),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!committed.get());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), initial);
+    }
+
+    #[test]
+    fn damaged_jsonl_has_only_a_best_effort_history() {
+        use std::io::Write;
+
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "history";
+        store.append(key, &ChatMessage::user("valid")).unwrap();
+        let clean = store.try_load(key).unwrap();
+        assert_eq!(clean.len(), 1);
+        assert_eq!(store.load(key)[0].content, clean[0].content);
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(store.session_path(key))
+            .unwrap();
+        writeln!(file, "invalid JSONL").unwrap();
+        assert_eq!(
+            store.try_load(key).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let best_effort = store.load(key);
+        assert_eq!(best_effort.len(), 1);
+        assert_eq!(best_effort[0].content, "valid");
     }
 
     #[test]
@@ -1237,6 +2302,38 @@ mod tests {
     }
 
     #[test]
+    fn rewriting_jsonl_retains_occurrences_only_on_surviving_rows() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let path = store.session_path("same-text");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"role\":\"assistant\",\"content\":\"same\",\"reply_occurrence\":\"first\"}\n",
+                "{\"role\":\"assistant\",\"content\":\"same\",\"reply_occurrence\":\"second\"}\n",
+                "{\"role\":\"assistant\",\"content\":\"same\"}\n",
+            ),
+        )
+        .unwrap();
+        store.compact("same-text").unwrap();
+        assert!(store.remove_last("same-text").unwrap());
+        assert!(
+            store
+                .update_last("same-text", &ChatMessage::assistant("same"))
+                .unwrap()
+        );
+        let wire = std::fs::read_to_string(path).unwrap();
+        let rows: Vec<serde_json::Value> = wire
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["reply_occurrence"], "first");
+        assert!(rows[1].get("reply_occurrence").is_none());
+        assert!(rows.iter().all(|row| row["content"] == "same"));
+    }
+
+    #[test]
     fn compact_removes_corrupt_lines() {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path()).unwrap();
@@ -1536,7 +2633,13 @@ mod tests {
         let backend: &dyn SessionBackend = &store;
 
         backend
-            .append("s1", &ChatMessage::user("pre-replace turn"))
+            .append_transcript_row(
+                "s1",
+                &SessionTranscriptRow {
+                    message: ChatMessage::assistant("pre-replace turn"),
+                    reply_occurrence: Some("original".into()),
+                },
+            )
             .unwrap();
         backend.set_session_trim_breadcrumb("s1", false).unwrap();
 
@@ -1557,6 +2660,11 @@ mod tests {
             result.is_err(),
             "the poisoned breadcrumb path must fail the call"
         );
+        assert!(
+            backend
+                .replace_transcript_rows_if_exists("s1", &[], true)
+                .is_err()
+        );
 
         // The transcript must have rolled back to its pre-replace content,
         // not the replacement that could never be paired with a committed
@@ -1564,5 +2672,11 @@ mod tests {
         let messages = backend.load("s1");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "pre-replace turn");
+        assert_eq!(
+            backend.try_load_transcript_rows("s1").unwrap()[0]
+                .reply_occurrence
+                .as_deref(),
+            Some("original")
+        );
     }
 }

@@ -127,6 +127,23 @@ async fn retire(
     if cancel.is_cancelled() {
         return false;
     }
+    // Do not wait on the lifecycle lock under the actor permit: an explicit
+    // close can own that lock while waiting for its place in the actor queue.
+    let Some(snapshot) = ctx.sessions.goal_session_snapshot(&current.id).await else {
+        return false;
+    };
+    if snapshot.generation != current.generation {
+        return false;
+    }
+    let Ok(goal_lifecycle) = snapshot.goal_command.try_lock_owned() else {
+        return false;
+    };
+    if !matches!(
+        ctx.goal_runtime.can_retire_session_goal(&current.id).await,
+        Ok(true)
+    ) {
+        return false;
+    }
     // Decided and removed in one step: a resume, a recorded activity, a
     // reconnect or a cancellation after the checks above leaves the session
     // alone.
@@ -139,6 +156,7 @@ async fn retire(
     else {
         return false;
     };
+    drop(goal_lifecycle);
     // Only the agent detached here, never a successor's.
     agent
         .lock()
