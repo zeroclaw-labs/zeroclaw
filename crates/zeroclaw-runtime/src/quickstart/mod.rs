@@ -3223,6 +3223,28 @@ mod tests {
         assert_eq!(agent.runtime_profile, "balanced");
     }
 
+    /// Choosing the `balanced` runtime preset writes the whole profile entry
+    /// to disk, its 500-cent delegation ceiling included, so the saved value
+    /// does not follow a later change to the schema default.
+    #[tokio::test]
+    async fn balanced_preset_writes_its_cost_ceiling_to_disk() {
+        let (dir, _applied) = apply_to_temp(fresh_submission("bot")).await;
+        let raw = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
+        let balanced = raw
+            .split("[runtime_profiles.balanced]")
+            .nth(1)
+            .and_then(|rest| rest.split("\n[").next())
+            .unwrap_or_else(|| panic!("no [runtime_profiles.balanced] table:\n{raw}"));
+        assert!(
+            balanced.contains("max_cost_per_day_cents = 500"),
+            "the ceiling is written, not left to the schema default:\n{raw}"
+        );
+        assert_eq!(
+            reload(&dir).runtime_profiles["balanced"].max_cost_per_day_cents,
+            500
+        );
+    }
+
     #[tokio::test]
     async fn existing_runtime_profile_is_reused_without_writing_preset() {
         let dir = tempfile::tempdir().unwrap();

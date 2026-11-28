@@ -181,6 +181,37 @@ The fix is to wait for new requests; there's no retroactive repricing.
 
 ## Budget enforcement
 
+ZeroClaw sets no dollar limit you did not write. `[cost] daily_limit_usd`
+and `monthly_limit_usd` are unset by default, and an unset limit is no
+limit: nothing is refused or warned about for that period. Set one to get
+a limit:
+
+```toml
+[cost]
+daily_limit_usd = 10.0
+monthly_limit_usd = 100.0
+```
+
+A set limit is checked before each model call against the spend already
+recorded for the UTC day or month. The call that takes the total past the
+limit still runs, because the check does not estimate a call's own cost;
+the calls after it are refused for the rest of the period unless the
+limit is raised. A limit of `0.0` therefore refuses every call once any
+spend has been recorded: the call that first costs something still runs. `warn_at_percent` applies only to a
+limit that is set. Both limits count recorded `cost_usd` only, so they
+bind once your models are priced.
+
+`[runtime_profiles.<alias>] max_cost_per_day_cents` is a different
+ceiling. It applies to runs delegated to an agent on that profile, not to
+the agent's own turns, and `0` (the default) sets none. The `balanced`
+runtime preset sets 500 cents, and `tight` and `local_small` set 100. See
+[delegation](../agents/delegation.md) for how a caller's ceiling carries
+down.
+
+Releases up to v0.9.0 defaulted the two `[cost]` limits to $10.00 and
+$100.00 and the profile ceiling to 500 cents. Set the keys to keep a
+limit after upgrading.
+
 `CostConfig::enforcement.mode` decides what happens when a projected
 cost would push `daily_total` or `monthly_total` past the configured
 limit:

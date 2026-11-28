@@ -1300,8 +1300,8 @@ mod tests {
             Some("/usr/share/zeroclawlabs/web/dist")
         );
         assert!(!cfg.cost.enabled);
-        assert_eq!(cfg.cost.daily_limit_usd, 10.0);
-        assert_eq!(cfg.cost.monthly_limit_usd, 100.0);
+        assert_eq!(cfg.cost.daily_limit_usd, Some(10.0));
+        assert_eq!(cfg.cost.monthly_limit_usd, Some(100.0));
         assert_eq!(cfg.cost.warn_at_percent, 80);
         assert!(!cfg.cost.allow_override);
     }

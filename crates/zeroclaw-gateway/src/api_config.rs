@@ -4760,6 +4760,67 @@ mod tests {
         );
     }
 
+    /// A JSON `null` replace clears an optional number. Over the
+    /// PATCH route that unsets a `[cost]` limit in memory and on disk, an
+    /// explicit `0.0` is kept as a value, and a comment op on an unset limit
+    /// creates no value.
+    #[tokio::test]
+    async fn patch_null_replace_unsets_an_optional_cost_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.cost.daily_limit_usd = Some(10.0);
+        config.save().await.unwrap();
+        let config_path = config.config_path.clone();
+        assert!(
+            std::fs::read_to_string(&config_path)
+                .unwrap()
+                .contains("daily_limit_usd = 10.0")
+        );
+        let state = test_state(config);
+        let patch = |ops: serde_json::Value| {
+            let state = state.clone();
+            async move {
+                response_json(
+                    handle_patch(State(state), None, HeaderMap::new(), axum::Json(ops)).await,
+                )
+                .await
+            }
+        };
+
+        let (status, json) = patch(serde_json::json!([{
+            "op": "replace",
+            "path": "/cost/daily_limit_usd",
+            "value": null
+        }]))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(state.config.read().cost.daily_limit_usd, None);
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!written.contains("daily_limit_usd"), "{written}");
+
+        let (status, json) = patch(serde_json::json!([{
+            "op": "comment",
+            "path": "/cost/monthly_limit_usd",
+            "comment": "no monthly limit on purpose"
+        }]))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(state.config.read().cost.monthly_limit_usd, None);
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!written.contains("monthly_limit_usd"), "{written}");
+
+        let (status, json) = patch(serde_json::json!([{
+            "op": "replace",
+            "path": "/cost/daily_limit_usd",
+            "value": 0.0
+        }]))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(state.config.read().cost.daily_limit_usd, Some(0.0));
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(written.contains("daily_limit_usd = 0.0"), "{written}");
+    }
+
     /// Enabling an opt-in tool through the config API follows the build. A
     /// build without Microsoft 365 saves the section without its credentials
     /// and says once that the tool is compiled out; a build with it still

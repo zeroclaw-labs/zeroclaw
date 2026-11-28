@@ -1567,7 +1567,7 @@ mod tests {
                 CostConfig {
                     enabled: true,
                     track_per_agent: true,
-                    daily_limit_usd: expected_cost / 2.0,
+                    daily_limit_usd: Some(expected_cost / 2.0),
                     ..CostConfig::default()
                 },
                 capped_workspace.path(),
@@ -1878,7 +1878,7 @@ mod tests {
         tracker.update_config(CostConfig {
             enabled: true,
             track_per_agent: true,
-            daily_limit_usd: recipient_summary.session_cost_usd / 2.0,
+            daily_limit_usd: Some(recipient_summary.session_cost_usd / 2.0),
             ..CostConfig::default()
         });
         let unrelated_ctx =

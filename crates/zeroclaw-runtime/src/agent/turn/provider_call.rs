@@ -4092,8 +4092,8 @@ mod tests {
         let tracker = crate::cost::CostTracker::new(
             zeroclaw_config::schema::CostConfig {
                 enabled: true,
-                daily_limit_usd: 10.0,
-                monthly_limit_usd: 1_000.0,
+                daily_limit_usd: Some(10.0),
+                monthly_limit_usd: Some(1_000.0),
                 warn_at_percent: 80,
                 ..Default::default()
             },

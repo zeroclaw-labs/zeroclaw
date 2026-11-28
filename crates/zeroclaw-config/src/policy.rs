@@ -766,7 +766,7 @@ impl Default for SecurityPolicy {
             allowed_roots_read_only: Vec::new(),
             allowed_roots_write_only: Vec::new(),
             max_actions_per_hour: 20,
-            max_cost_per_day_cents: 500,
+            max_cost_per_day_cents: 0,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             shell_env_passthrough: vec![],
@@ -6024,7 +6024,11 @@ impl SecurityPolicy {
                 parent: parent.max_actions_per_hour,
             });
         }
-        if self.max_cost_per_day_cents > parent.max_cost_per_day_cents {
+        // `0` is "no cost ceiling of its own", not a zero budget, so a
+        // parent at `0` has no ceiling a child could exceed.
+        if parent.max_cost_per_day_cents != 0
+            && self.max_cost_per_day_cents > parent.max_cost_per_day_cents
+        {
             return Err(EscalationViolation::MaxCostExceeded {
                 child: self.max_cost_per_day_cents,
                 parent: parent.max_cost_per_day_cents,
@@ -6706,7 +6710,10 @@ mod tests {
         let policy = SecurityPolicy::from_profiles(&risk, None, Path::new("/ws"));
 
         assert_eq!(policy.max_actions_per_hour, 20);
-        assert_eq!(policy.max_cost_per_day_cents, 500);
+        assert_eq!(
+            policy.max_cost_per_day_cents, 0,
+            "no runtime profile means no delegation cost ceiling of its own"
+        );
         assert_eq!(policy.shell_timeout_secs, 60);
     }
 
@@ -8621,7 +8628,9 @@ mod tests {
         assert!(!p.allowed_commands.is_empty());
         assert!(!p.forbidden_paths.is_empty());
         assert!(p.max_actions_per_hour > 0);
-        assert!(p.max_cost_per_day_cents > 0);
+        // `0` = no delegation cost ceiling of its own; a dollar limit
+        // exists only where the operator set one.
+        assert_eq!(p.max_cost_per_day_cents, 0);
         assert!(p.require_approval_for_medium_risk);
         assert!(p.block_high_risk_commands);
         assert!(p.shell_env_passthrough.is_empty());
@@ -12657,6 +12666,57 @@ mod tests {
             err,
             EscalationViolation::MaxCostExceeded { child, parent } if child == 1000 && parent == 500
         ));
+    }
+
+    /// A parent with no cost ceiling of its own (`0`) and a child that sets
+    /// one: the child is tighter than the parent, not looser.
+    #[test]
+    fn ensure_no_escalation_parent_without_cost_ceiling_child_with_one() {
+        let parent = SecurityPolicy {
+            max_cost_per_day_cents: 0,
+            ..parent_policy_for_escalation_tests()
+        };
+        let child = SecurityPolicy {
+            max_cost_per_day_cents: 500,
+            ..parent.clone()
+        };
+        assert_eq!(
+            child.ensure_no_escalation_beyond(&parent),
+            Ok(()),
+            "a parent at 0 has no ceiling for a child's 500 to exceed"
+        );
+    }
+
+    /// The parent-0 rule does not loosen an explicit parent ceiling: a
+    /// child above it is still rejected. A child at `0` under it passes
+    /// validation, as on the base commit; this check says nothing about
+    /// which ceiling the child then runs under.
+    #[test]
+    fn ensure_no_escalation_explicit_parent_cost_ceiling_still_binds() {
+        let parent = SecurityPolicy {
+            max_cost_per_day_cents: 500,
+            ..parent_policy_for_escalation_tests()
+        };
+        let above = SecurityPolicy {
+            max_cost_per_day_cents: 501,
+            ..parent.clone()
+        };
+        assert_eq!(
+            above.ensure_no_escalation_beyond(&parent),
+            Err(EscalationViolation::MaxCostExceeded {
+                child: 501,
+                parent: 500
+            })
+        );
+        let unset = SecurityPolicy {
+            max_cost_per_day_cents: 0,
+            ..parent.clone()
+        };
+        assert_eq!(
+            unset.ensure_no_escalation_beyond(&parent),
+            Ok(()),
+            "validation accepts a child at 0 under an explicit parent ceiling"
+        );
     }
 
     #[test]

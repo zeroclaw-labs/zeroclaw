@@ -45089,7 +45089,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let cost = zeroclaw_config::schema::CostConfig {
             enabled: true,
-            daily_limit_usd: 1.0,
+            daily_limit_usd: Some(1.0),
             ..Default::default()
         };
         let config = zeroclaw_config::schema::Config {
@@ -45137,7 +45137,7 @@ mod tests {
         .await;
         assert!(response.get("error").is_none(), "config/set: {response}");
 
-        assert_eq!(tracker.config().daily_limit_usd, 10.0);
+        assert_eq!(tracker.config().daily_limit_usd, Some(10.0));
         assert!(
             matches!(tracker.check_budget(0.0).unwrap(), BudgetCheck::Allowed),
             "the raised limit must apply without a restart"
@@ -45156,7 +45156,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let cost = zeroclaw_config::schema::CostConfig {
             enabled: true,
-            daily_limit_usd: 10.0,
+            daily_limit_usd: Some(10.0),
             ..Default::default()
         };
         let config = zeroclaw_config::schema::Config {
@@ -45203,7 +45203,7 @@ mod tests {
         .await;
         assert!(response.get("error").is_none(), "config/set: {response}");
 
-        assert_eq!(tracker.config().daily_limit_usd, 1.0);
+        assert_eq!(tracker.config().daily_limit_usd, Some(1.0));
         match tracker.check_budget(0.0).unwrap() {
             BudgetCheck::Exceeded {
                 current_usd,
