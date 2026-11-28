@@ -5620,6 +5620,32 @@ fn admin_reload_gate(
     }
 }
 
+// Unlike cold start, reload must not create a missing config, salvage bad
+// sections or publish process-wide settings just to check the candidate.
+async fn preflight_reload(state: &AppState) -> Result<(), String> {
+    let (config_path, data_dir) = {
+        let live = state.config.read();
+        (live.config_path.clone(), live.data_dir.clone())
+    };
+    let raw = tokio::fs::read_to_string(&config_path)
+        .await
+        .map_err(|e| format!("cannot read config.toml: {e}"))?;
+    let prepare = Config::prepare_from_migrated_toml(&raw, &config_path, &data_dir);
+    Box::pin(prepare).await.map_err(|e| {
+        // TOML errors can quote whole credential-bearing lines; secret
+        // resolution errors can include external command output. Only
+        // semantic validation diagnostics are suitable for direct display.
+        if let Some(field) = e.downcast_ref::<zeroclaw_config::api_error::ConfigApiError>() {
+            zeroclaw_providers::sanitize_api_error(&field.message)
+        } else if let Some(span) = e.downcast_ref::<toml::de::Error>().and_then(|e| e.span()) {
+            format!("invalid TOML at byte {} in config.toml", span.start)
+        } else {
+            "could not prepare config.toml: check its schema, secret references and environment overrides".into()
+        }
+    })?;
+    Ok(())
+}
+
 async fn handle_admin_reload(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -5670,6 +5696,15 @@ async fn handle_admin_reload(
             })),
         ));
     };
+
+    preflight_reload(&state).await.map_err(|detail| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Reload refused: {detail}")
+            })),
+        )
+    })?;
 
     ::zeroclaw_log::record!(
         INFO,
@@ -15065,6 +15100,7 @@ data: [DONE]\n\n";
         tokens: &[String],
     ) -> AppState {
         let mut state = admin_paircode_state(tmp, require_pairing, false);
+        std::fs::write(tmp.path().join("config.toml"), "schema_version = 4\n").unwrap();
         state.publish_test_config(|c| c.gateway.allow_remote_admin = allow_remote_admin);
         state.pairing = Arc::new(PairingGuard::new(
             require_pairing,
@@ -15107,6 +15143,78 @@ data: [DONE]\n\n";
                 .unwrap()
                 .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_reload_refuses_conflicting_agent_memory_before_shutdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, false, true, &[]);
+        let path = tmp.path().join("config.toml");
+        let candidate = r#"schema_version = 4
+[memory]
+backend = "sqlite"
+consolidation_extract_facts = true
+[agents.probe.memory]
+backend = "markdown"
+"#;
+        std::fs::write(&path, candidate).unwrap();
+        let mut shutdown = state.shutdown_tx.subscribe();
+        let mut reload = state.reload_tx.as_ref().unwrap().reload_tx.subscribe();
+        state
+            .pending_reload
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let (status, Json(body)) = handle_admin_reload(
+            State(state.clone()),
+            ConnectInfo(loopback_peer()),
+            HeaderMap::new(),
+        )
+        .await
+        .err()
+        .expect("invalid disk candidate must be refused");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("agents.probe.memory.backend"), "{error}");
+        assert!(
+            error.contains("memory.consolidation_extract_facts"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), candidate);
+        assert!(
+            state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        // Include the success path's delayed signal, not just synchronous sends.
+        tokio::select! {
+            _ = shutdown.changed() => panic!("rejected reload stopped the gateway"),
+            _ = reload.changed() => panic!("rejected reload signalled the daemon"),
+            () = tokio::time::sleep(Duration::from_millis(400)) => {},
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_reload_reports_validation_errors_without_echoing_file_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_reload_state(&tmp, false, true, &[]);
+        let path = tmp.path().join("config.toml");
+        for (section, expected) in [
+            // This conflict is a plain anyhow validation error, not validation_bail!.
+            (
+                "[risk_profiles.probe]\ndeny_all_tools = true\nallowed_tools = ['weather']",
+                "risk_profiles.probe.deny_all_tools",
+            ),
+            (
+                "[proxy]\nhttp_proxy = 'not-a-url-secret-marker'",
+                "proxy.http_proxy",
+            ),
+            ("[gateway]\nport = secret-marker", "invalid TOML"),
+        ] {
+            std::fs::write(&path, format!("schema_version = 4\n{section}\n")).unwrap();
+            let error = preflight_reload(&state).await.unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains("secret-marker"));
+        }
     }
 
     #[tokio::test]

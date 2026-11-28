@@ -121,7 +121,13 @@ The daemon owns the long-lived subsystem graph: gateway, channel listeners,
 scheduler, MQTT listener, session wiring, memory backend, provider factories,
 and cost wiring. `POST /admin/reload` signals the daemon loop, which re-reads
 `config.toml` and re-instantiates those subsystems in the same process. The PID
-stays the same, but listeners briefly rebind.
+stays the same, but listeners briefly rebind. Before signalling, the HTTP
+endpoint strictly prepares and validates the on-disk config, including
+per-agent settings. A rejected request returns HTTP 400 without stopping the
+listeners, clearing the pending-reload flag, or rewriting the file. Fix the
+reported setting and retry. The supervisor still reads the file again after
+drain: do not edit it between an accepted request and the new gateway becoming
+ready. This preflight does not change cold-start recovery or other reload triggers.
 
 Gateway config writes call `persist_and_swap()`: validate the staged authorization
 policy, save to disk inside an admitted, serialized config commit, publish that

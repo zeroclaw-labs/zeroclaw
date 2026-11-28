@@ -12026,14 +12026,15 @@ fn validate_mcp_config(config: &McpConfig) -> Result<()> {
 }
 
 fn validate_proxy_url(field: &str, url: &str) -> Result<()> {
-    let parsed = reqwest::Url::parse(url)
-        .with_context(|| format!("Invalid {field} URL: '{url}' is not a valid URL"))?;
+    // Validation diagnostics may be returned to a reload caller. A proxy
+    // URL can contain credentials; identify the setting, not its contents.
+    let parsed = reqwest::Url::parse(url).with_context(|| format!("Invalid proxy.{field} URL"))?;
 
     match parsed.scheme() {
         "http" | "https" | "socks5" | "socks5h" | "socks" => {}
-        scheme => {
+        _ => {
             anyhow::bail!(
-                "Invalid {field} URL scheme '{scheme}'. Allowed: http, https, socks5, socks5h, socks"
+                "Invalid proxy.{field} URL scheme. Allowed: http, https, socks5, socks5h, socks"
             );
         }
     }
@@ -24487,6 +24488,7 @@ impl Config {
         // file and the published pair are unchanged.
         config
             .validate()
+            .map_err(crate::api_error::ConfigApiError::from_validation)
             .context("migrated config failed strict validation")?;
         Ok(config)
     }
