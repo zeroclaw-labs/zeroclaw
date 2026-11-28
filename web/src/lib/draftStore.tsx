@@ -48,6 +48,10 @@ type ConfigDraftCtx = ConfigDraftState & {
   discardSection: (prefix: string) => void;
   /** Drop everything. */
   discardAll: () => void;
+  /** Increments when the operator discards staged edits so mounted forms can
+   *  reset their local copies. Save paths that also clear the store do not
+   *  change this value. */
+  discardGeneration: number;
   /** Commit every staged draft + tombstone as a single PATCH and clear on success. */
   saveAll: () => Promise<PatchResponse>;
 };
@@ -58,6 +62,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
   const [drafts, setDrafts] = useState<Record<string, DraftEntry>>({});
   const [comments, setComments] = useState<Record<string, string>>({});
   const [tombstones, setTombstones] = useState<Set<string>>(() => new Set());
+  const [discardGeneration, setDiscardGeneration] = useState(0);
 
   const setDraft = useCallback((path: string, input: string, value?: unknown) => {
     setDrafts((prev) => ({ ...prev, [path]: { input, value } }));
@@ -195,6 +200,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
     setDrafts({});
     setComments({});
     setTombstones(new Set());
+    setDiscardGeneration((n) => n + 1);
   }, []);
 
   const saveAll = useCallback(async (): Promise<PatchResponse> => {
@@ -261,6 +267,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       discardPaths,
       discardSection,
       discardAll,
+      discardGeneration,
       saveAll,
     }),
     [
@@ -276,6 +283,7 @@ export function ConfigDraftProvider({ children }: { children: ReactNode }) {
       discardPaths,
       discardSection,
       discardAll,
+      discardGeneration,
       saveAll,
     ],
   );
