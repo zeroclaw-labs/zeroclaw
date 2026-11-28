@@ -2026,6 +2026,7 @@ impl WhatsAppWebChannel {
                 conversation_scope,
                 references: Vec::new(),
                 voice_origin: false,
+                edited: false,
             })
             .await
         {

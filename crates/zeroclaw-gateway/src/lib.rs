@@ -15774,6 +15774,7 @@ data: [DONE]\n\n";
             conversation_scope: Default::default(),
             references: Vec::new(),
             voice_origin: false,
+            edited: false,
         }
     }
 

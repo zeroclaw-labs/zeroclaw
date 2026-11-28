@@ -120,6 +120,10 @@ rooms the bot answers in. Authorize senders with a [peer group](#who-can-talk-to
 
 {{#thread-context channel="Matrix" prop="reply_in_thread" path="channels.matrix.<alias>.reply_in_thread"}}
 
+### Edited messages
+
+Matrix delivers an edit as a new `m.replace` replacement event, not as a mutation of the original message. On master, every edit currently starts a second agent turn carrying the pre-edit fallback body (`* old text`); `edited_messages = false` (the default) drops replacement events instead, changing that default for every Matrix deployment. Set `edited_messages = true` to process edits: the edit is resolved against the replaced event (a different sender, a non-message or redacted target, an edit of an edit, or an original outside the 10-minute freshness window is dropped), and the corrected content from `m.new_content` flows through the ordinary inbound pipeline inheriting the original's thread and reply relations. The delivered message is marked `edited` and timestamped with the ORIGINAL's send time. Note the default-mode change: with the flag off, edits are dropped rather than answered with the fallback body. Replacements of non-text messages (media, polls) and malformed replacements (missing `m.new_content`, msgtype, or body) are dropped in both modes; v1 has no edit semantics for non-text content. `edited` is metadata no runtime consumer reads on this head; the orchestrator edit policy (marker, latest-wins coalescing, freshness gate) lands with the Telegram edited-message work, and Matrix edits will join it there.
+
 ## 3. Token path (alternative): obtaining `access_token` and `device_id`
 
 > [!IMPORTANT]
