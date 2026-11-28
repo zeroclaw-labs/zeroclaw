@@ -1781,14 +1781,21 @@ data: [DONE]
         let history = [
             ChatMessage::user("preview"),
             ChatMessage::assistant(
-                json!({"tool_calls": [{"id": "c1", "name": "preview", "arguments": "{}"}]})
-                    .to_string(),
+                json!({"tool_calls": [
+                    {"id": "c1", "name": "preview", "arguments": "{}"},
+                    {"id": "c2", "name": "status", "arguments": "{}"}
+                ]})
+                .to_string(),
             ),
             ChatMessage::tool(
                 json!({"tool_call_id": "c1", "content": "ready",
                        "attachments": [{"kind": "image", "target": image}]})
                 .to_string(),
             ),
+            ChatMessage::tool(
+                json!({"tool_call_id": "c2", "content": "queued", "attachments": []}).to_string(),
+            ),
+            ChatMessage::user("continue"),
         ];
 
         for policy in [
@@ -1806,6 +1813,22 @@ data: [DONE]
                 .chat_with_history(&history, "test/model", Some(0.0))
                 .await?;
             let body: Value = serde_json::from_str(&echoed)?;
+            let native = provider
+                .chat(
+                    ProviderChatRequest {
+                        messages: &history,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test/model",
+                    Some(0.0),
+                )
+                .await?;
+            let native_body: Value = serde_json::from_str(native.text.as_deref().expect("echo"))?;
+            assert_eq!(
+                native_body, body,
+                "history and native chat must agree on the wire"
+            );
             assert_eq!(body["model"], "test/model");
             assert_eq!(body["max_tokens"], 64);
             assert_eq!(body["temperature"], 0.0);
@@ -1817,10 +1840,20 @@ data: [DONE]
             assert_eq!(messages[1]["tool_calls"][0]["id"], "c1");
             assert_eq!(messages[2]["role"], "tool");
             assert_eq!(messages[2]["tool_call_id"], "c1");
+            assert_eq!(
+                messages.len(),
+                5,
+                "keep both results together before the follow-up"
+            );
+            assert_eq!(
+                messages[3],
+                json!({"role": "tool", "tool_call_id": "c2", "content": "queued"})
+            );
+            assert_eq!(messages[4]["role"], "user");
             let content = &messages[2]["content"];
             match policy {
                 ToolResultImagePolicy::Omit => {
-                    assert_eq!(messages.len(), 3);
+                    assert_eq!(messages[4]["content"], "continue");
                     assert_eq!(
                         content,
                         &json!(format!("ready\n\n{TOOL_RESULT_IMAGE_OMITTED_NOTICE}"))
@@ -1828,14 +1861,15 @@ data: [DONE]
                     assert!(!echoed.contains(image));
                 }
                 ToolResultImagePolicy::Relocate => {
-                    assert_eq!(messages.len(), 4);
                     assert!(content.as_str().expect("tool text").contains("ready"));
-                    assert_eq!(messages[3]["role"], "user");
-                    assert_eq!(messages[3]["content"][1]["image_url"]["url"], image);
+                    let follow_up = messages[4]["content"].as_array().expect("user parts");
+                    assert_eq!(follow_up.len(), 3);
+                    assert_eq!(follow_up[0]["text"], "continue");
+                    assert_eq!(follow_up[2]["image_url"]["url"], image);
                     assert_eq!(echoed.matches(image).count(), 1);
                 }
                 ToolResultImagePolicy::ImageUrl => {
-                    assert_eq!(messages.len(), 3);
+                    assert_eq!(messages[4]["content"], "continue");
                     assert_eq!(content[0]["text"], "ready");
                     assert_eq!(content[1]["type"], "image_url");
                     assert_eq!(content[1]["image_url"]["url"], image);
