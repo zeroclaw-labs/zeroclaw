@@ -7233,6 +7233,22 @@ impl ToolDisclosure {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static FILE_INPUT_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn specialized_file_input(name: &str, raw: &str) -> Option<serde_json::Value> {
+    if !matches!(name, "file_edit" | "file_write") {
+        return None;
+    }
+    #[cfg(test)]
+    FILE_INPUT_PARSES.with(|calls| calls.set(calls.get() + 1));
+    serde_json::from_str(raw)
+        .ok()
+        .filter(|input| valid_specialized_file_input(name, input))
+}
+
 fn valid_specialized_file_input(name: &str, input: &serde_json::Value) -> bool {
     if input.get("path").and_then(|value| value.as_str()).is_none() {
         return false;
@@ -7263,17 +7279,6 @@ fn valid_specialized_file_input(name: &str, input: &serde_json::Value) -> bool {
             has_content && valid_encoding
         }
         _ => false,
-    }
-}
-
-fn default_tool_disclosure(name: &str, input_json: &str) -> ToolDisclosure {
-    let specialized = matches!(name, "file_edit" | "file_write")
-        && serde_json::from_str::<serde_json::Value>(input_json)
-            .is_ok_and(|input| valid_specialized_file_input(name, &input));
-    if specialized {
-        ToolDisclosure::Preview
-    } else {
-        ToolDisclosure::Collapsed
     }
 }
 
@@ -7372,8 +7377,18 @@ fn render_tool_entry(
     input_json: &str,
     result: Option<&str>,
     is_selected: bool,
-    disclosure: ToolDisclosure,
+    disclosure_override: Option<ToolDisclosure>,
 ) -> Option<usize> {
+    let file_input = if disclosure_override == Some(ToolDisclosure::Collapsed) {
+        None
+    } else {
+        specialized_file_input(name, input_json)
+    };
+    let disclosure = disclosure_override.unwrap_or(if file_input.is_some() {
+        ToolDisclosure::Preview
+    } else {
+        ToolDisclosure::Collapsed
+    });
     let sel_mod = if is_selected {
         Modifier::REVERSED
     } else {
@@ -7476,17 +7491,13 @@ fn render_tool_entry(
         }
         "file_edit" => {
             if disclosure.is_open() {
-                let parsed = serde_json::from_str::<serde_json::Value>(input_json).ok();
-                let valid = parsed
-                    .as_ref()
-                    .filter(|input| valid_specialized_file_input(name, input))
-                    .and_then(|input| {
-                        Some((
-                            input.get("old_string")?.as_str()?,
-                            input.get("new_string")?.as_str()?,
-                        ))
-                    });
-                if let (Some(input), Some((old, new))) = (parsed.as_ref(), valid) {
+                if let Some((input, old, new)) = file_input.as_ref().and_then(|input| {
+                    Some((
+                        input,
+                        input.get("old_string")?.as_str()?,
+                        input.get("new_string")?.as_str()?,
+                    ))
+                }) {
                     let (metadata, metadata_limited) = terminal_safe_tool_text_limited(
                         &semantic_tool_metadata(input, &["old_string", "new_string"]),
                         TOOL_EXPANDED_MAX_BYTES,
@@ -7522,13 +7533,10 @@ fn render_tool_entry(
         }
         "file_write" => {
             if disclosure.is_open() {
-                let parsed = serde_json::from_str::<serde_json::Value>(input_json).ok();
-                let content = parsed
+                if let Some((input, content)) = file_input
                     .as_ref()
-                    .filter(|input| valid_specialized_file_input(name, input))
-                    .and_then(|input| input.get("content"))
-                    .and_then(|value| value.as_str());
-                if let (Some(input), Some(content)) = (parsed.as_ref(), content) {
+                    .and_then(|input| Some((input, input.get("content")?.as_str()?)))
+                {
                     let (metadata, metadata_limited) = terminal_safe_tool_text_limited(
                         &semantic_tool_metadata(input, &["content"]),
                         TOOL_EXPANDED_MAX_BYTES,
@@ -7778,7 +7786,7 @@ fn render_entry_into(
     entry: &ChatEntry,
     is_selected: bool,
     show_thoughts: bool,
-    tool_disclosure: ToolDisclosure,
+    tool_disclosure: Option<ToolDisclosure>,
     width: u16,
     lines: &mut Vec<Line<'static>>,
 ) -> Option<usize> {
@@ -11277,17 +11285,18 @@ impl ChatState {
             return false;
         };
         let tool_call_id = Arc::clone(tool_call_id);
-        let current = self
-            .tool_disclosures
-            .get(&tool_call_id)
-            .copied()
-            .unwrap_or_else(|| default_tool_disclosure(name, input_json));
-        let next = match current {
-            ToolDisclosure::Collapsed => match default_tool_disclosure(name, input_json) {
-                ToolDisclosure::Preview => ToolDisclosure::Preview,
-                ToolDisclosure::Collapsed | ToolDisclosure::Full => ToolDisclosure::Full,
-            },
-            ToolDisclosure::Preview | ToolDisclosure::Full => ToolDisclosure::Collapsed,
+        let previous = self.tool_disclosures.get(&tool_call_id).copied();
+        let next = match previous {
+            Some(ToolDisclosure::Preview | ToolDisclosure::Full) => ToolDisclosure::Collapsed,
+            _ if specialized_file_input(name, input_json).is_some() => {
+                if previous.is_none() {
+                    // Valid file edits and writes start in preview.
+                    ToolDisclosure::Collapsed
+                } else {
+                    ToolDisclosure::Preview
+                }
+            }
+            _ => ToolDisclosure::Full,
         };
         self.tool_disclosures.insert(tool_call_id, next);
         self.clear_transcript_selection();
@@ -11490,16 +11499,10 @@ impl ChatState {
                         || browse_range.is_some_and(|(lo, hi)| index >= lo && index <= hi)
                         || browse_cursor == Some(index);
                     let disclosure = match entry {
-                        ChatEntry::Tool {
-                            tool_call_id,
-                            name,
-                            input_json,
-                            ..
-                        } => tool_disclosures
-                            .get(tool_call_id)
-                            .copied()
-                            .unwrap_or_else(|| default_tool_disclosure(name, input_json)),
-                        _ => ToolDisclosure::Collapsed,
+                        ChatEntry::Tool { tool_call_id, .. } => {
+                            tool_disclosures.get(tool_call_id).copied()
+                        }
+                        _ => None,
                     };
                     EntryLayoutInput {
                         index,
@@ -13926,7 +13929,7 @@ mod tests {
             },
             false,
             false,
-            ToolDisclosure::Collapsed,
+            Some(ToolDisclosure::Collapsed),
             80,
             &mut lines,
         );
@@ -28780,7 +28783,14 @@ mod tests {
             .iter()
             .map(|entry| {
                 let mut lines = Vec::new();
-                render_entry_into(entry, false, false, ToolDisclosure::Full, 80, &mut lines);
+                render_entry_into(
+                    entry,
+                    false,
+                    false,
+                    Some(ToolDisclosure::Full),
+                    80,
+                    &mut lines,
+                );
                 rendered_text(&lines)
             })
             .collect::<Vec<_>>();
@@ -28819,7 +28829,7 @@ mod tests {
             &s.entries()[0],
             false,
             false,
-            ToolDisclosure::Full,
+            Some(ToolDisclosure::Full),
             80,
             &mut lines,
         );
@@ -28849,7 +28859,7 @@ mod tests {
             &input,
             Some(output),
             false,
-            ToolDisclosure::Full,
+            Some(ToolDisclosure::Full),
         );
         let text = rendered_text(&lines);
         assert_eq!(text.matches("[Delegation → reader, reviewer]").count(), 1);
@@ -28875,7 +28885,7 @@ mod tests {
                 &input.to_string(),
                 Some("Task started"),
                 false,
-                ToolDisclosure::Full,
+                Some(ToolDisclosure::Full),
             );
             let text = rendered_text(&lines);
             assert!(text.starts_with("▼ [tool: delegate]"));
@@ -28901,7 +28911,7 @@ mod tests {
             &input,
             Some(&result),
             false,
-            ToolDisclosure::Collapsed,
+            Some(ToolDisclosure::Collapsed),
         );
         let collapsed = rendered_text(&collapsed);
         assert!(collapsed.contains("[Delegation → reviewer"));
@@ -28914,7 +28924,7 @@ mod tests {
             &input,
             Some(&result),
             false,
-            ToolDisclosure::Full,
+            Some(ToolDisclosure::Full),
         );
         let text = rendered_text(&lines);
         assert!(lines.len() <= 2 * TOOL_EXPANDED_MAX_LINES + 4);
@@ -28950,7 +28960,7 @@ mod tests {
                 &input,
                 None,
                 false,
-                ToolDisclosure::Full,
+                Some(ToolDisclosure::Full),
             );
             let text = rendered_text(&lines);
             assert!(text.starts_with("▼ [tool: spawn_subagent]"));
@@ -28971,7 +28981,7 @@ mod tests {
                 input,
                 Some(result),
                 false,
-                disclosure,
+                Some(disclosure),
             );
             let text = rendered_text(&lines);
             assert!(text.contains("[Delegation → fable]"));
@@ -29010,7 +29020,7 @@ mod tests {
                 input,
                 Some(raw),
                 false,
-                ToolDisclosure::Full,
+                Some(ToolDisclosure::Full),
             );
             let text = rendered_text(&lines);
             assert!(text.contains(&raw.replace('\n', "\n    ")));
@@ -29040,7 +29050,7 @@ mod tests {
             &input,
             Some(&result),
             false,
-            ToolDisclosure::Collapsed,
+            Some(ToolDisclosure::Collapsed),
         );
         let collapsed_text = rendered_text(&collapsed);
         assert!(collapsed_text.starts_with("▶ [tool: shell]"));
@@ -29056,7 +29066,7 @@ mod tests {
             &input,
             Some(&result),
             false,
-            ToolDisclosure::Full,
+            Some(ToolDisclosure::Full),
         );
         let expanded_text = rendered_text(&expanded);
         assert!(expanded_text.starts_with("▼ [tool: shell]"));
@@ -29082,7 +29092,7 @@ mod tests {
             &input,
             Some(&result),
             false,
-            ToolDisclosure::Full,
+            Some(ToolDisclosure::Full),
         );
 
         let text = rendered_text(&lines);
@@ -29103,6 +29113,49 @@ mod tests {
     }
 
     #[test]
+    fn rebuilding_specialized_file_cards_parses_each_visible_input_once() {
+        let mut chat = state();
+        let multiline = "example line\n".repeat(1000) + "end-of-edit";
+        let single_line = "a".repeat(TOOL_EXPANDED_MAX_BYTES + 500) + "end-of-write";
+        for (name, input, tail) in [
+            (
+                "file_edit",
+                serde_json::json!({"path":"example.txt","old_string":"old", "new_string":multiline}),
+                "end-of-edit",
+            ),
+            (
+                "file_write",
+                serde_json::json!({"path":"example.txt","content":single_line}),
+                "end-of-write",
+            ),
+        ] {
+            let entry = ChatEntry::Tool {
+                tool_call_id: Arc::from(name),
+                name: Arc::from(name),
+                input_json: Arc::from(input.to_string()),
+                result: None,
+            };
+            assert!(clipboard_text(&entry).contains(tail));
+            chat.entries.push(entry);
+        }
+
+        FILE_INPUT_PARSES.with(|calls| calls.set(0));
+        chat.mark_dirty_full();
+        chat.rebuild_lines(80);
+        assert_eq!(FILE_INPUT_PARSES.with(|calls| calls.get()), 2);
+        let preview = rendered_text(&chat.transcript_layout.view().cached_lines);
+        assert!(!preview.contains("end-of-edit"));
+        assert!(!preview.contains("end-of-write"));
+
+        chat.tool_disclosures
+            .insert(Arc::from("file_write"), ToolDisclosure::Collapsed);
+        FILE_INPUT_PARSES.with(|calls| calls.set(0));
+        chat.mark_dirty_full();
+        chat.rebuild_lines(80);
+        assert_eq!(FILE_INPUT_PARSES.with(|calls| calls.get()), 1);
+    }
+
+    #[test]
     fn file_tool_preview_is_six_lines_and_full_view_avoids_raw_content_duplication() {
         let edit_input = serde_json::json!({
             "path": "/tmp/example.rs",
@@ -29117,7 +29170,7 @@ mod tests {
             &edit_input,
             Some("done"),
             false,
-            ToolDisclosure::Collapsed,
+            Some(ToolDisclosure::Collapsed),
         );
         let collapsed_edit_text = rendered_text(&collapsed_edit_lines);
         assert!(collapsed_edit_text.starts_with("▶ [tool: file_edit]"));
@@ -29143,7 +29196,7 @@ mod tests {
             &write_input,
             Some(&result),
             false,
-            ToolDisclosure::Preview,
+            Some(ToolDisclosure::Preview),
         );
         let preview_text = rendered_text(&preview_lines);
         let footer_line = footer_line.expect("long preview has a disclosure footer");
@@ -29173,7 +29226,7 @@ mod tests {
             &write_input,
             Some(&result),
             false,
-            ToolDisclosure::Full,
+            Some(ToolDisclosure::Full),
         );
         let full_text = rendered_text(&full_lines);
         assert!(full_text.contains("line 9"));
@@ -29200,7 +29253,7 @@ mod tests {
             &base64_input,
             None,
             false,
-            ToolDisclosure::Preview,
+            Some(ToolDisclosure::Preview),
         );
         let base64_text = rendered_text(&base64_lines);
         assert!(footer_line.is_none());
@@ -29216,7 +29269,7 @@ mod tests {
             malformed,
             None,
             false,
-            ToolDisclosure::Preview,
+            Some(ToolDisclosure::Preview),
         );
         assert!(rendered_text(&malformed_lines).contains(malformed));
 
@@ -29226,14 +29279,10 @@ mod tests {
             serde_json::json!({"path": "/tmp/a.txt", "content": "text", "encoding": "hex"}),
         ] {
             let invalid = invalid.to_string();
-            assert_eq!(
-                default_tool_disclosure("file_write", &invalid),
-                ToolDisclosure::Collapsed
-            );
+            assert!(specialized_file_input("file_write", &invalid).is_none());
         }
-        assert_eq!(
-            default_tool_disclosure("file_edit", r#"{"old_string":"a","new_string":"b"}"#),
-            ToolDisclosure::Collapsed
+        assert!(
+            specialized_file_input("file_edit", r#"{"old_string":"a","new_string":"b"}"#).is_none()
         );
     }
 
@@ -33784,7 +33833,7 @@ mod tests {
                     &input,
                     Some(&result),
                     false,
-                    ToolDisclosure::Collapsed
+                    Some(ToolDisclosure::Collapsed)
                 )
                 .is_some()
             );
@@ -33800,7 +33849,7 @@ mod tests {
                 &input,
                 Some(&result),
                 false,
-                ToolDisclosure::Full,
+                Some(ToolDisclosure::Full),
             );
             let text = rendered_text(&lines);
             assert!(text.contains(&"a".repeat(250)));
@@ -34104,7 +34153,7 @@ mod tests {
             &input,
             Some("Only A and C now, B waits for the dogfood rebase"),
             false,
-            ToolDisclosure::Collapsed,
+            Some(ToolDisclosure::Collapsed),
         );
         let text = rendered_text(&lines);
         assert!(
@@ -34134,7 +34183,7 @@ mod tests {
             &input,
             None,
             false,
-            ToolDisclosure::Full,
+            Some(ToolDisclosure::Full),
         );
         let text = rendered_text(&lines);
         assert!(text.contains("end-of-long-choice"), "{text}");
@@ -34149,7 +34198,7 @@ mod tests {
             &input,
             None,
             false,
-            ToolDisclosure::Collapsed,
+            Some(ToolDisclosure::Collapsed),
         );
         let collapsed = rendered_text(&collapsed);
         assert!(!collapsed.contains("end-of-long-choice"), "{collapsed}");
@@ -34171,7 +34220,7 @@ mod tests {
             &serde_json::json!({ "options": choices, "question": "Pick" }).to_string(),
             None,
             false,
-            ToolDisclosure::Full,
+            Some(ToolDisclosure::Full),
         );
         let choice_rows = rendered_text(&lines)
             .lines()
