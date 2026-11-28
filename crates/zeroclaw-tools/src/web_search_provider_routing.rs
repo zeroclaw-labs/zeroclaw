@@ -10,6 +10,7 @@ pub enum WebSearchProviderRoute {
     Serply,
     Keenable,
     Firecrawl,
+    DeepSeek,
 }
 
 /// Provider HTTP-failure status surfaced to the agent via the error message's
@@ -52,6 +53,7 @@ const ANYSEARCH_PROVIDER: &str = "anysearch";
 const SERPLY_PROVIDER: &str = "serply";
 const KEENABLE_PROVIDER: &str = "keenable";
 const FIRECRAWL_PROVIDER: &str = "firecrawl";
+const DEEPSEEK_PROVIDER: &str = "deepseek";
 
 pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProviderResolution {
     let normalized = raw_model_provider.trim().to_ascii_lowercase();
@@ -110,6 +112,11 @@ pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProvide
         "firecrawl" | "firecrawl-search" | "firecrawl_search" => WebSearchProviderResolution {
             route: WebSearchProviderRoute::Firecrawl,
             canonical_provider: FIRECRAWL_PROVIDER,
+            used_fallback: false,
+        },
+        DEEPSEEK_PROVIDER => WebSearchProviderResolution {
+            route: WebSearchProviderRoute::DeepSeek,
+            canonical_provider: DEEPSEEK_PROVIDER,
             used_fallback: false,
         },
         // Warns for unknown model_providers, falls back to default.
