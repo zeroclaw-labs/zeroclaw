@@ -267,6 +267,19 @@ fn is_legacy_session_artifact(filename: &str) -> bool {
         || filename.ends_with(".jsonl.migrated")
 }
 
+fn is_legacy_migrated_archive_name(filename: &str) -> bool {
+    let Some((_, suffix)) = filename
+        .strip_suffix(".migrated")
+        .and_then(|stem| stem.rsplit_once(".jsonl_"))
+    else {
+        return false;
+    };
+    // Older hygiene runs inserted a number from 1 through 9999 before `.migrated`.
+    (1..=4).contains(&suffix.len())
+        && !suffix.starts_with('0')
+        && suffix.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 fn purge_memory_archives(workspace_dir: &Path, purge_after_days: u32) -> Result<u64> {
     if purge_after_days == 0 {
         return Ok(0);
@@ -335,7 +348,7 @@ fn purge_session_archives(workspace_dir: &Path, purge_after_days: u32) -> Result
             continue;
         };
 
-        if !is_legacy_session_artifact(filename) {
+        if !is_legacy_session_artifact(filename) && !is_legacy_migrated_archive_name(filename) {
             continue;
         }
 
@@ -515,6 +528,9 @@ fn unique_archive_target(archive_dir: &Path, filename: &str) -> PathBuf {
 }
 
 fn split_name(filename: &str) -> (&str, &str) {
+    if let Some(stem) = filename.strip_suffix(".jsonl.migrated") {
+        return (stem, "jsonl.migrated");
+    }
     match filename.rsplit_once('.') {
         Some((stem, ext)) => (stem, ext),
         None => (filename, ""),
