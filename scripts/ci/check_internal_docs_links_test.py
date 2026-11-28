@@ -43,6 +43,31 @@ class InternalDocsLinksTest(unittest.TestCase):
         self.assertIn("index.md:1", result.stdout)
         self.assertIn("missing.md", result.stdout)
 
+    def test_accepts_angle_bracket_destinations_and_optional_titles(self) -> None:
+        result = self.run_checker(
+            {
+                "index.md": (
+                    '[Plain](<guide.md> "Guide")\n'
+                    '[Spaced](<guide notes.md#intro>)\n'
+                    '[External](<https://example.com/guide> "External guide")\n'
+                    '[Tabbed](guide.md\t"Guide")\n'
+                    '[Reference][notes]\n\n'
+                    '[notes]: <guide notes.md> "Notes"\n'
+                ),
+                "guide.md": "# Guide\n",
+                "guide notes.md": "# Notes\n## Intro\n",
+            }
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_reports_missing_angle_bracket_target(self) -> None:
+        result = self.run_checker(
+            {"index.md": '[Missing](<missing notes.md> "Notes")\n'}
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("missing notes.md", result.stdout)
+
     def test_resolves_percent_encoded_local_paths(self) -> None:
         result = self.run_checker(
             {
