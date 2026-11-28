@@ -291,7 +291,13 @@ rpc_type! {
         /// Successful parent candidate presentation fallback after ordinary
         /// events drain. The legacy name is not a verifier verdict or proof of
         /// durable candidate persistence; lifecycle updates carry those outcomes.
-        VerifiedCandidate { session_id: String, candidate: String },
+        VerifiedCandidate {
+            session_id: String,
+            candidate: String,
+            /// Opaque presentation identity, sent only to opted-in peers.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            reply_occurrence: Option<String>,
+        },
         Completed { session_id: String },
         PausedForBlocker { session_id: String },
         Failed {
@@ -619,6 +625,9 @@ rpc_type! {
     pub struct MessageEntry {
         pub role: String,
         pub content: String,
+        /// When present, identifies this assistant reply across live and history delivery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reply_occurrence: Option<String>,
         #[serde(default)]
         pub kind: MessageEntryKind,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1858,6 +1867,20 @@ rpc_type! {
 // ── Session update notifications ─────────────────────────────────────
 // ══════════════════════════════════════════════════════════════════════
 
+rpc_type! {
+    /// A session update with optional, negotiated reply identity. A missing
+    /// identity leaves the event in its original wire format.
+    pub struct SessionUpdateNotification {
+        #[serde(flatten)]
+        // Keep the published event component addressable when the envelope
+        // extends it. Serde still writes both as one flat object.
+        #[cfg_attr(feature = "schema-export", schemars(schema_with = "schemars::SchemaGenerator::subschema_for::<SessionUpdateEvent>"))]
+        pub event: SessionUpdateEvent,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reply_occurrence: Option<String>,
+    }
+}
+
 /// Typed session update events pushed via `session/update` notifications.
 /// Replaces the hand-built `notification_for_turn_event` function.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2304,6 +2327,40 @@ mod tests {
             serde_json::to_value(TurnCompletionOutcome::Completed).unwrap(),
             json!("completed")
         );
+    }
+
+    #[test]
+    fn reply_occurrences_round_trip_without_changing_legacy_payloads() {
+        // A transcript row and its Goal fallback carry the same opaque token.
+        // Peers that omitted it must not acquire a null field on re-encoding.
+        for occurrence in [None, Some("fixture:1"), Some("fixture:2")] {
+            let mut row = json!({"role":"assistant", "content":"same reply", "kind":"message"});
+            let mut candidate = json!({"session_id":"s", "candidate":"same reply"});
+            if let Some(occurrence) = occurrence {
+                row["reply_occurrence"] = json!(occurrence);
+                candidate["reply_occurrence"] = json!(occurrence);
+            }
+            let fallback = json!({"verified_candidate": candidate});
+            let mut frame =
+                json!({"type":"agent_message_chunk", "session_id":"s", "text":"same reply"});
+            if let Some(occurrence) = occurrence {
+                frame["reply_occurrence"] = json!(occurrence);
+            }
+            let notification: SessionUpdateNotification =
+                serde_json::from_value(frame.clone()).unwrap();
+            if occurrence.is_none() {
+                assert_eq!(
+                    serde_json::to_vec(&notification).unwrap(),
+                    serde_json::to_vec(&notification.event).unwrap(),
+                    "adding an optional envelope must not change legacy chunk bytes"
+                );
+            }
+            assert_eq!(serde_json::to_value(notification).unwrap(), frame);
+            let message: MessageEntry = serde_json::from_value(row.clone()).unwrap();
+            let update: SessionGoalUpdate = serde_json::from_value(fallback.clone()).unwrap();
+            assert_eq!(serde_json::to_value(message).unwrap(), row);
+            assert_eq!(serde_json::to_value(update).unwrap(), fallback);
+        }
     }
 
     #[test]

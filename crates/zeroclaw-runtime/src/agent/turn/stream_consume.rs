@@ -1,6 +1,7 @@
 //! Streaming provider-response consumption for the turn loop.
 
 use super::events::{DraftEvent, StreamDelta};
+use super::native_replies::LiveReplySegment;
 use super::outcome::{
     StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamInterruptedAfterOutput,
     StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion,
@@ -56,6 +57,7 @@ pub(crate) struct StreamedChatOutcome {
     pub(crate) suppressed_protocol: bool,
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
     pub(crate) saw_pre_executed_tool_activity: bool,
+    pub(super) live_reply_occurrence: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -110,6 +112,7 @@ pub(crate) async fn consume_provider_streaming_response(
         draft_reasoning,
         zeroclaw_api::model_provider::ToolRoundPolicy::Batch,
         guard_tools,
+        None,
     )
     .await
 }
@@ -118,7 +121,7 @@ pub(crate) async fn consume_provider_streaming_response(
     clippy::too_many_arguments,
     reason = "Request exposure and protocol recognition need distinct tool projections"
 )]
-pub(crate) async fn consume_provider_streaming_response_with_policy(
+pub(super) async fn consume_provider_streaming_response_with_policy(
     model_provider: &dyn ModelProvider,
     request: ChatRequest<'_>,
     model: &str,
@@ -130,6 +133,7 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
     draft_reasoning: StreamReasoningMode,
     policy: zeroclaw_api::model_provider::ToolRoundPolicy,
     guard_tools: Option<&[crate::tools::ToolSpec]>,
+    mut live_reply: Option<LiveReplySegment>,
 ) -> Result<StreamedChatOutcome> {
     let request_tools = request.tools;
     let mut provider_stream = ProviderDispatch::from_ref(model_provider)
@@ -176,11 +180,11 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                 if let Some(tx) = event_tx {
                     outcome.forwarded_live_deltas = true;
                     forward_visible!(@count $count_visible, visible);
-                    let _ = tx
-                        .send(TurnEvent::Chunk {
-                            delta: visible.clone(),
-                        })
-                        .await;
+                    let event = match live_reply.as_mut() {
+                        Some(segment) => segment.forward(visible.clone()),
+                        None => TurnEvent::Chunk { delta: visible.clone() },
+                    };
+                    let _ = tx.send(event).await;
                 }
                 if let Some(tx) = delta_sender {
                     outcome.forwarded_live_deltas = true;
@@ -289,6 +293,9 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                 outcome.usage = Some(usage);
             }
             StreamEvent::ToolCall(tool_call) => {
+                if let Some(segment) = live_reply.as_mut() {
+                    segment.tool_boundary(!outcome.response_text.is_empty());
+                }
                 replay_blocking_activity = true;
                 outcome.tool_calls.push(tool_call);
             }
@@ -323,6 +330,9 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
             // relayed as TurnEvents but do not affect the agent's tool
             // dispatch loop.
             StreamEvent::PreExecutedToolCall { name, args } => {
+                if let Some(segment) = live_reply.as_mut() {
+                    segment.tool_boundary(!outcome.response_text.is_empty());
+                }
                 replay_blocking_activity = true;
                 outcome.saw_pre_executed_tool_activity = true;
                 let id = Uuid::new_v4().to_string();
@@ -342,6 +352,9 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
                 }
             }
             StreamEvent::PreExecutedToolResult { name, output } => {
+                if let Some(segment) = live_reply.as_mut() {
+                    segment.tool_boundary(!outcome.response_text.is_empty());
+                }
                 replay_blocking_activity = true;
                 outcome.saw_pre_executed_tool_activity = true;
                 let id = pre_executed_ids
@@ -488,6 +501,9 @@ pub(crate) async fn consume_provider_streaming_response_with_policy(
         .into());
     }
 
+    if !outcome.suppressed_protocol && outcome.tool_calls.is_empty() {
+        outcome.live_reply_occurrence = live_reply.and_then(LiveReplySegment::complete);
+    }
     Ok(outcome)
 }
 

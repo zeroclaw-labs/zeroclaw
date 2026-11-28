@@ -6,7 +6,10 @@
 use crate::agent::history::normalize_system_messages;
 use zeroclaw_providers::ChatMessage;
 
-pub(crate) fn preflight_history_maintenance(history: &mut Vec<ChatMessage>) {
+pub(crate) fn preflight_history_maintenance(
+    history: &mut Vec<ChatMessage>,
+    mut native_replies: Option<&mut super::NativeReplyTrace>,
+) {
     // Remove orphaned tool-role messages whose assistant (tool_calls)
     // counterpart was dropped by turn-boundary trimming or session history
     // reloading. Without this, model_providers like MiniMax reject the
@@ -23,7 +26,10 @@ pub(crate) fn preflight_history_maintenance(history: &mut Vec<ChatMessage>) {
     // could rewrite an ordinary assistant answer. Restored ACP transcripts are
     // instead repaired earlier, while still typed `ConversationMessage` data
     // (see `repair_incomplete_tool_calls` on the ACP `session/load` path).
-    let pruned_in_loop = crate::agent::history_pruner::remove_orphaned_tool_messages(history);
+    let pruned_in_loop = crate::agent::history_pruner::remove_orphaned_tool_messages_with_replies(
+        history,
+        native_replies.as_deref_mut(),
+    );
     if !pruned_in_loop.is_empty() {
         ::zeroclaw_log::record!(
             WARN,
@@ -39,6 +45,9 @@ pub(crate) fn preflight_history_maintenance(history: &mut Vec<ChatMessage>) {
              the live history. If this fires mid-conversation the model loses \
              the in-flight tool work and acts like it just woke up."
         );
+    }
+    if let Some(trace) = native_replies {
+        trace.normalize_system_slots(history);
     }
     normalize_system_messages(history);
 }
@@ -69,7 +78,7 @@ mod tests {
             msg("tool", idless_result),
         ];
 
-        preflight_history_maintenance(&mut history);
+        preflight_history_maintenance(&mut history, None);
 
         assert_eq!(
             history.len(),
@@ -93,12 +102,36 @@ mod tests {
             r#"{"answer":"here","tool_calls":[{"id":"x","name":"noop","arguments":"{}"}]}"#;
         let mut history = vec![msg("user", "hi"), msg("assistant", assistant_json)];
 
-        preflight_history_maintenance(&mut history);
+        preflight_history_maintenance(&mut history, None);
 
         assert_eq!(history.len(), 2, "no message may be dropped: {history:?}");
         assert_eq!(
             history[1].content, assistant_json,
             "ordinary assistant JSON must not be rewritten"
         );
+    }
+
+    #[test]
+    fn preflight_retains_exact_occurrences_across_orphan_removal_and_system_movement() {
+        let mut history = vec![
+            msg("user", "first"),
+            msg("assistant", "same"),
+            msg("tool", r#"{"tool_call_id":"orphan"}"#),
+            msg("system", "late system"),
+            msg("user", "second"),
+            msg("assistant", "same"),
+        ];
+        let mut trace = super::super::NativeReplyTrace::new(
+            [(1, "first".into()), (5, "second".into())].into(),
+            None,
+        );
+        preflight_history_maintenance(&mut history, Some(&mut trace));
+        assert_eq!(history.len(), 5);
+        assert_eq!(history[0].role, "system");
+        assert_eq!(
+            trace.raw,
+            [(2, "first".into()), (4, "second".into())].into()
+        );
+        assert!(trace.rebuild_required);
     }
 }

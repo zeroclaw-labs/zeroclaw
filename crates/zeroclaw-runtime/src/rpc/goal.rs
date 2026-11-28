@@ -37,7 +37,9 @@ use crate::{
     },
     rpc::{
         context::RpcContext,
-        session::{GoalFrameClass, GoalFrameDelivery, GoalRecipient, GoalSessionSnapshot},
+        session::{
+            GoalFrameClass, GoalFrameDelivery, GoalRecipient, GoalSessionSnapshot, GoalWireFrame,
+        },
     },
 };
 
@@ -160,6 +162,24 @@ fn encode_goal_update(update: crate::rpc::types::SessionGoalUpdate) -> Result<St
         SESSION_GOAL_UPDATE,
         params,
     ))?)
+}
+
+pub(super) fn encode_goal_candidate_frame(
+    session_id: &str,
+    candidate: String,
+    reply_occurrence: Option<String>,
+) -> Result<GoalWireFrame> {
+    let encode = |candidate, reply_occurrence| {
+        encode_goal_update(crate::rpc::types::SessionGoalUpdate::VerifiedCandidate {
+            session_id: session_id.to_owned(),
+            candidate,
+            reply_occurrence,
+        })
+    };
+    let negotiated = reply_occurrence
+        .map(|id| encode(candidate.clone(), Some(id)))
+        .transpose()?;
+    Ok(GoalWireFrame::new(encode(candidate, None)?, negotiated))
 }
 
 async fn report_goal_command_failure(
@@ -664,6 +684,7 @@ impl GoalSessionDriver for ZeroCodeGoalSessionDriver {
             agent_alias: self.agent_alias.clone(),
             session_generation: self.session_generation,
             history_has_trim_breadcrumb: false,
+            pending_parent_occurrence: None,
             recipient: Arc::clone(&self.recipient),
             context: Arc::clone(&self.context),
             session_key: self.session_key.clone(),
@@ -683,6 +704,8 @@ struct ZeroCodeGoalExecutionLease {
     agent_alias: String,
     session_generation: u64,
     history_has_trim_breadcrumb: bool,
+    // The controller appends the successful parent result once on this lease.
+    pending_parent_occurrence: Option<String>,
     recipient: Arc<GoalRecipient>,
     context: Arc<RpcContext>,
     session_key: GoalSessionKey,
@@ -791,7 +814,7 @@ impl ZeroCodeGoalExecutionLease {
     async fn publish_frame(
         &self,
         session_id: &str,
-        frame: String,
+        frame: impl Into<GoalWireFrame>,
         class: GoalFrameClass,
     ) -> GoalFrameDelivery {
         self.context
@@ -801,7 +824,17 @@ impl ZeroCodeGoalExecutionLease {
     }
 
     async fn publish_parent_event(&self, session_id: &str, event: &TurnEvent) {
-        if let Some(frame) = super::dispatch::notification_for_turn_event(session_id, event) {
+        if let Some(before_negotiation) =
+            super::dispatch::notification_for_turn_event(session_id, event)
+        {
+            let negotiated = if matches!(event, TurnEvent::NativeReplyChunk { .. }) {
+                super::dispatch::notification_for_turn_event_with_occurrence(
+                    session_id, event, true,
+                )
+            } else {
+                None
+            };
+            let frame = GoalWireFrame::new(before_negotiation, negotiated);
             self.publish_frame(session_id, frame, GoalFrameClass::ParentEvent)
                 .await;
         }
@@ -906,6 +939,8 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
         turn: GoalParentTurn,
     ) -> Result<GoalParentTurnResult> {
         self.recipient.clear_unsaved_candidate();
+        self.pending_parent_occurrence = None;
+        let occurrence = self.recipient.allocate_reply_occurrence();
         let cost_context = self.cost_context();
         let result = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(cost_context, async {
@@ -949,7 +984,12 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
                     let session_id = self.raw_session_id()?.to_owned();
                     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
                     let recall_query = self.recall_query.clone();
-                    let run = prepared.run_with_presentation(source, &recall_query, event_tx);
+                    let run = prepared.run_with_presentation(
+                        source,
+                        &recall_query,
+                        event_tx,
+                        Some(occurrence),
+                    );
                     tokio::pin!(run);
 
                     let mut event_rx_open = true;
@@ -971,13 +1011,15 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
                             }
                         }
                     };
-                    let (outcome, presentation) = result?;
-                    // Complete the native stream before publishing the clean candidate.
-                    // A client that joined halfway through can now keep the marked tail.
+                    let (outcome, presentation, whole_reply) = result?;
+                    // A compound candidate must not appropriate any of its live fragments.
+                    let occurrence =
+                        whole_reply.unwrap_or_else(|| self.recipient.allocate_reply_occurrence());
                     for delta in presentation {
-                        let frame = super::dispatch::presentation_notification_for_chunk(
+                        let frame = super::dispatch::goal_presentation_frame(
                             &session_id,
                             delta,
+                            &occurrence,
                         )?;
                         self.publish_frame(&session_id, frame, GoalFrameClass::ParentEvent)
                             .await;
@@ -1009,26 +1051,31 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
                         )
                     };
                     let candidate = crate::agent::turn::scrub_credentials(&candidate);
-                    let notification = encode_goal_update(
-                        crate::rpc::types::SessionGoalUpdate::VerifiedCandidate {
-                            session_id: session_id.clone(),
-                            candidate,
-                        },
+                    let notification = encode_goal_candidate_frame(
+                        &session_id,
+                        candidate,
+                        Some(occurrence.clone()),
                     )?;
                     // Losing the observer after admission must not turn successful work
                     // into a parent failure or prevent the controller from saving it.
                     self.publish_frame(&session_id, notification, GoalFrameClass::Candidate)
                         .await;
-                    Ok(result)
+                    Ok((result, occurrence))
                 };
                 tokio::pin!(work);
                 root.scope(work).await
             })
             .await;
-        if let Err(error) = &result {
-            let _ = self.publish_parent_turn_failure(error).await;
+        match result {
+            Ok((parent, occurrence)) => {
+                self.pending_parent_occurrence = Some(occurrence);
+                Ok(parent)
+            }
+            Err(error) => {
+                let _ = self.publish_parent_turn_failure(&error).await;
+                Err(error)
+            }
         }
-        result
     }
 
     async fn run_verifier(
@@ -1100,12 +1147,14 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
     }
 
     async fn append_parent_candidate(&mut self, candidate: String) -> Result<()> {
-        let session_id = self.raw_session_id()?;
+        let session_key = format!("rpc_{}", self.raw_session_id()?);
+        let row = zeroclaw_infra::session_backend::SessionTranscriptRow {
+            message: ChatMessage::assistant(&candidate),
+            reply_occurrence: self.pending_parent_occurrence.take(),
+        };
         let backend = self.context.session_backend.as_ref().context(
             "cannot publish Goal parent response: ZeroCode session persistence is disabled",
         );
-        let session_key = format!("rpc_{session_id}");
-        let message = ChatMessage::assistant(&candidate);
         let persisted = match backend {
             Ok(backend) => {
                 #[cfg(test)]
@@ -1113,14 +1162,17 @@ impl GoalSessionExecutionLease for ZeroCodeGoalExecutionLease {
                     .sessions
                     .wait_test_effect_pause("goal-before-candidate-save")
                     .await;
-                run_session_write(|| backend.append(&session_key, &message))
+                run_session_write(|| backend.append_transcript_row(&session_key, &row))
                     .context("persist ZeroCode Goal parent response")
             }
             Err(error) => Err(error),
         };
         self.recipient.clear_unsaved_candidate();
         persisted?;
-        self.agent.lock().await.seed_history(&[message]);
+        self.agent
+            .lock()
+            .await
+            .seed_native_transcript_rows_with_event(std::slice::from_ref(&row));
         Ok(())
     }
 

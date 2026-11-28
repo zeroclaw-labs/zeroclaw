@@ -91,7 +91,7 @@ catalog! {
     LogsGetResult, EventsHistoryResult, SubscriptionCancelParams, SubscriptionCancelResult,
     SubscriptionLagged,
     // Notifications
-    SessionUpdateEvent, TurnCompletionOutcome, SafeguardFallbackKindWire, SafeguardFallbackWire,
+    SessionUpdateEvent, SessionUpdateNotification, TurnCompletionOutcome, SafeguardFallbackKindWire, SafeguardFallbackWire,
     ProviderUsageTotals, TurnUsageTotals,
     // Quickstart (wire-stable subset)
     QuickstartStateResult, QuickstartTypeOption, QuickstartValidateParams, QuickstartApplyParams,
@@ -133,6 +133,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn session_update_schema_describes_optional_reply_occurrence() {
+        let mut settings = schemars::generate::SchemaSettings::draft07();
+        settings.definitions_path = "#/components/schemas/".into();
+        let mut generator = settings.into_generator();
+        let payload = crate::notification::ALL
+            .iter()
+            .find(|(name, _)| *name == crate::notification::SESSION_UPDATE)
+            .and_then(|(_, payload)| *payload)
+            .unwrap();
+        let envelope = subschema_for_named(&mut generator, payload).unwrap();
+        assert_eq!(
+            envelope.get("$ref").unwrap(),
+            "#/components/schemas/SessionUpdateNotification"
+        );
+        let definitions = generator.take_definitions(true);
+        let schema = &definitions["SessionUpdateNotification"];
+        let id = &schema["properties"]["reply_occurrence"];
+        assert!(id.is_object(), "missing optional reply identity: {schema}");
+        assert!(
+            schema
+                .get("required")
+                .and_then(serde_json::Value::as_array)
+                .is_none_or(|required| !required.iter().any(|name| name == "reply_occurrence"))
+        );
+        // The Draft 7 envelope must reference the original, still published
+        // event component rather than inlining and removing its public pointer.
+        assert!(
+            schema["allOf"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!({"$ref":"#/components/schemas/SessionUpdateEvent"}))
+        );
+        let event = &definitions["SessionUpdateEvent"];
+        assert!(event.get("properties").is_none());
+        let alternatives = event["oneOf"]
+            .as_array()
+            .expect("event discriminator branches");
+        assert!(
+            alternatives
+                .iter()
+                .any(|item| item.to_string().contains("agent_message_chunk"))
+        );
     }
 
     #[test]

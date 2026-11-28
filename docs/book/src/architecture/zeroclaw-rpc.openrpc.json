@@ -2773,6 +2773,13 @@
             ],
             "default": "message"
           },
+          "reply_occurrence": {
+            "description": "When present, identifies this assistant reply across live and history delivery.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "role": {
             "type": "string"
           },
@@ -3962,6 +3969,13 @@
                   "candidate": {
                     "type": "string"
                   },
+                  "reply_occurrence": {
+                    "description": "Opaque presentation identity, sent only to opted-in peers.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
                   "session_id": {
                     "type": "string"
                   }
@@ -4882,6 +4896,23 @@
             "type": "object"
           }
         ]
+      },
+      "SessionUpdateNotification": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/SessionUpdateEvent"
+          }
+        ],
+        "description": "A session update with optional, negotiated reply identity. A missing\nidentity leaves the event in its original wire format.",
+        "properties": {
+          "reply_occurrence": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
       },
       "SkillBundleEntry": {
         "description": "Wire representation of a skill bundle. Consolidates gateway `BundleEntry`.",
@@ -9009,7 +9040,7 @@
       "params": {
         "name": "params",
         "schema": {
-          "$ref": "#/components/schemas/SessionUpdateEvent"
+          "$ref": "#/components/schemas/SessionUpdateNotification"
         }
       }
     },

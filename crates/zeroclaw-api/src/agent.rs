@@ -100,6 +100,12 @@ pub enum TurnEvent {
     Chunk {
         delta: String,
     },
+    /// A native Chat reply fragment. The occurrence is provisional until this
+    /// exact segment is accepted as a canonical row and persisted.
+    NativeReplyChunk {
+        delta: String,
+        reply_occurrence: String,
+    },
     /// A reasoning/thinking chunk from a thinking model (may arrive many times).
     Thinking {
         delta: String,

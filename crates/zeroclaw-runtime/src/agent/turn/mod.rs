@@ -13,6 +13,7 @@ pub(crate) mod history_window;
 pub(crate) mod knobs;
 pub(crate) mod max_iter;
 pub(crate) mod media_degrade;
+mod native_replies;
 pub(crate) mod outcome;
 pub(crate) mod parse_response;
 pub(crate) mod post_exec;
@@ -46,6 +47,7 @@ pub use execution::{
 pub(crate) use history_window::preflight_history_maintenance;
 pub use knobs::{LoopKnobs, MaxIterationBehavior};
 pub(crate) use max_iter::finish_after_max_iterations;
+pub(crate) use native_replies::NativeReplyTrace;
 pub use outcome::{
     ContextWindowExceeded, append_safeguard_fallback_notice, context_window_exceeded_from_error,
     is_semantic_empty_terminal_completion, semantic_empty_terminal_completion_message,
@@ -67,9 +69,9 @@ pub(crate) use parse_response::{
     unforwarded_narration,
 };
 pub(crate) use post_exec::record_executed_outcomes;
+use provider_call::call_provider_with_live_reply;
 pub(crate) use provider_call::{
-    ProviderCallOutcome, announce_budget_warning, announce_llm_request, call_provider,
-    enforce_tool_loop_budget,
+    ProviderCallOutcome, announce_budget_warning, announce_llm_request, enforce_tool_loop_budget,
 };
 pub use redact::scrub_credentials;
 pub(crate) use results_collect::{
@@ -200,6 +202,7 @@ mod memory_preamble_lifetime_tests {
             &mut breadcrumb,
             100,
             1,
+            None,
         );
         assert_eq!(trim.outcome, PreDispatchOutcome::Trimmed);
         assert!(breadcrumb);
@@ -233,6 +236,7 @@ mod memory_preamble_lifetime_tests {
             &mut breadcrumb,
             100,
             1,
+            None,
         );
         assert_eq!(trim.outcome, PreDispatchOutcome::Trimmed);
         assert!(record.is_none());
@@ -258,12 +262,7 @@ fn remap_memory_after_trim(
     history: &[ChatMessage],
     crumb: bool,
 ) {
-    let inserted = usize::from(crumb && !before.2);
-    let dropped = before
-        .0
-        .saturating_add(inserted)
-        .saturating_sub(history.len());
-    let start = before.1 + usize::from(before.2);
+    let (start, dropped, inserted) = retained_slot_change(before, history, crumb);
     if let Some(target) = injected {
         if (start..start.saturating_add(dropped)).contains(&target.index) {
             *injected = None;
@@ -273,6 +272,32 @@ fn remap_memory_after_trim(
                 .saturating_sub(dropped)
                 .saturating_add(inserted);
         }
+    }
+}
+
+fn retained_slot_change(
+    before: (usize, usize, bool),
+    history: &[ChatMessage],
+    crumb: bool,
+) -> (usize, usize, usize) {
+    let inserted = usize::from(crumb && !before.2);
+    let dropped = before
+        .0
+        .saturating_add(inserted)
+        .saturating_sub(history.len());
+    let start = before.1 + usize::from(before.2);
+    (start, dropped, inserted)
+}
+
+fn remap_replies_after_trim(
+    native_replies: Option<&mut NativeReplyTrace>,
+    before: (usize, usize, bool),
+    history: &[ChatMessage],
+    crumb: bool,
+) {
+    if let Some(trace) = native_replies {
+        let (start, dropped, inserted) = retained_slot_change(before, history, crumb);
+        trace.remap_raw_after_trim(start, dropped, inserted);
     }
 }
 
@@ -1333,6 +1358,7 @@ fn surface_oversized_dispatch_if_needed(
     crumb_present: &mut bool,
     measured_population: u64,
     context_token_budget: usize,
+    native_replies: Option<&mut NativeReplyTrace>,
 ) -> PreDispatchTrimResult {
     let before = retention_layout(history, *crumb_present);
     let outcome;
@@ -1351,6 +1377,7 @@ fn surface_oversized_dispatch_if_needed(
         }
     }
     remap_memory_after_trim(injected_memory_preamble, before, history, *crumb_present);
+    remap_replies_after_trim(native_replies, before, history, *crumb_present);
     PreDispatchTrimResult {
         outcome,
         dropped_messages,
@@ -1416,6 +1443,7 @@ async fn enforce_reported_budget(
     // The next request leaves out older turns' tool rows. Every projection
     // below counts that collapsed view, not the full working history.
     tool_context: ToolContextRetention<'_>,
+    native_replies: Option<&mut NativeReplyTrace>,
 ) {
     if context_token_budget == 0 {
         return;
@@ -1615,6 +1643,7 @@ async fn enforce_reported_budget(
             history,
             *crumb_present,
         );
+        remap_replies_after_trim(native_replies, retention_before, history, *crumb_present);
         if let Some(tx) = event_tx {
             let _ = tx
                 .send(TurnEvent::HistoryTrimmed {
@@ -1746,6 +1775,28 @@ impl<'a> TurnState<'a> {
         self.synced = self.canonical.as_ref().map_or(0, |c| c.len());
     }
 
+    fn push_terminal_reply(
+        &mut self,
+        text: String,
+        whole: bool,
+        native_replies: Option<&mut NativeReplyTrace>,
+        live_reply_occurrence: Option<String>,
+    ) -> Option<String> {
+        let raw = self.history.len();
+        let canonical = self.canonical.as_ref().map(|messages| messages.len());
+        let has_reply = !text.trim().is_empty();
+        self.push_dual(ChatMessage::assistant(text));
+        if has_reply && let Some(trace) = native_replies {
+            return trace.record_reply_with_live_occurrence(
+                raw,
+                canonical,
+                whole,
+                live_reply_occurrence,
+            );
+        }
+        None
+    }
+
     /// Advance the cursor past all current canonical messages.  Call after
     /// external code modifies both buffers (e.g. `drive_live_sop_actions`).
     fn mark_all_synced(&mut self) {
@@ -1830,8 +1881,15 @@ pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
     subject: InitialIngressSubject<'a>,
     reported_usage: Option<ReportedRequestUsage>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
+    native_replies: Option<&'a mut NativeReplyTrace>,
 ) -> impl std::future::Future<Output = Result<String>> + 'a {
-    run_tool_call_loop_impl(p, Some(subject), reported_usage, repetition_guard)
+    run_tool_call_loop_impl(
+        p,
+        Some(subject),
+        reported_usage,
+        repetition_guard,
+        native_replies,
+    )
 }
 
 /// Non-streamed Agent turns own the guard without steering ingress.
@@ -1839,14 +1897,15 @@ pub(crate) fn run_tool_call_loop_with_initial_ingress<'a>(
 pub(crate) fn run_tool_call_loop_with_guard<'a>(
     p: ToolLoop<'a>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
+    native_replies: Option<&'a mut NativeReplyTrace>,
 ) -> impl std::future::Future<Output = Result<String>> + 'a {
-    run_tool_call_loop_impl(p, None, None, repetition_guard)
+    run_tool_call_loop_impl(p, None, None, repetition_guard, native_replies)
 }
 
 pub fn run_tool_call_loop(
     p: ToolLoop<'_>,
 ) -> impl std::future::Future<Output = Result<String>> + '_ {
-    run_tool_call_loop_impl(p, None, None, None)
+    run_tool_call_loop_impl(p, None, None, None, None)
 }
 
 /// Evidence created by this invocation's structured tool lifecycle, never by
@@ -2005,6 +2064,7 @@ fn run_tool_call_loop_impl<'a>(
     initial_ingress: Option<InitialIngressSubject<'a>>,
     seed_reported_usage: Option<ReportedRequestUsage>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
+    native_replies: Option<&'a mut NativeReplyTrace>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
     // A concrete Send return breaks the live-SOP recursive opaque-future
     // inference boundary. Everything, including task-local reads, remains on
@@ -2022,6 +2082,7 @@ fn run_tool_call_loop_impl<'a>(
             seed_reported_usage,
             repetition_guard,
             &mut phase,
+            native_replies,
         )
         .await;
         finish_goal_tool_phase(result, participating, phase)
@@ -2346,6 +2407,7 @@ async fn run_tool_call_loop_body<'a>(
     seed_reported_usage: Option<ReportedRequestUsage>,
     repetition_guard: Option<&'a std::sync::Mutex<repetition::RepetitionGuard>>,
     goal_phase: &mut Option<GoalToolPhase>,
+    mut native_replies: Option<&mut NativeReplyTrace>,
 ) -> Result<String> {
     let model_switch_state = p
         .exec
@@ -2830,6 +2892,7 @@ async fn run_tool_call_loop_body<'a>(
                             keep_prior_turns: keep_tool_context_turns,
                             known_tools: &known_tool_names,
                         },
+                        native_replies.as_deref_mut(),
                     )
                     .await;
                     *history_has_trim_breadcrumb = turn_state.crumb_present;
@@ -2839,7 +2902,7 @@ async fn run_tool_call_loop_body<'a>(
             }
         }
 
-        preflight_history_maintenance(turn_state.history);
+        preflight_history_maintenance(turn_state.history, native_replies.as_deref_mut());
 
         // Check if model switch was requested via model_switch tool before
         // constructing this iteration's provider route.
@@ -3211,6 +3274,7 @@ async fn run_tool_call_loop_body<'a>(
             &mut turn_state.crumb_present,
             tokens_before_dispatch,
             trim_budget,
+            native_replies.as_deref_mut(),
         );
         *history_has_trim_breadcrumb = turn_state.crumb_present;
         let history_was_trimmed = turn_state.history.len() != history_len_before
@@ -3315,6 +3379,7 @@ async fn run_tool_call_loop_body<'a>(
                     &mut turn_state.crumb_present,
                     tokens_after_dispatch,
                     trim_budget,
+                    native_replies.as_deref_mut(),
                 );
                 *history_has_trim_breadcrumb = turn_state.crumb_present;
                 total_dropped_messages += trim_result.dropped_messages;
@@ -3609,8 +3674,9 @@ async fn run_tool_call_loop_body<'a>(
             streamed_live_deltas,
             streamed_protocol_suppressed,
             streamed_visible_text,
+            live_reply_occurrence,
             image_recovery_succeeded,
-        } = call_provider(
+        } = call_provider_with_live_reply(
             &ctx,
             active_model_provider,
             active_model_provider_name,
@@ -3630,6 +3696,13 @@ async fn run_tool_call_loop_body<'a>(
             iteration,
             use_native_tools.then_some(iteration_tool_specs.tool_specs.as_slice()),
             dispatch_start,
+            if should_consume_provider_stream {
+                native_replies
+                    .as_deref()
+                    .and_then(NativeReplyTrace::begin_live_reply)
+            } else {
+                None
+            },
         )
         .await?;
         let accepted_request_messages = if image_recovery_succeeded {
@@ -3775,7 +3848,8 @@ async fn run_tool_call_loop_body<'a>(
                 emit_rejected_attempt_usage(ctx.event_tx, &attempts).await;
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = if settlement_error.is_none() {
-                    try_recover_context_overflow(
+                    let before = retention_layout(turn_state.history, turn_state.crumb_present);
+                    let recovery = try_recover_context_overflow(
                         injected_memory_preamble,
                         turn_state.history,
                         &e,
@@ -3788,7 +3862,14 @@ async fn run_tool_call_loop_body<'a>(
                         turn_id,
                         &mut turn_state.crumb_present,
                     )
-                    .await
+                    .await;
+                    remap_replies_after_trim(
+                        native_replies.as_deref_mut(),
+                        before,
+                        turn_state.history,
+                        turn_state.crumb_present,
+                    );
+                    recovery
                 } else {
                     ContextRecovery::NotOverflow
                 };
@@ -4084,26 +4165,47 @@ async fn run_tool_call_loop_body<'a>(
                 "turn_final_response"
             );
             // No tool calls — this is the final response.
+            let exact_reply_chunk = !protocol_suppressed && display_text == response_text;
+            let whole_reply = accumulated_display_text.is_empty() && exact_reply_chunk;
             accumulated_display_text.push_str(&display_text);
 
             // If text wasn't streamed live, send it now post-hoc. Gated on
             // event_tx independently of on_delta (never nested — §8.4).
-            if !response_streamed_live && !protocol_suppressed {
-                events::emit_posthoc_turn_chunk(event_tx.as_ref(), &display_text).await;
+            let posthoc = !response_streamed_live && !protocol_suppressed;
+            if posthoc && exact_reply_chunk && on_delta.is_none() && native_replies.is_some() {
+                // Native Chat has no fallible channel post-hoc stream here.
+                // Bind the exact canonical row before exposing its chunk.
+                let occurrence = turn_state.push_terminal_reply(
+                    response_text,
+                    whole_reply,
+                    native_replies.as_deref_mut(),
+                    None,
+                );
+                events::emit_posthoc_turn_chunk_with_occurrence(
+                    event_tx.as_ref(),
+                    &display_text,
+                    occurrence,
+                )
+                .await;
+            } else {
+                if posthoc {
+                    events::emit_posthoc_turn_chunk(event_tx.as_ref(), &display_text).await;
+                    if let Some(ref tx) = on_delta {
+                        events::stream_text_posthoc_chunks(
+                            tx,
+                            &display_text,
+                            cancellation_token.as_ref(),
+                        )
+                        .await?;
+                    }
+                }
+                let _ = turn_state.push_terminal_reply(
+                    response_text,
+                    whole_reply,
+                    native_replies.as_deref_mut(),
+                    live_reply_occurrence.filter(|_| exact_reply_chunk),
+                );
             }
-
-            // If text wasn't streamed live, send it now via post-hoc chunking.
-            // When streamed live, the channel already received the deltas.
-            if let Some(ref tx) = on_delta
-                && !response_streamed_live
-                && !protocol_suppressed
-            {
-                events::stream_text_posthoc_chunks(tx, &display_text, cancellation_token.as_ref())
-                    .await?;
-            }
-
-            let msg = ChatMessage::assistant(response_text.clone());
-            turn_state.push_dual(msg);
             if let Some(reported) = reported_input_tokens {
                 // Terminal response: no next request will be dispatched, so no
                 // hook reserve is carried — enforcement never executes a
@@ -4130,6 +4232,7 @@ async fn run_tool_call_loop_body<'a>(
                         keep_prior_turns: keep_tool_context_turns,
                         known_tools: &known_tool_names,
                     },
+                    native_replies.as_deref_mut(),
                 ))
                 .await;
             }
@@ -4898,6 +5001,7 @@ async fn run_tool_call_loop_body<'a>(
             keep_prior_turns: keep_tool_context_turns,
             known_tools: &known_tool_names,
         },
+        native_replies,
     )
     .await;
     *history_has_trim_breadcrumb = turn_state.crumb_present;
@@ -6709,6 +6813,7 @@ mod reported_budget_tests {
             hook_reserve_tokens,
             crumb_present,
             super::ToolContextRetention::keep_all(),
+            None,
         )
         .await;
     }
@@ -6800,6 +6905,7 @@ mod reported_budget_tests {
             0,
             &mut false,
             retention,
+            None,
         )
         .await;
         assert_eq!(
@@ -6828,6 +6934,7 @@ mod reported_budget_tests {
             0,
             &mut false,
             super::ToolContextRetention::keep_all(),
+            None,
         )
         .await;
         assert!(counted_in_full.len() < history.len());
@@ -6864,6 +6971,7 @@ mod reported_budget_tests {
             0,
             &mut crumb_present,
             retention,
+            None,
         )
         .await;
         assert!(
@@ -6896,6 +7004,7 @@ mod reported_budget_tests {
             0,
             &mut false,
             super::ToolContextRetention::keep_all(),
+            None,
         )
         .await;
         let events = observer.0.lock().expect("trim events lock");
@@ -7916,6 +8025,7 @@ mod trim_budget_tests {
             &mut crumb_present,
             tokens_before as u64,
             budget,
+            None,
         );
         assert_eq!(result.outcome, PreDispatchOutcome::Trimmed);
         let final_tokens = crate::agent::history::estimate_history_tokens(&history);
@@ -7929,6 +8039,7 @@ mod trim_budget_tests {
             &mut crumb_present,
             final_tokens as u64,
             budget,
+            None,
         );
         assert_eq!(floor.outcome, PreDispatchOutcome::Floor);
         let crumb = crate::agent::history_trim::breadcrumb();
@@ -8078,6 +8189,7 @@ mod active_route_context_tests {
             &mut false,
             tokens_before as u64,
             vision_limits.context_token_budget,
+            None,
         );
         assert!(
             trim.outcome == PreDispatchOutcome::Trimmed,
@@ -13545,6 +13657,7 @@ mod tool_lifecycle_abandonment_tests {
                 served_route_sink: None,
             },
             repetition_guard,
+            None,
         )
         .await
     }

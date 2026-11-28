@@ -2035,6 +2035,42 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn ordinary_reply_occurrences_survive_rewrite_local_ipc() {
+        use crate::rpc::dispatch::connection_test_support::{
+            assert_ordinary_reply_occurrences, prepare_ordinary_occurrence,
+        };
+
+        for negotiated in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ctx = test_ctx(tmp.path());
+            let store = zeroclaw_infra::session_store::SessionStore::new(tmp.path()).unwrap();
+            let held = prepare_ordinary_occurrence(&mut ctx, tmp.path(), Arc::new(store)).await;
+            let socket = ctx.config.read().data_dir.join("daemon.sock");
+            let cancel = CancellationToken::new();
+            let server_ctx = Arc::clone(&ctx);
+            let server_cancel = cancel.clone();
+            let server = zeroclaw_spawn::spawn!(run_local_listener(
+                server_ctx,
+                server_cancel,
+                test_client_count(),
+                None,
+            ));
+            wait_for_socket(&socket).await;
+            let mut peer =
+                tokio::io::BufReader::new(tokio::net::UnixStream::connect(&socket).await.unwrap());
+            assert_ordinary_reply_occurrences(&ctx, &mut peer, None, negotiated, &held).await;
+            cancel.cancel();
+            drop(peer);
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn goal_reattach_split_final_local_ipc() {
         use crate::rpc::dispatch::connection_test_support::{NativeBurstMode, NativeBurstRoute};
         exercise_goal_stream_reattach(
@@ -3501,6 +3537,7 @@ mod tests {
                             crate::rpc::types::SessionGoalUpdate::VerifiedCandidate {
                                 session_id,
                                 candidate,
+                                ..
                             } => {
                                 assert_eq!(session_id, SID);
                                 assert_eq!(candidate, "ordinary answer");

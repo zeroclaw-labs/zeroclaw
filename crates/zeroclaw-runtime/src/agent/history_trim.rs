@@ -101,10 +101,25 @@ fn is_conversation_turn_boundary(msg: &ConversationMessage, is_breadcrumb: bool)
 /// retaining the newest complete turn. The legacy config key is named
 /// `max_history_messages`, but tool-call and tool-result rows do not consume
 /// independent slots.
+#[cfg(test)]
 pub(crate) fn trim_conversation_to_recent_turns(
     history: Vec<ConversationMessage>,
     max_turns: usize,
     has_leading_breadcrumb: bool,
+) -> TurnCountTrimResult<ConversationMessage> {
+    trim_conversation_with_reply_rows(
+        history,
+        max_turns,
+        has_leading_breadcrumb,
+        &mut Default::default(),
+    )
+}
+
+pub(super) fn trim_conversation_with_reply_rows(
+    history: Vec<ConversationMessage>,
+    max_turns: usize,
+    has_leading_breadcrumb: bool,
+    reply_rows: &mut std::collections::BTreeMap<usize, String>,
 ) -> TurnCountTrimResult<ConversationMessage> {
     let first_non_system = history
         .iter()
@@ -130,10 +145,14 @@ pub(crate) fn trim_conversation_to_recent_turns(
 
     let mut system = Vec::new();
     let mut body = Vec::new();
-    for message in history {
+    let mut body_replies = Vec::new();
+    for (index, message) in history.into_iter().enumerate() {
         if is_conversation_system(&message) {
             system.push(message);
         } else {
+            if let Some(occurrence) = reply_rows.remove(&index) {
+                body_replies.push((body.len(), occurrence));
+            }
             body.push(message);
         }
     }
@@ -152,6 +171,14 @@ pub(crate) fn trim_conversation_to_recent_turns(
     let first_kept = boundaries[dropped_turns];
 
     let dropped_messages = first_kept - synthetic_messages;
+    reply_rows.clear();
+    for (index, occurrence) in body_replies {
+        if let Some(retained) = index.checked_sub(first_kept) {
+            // The structured owner inserts one new breadcrumb before the
+            // retained body when consuming a trimmed result.
+            reply_rows.insert(system.len() + 1 + retained, occurrence);
+        }
+    }
     system.extend(body.into_iter().skip(first_kept));
     TurnCountTrimResult {
         history: system,

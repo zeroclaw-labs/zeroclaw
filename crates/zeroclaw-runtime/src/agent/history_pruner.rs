@@ -1,3 +1,4 @@
+use super::turn::NativeReplyTrace;
 use zeroclaw_api::model_provider::ChatMessage;
 
 // ---------------------------------------------------------------------------
@@ -41,23 +42,35 @@ impl PrunedOrphans {
 }
 
 pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> PrunedOrphans {
+    remove_orphaned_tool_messages_with_replies(messages, None)
+}
+
+pub(super) fn remove_orphaned_tool_messages_with_replies(
+    messages: &mut Vec<ChatMessage>,
+    mut replies: Option<&mut NativeReplyTrace>,
+) -> PrunedOrphans {
     let mut outcome = PrunedOrphans::default();
     let mut i = 0;
     while i < messages.len() {
-        let assistant_tool_call_ids = if messages[i].role == "assistant" {
-            extract_assistant_tool_call_ids(&messages[i].content)
-        } else {
-            None
-        };
+        let assistant_tool_call_ids =
+            if messages[i].role == "assistant" && !is_literal_reply(replies.as_deref(), i) {
+                extract_assistant_tool_call_ids(&messages[i].content)
+            } else {
+                None
+            };
         if let Some(doomed_ids) = assistant_tool_call_ids
             && i > 0
             && messages[i - 1].role == "assistant"
+            && !is_literal_reply(replies.as_deref(), i - 1)
             && assistant_is_unresolved_dispatch(messages, i - 1, i)
         {
             outcome
                 .orphan_tool_call_ids
                 .extend(doomed_ids.iter().cloned());
             messages.remove(i);
+            if let Some(trace) = replies.as_deref_mut() {
+                trace.remove_raw(i);
+            }
             outcome.removed += 1;
             while i < messages.len() && messages[i].role == "tool" {
                 let dominated = match extract_tool_call_id(&messages[i].content) {
@@ -66,6 +79,9 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> PrunedO
                 };
                 if dominated {
                     messages.remove(i);
+                    if let Some(trace) = replies.as_deref_mut() {
+                        trace.remove_raw(i);
+                    }
                     outcome.removed += 1;
                 } else {
                     break;
@@ -90,6 +106,7 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> PrunedO
 
         let is_orphan = match assistant_idx {
             None => true,
+            Some(idx) if is_literal_reply(replies.as_deref(), idx) => true,
             Some(idx) => match extract_assistant_tool_call_ids(&messages[idx].content) {
                 None => true,
                 Some(ids) => match extract_tool_call_id(&messages[i].content) {
@@ -104,12 +121,21 @@ pub fn remove_orphaned_tool_messages(messages: &mut Vec<ChatMessage>) -> PrunedO
                 outcome.orphan_tool_call_ids.push(id);
             }
             messages.remove(i);
+            if let Some(trace) = replies.as_deref_mut() {
+                trace.remove_raw(i);
+            }
             outcome.removed += 1;
         } else {
             i += 1;
         }
     }
     outcome
+}
+
+// A producer-confirmed reply can demonstrate a tool-call payload verbatim.
+// Its bytes neither invoke a tool nor authorize a tool result.
+fn is_literal_reply(replies: Option<&NativeReplyTrace>, index: usize) -> bool {
+    replies.is_some_and(|trace| trace.raw.contains_key(&index))
 }
 
 /// Try to extract a `tool_call_id` from a tool-role message's JSON content.
@@ -137,7 +163,15 @@ pub(crate) fn extract_assistant_tool_call_ids(content: &str) -> Option<Vec<Strin
     if ids.is_empty() { None } else { Some(ids) }
 }
 
-pub(crate) fn strip_orphaned_tool_calls_from_assistants(messages: &mut Vec<ChatMessage>) -> usize {
+#[cfg(test)]
+fn strip_orphaned_tool_calls_from_assistants(messages: &mut Vec<ChatMessage>) -> usize {
+    strip_orphaned_tool_calls_with_replies(messages, None)
+}
+
+pub(super) fn strip_orphaned_tool_calls_with_replies(
+    messages: &mut Vec<ChatMessage>,
+    mut replies: Option<&mut NativeReplyTrace>,
+) -> usize {
     let mut seen_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut stripped = 0usize;
 
@@ -151,7 +185,10 @@ pub(crate) fn strip_orphaned_tool_calls_from_assistants(messages: &mut Vec<ChatM
             }
             continue;
         }
-        if messages[idx].role != "assistant" || !messages[idx].content.contains("tool_calls") {
+        if messages[idx].role != "assistant"
+            || is_literal_reply(replies.as_deref(), idx)
+            || !messages[idx].content.contains("tool_calls")
+        {
             continue;
         }
         let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&messages[idx].content)
@@ -190,9 +227,17 @@ pub(crate) fn strip_orphaned_tool_calls_from_assistants(messages: &mut Vec<ChatM
                 .filter(|text| !text.is_empty())
                 .map(ToString::to_string);
             match salvaged_text {
-                Some(text) => messages[idx].content = text,
+                Some(text) => {
+                    messages[idx].content = text;
+                    if let Some(trace) = replies.as_deref_mut() {
+                        trace.rewrite_raw(idx);
+                    }
+                }
                 None => {
                     messages.remove(idx);
+                    if let Some(trace) = replies.as_deref_mut() {
+                        trace.remove_raw(idx);
+                    }
                 }
             }
         } else {
@@ -203,6 +248,9 @@ pub(crate) fn strip_orphaned_tool_calls_from_assistants(messages: &mut Vec<ChatM
                 );
             }
             messages[idx].content = value.to_string();
+            if let Some(trace) = replies.as_deref_mut() {
+                trace.rewrite_raw(idx);
+            }
         }
         stripped += 1;
 
@@ -225,6 +273,74 @@ pub(crate) fn strip_orphaned_tool_calls_from_assistants(messages: &mut Vec<ChatM
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_reply_is_literal_in_preflight_and_summary_even_if_it_looks_like_a_call() {
+        let literal = r#"{"tool_calls":[{"id":"sample","name":"example"}]}"#;
+        let result = r#"{"tool_call_id":"sample","content":"unpaired"}"#;
+        let mut history = vec![
+            ChatMessage::assistant(literal),
+            ChatMessage::assistant(literal),
+            ChatMessage::tool(result),
+        ];
+        let mut trace = NativeReplyTrace::new([(1, "session:answer".to_owned())].into(), None);
+
+        // The first row really is an unresolved invocation. The identical
+        // second row is an answer, not a second invocation or a tool-result owner.
+        let pruned = remove_orphaned_tool_messages_with_replies(&mut history, Some(&mut trace));
+        assert_eq!(pruned.removed, 1);
+        assert_eq!(pruned.orphan_tool_call_ids, ["sample"]);
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            trace.raw.get(&1).map(String::as_str),
+            Some("session:answer")
+        );
+        assert_eq!(
+            strip_orphaned_tool_calls_with_replies(&mut history, Some(&mut trace)),
+            1
+        );
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, literal);
+        assert_eq!(trace.raw, [(0, "session:answer".to_owned())].into());
+    }
+
+    #[test]
+    fn native_literal_reply_survives_max_iterations_pruner_order() {
+        let literal = r#"{"tool_calls":[{"id":"sample","name":"example"}]}"#;
+        let result = r#"{"tool_call_id":"sample","content":"genuine result"}"#;
+        let mut history = vec![
+            ChatMessage::tool(r#"{"tool_call_id":"older-orphan"}"#),
+            ChatMessage::assistant(literal),
+            ChatMessage::tool(result),
+            ChatMessage::assistant(literal),
+            ChatMessage::user("continue"),
+            ChatMessage::assistant(r#"{"tool_calls":[{"id":"dangling","name":"example"}]}"#),
+        ];
+        let mut trace = NativeReplyTrace::new([(3, "scope:reply".to_owned())].into(), None);
+
+        assert_eq!(
+            strip_orphaned_tool_calls_with_replies(&mut history, Some(&mut trace)),
+            1,
+            "strip only the dangling invocation",
+        );
+        let pruned = remove_orphaned_tool_messages_with_replies(&mut history, Some(&mut trace));
+        assert_eq!(pruned.removed, 1);
+        assert_eq!(pruned.orphan_tool_call_ids, ["older-orphan"]);
+        assert_eq!(
+            history
+                .iter()
+                .map(|row| (row.role.as_str(), row.content.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("assistant", literal),
+                ("tool", result),
+                ("assistant", literal),
+                ("user", "continue"),
+            ]
+        );
+        assert_eq!(trace.raw, [(2, "scope:reply".to_owned())].into());
+        assert!(trace.rebuild_required);
+    }
 
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {

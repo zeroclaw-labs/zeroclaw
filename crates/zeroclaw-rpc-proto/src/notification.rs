@@ -4,7 +4,7 @@
 //! them on the connection that owns the subscription or session.
 
 /// Turn progress for a session started with `session/prompt`. Payload:
-/// [`crate::types::SessionUpdateEvent`].
+/// [`crate::types::SessionUpdateNotification`].
 pub const SESSION_UPDATE: &str = "session/update";
 
 /// Additive Goal lifecycle and candidate-presentation updates. Payload:
@@ -27,7 +27,7 @@ pub const SUBSCRIPTION_LAGGED: &str = "subscription/lagged";
 /// Every notification with the name of its payload type, or `None` when the
 /// payload is an untyped JSON object.
 pub const ALL: &[(&str, Option<&str>)] = &[
-    (SESSION_UPDATE, Some("SessionUpdateEvent")),
+    (SESSION_UPDATE, Some("SessionUpdateNotification")),
     (SESSION_GOAL_UPDATE, Some("SessionGoalUpdate")),
     (LOGS_EVENT, None),
     (EVENTS_EVENT, None),

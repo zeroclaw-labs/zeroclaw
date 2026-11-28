@@ -140,6 +140,31 @@ pub(super) enum GoalFrameClass {
     Notice,
 }
 
+/// Pre-rendered alternatives; choose only once the actual recipient is admitted.
+pub(super) struct GoalWireFrame {
+    legacy: String,
+    negotiated: Option<String>,
+}
+
+impl GoalWireFrame {
+    pub(super) fn new(legacy: String, negotiated: Option<String>) -> Self {
+        Self { legacy, negotiated }
+    }
+
+    fn take_for(&mut self, reply_occurrence_enabled: bool) -> String {
+        if reply_occurrence_enabled && let Some(frame) = self.negotiated.take() {
+            return frame;
+        }
+        std::mem::take(&mut self.legacy)
+    }
+}
+
+impl From<String> for GoalWireFrame {
+    fn from(legacy: String) -> Self {
+        Self::new(legacy, None)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum GoalFrameDelivery {
     Delivered,
@@ -202,10 +227,20 @@ impl GoalDestinationRegistry {
 }
 
 /// Ephemeral presentation for this live incarnation; never used for worker admission.
-#[derive(Default)]
 pub(super) struct GoalRecipient {
     state: parking_lot::Mutex<GoalRecipientState>,
     changed: tokio::sync::Notify,
+    reply_occurrence_scope: uuid::Uuid,
+}
+
+impl Default for GoalRecipient {
+    fn default() -> Self {
+        Self {
+            state: parking_lot::Mutex::default(),
+            changed: tokio::sync::Notify::new(),
+            reply_occurrence_scope: uuid::Uuid::new_v4(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -239,6 +274,14 @@ impl GoalRecipientState {
 }
 
 impl GoalRecipient {
+    pub(super) fn allocate_reply_occurrence(&self) -> String {
+        format!(
+            "{}:{}",
+            self.reply_occurrence_scope.simple(),
+            uuid::Uuid::new_v4().simple()
+        )
+    }
+
     fn close(&self) {
         let mut state = self.state.lock();
         state.closed = true;
@@ -583,6 +626,12 @@ impl Drop for GoalLifecycleFence {
 }
 
 impl RpcSession {
+    pub(super) fn allocate_reply_occurrence(&self) -> String {
+        self.owner_binding
+            .goal_recipient
+            .allocate_reply_occurrence()
+    }
+
     pub(super) fn has_approval_rebind(&self, expected: &ApprovalRebindTicket) -> bool {
         self.approval_rebind
             .as_ref()
@@ -1770,10 +1819,10 @@ impl SessionStore {
         &self,
         id: &str,
         recipient: &Arc<GoalRecipient>,
-        frame: String,
+        frame: impl Into<GoalWireFrame>,
         class: GoalFrameClass,
     ) -> GoalFrameDelivery {
-        let mut frame = frame;
+        let mut frame = frame.into();
         loop {
             let notified = recipient.changed.notified();
             tokio::pin!(notified);
@@ -1826,7 +1875,9 @@ impl SessionStore {
                     }
                     let sent = permit.filter(|_| authority.is_ok()).is_some_and(|permit| {
                         target
-                            .with_live_tui_registration(|| permit.send(std::mem::take(&mut frame)))
+                            .with_live_tui_registration(|| {
+                                permit.send(frame.take_for(target.reply_occurrence_enabled()))
+                            })
                             .is_some()
                     });
                     let outcome = if sent {
@@ -1865,11 +1916,22 @@ impl SessionStore {
         &self,
         id: &str,
     ) -> Option<(u64, crate::rpc::types::ChatMode)> {
-        self.sessions
-            .lock()
+        self.history_incarnation(id)
             .await
-            .get(id)
-            .map(|session| (session.generation, session.chat_mode.clone()))
+            .map(|(identity, _)| identity)
+    }
+
+    /// Capture the live generation and its presentation namespace together.
+    pub(super) async fn history_incarnation(
+        &self,
+        id: &str,
+    ) -> Option<((u64, crate::rpc::types::ChatMode), uuid::Uuid)> {
+        self.sessions.lock().await.get(id).map(|session| {
+            (
+                (session.generation, session.chat_mode.clone()),
+                session.owner_binding.goal_recipient.reply_occurrence_scope,
+            )
+        })
     }
 
     /// The owning principal and generation of the LIVE incarnation under

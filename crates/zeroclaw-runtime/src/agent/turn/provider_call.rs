@@ -3,6 +3,7 @@
 
 use super::context::TurnCtx;
 use super::events::{ProgressEvent, StreamDelta, send_progress, thinking_status_text};
+use super::native_replies::LiveReplySegment;
 use super::outcome::{
     StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamInterruptedAfterOutput,
     StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion, ToolLoopCancelled,
@@ -33,6 +34,7 @@ pub(crate) struct ProviderCallOutcome {
     pub(crate) streamed_live_deltas: bool,
     pub(crate) streamed_protocol_suppressed: bool,
     pub(crate) streamed_visible_text: String,
+    pub(super) live_reply_occurrence: Option<String>,
     pub(crate) image_recovery_succeeded: bool,
 }
 
@@ -316,7 +318,7 @@ pub(super) fn ensure_goal_foreground_active() -> Result<()> {
 /// is held until the dispatch future is first polled (or the stream is
 /// constructed), even if an outer cancellation select yields beforehand.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn call_provider(
+pub(super) async fn call_provider_with_live_reply(
     ctx: &TurnCtx<'_>,
     active_model_provider: &dyn ModelProvider,
     active_model_provider_name: &str,
@@ -329,10 +331,12 @@ pub(crate) async fn call_provider(
     iteration: usize,
     guard_tools: Option<&[ToolSpec]>,
     dispatch_start: Option<zeroclaw_goal::task::GoalDispatchStart>,
+    live_reply: Option<LiveReplySegment>,
 ) -> Result<ProviderCallOutcome> {
     let mut streamed_live_deltas = false;
     let mut streamed_protocol_suppressed = false;
     let mut streamed_visible_text = String::new();
+    let mut live_reply_occurrence = None;
     let mut image_recovery_succeeded = false;
     let prepared_messages = original_request.messages;
     let request_tools = original_request.tools;
@@ -358,11 +362,13 @@ pub(crate) async fn call_provider(
                             ctx.draft_reasoning,
                             policy,
                             guard_tools,
+                            live_reply,
                         ),
                     )
                     .await
                     {
                         Ok(streamed) => {
+                            live_reply_occurrence = streamed.live_reply_occurrence;
                             let reasoning_content = (!streamed.reasoning_content.is_empty())
                                 .then_some(streamed.reasoning_content);
                             (
@@ -714,8 +720,43 @@ pub(crate) async fn call_provider(
         streamed_live_deltas,
         streamed_protocol_suppressed,
         streamed_visible_text,
+        live_reply_occurrence,
         image_recovery_succeeded,
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn call_provider(
+    ctx: &TurnCtx<'_>,
+    active_model_provider: &dyn ModelProvider,
+    active_model_provider_name: &str,
+    active_model: &str,
+    active_dispatch_model: &str,
+    original_request: ChatRequest<'_>,
+    image_recovery_messages: Option<&[ChatMessage]>,
+    should_consume_provider_stream: bool,
+    policy: zeroclaw_api::model_provider::ToolRoundPolicy,
+    iteration: usize,
+    guard_tools: Option<&[ToolSpec]>,
+    dispatch_start: Option<zeroclaw_goal::task::GoalDispatchStart>,
+) -> Result<ProviderCallOutcome> {
+    call_provider_with_live_reply(
+        ctx,
+        active_model_provider,
+        active_model_provider_name,
+        active_model,
+        active_dispatch_model,
+        original_request,
+        image_recovery_messages,
+        should_consume_provider_stream,
+        policy,
+        iteration,
+        guard_tools,
+        dispatch_start,
+        None,
+    )
+    .await
 }
 
 #[cfg(test)]

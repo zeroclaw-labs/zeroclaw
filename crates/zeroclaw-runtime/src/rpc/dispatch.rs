@@ -271,6 +271,7 @@ pub(super) struct TurnCompleteExtras {
     safeguard_fallback: Option<crate::rpc::types::SafeguardFallbackWire>,
     usage: Option<crate::rpc::types::TurnUsageTotals>,
     goal_owned: bool,
+    reply_occurrence: Option<String>,
 }
 
 impl TurnCompleteExtras {
@@ -956,6 +957,8 @@ pub struct RpcDispatcher {
     /// Transport-level peer label (e.g. `unix:pid=1234,uid=1000`).
     peer_label: String,
     client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities,
+    /// Presentation metadata requested by this native connection registration.
+    client_reply_occurrence: bool,
     /// Generation token for the transport connection that accepted work.
     /// Every detached prompt is linked to it and drained before teardown.
     connection_cancel: CancellationToken,
@@ -1155,6 +1158,7 @@ impl RpcDispatcher {
             tui_epoch: None,
             peer_label,
             client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities::default(),
+            client_reply_occurrence: false,
             connection_cancel,
             owns_connection: true,
             connection_activity: None,
@@ -1502,6 +1506,10 @@ impl GoalFrameDestination {
 
     pub(super) fn outbound(&self) -> &RpcOutbound {
         &self.0.rpc
+    }
+
+    pub(super) fn reply_occurrence_enabled(&self) -> bool {
+        self.0.client_reply_occurrence
     }
 
     pub(super) fn cancelled(&self) -> &CancellationToken {
@@ -4132,6 +4140,7 @@ impl RpcDispatcher {
             tui_epoch: self.tui_epoch,
             peer_label: self.peer_label.clone(),
             client_elicitation_caps: self.client_elicitation_caps,
+            client_reply_occurrence: self.client_reply_occurrence,
             connection_cancel: self.connection_cancel.clone(),
             owns_connection: false,
             // Shared, not re-created: this handle is moved into the spawned
@@ -5013,6 +5022,14 @@ impl RpcDispatcher {
         let principal_id = connection_auth.principal.id.as_str().to_owned();
         let auth_provider_label = connection_auth.principal.auth_provider_label();
         self.auth = Some(connection_auth);
+        self.client_reply_occurrence = matches!(
+            self.transport_kind,
+            crate::rpc::transport::TransportKind::Local | crate::rpc::transport::TransportKind::Wss
+        ) && req
+            .client_capabilities
+            .as_ref()
+            .and_then(|capabilities| capabilities.get("replyOccurrence"))
+            .is_some_and(Value::is_object);
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -6833,7 +6850,7 @@ impl RpcDispatcher {
                         // Fail closed: an unreadable transcript must not become
                         // an empty history that a later turn authoritatively
                         // persists over the existing durable session.
-                        let stored = match backend.try_load(&session_key) {
+                        let stored = match backend.try_load_transcript_rows(&session_key) {
                             Ok(stored) => stored,
                             Err(e) => {
                                 ::zeroclaw_log::record!(
@@ -6867,7 +6884,7 @@ impl RpcDispatcher {
                             match backend.get_session_trim_breadcrumb(&session_key) {
                                 Ok(opt) => {
                                     agent.set_history_has_trim_breadcrumb(opt.unwrap_or(false));
-                                    seed_event = agent.seed_history_with_event(&stored);
+                                    seed_event = agent.seed_native_transcript_rows_with_event(&stored);
                                     message_count = stored.len();
                                     // Seed-time trim only fires when the
                                     // restored history exceeded the structured
@@ -6882,16 +6899,16 @@ impl RpcDispatcher {
                                     // agent and the durable session
                                     // disagreeing.
                                     if seed_event.is_some() {
-                                        let durable = zeroclaw_providers::durable_chat_messages(
-                                            agent.history(),
-                                        );
-                                        if !replace_rpc_chat_conversation_state(
+                                        let durable = agent.native_transcript_rows();
+                                        if replace_rpc_chat_conversation_state(
                                             backend.as_ref(),
                                             &session_id,
                                             &session_key,
                                             &durable,
                                             agent.history_has_trim_breadcrumb(),
-                                        ) {
+                                        )
+                                        .is_err()
+                                        {
                                             return Err(rpc_err(
                                                 INTERNAL_ERROR,
                                                 "session restore unavailable; retry the connection",
@@ -8869,6 +8886,8 @@ impl RpcDispatcher {
         let checkpoint_turn_id_for_events = checkpoint_turn_id.clone();
         let checkpoint_error_for_events = Arc::clone(&checkpoint_error);
         let checkpoint_cancel = cancel.clone();
+        let supports_reply_occurrence =
+            self.client_reply_occurrence && chat_mode == crate::rpc::types::ChatMode::Chat;
         let acp_token_store = if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
             self.ctx.acp_session_store.clone()
         } else {
@@ -8948,21 +8967,29 @@ impl RpcDispatcher {
                 let result = if tokio::runtime::Handle::current().runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
                     tokio::task::block_in_place(work)
                 } else { work() };
-                result.map_err(|error| session_effect_error(error, "Failed to prepare RPC turn"))
+                result
+                    .map(|()| {
+                        (session.chat_mode == crate::rpc::types::ChatMode::Chat
+                            && current.ctx.session_backend.is_some())
+                            .then(|| session.allocate_reply_occurrence())
+                    })
+                    .map_err(|error| session_effect_error(error, "Failed to prepare RPC turn"))
             }).await;
-            if let Err(error) = checked {
-                *preparation_error_for_task
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(error.clone());
-                return Err(crate::agent::agent::StreamedTurnError {
-                    error: SessionEffectDenied(error).into(),
-                    committed_response: String::new(),
-                    new_messages: Vec::new(),
-                });
+            match checked {
+                Ok(occurrence) => Ok((guard, occurrence)),
+                Err(error) => {
+                    *preparation_error_for_task
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(error.clone());
+                    Err(crate::agent::agent::StreamedTurnError {
+                        error: SessionEffectDenied(error).into(),
+                        committed_response: String::new(),
+                        new_messages: Vec::new(),
+                    })
+                }
             }
-            Ok(guard)
         };
-        let turn = crate::rpc::turn::execute_turn_prepared(
+        let turn = crate::rpc::turn::execute_turn_prepared_with_native_reply_occurrence(
             agent,
             prompt.clone(),
             cancel.clone(),
@@ -9017,6 +9044,7 @@ impl RpcDispatcher {
                         &sid,
                         &event,
                         &rpc,
+                        supports_reply_occurrence,
                     )
                     .await
                     {
@@ -9027,7 +9055,7 @@ impl RpcDispatcher {
             }),
         );
         tokio::pin!(turn);
-        let mut outcome = tokio::select! {
+        let outcome = tokio::select! {
             biased;
             _ = self.connection_cancel.cancelled() => {
                 self.ctx.sessions.record_cancel_cause_if_absent(
@@ -9038,6 +9066,10 @@ impl RpcDispatcher {
                 turn.await
             }
             outcome = &mut turn => outcome,
+        };
+        let (mut outcome, terminal_reply_occurrence) = match outcome {
+            Ok((outcome, reply_occurrence)) => (Ok(outcome), reply_occurrence),
+            Err(error) => (Err(error), None),
         };
 
         let refused_preparation = preparation_error
@@ -9266,6 +9298,7 @@ impl RpcDispatcher {
             });
         }
 
+        let mut committed_reply_occurrence = None;
         match chat_mode {
             crate::rpc::types::ChatMode::Acp => {
                 // Native ACP turns always own a checkpoint. Their terminal
@@ -9287,14 +9320,33 @@ impl RpcDispatcher {
                     // delta on top of a transcript the agent's loop may have
                     // already trimmed underneath it.
                     let agent = agent.lock().await;
-                    let durable = zeroclaw_providers::durable_chat_messages(agent.history());
-                    replace_rpc_chat_conversation_state(
+                    let durable = agent.native_transcript_rows();
+                    let write = replace_rpc_chat_conversation_state(
                         backend.as_ref(),
                         sid,
                         &key,
                         &durable,
                         agent.history_has_trim_breadcrumb(),
                     );
+                    if matches!(write, Ok(true))
+                        && self.client_reply_occurrence
+                        && let Ok(TurnOutcome::Completed {
+                            text,
+                            safeguard_fallback: None,
+                            ..
+                        }) = &outcome
+                        && let Some(occurrence) = terminal_reply_occurrence.as_ref()
+                        && backend.try_load_transcript_rows(&key).is_ok_and(|rows| {
+                            let mut matching = rows.iter().filter(|row| {
+                                row.reply_occurrence.as_deref() == Some(occurrence.as_str())
+                            });
+                            matching.next().is_some_and(|row| {
+                                row.message.role == "assistant" && row.message.content == *text
+                            }) && matching.next().is_none()
+                        })
+                    {
+                        committed_reply_occurrence = Some(occurrence.clone());
+                    }
                 }
             }
         }
@@ -9351,6 +9403,7 @@ impl RpcDispatcher {
                     TurnCompleteExtras {
                         safeguard_fallback: safeguard_wire,
                         usage: usage.clone(),
+                        reply_occurrence: committed_reply_occurrence,
                         ..Default::default()
                     },
                 )
@@ -11064,10 +11117,10 @@ impl RpcDispatcher {
                 "cursor pagination cannot be combined with before_index",
             ));
         }
-        let initial_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
+        let initial_incarnation = self.ctx.sessions.history_incarnation(&req.session_id).await;
         // Live reads do not queue behind a running turn. Reaped reads need
         // admission because checkpoint recovery changes durable history.
-        let mut session_guard = if initial_identity.is_none() {
+        let mut session_guard = if initial_incarnation.is_none() {
             Some(
                 self.ctx
                     .sessions
@@ -11079,8 +11132,8 @@ impl RpcDispatcher {
         } else {
             None
         };
-        let mut live_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
-        if live_identity.is_none() && session_guard.is_none() {
+        let mut live_incarnation = self.ctx.sessions.history_incarnation(&req.session_id).await;
+        if live_incarnation.is_none() && session_guard.is_none() {
             session_guard = Some(
                 self.ctx
                     .sessions
@@ -11089,8 +11142,9 @@ impl RpcDispatcher {
                     .await
                     .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?,
             );
-            live_identity = self.ctx.sessions.generation_and_mode(&req.session_id).await;
+            live_incarnation = self.ctx.sessions.history_incarnation(&req.session_id).await;
         }
+        let live_identity = live_incarnation.as_ref().map(|(identity, _)| identity);
         let record = if session_guard.is_some() {
             // Admission can outlast the caller's authority: judge the record
             // by the authority and ownership scope in force now.
@@ -11220,12 +11274,27 @@ impl RpcDispatcher {
                     self.ctx.session_backend.as_ref().ok_or_else(|| {
                         rpc_err(INTERNAL_ERROR, "Session persistence is disabled")
                     })?;
+                let native_key = format!("rpc_{}", req.session_id);
+                let mut occurrence_prefix = live_incarnation
+                    .as_ref()
+                    .filter(|((_, mode), _)| {
+                        self.client_reply_occurrence
+                            && *mode == crate::rpc::types::ChatMode::Chat
+                            && key == native_key
+                    })
+                    .map(|(_, scope)| format!("{}:", scope.simple()));
                 let history = if checked_chat_snapshot {
-                    match backend.try_load(&key) {
+                    let read = if occurrence_prefix.is_some() {
+                        backend.try_load_transcript_rows(&key)
+                    } else {
+                        backend
+                            .try_load(&key)
+                            .map(|history| history.into_iter().map(Into::into).collect())
+                    };
+                    match read {
                         Ok(history) => {
                             // Goal writes use the native RPC key. An alternate browse key
                             // covers the Goal only if there is no native history to omit.
-                            let native_key = format!("rpc_{}", req.session_id);
                             checked = key == native_key
                                 || self.verified_empty_native_goal_history(
                                     &req.session_id,
@@ -11247,22 +11316,41 @@ impl RpcDispatcher {
                                 })),
                                 "ZeroCode Goal history is incomplete; live delivery did not move"
                             );
-                            backend.load(&key)
+                            occurrence_prefix = None;
+                            backend.load(&key).into_iter().map(Into::into).collect()
+                        }
+                    }
+                } else if occurrence_prefix.is_some() {
+                    match backend.try_load_transcript_rows(&key) {
+                        Ok(history) => history,
+                        Err(_) => {
+                            occurrence_prefix = None;
+                            backend.load(&key).into_iter().map(Into::into).collect()
                         }
                     }
                 } else {
-                    backend.load(&key)
+                    backend.load(&key).into_iter().map(Into::into).collect()
                 };
                 history
                     .into_iter()
-                    .map(|message| MessageEntry {
-                        role: message.role,
-                        content: message.content,
-                        kind: MessageEntryKind::Message,
-                        tool_call_id: None,
-                        tool_name: None,
-                        tool_input: None,
-                        tool_output: None,
+                    .map(|row| {
+                        let occurrence = row.reply_occurrence.filter(|occurrence| {
+                            row.message.role == "assistant"
+                                && occurrence_prefix
+                                    .as_deref()
+                                    .and_then(|prefix| occurrence.strip_prefix(prefix))
+                                    .is_some_and(|suffix| !suffix.is_empty())
+                        });
+                        MessageEntry {
+                            role: row.message.role,
+                            content: row.message.content,
+                            reply_occurrence: occurrence,
+                            kind: MessageEntryKind::Message,
+                            tool_call_id: None,
+                            tool_name: None,
+                            tool_input: None,
+                            tool_output: None,
+                        }
                     })
                     .collect()
             }
@@ -11284,7 +11372,7 @@ impl RpcDispatcher {
             }
         };
 
-        if let Some(identity) = live_identity.as_ref()
+        if let Some(identity) = live_identity
             && !self
                 .ctx
                 .sessions
@@ -15976,6 +16064,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
             ConversationMessage::Chat(chat) => entries.push(MessageEntry {
                 role: chat.role.clone(),
                 content: chat.content.clone(),
+                reply_occurrence: None,
                 kind: MessageEntryKind::Message,
                 tool_call_id: None,
                 tool_name: None,
@@ -15989,6 +16078,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                     entries.push(MessageEntry {
                         role: "assistant".to_string(),
                         content: text.clone(),
+                        reply_occurrence: None,
                         kind: MessageEntryKind::Message,
                         tool_call_id: None,
                         tool_name: None,
@@ -16006,6 +16096,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                     entries.push(MessageEntry {
                         role: "assistant".to_string(),
                         content: format!("Tool call: {}\n{}", call.name, call.arguments),
+                        reply_occurrence: None,
                         kind: MessageEntryKind::ToolCall,
                         tool_call_id: Some(call.id.clone()),
                         tool_name: Some(call.name.clone()),
@@ -16045,6 +16136,7 @@ fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<Message
                                 },
                                 output
                             ),
+                            reply_occurrence: None,
                             kind: MessageEntryKind::ToolResult,
                             tool_call_id: Some(result.tool_call_id.clone()),
                             tool_name: (!result.tool_name.is_empty())
@@ -16386,7 +16478,7 @@ fn context_usage_model_window(cfg: &zeroclaw_config::schema::Config, agent_alias
 
 fn checkpoint_fragment_for_event(event: &TurnEvent) -> Option<ConversationMessage> {
     match event {
-        TurnEvent::Chunk { delta } => {
+        TurnEvent::Chunk { delta } | TurnEvent::NativeReplyChunk { delta, .. } => {
             Some(ConversationMessage::Chat(ChatMessage::assistant(delta)))
         }
         TurnEvent::ToolCall { id, name, args } => {
@@ -16613,8 +16705,10 @@ async fn persist_checkpoint_event_before_notification(
     session_id: &str,
     event: &TurnEvent,
     rpc: &Arc<RpcOutbound>,
+    supports_reply_occurrence: bool,
 ) -> Result<(), String> {
-    let notification = notification_for_turn_event(session_id, event);
+    let notification =
+        notification_for_turn_event_with_occurrence(session_id, event, supports_reply_occurrence);
     let checkpoint_write = async {
         let mut observed_frontier = None;
         if let (Some(store), Some(turn_id)) = (acp_store, turn_id)
@@ -16759,12 +16853,22 @@ pub(crate) fn notification_for_turn_event_for_test(
 }
 
 pub(super) fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<String> {
+    notification_for_turn_event_with_occurrence(session_id, event, false)
+}
+
+pub(super) fn notification_for_turn_event_with_occurrence(
+    session_id: &str,
+    event: &TurnEvent,
+    supports_reply_occurrence: bool,
+) -> Option<String> {
     let update = match event {
-        TurnEvent::Chunk { delta } => SessionUpdateEvent::AgentMessageChunk {
-            session_id: session_id.to_string(),
-            text: delta.clone(),
-            presentation_only: false,
-        },
+        TurnEvent::Chunk { delta } | TurnEvent::NativeReplyChunk { delta, .. } => {
+            SessionUpdateEvent::AgentMessageChunk {
+                session_id: session_id.to_string(),
+                text: delta.clone(),
+                presentation_only: false,
+            }
+        }
         TurnEvent::Thinking { delta } => SessionUpdateEvent::AgentThoughtChunk {
             session_id: session_id.to_string(),
             text: delta.clone(),
@@ -16878,22 +16982,67 @@ pub(super) fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -
         _ => return None,
     };
 
-    encode_session_update(update).ok()
+    if supports_reply_occurrence
+        && let TurnEvent::NativeReplyChunk {
+            reply_occurrence, ..
+        } = event
+    {
+        encode_session_update_with_occurrence(update, reply_occurrence.clone()).ok()
+    } else {
+        encode_session_update(update).ok()
+    }
 }
 
-pub(super) fn presentation_notification_for_chunk(
-    session_id: &str,
-    delta: String,
-) -> serde_json::Result<String> {
-    encode_session_update(SessionUpdateEvent::AgentMessageChunk {
+fn presentation_chunk_update(session_id: &str, delta: String) -> SessionUpdateEvent {
+    SessionUpdateEvent::AgentMessageChunk {
         session_id: session_id.to_owned(),
         text: delta,
         presentation_only: true,
-    })
+    }
+}
+
+#[cfg(test)]
+fn presentation_notification_for_chunk(
+    session_id: &str,
+    delta: String,
+) -> serde_json::Result<String> {
+    encode_session_update(presentation_chunk_update(session_id, delta))
+}
+
+pub(super) fn goal_presentation_frame(
+    session_id: &str,
+    delta: String,
+    reply_occurrence: &str,
+) -> serde_json::Result<super::session::GoalWireFrame> {
+    let event = presentation_chunk_update(session_id, delta);
+    let legacy = encode_session_update(event.clone())?;
+    let params = serde_json::to_value(crate::rpc::types::SessionUpdateNotification {
+        event,
+        reply_occurrence: Some(reply_occurrence.to_owned()),
+    })?;
+    let negotiated = serde_json::to_string(&JsonRpcNotification::new(
+        notification::SESSION_UPDATE,
+        params,
+    ))?;
+    Ok(super::session::GoalWireFrame::new(legacy, Some(negotiated)))
 }
 
 fn encode_session_update(update: SessionUpdateEvent) -> serde_json::Result<String> {
     let params = serde_json::to_value(update)?;
+    serde_json::to_string(&JsonRpcNotification::new(
+        notification::SESSION_UPDATE,
+        params,
+    ))
+}
+
+fn encode_session_update_with_occurrence(
+    event: SessionUpdateEvent,
+    reply_occurrence: String,
+) -> serde_json::Result<String> {
+    let params = serde_json::to_value(crate::rpc::types::SessionUpdateNotification {
+        event,
+        reply_occurrence: Some(reply_occurrence),
+    })?;
     serde_json::to_string(&JsonRpcNotification::new(
         notification::SESSION_UPDATE,
         params,
@@ -16964,7 +17113,15 @@ pub(super) fn turn_completion_notification(
         safeguard_fallback: extras.safeguard_fallback,
         usage: extras.usage.map(Box::new),
     };
-    let params = serde_json::to_value(update).ok()?;
+    let params = if let Some(reply_occurrence) = extras.reply_occurrence {
+        serde_json::to_value(crate::rpc::types::SessionUpdateNotification {
+            event: update,
+            reply_occurrence: Some(reply_occurrence),
+        })
+    } else {
+        serde_json::to_value(update)
+    }
+    .ok()?;
     let notification = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
     serde_json::to_string(&notification).ok()
 }
@@ -16976,25 +17133,21 @@ pub(super) fn turn_completion_notification(
 /// with what the caller claims was persisted, so failures are logged with
 /// session context for operators to notice.
 ///
-/// Returns `true` when the row was committed or there was nothing left to
-/// persist (session already deleted), and `false` when the durable write
-/// itself failed, so a restore-time caller can fail closed instead of
-/// letting the session go live against a store that still has the
-/// untrimmed prefix.
+/// A successful no-op after deletion is not proof of a committed reply.
 fn replace_rpc_chat_conversation_state(
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_id: &str,
     session_key: &str,
-    durable: &[zeroclaw_providers::ChatMessage],
+    durable: &[zeroclaw_infra::session_backend::SessionTranscriptRow],
     breadcrumb_present: bool,
-) -> bool {
+) -> std::io::Result<bool> {
     // Guarded replacement, not check-then-act: a delete committing between a
     // separate existence probe and the write would be silently undone by the
     // replace recreating the session row/files. When deletion already won
     // (`Ok(false)`) there is nothing left to persist, so skip quietly.
-    match backend.replace_conversation_state_if_exists(session_key, durable, breadcrumb_present) {
-        Ok(_) => true,
-        Err(e) => {
+    backend
+        .replace_transcript_rows_if_exists(session_key, durable, breadcrumb_present)
+        .inspect_err(|e| {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -17005,14 +17158,13 @@ fn replace_rpc_chat_conversation_state(
                     })),
                 "Failed to persist authoritative post-turn conversation state"
             );
-            false
-        }
-    }
+        })
 }
 
 #[cfg(test)]
 pub(crate) mod connection_test_support {
     mod goal_history_tests;
+    mod ordinary_reply_stream_tests;
 
     use super::RpcContext;
     use async_trait::async_trait;
@@ -18153,6 +18305,681 @@ pub(crate) mod connection_test_support {
     pub(crate) const REATTACH_OWNER: &str = "goal-stream-owner";
     const QUESTION: &str = "Which option should I use?";
 
+    pub(crate) const OCCURRENCE_SID: &str = "ordinary-reply-occurrence";
+    pub(crate) const OCCURRENCE_OWNER: &str = "ordinary-occurrence-owner";
+    const OCCURRENCE_DELETE_SID: &str = "ordinary-reply-occurrence-delete";
+    const OCCURRENCE_STEER_SID: &str = "ordinary-reply-occurrence-steer";
+    const OCCURRENCE_REBUILD_SID: &str = "ordinary-reply-occurrence-rebuild";
+    const REBUILD_DROPPED_USER: &str = "drop-this-old-turn";
+    const REBUILD_LITERAL: &str =
+        r#"{"content":null,"tool_calls":[{"id":"literal","name":"not_a_tool","arguments":"{}"}]}"#;
+    const REBUILD_TOOL_ID: &str = "fixture-real-control";
+    const REBUILD_TOOL_RESULT: &str = "genuine tool result";
+    const REBUILD_ANSWER: &str = "answer after recovery";
+
+    #[derive(Default)]
+    struct OccurrenceRebuildProvider(AtomicUsize);
+
+    #[async_trait]
+    impl ModelProvider for OccurrenceRebuildProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("occurrence recovery fixture expects a structured request")
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let call = self.0.fetch_add(1, Ordering::SeqCst);
+            assert!(call < 2, "one overflow and one recovered request");
+            assert_eq!(
+                request
+                    .messages
+                    .iter()
+                    .filter(|row| { row.role == "assistant" && row.content == REBUILD_LITERAL })
+                    .count(),
+                2 - call,
+                "the equal literal rows must stay text through provider preparation"
+            );
+            assert_eq!(
+                request
+                    .messages
+                    .iter()
+                    .any(|row| row.content.contains(REBUILD_DROPPED_USER)),
+                call == 0,
+                "only the obsolete turn is removed by recovery"
+            );
+            assert!(
+                request
+                    .messages
+                    .iter()
+                    .any(|row| { row.role == "tool" && row.content.contains(REBUILD_TOOL_RESULT) })
+            );
+            if call == 0 {
+                anyhow::bail!("maximum context length exceeded");
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some(REBUILD_ANSWER.into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+    }
+
+    impl Attributable for OccurrenceRebuildProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "connection-occurrence-rebuild"
+        }
+    }
+
+    async fn prepare_occurrence_rebuild(ctx: &Arc<RpcContext>, path: &Path) {
+        use zeroclaw_api::model_provider::{
+            ChatMessage, ConversationMessage, ToolCall, ToolResultMessage,
+        };
+        use zeroclaw_infra::session_backend::SessionTranscriptRow;
+
+        let sid = OCCURRENCE_REBUILD_SID;
+        insert_session_with_owner(
+            ctx,
+            path,
+            sid,
+            Box::new(OccurrenceRebuildProvider::default()),
+            Some(OCCURRENCE_OWNER),
+        )
+        .await;
+        let snapshot = ctx.sessions.goal_session_snapshot(sid).await.unwrap();
+        let tagged_reply = || SessionTranscriptRow {
+            message: ChatMessage::assistant(REBUILD_LITERAL),
+            reply_occurrence: Some(snapshot.goal_recipient.allocate_reply_occurrence()),
+        };
+        let before_tool = [
+            ChatMessage::user(format!(
+                "{REBUILD_DROPPED_USER} {}",
+                "obsolete context ".repeat(256)
+            ))
+            .into(),
+            tagged_reply(),
+            ChatMessage::user("the retained exchange").into(),
+        ];
+        let retained_reply = tagged_reply();
+        let mut agent = snapshot.agent.lock().await;
+        assert!(
+            agent
+                .seed_native_transcript_rows_with_event(&before_tool)
+                .is_none()
+        );
+        // Native history omits provider-only plumbing from its durable Chat
+        // projection. The existing live Agent retains this actual typed pair.
+        agent.seed_conversation_history(vec![
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: REBUILD_TOOL_ID.into(),
+                    name: "fixture_control".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: REBUILD_TOOL_ID.into(),
+                content: REBUILD_TOOL_RESULT.into(),
+                tool_name: "fixture_control".into(),
+            }]),
+        ]);
+        assert!(
+            agent
+                .seed_native_transcript_rows_with_event(std::slice::from_ref(&retained_reply))
+                .is_none()
+        );
+        drop(agent);
+        let key = format!("rpc_{sid}");
+        let backend = ctx.session_backend.as_ref().unwrap();
+        for row in before_tool.iter().chain(std::iter::once(&retained_reply)) {
+            backend.append_transcript_row(&key, row).unwrap();
+        }
+    }
+
+    pub(crate) async fn prepare_ordinary_occurrence(
+        ctx: &mut Arc<RpcContext>,
+        path: &Path,
+        store: Arc<dyn zeroclaw_infra::session_backend::SessionBackend>,
+    ) -> HeldOrdinaryTurn {
+        let seed = zeroclaw_api::model_provider::ChatMessage::user("Existing history");
+        store
+            .append(&format!("rpc_{OCCURRENCE_SID}"), &seed)
+            .unwrap();
+        Arc::get_mut(ctx).unwrap().session_backend = Some(store);
+        insert_immediate_session_with_owner(ctx, path, OCCURRENCE_SID, OCCURRENCE_OWNER).await;
+        let agent = ctx.sessions.get_agent(OCCURRENCE_SID).await.unwrap();
+        agent.lock().await.seed_history(&[seed]);
+        prepare_occurrence_rebuild(ctx, path).await;
+        let held = HeldOrdinaryTurn::default();
+        for sid in [OCCURRENCE_DELETE_SID, OCCURRENCE_STEER_SID] {
+            ctx.session_backend
+                .as_ref()
+                .unwrap()
+                .append(
+                    &format!("rpc_{sid}"),
+                    &zeroclaw_api::model_provider::ChatMessage::user("Existing history"),
+                )
+                .unwrap();
+            insert_session_with_owner(
+                ctx,
+                path,
+                sid,
+                Box::new(HeldOrdinaryProvider(held.clone())),
+                Some(OCCURRENCE_OWNER),
+            )
+            .await;
+        }
+        held
+    }
+
+    async fn assert_occurrences_survive_persisted_rebuild(
+        ctx: &RpcContext,
+        peer: &mut impl GoalReattachPeer,
+        negotiated: bool,
+    ) {
+        use serde_json::json;
+        use zeroclaw_api::model_provider::ConversationMessage;
+
+        let sid = OCCURRENCE_REBUILD_SID;
+        let key = format!("rpc_{sid}");
+        let backend = ctx.session_backend.as_ref().unwrap();
+        let original = backend.try_load_transcript_rows(&key).unwrap();
+        let originals: Vec<_> = original
+            .iter()
+            .filter(|row| row.message.role == "assistant" && row.message.content == REBUILD_LITERAL)
+            .map(|row| row.reply_occurrence.as_deref().unwrap())
+            .collect();
+        assert_eq!(originals.len(), 2);
+        assert_ne!(originals[0], originals[1]);
+
+        peer.write_request(
+            super::Method::SessionPrompt,
+            &json!({"session_id": sid, "prompt": "Recover the ordinary turn"}),
+            20,
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut acknowledged = false;
+            let mut completed = false;
+            let mut trims = 0;
+            while !acknowledged || !completed {
+                let frame = peer.read_frame().await;
+                if frame["id"] == 20 {
+                    assert!(!acknowledged, "{frame}");
+                    assert_ordinary_prompt_acknowledgement(&frame, sid);
+                    acknowledged = true;
+                    continue;
+                }
+                assert_eq!(frame["method"], "session/update", "{frame}");
+                let params = &frame["params"];
+                assert_eq!(params["session_id"], sid, "{frame}");
+                if !negotiated {
+                    assert!(params.get("reply_occurrence").is_none(), "{frame}");
+                }
+                match params["type"].as_str() {
+                    Some("history_trimmed") => {
+                        assert_eq!(params["dropped_turns"], 1, "{frame}");
+                        assert_eq!(params["dropped_messages"], 2, "{frame}");
+                        trims += 1;
+                    }
+                    Some("turn_complete") => {
+                        assert!(!completed, "{frame}");
+                        assert_eq!(params["outcome"], "completed", "{frame}");
+                        assert_eq!(params["content"], REBUILD_ANSWER, "{frame}");
+                        completed = true;
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                trims, 1,
+                "must exercise the ordinary loop's real overflow trim"
+            );
+        })
+        .await
+        .expect("ordinary trim must recover and reach its real terminal");
+
+        let saved = backend.try_load_transcript_rows(&key).unwrap();
+        let equal_replies = saved
+            .iter()
+            .filter(|row| row.message.role == "assistant" && row.message.content == REBUILD_LITERAL)
+            .collect::<Vec<_>>();
+        assert_eq!(equal_replies.len(), 1, "{saved:?}");
+        assert_eq!(
+            equal_replies[0].reply_occurrence.as_deref(),
+            Some(originals[1])
+        );
+        assert!(
+            saved.iter().all(|row| {
+                row.reply_occurrence.as_deref() != Some(originals[0])
+                    && !row.message.content.contains(REBUILD_DROPPED_USER)
+                    && !row.message.content.contains(REBUILD_TOOL_RESULT)
+            }),
+            "{saved:?}"
+        );
+        assert_eq!(
+            backend.get_session_trim_breadcrumb(&key).unwrap(),
+            Some(true)
+        );
+        assert!(saved.iter().any(|row| row.message.role == "assistant" && row.message.content == REBUILD_ANSWER));
+
+        let page = peer
+            .result(
+                super::Method::SessionMessages,
+                json!({"session_id": sid}),
+                21,
+            )
+            .await;
+        let rows = page["messages"].as_array().unwrap();
+        let equal_replies = rows
+            .iter()
+            .filter(|row| row["role"] == "assistant" && row["content"] == REBUILD_LITERAL)
+            .collect::<Vec<_>>();
+        assert_eq!(equal_replies.len(), 1, "{page}");
+        if negotiated {
+            assert_eq!(equal_replies[0]["reply_occurrence"], originals[1], "{page}");
+            assert!(
+                rows.iter()
+                    .all(|row| row["reply_occurrence"] != originals[0]),
+                "{page}"
+            );
+        } else {
+            assert!(
+                rows.iter().all(|row| row.get("reply_occurrence").is_none()),
+                "{page}"
+            );
+        }
+
+        let agent = ctx.sessions.get_agent(sid).await.unwrap();
+        let agent = agent.lock().await;
+        let tools = agent
+            .history()
+            .iter()
+            .filter_map(|row| match row {
+                ConversationMessage::AssistantToolCalls { tool_calls, .. } => Some(tool_calls),
+                _ => None,
+            })
+            .flatten()
+            .map(|call| call.id.as_str())
+            .collect::<Vec<_>>();
+        let results = agent
+            .history()
+            .iter()
+            .filter_map(|row| match row {
+                ConversationMessage::ToolResults(results) => Some(results),
+                _ => None,
+            })
+            .flatten()
+            .map(|result| (result.tool_call_id.as_str(), result.content.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tools,
+            [REBUILD_TOOL_ID],
+            "literal JSON must not rebuild as a tool call"
+        );
+        assert_eq!(results, [(REBUILD_TOOL_ID, REBUILD_TOOL_RESULT)]);
+    }
+
+    pub(crate) async fn assert_ordinary_reply_occurrences(
+        ctx: &Arc<RpcContext>,
+        peer: &mut impl GoalReattachPeer,
+        auth_token: Option<&str>,
+        negotiated: bool,
+        held: &HeldOrdinaryTurn,
+    ) {
+        use super::Method;
+        use serde_json::{Value, json};
+
+        let mut init = json!({
+            "protocol_version": 1,
+            "tui_id": OCCURRENCE_OWNER,
+            "tui_sig": ctx.tui_registry.sign(OCCURRENCE_OWNER),
+            "auth_token": auth_token,
+        });
+        if negotiated {
+            init["clientCapabilities"] = json!({ "replyOccurrence": {} });
+        }
+        let initialized = peer.result(Method::Initialize, init, 1).await;
+        assert_eq!(initialized["tui_id"], OCCURRENCE_OWNER);
+
+        let mut live = Vec::new();
+        let mut history = Vec::new();
+        for turn in 0..2 {
+            let request = 2 + 2 * turn;
+            peer.write_request(
+                Method::SessionPrompt,
+                &json!({"session_id": OCCURRENCE_SID, "prompt": format!("Ordinary turn {turn}")}),
+                request,
+            )
+            .await;
+
+            let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut acknowledged = false;
+                let mut completed = None;
+                let mut final_chunks = Vec::new();
+                while !acknowledged || completed.is_none() {
+                    let frame = peer.read_frame().await;
+                    if frame["id"] == request {
+                        assert!(!acknowledged, "{frame}");
+                        assert_ordinary_prompt_acknowledgement(&frame, OCCURRENCE_SID);
+                        acknowledged = true;
+                        continue;
+                    }
+                    assert_eq!(frame["method"], "session/update", "{frame}");
+                    let params = &frame["params"];
+                    assert_eq!(params["session_id"], OCCURRENCE_SID, "{frame}");
+                    if params["type"] == "agent_message_chunk" && params["text"] == "done" {
+                        assert!(params.get("presentation_only").is_none(), "{frame}");
+                        final_chunks.push(params.get("reply_occurrence").cloned());
+                    } else if !negotiated || params["type"] != "turn_complete" {
+                        assert!(params.get("reply_occurrence").is_none(), "{frame}");
+                    }
+                    if params["type"] == "turn_complete" {
+                        assert!(completed.is_none(), "{frame}");
+                        assert_eq!(params["outcome"], "completed", "{frame}");
+                        assert_eq!(params["content"], "done", "{frame}");
+                        completed = Some(params.get("reply_occurrence").cloned());
+                    }
+                }
+                let completed = completed.unwrap();
+                assert_eq!(
+                    final_chunks.len(),
+                    1,
+                    "expected a definite post-hoc reply chunk"
+                );
+                assert_eq!(
+                    final_chunks[0], completed,
+                    "post-hoc chunk must use the terminal row's occurrence"
+                );
+                if !negotiated {
+                    assert!(
+                        final_chunks[0].is_none(),
+                        "legacy chunk must omit the occurrence"
+                    );
+                }
+                completed
+            })
+            .await
+            .expect("ordinary fake-provider turn must finish");
+            live.push(completed);
+
+            let page = peer
+                .result(
+                    Method::SessionMessages,
+                    json!({"session_id": OCCURRENCE_SID}),
+                    request + 1,
+                )
+                .await;
+            assert_eq!(page["session_id"], OCCURRENCE_SID);
+            let rows = page["messages"].as_array().unwrap();
+            let answers: Vec<_> = rows
+                .iter()
+                .filter(|row| row["role"] == "assistant")
+                .collect();
+            assert_eq!(answers.len(), live.len(), "ordinary transcript: {page}");
+            assert!(answers.iter().all(|row| row["content"] == "done"), "{page}");
+            if !negotiated {
+                assert!(rows.iter().all(|row| row.get("reply_occurrence").is_none()));
+            }
+            history.push(
+                answers
+                    .iter()
+                    .map(|row| row.get("reply_occurrence").cloned())
+                    .collect::<Vec<_>>(),
+            );
+        }
+
+        assert_occurrences_survive_persisted_rebuild(ctx, peer, negotiated).await;
+        ordinary_reply_stream_tests::assert_ordinary_stream_identity(ctx, peer, negotiated).await;
+
+        if negotiated {
+            assert!(
+                live.iter().all(|id| id
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.is_empty())),
+                "negotiated ordinary turn_complete is missing a nonempty reply_occurrence: {live:?}"
+            );
+            assert_ne!(
+                live[0], live[1],
+                "identical replies are distinct occurrences"
+            );
+            assert_eq!(history[0], live[..1], "first saved assistant row");
+            assert_eq!(
+                history[1], live,
+                "both occurrences survive the next ordinary rewrite"
+            );
+
+            let key = format!("rpc_{OCCURRENCE_DELETE_SID}");
+            let backend = ctx.session_backend.as_ref().unwrap();
+            peer.write_request(
+                Method::SessionPrompt,
+                &json!({"session_id": OCCURRENCE_DELETE_SID, "prompt": "Race the durable delete"}),
+                6,
+            )
+            .await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), held.started.notified())
+                .await
+                .expect("ordinary turn must enter its provider before deletion");
+            assert!(backend.delete_session(&key).unwrap());
+            held.release.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut acknowledged = false;
+                let mut completed = false;
+                let mut definite_chunks = 0;
+                while !acknowledged || !completed {
+                    let frame = peer.read_frame().await;
+                    if frame["id"] == 6 {
+                        assert!(!acknowledged, "{frame}");
+                        assert_ordinary_prompt_acknowledgement(&frame, OCCURRENCE_DELETE_SID);
+                        acknowledged = true;
+                        continue;
+                    }
+                    assert_eq!(frame["method"], "session/update", "{frame}");
+                    let params = &frame["params"];
+                    assert_eq!(params["session_id"], OCCURRENCE_DELETE_SID, "{frame}");
+                    if params["type"] == "agent_message_chunk"
+                        && params["text"] == "ordinary answer"
+                    {
+                        definite_chunks += 1;
+                        assert!(
+                            params["reply_occurrence"]
+                                .as_str()
+                                .is_some_and(|id| !id.is_empty()),
+                            "{frame}"
+                        );
+                    } else {
+                        assert!(params.get("reply_occurrence").is_none(), "{frame}");
+                    }
+                    if params["type"] == "turn_complete" {
+                        assert!(!completed, "{frame}");
+                        assert_eq!(params["outcome"], "completed", "{frame}");
+                        assert_eq!(params["content"], "ordinary answer", "{frame}");
+                        completed = true;
+                    }
+                }
+                assert_eq!(
+                    definite_chunks, 1,
+                    "only the definite reply may carry an ID"
+                );
+            })
+            .await
+            .expect("the completed answer must remain visible after durable deletion");
+            assert!(
+                !backend.session_exists(&key),
+                "completion must not recreate history"
+            );
+
+            peer.write_request(
+                Method::SessionPrompt,
+                &json!({"session_id": OCCURRENCE_STEER_SID, "prompt": "First answer"}),
+                7,
+            )
+            .await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), held.started.notified())
+                .await
+                .expect("ordinary turn must reach the first model call before steering");
+            peer.write_request(
+                Method::SessionSteer,
+                &json!({"session_id": OCCURRENCE_STEER_SID, "content": "Give a second answer"}),
+                8,
+            )
+            .await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let frame = peer.read_frame().await;
+                    if frame["id"] == 8 {
+                        assert_eq!(frame["result"]["accepted"], true, "{frame}");
+                        break;
+                    }
+                    assert_eq!(frame["method"], "session/update", "{frame}");
+                    assert_eq!(
+                        frame["params"]["session_id"], OCCURRENCE_STEER_SID,
+                        "{frame}"
+                    );
+                    assert!(frame["params"].get("reply_occurrence").is_none(), "{frame}");
+                    assert_ne!(frame["params"]["type"], "turn_complete", "{frame}");
+                }
+            })
+            .await
+            .expect("steering must be accepted before the first response is released");
+            held.release.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(5), held.started.notified())
+                .await
+                .expect("accepted steering must start a second model call");
+            held.release.notify_one();
+            let steered_chunks = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut acknowledged = false;
+                let mut completed = false;
+                let mut chunks = Vec::new();
+                while !acknowledged || !completed {
+                    let frame = peer.read_frame().await;
+                    if frame["id"] == 7 {
+                        assert!(!acknowledged, "{frame}");
+                        assert_ordinary_prompt_acknowledgement(&frame, OCCURRENCE_STEER_SID);
+                        acknowledged = true;
+                        continue;
+                    }
+                    assert_eq!(frame["method"], "session/update", "{frame}");
+                    let params = &frame["params"];
+                    assert_eq!(params["session_id"], OCCURRENCE_STEER_SID, "{frame}");
+                    if params["type"] == "agent_message_chunk"
+                        && params["text"] == "ordinary answer"
+                    {
+                        let occurrence = params["reply_occurrence"]
+                            .as_str()
+                            .filter(|id| !id.is_empty())
+                            .expect("classified post-hoc reply must carry its own row ID");
+                        chunks.push(occurrence.to_owned());
+                    } else {
+                        assert!(params.get("reply_occurrence").is_none(), "{frame}");
+                    }
+                    if params["type"] == "turn_complete" {
+                        assert!(!completed, "{frame}");
+                        assert_eq!(params["outcome"], "completed", "{frame}");
+                        assert_eq!(
+                            params["content"]
+                                .as_str()
+                                .unwrap()
+                                .matches("ordinary answer")
+                                .count(),
+                            2,
+                            "{frame}"
+                        );
+                        completed = true;
+                    }
+                }
+                chunks
+            })
+            .await
+            .expect("a combined ordinary response must remain visible without an occurrence");
+            let steered_history = peer
+                .result(
+                    Method::SessionMessages,
+                    json!({"session_id": OCCURRENCE_STEER_SID}),
+                    9,
+                )
+                .await;
+            let saved_steered_chunks = steered_history["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|row| row["role"] == "assistant" && row["content"] == "ordinary answer")
+                .map(|row| row["reply_occurrence"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(steered_chunks.len(), 2, "{steered_history}");
+            assert_ne!(steered_chunks[0], steered_chunks[1]);
+            assert_eq!(saved_steered_chunks, steered_chunks);
+
+            let key = format!("rpc_{OCCURRENCE_STEER_SID}");
+            let before_refusal =
+                serde_json::to_value(backend.try_load_transcript_rows(&key).unwrap()).unwrap();
+            let (registered, release_registration) =
+                ctx.sessions.set_test_prompt_registration_pause();
+            peer.write_request(
+                Method::SessionPrompt,
+                &json!({"session_id": OCCURRENCE_STEER_SID, "prompt": "Refuse this stale prompt"}),
+                10,
+            )
+            .await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), registered.notified())
+                .await
+                .expect("the prompt must be admitted before its incarnation is retired");
+            assert!(ctx.sessions.remove(OCCURRENCE_STEER_SID).await);
+            release_registration.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut refused = false;
+                let mut completed = false;
+                while !refused || !completed {
+                    let frame = peer.read_frame().await;
+                    if frame["id"] == 10 {
+                        assert!(!refused && frame["error"].is_object(), "{frame}");
+                        refused = true;
+                    } else {
+                        assert_eq!(frame["method"], "session/update", "{frame}");
+                        let params = &frame["params"];
+                        assert_eq!(params["session_id"], OCCURRENCE_STEER_SID, "{frame}");
+                        assert!(params.get("reply_occurrence").is_none(), "{frame}");
+                        assert_eq!(params["type"], "turn_complete", "{frame}");
+                        assert_eq!(params["outcome"], "failed", "{frame}");
+                        assert_eq!(
+                            params["content"], "turn cancelled by daemon: stale_session_prompt",
+                            "{frame}"
+                        );
+                        assert!(!completed, "{frame}");
+                        completed = true;
+                    }
+                }
+            })
+            .await
+            .expect("the stale admitted prompt must be refused without an occurrence");
+            assert_eq!(
+                serde_json::to_value(backend.try_load_transcript_rows(&key).unwrap()).unwrap(),
+                before_refusal
+            );
+        }
+    }
+
     pub(crate) struct GoalReattachFixture {
         parent: HeldGoalParent,
         burst: NativeBurstFixture,
@@ -18162,14 +18989,6 @@ pub(crate) mod connection_test_support {
     }
 
     impl GoalReattachFixture {
-        pub(crate) async fn new(
-            ctx: &mut Arc<RpcContext>,
-            path: &Path,
-            mode: NativeBurstMode,
-        ) -> Self {
-            Self::with_route(ctx, path, mode, NativeBurstRoute::Primary).await
-        }
-
         pub(crate) async fn with_route(
             ctx: &mut Arc<RpcContext>,
             path: &Path,
@@ -18306,7 +19125,7 @@ pub(crate) mod connection_test_support {
                     let update: SessionGoalUpdate =
                         serde_json::from_value(frame["params"].clone()).unwrap();
                     assert!(
-                        matches!(update, SessionGoalUpdate::VerifiedCandidate { session_id, candidate: text } if session_id == sid && text == candidate)
+                        matches!(update, SessionGoalUpdate::VerifiedCandidate { session_id, candidate: text, .. } if session_id == sid && text == candidate)
                     );
                     break;
                 }
@@ -18547,9 +19366,21 @@ pub(crate) mod connection_test_support {
                     }
                 }
                 Some("session/goal_update") => {
-                    match serde_json::from_value::<SessionGoalUpdate>(frame["params"].clone())
-                        .unwrap()
-                    {
+                    let params = &frame["params"];
+                    if let Some(payload) = params.get("verified_candidate") {
+                        let candidate = payload["candidate"].as_str().expect("candidate text");
+                        // The published ZeroCode decoder rejects any extra variant or member.
+                        assert_eq!(
+                            params,
+                            &serde_json::json!({
+                                "verified_candidate": {
+                                    "session_id": session_id,
+                                    "candidate": candidate,
+                                }
+                            }),
+                        );
+                    }
+                    match serde_json::from_value::<SessionGoalUpdate>(params.clone()).unwrap() {
                         SessionGoalUpdate::VerifiedCandidate { candidate, .. } => {
                             assert!(!fail);
                             assert!(candidate.contains("ordinary answer"));
@@ -18941,6 +19772,7 @@ pub(crate) mod connection_test_support {
                         SessionGoalUpdate::VerifiedCandidate {
                             session_id: actual,
                             candidate,
+                            ..
                         } => {
                             assert_eq!(actual, session_id);
                             assert!(self.announced);
@@ -19224,6 +20056,7 @@ pub(crate) mod connection_test_support {
                         SessionGoalUpdate::VerifiedCandidate {
                             session_id: actual,
                             candidate,
+                            ..
                         } => {
                             assert_eq!(actual, session_id);
                             assert_eq!(candidate, "ordinary answer");
@@ -19263,6 +20096,7 @@ pub(crate) mod connection_test_support {
             "method": "session/goal_update",
             "params": SessionGoalUpdate::VerifiedCandidate {
                 session_id: SID.into(), candidate: "ordinary answer".into(),
+                reply_occurrence: None,
             },
         });
         let budget = serde_json::json!({
@@ -21648,14 +22482,15 @@ mod tests {
     fn replace_rpc_chat_conversation_state_logs_and_does_not_panic_on_durable_failure() {
         // The RPC chat completion path must not crash or hang when the
         // durable replacement fails; it logs and returns so the turn's
-        // completion notification still reaches the client. There is no
-        // return value to assert on directly (the caller's contract is
-        // "best-effort, logged"), so this pins that the call completes
-        // without panicking against a backend that always fails the write.
+        // completion notification still reaches the client. The error is
+        // available to keep durable-reply metadata off that completion.
         let backend = FailingReplaceBackend;
-        let durable = vec![zeroclaw_providers::ChatMessage::user("hi")];
+        let durable = vec![zeroclaw_providers::ChatMessage::user("hi").into()];
 
-        replace_rpc_chat_conversation_state(&backend, "sess-1", "rpc_sess-1", &durable, false);
+        assert!(
+            replace_rpc_chat_conversation_state(&backend, "sess-1", "rpc_sess-1", &durable, false)
+                .is_err()
+        );
     }
 
     #[test]
@@ -21698,16 +22533,21 @@ mod tests {
         let backend = DeletedBackend {
             rewrites: std::sync::Mutex::new(0),
         };
-        let durable = vec![zeroclaw_providers::ChatMessage::user("late turn")];
+        let durable = vec![zeroclaw_providers::ChatMessage::user("late turn").into()];
 
-        replace_rpc_chat_conversation_state(
+        let wrote = replace_rpc_chat_conversation_state(
             &backend,
             "sess-gone",
             "rpc_sess-gone",
             &durable,
             false,
-        );
+        )
+        .unwrap();
 
+        assert!(
+            !wrote,
+            "a successful no-op does not commit a reply occurrence"
+        );
         assert_eq!(
             *backend.rewrites.lock().unwrap(),
             0,
@@ -42325,6 +43165,7 @@ mod tests {
                     let SessionGoalUpdate::VerifiedCandidate {
                         session_id,
                         candidate,
+                        ..
                     } = serde_json::from_value(frame["params"].clone()).unwrap()
                     else {
                         panic!("no lifecycle notice belongs to a direct parent run");
@@ -43279,6 +44120,20 @@ mod tests {
             notification_for_turn_event("s", &TurnEvent::Chunk { delta: "t".into() }).unwrap(),
             golden(ordinary)
         );
+        let reply = TurnEvent::NativeReplyChunk {
+            delta: "t".into(),
+            reply_occurrence: "scope:reply".into(),
+        };
+        assert_eq!(
+            notification_for_turn_event("s", &reply).unwrap(),
+            golden(ordinary)
+        );
+        assert_eq!(
+            notification_for_turn_event_with_occurrence("s", &reply, true).unwrap(),
+            golden(
+                r#"{"type":"agent_message_chunk","session_id":"s","text":"t","reply_occurrence":"scope:reply"}"#
+            ),
+        );
         assert_eq!(
             presentation_notification_for_chunk("s", "t".into()).unwrap(),
             golden(marked)
@@ -43766,7 +44621,7 @@ mod tests {
             *context_token_budget = Some(max_ctx);
             *model_context_window = Some(model_ctx);
         }
-        persist_checkpoint_event_before_notification(None, None, "s1", &event, &rpc)
+        persist_checkpoint_event_before_notification(None, None, "s1", &event, &rpc, false)
             .await
             .unwrap();
         let json = rx.try_recv().expect("usage must reach the RPC writer");
@@ -44737,6 +45592,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initialize_reply_occurrence_is_object_only_and_connection_local() {
+        let (mut opted, _) = make_acp_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let (tx, _rx) = mpsc::channel(8);
+        let mut legacy = RpcDispatcher::new(Arc::clone(&opted.ctx), tx, "legacy-peer".into());
+        let mut init = serde_json::json!({
+            "protocol_version": RPC_PROTOCOL_VERSION,
+            "tui_id": "same-native-pane",
+            "clientCapabilities": { "replyOccurrence": {} },
+        });
+        assert!(!opted.client_reply_occurrence);
+        let response = opted.handle_initialize(&init).await.unwrap();
+        assert!(opted.client_reply_occurrence);
+        assert!(opted.spawn_handle().client_reply_occurrence);
+        assert!(GoalFrameDestination::new(&opted).0.client_reply_occurrence);
+        assert!(response.get("clientCapabilities").is_none());
+        assert!(
+            response["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|name| name != "replyOccurrence")
+        );
+
+        init.as_object_mut().unwrap().remove("clientCapabilities");
+        legacy.handle_initialize(&init).await.unwrap();
+        assert!(!legacy.spawn_handle().client_reply_occurrence);
+        assert!(!GoalFrameDestination::new(&legacy).0.client_reply_occurrence);
+        assert!(opted.client_reply_occurrence);
+
+        for malformed in [
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!(0),
+            serde_json::json!("enabled"),
+            serde_json::json!([]),
+        ] {
+            init["clientCapabilities"] = serde_json::json!({ "replyOccurrence": malformed });
+            opted.handle_initialize(&init).await.unwrap();
+            assert!(!opted.spawn_handle().client_reply_occurrence);
+        }
+    }
+
+    #[tokio::test]
     async fn handle_initialize_caches_elicitation_form_capability() {
         let (mut dispatcher, _sessions) =
             make_acp_test_dispatcher(zeroclaw_config::schema::Config::default());
@@ -45240,12 +46138,14 @@ mod tests {
             let (mut old, sessions, _old_receiver) =
                 make_acp_test_dispatcher_with_receiver(make_acp_test_config(&tmp));
             old.register_tui_for_test(TUI);
+            old.client_reply_occurrence = !successor_is_active;
             new_chat_session_for_eviction_test(&old, SESSION, None).await;
             let generation = sessions.get_generation(SESSION).await.unwrap();
             let (tx, mut receiver) = tokio::sync::mpsc::channel(64);
             let mut successor = RpcDispatcher::new(Arc::clone(&old.ctx), tx, "successor".into());
             successor.set_authenticated_for_test();
             successor.register_tui_for_test(TUI);
+            successor.client_reply_occurrence = successor_is_active;
 
             // Launch from a spawned authorization handle, not from the root.
             let spawned = old.spawn_handle();
@@ -45355,6 +46255,30 @@ mod tests {
                 GoalFrameDelivery::Delivered
             );
             assert_eq!(receiver.try_recv().unwrap(), frame);
+            let candidate = super::super::goal::encode_goal_candidate_frame(
+                SESSION,
+                "fixture answer".into(),
+                Some("fixture-occurrence".into()),
+            )
+            .unwrap();
+            assert_eq!(
+                sessions
+                    .publish_goal_frame(SESSION, &recipient, candidate, GoalFrameClass::Candidate)
+                    .await,
+                GoalFrameDelivery::Delivered
+            );
+            let delivered: Value = serde_json::from_str(&receiver.try_recv().unwrap()).unwrap();
+            let expected = if successor_is_active {
+                json!({
+                    "session_id": SESSION,
+                    "candidate": "fixture answer",
+                    "reply_occurrence": "fixture-occurrence",
+                })
+            } else {
+                json!({"session_id": SESSION, "candidate": "fixture answer"})
+            };
+            assert_eq!(delivered["method"], "session/goal_update");
+            assert_eq!(delivered["params"], json!({"verified_candidate": expected}));
             assert!(sessions.remove(SESSION).await);
             assert!(weak_new_target.upgrade().is_none());
             drop(recipient);
@@ -48667,6 +49591,7 @@ mod tests {
                 session_id,
                 event,
                 &rpc,
+                false,
             )
             .await
             .unwrap();
@@ -48786,6 +49711,7 @@ mod tests {
                 delta: "must-not-emit".into(),
             },
             &rpc,
+            false,
         )
         .await
         .expect_err("a stale turn ID must fail the checkpoint append");
@@ -48845,6 +49771,7 @@ mod tests {
                 sid,
                 &event,
                 &rpc,
+                false,
             )
             .await
             .expect_err("stale identity must reject the write");
@@ -48859,6 +49786,7 @@ mod tests {
                 sid,
                 &event,
                 &rpc,
+                false,
             )
             .await
             .unwrap();
@@ -48881,6 +49809,7 @@ mod tests {
                 delta: "later progress".into(),
             },
             &rpc,
+            false,
         )
         .await
         .unwrap();

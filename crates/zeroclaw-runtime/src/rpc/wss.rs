@@ -3722,6 +3722,7 @@ mod accept_error_tests {
                             crate::rpc::types::SessionGoalUpdate::VerifiedCandidate {
                                 session_id,
                                 candidate,
+                                ..
                             } => {
                                 assert_eq!(session_id, SID);
                                 assert_eq!(candidate, "ordinary answer");
@@ -5548,6 +5549,87 @@ mod tests {
                     frame => panic!("unexpected Goal WSS frame: {frame:?}"),
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_reply_occurrences_survive_rewrite_wss() {
+        use crate::rpc::dispatch::connection_test_support::{
+            assert_ordinary_reply_occurrences, prepare_ordinary_occurrence,
+        };
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        const TOKEN: &str = "ordinary-occurrence-fixture-token";
+        for negotiated in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut config = zeroclaw_config::schema::Config {
+                data_dir: tmp.path().to_owned(),
+                config_path: tmp.path().join("config.toml"),
+                ..Default::default()
+            };
+            config.gateway.paired_tokens = vec![TOKEN.into()];
+            let sessions = Arc::new(SessionStore::new(
+                64,
+                Arc::new(SessionActorQueue::new(4, 30, 60)),
+            ));
+            let mut ctx = RpcContext::minimal(config, sessions);
+            std::fs::write(tmp.path().join(".secret_key"), "42".repeat(32)).unwrap();
+            Arc::get_mut(&mut ctx).unwrap().tui_registry =
+                Arc::new(crate::rpc::tui_identity::TuiRegistry::new(tmp.path()));
+            let store =
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap();
+            let held = prepare_ordinary_occurrence(&mut ctx, tmp.path(), Arc::new(store)).await;
+            let materials = zeroclaw_tls::ensure_server_materials(tmp.path(), &[]).unwrap();
+            let client = zeroclaw_tls::issue_client_cert(
+                &std::fs::read_to_string(&materials.ca_cert_path).unwrap(),
+                &std::fs::read_to_string(&materials.ca_key_path).unwrap(),
+                "ordinary-occurrence-test",
+            )
+            .unwrap();
+            let acceptor = build_tls_acceptor(
+                materials.server_cert_path.to_str().unwrap(),
+                materials.server_key_path.to_str().unwrap(),
+                materials.ca_cert_path.to_str().unwrap(),
+                &[],
+                "",
+            )
+            .unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("wss://{}/", listener.local_addr().unwrap());
+            let cancel = CancellationToken::new();
+            let server_ctx = Arc::clone(&ctx);
+            let server_cancel = cancel.clone();
+            let server = zeroclaw_spawn::spawn!(serve_wss_listener(
+                server_ctx,
+                server_cancel,
+                Arc::new(AtomicUsize::new(0)),
+                acceptor,
+                listener,
+                WssLimits::default(),
+            ));
+            let connector =
+                super::accept_error_tests::test_client_connector(&client.cert_pem, &client.key_pem);
+            let (mut peer, _) = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio_tungstenite::connect_async_tls_with_config(
+                    &url,
+                    None,
+                    false,
+                    Some(connector),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_ordinary_reply_occurrences(&ctx, &mut peer, Some(TOKEN), negotiated, &held)
+                .await;
+            cancel.cancel();
+            drop(peer);
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
         }
     }
 

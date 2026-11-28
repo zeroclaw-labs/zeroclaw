@@ -134,6 +134,7 @@ pub(crate) async fn finish_after_max_iterations(
     // The summary request leaves out older turns' tool rows, as every ordinary
     // request does; it is prepared from that view, before and after each trim.
     tool_context: super::ToolContextRetention<'_>,
+    mut native_replies: Option<&mut super::NativeReplyTrace>,
 ) -> Result<String> {
     let exhaustion = limit.explanation();
     ::zeroclaw_log::record!(
@@ -164,10 +165,16 @@ pub(crate) async fn finish_after_max_iterations(
             .with_attrs(::serde_json::json!({"limit": format!("{limit:?}")})),
         "Iteration allowance exhausted, requesting final summary"
     );
-    let tool_calls_stripped =
-        crate::agent::history_pruner::strip_orphaned_tool_calls_from_assistants(history);
+    let tool_calls_stripped = crate::agent::history_pruner::strip_orphaned_tool_calls_with_replies(
+        history,
+        native_replies.as_deref_mut(),
+    );
     let tool_messages_removed =
-        crate::agent::history_pruner::remove_orphaned_tool_messages(history).removed;
+        crate::agent::history_pruner::remove_orphaned_tool_messages_with_replies(
+            history,
+            native_replies.as_deref_mut(),
+        )
+        .removed;
     if tool_calls_stripped > 0 || tool_messages_removed > 0 {
         ::zeroclaw_log::record!(
             WARN,
@@ -325,6 +332,7 @@ pub(crate) async fn finish_after_max_iterations(
                     crumb_present,
                     tokens,
                     trim_budget,
+                    native_replies.as_deref_mut(),
                 );
                 dropped_messages += trim.dropped_messages;
                 if trim.outcome == super::PreDispatchOutcome::Trimmed {
@@ -618,6 +626,13 @@ pub(crate) async fn finish_after_max_iterations(
     let summary_msg = ChatMessage::assistant(raw_text.clone());
     if let Some(out) = &mut new_messages_out {
         out.push(summary_prompt_mirror);
+        if let Some(trace) = native_replies
+            && !protocol_suppressed
+            && !raw_text.trim().is_empty()
+        {
+            // The display adds its own stop reason; it is not this row alone.
+            let _ = trace.record_reply(history.len(), out.len(), false);
+        }
         out.push(summary_msg.clone());
     }
     history.push(summary_msg);
@@ -797,6 +812,7 @@ mod graceful_summary_metering_tests {
             &crate::observability::NoopObserver,
             None,
             crate::agent::turn::ToolContextRetention::keep_all(),
+            None,
         )
         .await
     }
@@ -948,6 +964,7 @@ mod graceful_summary_metering_tests {
             &crate::observability::NoopObserver,
             None,
             crate::agent::turn::ToolContextRetention::keep_all(),
+            None,
         )
         .await
     }
@@ -1283,6 +1300,7 @@ mod graceful_summary_metering_tests {
             &crate::observability::NoopObserver,
             None,
             crate::agent::turn::ToolContextRetention::keep_all(),
+            None,
         )
         .await
     }
@@ -2481,6 +2499,7 @@ mod graceful_summary_metering_tests {
                     &crate::observability::NoopObserver,
                     None,
                     crate::agent::turn::ToolContextRetention::keep_all(),
+                    None,
                 )
                 .await
                 .unwrap_err()
@@ -2720,6 +2739,7 @@ mod graceful_summary_metering_tests {
                 &crate::observability::NoopObserver,
                 None,
                 crate::agent::turn::ToolContextRetention::keep_all(),
+                None,
             )
             .await;
             assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -2871,6 +2891,7 @@ mod graceful_summary_metering_tests {
                 &crate::observability::NoopObserver,
                 None,
                 crate::agent::turn::ToolContextRetention::keep_all(),
+                None,
             )
             .await
             .expect("graceful summary succeeds");
@@ -2947,6 +2968,7 @@ mod graceful_summary_metering_tests {
                 &crate::observability::NoopObserver,
                 None,
                 crate::agent::turn::ToolContextRetention::keep_all(),
+                None,
             )
             .await
             .expect_err("summary prompt must be included in the floor decision");
@@ -3041,6 +3063,7 @@ mod graceful_summary_metering_tests {
                 keep_prior_turns: 1,
                 known_tools: &known,
             },
+            None,
         );
         TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(Some(ToolLoopCostTrackingContext::usage_only()), summary)
@@ -3154,6 +3177,7 @@ mod graceful_summary_metering_tests {
             &crate::observability::NoopObserver,
             None,
             crate::agent::turn::ToolContextRetention::keep_all(),
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -3239,6 +3263,7 @@ mod graceful_summary_metering_tests {
             &crate::observability::NoopObserver,
             None,
             crate::agent::turn::ToolContextRetention::keep_all(),
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -3339,6 +3364,7 @@ mod graceful_summary_metering_tests {
             &crate::observability::NoopObserver,
             None,
             crate::agent::turn::ToolContextRetention::keep_all(),
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -3422,6 +3448,7 @@ mod graceful_summary_metering_tests {
             &crate::observability::NoopObserver,
             None,
             crate::agent::turn::ToolContextRetention::keep_all(),
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -3515,6 +3542,7 @@ mod graceful_summary_metering_tests {
             &crate::observability::NoopObserver,
             None,
             crate::agent::turn::ToolContextRetention::keep_all(),
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -3571,6 +3599,7 @@ mod graceful_summary_metering_tests {
             &crate::observability::NoopObserver,
             None,
             crate::agent::turn::ToolContextRetention::keep_all(),
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -3659,6 +3688,7 @@ mod graceful_summary_metering_tests {
             &crate::observability::NoopObserver,
             None,
             crate::agent::turn::ToolContextRetention::keep_all(),
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -3750,6 +3780,7 @@ mod graceful_summary_metering_tests {
             &crate::observability::NoopObserver,
             None,
             crate::agent::turn::ToolContextRetention::keep_all(),
+            None,
         )
         .await
         .expect("graceful summary should succeed");

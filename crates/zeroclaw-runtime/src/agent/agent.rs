@@ -13,7 +13,7 @@ use crate::security::ingress::{IngressPolicy, steering_policy};
 use crate::sop::{SopAuditLogger, SopEngine};
 use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
@@ -581,6 +581,11 @@ pub(crate) struct PreparedIsolatedTurn {
     policy: ResolvedTurnRoute,
 }
 
+struct IsolatedPresentation<'a> {
+    decorations: &'a mut Vec<String>,
+    replies: Option<&'a mut super::turn::NativeReplyTrace>,
+}
+
 impl PreparedIsolatedTurn {
     pub(crate) fn new(
         mut agent: tokio::sync::OwnedMutexGuard<Agent>,
@@ -635,13 +640,16 @@ impl PreparedIsolatedTurn {
         source: IsolatedTranscriptSource,
         recall_query: &str,
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
-    ) -> Result<(IsolatedTurnOutcome, Vec<String>)> {
+        admitted_reply: Option<String>,
+    ) -> Result<(IsolatedTurnOutcome, Vec<String>, Option<String>)> {
         let Self {
             mut agent,
             input,
             policy,
         } = self;
         let mut presentation = Vec::new();
+        let mut replies =
+            admitted_reply.map(|id| super::turn::NativeReplyTrace::new(BTreeMap::new(), Some(id)));
         let outcome = agent
             .run_isolated_turn_with_policy(
                 source,
@@ -649,10 +657,17 @@ impl PreparedIsolatedTurn {
                 recall_query,
                 Some(event_tx),
                 &policy,
-                Some(&mut presentation),
+                Some(IsolatedPresentation {
+                    decorations: &mut presentation,
+                    replies: replies.as_mut(),
+                }),
             )
             .await?;
-        Ok((outcome, presentation))
+        Ok((
+            outcome,
+            presentation,
+            replies.and_then(|trace| trace.whole_completion),
+        ))
     }
 }
 
@@ -703,6 +718,9 @@ pub struct Agent {
     auto_save: bool,
     memory_session_id: Option<String>,
     history: Vec<ConversationMessage>,
+    /// Native presentation identity belongs to the exact structured row.
+    /// It is deliberately absent from model messages and tool inputs.
+    native_reply_rows: BTreeMap<usize, String>,
     /// True only when `history` contains the synthetic trim breadcrumb inserted
     /// by this Agent. User text is never inferred to be synthetic by content.
     history_has_trim_breadcrumb: bool,
@@ -835,6 +853,12 @@ pub struct StreamedTurnSuccess {
     /// Display-only accepted safeguard attribution. Callers choose the
     /// transport presentation; `new_messages` remains undecorated.
     pub safeguard_fallback: Option<zeroclaw_providers::SafeguardFallbackNotice>,
+}
+
+pub(crate) struct NativeStreamedTurnSuccess {
+    pub(crate) turn: StreamedTurnSuccess,
+    /// Present only when the complete native presentation represents this row.
+    pub(crate) reply_occurrence: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1554,6 +1578,7 @@ impl AgentBuilder {
             },
             memory_session_id: self.memory_session_id,
             history: Vec::new(),
+            native_reply_rows: BTreeMap::new(),
             history_has_trim_breadcrumb: false,
             history_trim_generation: 0,
             classification_config: self.classification_config.unwrap_or_default(),
@@ -1710,6 +1735,26 @@ impl Agent {
         &self.history
     }
 
+    pub(crate) fn native_transcript_rows(
+        &self,
+    ) -> Vec<zeroclaw_infra::session_backend::SessionTranscriptRow> {
+        self.history
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                let ConversationMessage::Chat(chat) = row else {
+                    return None;
+                };
+                (chat.role != "system").then(|| {
+                    zeroclaw_infra::session_backend::SessionTranscriptRow {
+                        message: chat.clone(),
+                        reply_occurrence: self.native_reply_rows.get(&index).cloned(),
+                    }
+                })
+            })
+            .collect()
+    }
+
     /// Return the owner-maintained structured history for native persistence.
     /// The Agent history is already replayed from the provider buffer with
     /// positional memory provenance applied; callers must not reconstruct it
@@ -1831,6 +1876,7 @@ impl Agent {
             return false;
         }
         self.history.truncate(start);
+        self.native_reply_rows.retain(|index, _| *index < start);
         self.history.extend(replacement);
         true
     }
@@ -2012,7 +2058,7 @@ impl Agent {
         recall_query: &str,
         event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
         policy: &ResolvedTurnRoute,
-        presentation: Option<&mut Vec<String>>,
+        presentation: Option<IsolatedPresentation<'_>>,
     ) -> Result<IsolatedTurnOutcome> {
         zeroclaw_providers::reliable::scope_provider_attempt_allowlist(
             policy.allowed_provider_refs.clone(),
@@ -2035,7 +2081,7 @@ impl Agent {
         recall_query: &str,
         event_tx: Option<tokio::sync::mpsc::Sender<TurnEvent>>,
         policy: &ResolvedTurnRoute,
-        presentation: Option<&mut Vec<String>>,
+        mut presentation: Option<IsolatedPresentation<'_>>,
     ) -> Result<IsolatedTurnOutcome> {
         if self.history.is_empty() {
             self.history
@@ -2149,8 +2195,12 @@ impl Agent {
                     &self.build_system_prompt_with_dispatcher(active_dispatcher.as_ref())?,
                 );
                 let tool_protocol_prompts = self.tool_protocol_prompts()?;
-                let isolated_loop =
-                    crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                let mut replies = presentation.as_mut().and_then(|p| p.replies.as_deref_mut());
+                if let Some(trace) = replies.as_deref_mut() {
+                    trace.begin_round();
+                }
+                let isolated_loop = super::turn::run_tool_call_loop_with_guard(
+                    crate::agent::loop_::ToolLoop {
                         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                             crate::agent::loop_::ResolvedModelAccess {
                                 model_provider: active_provider,
@@ -2238,7 +2288,10 @@ impl Agent {
                                 }
                             })
                         }),
-                    });
+                    },
+                    None,
+                    replies,
+                );
                 // Match ordinary streamed turns: task-local wrappers must not
                 // embed the large loop future on a nested SOP worker's stack.
                 let isolated_loop = Box::pin(isolated_loop);
@@ -2373,7 +2426,7 @@ impl Agent {
 
         if let (Some(presentation), Some((_, mut rx))) = (presentation, projection) {
             while let Ok(TurnEvent::Chunk { delta }) = rx.try_recv() {
-                presentation.push(delta);
+                presentation.decorations.push(delta);
             }
         }
 
@@ -2482,6 +2535,7 @@ impl Agent {
 
     pub fn clear_history(&mut self) {
         self.history.clear();
+        self.native_reply_rows.clear();
         self.history_has_trim_breadcrumb = false;
     }
 
@@ -3099,14 +3153,37 @@ impl Agent {
     /// Hydrate prior chat messages and return a transport event when restoring
     /// the history enforces the structured whole-turn limit.
     pub fn seed_history_with_event(&mut self, messages: &[ChatMessage]) -> Option<TurnEvent> {
+        self.seed_chat_rows(messages.iter().map(|msg| (msg, None)))
+    }
+
+    pub(crate) fn seed_native_transcript_rows_with_event(
+        &mut self,
+        rows: &[zeroclaw_infra::session_backend::SessionTranscriptRow],
+    ) -> Option<TurnEvent> {
+        self.seed_chat_rows(
+            rows.iter()
+                .map(|row| (&row.message, row.reply_occurrence.as_deref())),
+        )
+    }
+
+    fn seed_chat_rows<'a>(
+        &mut self,
+        messages: impl Iterator<Item = (&'a ChatMessage, Option<&'a str>)>,
+    ) -> Option<TurnEvent> {
         if self.history.is_empty()
             && let Ok(sys) = self.build_system_prompt()
         {
             self.history
                 .push(ConversationMessage::Chat(ChatMessage::system(sys)));
         }
-        for msg in messages {
+        for (msg, occurrence) in messages {
             if msg.role != "system" {
+                if msg.role == "assistant"
+                    && let Some(id) = occurrence
+                {
+                    self.native_reply_rows
+                        .insert(self.history.len(), id.to_owned());
+                }
                 self.history.push(ConversationMessage::Chat(msg.clone()));
             }
         }
@@ -4334,10 +4411,11 @@ impl Agent {
             .map_or(self.config.resolved.max_history_messages, |resolve| {
                 resolve()
             });
-        let result = crate::agent::history_trim::trim_conversation_to_recent_turns(
+        let result = crate::agent::history_trim::trim_conversation_with_reply_rows(
             std::mem::take(&mut self.history),
             max_turns,
             self.history_has_trim_breadcrumb,
+            &mut self.native_reply_rows,
         );
         self.history = result.history;
         if !result.trimmed {
@@ -4888,6 +4966,15 @@ impl Agent {
         loop_messages: &[ChatMessage],
         injected: Option<MemoryPreambleTarget<'_>>,
     ) -> Vec<ConversationMessage> {
+        Self::replay_with_native_rows(loop_messages, injected, None).0
+    }
+
+    fn replay_with_native_rows(
+        loop_messages: &[ChatMessage],
+        injected: Option<MemoryPreambleTarget<'_>>,
+        input_ids: Option<&BTreeMap<usize, String>>,
+    ) -> (Vec<ConversationMessage>, BTreeMap<usize, String>) {
+        let mut output_ids = BTreeMap::new();
         // The turn engine injects the recalled-memory preamble onto the last
         // user message (`turn::mod.rs`'s `memory` handling, which records the
         // exact rendered block) for this turn's provider request only; it
@@ -4930,6 +5017,15 @@ impl Agent {
             }
         };
         for (index, msg) in loop_messages.iter().enumerate() {
+            // A recorded final reply can itself be literal tool-shaped JSON.
+            // Its producer already knows the row kind; do not reinterpret it.
+            if msg.role == "assistant"
+                && let Some(id) = input_ids.and_then(|ids| ids.get(&index))
+            {
+                output_ids.insert(replayed.len(), id.clone());
+                replayed.push(ConversationMessage::Chat(msg.clone()));
+                continue;
+            }
             if msg.role == "assistant"
                 && let Ok(serde_json::Value::Object(obj)) =
                     serde_json::from_str::<serde_json::Value>(&msg.content)
@@ -5040,7 +5136,34 @@ impl Agent {
                 replayed.push(ConversationMessage::Chat(msg));
             }
         }
-        replayed
+        (replayed, output_ids)
+    }
+
+    fn native_flat_history(
+        &self,
+        dispatcher: &dyn ToolDispatcher,
+    ) -> (Vec<ChatMessage>, BTreeMap<usize, String>) {
+        if self.native_reply_rows.is_empty() {
+            return (
+                dispatcher.to_provider_messages(&self.history),
+                BTreeMap::new(),
+            );
+        }
+        let mut messages = Vec::new();
+        let mut ids = BTreeMap::new();
+        for (index, source) in self.history.iter().enumerate() {
+            // Both built-in dispatchers project a chat row verbatim. Project
+            // each source at its boundary: tool rows can expand or coalesce.
+            let flat = dispatcher.to_provider_messages(std::slice::from_ref(source));
+            if let Some(id) = self.native_reply_rows.get(&index)
+                && matches!(source, ConversationMessage::Chat(chat) if chat.role == "assistant")
+                && matches!(flat.as_slice(), [row] if row.role == "assistant")
+            {
+                ids.insert(messages.len(), id.clone());
+            }
+            messages.extend(flat);
+        }
+        (messages, ids)
     }
 
     pub(crate) fn replay_loop_messages_for_retention(
@@ -5206,7 +5329,7 @@ impl Agent {
             }
         };
 
-        let provider_messages = active_dispatcher.to_provider_messages(&self.history);
+        let (provider_messages, flat_ids) = self.native_flat_history(active_dispatcher.as_ref());
         let cache_key = self.response_cache_key_for_messages(
             &provider_messages,
             &effective_model,
@@ -5241,6 +5364,8 @@ impl Agent {
             .rposition(|m| m.role == "user")
             .unwrap_or(provider_messages.len());
         let mut loop_history = provider_messages[..split_idx].to_vec();
+        let mut trace =
+            (!flat_ids.is_empty()).then(|| super::turn::NativeReplyTrace::new(flat_ids, None));
         let original_loop_history_len = loop_history.len();
         let original_loop_history_crumb = self.history_has_trim_breadcrumb;
         // Seed raw-transcript crumb provenance from the structured history's
@@ -5376,6 +5501,7 @@ impl Agent {
                         }),
                     },
                     Some(&repetition_guard),
+                    trace.as_mut(),
                 )),
             ),
         );
@@ -5439,7 +5565,8 @@ impl Agent {
         // `sync_pending` and tool appends.
         let new_prefix_len = loop_history.len().saturating_sub(loop_new_messages.len());
         let history_trimmed_in_loop = new_prefix_len != original_loop_history_len
-            || loop_history_crumb_present != original_loop_history_crumb;
+            || loop_history_crumb_present != original_loop_history_crumb
+            || trace.as_ref().is_some_and(|t| t.rebuild_required);
         if history_trimmed_in_loop {
             // The loop's history is already the authoritative full transcript
             // (trimmed prefix + canonical). It already contains the user and
@@ -5459,9 +5586,11 @@ impl Agent {
                         preamble: &target.preamble,
                         index: target.index,
                     });
-            self.history.clear();
-            self.history
-                .extend(Self::replay_loop_messages(&loop_history, injected));
+            (self.history, self.native_reply_rows) = Self::replay_with_native_rows(
+                &loop_history,
+                injected,
+                trace.as_ref().map(|t| &t.raw),
+            );
             self.history_has_trim_breadcrumb = loop_history_crumb_present;
             self.history_trim_generation = self.history_trim_generation.wrapping_add(1);
         } else {
@@ -5592,12 +5721,32 @@ impl Agent {
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         steering_rx: Option<&mut tokio::sync::mpsc::Receiver<crate::agent::SteeringInput>>,
     ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
+        self.turn_streamed_with_native_reply_occurrence(
+            user_message,
+            event_tx,
+            cancel_token,
+            steering_rx,
+            None,
+        )
+        .await
+        .map(|result| result.turn)
+    }
+
+    pub(crate) async fn turn_streamed_with_native_reply_occurrence(
+        &mut self,
+        user_message: &str,
+        event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
+        steering_rx: Option<&mut tokio::sync::mpsc::Receiver<crate::agent::SteeringInput>>,
+        reply_occurrence: Option<String>,
+    ) -> std::result::Result<NativeStreamedTurnSuccess, StreamedTurnError> {
         let mut steering = CloseSteeringOnExit(steering_rx);
         self.turn_streamed_with_steering_body(
             user_message,
             event_tx,
             cancel_token,
             steering.0.as_deref_mut(),
+            reply_occurrence,
         )
         .await
     }
@@ -5611,7 +5760,8 @@ impl Agent {
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         mut steering_rx: Option<&mut tokio::sync::mpsc::Receiver<crate::agent::SteeringInput>>,
-    ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
+        reply_occurrence: Option<String>,
+    ) -> std::result::Result<NativeStreamedTurnSuccess, StreamedTurnError> {
         // See `Agent::turn` for the rationale. Same guard: blank input would
         // push a timestamp-only user message into history and the model would
         // narrate the trailing prompt-template sentinel instead of replying.
@@ -5776,7 +5926,7 @@ impl Agent {
             }
         };
 
-        let provider_messages = active_dispatcher.to_provider_messages(&self.history);
+        let (provider_messages, flat_ids) = self.native_flat_history(active_dispatcher.as_ref());
         let cache_key = self.response_cache_key_for_messages(
             &provider_messages,
             &effective_model,
@@ -5792,22 +5942,29 @@ impl Agent {
                     tokens_saved: 0,
                 });
                 let cached_msg = ConversationMessage::Chat(ChatMessage::assistant(cached.clone()));
+                if let Some(id) = &reply_occurrence {
+                    self.native_reply_rows
+                        .insert(self.history.len(), id.clone());
+                }
                 new_msgs.push(cached_msg.clone());
                 self.history.push(cached_msg);
                 let notice = self.trim_history(Some(&turn_id));
                 forward_history_trim_notice(&event_tx, notice).await;
                 self.observer.record_event(&ObserverEvent::TurnComplete);
                 committed_response.push_str(&cached);
-                return Ok(StreamedTurnSuccess {
-                    response: committed_response,
-                    new_messages: new_msgs,
-                    provider_name: selected_route.provider_name.clone(),
-                    model: selected_route.model.clone(),
-                    // Cache hit: no LLM call was served, so there is no
-                    // per-call route snapshot. The gateway falls back to
-                    // resolving limits from the selected route.
-                    final_context_limits: None,
-                    safeguard_fallback: None,
+                return Ok(NativeStreamedTurnSuccess {
+                    reply_occurrence,
+                    turn: StreamedTurnSuccess {
+                        response: committed_response,
+                        new_messages: new_msgs,
+                        provider_name: selected_route.provider_name.clone(),
+                        model: selected_route.model.clone(),
+                        // Cache hit: no LLM call was served, so there is no
+                        // per-call route snapshot. The gateway falls back to
+                        // resolving limits from the selected route.
+                        final_context_limits: None,
+                        safeguard_fallback: None,
+                    },
                 });
             }
             self.observer.record_event(&ObserverEvent::CacheMiss {
@@ -5824,6 +5981,8 @@ impl Agent {
             .unwrap_or(provider_messages.len());
         let mut loop_history = provider_messages[..split_idx].to_vec();
         let mut streamed_original_loop_history_len = loop_history.len();
+        let mut trace = (!flat_ids.is_empty() || reply_occurrence.is_some())
+            .then(|| super::turn::NativeReplyTrace::new(flat_ids, reply_occurrence));
         let mut streamed_original_crumb = self.history_has_trim_breadcrumb;
         // Seed raw-transcript crumb provenance from the structured history's
         // owner-tracked state (the conversion preserves the crumb position).
@@ -5911,6 +6070,9 @@ impl Agent {
             } else {
                 Vec::new()
             };
+            if let Some(trace) = trace.as_mut() {
+                trace.begin_round();
+            }
 
             // Steering drain: each admitted mid-turn message becomes its own
             // enriched user turn in both transcripts before the next round.
@@ -6056,6 +6218,7 @@ impl Agent {
                         initial_ingress_subject,
                         carried_reported_usage.take(),
                         Some(&repetition_guard),
+                        trace.as_mut(),
                     )),
                 ),
             );
@@ -6131,7 +6294,15 @@ impl Agent {
             // buffer), so no strip target is passed here either: even the
             // round-0 user message it carries for a single tool-free
             // exchange is the clean clone, and must replay byte-for-byte.
-            for replayed in Self::replay_loop_messages(&round_added, None) {
+            let (round_rows, round_ids) = Self::replay_with_native_rows(
+                &round_added,
+                None,
+                trace.as_ref().map(|t| &t.canonical),
+            );
+            let start = self.history.len();
+            self.native_reply_rows
+                .extend(round_ids.into_iter().map(|(i, id)| (start + i, id)));
+            for replayed in round_rows {
                 new_msgs.push(replayed.clone());
                 self.history.push(replayed);
             }
@@ -6143,6 +6314,7 @@ impl Agent {
             let new_prefix_len = loop_history.len().saturating_sub(total_canonical_len);
             if new_prefix_len != streamed_original_loop_history_len
                 || loop_history_crumb_present != streamed_original_crumb
+                || trace.as_ref().is_some_and(|t| t.rebuild_required)
             {
                 // The prefix was trimmed (old turns dropped or crumb inserted).
                 // Rebuild durable history from the authoritative loop_history
@@ -6156,9 +6328,11 @@ impl Agent {
                             preamble: &target.preamble,
                             index: target.index,
                         });
-                self.history.clear();
-                self.history
-                    .extend(Self::replay_loop_messages(&loop_history, injected));
+                (self.history, self.native_reply_rows) = Self::replay_with_native_rows(
+                    &loop_history,
+                    injected,
+                    trace.as_ref().map(|t| &t.raw),
+                );
                 self.history_has_trim_breadcrumb = loop_history_crumb_present;
                 self.history_trim_generation = self.history_trim_generation.wrapping_add(1);
                 streamed_original_loop_history_len = new_prefix_len;
@@ -6249,6 +6423,7 @@ impl Agent {
                     }
 
                     self.observer.record_event(&ObserverEvent::TurnComplete);
+                    let native_payload_len = committed_response.len();
                     let committed_response =
                         self.append_receipts_block(committed_response, receipt_scope.as_ref());
                     let committed_response = Self::append_model_fallback_notice(
@@ -6276,13 +6451,20 @@ impl Agent {
                             None,
                         ),
                     };
-                    return Ok(StreamedTurnSuccess {
-                        response: committed_response,
-                        new_messages: new_msgs,
-                        provider_name: final_provider,
-                        model: final_model,
-                        final_context_limits: final_limits,
-                        safeguard_fallback: turn_safeguard_fallback,
+                    return Ok(NativeStreamedTurnSuccess {
+                        // Both decorators are append-only. Never give a receipt,
+                        // route notice, or a combined steering turn the row ID.
+                        reply_occurrence: trace.and_then(|t| t.whole_completion).filter(|_| {
+                            round == 0 && committed_response.len() == native_payload_len
+                        }),
+                        turn: StreamedTurnSuccess {
+                            response: committed_response,
+                            new_messages: new_msgs,
+                            provider_name: final_provider,
+                            model: final_model,
+                            final_context_limits: final_limits,
+                            safeguard_fallback: turn_safeguard_fallback,
+                        },
                     });
                 }
                 Err(error)
@@ -16157,15 +16339,16 @@ mod tests {
                     prefix: prepared.canonical_prefix().await.unwrap(),
                 };
                 let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-                let (mut outcome, mut presentation) = if collect {
+                let (mut outcome, mut presentation, _) = if collect {
                     prepared
-                        .run_with_presentation(source, "finish", tx)
+                        .run_with_presentation(source, "finish", tx, None)
                         .await
                         .unwrap()
                 } else {
                     (
                         prepared.run(source, "finish", Some(tx)).await.unwrap(),
                         Vec::new(),
+                        None,
                     )
                 };
                 let mut chunks: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
@@ -19350,6 +19533,347 @@ mod tests {
                 _ => panic!("tool exchange {} was split or reordered", index + 1),
             }
         }
+    }
+
+    #[test]
+    fn native_reply_rows_follow_trim_and_replay_without_entering_provider_messages() {
+        use zeroclaw_infra::session_backend::SessionTranscriptRow;
+        let mut agent = trim_history_test_agent(1, Arc::new(CapturingObserver::default()));
+        let literal = r#"{"tool_calls":[{"id":"literal","name":"not_a_call"}]}"#;
+        let answer = |id: &str| SessionTranscriptRow {
+            message: ChatMessage::assistant(literal),
+            reply_occurrence: Some(id.to_owned()),
+        };
+        agent.seed_native_transcript_rows_with_event(&[
+            ChatMessage::user("same question").into(),
+            answer("older-occurrence"),
+            ChatMessage::user("same question").into(),
+            answer("surviving-occurrence"),
+        ]);
+        let durable = agent.native_transcript_rows();
+        let ids = durable
+            .iter()
+            .filter_map(|row| row.reply_occurrence.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["surviving-occurrence"]);
+        for dispatcher in [
+            &NativeToolDispatcher as &dyn ToolDispatcher,
+            &XmlToolDispatcher,
+        ] {
+            let (provider, origins) = agent.native_flat_history(dispatcher);
+            let payload = serde_json::to_value(&provider).unwrap();
+            assert!(
+                payload
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row.get("reply_occurrence").is_none())
+            );
+            let (replayed, recovered) =
+                Agent::replay_with_native_rows(&provider, None, Some(&origins));
+            assert_eq!(recovered, agent.native_reply_rows);
+            assert!(recovered.keys().all(|index| matches!(
+                &replayed[*index], ConversationMessage::Chat(chat) if chat.content == literal
+            )));
+        }
+        agent.clear_history();
+        agent.seed_history(&[ChatMessage::assistant(literal)]);
+        assert!(
+            agent
+                .native_transcript_rows()
+                .iter()
+                .all(|row| row.reply_occurrence.is_none())
+        );
+    }
+
+    const NATIVE_LITERAL_REPLY: &str =
+        r#"{"content":null,"tool_calls":[{"id":"sample","name":"not_a_tool","arguments":"{}"}]}"#;
+
+    fn native_literal_reply_agent(
+        workspace: &std::path::Path,
+        max_iterations: usize,
+        retained_turns: usize,
+        answer: &str,
+    ) -> (Agent, Arc<Mutex<Vec<Vec<ChatMessage>>>>) {
+        use zeroclaw_infra::session_backend::SessionTranscriptRow;
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = TranscriptCaptureModelProvider {
+            alias: "native-literal-reply".into(),
+            responses: Mutex::new(vec![
+                zeroclaw_providers::ChatResponse {
+                    text: None,
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "sample".into(),
+                        name: MockTool.name().into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                zeroclaw_providers::ChatResponse {
+                    text: Some(answer.into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]),
+            seen_messages: Arc::clone(&requests),
+        };
+        let memory_config = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..Default::default()
+        };
+        let mut config = zeroclaw_config::schema::AliasedAgentConfig::default();
+        config.resolved.tool_dispatcher = "native".into();
+        config.resolved.max_tool_iterations = max_iterations;
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(provider))
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![Box::new(MockTool)],
+            ))
+            .memory(Arc::from(
+                zeroclaw_memory::create_memory(&memory_config, workspace, None)
+                    .expect("create disabled fixture memory"),
+            ))
+            .observer(Arc::new(crate::observability::NoopObserver))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(workspace.to_path_buf())
+            .config(config)
+            .structured_max_history_turns(retained_turns)
+            .build()
+            .expect("build native reply fixture");
+        agent.seed_native_transcript_rows_with_event(&[
+            ChatMessage::user("q1").into(),
+            SessionTranscriptRow {
+                message: ChatMessage::assistant(NATIVE_LITERAL_REPLY),
+                reply_occurrence: Some("scope:old".into()),
+            },
+        ]);
+        // Matching bytes are not a genuine invocation and must not keep this result.
+        agent
+            .history
+            .push(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "sample".into(),
+                content: "stale fixture result".into(),
+                tool_name: MockTool.name().to_owned(),
+            }]));
+        (agent, requests)
+    }
+
+    fn assert_native_literal_reply_tags(agent: &Agent, expected: &[(&str, &str)]) {
+        let actual: Vec<_> = agent
+            .native_reply_rows
+            .iter()
+            .map(|(&index, id)| match &agent.history[index] {
+                ConversationMessage::Chat(row) if row.role == "assistant" => {
+                    (id.as_str(), row.content.as_str())
+                }
+                _ => panic!("occurrence {id} is not attached to an assistant Chat row"),
+            })
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    fn assert_native_literal_provider_requests(requests: &[Vec<ChatMessage>]) {
+        let [initial, follow_up] = requests else {
+            panic!("expected one tool step and one follow-up request");
+        };
+        for request in [initial, follow_up] {
+            assert_eq!(
+                request
+                    .iter()
+                    .filter(|row| row.role == "assistant" && row.content == NATIVE_LITERAL_REPLY)
+                    .count(),
+                1
+            );
+            assert!(request.iter().all(|row| {
+                !["stale fixture result", "scope:old", "scope:new"]
+                    .iter()
+                    .any(|&needle| row.content.contains(needle))
+            }));
+        }
+        assert!(initial.iter().all(|row| row.role != "tool"));
+        assert!(follow_up.iter().any(|row| {
+            row.role == "assistant"
+                && serde_json::from_str::<serde_json::Value>(&row.content)
+                    .is_ok_and(|value| value["tool_calls"][0]["name"] == MockTool.name())
+        }));
+        let tool_rows: Vec<_> = follow_up.iter().filter(|row| row.role == "tool").collect();
+        let [tool] = tool_rows.as_slice() else {
+            panic!("expected only the genuine tool result");
+        };
+        let tool: serde_json::Value =
+            serde_json::from_str(&tool.content).expect("native tool result envelope");
+        assert_eq!(tool["tool_call_id"], "sample");
+        assert_eq!(tool["content"], "tool-out");
+    }
+
+    #[tokio::test]
+    async fn native_literal_reply_survives_streamed_rebuild_trim_and_reread() {
+        let workspace = tempfile::tempdir().expect("isolated fixture workspace");
+        let (mut agent, requests) =
+            native_literal_reply_agent(workspace.path(), 3, 2, NATIVE_LITERAL_REPLY);
+        let before = agent.history_trim_generation();
+        let (tx, _rx) = tokio::sync::mpsc::channel(128);
+        let NativeStreamedTurnSuccess {
+            turn,
+            reply_occurrence,
+        } = agent
+            .turn_streamed_with_native_reply_occurrence(
+                "q2",
+                tx,
+                None,
+                None,
+                Some("scope:new".into()),
+            )
+            .await
+            .expect("native tool round and literal final reply");
+        assert_eq!(turn.response, NATIVE_LITERAL_REPLY);
+        assert_eq!(reply_occurrence.as_deref(), Some("scope:new"));
+        assert_native_literal_provider_requests(&requests.lock());
+        assert_ne!(
+            agent.history_trim_generation(),
+            before,
+            "must rebuild after pruning"
+        );
+        assert!(
+            !agent.history_has_trim_breadcrumb(),
+            "both turns still fit the cap"
+        );
+        assert!(agent.history.windows(2).any(|rows| matches!(
+            rows,
+            [ConversationMessage::AssistantToolCalls { tool_calls, .. }, ConversationMessage::ToolResults(results)]
+                if tool_calls.len() == 1 && tool_calls[0].id == "sample"
+                    && results.len() == 1 && results[0].tool_call_id == "sample"
+                    && results[0].content.contains("tool-out")
+        )));
+        assert_native_literal_reply_tags(
+            &agent,
+            &[
+                ("scope:old", NATIVE_LITERAL_REPLY),
+                ("scope:new", NATIVE_LITERAL_REPLY),
+            ],
+        );
+
+        for dispatcher in [
+            &NativeToolDispatcher as &dyn ToolDispatcher,
+            &XmlToolDispatcher,
+        ] {
+            let (projected, _) = agent.native_flat_history(dispatcher);
+            let plain = dispatcher.to_provider_messages(agent.history());
+            assert_eq!(
+                projected
+                    .iter()
+                    .map(|row| (&row.role, &row.content))
+                    .collect::<Vec<_>>(),
+                plain
+                    .iter()
+                    .map(|row| (&row.role, &row.content))
+                    .collect::<Vec<_>>(),
+                "adding reply provenance must not change any provider input row",
+            );
+        }
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(128);
+        let third = agent
+            .turn_streamed_with_native_reply_occurrence(
+                "q3",
+                tx,
+                None,
+                None,
+                Some("scope:third".into()),
+            )
+            .await
+            .expect("third turn");
+        assert_eq!(third.reply_occurrence.as_deref(), Some("scope:third"));
+        assert!(agent.history_has_trim_breadcrumb());
+        assert!(matches!(
+            agent.history().get(1),
+            Some(ConversationMessage::Chat(row))
+                if row.role == "user"
+                    && row.content == crate::i18n::get_required_cli_string("history-trim-breadcrumb")
+        ));
+        assert!(!agent.history().iter().any(|row| matches!(
+            row, ConversationMessage::Chat(chat) if chat.role == "user" && chat.content == "q1"
+        )));
+        let expected = [("scope:new", NATIVE_LITERAL_REPLY), ("scope:third", "done")];
+        assert_native_literal_reply_tags(&agent, &expected);
+
+        let stored = agent.native_transcript_rows();
+        let restored_tags: Vec<_> = stored
+            .iter()
+            .filter_map(|row| {
+                Some((
+                    row.reply_occurrence.as_deref()?,
+                    row.message.content.as_str(),
+                ))
+            })
+            .collect();
+        assert_eq!(restored_tags, expected);
+        let mut restored = trim_history_test_agent(8, Arc::new(crate::observability::NoopObserver));
+        restored.seed_native_transcript_rows_with_event(&stored);
+        assert_native_literal_reply_tags(&restored, &expected);
+        let (messages, origins) = restored.native_flat_history(&NativeToolDispatcher);
+        assert_eq!(origins.len(), 2);
+        assert!(
+            origins
+                .iter()
+                .all(|(row, id)| expected.contains(&(id.as_str(), messages[*row].content.as_str())))
+        );
+
+        restored.clear_history();
+        let plain: Vec<_> = stored.into_iter().map(|row| row.message).collect();
+        restored.seed_history(&plain);
+        assert!(restored.native_reply_rows.is_empty());
+        let (messages, origins) = restored.native_flat_history(&NativeToolDispatcher);
+        assert!(origins.is_empty());
+        assert!(Agent::replay_loop_messages(&messages, None).iter().any(|row| matches!(
+            row, ConversationMessage::AssistantToolCalls { tool_calls, .. }
+                if tool_calls.iter().any(|call| call.id == "sample" && call.name == "not_a_tool")
+        )));
+    }
+
+    #[tokio::test]
+    async fn native_literal_reply_survives_actual_max_iterations_summary() {
+        let workspace = tempfile::tempdir().expect("isolated fixture workspace");
+        let summary = "The genuine tool completed.";
+        // q1, q2, and the summary's synthetic user prompt are three turn boundaries.
+        let (mut agent, requests) = native_literal_reply_agent(workspace.path(), 1, 3, summary);
+        let (tx, _rx) = tokio::sync::mpsc::channel(128);
+        let NativeStreamedTurnSuccess {
+            turn,
+            reply_occurrence,
+        } = agent
+            .turn_streamed_with_native_reply_occurrence(
+                "q2",
+                tx,
+                None,
+                None,
+                Some("scope:new".into()),
+            )
+            .await
+            .expect("iteration-cap summary");
+        assert!(turn.response.starts_with(summary));
+        assert!(
+            reply_occurrence.is_none(),
+            "the terminal also contains the stop reason"
+        );
+        let requests = requests.lock();
+        assert_native_literal_provider_requests(&requests);
+        assert!(matches!(
+            requests[1].last(),
+            Some(row) if row.role == "user" && row.content.contains("Summarize what you accomplished")
+        ));
+        assert!(!agent.history_has_trim_breadcrumb());
+        assert!(agent.history().iter().any(|row| matches!(
+            row, ConversationMessage::Chat(chat) if chat.role == "user" && chat.content == "q1"
+        )));
+        assert_native_literal_reply_tags(
+            &agent,
+            &[("scope:old", NATIVE_LITERAL_REPLY), ("scope:new", summary)],
+        );
     }
 
     #[test]

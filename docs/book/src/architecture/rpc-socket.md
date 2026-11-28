@@ -199,6 +199,24 @@ owns the session can resume it while its Goal runs; the resume is checked
 against the same current credentials, policy, ownership, environment and
 channel rules, and approvals move to it between turns.
 
+During initialization a native client can send
+`"clientCapabilities": {"replyOccurrence": {}}`. This opts in only that
+connection. Without the capability, the daemon omits `reply_occurrence`
+from notifications and history. An older daemon can ignore the capability;
+no echo or protocol-version change is required.
+
+The optional `reply_occurrence` identifies one ordinary or Goal assistant
+reply, not its text. Two identical answers can have different IDs. When
+ZeroCode reloads history after missing updates, it keeps events received
+during the reload in order. It skips replaying reply text only when that ID
+is already on an assistant row it actually displayed for the same session.
+Live text can carry an ID before the reply is saved. A discarded attempt
+or narration before a tool call does not share the saved answer's ID.
+Thoughts, tools, display-only notices and terminal bookkeeping still run.
+When replaying held events, ZeroCode shows text without a matching ID
+even if it could be a duplicate. An ID is not a grant, a verifier verdict,
+or proof of persistence. This does not replay events the client never received.
+
 An older ZeroCode client may show only the streamed tail of the final response
 until it reloads history. With an older daemon that does not deliver the live
 remainder, the current client still displays the response as it did before.

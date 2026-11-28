@@ -1,5 +1,6 @@
 use super::{
-    GoalReattachFixture, GoalReattachPeer, NativeBurstMode, QUESTION, REATTACH_OWNER, REATTACH_SID,
+    GoalReattachFixture, GoalReattachPeer, NativeBurstMode, NativeBurstRoute, QUESTION,
+    REATTACH_OWNER, REATTACH_SID,
 };
 use crate::rpc::context::RpcContext;
 use crate::rpc::dispatch::{Method, RpcDispatcher};
@@ -556,6 +557,7 @@ struct Peer {
     dispatcher: RpcDispatcher,
     writer: mpsc::Sender<String>,
     frames: mpsc::Receiver<String>,
+    live_reply_chunks: Vec<(String, Option<String>)>,
 }
 
 impl GoalReattachPeer for Peer {
@@ -569,7 +571,19 @@ impl GoalReattachPeer for Peer {
     }
 
     async fn read_frame(&mut self) -> Value {
-        serde_json::from_str(&self.frames.recv().await.expect("peer writer open")).unwrap()
+        let frame: Value =
+            serde_json::from_str(&self.frames.recv().await.expect("peer writer open")).unwrap();
+        let params = &frame["params"];
+        if frame["method"] == "session/update"
+            && params["type"] == "agent_message_chunk"
+            && params["presentation_only"] != true
+        {
+            self.live_reply_chunks.push((
+                params["text"].as_str().unwrap().to_owned(),
+                params["reply_occurrence"].as_str().map(str::to_owned),
+            ));
+        }
+        frame
     }
 }
 
@@ -579,6 +593,14 @@ fn request(method: Method, params: &Value, id: u64) -> String {
 
 impl Peer {
     async fn connect(ctx: &Arc<RpcContext>, tui_id: &str) -> Self {
+        Self::connect_with_occurrence(ctx, tui_id, false).await
+    }
+
+    async fn connect_with_occurrence(
+        ctx: &Arc<RpcContext>,
+        tui_id: &str,
+        reply_occurrence: bool,
+    ) -> Self {
         let uid = PeercredAuthProvider::current_process_uid();
         // The native burst emits 72 thoughts even before the final round starts.
         let (writer, frames) = mpsc::channel(128);
@@ -589,8 +611,25 @@ impl Peer {
             dispatcher,
             writer,
             frames,
+            live_reply_chunks: Vec::new(),
         };
-        peer.initialize(ctx, tui_id, None).await;
+        if reply_occurrence {
+            let initialized = peer
+                .result(
+                    Method::Initialize,
+                    json!({
+                        "protocol_version": 1,
+                        "tui_id": tui_id,
+                        "tui_sig": ctx.tui_registry.sign(tui_id),
+                        "clientCapabilities": { "replyOccurrence": {} },
+                    }),
+                    1,
+                )
+                .await;
+            assert_eq!(initialized["tui_id"], tui_id);
+        } else {
+            peer.initialize(ctx, tui_id, None).await;
+        }
         peer
     }
 
@@ -698,7 +737,7 @@ fn assert_candidate(frame: &Value, expected: &str) {
     assert_eq!(frame["method"], "session/goal_update", "{frame}");
     assert!(
         matches!(serde_json::from_value::<SessionGoalUpdate>(frame["params"].clone()).unwrap(),
-        SessionGoalUpdate::VerifiedCandidate { session_id, candidate } if session_id == REATTACH_SID && candidate == expected),
+        SessionGoalUpdate::VerifiedCandidate { session_id, candidate, .. } if session_id == REATTACH_SID && candidate == expected),
         "{frame}"
     );
 }
@@ -738,6 +777,15 @@ struct HistoryCase {
 
 impl HistoryCase {
     async fn new(mode: NativeBurstMode) -> Self {
+        Self::with_occurrences(mode, NativeBurstRoute::Primary, false, false).await
+    }
+
+    async fn with_occurrences(
+        mode: NativeBurstMode,
+        route: NativeBurstRoute,
+        first: bool,
+        second: bool,
+    ) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let config = zeroclaw_config::schema::Config {
             data_dir: directory.path().to_owned(),
@@ -751,7 +799,7 @@ impl HistoryCase {
                 Arc::new(SessionActorQueue::new(4, 30, 60)),
             )),
         );
-        let goal = GoalReattachFixture::new(&mut ctx, directory.path(), mode).await;
+        let goal = GoalReattachFixture::with_route(&mut ctx, directory.path(), mode, route).await;
         // Here the held parent must be the *only* source of its question: the
         // stream fixture normally seeds the same text from an older turn.
         let key = format!("rpc_{REATTACH_SID}");
@@ -766,9 +814,9 @@ impl HistoryCase {
             agent.clear_history();
             agent.seed_history(&seed);
         }
-        let mut a = Peer::connect(&ctx, REATTACH_OWNER).await;
+        let mut a = Peer::connect_with_occurrence(&ctx, REATTACH_OWNER, first).await;
         goal.start(&mut a).await;
-        let b = Peer::connect(&ctx, "goal-history-reader").await;
+        let b = Peer::connect_with_occurrence(&ctx, "goal-history-reader", second).await;
         Self {
             ctx,
             goal,
@@ -902,6 +950,102 @@ async fn goal_history_waits_for_published_candidate_to_be_saved() {
     case.b.notice(true).await;
     case.a.result(Method::Status, json!({}), 7).await;
     case.finish(QUESTION).await;
+}
+
+#[tokio::test]
+async fn goal_parent_occurrence_follows_negotiated_delivery_and_saved_row() {
+    for first_opted_in in [true, false] {
+        let mut case = HistoryCase::with_occurrences(
+            NativeBurstMode::SplitFinal,
+            NativeBurstRoute::StreamingFallback,
+            first_opted_in,
+            !first_opted_in,
+        )
+        .await;
+        let (saving, save) = case.ctx.sessions.set_test_effect_pause(BEFORE_SAVE);
+        case.goal.parent.turn.release.notify_one();
+        let mut tails = Vec::new();
+        let occurrence = loop {
+            let frame = case.a.next_frame().await;
+            if frame["method"] == "session/goal_update" {
+                assert_candidate(&frame, QUESTION);
+                let payload = &frame["params"]["verified_candidate"];
+                if !first_opted_in {
+                    assert!(payload.get("reply_occurrence").is_none(), "{frame}");
+                }
+                break payload["reply_occurrence"].as_str().map(str::to_owned);
+            }
+            assert_parent_stream(&frame);
+            let params = &frame["params"];
+            if params["presentation_only"] == true {
+                tails.push(params.get("reply_occurrence").cloned());
+            }
+        };
+        assert_eq!(occurrence.is_some(), first_opted_in);
+        assert!(!tails.is_empty(), "fixture must emit a marked display tail");
+        let expected_tail = occurrence.as_ref().map(|id| json!(id));
+        assert!(tails.iter().all(|tail| tail == &expected_tail));
+        let chunks = &case.a.live_reply_chunks;
+        let before_tool = chunks
+            .iter()
+            .find(|(s, _)| s == "draft before child\n")
+            .expect("pre-tool narration was delivered");
+        if first_opted_in {
+            assert!(before_tool.1.is_some());
+            assert_ne!(before_tool.1, occurrence);
+        } else {
+            assert!(before_tool.1.is_none());
+        }
+        for fragment in ["Which option ", "should I use?"] {
+            let (_, id) = chunks
+                .iter()
+                .find(|(s, _)| s == fragment)
+                .expect("both real streamed question fragments were delivered");
+            assert_eq!(id.as_deref(), occurrence.as_deref());
+        }
+
+        arrived(&saving, BEFORE_SAVE).await;
+        let backend = case.ctx.session_backend.as_ref().unwrap();
+        let key = format!("rpc_{REATTACH_SID}");
+        let before = backend.try_load_transcript_rows(&key).unwrap();
+        assert_eq!(before.len(), 1);
+        assert!(before[0].reply_occurrence.is_none());
+        save.notify_one();
+        case.verifier_started().await;
+        let after = backend.try_load_transcript_rows(&key).unwrap();
+        assert_eq!(after.len(), 2);
+        let row = &after[1];
+        assert_eq!(row.message.content, QUESTION);
+        let saved = row
+            .reply_occurrence
+            .as_deref()
+            .expect("durable candidate identity");
+        if first_opted_in {
+            assert_eq!(occurrence.as_deref(), Some(saved));
+        }
+
+        for (peer, opted_in) in [
+            (&mut case.a, first_opted_in),
+            (&mut case.b, !first_opted_in),
+        ] {
+            let read = peer.start_history_with(json!({"session_id": REATTACH_SID, "limit": 1}));
+            let response = peer.next_frame().await;
+            assert_eq!(response["id"], HISTORY_ID, "{response}");
+            let page = response["result"]["messages"].as_array().unwrap();
+            assert_eq!(page.len(), 1);
+            assert_eq!(page[0]["content"], QUESTION);
+            if opted_in {
+                assert_eq!(page[0]["reply_occurrence"], saved);
+            } else {
+                assert!(page[0].get("reply_occurrence").is_none(), "{response}");
+            }
+            join_history(read).await;
+        }
+
+        case.goal.verifier.turn.release.notify_one();
+        case.a.notice(true).await;
+        case.finish(QUESTION).await;
+    }
 }
 
 #[tokio::test]
