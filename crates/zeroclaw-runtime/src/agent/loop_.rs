@@ -19405,8 +19405,16 @@ Let me check the result."#;
         );
     }
 
-    #[tokio::test]
-    async fn budget_rejection_emits_no_waiting_on_model_lifecycle() {
+    /// Run one turn whose cost scope is already past a $0.001 daily limit,
+    /// with `[cost.enforcement] mode` set to `mode`, or left at its default
+    /// when `None`. Returns the turn's result and the lifecycle events it
+    /// streamed.
+    async fn run_turn_past_the_daily_limit(
+        mode: Option<&str>,
+    ) -> (
+        anyhow::Result<String>,
+        Vec<zeroclaw_api::channel::ProgressEvent>,
+    ) {
         use super::{
             TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoop, ToolLoopCostTrackingContext,
             run_tool_call_loop,
@@ -19415,18 +19423,20 @@ Let me check the result."#;
         use crate::cost::CostTracker;
         use crate::observability::noop::NoopObserver;
         use std::collections::HashMap;
-        use zeroclaw_api::channel::ProgressEvent;
 
         let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider =
-            ScriptedModelProvider::from_text_responses(vec!["should not reach this"]);
+            ScriptedModelProvider::from_text_responses(vec!["the provider answered"]);
         let observer = NoopObserver;
         let workspace = tempfile::TempDir::new().unwrap();
-        let cost_config = zeroclaw_config::schema::CostConfig {
+        let mut cost_config = zeroclaw_config::schema::CostConfig {
             enabled: true,
             daily_limit_usd: 0.001, // very low limit
             ..zeroclaw_config::schema::CostConfig::default()
         };
+        if let Some(mode) = mode {
+            cost_config.enforcement.mode = mode.to_string();
+        }
         let tracker = Arc::new(CostTracker::new(cost_config.clone(), workspace.path()).unwrap());
         // Record a usage that already exceeds the limit
         tracker
@@ -19448,9 +19458,9 @@ Let me check the result."#;
         pricing.insert("mock-provider".to_string(), model_pricing);
         let ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(pricing));
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
-        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(16);
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(64);
 
-        let err = TOOL_LOOP_COST_TRACKING_CONTEXT
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
                 Some(ctx),
                 run_tool_call_loop(ToolLoop {
@@ -19513,22 +19523,45 @@ Let me check the result."#;
                     turn_id: &turn_id,
                 }),
             )
-            .await
-            .expect_err("should fail with budget exceeded");
+            .await;
 
-        assert!(
-            err.to_string().contains("Budget exceeded"),
-            "error should mention budget: {err}"
-        );
         let mut lifecycle = Vec::new();
         while let Ok(delta) = delta_rx.try_recv() {
             if let StreamDelta::Lifecycle(event) = delta {
                 lifecycle.push(event);
             }
         }
+        (result, lifecycle)
+    }
+
+    #[tokio::test]
+    async fn budget_rejection_emits_no_waiting_on_model_lifecycle() {
+        use zeroclaw_api::channel::ProgressEvent;
+
+        let (result, lifecycle) = run_turn_past_the_daily_limit(None).await;
+        let err = result.expect_err("should fail with budget exceeded");
+        assert!(
+            err.to_string().contains("Budget exceeded"),
+            "error should mention budget: {err}"
+        );
         assert!(
             !lifecycle.contains(&ProgressEvent::WaitingOnModel),
             "a budget-rejected turn never calls the provider, so it must not announce a model wait: {lifecycle:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn warn_mode_turn_past_the_daily_limit_still_reaches_the_provider() {
+        use zeroclaw_api::channel::ProgressEvent;
+
+        let (result, lifecycle) = run_turn_past_the_daily_limit(Some("warn")).await;
+        assert_eq!(
+            result.expect("warn must let the turn run"),
+            "the provider answered"
+        );
+        assert!(
+            lifecycle.contains(&ProgressEvent::WaitingOnModel),
+            "the turn called the provider: {lifecycle:?}"
         );
     }
 

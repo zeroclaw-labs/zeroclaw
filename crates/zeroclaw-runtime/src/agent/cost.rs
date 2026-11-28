@@ -636,6 +636,29 @@ fn warn_once_missing_pricing(model_provider: &str, model: &str, missing_dimensio
     }
 }
 
+/// The tracker of the scoped cost context, when one is scoped.
+fn scoped_budget_tracker() -> Option<Arc<CostTracker>> {
+    TOOL_LOOP_COST_TRACKING_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .and_then(|ctx| ctx.tracker)
+}
+
+/// `[cost.enforcement] mode` from the scoped tracker's live config, the
+/// same config its limits come from, so a reload applies at the next
+/// check. `None` when no cost tracking context is scoped.
+pub fn tool_loop_enforcement_mode() -> Option<String> {
+    scoped_budget_tracker().map(|tracker| tracker.config().enforcement.mode)
+}
+
+/// The scoped tracker's per-hop and per-agent ceilings on their own (see
+/// [`CostTracker::check_ceilings`]). `None` when no cost tracking context
+/// is scoped.
+pub fn check_tool_loop_ceilings() -> Option<anyhow::Result<BudgetCheck>> {
+    scoped_budget_tracker().map(|tracker| tracker.check_ceilings())
+}
+
 /// Check budget before an LLM call. Returns `None` when no cost tracking
 /// context is scoped (tests, delegate, CLI without cost config).
 pub fn check_tool_loop_budget() -> Option<BudgetCheck> {

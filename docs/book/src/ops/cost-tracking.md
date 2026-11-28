@@ -181,16 +181,18 @@ The fix is to wait for new requests; there's no retroactive repricing.
 
 ## Budget enforcement
 
-`CostConfig::enforcement.mode` decides what happens when a projected
-cost would push `daily_total` or `monthly_total` past the configured
-limit:
+`[cost.enforcement] mode` decides what happens once the spend already
+recorded for the UTC day or month is past `daily_limit_usd` or
+`monthly_limit_usd`. The check runs before each model call and does not
+estimate the call's own cost, so the call that takes the total past a
+limit still runs:
 
-- `warn`: the default; record the event with a warn-level log and
-  let the request through.
-- `block`: refuse the request with a `BudgetExceeded` error.
-- `route_down`: substitute `route_down_model` (a cheaper
-  alternative) for the original model. The substitution happens before
-  the request is dispatched.
+- `block`: the default; refuse the request with a `BudgetExceeded` error.
+- `warn`: record the event with a warn-level log and let the request
+  through.
+- `route_down`: meant to substitute `route_down_model` (a cheaper
+  alternative), but no model substitution exists yet. It refuses the
+  request as `block` does and logs that it fell back to `block`.
 
 `allow_override = true` lets a request bypass `block` by passing an
 override token on the CLI (`zeroclaw --override`). Defaults to
@@ -202,6 +204,17 @@ Budget comparisons use recorded `cost_usd`, so they cannot account for the
 assurance while the current month contains unpriced tokens. Configure the
 missing rate dimensions and generate a new request before relying on cap
 enforcement; existing ledger rows are never retroactively repriced.
+
+The mode applies to the shared `daily_limit_usd` and `monthly_limit_usd`
+limits. It is read together with the limits at each check, so it follows the
+same reload rules. A delegated agent's per-hop ceiling
+(`max_cost_per_day_cents` on its runtime profile) refuses that agent's own
+model calls in every mode. It does not cover a sub-agent the delegated agent
+starts with `spawn_subagent`: that sub-agent runs on the process-wide tracker,
+so today only the shared limits check its calls. Under `warn`, each model call
+past a shared limit logs a warn-level `cost limit exceeded` event and nothing
+stops the spend. Any value other than `warn`, `block` or `route_down` is
+enforced as `block`.
 
 ## Per-agent attribution
 

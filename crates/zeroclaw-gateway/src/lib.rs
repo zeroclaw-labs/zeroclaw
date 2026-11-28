@@ -11181,6 +11181,13 @@ data: [DONE]\n\n";
         assert!(stats.cost_usd > 0.0);
     }
 
+    /// Set `[cost.enforcement] mode` on the tracker the gateway turn reads.
+    fn set_cost_enforcement_mode(tracker: &CostTracker, mode: &str) {
+        let mut cost = tracker.config();
+        cost.enforcement.mode = mode.to_string();
+        tracker.update_config(cost);
+    }
+
     #[tokio::test]
     async fn webhook_sse_production_budget_exhaustion_skips_provider_request() {
         let fixture = spawn_chat_completion_fixture(PRODUCTION_FIXTURE_STREAM).await;
@@ -11220,6 +11227,41 @@ data: [DONE]\n\n";
             !text.contains("event: done"),
             "budget rejection must not emit done: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_production_warn_mode_past_the_budget_reaches_provider() {
+        let fixture = spawn_chat_completion_fixture(PRODUCTION_FIXTURE_STREAM).await;
+        let tmp = tempfile::tempdir().expect("production gateway temp dir");
+        let (state, tracker) = production_sse_state(&tmp, &fixture.base_url(), 0.01, false);
+        set_cost_enforcement_mode(&tracker, "warn");
+        tracker
+            .record_usage_with_agent(
+                zeroclaw_config::cost::types::TokenUsage::new(
+                    "fixture-model",
+                    1_000_000,
+                    0,
+                    0,
+                    2.0,
+                    4.0,
+                    0.0,
+                ),
+                Some("web"),
+            )
+            .expect("seed exhausted budget record");
+
+        let text = collect_production_sse(&state, "warned stream", "production-warn").await;
+
+        assert_eq!(
+            fixture.requests.load(Ordering::SeqCst),
+            1,
+            "warn mode must let the turn reach the provider: {text}"
+        );
+        assert!(
+            !text.contains("Budget exceeded"),
+            "warn mode must not refuse: {text}"
+        );
+        assert!(text.contains("event: done"), "the turn must finish: {text}");
     }
 
     #[tokio::test]
