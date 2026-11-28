@@ -142,7 +142,7 @@ impl VoiceWakeChannel {
         transcription_config: TranscriptionConfig,
     ) -> Self {
         let transcription_manager_factory =
-            Arc::new(move || TranscriptionManager::new(&transcription_config));
+            Arc::new(move || TranscriptionManager::new(&transcription_config, None));
         Self {
             config,
             alias: alias.into(),
@@ -916,6 +916,7 @@ mod tests {
             TranscriptionManager::from_config_with_provider(
                 &runtime_config,
                 "local_whisper.office".to_string(),
+                None,
             )
         });
 

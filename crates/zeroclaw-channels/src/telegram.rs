@@ -2386,6 +2386,14 @@ pub(crate) enum VoiceDropReason {
     FileUnavailable,
     /// Transcription succeeded but produced nothing usable — silence, noise.
     EmptyTranscript,
+    /// The resolved transcription provider name is not registered — a
+    /// startup typo or a selected default that failed to register. No
+    /// attempt can succeed, so the drop is permanent and announced.
+    ProviderUnavailable,
+    /// Neither the agent nor `[transcription].default_provider` names a
+    /// provider, so there is nothing to transcribe with. The drop is
+    /// permanent and announced like every other.
+    NoProviderConfigured,
 }
 
 impl VoiceDropReason {
@@ -2413,6 +2421,12 @@ impl VoiceDropReason {
             }
             Self::EmptyTranscript => {
                 i18n::get_required_cli_string("channel-telegram-voice-drop-empty-transcript")
+            }
+            Self::ProviderUnavailable => {
+                i18n::get_required_cli_string("channel-telegram-voice-drop-provider-unavailable")
+            }
+            Self::NoProviderConfigured => {
+                i18n::get_required_cli_string("channel-telegram-voice-drop-no-provider")
             }
         }
     }
@@ -6800,7 +6814,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
     /// Attempt to parse a Telegram update as a voice message and transcribe it.
     /// Returns `SkipPermanent` if the message is not a voice message, transcription is
-    /// disabled, or the message exceeds duration limits; `RetryTransient` if download or
+    /// disabled, the message exceeds duration limits, or no transcription provider is
+    /// resolvable for the owning agent (neither `transcription_provider` nor a
+    /// `[transcription].default_provider` fallback); `RetryTransient` if download or
     /// transcription I/O fails.
     ///
     /// Every permanent drop that reaches an allowed sender is announced to them
@@ -6936,9 +6952,65 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         };
 
-        let text = match manager.transcribe(&audio_data, &file_name).await {
+        // Resolve the provider the same way `TranscriptionManager::transcribe`
+        // does — the agent's own `transcription_provider`, else the configured
+        // `[transcription].default_provider` — but skip permanently instead of
+        // retrying when nothing is resolvable.
+        let provider_alias = manager.resolved_agent_alias();
+        if provider_alias.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "chat_id": chat_id,
+                    })),
+                "Skipping voice message: agent has no transcription_provider and no transcription default_provider is set"
+            );
+            // A permanent drop that reached an allowed sender is announced,
+            // like every other in this function.
+            self.notify_voice_drop(
+                &chat_id,
+                thread_id.as_deref(),
+                VoiceDropReason::NoProviderConfigured,
+            )
+            .await;
+            return UpdateDisposition::SkipPermanent;
+        }
+
+        let text = match manager
+            .transcribe_with_provider(&audio_data, &file_name, provider_alias)
+            .await
+        {
             Ok(t) => t,
             Err(e) => {
+                if e.downcast_ref::<super::transcription::ProviderNotConfigured>()
+                    .is_some()
+                {
+                    // The resolved provider name is not registered — a
+                    // startup typo or a selected default that failed to
+                    // register. Retrying the same name cannot succeed and
+                    // would hold the Telegram offset forever, stalling every
+                    // later update; announce the permanent drop like every
+                    // other one that reaches an allowed sender.
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "provider": provider_alias,
+                                "chat_id": chat_id,
+                            })),
+                        "Voice transcription provider not configured; dropping permanently"
+                    );
+                    self.notify_voice_drop(
+                        &chat_id,
+                        thread_id.as_deref(),
+                        VoiceDropReason::ProviderUnavailable,
+                    )
+                    .await;
+                    return UpdateDisposition::SkipPermanent;
+                }
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -22081,6 +22153,8 @@ mod tests {
             too_long,
             unavailable,
             VoiceDropReason::EmptyTranscript.notice(),
+            VoiceDropReason::ProviderUnavailable.notice(),
+            VoiceDropReason::NoProviderConfigured.notice(),
         ] {
             assert!(
                 !notice.contains("microphone") && !notice.contains("voice"),
@@ -22128,6 +22202,74 @@ mod tests {
         let parsed = ch.try_parse_voice_message(&update).await;
         assert!(matches!(parsed, UpdateDisposition::SkipPermanent));
         assert!(ch.voice_transcriptions.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn try_parse_voice_message_unavailable_provider_skips_permanently_and_notifies() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "voice/file.ogg" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/voice/file\.ogg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 64]))
+            .mount(&mock_server)
+            .await;
+        // The permanent drop must reach the allowed sender: exactly one
+        // notice, best-effort but attempted.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 7 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+        // A selected default that failed to register: the manager resolves to
+        // the missing name, and no retry of that name can succeed — the
+        // update must skip permanently (releasing the Telegram offset) and
+        // announce the drop, not stall the batch as a transient.
+        let manager = crate::transcription::TranscriptionManager::empty()
+            .with_default_provider(Some("deepgram.missing".to_string()));
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_transcription_manager(tc, Some(std::sync::Arc::new(manager)));
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 5,
+                "voice": { "file_id": "voice_file", "duration": 4 },
+                "from": { "id": 123, "username": "alice" },
+                "chat": { "id": 456, "type": "private" }
+            }
+        });
+
+        let parsed = ch.try_parse_voice_message(&update).await;
+        assert!(
+            matches!(parsed, UpdateDisposition::SkipPermanent),
+            "a provider name that is not registered must drop permanently"
+        );
     }
 
     /// The voice path must carry the immutable Telegram user ID into
@@ -24190,7 +24332,7 @@ mod tests {
             api_key: Some(api_key),
             ..Default::default()
         };
-        let manager = crate::transcription::TranscriptionManager::new(&config)
+        let manager = crate::transcription::TranscriptionManager::new(&config, None)
             .expect("TranscriptionManager::new should succeed with valid GROQ_API_KEY");
         let transcript: String = manager
             .transcribe(&audio_data, "hello.mp3")
