@@ -741,6 +741,17 @@ async fn save_and_publish_config_detached(
     revision: zeroclaw_config::live::ConfigRevision,
     mut snapshot: zeroclaw_config::schema::Config,
 ) -> Result<(), JsonRpcError> {
+    // Generic RPC config writes must not bypass the operator credential
+    // API, its explicit grants or mutation audit. Compare canonical maps
+    // under the admitted writer guard, covering batches and map mutations.
+    if snapshot.http_request.scoped_credentials
+        != commit.current_config().http_request.scoped_credentials
+    {
+        return Err(rpc_err(
+            FORBIDDEN,
+            crate::i18n::get_required_cli_string("rpc-scoped-credentials-managed"),
+        ));
+    }
     Box::pin(snapshot.save_dirty())
         .await
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config save failed: {e}")))?;
@@ -3082,6 +3093,17 @@ impl RpcDispatcher {
         snapshot: zeroclaw_config::schema::Config,
         effects: RpcConfigCommitEffects,
     ) -> Result<zeroclaw_config::live::ConfigRevision, JsonRpcError> {
+        // Generic RPC config writes must not bypass the operator credential
+        // API, its explicit grants or mutation audit. Compare canonical maps
+        // under the admitted writer guard, covering batches and map mutations.
+        if snapshot.http_request.scoped_credentials
+            != commit.current_config().http_request.scoped_credentials
+        {
+            return Err(rpc_err(
+                FORBIDDEN,
+                crate::i18n::get_required_cli_string("rpc-scoped-credentials-managed"),
+            ));
+        }
         snapshot.validate_auth().map_err(|e| {
             rpc_err(
                 INVALID_PARAMS,
@@ -47461,6 +47483,32 @@ mod tests {
             on_disk.contains("blocked-value"),
             "config/set must persist once unblocked; on-disk file:\n{on_disk}"
         );
+    }
+
+    #[test]
+    fn rpc_config_cannot_bypass_managed_credentials_with_single_or_batch_writes() {
+        run_on_a_large_stack(|| async move {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let config_path = tmp.path().join("config.toml");
+            let ctx = enforcement_ctx(config_write_roster_config(&tmp, 4242, &["http_request.*"]));
+            let (writer, _rx) = roster_peer(&ctx, 4242).await;
+            let before = std::fs::read(&config_path).unwrap_or_default();
+            let record = json!({"origin":"https://api.example.test","http_allowed":true,
+                "auth":{"kind":"api_key","value":"synthetic-api-secret","header":"bearer"}})
+            .to_string();
+            let entry = json!({"prop":"http_request.scoped_credentials.TEST","value":record});
+            let single = writer.handle_config_set(&entry).await.unwrap_err();
+            assert_eq!(single.code, FORBIDDEN);
+            let batch = writer
+                .handle_config_set_many(&json!({"sets":[
+                    {"prop":"http_request.timeout_secs","value":45}, entry
+                ]}))
+                .await
+                .unwrap_err();
+            assert_eq!(batch.code, FORBIDDEN);
+            assert!(ctx.config.read().http_request.scoped_credentials.is_empty());
+            assert_eq!(std::fs::read(&config_path).unwrap_or_default(), before);
+        });
     }
 
     // ── Config authority is rechecked after write-lock admission ─────
