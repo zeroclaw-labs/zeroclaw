@@ -3599,6 +3599,32 @@ fn strip_wrapping_quotes(token: &str) -> &str {
     token.trim_matches(|c| c == '"' || c == '\'')
 }
 
+/// One `allowed_commands` entry, parsed.
+///
+/// Entries reach the policy in whatever spelling the operator typed. Editors
+/// that render list values as JSON invite `"*"` or `'git'`, and hand-written
+/// TOML adds stray whitespace. Every consumer of the allowlist goes through
+/// [`parse_allowlist_entry`] and matches on this type instead of trimming,
+/// unquoting and comparing to `"*"` itself, so no two checks can disagree on
+/// what an entry means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AllowlistEntry<'a> {
+    /// `*`: any command name or path.
+    Wildcard,
+    /// A command name or path, unquoted and trimmed.
+    Command(&'a str),
+}
+
+/// Parse an `allowed_commands` entry. Surrounding whitespace and one layer of
+/// wrapping quotes are removed, in either order. Blank entries yield `None`.
+fn parse_allowlist_entry(raw: &str) -> Option<AllowlistEntry<'_>> {
+    match strip_wrapping_quotes(raw.trim()).trim() {
+        "" => None,
+        "*" => Some(AllowlistEntry::Wildcard),
+        command => Some(AllowlistEntry::Command(command)),
+    }
+}
+
 fn looks_like_path(candidate: &str) -> bool {
     candidate.starts_with('/')
         || candidate.starts_with("./")
@@ -3817,36 +3843,31 @@ fn command_names_equivalent_for_shell(left: &str, right: &str, dialect: ShellDia
 }
 
 fn command_allowlist_entries_equivalent(left: &str, right: &str) -> bool {
-    let left = strip_wrapping_quotes(left).trim();
-    let right = strip_wrapping_quotes(right).trim();
-    if left.is_empty() || right.is_empty() {
-        return false;
+    match (parse_allowlist_entry(left), parse_allowlist_entry(right)) {
+        (Some(AllowlistEntry::Wildcard), Some(AllowlistEntry::Wildcard)) => true,
+        (Some(AllowlistEntry::Command(left)), Some(AllowlistEntry::Command(right))) => {
+            // Preserve exact equality for paths. Case-folding a path would
+            // widen the policy on case-sensitive filesystems.
+            if looks_like_path(left) || looks_like_path(right) {
+                return left == right;
+            }
+            command_names_equivalent(left, right)
+        }
+        _ => false,
     }
-
-    // Preserve exact equality for paths. Case-folding a path would widen the
-    // policy on case-sensitive filesystems.
-    if looks_like_path(left) || looks_like_path(right) {
-        return left == right;
-    }
-
-    command_names_equivalent(left, right)
 }
 
 fn is_allowlist_entry_match(
-    allowed: &str,
+    entry: AllowlistEntry<'_>,
     executable: &str,
     executable_base: &str,
     dialect: ShellDialect,
 ) -> bool {
-    let allowed = strip_wrapping_quotes(allowed).trim();
-    if allowed.is_empty() {
-        return false;
-    }
-
-    // Explicit wildcard support for "allow any command name/path".
-    if allowed == "*" {
-        return true;
-    }
+    let allowed = match entry {
+        // Explicit wildcard support for "allow any command name/path".
+        AllowlistEntry::Wildcard => return true,
+        AllowlistEntry::Command(allowed) => allowed,
+    };
 
     // Path-like allowlist entries must match the executable token exactly
     // after "~" expansion.
@@ -4119,15 +4140,14 @@ fn powershell_variables_are_simple(command: &str) -> bool {
 }
 
 fn is_powershell_allowlist_entry_match(
-    allowed: &str,
+    entry: AllowlistEntry<'_>,
     executable: &str,
     executable_base: &str,
 ) -> bool {
-    if allowed.trim() == "*" {
-        return true;
-    }
-
-    let allowed = strip_wrapping_quotes(allowed).trim();
+    let allowed = match entry {
+        AllowlistEntry::Wildcard => return true,
+        AllowlistEntry::Command(allowed) => allowed,
+    };
     if looks_like_path_for_shell(allowed, ShellDialect::PowerShell) {
         // An explicit path is the trust anchor, so it must match with the host
         // filesystem's case semantics: case-insensitive on Windows, exact on
@@ -4686,6 +4706,30 @@ impl SecurityPolicy {
         Ok(risk)
     }
 
+    /// `allowed_commands`, each entry parsed by [`parse_allowlist_entry`].
+    /// Blank entries are skipped.
+    fn allowlist_entries(&self) -> impl Iterator<Item = AllowlistEntry<'_>> {
+        self.allowed_commands
+            .iter()
+            .filter_map(|raw| parse_allowlist_entry(raw))
+    }
+
+    fn allowlist_has_wildcard(&self) -> bool {
+        self.allowlist_entries()
+            .any(|entry| entry == AllowlistEntry::Wildcard)
+    }
+
+    /// The named commands and paths in `allowed_commands`, without the
+    /// wildcard. Exemptions that require an operator to have listed a command
+    /// explicitly (high-risk under `block_high_risk_commands`, explicit-path
+    /// confinement) consult only these.
+    fn explicit_allowlist_commands(&self) -> impl Iterator<Item = &str> {
+        self.allowlist_entries().filter_map(|entry| match entry {
+            AllowlistEntry::Command(command) => Some(command),
+            AllowlistEntry::Wildcard => None,
+        })
+    }
+
     fn is_command_explicitly_allowed_for_shell(&self, command: &str, shell: ShellGrammar) -> bool {
         let dialect = shell.dialect;
         match dialect {
@@ -4702,13 +4746,12 @@ impl SecurityPolicy {
                     let base = strip_powershell_executable_suffix(&base_owned);
                     !base.is_empty()
                         && !is_powershell_batch_file(&base_owned)
-                        && self.allowed_commands.iter().any(|allowed| {
-                            allowed.trim() != "*"
-                                && is_powershell_allowlist_entry_match(
-                                    allowed,
-                                    raw_executable,
-                                    base,
-                                )
+                        && self.explicit_allowlist_commands().any(|allowed| {
+                            is_powershell_allowlist_entry_match(
+                                AllowlistEntry::Command(allowed),
+                                raw_executable,
+                                base,
+                            )
                         })
                 })
             }
@@ -4740,13 +4783,14 @@ impl SecurityPolicy {
                 continue;
             }
 
-            let explicitly_listed = self.allowed_commands.iter().any(|allowed| {
-                let allowed = strip_wrapping_quotes(allowed).trim();
-                // Skip wildcard — it does not count as an explicit entry.
-                if allowed.is_empty() || allowed == "*" {
-                    return false;
-                }
-                is_allowlist_entry_match(allowed, executable, base_cmd, dialect)
+            // The wildcard does not count as an explicit entry.
+            let explicitly_listed = self.explicit_allowlist_commands().any(|allowed| {
+                is_allowlist_entry_match(
+                    AllowlistEntry::Command(allowed),
+                    executable,
+                    base_cmd,
+                    dialect,
+                )
             });
 
             if !explicitly_listed {
@@ -4797,7 +4841,7 @@ impl SecurityPolicy {
             return false;
         }
 
-        let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
+        let has_wildcard = self.allowlist_has_wildcard();
         // Preserve the existing trusted-environment escape hatch shared with
         // POSIX/cmd policy: wildcard plus disabled high-risk blocking opts out
         // of command-level syntax restrictions. In every other configuration,
@@ -4828,9 +4872,8 @@ impl SecurityPolicy {
             }
             let base = strip_powershell_executable_suffix(&base_owned);
             if !self
-                .allowed_commands
-                .iter()
-                .any(|allowed| is_powershell_allowlist_entry_match(allowed, raw_executable, base))
+                .allowlist_entries()
+                .any(|entry| is_powershell_allowlist_entry_match(entry, raw_executable, base))
             {
                 return false;
             }
@@ -4864,7 +4907,7 @@ impl SecurityPolicy {
         // restrictions (wildcard + no high-risk blocking), skip the
         // subshell/expansion guard entirely. This allows backticks,
         // $(), heredocs, etc. in trusted environments.
-        let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
+        let has_wildcard = self.allowlist_has_wildcard();
         if has_wildcard && !self.block_high_risk_commands {
             // The opt-out skips syntax restrictions, but not a heredoc whose
             // body boundary cannot be proven. The path and risk checks refuse
@@ -4946,9 +4989,8 @@ impl SecurityPolicy {
             }
 
             if !self
-                .allowed_commands
-                .iter()
-                .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd, dialect))
+                .allowlist_entries()
+                .any(|entry| is_allowlist_entry_match(entry, executable, base_cmd, dialect))
             {
                 return false;
             }
@@ -5177,10 +5219,8 @@ impl SecurityPolicy {
         };
         let executable_has_explicit_path_allowlist = |raw: &str| {
             let executable = strip_wrapping_quotes(raw).trim();
-            self.allowed_commands.iter().any(|allowed| {
-                let allowed = strip_wrapping_quotes(allowed).trim();
-                allowed != "*"
-                    && looks_like_path_for_shell(allowed, dialect)
+            self.explicit_allowlist_commands().any(|allowed| {
+                looks_like_path_for_shell(allowed, dialect)
                     && shell_path_tokens_equal(allowed, executable, dialect)
             })
         };
@@ -6242,13 +6282,16 @@ impl SecurityPolicy {
             let _ = writeln!(out, "**Additional allowed paths**: {}", roots.join(", "));
         }
 
-        // Allowed commands
-        if !self.allowed_commands.is_empty() {
-            let cmds: Vec<String> = self
-                .allowed_commands
-                .iter()
-                .map(|c| format!("`{c}`"))
-                .collect();
+        // Allowed commands, in their parsed form so the model is told `*`
+        // rather than whatever quoting the operator's editor saved.
+        let cmds: Vec<String> = self
+            .allowlist_entries()
+            .map(|entry| match entry {
+                AllowlistEntry::Wildcard => "`*`".to_string(),
+                AllowlistEntry::Command(command) => format!("`{command}`"),
+            })
+            .collect();
+        if !cmds.is_empty() {
             let _ = writeln!(
                 out,
                 "**Allowed shell commands**: {}. \
@@ -6887,6 +6930,56 @@ mod tests {
     }
 
     #[test]
+    fn quoted_wildcard_entry_is_the_wildcard() {
+        // Config editors that show list values as JSON invite operators to
+        // type the entry quoted, so `"*"` / `'*'` reach the policy verbatim.
+        // The per-command matcher already treated those as the wildcard; the
+        // syntax opt-out must agree, or `$VAR`, `$(...)` and redirects are
+        // refused under an allowlist that admits every command name.
+        let syntax = [
+            "echo $HOME",
+            "echo $(date)",
+            "ls > out.txt",
+            "echo `date`",
+            "(git status)",
+        ];
+        for entry in ["*", "\"*\"", "'*'", " \"*\" "] {
+            let p = SecurityPolicy {
+                allowed_commands: vec![entry.into()],
+                block_high_risk_commands: false,
+                ..SecurityPolicy::default()
+            };
+            for cmd in syntax {
+                assert!(
+                    p.is_command_allowed(cmd),
+                    "entry {entry:?} must be the wildcard for {cmd:?}"
+                );
+                assert!(
+                    p.is_command_allowed_for_shell(cmd, ShellDialect::PowerShell),
+                    "entry {entry:?} must be the wildcard for PowerShell {cmd:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_wildcard_entry_keeps_high_risk_gate() {
+        // Normalizing the quotes must not widen anything beyond what `*`
+        // already grants: with high-risk blocking on, the opt-out stays off.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["\"*\"".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("cargo build"));
+        assert!(!p.is_command_allowed("echo $(date)"));
+        assert!(
+            p.validate_command_execution("rm -rf /tmp/test", true)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn empty_command_blocked() {
         let p = default_policy();
         assert!(!p.is_command_allowed(""));
@@ -7110,21 +7203,81 @@ mod tests {
 
     #[test]
     fn validate_command_blocks_powershell_native_command_via_wildcard() {
+        // Every spelling of the wildcard must stay out of the explicit-entry
+        // exemption, or a quoted `"*"` would lift the high-risk block that a
+        // bare `*` respects.
+        for entry in ["*", "\"*\"", "'*'", " \"*\" "] {
+            let p = SecurityPolicy {
+                autonomy: AutonomyLevel::Full,
+                allowed_commands: vec![entry.into()],
+                block_high_risk_commands: true,
+                ..SecurityPolicy::default()
+            };
+
+            let error = p
+                .validate_command_execution_for_shell(
+                    "Remove-Item important.txt",
+                    true,
+                    ShellDialect::PowerShell,
+                )
+                .expect_err("PowerShell-native high-risk commands must be blocked");
+            assert!(error.contains("high-risk"), "entry {entry:?}: {error}");
+
+            let error = p
+                .validate_command_execution_for_shell("rm -rf /tmp/test", true, ShellDialect::Posix)
+                .expect_err("POSIX high-risk commands must be blocked");
+            assert!(error.contains("high-risk"), "entry {entry:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn prompt_summary_lists_parsed_allowlist_entries() {
         let p = SecurityPolicy {
-            autonomy: AutonomyLevel::Full,
-            allowed_commands: vec!["*".into()],
-            block_high_risk_commands: true,
+            allowed_commands: vec!["\"*\"".into(), " 'git' ".into(), "  ".into()],
             ..SecurityPolicy::default()
         };
+        let summary = p.prompt_summary();
+        assert!(
+            summary.contains("**Allowed shell commands**: `*`, `git`."),
+            "{summary}"
+        );
+    }
 
-        let error = p
-            .validate_command_execution_for_shell(
-                "Remove-Item important.txt",
-                true,
-                ShellDialect::PowerShell,
-            )
-            .expect_err("PowerShell-native high-risk commands must be blocked");
-        assert!(error.contains("high-risk"));
+    #[test]
+    fn allowlist_entry_parses_once_for_every_spelling() {
+        // One parser: surrounding whitespace and one layer of quotes, in
+        // either order, reduce to the same entry.
+        for raw in ["*", " * ", "\"*\"", "'*'", " \"*\" ", "\" * \""] {
+            assert_eq!(
+                parse_allowlist_entry(raw),
+                Some(AllowlistEntry::Wildcard),
+                "{raw:?}"
+            );
+        }
+        for raw in ["git", " git ", "\"git\"", " 'git' "] {
+            assert_eq!(
+                parse_allowlist_entry(raw),
+                Some(AllowlistEntry::Command("git")),
+                "{raw:?}"
+            );
+        }
+        for raw in ["", "   ", "\"\"", " '' "] {
+            assert_eq!(parse_allowlist_entry(raw), None, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn subagent_quoted_wildcard_matches_parent_wildcard() {
+        // Containment compares parsed entries, so spelling differences
+        // between a parent and child profile do not read as escalation.
+        for (parent, child) in [("*", "\"*\""), ("\"*\"", "*"), (" 'git' ", "git")] {
+            assert!(
+                command_allowlist_entries_equivalent(parent, child),
+                "parent {parent:?} child {child:?}"
+            );
+        }
+        assert!(!command_allowlist_entries_equivalent("*", "git"));
+        assert!(!command_allowlist_entries_equivalent("git", "*"));
     }
 
     #[test]
@@ -9310,14 +9463,16 @@ mod tests {
     #[test]
     fn powershell_allowlist_accepts_case_insensitive_exe_suffix() {
         assert!(is_powershell_allowlist_entry_match(
-            "git.EXE", "git.exe", "git"
+            AllowlistEntry::Command("git.EXE"),
+            "git.exe",
+            "git"
         ));
     }
 
     #[test]
     fn powershell_allowlist_accepts_windows_relative_path_spelling() {
         assert!(is_powershell_allowlist_entry_match(
-            r".\tools\git.exe",
+            AllowlistEntry::Command(r".\tools\git.exe"),
             "./tools/git.exe",
             "git"
         ));
@@ -9363,11 +9518,19 @@ mod tests {
         // same case rule: the differently cased executable is not exempted by
         // the trusted entry, so it is subject to path confinement.
         assert!(
-            !is_powershell_allowlist_entry_match("/tmp/Safe/tool", "/tmp/safe/tool", "tool"),
+            !is_powershell_allowlist_entry_match(
+                AllowlistEntry::Command("/tmp/Safe/tool"),
+                "/tmp/safe/tool",
+                "tool"
+            ),
             "path allowlist match must be case-sensitive on Unix"
         );
         assert!(
-            is_powershell_allowlist_entry_match("/tmp/Safe/tool", "/tmp/Safe/tool", "tool"),
+            is_powershell_allowlist_entry_match(
+                AllowlistEntry::Command("/tmp/Safe/tool"),
+                "/tmp/Safe/tool",
+                "tool"
+            ),
             "exact-case path allowlist match must still succeed"
         );
     }
