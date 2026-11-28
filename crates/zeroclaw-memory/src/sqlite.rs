@@ -714,43 +714,39 @@ impl SqliteMemory {
         Ok(Some(embedding))
     }
 
+    /// Match is_user_autosave_key before any SQL limit. GLOB's underscore
+    /// is literal (unlike LIKE); no schema marker or archive-wide refill is needed.
+    fn prompt_key_filter(prefix: &str) -> String {
+        Self::prompt_key_expression_filter(&format!("{prefix}key"))
+    }
+
+    fn prompt_key_expression_filter(expression: &str) -> String {
+        // Rust str::trim uses Unicode White_Space; SQLite trim defaults to ASCII space.
+        let key = format!(
+            "lower(trim({expression}, char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288)))"
+        );
+        format!(" AND {key} != 'user_msg' AND {key} NOT GLOB 'user_msg_*'")
+    }
+
     /// FTS5 BM25 keyword search
     pub fn fts5_search(
         conn: &Connection,
         query: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<(String, f32)>> {
-        Self::fts5_search_scoped(conn, query, limit, None, None)
+        Self::fts5_search_scoped(conn, query, limit, None, None, false)
     }
 
     /// FTS5 BM25 search constrained to the rows a live vector-stage recall
     /// may return for a session. Applying this predicate inside FTS keeps
     /// excluded rows out of BM25 ranking, limiting, and normalization.
-    fn fts5_search_for_session(
-        conn: &Connection,
-        query: &str,
-        limit: usize,
-        session_id: Option<&str>,
-    ) -> anyhow::Result<Vec<(String, f32)>> {
-        Self::fts5_search_scoped(conn, query, limit, session_id, None)
-    }
-
-    fn fts5_search_for_session_and_agents(
-        conn: &Connection,
-        query: &str,
-        limit: usize,
-        session_id: Option<&str>,
-        allowed_agent_ids: &[String],
-    ) -> anyhow::Result<Vec<(String, f32)>> {
-        Self::fts5_search_scoped(conn, query, limit, session_id, Some(allowed_agent_ids))
-    }
-
     fn fts5_search_scoped(
         conn: &Connection,
         query: &str,
         limit: usize,
         session_id: Option<&str>,
         allowed_agent_ids: Option<&[String]>,
+        prompt_only: bool,
     ) -> anyhow::Result<Vec<(String, f32)>> {
         // Escape FTS5 special chars and build query
         let fts_query: String = query
@@ -803,6 +799,9 @@ impl SqliteMemory {
             param_idx += allowed_agent_ids.len();
         }
 
+        if prompt_only {
+            sql.push_str(&Self::prompt_key_filter("m."));
+        }
         let _ = write!(sql, " ORDER BY score LIMIT ?{param_idx}");
         #[allow(clippy::cast_possible_wrap)]
         let limit_i64 = limit as i64;
@@ -890,24 +889,14 @@ impl SqliteMemory {
         category: Option<&str>,
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<(String, f32)>> {
-        Self::vector_search_scoped(conn, query_embedding, limit, category, session_id, None)
-    }
-
-    fn vector_search_for_agents(
-        conn: &Connection,
-        query_embedding: &[f32],
-        limit: usize,
-        category: Option<&str>,
-        session_id: Option<&str>,
-        allowed_agent_ids: &[String],
-    ) -> anyhow::Result<Vec<(String, f32)>> {
         Self::vector_search_scoped(
             conn,
             query_embedding,
             limit,
             category,
             session_id,
-            Some(allowed_agent_ids),
+            None,
+            false,
         )
     }
 
@@ -918,8 +907,12 @@ impl SqliteMemory {
         category: Option<&str>,
         session_id: Option<&str>,
         allowed_agent_ids: Option<&[String]>,
+        prompt_only: bool,
     ) -> anyhow::Result<Vec<(String, f32)>> {
         let mut sql = "SELECT id, embedding FROM memories WHERE embedding IS NOT NULL".to_string();
+        if prompt_only {
+            sql.push_str(&Self::prompt_key_filter(""));
+        }
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let mut idx = 1;
 
@@ -989,6 +982,8 @@ impl SqliteMemory {
         session_id: Option<&str>,
         since: Option<&str>,
         until: Option<&str>,
+        prompt_only: bool,
+        allowed_agent_ids: Vec<String>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         let conn = self.conn.clone();
         let sid = session_id.map(String::from);
@@ -1005,6 +1000,7 @@ impl SqliteMemory {
                  FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
                  WHERE m.superseded_by IS NULL AND m.principal_id IS NULL AND 1=1"
                     .to_string();
+            if prompt_only { sql.push_str(&Self::prompt_key_filter("m.")); }
             let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
             let mut idx = 1;
 
@@ -1022,6 +1018,12 @@ impl SqliteMemory {
                 let _ = write!(sql, " AND m.created_at <= ?{idx}");
                 param_values.push(Box::new(u.to_string()));
                 idx += 1;
+            }
+            if !allowed_agent_ids.is_empty() {
+                let placeholders = (0..allowed_agent_ids.len()).map(|offset| format!("?{}", idx + offset)).collect::<Vec<_>>().join(", ");
+                let _ = write!(sql, " AND m.agent_id IN ({placeholders})");
+                idx += allowed_agent_ids.len();
+                for id in allowed_agent_ids { param_values.push(Box::new(id)); }
             }
             let _ = write!(sql, " ORDER BY m.updated_at DESC LIMIT ?{idx}");
             #[allow(clippy::cast_possible_wrap)]
@@ -1065,22 +1067,31 @@ impl SqliteMemory {
         query: &str,
         limit: usize,
         session_id: Option<&str>,
-        since: Option<&str>,
-        until: Option<&str>,
+        window: (Option<&str>, Option<&str>),
         allowed_agent_ids: Option<Vec<String>>,
+        prompt_only: bool,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let (since, until) = window;
+        if prompt_only && limit == 0 {
+            return Ok(Vec::new());
+        }
         let allowed_agent_ids = allowed_agent_ids.unwrap_or_default();
         // Time-only query: list by time range when no keywords.
         // Treat only a bare "*" as the same recent-entry request; keep
         // real wildcard searches such as "wild*" on the keyword path.
         if is_recent_recall_query(query) {
+            if prompt_only {
+                return self
+                    .recall_by_time_only(limit, session_id, since, until, true, allowed_agent_ids)
+                    .await;
+            }
             let recall_limit = if allowed_agent_ids.is_empty() {
                 limit
             } else {
                 self.count().await?.max(limit)
             };
             let raw = self
-                .recall_by_time_only(recall_limit, session_id, since, until)
+                .recall_by_time_only(recall_limit, session_id, since, until, false, Vec::new())
                 .await?;
             if allowed_agent_ids.is_empty() {
                 return Ok(raw);
@@ -1152,37 +1163,21 @@ impl SqliteMemory {
             // FTS5 BM25 keyword search (skip for embedding-only mode)
             let keyword_results = if search_mode == SearchMode::Embedding {
                 Vec::new()
-            } else if let Some(agent_filter) = agent_filter {
-                if vector_live {
-                    Self::fts5_search_for_session_and_agents(
-                        &conn,
-                        &query,
-                        limit * 2,
-                        session_ref,
-                        agent_filter,
-                    )
-                    .unwrap_or_default()
-                } else {
-                    Self::fts5_search_scoped(&conn, &query, limit * 2, None, Some(agent_filter))
-                        .unwrap_or_default()
-                }
-            } else if vector_live {
-                Self::fts5_search_for_session(&conn, &query, limit * 2, session_ref)
-                    .unwrap_or_default()
             } else {
-                Self::fts5_search(&conn, &query, limit * 2).unwrap_or_default()
+                Self::fts5_search_scoped(
+                    &conn, &query, limit * 2,
+                    if vector_live { session_ref } else { None },
+                    agent_filter, prompt_only,
+                ).unwrap_or_default()
             };
 
-            // Vector similarity search (skip for BM25-only mode)
+            // Filter before vector scoring and truncation as well as FTS ranking.
             let vector_results = if search_mode == SearchMode::Bm25 {
                 Vec::new()
             } else if let Some(ref qe) = query_embedding {
-                if let Some(agent_filter) = agent_filter {
-                    Self::vector_search_for_agents(&conn, qe, limit * 2, None, session_ref, agent_filter)
-                        .unwrap_or_default()
-                } else {
-                    Self::vector_search(&conn, qe, limit * 2, None, session_ref).unwrap_or_default()
-                }
+                Self::vector_search_scoped(
+                    &conn, qe, limit * 2, None, session_ref, agent_filter, prompt_only,
+                ).unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -1405,10 +1400,22 @@ impl SqliteMemory {
                         let _ = write!(agent_conditions, " AND m.agent_id IN ({agent_placeholders})");
                         param_idx += agent_filter.len();
                     }
+                    // Match the fallback's strict session semantics before LIMIT:
+                    // Some(session) excludes NULL/other sessions; None is unscoped.
+                    // Filtering after LIMIT lets newer foreign-session rows starve
+                    // eligible matches, even when prompt autosaves are excluded.
+                    let session_conditions = if session_ref.is_some() {
+                        let condition = format!(" AND m.session_id = ?{param_idx}");
+                        param_idx += 1;
+                        condition
+                    } else {
+                        String::new()
+                    };
+                    let prompt_conditions = if prompt_only { Self::prompt_key_filter("m.") } else { String::new() };
                     let sql = format!(
                         "SELECT m.id, m.key, m.content, m.category, m.created_at, m.session_id, m.namespace, m.importance, m.superseded_by, m.kind, m.pinned, a.alias, m.agent_id, m.tenant_id
                          FROM memories m LEFT JOIN agents a ON a.id = m.agent_id
-                         WHERE m.superseded_by IS NULL AND m.principal_id IS NULL AND ({where_clause}){time_conditions}{agent_conditions}
+                         WHERE m.superseded_by IS NULL AND m.principal_id IS NULL AND ({where_clause}){time_conditions}{agent_conditions}{session_conditions}{prompt_conditions}
                          ORDER BY m.updated_at DESC
                          LIMIT ?{param_idx}"
                     );
@@ -1428,6 +1435,9 @@ impl SqliteMemory {
                         for agent_id in agent_filter {
                             param_values.push(Box::new(agent_id.clone()));
                         }
+                    }
+                    if let Some(sid) = session_ref {
+                        param_values.push(Box::new(sid.to_string()));
                     }
                     #[allow(clippy::cast_possible_wrap)]
                     param_values.push(Box::new(sql_limit as i64));
@@ -1476,6 +1486,91 @@ impl SqliteMemory {
             }
 
             results.truncate(limit);
+            Ok(results)
+        })
+        .await?
+    }
+
+    async fn recall_principal_scoped(
+        &self,
+        scope: &PrincipalScope,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        window: (Option<&str>, Option<&str>),
+        prompt_only: bool,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let (since, until) = window;
+        let conn = self.conn.clone();
+        let scope = scope.clone();
+        let query = query.to_string();
+        let sid = session_id.map(String::from);
+        let since_owned = since.map(String::from);
+        let until_owned = until.map(String::from);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let conn = conn.lock();
+            // Keyword/time recall over the private plane only. The
+            // embedding/rerank pipeline stays on the shared plane. Prompt reads
+            // exclude private autosaves before the same scoped recent limit.
+            let (scope_sql, mut param_values) = Self::scope_predicate(&scope, "m.", 1);
+            let mut sql = format!(
+                "SELECT {} FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
+                 WHERE m.superseded_by IS NULL{scope_sql}",
+                Self::PRIVATE_COLUMNS
+            );
+            let mut idx = param_values.len() + 1;
+            if prompt_only {
+                // private_row exposes keys with this exact scope prefix removed.
+                // SQLite substr counts characters, not UTF-8 bytes.
+                let prefix = Self::principal_physical_prefix(&scope);
+                let prefix_len = prefix.chars().count();
+                let visible_key = format!("CASE WHEN substr(m.key, 1, {prefix_len}) = ?{idx} THEN substr(m.key, {}) ELSE m.key END", prefix_len + 1);
+                sql.push_str(&Self::prompt_key_expression_filter(&visible_key));
+                param_values.push(Box::new(prefix));
+                idx += 1;
+            }
+
+            let trimmed = query.trim();
+            if !(trimmed.is_empty() || trimmed == "*") {
+                let _ = write!(sql, " AND m.content LIKE ?{idx} ESCAPE '\\'");
+                let escaped = trimmed
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_");
+                param_values.push(Box::new(format!("%{escaped}%")));
+                idx += 1;
+            }
+            if let Some(sid) = sid.as_deref() {
+                let _ = write!(sql, " AND m.session_id = ?{idx}");
+                param_values.push(Box::new(sid.to_string()));
+                idx += 1;
+            }
+            if let Some(since) = since_owned.as_deref() {
+                let _ = write!(sql, " AND m.created_at >= ?{idx}");
+                param_values.push(Box::new(since.to_string()));
+                idx += 1;
+            }
+            if let Some(until) = until_owned.as_deref() {
+                let _ = write!(sql, " AND m.created_at <= ?{idx}");
+                param_values.push(Box::new(until.to_string()));
+                idx += 1;
+            }
+            let _ = write!(sql, " ORDER BY m.updated_at DESC LIMIT ?{idx}");
+            #[allow(clippy::cast_possible_wrap)]
+            param_values.push(Box::new(limit as i64));
+
+            let mut stmt = conn.prepare(&sql)?;
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values
+                .iter()
+                .map(std::convert::AsRef::as_ref)
+                .collect();
+            let rows =
+                stmt.query_map(params_ref.as_slice(), |row| Self::private_row(row, &scope))?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
             Ok(results)
         })
         .await?
@@ -1696,7 +1791,32 @@ impl Memory for SqliteMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        self.recall_scoped(query, limit, session_id, since, until, None)
+        self.recall_scoped(query, limit, session_id, (since, until), None, false)
+            .await
+    }
+
+    async fn recall_for_prompt(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.recall_scoped(query, limit, session_id, (None, None), None, true)
+            .await
+    }
+
+    async fn recall_for_prompt_for_agents(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let allowed = allowed_agent_ids
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect();
+        self.recall_scoped(query, limit, session_id, (None, None), Some(allowed), true)
             .await
     }
 
@@ -1985,68 +2105,19 @@ impl Memory for SqliteMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
-        let conn = self.conn.clone();
-        let scope = scope.clone();
-        let query = query.to_string();
-        let sid = session_id.map(String::from);
-        let since_owned = since.map(String::from);
-        let until_owned = until.map(String::from);
+        self.recall_principal_scoped(scope, query, limit, session_id, (since, until), false)
+            .await
+    }
 
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
-            let conn = conn.lock();
-            // Keyword/time recall over the private plane only. The
-            // embedding/rerank pipeline stays on the shared plane; private
-            // rows are operator-curated notes reached over RPC.
-            let (scope_sql, mut param_values) = Self::scope_predicate(&scope, "m.", 1);
-            let mut sql = format!(
-                "SELECT {} FROM memories m LEFT JOIN agents a ON a.id = m.agent_id \
-                 WHERE m.superseded_by IS NULL{scope_sql}",
-                Self::PRIVATE_COLUMNS
-            );
-            let mut idx = param_values.len() + 1;
-            let trimmed = query.trim();
-            if !(trimmed.is_empty() || trimmed == "*") {
-                let _ = write!(sql, " AND m.content LIKE ?{idx} ESCAPE '\\'");
-                let escaped = trimmed
-                    .replace('\\', "\\\\")
-                    .replace('%', "\\%")
-                    .replace('_', "\\_");
-                param_values.push(Box::new(format!("%{escaped}%")));
-                idx += 1;
-            }
-            if let Some(sid) = sid.as_deref() {
-                let _ = write!(sql, " AND m.session_id = ?{idx}");
-                param_values.push(Box::new(sid.to_string()));
-                idx += 1;
-            }
-            if let Some(since) = since_owned.as_deref() {
-                let _ = write!(sql, " AND m.created_at >= ?{idx}");
-                param_values.push(Box::new(since.to_string()));
-                idx += 1;
-            }
-            if let Some(until) = until_owned.as_deref() {
-                let _ = write!(sql, " AND m.created_at <= ?{idx}");
-                param_values.push(Box::new(until.to_string()));
-                idx += 1;
-            }
-            let _ = write!(sql, " ORDER BY m.updated_at DESC LIMIT ?{idx}");
-            #[allow(clippy::cast_possible_wrap)]
-            param_values.push(Box::new(limit as i64));
-
-            let mut stmt = conn.prepare(&sql)?;
-            let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values
-                .iter()
-                .map(std::convert::AsRef::as_ref)
-                .collect();
-            let rows =
-                stmt.query_map(params_ref.as_slice(), |row| Self::private_row(row, &scope))?;
-            let mut results = Vec::new();
-            for row in rows {
-                results.push(row?);
-            }
-            Ok(results)
-        })
-        .await?
+    async fn recall_for_prompt_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.recall_principal_scoped(scope, query, limit, session_id, (None, None), true)
+            .await
     }
 
     async fn list_for_principal(
@@ -2808,8 +2879,15 @@ impl Memory for SqliteMemory {
         }
 
         let allowed: Vec<String> = allowed_agent_ids.iter().map(|s| (*s).to_string()).collect();
-        self.recall_scoped(query, limit, session_id, since, until, Some(allowed))
-            .await
+        self.recall_scoped(
+            query,
+            limit,
+            session_id,
+            (since, until),
+            Some(allowed),
+            false,
+        )
+        .await
     }
 
     async fn ensure_agent_uuid(&self, alias: &str) -> anyhow::Result<String> {
@@ -2841,6 +2919,90 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         (tmp, mem)
+    }
+
+    #[test]
+    fn prompt_key_sql_matches_user_autosave_predicate() {
+        let conn = Connection::open_in_memory().unwrap();
+        let sql = format!(
+            "SELECT key FROM (SELECT ?1 AS key) WHERE 1=1{}",
+            SqliteMemory::prompt_key_filter("")
+        );
+        for key in [
+            "user_msg",
+            "user_msg_",
+            "USER_MSG_abc",
+            "\tuser_msg_abc\n",
+            "\u{2003}USER_MSG_abc\u{a0}",
+            "user_message",
+            "userXmsg_abc",
+            "fact",
+            "assistant_resp_abc",
+        ] {
+            let found = conn.prepare(&sql).unwrap().exists([key]).unwrap();
+            assert_eq!(found, !crate::is_user_autosave_key(key), "{key:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_recall_filters_before_fts_recent_and_like_limits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mem = SqliteMemory::new("prompt", tmp.path()).unwrap();
+        let session = Some("prompt-session");
+        mem.store("fact", "needle flower", MemoryCategory::Core, session)
+            .await
+            .unwrap();
+        for i in 0..12 {
+            mem.store(
+                &format!("user_msg_{i}"),
+                "needle needle flower",
+                MemoryCategory::Conversation,
+                session,
+            )
+            .await
+            .unwrap();
+        }
+        for query in ["needle", "*", "eedl"] {
+            let hits = mem.recall_for_prompt(query, 1, session).await.unwrap();
+            assert_eq!(hits.len(), 1, "{query}");
+            assert_eq!(hits[0].key, "fact", "{query}");
+        }
+        assert!(
+            mem.recall_for_prompt("needle", 0, session)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(mem.count().await.unwrap(), 13);
+    }
+
+    #[test]
+    fn prompt_vector_candidates_exclude_autosaves_before_limit() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE memories (id TEXT, key TEXT, embedding BLOB, session_id TEXT, category TEXT, agent_id TEXT)").unwrap();
+        for i in 0..12 {
+            conn.execute(
+                "INSERT INTO memories VALUES (?1, ?2, ?3, 's', 'conversation', 'a')",
+                params![
+                    format!("auto-{i}"),
+                    format!("user_msg_{i}"),
+                    vector::vec_to_bytes(&[1.0, 0.0])
+                ],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO memories VALUES ('fact', 'fact', ?1, 's', 'core', 'a')",
+            params![vector::vec_to_bytes(&[0.8, 0.6])],
+        )
+        .unwrap();
+        let generic = SqliteMemory::vector_search(&conn, &[1.0, 0.0], 5, None, Some("s")).unwrap();
+        assert!(generic.iter().all(|(id, _)| id.starts_with("auto-")));
+        let prompt =
+            SqliteMemory::vector_search_scoped(&conn, &[1.0, 0.0], 5, None, Some("s"), None, true)
+                .unwrap();
+        assert_eq!(prompt.len(), 1);
+        assert_eq!(prompt[0].0, "fact");
     }
 
     #[tokio::test]
@@ -6644,5 +6806,127 @@ mod tests {
                 "list() must yield a deterministic order across reads"
             );
         }
+    }
+    #[tokio::test]
+    async fn like_fallback_filters_session_before_limit_preserving_unscoped_archive() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            "test",
+            tmp.path(),
+            Arc::new(FailingEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::Hybrid,
+        )
+        .unwrap();
+        let own = mem.ensure_agent_uuid("own").await.unwrap();
+        let other = mem.ensure_agent_uuid("other").await.unwrap();
+        let session = Some("wanted");
+        for (key, sid, agent) in [
+            ("fact", session, &own),
+            ("user_msg_raw", session, &own),
+            ("wrong_session", Some("foreign"), &own),
+            ("null_session", None, &own),
+            ("other_agent", session, &other),
+        ] {
+            mem.store_with_agent(
+                key,
+                "orchid prefers shade",
+                MemoryCategory::Core,
+                sid,
+                None,
+                None,
+                Some(agent),
+            )
+            .await
+            .unwrap();
+        }
+        mem.store_for_principal(
+            &PrincipalScope::new("user:alice"),
+            "private_fact",
+            "orchid private",
+            MemoryCategory::Core,
+            session,
+        )
+        .await
+        .unwrap();
+        // Deterministic ordering: both foreign/NULL session rows are newer.
+        {
+            let conn = mem.conn.lock();
+            for (key, timestamp) in [
+                ("fact", "2026-01-01T00:00:00+00:00"),
+                ("user_msg_raw", "2026-01-02T00:00:00+00:00"),
+                ("wrong_session", "2026-01-03T00:00:00+00:00"),
+                ("null_session", "2026-01-04T00:00:00+00:00"),
+                ("other_agent", "2026-01-05T00:00:00+00:00"),
+            ] {
+                conn.execute(
+                    "UPDATE memories SET created_at=?1, updated_at=?1 WHERE key=?2",
+                    params![timestamp, key],
+                )
+                .unwrap();
+            }
+        }
+        // Substring is not an FTS token: force LIKE after the embedding error.
+        let prompt = mem
+            .recall_for_prompt_for_agents(&[&own], "rch", 1, session)
+            .await
+            .unwrap();
+        assert_eq!(prompt.len(), 1);
+        assert_eq!(prompt[0].key, "fact");
+        assert_eq!(prompt[0].session_id.as_deref(), session);
+        assert_eq!(prompt[0].agent_id.as_deref(), Some(own.as_str()));
+        assert!(prompt[0].principal_id.is_none());
+        // Archival reads still include autosaves, but cannot lose the scoped row.
+        let archive = mem
+            .recall_for_agents(&[&own], "rch", 1, session, None, None)
+            .await
+            .unwrap();
+        assert_eq!(archive.len(), 1);
+        assert_eq!(archive[0].key, "user_msg_raw");
+        let all = mem
+            .recall_for_agents(&[&own], "rch", 10, session, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            all.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
+            vec!["user_msg_raw", "fact"]
+        );
+        // None remains unscoped, not IS NULL and not an implicit default session.
+        let unscoped = mem
+            .recall_for_prompt_for_agents(&[&own], "rch", 10, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            unscoped.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
+            vec!["null_session", "wrong_session", "fact"]
+        );
+        let top = mem
+            .recall_for_prompt_for_agents(&[&own], "rch", 1, None)
+            .await
+            .unwrap();
+        assert_eq!(top[0].key, "null_session");
+        assert!(
+            mem.recall_for_prompt_for_agents(&[&own], "rch", 1, Some("missing"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // Parameter ordering stays correct with time + agent + session filters.
+        let window = mem
+            .recall_for_agents(
+                &[&own],
+                "rch",
+                1,
+                session,
+                Some("2026-01-01T00:00:00+00:00"),
+                Some("2026-01-01T23:59:59+00:00"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(window.len(), 1);
+        assert_eq!(window[0].key, "fact");
     }
 }

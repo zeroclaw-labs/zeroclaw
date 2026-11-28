@@ -344,6 +344,44 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>>;
 
+    /// Recall candidates for prompt injection. Backends may exclude raw user
+    /// autosaves before ranking and limiting. The compatibility default keeps
+    /// existing bounded recall behavior; the renderer must retain its skip set.
+    async fn recall_for_prompt(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.recall(query, limit, session_id, None, None).await
+    }
+
+    /// Private-plane prompt candidates, retaining the full principal scope.
+    /// Compatibility backends keep their existing bounded private recall.
+    async fn recall_for_prompt_for_principal(
+        &self,
+        scope: &PrincipalScope,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.recall_for_principal(scope, query, limit, session_id, None, None)
+            .await
+    }
+
+    /// Agent-scoped counterpart of prompt recall. The default retains the
+    /// backend's existing authorization and bounded recall behavior.
+    async fn recall_for_prompt_for_agents(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        self.recall_for_agents(allowed_agent_ids, query, limit, session_id, None, None)
+            .await
+    }
+
     /// Get a specific memory by key.
     ///
     /// After composite uniqueness landed, multiple rows may share a `key`
