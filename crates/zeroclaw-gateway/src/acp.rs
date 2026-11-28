@@ -265,7 +265,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        cfg
+        zeroclaw_config::migration::admit_test_input(&cfg)
     }
 
     #[tokio::test]

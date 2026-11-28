@@ -384,6 +384,39 @@ impl RpcContext {
         })
     }
 
+    /// Test-only context for property-path fixtures that intentionally edit
+    /// historical typed provider maps before the resolver admission boundary.
+    #[cfg(test)]
+    pub fn minimal_raw(config: Config, sessions: Arc<SessionStore>) -> Arc<Self> {
+        let auth = crate::rpc::auth::RpcInboundAuth::for_tests(&config);
+        let authority = LiveConfigAuthority::for_tests(config);
+        Arc::new(Self {
+            config: authority.live_handle(),
+            config_authority: authority.clone(),
+            agent_lifecycle: authority.agent_lifecycle(),
+            channel_generation_control: None,
+            sessions,
+            session_backend: None,
+            memory: None,
+            cost_tracker: None,
+            event_tx: None,
+            event_history: None,
+            subscriptions: Arc::new(crate::rpc::subscription::SubscriptionHub::new()),
+            reload_tx: None,
+            gateway_shutdown_tx: None,
+            approval_pending: Arc::new(ApprovalPendingMap::default()),
+            tui_registry: Arc::new(TuiRegistry::new_unsigned()),
+            acp_session_store: None,
+            sop_engine: None,
+            sop_driver_handles: None,
+            sop_audit: None,
+            hooks: None,
+            config_commit_pause: None,
+            cert_audit: None,
+            auth,
+        })
+    }
+
     /// Like [`RpcContext::minimal`] but with the shared certificate audit
     /// logger the daemon wires in production. Certificate-path tests must use
     /// this: `minimal` leaves `cert_audit` unset, and those handlers fail

@@ -10,8 +10,11 @@ This lets one trigger (a webhook path, a channel, an MQTT topic) feed several
 SOPs, with the model deciding which of them the event is really for and how
 much human supervision each run gets.
 
-ZeroClaw speaks the "System One" typed-decision API (`POST <base_url>/v1/systemone`).
-Two models implement it:
+ZeroClaw supports native decision protocols: OpenAI Decisions
+(`POST <service-root>/decisions`) and System One
+(`POST <service-root>/systemone`). The service root normally includes `/v1`.
+These are decision endpoints, separate from Chat Completions and Responses.
+Two models implement System One:
 
 | Model | Where it runs | Notes |
 |---|---|---|
@@ -20,32 +23,43 @@ Two models implement it:
 
 ## Configure models
 
-Declare each model under an alias in `config.toml` and pick its `provider`:
-
-| `provider` | Service | `base_url` default | `model` default | Key |
-|---|---|---|---|---|
-| `jev` (default) | TypeSafe Jev, hosted | `https://api.typesafe.ai` | `jev-latest` | `api_key` required |
-| `laya` | Laya via `laya-serve` | `http://127.0.0.1:8000` | `laya` | none |
-| `custom` | Any other System One-compatible endpoint | required | `jev-latest` | optional |
+Declare a connection and then a decision model that references it in
+`config.toml`. Model names are exact keys, including any dots:
 
 ```toml
-[decision_models.jev]
-provider = "jev"
-# api_key is a secret; set it with `zeroclaw config` or
-# ZEROCLAW_decision_models__jev__api_key.
+[providers.connections.typesafe]
+kind = "system-one"
+uri = "https://api.typesafe.ai/v1"
 
-[decision_models.laya]
-provider = "laya"
+[providers.connections.typesafe.auth]
+mode = "api_key"
+api_key = "YOUR_TYPESAFE_API_KEY"
 
-[decision_models.gpu_box]
-provider = "custom"
-base_url = "http://10.0.0.5:8000"
+[providers.models."decision.jev"]
+capability = "decision"
+provider = "typesafe"
+model = "jev-latest"
+
+[providers.connections.gpu_box]
+kind = "system-one"
+uri = "http://127.0.0.1:8000/v1"
+
+[providers.models."decision.laya"]
+capability = "decision"
+provider = "gpu_box"
 model = "laya"
 ```
 
-`base_url` and `model` override the provider defaults. A `custom` entry without
-a `base_url` is ignored, and SOPs selecting it fall back to their fail-closed mode (see [Safety](#safety)).
-The aliases can also be managed from the dashboard's Config page.
+Use the dashboard's Config provider registry editor to enter secrets through
+the normal encrypted configuration lifecycle. Several decision models can
+share one connection. The connection kind supplies the native protocol default;
+`providers.connections.<name>.api.decision.wire_api` can select a supported
+protocol, and a model's `api.wire_api` can override it. OpenAI, custom and vLLM
+connections support `openai_decisions`; System One connections use `system_one`.
+Selecting a chat model does not simulate a native decision endpoint.
+
+Invalid registry definitions are rejected during configuration admission.
+Unavailable models use the SOP's fail-closed behavior (see [Safety](#safety)).
 
 ## Select a model in an SOP
 
@@ -54,11 +68,11 @@ mode and pick a configured model from the dropdown; the gate, modes, and
 thresholds are edited in the same panel. Saving rejects an invalid
 `[decision]` table with the reason.
 
-In a file-backed SOP, add a `[decision]` table to `SOP.toml` and name the alias:
+In a file-backed SOP, add a `[decision]` table to `SOP.toml` and name the model:
 
 ```toml
 [decision]
-model = "jev"
+model = "decision.jev"
 gate = "Is the customer asking for money back?"
 gate_threshold = 0.7
 modes = ["auto", "supervised", "step_by_step"]
@@ -68,7 +82,7 @@ min_confidence = 0.7
 
 | Field | Default | Effect |
 |---|---:|---|
-| `model` | required | Alias from `[decision_models]`. |
+| `model` | required | Exact key in `[providers.models]` with `capability = "decision"`. |
 | `gate` | unset | Yes/no question. The run starts only when the model's "yes" probability reaches `gate_threshold`; otherwise the event is recorded as skipped for this SOP. |
 | `gate_threshold` | `0.7` | Minimum "yes" probability to start. |
 | `gate_on_error` | `run_strict` | When the model cannot answer: `run_strict` starts the run in its fail-closed mode, `skip` does not start it. |
@@ -133,7 +147,7 @@ each ask the model whether to start.
 - A chosen mode applies to that run only and is stored with the run, so it
   survives a restart. Step-level `requires_confirmation` and checkpoints still
   gate regardless of the chosen mode.
-- **Fail-closed:** an unconfigured alias, a network or HTTP error, a malformed
+- **Fail-closed:** an unconfigured model, a network or HTTP error, a malformed
   answer, or a low-confidence answer never reduces supervision. The run uses the
   strictest of its listed modes, its authored `execution_mode`, and
   `supervised`. A `priority_based` SOP keeps its own gating unless `step_by_step`

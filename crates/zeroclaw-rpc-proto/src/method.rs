@@ -61,6 +61,8 @@ pub enum Method {
 
     // Config
     ConfigGet,
+    ConfigRegistryGet,
+    ConfigRegistrySet,
     ConfigSet,
     ConfigSetMany,
     ConfigValidate,
@@ -197,6 +199,8 @@ impl Method {
         (Method::CronSettings, "cron/settings"),
         // Config
         (Method::ConfigGet, "config/get"),
+        (Method::ConfigRegistryGet, "config/provider-registry"),
+        (Method::ConfigRegistrySet, "config/provider-registry-set"),
         (Method::ConfigSet, "config/set"),
         (Method::ConfigSetMany, "config/set-many"),
         (Method::ConfigValidate, "config/validate"),
@@ -359,6 +363,8 @@ impl Method {
 
             // Config
             M::ConfigGet => (Typed("ConfigGetParams"), Untyped),
+            M::ConfigRegistryGet => (None, Untyped),
+            M::ConfigRegistrySet => (Typed("RegistryEdit"), Untyped),
             M::ConfigSet => (Typed("ConfigSetParams"), Typed("ConfigSetResult")),
             M::ConfigSetMany => (Typed("ConfigSetManyParams"), Typed("ConfigSetManyResult")),
             M::ConfigValidate => (None, Typed("ConfigValidateResult")),

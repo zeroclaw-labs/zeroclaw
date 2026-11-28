@@ -395,7 +395,10 @@ fn submission(agent: &str, channels: Vec<SelectorChoice<ChannelQuickStart>>) -> 
             provider_type: "anthropic".into(),
             alias: "anthropic".into(),
             model: "claude-sonnet-4-5".into(),
-            fields: HashMap::from([("api_key".to_string(), "placeholder-api-key".to_string())]),
+            fields: HashMap::from([(
+                "auth.api_key".to_string(),
+                "placeholder-api-key".to_string(),
+            )]),
         }),
         risk_profile: SelectorChoice::Fresh("balanced".into()),
         runtime_profile: SelectorChoice::Fresh("balanced".into()),

@@ -50,7 +50,7 @@ fn write_config(dir: &std::path::Path, uri: &str) {
     std::fs::write(
         dir.join("config.toml"),
         format!(
-            r#"schema_version = 4
+            r#"schema_version = 5
 locale = "en"
 
 [reliability]
@@ -61,14 +61,22 @@ provider_backoff_ms = 0
 
 [runtime_profiles.default]
 
-[providers.models.openai.mock]
-api_key = "test-key"
+[providers.connections."openai.mock"]
+kind = "openai"
 uri = "{uri}"
-model = "test-model"
+auth = {{ mode = "api_key", api_key = "test-key" }}
+
+[providers.connections."openai.mock".api.chat]
 wire_api = "responses"
 
+[providers.models."chat.mock"]
+capability = "chat"
+provider = "openai.mock"
+model = "test-model"
+options = {{ extract_text_tool_calls = true }}
+
 [agents.test-agent]
-model_provider = "openai.mock"
+model_provider = "chat.mock"
 risk_profile = "default"
 runtime_profile = "default"
 "#

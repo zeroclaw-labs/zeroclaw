@@ -56,7 +56,7 @@ mod tests {
             ..MemoryConfig::default()
         };
         let memory: Arc<dyn Memory> = Arc::from(
-            zeroclaw_memory::create_memory(&memory_config, tmp.path(), None)
+            zeroclaw_memory::create_memory(&memory_config, tmp.path())
                 .expect("markdown memory backend is created"),
         );
         let browser = BrowserConfig {
@@ -75,29 +75,31 @@ mod tests {
         root_config.web_search.enabled = true;
         let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
 
-        let tools = crate::tools::all_tools_with_runtime(
-            Arc::new(root_config.clone()),
-            &security,
-            &RiskProfileConfig::default(),
-            "test-agent",
-            Arc::new(NativeRuntime::new()),
-            memory,
-            None,
-            None,
-            &browser,
-            &http,
-            &WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &root_config,
-            None,
-            false,
-            None,
-            Some(engine),
-            None,
-            None,
-        )
+        let tools = {
+            let registry_config = Arc::new(root_config.clone());
+            let registry_config = {
+                let mut fixture = (*registry_config).clone();
+                fixture.browser = browser.clone();
+                fixture.http_request = http.clone();
+                fixture.web_fetch = WebFetchConfig::default();
+                fixture.agents = HashMap::new();
+                std::sync::Arc::new(fixture)
+            };
+            let registry_runtime: std::sync::Arc<dyn zeroclaw_config::platform::RuntimeAdapter> =
+                Arc::new(NativeRuntime::new());
+            let registry_memory: std::sync::Arc<dyn zeroclaw_memory::Memory> = memory;
+            let registry_request = crate::composition::ToolRequest {
+                config: &registry_config,
+                agent_alias: "test-agent",
+                security: &security,
+                runtime: &registry_runtime,
+                memory: &registry_memory,
+            };
+            let mut registry_inputs =
+                crate::composition::NativeRecipeInputs::new(&registry_request, tmp.path());
+            registry_inputs.sop_engine = Some(engine);
+            crate::tools::build_native_registry(registry_inputs, &RiskProfileConfig::default())
+        }
         .expect("tool registry builds")
         .tools;
 

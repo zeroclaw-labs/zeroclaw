@@ -110,7 +110,7 @@ struct Session {
     last_active: Instant,
     /// Agent alias (e.g. `"clamps"`) for attributable span logs.
     agent_alias: String,
-    /// Model-provider ref (e.g. `"anthropic.default"`) for attributable span logs.
+    /// Model-provider ref (e.g. `"chat.test"`) for attributable span logs.
     model_provider: String,
     /// Model identifier (e.g. `"claude-sonnet-4-6"`) for attributable span logs.
     model: String,
@@ -344,74 +344,31 @@ impl AcpServer {
         workspace_dir: &std::path::Path,
         enable_mcp: bool,
     ) -> Result<Agent> {
-        let Some(store) = self.store.as_ref() else {
-            return if let ConfigSource::Live(live_config) = &self.config_source {
-                Agent::from_live_config_with_session_cwd_and_mcp_backchannel_with_capability(
-                    live_config.clone(),
-                    agent_alias,
-                    Some(workspace_dir),
-                    enable_mcp,
-                    true,
-                    true,
-                    self.sop_engine.clone(),
-                    self.sop_audit.clone(),
-                    self.canvas_store.clone(),
+        let mut context = zeroclaw_runtime::agent::AgentBuildContext {
+            session_cwd: Some(workspace_dir),
+            initialize_mcp: enable_mcp,
+            approval_backchannel: true,
+            exclude_memory: true,
+            acp_delivery: true,
+            sop_engine: self.sop_engine.clone(),
+            sop_audit: self.sop_audit.clone(),
+            canvas_store: self.canvas_store.clone(),
+            acp_session_store: self.store.clone(),
+            ..Default::default()
+        };
+        match &self.config_source {
+            ConfigSource::Live(live_config) => {
+                context.execution_capability =
                     Some(zeroclaw_runtime::AgentExecutionCapability::from_parts(
                         live_config.clone(),
                         self.agent_lifecycle.clone(),
-                    )),
-                )
-                .await
-            } else {
-                Agent::from_config_with_session_cwd_and_mcp_backchannel(
-                    config,
-                    agent_alias,
-                    Some(workspace_dir),
-                    enable_mcp,
-                    true,
-                    true,
-                    self.sop_engine.clone(),
-                    self.sop_audit.clone(),
-                    self.canvas_store.clone(),
-                )
-                .await
-            };
-        };
-        if let ConfigSource::Live(live_config) = &self.config_source {
-            let execution_capability = zeroclaw_runtime::AgentExecutionCapability::from_parts(
-                live_config.clone(),
-                self.agent_lifecycle.clone(),
-            );
-            Agent::from_live_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions_with_capability(
-                live_config.clone(),
-                agent_alias,
-                Some(workspace_dir),
-                enable_mcp,
-                true,
-                // ACP turns transport the typed file attachment `deliver_file` emits.
-                true,
-                self.sop_engine.clone(),
-                self.sop_audit.clone(),
-                self.canvas_store.clone(),
-                Arc::clone(store),
-                Some(execution_capability),
-            )
-            .await
-        } else {
-            Agent::from_config_with_session_cwd_and_mcp_backchannel_and_acp_sessions(
-                config,
-                agent_alias,
-                Some(workspace_dir),
-                enable_mcp,
-                true,
-                // ACP turns transport the typed file attachment `deliver_file` emits.
-                true,
-                self.sop_engine.clone(),
-                self.sop_audit.clone(),
-                self.canvas_store.clone(),
-                Arc::clone(store),
-            )
-            .await
+                    ));
+                Agent::from_live_config_with_context(live_config.clone(), agent_alias, context)
+                    .await
+            }
+            ConfigSource::Standalone(_) => {
+                Agent::from_config_with_context(config, agent_alias, context).await
+            }
         }
     }
 
@@ -711,16 +668,11 @@ impl AcpServer {
         // install-wide first configured model when no default agent can be
         // inferred (e.g. agent-less onboarding configs).
         let default_model = match self.default_session_agent_alias(&config) {
-            Some(alias) => Self::alias_if_dispatchable(&config, &alias)
-                .and_then(|alias| config.resolved_model_provider_for_agent(&alias))
-                .and_then(|(_, _, entry)| {
-                    entry
-                        .model
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|model| !model.is_empty())
-                        .map(ToString::to_string)
-                }),
+            Some(alias) => Self::alias_if_dispatchable(&config, &alias).and_then(|alias| {
+                config
+                    .agent(&alias)
+                    .and_then(|agent| config.resolve_model_id(&agent.model_provider))
+            }),
             None => config.resolve_default_model(),
         };
 
@@ -1000,11 +952,16 @@ impl AcpServer {
                     .map(|a| a.model_provider.to_string())
                     .unwrap_or_default();
                 let model = config
-                    .model_provider_for_agent(&agent_alias)
-                    .and_then(|mp| mp.model.clone())
+                    .agent(&agent_alias)
+                    .and_then(|agent| config.resolve_model_id(agent.model_provider.as_str()))
                     .unwrap_or_default();
+                // `anyhow::Error::to_string()` only renders the outer context,
+                // which hid actionable provider failures (for example, an API
+                // key prefix mismatch) behind "Failed to create agent". Keep
+                // the complete chain while applying the provider sanitizer
+                // before exposing it over the RPC boundary.
                 let error = zeroclaw_runtime::security::scrub(
-                    &zeroclaw_providers::sanitize_api_error(&e.to_string()),
+                    &zeroclaw_providers::format_error_chain(e.as_ref()),
                 );
                 ::zeroclaw_log::scope!(
                     session_key: session_id.as_str(),
@@ -1113,8 +1070,8 @@ impl AcpServer {
                         .map(|a| a.model_provider.to_string())
                         .unwrap_or_default(),
                     model: config
-                        .model_provider_for_agent(&agent_alias)
-                        .and_then(|mp| mp.model.clone())
+                        .agent(&agent_alias)
+                        .and_then(|agent| config.resolve_model_id(agent.model_provider.as_str()))
                         .unwrap_or_default(),
                     workspace_dir: workspace_dir.clone(),
                 })),
@@ -1126,8 +1083,8 @@ impl AcpServer {
             .map(|a| a.model_provider.to_string())
             .unwrap_or_default();
         let model_name = config
-            .model_provider_for_agent(&agent_alias)
-            .and_then(|mp| mp.model.clone())
+            .agent(&agent_alias)
+            .and_then(|agent| config.resolve_model_id(agent.model_provider.as_str()))
             .unwrap_or_default();
         ::zeroclaw_log::record!(
             INFO,
@@ -1282,7 +1239,10 @@ impl AcpServer {
             .await
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
-                message: format!("Failed to create agent: {e}"),
+                message: format!(
+                    "Failed to create agent: {}",
+                    zeroclaw_providers::format_error_chain(e.as_ref())
+                ),
                 data: None,
             });
 
@@ -1428,8 +1388,8 @@ impl AcpServer {
                         .map(|a| a.model_provider.to_string())
                         .unwrap_or_default(),
                     model: config
-                        .model_provider_for_agent(&restore_alias)
-                        .and_then(|mp| mp.model.clone())
+                        .agent(&restore_alias)
+                        .and_then(|agent| config.resolve_model_id(agent.model_provider.as_str()))
                         .unwrap_or_default(),
                     workspace_dir: workspace_dir.to_string_lossy().into_owned(),
                 })),
@@ -1475,8 +1435,8 @@ impl AcpServer {
             .map(|a| a.model_provider.to_string())
             .unwrap_or_default();
         let model_name = config
-            .model_provider_for_agent(&restore_alias)
-            .and_then(|mp| mp.model.clone())
+            .agent(&restore_alias)
+            .and_then(|agent| config.resolve_model_id(agent.model_provider.as_str()))
             .unwrap_or_default();
         ::zeroclaw_log::record!(
             INFO,
@@ -1619,7 +1579,10 @@ impl AcpServer {
             .await
             .map_err(|e| RpcError {
                 code: INTERNAL_ERROR,
-                message: format!("Failed to create agent: {e}"),
+                message: format!(
+                    "Failed to create agent: {}",
+                    zeroclaw_providers::format_error_chain(e.as_ref())
+                ),
                 data: None,
             });
 
@@ -1724,8 +1687,8 @@ impl AcpServer {
                         .map(|a| a.model_provider.to_string())
                         .unwrap_or_default(),
                     model: config
-                        .model_provider_for_agent(&restore_alias)
-                        .and_then(|mp| mp.model.clone())
+                        .agent(&restore_alias)
+                        .and_then(|agent| config.resolve_model_id(agent.model_provider.as_str()))
                         .unwrap_or_default(),
                     workspace_dir: workspace_dir.to_string_lossy().into_owned(),
                 })),
@@ -1743,8 +1706,8 @@ impl AcpServer {
             .map(|a| a.model_provider.to_string())
             .unwrap_or_default();
         let model_name = config
-            .model_provider_for_agent(&restore_alias)
-            .and_then(|mp| mp.model.clone())
+            .agent(&restore_alias)
+            .and_then(|agent| config.resolve_model_id(agent.model_provider.as_str()))
             .unwrap_or_default();
 
         // Replay the durable TodoWrite plan so the resuming client's tracker
@@ -4551,7 +4514,7 @@ mod tests {
         // When a client passes cwd = '.' (resolved to the install root), the
         // session must still use the per-agent workspace — not the daemon cwd.
         let cwd = tempfile::tempdir().unwrap();
-        // A fully-wired config (valid `anthropic.default` provider + `test-agent`)
+        // A fully-wired config (valid `chat.test` provider + `test-agent`)
         // so agent construction succeeds. A failing construction would emit the
         // shared "ACP session/new failed" log line and race the attribution test
         // that matches events by message text alone.
@@ -4719,19 +4682,7 @@ mod tests {
         let spawn_marker = cwd.path().join("mcp-server-was-spawned");
         let mut config = Config {
             data_dir: cwd.path().to_path_buf(),
-            providers: {
-                let mut p = zeroclaw_config::providers::Providers::default();
-                p.models.openrouter.insert(
-                    "default".to_string(),
-                    zeroclaw_config::schema::OpenRouterModelProviderConfig {
-                        base: zeroclaw_config::schema::ModelProviderConfig {
-                            model: Some("test-model".to_string()),
-                            ..Default::default()
-                        },
-                    },
-                );
-                p
-            },
+            providers: openrouter_test_providers(None),
             mcp: zeroclaw_config::schema::McpConfig {
                 enabled: true,
                 servers: vec![zeroclaw_config::schema::McpServerConfig {
@@ -4768,7 +4719,7 @@ mod tests {
                 exclude: Vec::new(),
             },
         );
-        let mut agent = dispatchable_test_agent("openrouter.default");
+        let mut agent = dispatchable_test_agent("chat.openrouter");
         agent.mcp_bundles = vec!["slow-bundle".to_string()];
         config.agents.insert("test-agent".to_string(), agent);
         let server = AcpServer::new(config, AcpServerConfig::default());
@@ -4805,20 +4756,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let mut config = Config {
             data_dir: cwd.path().to_path_buf(),
-            providers: {
-                let mut providers = zeroclaw_config::providers::Providers::default();
-                providers.models.openrouter.insert(
-                    "default".to_string(),
-                    zeroclaw_config::schema::OpenRouterModelProviderConfig {
-                        base: zeroclaw_config::schema::ModelProviderConfig {
-                            api_key: Some("sk-ant-zeroclaw_test_credential".to_string()),
-                            model: Some("test-model".to_string()),
-                            ..Default::default()
-                        },
-                    },
-                );
-                providers
-            },
+            providers: openrouter_test_providers(Some("sk-ant-zeroclaw_test_credential")),
             ..Default::default()
         };
         config.risk_profiles.insert(
@@ -4827,7 +4765,7 @@ mod tests {
         );
         config.agents.insert(
             "test-agent".to_string(),
-            dispatchable_test_agent("openrouter.default"),
+            dispatchable_test_agent("chat.openrouter"),
         );
         let server = AcpServer::new(config, AcpServerConfig::default());
 
@@ -4878,7 +4816,7 @@ mod tests {
         assert_eq!(event["event"]["outcome"], "failure");
         assert_eq!(event["zeroclaw"]["channel_type"], "acp");
         assert_eq!(event["zeroclaw"]["agent_alias"], "test-agent");
-        assert_eq!(event["zeroclaw"]["model_provider"], "openrouter.default");
+        assert_eq!(event["zeroclaw"]["model_provider"], "chat.openrouter");
         assert_eq!(event["zeroclaw"]["model"], "test-model");
         assert!(
             event["zeroclaw"]["session_key"]
@@ -5059,20 +4997,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let mut config = Config {
             data_dir: cwd.path().to_path_buf(),
-            providers: {
-                let mut p = zeroclaw_config::providers::Providers::default();
-                p.models.openrouter.insert(
-                    "default".to_string(),
-                    zeroclaw_config::schema::OpenRouterModelProviderConfig {
-                        base: zeroclaw_config::schema::ModelProviderConfig {
-                            api_key: Some("test-key".to_string()),
-                            model: Some("test-model".to_string()),
-                            ..Default::default()
-                        },
-                    },
-                );
-                p
-            },
+            providers: openrouter_test_providers(Some("test-key")),
             ..Default::default()
         };
         config.risk_profiles.insert(
@@ -5085,7 +5010,7 @@ mod tests {
         );
         config.agents.insert(
             "only-agent".to_string(),
-            dispatchable_test_agent("openrouter.default"),
+            dispatchable_test_agent("chat.openrouter"),
         );
         let server = AcpServer::new(config, AcpServerConfig::default());
 
@@ -5134,20 +5059,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let mut config = Config {
             data_dir: cwd.path().to_path_buf(),
-            providers: {
-                let mut p = zeroclaw_config::providers::Providers::default();
-                p.models.openrouter.insert(
-                    "default".to_string(),
-                    zeroclaw_config::schema::OpenRouterModelProviderConfig {
-                        base: zeroclaw_config::schema::ModelProviderConfig {
-                            api_key: Some("test-key".to_string()),
-                            model: Some("test-model".to_string()),
-                            ..Default::default()
-                        },
-                    },
-                );
-                p
-            },
+            providers: openrouter_test_providers(Some("test-key")),
             ..Default::default()
         };
         config.risk_profiles.insert(
@@ -5160,11 +5072,11 @@ mod tests {
         );
         config.agents.insert(
             "agent-alpha".to_string(),
-            dispatchable_test_agent("openrouter.default"),
+            dispatchable_test_agent("chat.openrouter"),
         );
         config.agents.insert(
             "agent-beta".to_string(),
-            dispatchable_test_agent("openrouter.default"),
+            dispatchable_test_agent("chat.openrouter"),
         );
         config.acp.default_agent = Some("agent-alpha".to_string());
         let server = AcpServer::new(config, AcpServerConfig::default());
@@ -5188,20 +5100,7 @@ mod tests {
         let cwd = tempfile::tempdir().unwrap();
         let mut config = Config {
             data_dir: cwd.path().to_path_buf(),
-            providers: {
-                let mut p = zeroclaw_config::providers::Providers::default();
-                p.models.openrouter.insert(
-                    "default".to_string(),
-                    zeroclaw_config::schema::OpenRouterModelProviderConfig {
-                        base: zeroclaw_config::schema::ModelProviderConfig {
-                            api_key: Some("test-key".to_string()),
-                            model: Some("test-model".to_string()),
-                            ..Default::default()
-                        },
-                    },
-                );
-                p
-            },
+            providers: openrouter_test_providers(Some("test-key")),
             ..Default::default()
         };
         config.risk_profiles.insert(
@@ -5214,11 +5113,11 @@ mod tests {
         );
         config.agents.insert(
             "agent-alpha".to_string(),
-            dispatchable_test_agent("openrouter.default"),
+            dispatchable_test_agent("chat.openrouter"),
         );
         config.agents.insert(
             "agent-beta".to_string(),
-            dispatchable_test_agent("openrouter.default"),
+            dispatchable_test_agent("chat.openrouter"),
         );
         config.acp.default_agent = Some("agent-alpha".to_string());
         let server = AcpServer::new(config, AcpServerConfig::default());
@@ -5255,10 +5154,8 @@ mod tests {
     fn two_agent_config(cwd: &std::path::Path) -> Config {
         let mut cfg = make_test_config(cwd);
         for alias in ["agent-alpha", "agent-beta"] {
-            cfg.agents.insert(
-                alias.to_string(),
-                dispatchable_test_agent("anthropic.default"),
-            );
+            cfg.agents
+                .insert(alias.to_string(), dispatchable_test_agent("chat.test"));
         }
         cfg
     }
@@ -5482,7 +5379,7 @@ mod tests {
         config.agents.clear();
         config.agents.insert(
             "agent-beta".to_string(),
-            dispatchable_test_agent("anthropic.default"),
+            dispatchable_test_agent("chat.test"),
         );
         // Missing config default is skipped; sole configured agent applies.
         // Connection default stays out of the restore chain.
@@ -5526,7 +5423,7 @@ mod tests {
         let mut config = two_agent_config(cwd.path());
         config.agents.insert(
             "agent-gamma".to_string(),
-            dispatchable_test_agent("anthropic.default"),
+            dispatchable_test_agent("chat.test"),
         );
         config.agents.get_mut("agent-alpha").unwrap().enabled = false;
         config.acp.default_agent = Some("agent-beta".to_string());
@@ -6069,18 +5966,22 @@ mod tests {
 
     #[test]
     fn handle_initialize_default_model_reflects_configured_provider() {
-        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
-        let mut config = Config::default();
-        config.providers.models.ollama.insert(
-            "default".to_string(),
-            OllamaModelProviderConfig {
-                base: ModelProviderConfig {
-                    model: Some("llama3.2".to_string()),
-                    ..Default::default()
-                },
-                ..OllamaModelProviderConfig::default()
-            },
-        );
+        let config = Config {
+            providers: toml::from_str(
+                r#"
+[connections."gateway.ollama"]
+kind = "custom"
+uri = "http://127.0.0.1:1/v1"
+
+[models."chat.ollama"]
+capability = "chat"
+provider = "gateway.ollama"
+model = "llama3.2"
+"#,
+            )
+            .expect("canonical model fixture parses"),
+            ..Default::default()
+        };
         let server = AcpServer::new(config, AcpServerConfig::default());
         let result = server.handle_initialize(&serde_json::json!({})).unwrap();
         assert_eq!(result["_meta"]["zeroclaw"]["defaultModel"], "llama3.2");
@@ -6088,39 +5989,38 @@ mod tests {
 
     #[test]
     fn handle_initialize_default_model_prefers_default_session_agent() {
-        use zeroclaw_config::schema::{
-            ModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
+        let mut config = Config {
+            // The install-wide first configured model (the openai slot precedes
+            // ollama in slot order) differs from the default agent's entry, so the
+            // assertion proves the agent binding wins over the install-wide pick.
+            providers: toml::from_str(
+                r#"
+[connections."gateway.install"]
+kind = "custom"
+uri = "http://127.0.0.1:1/v1"
+[connections."gateway.secondary"]
+kind = "custom"
+uri = "http://127.0.0.1:2/v1"
+
+[models."chat.install"]
+capability = "chat"
+provider = "gateway.install"
+model = "install-wide-model"
+[models."chat.secondary"]
+capability = "chat"
+provider = "gateway.secondary"
+model = "default-agent-model"
+"#,
+            )
+            .expect("canonical model fixture parses"),
+            ..Default::default()
         };
-        let mut config = Config::default();
-        // The install-wide first configured model (the openai slot precedes
-        // ollama in slot order) differs from the default agent's entry, so the
-        // assertion proves the agent binding wins over the install-wide pick.
-        config.providers.models.openai.insert(
-            "install".to_string(),
-            OpenAIModelProviderConfig {
-                base: ModelProviderConfig {
-                    model: Some("install-wide-model".to_string()),
-                    ..Default::default()
-                },
-            },
-        );
-        config.providers.models.ollama.insert(
-            "secondary".to_string(),
-            OllamaModelProviderConfig {
-                base: ModelProviderConfig {
-                    model: Some("default-agent-model".to_string()),
-                    ..Default::default()
-                },
-                ..OllamaModelProviderConfig::default()
-            },
-        );
-        config.agents.insert(
-            "first".to_string(),
-            dispatchable_test_agent("openai.install"),
-        );
+        config
+            .agents
+            .insert("first".to_string(), dispatchable_test_agent("chat.install"));
         config.agents.insert(
             "second".to_string(),
-            dispatchable_test_agent("ollama.secondary"),
+            dispatchable_test_agent("chat.secondary"),
         );
         config.acp.default_agent = Some("second".to_string());
 
@@ -6982,16 +6882,20 @@ mod tests {
             data_dir: cwd.to_path_buf(),
             ..Default::default()
         };
-        cfg.providers.models.anthropic.insert(
-            "default".to_string(),
-            zeroclaw_config::schema::AnthropicModelProviderConfig {
-                base: zeroclaw_config::schema::ModelProviderConfig {
-                    model: Some("claude-haiku-4-5".to_string()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        );
+        cfg.providers = toml::from_str(
+            r#"
+[connections."gateway.test"]
+kind = "custom"
+uri = "http://127.0.0.1:1/v1"
+auth = { mode = "api_key", api_key = "test-key" }
+
+[models."chat.test"]
+capability = "chat"
+provider = "gateway.test"
+model = "claude-haiku-4-5"
+"#,
+        )
+        .expect("canonical ACP test provider config parses");
         cfg.risk_profiles.insert(
             "default".to_string(),
             zeroclaw_config::schema::RiskProfileConfig::default(),
@@ -7002,8 +6906,54 @@ mod tests {
         );
         cfg.agents.insert(
             "test-agent".to_string(),
-            dispatchable_test_agent("anthropic.default"),
+            dispatchable_test_agent("chat.test"),
         );
+        cfg
+    }
+
+    fn openrouter_test_providers(api_key: Option<&str>) -> zeroclaw_config::providers::Providers {
+        let auth = api_key.map_or_else(String::new, |key| {
+            format!("auth = {{ mode = \"api_key\", api_key = \"{key}\" }}")
+        });
+        toml::from_str(&format!(
+            r#"
+[connections."gateway.openrouter"]
+kind = "openrouter"
+{auth}
+
+[models."chat.openrouter"]
+capability = "chat"
+provider = "gateway.openrouter"
+model = "test-model"
+"#
+        ))
+        .expect("canonical OpenRouter test provider config parses")
+    }
+
+    /// The carrier regression exercises prompt-guided tool extraction through
+    /// a supplied provider. Keep that parser choice explicit in the canonical
+    /// V4 fixture instead of relying on a provider-family default.
+    fn make_prompt_tool_config(cwd: &std::path::Path) -> Config {
+        let mut cfg = make_test_config(cwd);
+        cfg.providers = toml::from_str(
+            r#"
+[connections."carrier"]
+kind = "custom"
+uri = "http://127.0.0.1:9"
+capabilities = ["chat"]
+
+[models."custom.carrier"]
+capability = "chat"
+provider = "carrier"
+model = "carrier-model"
+options = { extract_text_tool_calls = true }
+"#,
+        )
+        .expect("prompt-tool carrier fixture parses");
+        cfg.agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "custom.carrier".into();
         cfg
     }
 
@@ -7022,14 +6972,20 @@ mod tests {
         );
 
         let mut reloaded = live.snapshot();
-        reloaded
-            .providers
-            .models
-            .anthropic
-            .get_mut("default")
-            .unwrap()
-            .base
-            .model = Some("reloaded-model".to_string());
+        zeroclaw_config::provider_registry::editor::update(&mut reloaded, |registry| {
+            let model = registry
+                .models
+                .get_mut(&zeroclaw_config::provider_registry::ModelRef::from(
+                    "chat.test",
+                ))
+                .expect("canonical ACP test model exists");
+            let zeroclaw_config::provider_registry::ModelDefinition::Chat(model) = model else {
+                anyhow::bail!("canonical ACP test model must be chat");
+            };
+            model.model = Some("reloaded-model".to_string());
+            Ok(())
+        })
+        .expect("reloaded canonical model must be editable");
         live.publish(live.next_revision().unwrap(), reloaded)
             .unwrap();
 
@@ -9083,7 +9039,7 @@ mod tests {
 
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
         let server = Arc::new(AcpServer::new_with_writer_and_store(
-            make_test_config(cwd.path()),
+            make_prompt_tool_config(cwd.path()),
             AcpServerConfig::default(),
             writer_tx,
             Arc::clone(&store),
@@ -9237,7 +9193,7 @@ mod tests {
             zeroclaw_infra::acp_session_store::AcpSessionStore::new(live_cwd.path()).unwrap(),
         );
         let live_server = Arc::new(AcpServer::new_with_store(
-            make_test_config(live_cwd.path()),
+            make_prompt_tool_config(live_cwd.path()),
             AcpServerConfig::default(),
             Arc::clone(&live_store),
         ));
@@ -10537,7 +10493,7 @@ mod tests {
         cfg.agents.insert(
             "finance".to_string(),
             zeroclaw_config::schema::AliasedAgentConfig {
-                model_provider: "anthropic.default".into(),
+                model_provider: "chat.test".into(),
                 risk_profile: "default".into(),
                 runtime_profile: "default".into(),
                 mcp_bundles: vec!["b1".into()],

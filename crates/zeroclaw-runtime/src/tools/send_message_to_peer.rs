@@ -1744,10 +1744,11 @@ mod tests {
         let control_plane = ControlPlaneHandle::open(workspace.path())
             .expect("isolated control plane should initialize");
         let task_store = Arc::clone(&control_plane.store);
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         let authority = crate::LiveConfigAuthority::new(config.clone());
         let lifecycle = authority.agent_lifecycle();
         let tool = SendMessageToPeerTool::new_with_capability(
-            Arc::new(config.clone()),
+            Arc::new(zeroclaw_config::migration::admit_test_input(&config)),
             "sender",
             Some(authority.execution_capability()),
         )
@@ -2009,6 +2010,7 @@ mod tests {
 
         let control_plane = ControlPlaneHandle::open(workspace.path())
             .expect("isolated control plane should initialize");
+        let config = zeroclaw_config::migration::admit_test_input(&config);
         let authority = crate::LiveConfigAuthority::new(config.clone());
         let tool = SendMessageToPeerTool::new_with_capability(
             Arc::new(config.clone()),
@@ -2296,9 +2298,7 @@ mod tests {
     #[tokio::test]
     async fn send_message_to_peer_consumes_action_budget() {
         use axum::{Json, Router, extract::State, routing::post};
-        use zeroclaw_config::schema::{
-            ModelProviderConfig, OllamaModelProviderConfig, RuntimeProfileConfig,
-        };
+        use zeroclaw_config::schema::RuntimeProfileConfig;
 
         async fn respond(State(requests): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
             requests.fetch_add(1, Ordering::SeqCst);
@@ -2324,18 +2324,17 @@ mod tests {
             },
         );
         config.agents.get_mut("recipient").unwrap().model_provider = "ollama.test".into();
-        config.providers.models.ollama.insert(
-            "test".into(),
-            OllamaModelProviderConfig {
-                base: ModelProviderConfig {
-                    model: Some("mock-model".into()),
-                    uri: Some(format!("http://{address}")),
-                    timeout_secs: Some(5),
-                    ..ModelProviderConfig::default()
-                },
-                ..OllamaModelProviderConfig::default()
-            },
-        );
+        config.providers = serde_json::from_value(json!({
+            "connections": {"ollama.test": {
+                "kind": "ollama",
+                "uri": format!("http://{address}"),
+                "api": {"chat": {"request_timeout_secs": 5}}
+            }},
+            "models": {"ollama.test": {
+                "capability": "chat", "provider": "ollama.test", "model": "mock-model"
+            }}
+        }))
+        .expect("canonical peer model fixture");
         let control_plane = ControlPlaneHandle::open(&config.data_dir).expect("task store");
         let task_store = Arc::clone(&control_plane.store);
         let authority = crate::LiveConfigAuthority::new(config.clone());
@@ -2384,7 +2383,7 @@ mod tests {
         })
         .await
         .expect("recipient completes through the local provider");
-        assert_eq!(terminal.task.status, TaskStatus::Completed);
+        assert_eq!(terminal.task.status, TaskStatus::Completed, "{terminal:?}");
         assert_eq!(terminal.output.as_deref(), Some("peer received"));
         assert_eq!(requests.load(Ordering::SeqCst), 1);
 
