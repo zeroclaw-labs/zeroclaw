@@ -3061,6 +3061,7 @@ url = "http://localhost:6333"
         let tmp = TempDir::new().unwrap();
         let mut config = agent_config(&tmp);
         config.memory.audit_enabled = true;
+        config.memory.retrieval_stages = vec!["cache".into()];
         config.agents.insert("peer".into(), Default::default());
         config
             .agents
@@ -3138,9 +3139,20 @@ url = "http://localhost:6333"
                 .superseded_by
                 .is_none()
         );
+        // Warm this handle after the last rejected write; check it again before
+        // another operation can clear the cache or a reopen can replace it.
+        let before = owner.recall("parcel", 10, None, None, None).await?;
+        assert!(before.iter().any(|e| e.id == old.id));
         owner
             .supersede(std::slice::from_ref(&old.id), &new.key)
             .await?;
+        let after = owner.recall("parcel", 10, None, None, None).await?;
+        assert!(
+            !after.iter().any(|e| e.id == old.id),
+            "stale recall after supersede"
+        );
+        assert!(after.iter().any(|e| e.id == new.id));
+        assert!(after.iter().any(|e| e.id == foreign.id));
         assert!(
             owner
                 .supersede(std::slice::from_ref(&new.id), &old.id)
