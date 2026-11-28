@@ -1,5 +1,6 @@
 //! Paginated stream reader for the JSONL log file.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -7,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
 
 use crate::event::LogEvent;
@@ -37,6 +39,28 @@ pub struct LogFilter {
     /// Per-attribution-field exact-match constraints. Key is any
     /// `zeroclaw.*` attribution name. Empty map = no attribution filter.
     pub field_eq: BTreeMap<String, String>,
+}
+
+struct PreparedFilter<'a> {
+    filter: &'a LogFilter,
+    needle: Option<String>,
+    since: Option<DateTime<FixedOffset>>,
+    until: Option<DateTime<FixedOffset>>,
+}
+
+impl<'a> PreparedFilter<'a> {
+    fn new(filter: &'a LogFilter) -> Self {
+        Self {
+            filter,
+            needle: filter.q.as_deref().map(str::to_ascii_lowercase),
+            since: filter.since_ts.as_deref().and_then(parse_timestamp),
+            until: filter.until_ts.as_deref().and_then(parse_timestamp),
+        }
+    }
+}
+
+fn parse_timestamp(value: &str) -> Option<DateTime<FixedOffset>> {
+    DateTime::parse_from_rfc3339(value).ok()
 }
 
 /// Segment-aware pagination cursor.
@@ -243,7 +267,7 @@ pub fn load_page(path: &Path, filter: &LogFilter, limit: usize) -> Result<LogPag
     let mut reader = BufReader::new(file);
 
     let mut window: VecDeque<(LogEvent, u64)> = VecDeque::with_capacity(limit + 1);
-    let needle = filter.q.as_deref().map(|s| s.to_ascii_lowercase());
+    let prepared = PreparedFilter::new(filter);
     // `dropped_older` records whether we ever pushed past `limit` and
     // had to evict the oldest matching event. If false at the end, every
     // matching event in the file is in `window` — meaning there are no
@@ -302,7 +326,7 @@ pub fn load_page(path: &Path, filter: &LogFilter, limit: usize) -> Result<LogPag
             }
         };
 
-        if !matches_filter(&event, filter, needle.as_deref()) {
+        if !matches_filter(&event, &prepared) {
             continue;
         }
 
@@ -343,12 +367,25 @@ pub fn load_page(path: &Path, filter: &LogFilter, limit: usize) -> Result<LogPag
     })
 }
 
-fn matches_filter(event: &LogEvent, filter: &LogFilter, needle: Option<&str>) -> bool {
+fn matches_filter(event: &LogEvent, prepared: &PreparedFilter<'_>) -> bool {
+    let filter = prepared.filter;
     if filter.hide_internal && event.event.category == "internal" {
         return false;
     }
+    let event_time = if prepared.since.is_some() || prepared.until.is_some() {
+        parse_timestamp(&event.timestamp)
+    } else {
+        None
+    };
+    let compare_timestamp = |bound: &str, parsed| {
+        // Keep the old comparison for legacy values that cannot be parsed.
+        event_time.zip(parsed).map_or_else(
+            || event.timestamp.as_str().cmp(bound),
+            |(time, bound)| time.cmp(&bound),
+        )
+    };
     if let Some(ref since) = filter.since_ts
-        && event.timestamp.as_str() < since.as_str()
+        && compare_timestamp(since, prepared.since) == Ordering::Less
     {
         return false;
     }
@@ -356,16 +393,16 @@ fn matches_filter(event: &LogEvent, filter: &LogFilter, needle: Option<&str>) ->
         // Cursor pagination: include events strictly older than the
         // cursor. If the timestamps tie, fall back to id ordering for
         // deterministic pagination.
-        match event.timestamp.as_str().cmp(until.as_str()) {
-            std::cmp::Ordering::Greater => return false,
-            std::cmp::Ordering::Equal => {
+        match compare_timestamp(until, prepared.until) {
+            Ordering::Greater => return false,
+            Ordering::Equal => {
                 if let Some(ref until_id) = filter.until_id
                     && event.id.as_str() >= until_id.as_str()
                 {
                     return false;
                 }
             }
-            std::cmp::Ordering::Less => {}
+            Ordering::Less => {}
         }
     }
     if let Some(ref action) = filter.action
@@ -398,7 +435,7 @@ fn matches_filter(event: &LogEvent, filter: &LogFilter, needle: Option<&str>) ->
     {
         return false;
     }
-    if let Some(n) = needle {
+    if let Some(n) = prepared.needle.as_deref() {
         let hay_msg = event.message.as_deref().unwrap_or("").to_ascii_lowercase();
         let hay_attrs = event.attributes.to_string().to_ascii_lowercase();
         if !hay_msg.contains(n) && !hay_attrs.contains(n) {
@@ -774,8 +811,7 @@ pub(crate) fn enumerate_segment_metas(
 /// below it, which is how a cursor excludes the page it already returned.
 fn scan_segment(
     seg: &SegmentMeta,
-    filter: &LogFilter,
-    needle: Option<&str>,
+    prepared: &PreparedFilter<'_>,
     limit: usize,
     until_off: Option<u64>,
     window: &mut VecDeque<(LogEvent, SegmentRef, u64)>,
@@ -862,7 +898,7 @@ fn scan_segment(
             }
         };
 
-        if !matches_filter(&event, filter, needle) {
+        if !matches_filter(&event, prepared) {
             continue;
         }
 
@@ -1128,8 +1164,7 @@ fn find_anchor_offset(seg: &SegmentMeta, anchor_id: &str, unreadable: &mut bool)
 #[allow(deprecated)]
 fn do_scan(
     segs: &[SegmentMeta],
-    filter: &LogFilter,
-    needle: Option<&str>,
+    prepared: &PreparedFilter<'_>,
     limit: usize,
     cursor_idx: usize,
     cursor_off: Option<u64>,
@@ -1150,8 +1185,7 @@ fn do_scan(
         let until_off = if i == cursor_idx { cursor_off } else { None };
         scan_segment(
             seg,
-            filter,
-            needle,
+            prepared,
             limit,
             until_off,
             &mut window,
@@ -1311,7 +1345,7 @@ pub fn query_log_page(
     segment_cursor: Option<&SegmentCursor>,
 ) -> Result<LogPage> {
     let limit = limit.clamp(1, 10_000);
-    let needle = filter.q.as_deref().map(|s| s.to_ascii_lowercase());
+    let prepared = PreparedFilter::new(filter);
 
     for _ in 0..MAX_SNAPSHOT_ATTEMPTS {
         let mut unreadable = false;
@@ -1339,8 +1373,7 @@ pub fn query_log_page(
 
         let page = do_scan(
             &segs,
-            filter,
-            needle.as_deref(),
+            &prepared,
             limit,
             cursor_idx,
             cursor_off,
@@ -1722,6 +1755,50 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(load_page(&path, &filter, 10).unwrap().events.len(), 0);
+    }
+
+    #[test]
+    fn timestamp_bounds_compare_instants_in_both_readers() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("trace.jsonl");
+        let events = [
+            ("before", "2026-05-15T18:59:59.999Z"),
+            ("at-start", "2026-05-15T19:00:00.000Z"),
+            ("inside", "2026-05-15T19:00:00.500Z"),
+            ("at-end-a", "2026-05-15T19:00:01.000Z"),
+            ("at-end-z", "2026-05-15T19:00:01.000Z"),
+            ("after", "2026-05-15T19:00:01.001Z"),
+        ]
+        .map(|(id, timestamp)| {
+            let mut event = make_event("test", None);
+            event.id = id.into();
+            event.timestamp = timestamp.into();
+            event
+        });
+        write_jsonl(&path, &events);
+
+        let ids = |page: LogPage| -> Vec<String> {
+            page.events.into_iter().map(|event| event.id).collect()
+        };
+        let control = ids(load_page(&path, &LogFilter::default(), 10).unwrap());
+        assert_eq!(
+            control,
+            [
+                "after", "at-end-z", "at-end-a", "inside", "at-start", "before"
+            ]
+        );
+
+        let filter = LogFilter {
+            since_ts: Some("2026-05-15T19:00:00Z".into()),
+            until_ts: Some("2026-05-15T21:00:01+02:00".into()),
+            until_id: Some("at-end-m".into()),
+            ..Default::default()
+        };
+        let single = ids(load_page(&path, &filter, 10).unwrap());
+        let segmented = ids(query_log_page(&path, true, &filter, 10, None).unwrap());
+        println!("unfiltered={control:?}, single={single:?}, segmented={segmented:?}");
+        assert_eq!(single, ["at-end-a", "inside", "at-start"]);
+        assert_eq!(segmented, single);
     }
 
     #[test]
