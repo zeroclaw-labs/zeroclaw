@@ -2867,6 +2867,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_usage_is_not_granted_by_a_scoped_chat() {
+        use crate::api_codex_usage as usage;
+        let fixture = Fixture::new().await;
+        let addr = serve(fixture.router()).await;
+        let (alice, _) = fixture.sign_in("alice").await;
+        let mut socket = open_chat(addr, &alice, "support", "scoped-usage")
+            .await
+            .expect("alice may chat with support");
+        await_frame(&mut socket, "session_start").await;
+        socket
+            .send(ClientMessage::Text(
+                json!({"type": "connect"}).to_string().into(),
+            ))
+            .await
+            .unwrap();
+        await_frame(&mut socket, "connected").await;
+        socket
+            .send(ClientMessage::Text(
+                json!({"type": usage::REQUEST, "request_id": 10})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            await_frame(&mut socket, "codex_usage").await,
+            usage::unavailable(10, "not_permitted")
+        );
+    }
+
+    #[tokio::test]
     async fn a_scoped_chat_runs_as_its_principal_and_only_they_see_it() {
         let fixture = Fixture::new().await;
         let router = fixture.router();

@@ -32,7 +32,9 @@ class FakeWebSocket {
     FakeWebSocket.instances.push(this);
   }
 
-  send(): void {}
+  readonly sent: string[] = [];
+  send(value: string): void { this.sent.push(value); }
+  serverMessage(frame: unknown): void { this.onmessage?.({ data: JSON.stringify(frame) }); }
 
   close(): void {
     this.serverClose(1000);
@@ -250,6 +252,55 @@ test("a disconnected socket ignores a resume", async () => {
   fakeWindow.dispatchEvent(new Event(auth.AUTH_EVENTS.resumed));
   await settle();
   assert.equal(FakeWebSocket.instances.length, 1);
+});
+
+test("Codex usage sends only a request id on the matching chat socket and drops superseded replies", async () => {
+  auth.setToken("synthetic-device");
+  const client = newClient();
+  client.connect();
+  const socket = lastSocket();
+  socket.readyState = FakeWebSocket.OPEN;
+  assert.equal(await client.checkCodexUsage("not-s1"), null);
+  assert.deepEqual(socket.sent, []);
+  const first = client.checkCodexUsage("s1");
+  const second = client.checkCodexUsage("s1");
+  assert.deepEqual(socket.sent.map((text) => JSON.parse(text)), [
+    { type: "check_codex_usage", request_id: 1 },
+    { type: "check_codex_usage", request_id: 2 },
+  ]);
+  assert.equal(await first, null);
+  const chatEvents: unknown[] = [];
+  client.onMessage = (event) => { chatEvents.push(event); };
+  socket.serverMessage({ type: "codex_usage", request_id: 1, status: "ok" });
+  const reply = { type: "codex_usage", request_id: 2, status: "unavailable", reason: "route_unavailable" };
+  socket.serverMessage(reply);
+  assert.deepEqual(await second, reply);
+  assert.deepEqual(chatEvents, [], "usage frames are not chat events");
+  client.disconnect();
+});
+
+test("Codex usage drops a reply when the socket's bearer or administrator grant changed", async () => {
+  auth.setToken("synthetic-old-device");
+  const paired = newClient();
+  paired.connect();
+  lastSocket().readyState = FakeWebSocket.OPEN;
+  const oldBearer = paired.checkCodexUsage("s1");
+  auth.setToken("synthetic-new-device");
+  lastSocket().serverMessage({ type: "codex_usage", request_id: 1, status: "ok" });
+  assert.equal(await oldBearer, null);
+  paired.disconnect();
+
+  auth.setOidcSession(session);
+  const signedIn = newClient();
+  signedIn.connect();
+  lastSocket().readyState = FakeWebSocket.OPEN;
+  const oldAdmin = signedIn.checkCodexUsage("s1");
+  auth.setOidcSession({ ...session, admin: false, features: { chat: true, operator_pages: false } });
+  lastSocket().serverMessage({ type: "codex_usage", request_id: 1, status: "ok" });
+  assert.equal(await oldAdmin, null);
+  assert.equal(await signedIn.checkCodexUsage("s1"), null);
+  assert.equal(lastSocket().sent.length, 1);
+  signedIn.disconnect();
 });
 
 // ---------------------------------------------------------------------------

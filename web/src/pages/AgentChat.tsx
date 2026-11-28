@@ -27,6 +27,7 @@ import ApprovalBanner from '@/components/ApprovalBanner';
 import { resolveContextBarState } from '@/lib/contextBar';
 import SessionPicker from '@/components/SessionPicker';
 import { isNearBottom } from './agentChatScroll';
+import CodexUsage from '@/components/CodexUsage';
 
 const DRAFT_KEY_PREFIX = 'agent-chat';
 
@@ -165,9 +166,11 @@ export interface AgentChatStatus {
 export function AgentChatInner({
   agentAlias,
   onStatus,
+  visible = true,
 }: {
   agentAlias: string;
   onStatus?: (s: AgentChatStatus) => void;
+  visible?: boolean;
 }) {
   const {
     messages,
@@ -186,6 +189,8 @@ export function AgentChatInner({
     currentModel,
     availableModels,
     switchModel,
+    checkCodexUsage,
+    modelInfoVersion,
     modelLoading,
     deleteMessage,
     clearAllMessages,
@@ -775,6 +780,19 @@ export function AgentChatInner({
         <div className="flex items-center justify-between gap-2 min-w-0 w-full @xl/chat-header:w-auto ms-auto">
           {/* Nothing to list or reopen when each socket is its own conversation. */}
           {!conversationPerSocket && <SessionPicker agentAlias={agentAlias} />}
+
+          {/* Operator-only: the shared server account's usage, on demand. */}
+          {operator && visible && !conversationPerSocket && (
+            <CodexUsage
+              agentAlias={agentAlias}
+              modelInfoVersion={modelInfoVersion}
+              switching={modelLoading}
+              connected={connected}
+              busy={typing}
+              sessionId={sessionId}
+              fetchUsage={checkCodexUsage}
+            />
+          )}
 
           {operator ? (
             <div className="relative min-w-0" ref={modelDropdownRef}>

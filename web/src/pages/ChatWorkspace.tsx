@@ -366,7 +366,7 @@ export default function ChatWorkspace({ initialAlias, allowedAliases }: ChatWork
                 reservedSessionIds={reservedByKey[tab.key]}
                 onSessionChange={onSessionChangeFor(tab.key)}
               >
-                <AgentChatInner agentAlias={tab.alias} onStatus={onStatusFor(tab.key)} />
+                <AgentChatInner agentAlias={tab.alias} onStatus={onStatusFor(tab.key)} visible={visible} />
               </AgentProvider>
             </div>
           );

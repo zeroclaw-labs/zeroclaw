@@ -143,6 +143,16 @@ impl Default for AuthProfilesData {
     }
 }
 
+/// Result of checking the selected profile without decoding other credentials.
+pub(crate) enum OAuthAccessSnapshot {
+    NotOAuth,
+    MissingAccessToken,
+    Access {
+        account_id: Option<String>,
+        tokens: TokenSet,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct AuthProfilesStore {
     path: PathBuf,
@@ -168,9 +178,68 @@ impl AuthProfilesStore {
         self.load_locked().await
     }
 
+    /// Select and read one OAuth profile from the same on-disk snapshot.
+    /// Writers replace the file atomically. No lock, secret migration, or
+    /// decoding of refresh, ID, generic, or unrelated credentials is needed.
+    pub(super) async fn read_oauth_access_only(
+        &self,
+        model_provider: &str,
+        profile_override: Option<&str>,
+    ) -> Result<Option<OAuthAccessSnapshot>> {
+        let persisted = self.read_persisted_snapshot().await?;
+        let Some(profile_id) = super::select_profile_id_from(
+            &persisted.active_profiles,
+            &persisted.profiles,
+            |profile| &profile.model_provider,
+            model_provider,
+            profile_override,
+        ) else {
+            return Ok(None);
+        };
+        let Some(p) = persisted.profiles.get(&profile_id) else {
+            return Ok(None);
+        };
+        if p.model_provider != model_provider {
+            return Ok(None);
+        }
+        if parse_profile_kind(&p.kind)? != AuthProfileKind::OAuth {
+            return Ok(Some(OAuthAccessSnapshot::NotOAuth));
+        }
+        let Some(stored_access) = p.access_token.as_deref().filter(|v| !v.trim().is_empty()) else {
+            return Ok(Some(OAuthAccessSnapshot::MissingAccessToken));
+        };
+        // Usage lookups only accept plaintext or locally encrypted tokens; an
+        // external reference must never reach a resolver or spawn a subprocess.
+        if SecretStore::is_onepassword_ref(stored_access) {
+            return Err(anyhow::Error::msg(
+                "external secret references are not supported for the selected access credential",
+            ));
+        }
+        let access_token = self
+            .secret_store
+            .decrypt(stored_access)
+            .map_err(|_| anyhow::Error::msg("failed to decode the selected access credential"))?;
+        if access_token.trim().is_empty() {
+            return Ok(Some(OAuthAccessSnapshot::MissingAccessToken));
+        }
+        let expires_at = parse_optional_datetime(p.expires_at.as_deref())
+            .map_err(|_| anyhow::Error::msg("invalid expiry on the selected profile"))?;
+        Ok(Some(OAuthAccessSnapshot::Access {
+            account_id: p.account_id.clone(),
+            tokens: TokenSet {
+                access_token,
+                refresh_token: None,
+                id_token: None,
+                expires_at,
+                token_type: None,
+                scope: None,
+            },
+        }))
+    }
+
     pub async fn list_profile_ids(&self) -> Result<Vec<String>> {
         let _lock = self.acquire_lock().await?;
-        let persisted = self.read_persisted_locked().await?;
+        let persisted = self.read_persisted_snapshot().await?;
         Ok(persisted.profiles.into_keys().collect())
     }
 
@@ -259,7 +328,7 @@ impl AuthProfilesStore {
     }
 
     async fn load_locked(&self) -> Result<AuthProfilesData> {
-        let mut persisted = self.read_persisted_locked().await?;
+        let mut persisted = self.read_persisted_snapshot().await?;
         let mut migrated = false;
 
         let mut profiles = BTreeMap::new();
@@ -398,7 +467,7 @@ impl AuthProfilesStore {
         self.write_persisted_locked(&persisted).await
     }
 
-    async fn read_persisted_locked(&self) -> Result<PersistedAuthProfiles> {
+    async fn read_persisted_snapshot(&self) -> Result<PersistedAuthProfiles> {
         if !self.path.exists() {
             return Ok(PersistedAuthProfiles::default());
         }
@@ -760,6 +829,99 @@ mod tests {
         assert!(raw.contains("enc2:"));
         assert!(!raw.contains("refresh-123"));
         assert!(!raw.contains("access-123"));
+    }
+
+    #[tokio::test]
+    async fn read_oauth_access_only_leaves_encrypted_store_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), true);
+        let profile = AuthProfile::new_oauth(
+            "openai-codex",
+            "default",
+            TokenSet {
+                access_token: "fake-access".into(),
+                refresh_token: Some("fake-refresh".into()),
+                id_token: Some("fake-id-token".into()),
+                expires_at: None,
+                token_type: None,
+                scope: None,
+            },
+        );
+        store.upsert_profile(profile, true).await.unwrap();
+        let before = tokio::fs::read(store.path()).await.unwrap();
+
+        // A writer holding the lock must not block this read-only path.
+        let _lock = store.acquire_lock().await.unwrap();
+        let loaded = store
+            .read_oauth_access_only("openai-codex", None)
+            .await
+            .unwrap()
+            .unwrap();
+        let OAuthAccessSnapshot::Access { tokens, .. } = loaded else {
+            panic!("expected selected OAuth access token");
+        };
+        assert_eq!(tokens.access_token, "fake-access");
+        assert!(tokens.refresh_token.is_none());
+        assert!(tokens.id_token.is_none());
+        assert_eq!(tokio::fs::read(store.path()).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn read_oauth_access_only_rejects_external_secret_refs_without_resolving() {
+        // The malformed ref makes any resolver attempt fail validation before
+        // `op` could be spawned, so no subprocess is ever run by this test.
+        // Only the dedicated rejection message proves the guard ran first.
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        let profile = AuthProfile::new_oauth(
+            "openai-codex",
+            "default",
+            TokenSet {
+                access_token: "op://vault-only".into(),
+                refresh_token: Some("fake-refresh".into()),
+                id_token: None,
+                expires_at: None,
+                token_type: None,
+                scope: None,
+            },
+        );
+        store.upsert_profile(profile, true).await.unwrap();
+        let before = tokio::fs::read(store.path()).await.unwrap();
+
+        let Err(err) = store.read_oauth_access_only("openai-codex", None).await else {
+            panic!("expected the external reference to be rejected");
+        };
+        let err = err.to_string();
+        assert!(err.contains("external secret references are not supported"));
+        assert!(!err.contains("op://"));
+        assert_eq!(tokio::fs::read(store.path()).await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn read_oauth_access_only_reads_plaintext_access_token() {
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        let profile = AuthProfile::new_oauth(
+            "openai-codex",
+            "default",
+            TokenSet {
+                access_token: "fake-plain-access".into(),
+                refresh_token: None,
+                id_token: None,
+                expires_at: None,
+                token_type: None,
+                scope: None,
+            },
+        );
+        store.upsert_profile(profile, true).await.unwrap();
+        let Some(OAuthAccessSnapshot::Access { tokens, .. }) = store
+            .read_oauth_access_only("openai-codex", None)
+            .await
+            .unwrap()
+        else {
+            panic!("expected plaintext access token");
+        };
+        assert_eq!(tokens.access_token, "fake-plain-access");
     }
 
     #[tokio::test]

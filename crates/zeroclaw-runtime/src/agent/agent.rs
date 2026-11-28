@@ -1798,6 +1798,57 @@ impl Agent {
         )
     }
 
+    /// The installed single primary route and the config that built it. Unlike
+    /// turn attribution this is not a serving/fallback prediction. An adapter
+    /// doing a pre-turn account lookup must not choose a default when routing
+    /// can instead depend on the next prompt.
+    pub fn fixed_primary_route(&self) -> Option<(&zeroclaw_config::schema::Config, &str)> {
+        let config = self.full_config()?;
+        let effort_routing = config
+            .resolved_agent_config(&self.agent_alias)
+            .as_ref()
+            .map_or_else(
+                || self.config.resolved.effort_routing.is_some(),
+                |agent| agent.resolved.effort_routing.is_some(),
+            );
+        if self.supplied_capabilities.is_some() || self.model_provider_name.is_empty() {
+            return None;
+        }
+        Self::is_fixed_primary(
+            config,
+            &self.model_name,
+            self.automatic_model_routing && effort_routing,
+            self.config.resolved.auto_classify.is_some() || self.classification_config.enabled,
+        )
+        .then_some((config, self.model_provider_name.as_str()))
+    }
+
+    /// Resolve the primary route of a native agent that has not been built yet.
+    /// Use only when the session does not supply a route override. This reads
+    /// configuration, not credentials, and does not construct the agent.
+    pub fn configured_fixed_primary_route<'a>(config: &'a Config, alias: &str) -> Option<&'a str> {
+        let agent = config.agent(alias).filter(|agent| agent.enabled)?;
+        let (_, _, provider) = config.resolved_model_provider_for_agent(alias)?;
+        let model = provider
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())?;
+        let runtime = config.runtime_profile_for_agent(alias);
+        Self::is_fixed_primary(
+            config,
+            model,
+            runtime.is_some_and(|profile| profile.effort_routing.is_some()),
+            runtime.is_some_and(|profile| profile.auto_classify.is_some())
+                || config.query_classification.enabled,
+        )
+        .then_some(agent.model_provider.as_str())
+    }
+
+    fn is_fixed_primary(config: &Config, model: &str, effort: bool, classify: bool) -> bool {
+        !(effort || model.starts_with("hint:") || (classify && !config.model_routes.is_empty()))
+    }
+
     /// Capacity and proactive-trim budget for the currently selected route.
     /// This is resolved on demand so a model/provider switch cannot leave a
     /// stale snapshot in a long-lived session.
@@ -22238,6 +22289,116 @@ model_provider = "custom.only"
         assert_eq!(
             target_capture.authorization.lock().as_deref(),
             Some("Bearer target-secret")
+        );
+    }
+
+    #[test]
+    fn codex_usage_route_before_agent_construction_requires_a_fixed_configured_primary() {
+        use zeroclaw_config::schema::{
+            ModelProviderConfig, ModelRouteConfig, OpenAIModelProviderConfig,
+        };
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "configured".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("fixture-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        let test_agent = |route: &str| zeroclaw_config::schema::AliasedAgentConfig {
+            model_provider: route.into(),
+            runtime_profile: "fixture".into(),
+            ..Default::default()
+        };
+        config
+            .agents
+            .insert("web".into(), test_agent("openai.configured"));
+        config
+            .agents
+            .insert("unresolved".into(), test_agent("openai.missing"));
+        config
+            .runtime_profiles
+            .insert("fixture".into(), Default::default());
+        assert_eq!(
+            Agent::configured_fixed_primary_route(&config, "web"),
+            Some("openai.configured")
+        );
+        assert!(Agent::configured_fixed_primary_route(&config, "unresolved").is_none());
+        assert!(Agent::configured_fixed_primary_route(&config, "missing").is_none());
+        config.agents.get_mut("web").unwrap().enabled = false;
+        assert!(Agent::configured_fixed_primary_route(&config, "web").is_none());
+        config.agents.get_mut("web").unwrap().enabled = true;
+        config
+            .runtime_profiles
+            .get_mut("fixture")
+            .unwrap()
+            .effort_routing = Some(Default::default());
+        assert!(Agent::configured_fixed_primary_route(&config, "web").is_none());
+        config
+            .runtime_profiles
+            .get_mut("fixture")
+            .unwrap()
+            .effort_routing = None;
+        config.query_classification.enabled = true;
+        config.model_routes.push(ModelRouteConfig {
+            hint: "reasoning".into(),
+            model_provider: "openai.configured".into(),
+            model: "other-model".into(),
+            ..Default::default()
+        });
+        assert!(Agent::configured_fixed_primary_route(&config, "web").is_none());
+        config.query_classification.enabled = false;
+        config
+            .providers
+            .models
+            .openai
+            .get_mut("configured")
+            .unwrap()
+            .base
+            .model = Some("hint:reasoning".into());
+        assert!(Agent::configured_fixed_primary_route(&config, "web").is_none());
+    }
+
+    #[test]
+    fn codex_usage_route_follows_an_installed_switch_and_refuses_unknown_selection() {
+        let config = Arc::new(Config::default());
+        let mut agent = build_test_agent(
+            "openai.configured",
+            "fixture-model",
+            Some(ProviderSwitchConfig {
+                config: Some(Arc::clone(&config)),
+                live_config: None,
+                live: None,
+            }),
+        );
+        let (installed, route) = agent.fixed_primary_route().expect("fixed route");
+        assert!(std::ptr::eq(installed, config.as_ref()));
+        assert_eq!(route, "openai.configured");
+        // Rebuilding a local, native provider establishes the actual switch
+        // without a request or a Codex account lookup.
+        assert_eq!(
+            agent
+                .try_apply_model_switch(
+                    "fixture-model",
+                    None,
+                    "ollama".into(),
+                    "fixture-local".into(),
+                )
+                .as_deref(),
+            Some("fixture-local")
+        );
+        assert_eq!(
+            agent.fixed_primary_route().map(|(_, route)| route),
+            Some("ollama")
+        );
+        agent.set_model_name("hint:unknown".into());
+        assert!(agent.fixed_primary_route().is_none());
+        assert!(
+            build_test_agent("openai.configured", "fixture-model", None)
+                .fixed_primary_route()
+                .is_none()
         );
     }
 

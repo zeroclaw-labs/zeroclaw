@@ -9,10 +9,11 @@ pub mod xai_oauth;
 use crate::auth::oauth_common::{RefreshAttemptError, RefreshRetryPolicy, refresh_with_retries};
 use crate::auth::openai_oauth::refresh_access_token;
 use crate::auth::profiles::{
-    AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore, TokenSet, profile_id,
+    AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore, OAuthAccessSnapshot,
+    TokenSet, profile_id,
 };
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -52,6 +53,25 @@ impl AuthService {
 
     pub async fn load_profiles(&self) -> Result<AuthProfilesData> {
         self.store.load().await
+    }
+
+    /// Read-only lookup of one persisted OAuth profile for `model_provider`,
+    /// using the canonical selection rules ([`select_profile_id`]).
+    ///
+    /// Only the selected profile's access token is decrypted: no lock file,
+    /// no secret-migration write, no refresh, and no other credential is
+    /// decoded. An explicit override that does not exist, or that names a
+    /// profile of a different provider (e.g. a full `other:name` id), yields
+    /// `None`, never another profile.
+    pub(crate) async fn get_oauth_profile_access_only(
+        &self,
+        model_provider: &str,
+        profile_override: Option<&str>,
+    ) -> Result<Option<OAuthAccessSnapshot>> {
+        let model_provider = normalize_model_provider(model_provider)?;
+        self.store
+            .read_oauth_access_only(&model_provider, profile_override)
+            .await
     }
 
     /// Read-only listing of persisted profile IDs (no decrypt, no migration).
@@ -678,28 +698,41 @@ pub fn select_profile_id(
     model_provider: &str,
     profile_override: Option<&str>,
 ) -> Option<String> {
+    select_profile_id_from(
+        &data.active_profiles,
+        &data.profiles,
+        |profile| &profile.model_provider,
+        model_provider,
+        profile_override,
+    )
+}
+
+fn select_profile_id_from<P>(
+    active_profiles: &BTreeMap<String, String>,
+    profiles: &BTreeMap<String, P>,
+    provider_of: impl Fn(&P) -> &str,
+    model_provider: &str,
+    profile_override: Option<&str>,
+) -> Option<String> {
     if let Some(override_profile) = profile_override {
         let requested = resolve_requested_profile_id(model_provider, override_profile);
-        if data.profiles.contains_key(&requested) {
-            return Some(requested);
-        }
-        return None;
+        return profiles.contains_key(&requested).then_some(requested);
     }
 
-    if let Some(active) = data.active_profiles.get(model_provider)
-        && data.profiles.contains_key(active)
+    if let Some(active) = active_profiles.get(model_provider)
+        && profiles.contains_key(active)
     {
         return Some(active.clone());
     }
 
     let default = default_profile_id(model_provider);
-    if data.profiles.contains_key(&default) {
+    if profiles.contains_key(&default) {
         return Some(default);
     }
 
-    data.profiles
+    profiles
         .iter()
-        .find_map(|(id, profile)| (profile.model_provider == model_provider).then(|| id.clone()))
+        .find_map(|(id, profile)| (provider_of(profile) == model_provider).then(|| id.clone()))
 }
 
 async fn refresh_openai_access_token_with_retries(

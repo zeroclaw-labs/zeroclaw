@@ -1,5 +1,5 @@
 import type { ApprovalDecision, WsMessage } from '../types/api';
-import { AUTH_EVENTS, getToken, isReauthPending } from './auth';
+import { AUTH_EVENTS, getOidcSession, getToken, isReauthPending } from './auth';
 import { apiOrigin, basePath } from './basePath';
 import { isTauri } from './tauri';
 
@@ -68,6 +68,13 @@ export function routeSessionClose(code: number): boolean {
 
 export class WebSocketClient {
   private ws: WebSocket | null = null;
+  private codexUsageId = 0;
+  private codexUsage: {
+    socket: WebSocket;
+    id: number;
+    finish: (value: unknown) => void;
+  } | null = null;
+  private codexCredentialCurrent: (() => boolean) | null = null;
   private currentDelay: number;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private intentionallyClosed = false;
@@ -120,7 +127,19 @@ export class WebSocketClient {
 
     const protocols: string[] = ['zeroclaw.v1'];
     if (token) protocols.push(`bearer.${token}`);
-    this.ws = new WebSocket(url, protocols);
+    this.codexUsage?.finish(null);
+    const session = getOidcSession();
+    const socket = new WebSocket(url, protocols);
+    // Keep account checks bound to the credentials of this socket, even if the
+    // page learned of an account change before the socket closed.
+    this.codexCredentialCurrent = () => {
+      if (isReauthPending()) return false;
+      const current = getOidcSession();
+      if (!session) return current === null && getToken() === token;
+      return session.admin && current?.admin === true &&
+        current.principal_id === session.principal_id && current.csrf_token === session.csrf_token;
+    };
+    this.ws = socket;
 
     this.ws.onopen = () => {
       this.currentDelay = this.reconnectDelay;
@@ -129,14 +148,22 @@ export class WebSocketClient {
 
     this.ws.onmessage = (ev: MessageEvent) => {
       try {
-        const msg = JSON.parse(ev.data) as WsMessage;
-        this.onMessage?.(msg);
+        const msg = JSON.parse(ev.data);
+        if (msg?.type === 'codex_usage') {
+          const pending = this.codexUsage;
+          if (pending?.socket === socket && pending.id === msg.request_id) {
+            pending.finish(this.codexCredentialCurrent?.() ? msg : null);
+          }
+          return;
+        }
+        this.onMessage?.(msg as WsMessage);
       } catch {
         // Ignore non-JSON frames
       }
     };
 
     this.ws.onclose = (ev: CloseEvent) => {
+      if (this.codexUsage?.socket === socket) this.codexUsage.finish(null);
       this.onClose?.(ev);
       if (this.intentionallyClosed) return;
       // Retrying on a timer would only hit the limit again; the owner calls
@@ -150,8 +177,34 @@ export class WebSocketClient {
     };
 
     this.ws.onerror = (ev: Event) => {
+      if (this.codexUsage?.socket === socket) this.codexUsage.finish(null);
       this.onError?.(ev);
     };
+  }
+
+  /** Ask this chat's server-side Agent, not a caller-supplied route. */
+  checkCodexUsage(expectedSessionId: string): Promise<unknown> {
+    const socket = this.ws;
+    if (expectedSessionId !== this.sessionId || !socket || socket.readyState !== WebSocket.OPEN ||
+        !this.codexCredentialCurrent?.()) {
+      return Promise.resolve(null);
+    }
+    this.codexUsage?.finish(null);
+    const id = ++this.codexUsageId;
+    return new Promise((resolve) => {
+      const finish = (value: unknown) => {
+        clearTimeout(timeout);
+        this.codexUsage = null;
+        resolve(value);
+      };
+      const timeout = setTimeout(() => finish(null), 12_000);
+      this.codexUsage = { id, socket, finish };
+      try {
+        socket.send(JSON.stringify({ type: 'check_codex_usage', request_id: id }));
+      } catch {
+        finish(null);
+      }
+    });
   }
 
   /** Send a chat message to the agent. */
@@ -178,6 +231,8 @@ export class WebSocketClient {
   /** Close the connection without auto-reconnecting. */
   disconnect(): void {
     this.intentionallyClosed = true;
+    this.codexUsage?.finish(null);
+    this.codexCredentialCurrent = null;
     this.haltedForAuth = false;
     this.clearReconnectTimer();
     window.removeEventListener(AUTH_EVENTS.resumed, this.handleAuthResumed);

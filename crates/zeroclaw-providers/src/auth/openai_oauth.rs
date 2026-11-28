@@ -366,13 +366,22 @@ pub fn parse_code_from_redirect(input: &str, expected_state: Option<&str>) -> Re
     }
 }
 
-pub fn extract_account_id_from_jwt(token: &str) -> Option<String> {
+/// Strict variant of [`extract_account_id_from_jwt`]: only the explicit
+/// `chatgpt_account_id` claims, with none of the generic `sub`/`acct`
+/// fallbacks, so it can be compared against a stored account id.
+pub fn extract_chatgpt_account_id_from_jwt(token: &str) -> Option<String> {
+    explicit_chatgpt_account_id(&decode_jwt_claims(token)?)
+}
+
+fn decode_jwt_claims(token: &str) -> Option<serde_json::Value> {
     let payload = token.split('.').nth(1)?;
     let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload)
         .ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    serde_json::from_slice(&decoded).ok()
+}
 
+fn explicit_chatgpt_account_id(claims: &serde_json::Value) -> Option<String> {
     // Prefer the flat chatgpt_account_id claim when present.
     if let Some(value) = claims.get("chatgpt_account_id").and_then(|v| v.as_str())
         && !value.trim().is_empty()
@@ -382,13 +391,18 @@ pub fn extract_account_id_from_jwt(token: &str) -> Option<String> {
 
     // Real OpenAI OAuth tokens namespace custom claims under
     // https://api.openai.com/auth as a JSON object, not a flat dotted key.
-    if let Some(value) = claims
+    claims
         .get("https://api.openai.com/auth")
         .and_then(|auth| auth.get("chatgpt_account_id"))
         .and_then(|v| v.as_str())
-        && !value.trim().is_empty()
-    {
-        return Some(value.to_string());
+        .filter(|value| !value.trim().is_empty())
+        .map(ToString::to_string)
+}
+
+pub fn extract_account_id_from_jwt(token: &str) -> Option<String> {
+    let claims = decode_jwt_claims(token)?;
+    if let Some(value) = explicit_chatgpt_account_id(&claims) {
+        return Some(value);
     }
 
     for key in [

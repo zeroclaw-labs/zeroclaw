@@ -26,12 +26,13 @@ Object.assign(globalThis, {
   requestAnimationFrame: dom.requestAnimationFrame.bind(dom),
   cancelAnimationFrame: dom.cancelAnimationFrame.bind(dom),
 });
+let modelPickerProperty: Promise<unknown> | undefined;
 globalThis.fetch = async (input) => {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
   let body: unknown;
   if (url.includes('/api/config/catalog')) body = { providers: [] };
   else if (url.includes('/api/status')) body = { model: 'fixture-model' };
-  else if (url.includes('/api/config/prop')) body = { path: '', value: '<unset>' };
+  else if (url.includes('/api/config/prop')) body = await (modelPickerProperty ?? { path: '', value: '<unset>' });
   else if (url.includes('/api/config/list')) body = { entries: [] };
   else if (url.endsWith('/api/sessions')) body = { sessions: [] };
   else return new Response('{"error":"not found"}', { status: 404 });
@@ -45,14 +46,17 @@ const { AgentChatInner } = await import('../pages/AgentChat.tsx');
 const { DraftContext } = await import('../hooks/useDraft.ts');
 
 class MeterSocket implements SessionSocket {
+  usage: (sessionId: string) => Promise<unknown> = async () => null;
+  checkCodexUsage(sessionId: string): Promise<unknown> { return this.usage(sessionId); }
   onMessage: ((msg: WsMessage) => void) | null = null;
   onOpen: (() => void) | null = null;
   onClose: ((ev: CloseEvent) => void) | null = null;
   onError: ((ev: Event) => void) | null = null;
   connected = false;
+  sentMessages = 0;
   connect(): void { this.connected = true; this.onOpen?.(); }
   disconnect(): void { this.connected = false; }
-  sendMessage(): void {}
+  sendMessage(): void { this.sentMessages += 1; }
   sendApprovalResponse(): void {}
 }
 
@@ -89,7 +93,19 @@ async function mountMeter() {
   });
   assert.ok(socket.onMessage, 'the real AgentProvider installs the receiving callback');
   assert.ok(current?.hydrated, 'chat hydration completes before events are delivered');
+  function button(label: string) {
+    const el = [...container.querySelectorAll('button')].find((b) => b.textContent?.trim() === label);
+    assert.ok(el, `button ${label} is rendered`);
+    return el;
+  }
   return {
+    socket,
+    button,
+    text: () => container.textContent ?? '',
+    async click(label: string) {
+      await act(async () => { button(label).click(); });
+    },
+    async refreshModels() { await act(async () => { current?.refreshModels(); }); },
     async receive(frame: WsMessage) {
       await act(async () => { socket.onMessage?.(frame); });
     },
@@ -247,3 +263,162 @@ test('real gateway terminal frames reach the actual web meter unchanged', async 
 });
 
 test.after(async () => { await dom.happyDOM.close(); });
+
+function usageFrame(percent: number) {
+  return {
+    status: 'ok', route: 'openai.fixture-override', checked_at: '2027-01-15T08:00:00Z',
+    five_hour: { used_percent: percent, resets_at: null }, weekly: null,
+  };
+}
+
+test('Codex usage displays the server-selected route before the first message', async () => {
+  const chat = await mountMeter();
+  try {
+    let checks = 0;
+    chat.socket.usage = async (sessionId) => {
+      assert.equal(sessionId, 'meter-session');
+      checks += 1;
+      return { ...usageFrame(37), route: 'openai.fixture' };
+    };
+    await chat.receive({ type: 'session_start', session_id: 'meter-session', message_count: 0 });
+    await chat.click('Codex usage');
+    assert.equal(checks, 0, 'opening the panel must not poll');
+    await chat.click('Check Codex usage');
+    assert.match(chat.text(), /Chat route: openai\.fixture/);
+    assert.match(chat.text(), /37% used/);
+    assert.equal(checks, 1);
+    assert.equal(chat.socket.sentMessages, 0, 'checking usage does not send a message');
+  } finally {
+    await chat.unmount();
+  }
+});
+
+test('Codex usage displays only reported windows, without hiding real zero or unknown values', async () => {
+  const chat = await mountMeter();
+  try {
+    const weekly = { used_percent: 2, resets_at: '2027-01-15T12:00:00Z' };
+    chat.socket.usage = async () => ({ ...usageFrame(37), five_hour: null, weekly });
+    await chat.click('Codex usage');
+    await chat.click('Check Codex usage');
+    assert.match(chat.text(), /Weekly window2% usedResets /);
+    assert.doesNotMatch(chat.text(), /5-hour window|Not reported/);
+
+    chat.socket.usage = async () => ({
+      ...usageFrame(0), weekly: { used_percent: null, resets_at: null },
+    });
+    await chat.click('Check Codex usage');
+    assert.match(chat.text(), /5-hour window0% used/);
+    assert.match(chat.text(), /Weekly windowUnknown/);
+  } finally {
+    await chat.unmount();
+  }
+});
+
+test('Codex usage waits for a running turn without reporting a route error or auto-fetching', async () => {
+  const chat = await mountMeter();
+  try {
+    let checks = 0;
+    chat.socket.usage = async () => { checks += 1; return usageFrame(12); };
+    await chat.receive({ type: 'chunk', content: 'working' });
+    await chat.click('Codex usage');
+    assert.equal(chat.button('Check Codex usage').disabled, true);
+    await chat.click('Check Codex usage');
+    assert.match(chat.text(), /Available when this turn finishes\./);
+    assert.doesNotMatch(chat.text(), /route could not be verified/);
+    await chat.receive(done());
+    assert.equal(chat.button('Check Codex usage').disabled, false);
+    assert.doesNotMatch(chat.text(), /Available when this turn finishes/);
+    assert.equal(checks, 0);
+    await chat.click('Check Codex usage');
+    assert.equal(checks, 1);
+    assert.match(chat.text(), /12% used/);
+  } finally {
+    await chat.unmount();
+  }
+});
+
+test('Loading the model picker label does not clear usage for the same socket', async () => {
+  let loaded!: (property: unknown) => void;
+  modelPickerProperty = new Promise((resolve) => { loaded = resolve; });
+  const chat = await mountMeter();
+  try {
+    assert.doesNotMatch(chat.text(), /openai\.picker-label/);
+    chat.socket.usage = async () => usageFrame(37);
+    await chat.click('Codex usage');
+    await chat.click('Check Codex usage');
+    assert.match(chat.text(), /37% used/);
+    await act(async () => { loaded({ path: '', value: 'openai.picker-label' }); });
+    assert.match(chat.text(), /openai\.picker-label/);
+    assert.match(chat.text(), /37% used/);
+    assert.match(chat.text(), /Chat route: openai\.fixture-override/);
+  } finally {
+    modelPickerProperty = undefined;
+    await chat.unmount();
+  }
+});
+
+test('Codex usage clears on session change and an ambiguous model refresh; late replies stay hidden', async () => {
+  const chat = await mountMeter();
+  try {
+    await chat.click('Codex usage');
+    assert.doesNotMatch(chat.text(), /% used/);
+    chat.socket.usage = async (sessionId) => {
+      assert.equal(sessionId, 'meter-session');
+      return usageFrame(42);
+    };
+    await chat.click('Check Codex usage');
+    assert.match(chat.text(), /Chat route: openai\.fixture-override/);
+    assert.match(chat.text(), /42% used/);
+    await chat.refreshModels();
+    assert.doesNotMatch(chat.text(), /42% used/);
+
+    let deliver!: (usage: unknown) => void;
+    chat.socket.usage = (sessionId) => {
+      assert.equal(sessionId, 'meter-session');
+      return new Promise((resolve) => { deliver = resolve; });
+    };
+    await chat.click('Check Codex usage');
+    await chat.switchSession();
+    await act(async () => { deliver(usageFrame(87)); });
+    assert.doesNotMatch(chat.text(), /87% used/);
+
+    chat.socket.usage = async (sessionId) => {
+      assert.equal(sessionId, 'next-meter-session');
+      return usageFrame(3);
+    };
+    await chat.click('Check Codex usage');
+    assert.match(chat.text(), /3% used/);
+  } finally {
+    await chat.unmount();
+  }
+});
+
+test('Codex usage clears on same-tab credential changes and hides on loss of operator access', async () => {
+  const { setToken, setOidcSession } = await import('../lib/auth.ts');
+  const chat = await mountMeter();
+  try {
+    await act(async () => { setToken('synthetic-pairing-one'); });
+    await chat.click('Codex usage');
+    chat.socket.usage = async () => usageFrame(29);
+    await chat.click('Check Codex usage');
+    assert.match(chat.text(), /29% used/);
+    await act(async () => { setToken('synthetic-pairing-two'); });
+    assert.doesNotMatch(chat.text(), /29% used/);
+
+    let deliver!: (usage: unknown) => void;
+    chat.socket.usage = () => new Promise((resolve) => { deliver = resolve; });
+    await chat.click('Check Codex usage');
+    await act(async () => {
+      setOidcSession({
+        kind: 'oidc', provider: 'oidc.fixture', principal_id: 'scoped', display_name: 'Scoped',
+        admin: false, expires_at: 2_000_000_000, csrf_token: 'synthetic',
+        features: { chat: true, operator_pages: false },
+      });
+      deliver(usageFrame(73));
+    });
+    assert.doesNotMatch(chat.text(), /Codex usage|73% used/);
+  } finally {
+    await chat.unmount();
+    setOidcSession(null);
+  }
+});

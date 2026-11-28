@@ -81,6 +81,49 @@ API-key verification and Codex-subscription verification are independent.
 The alias half (`coding`, `review`) is operator-chosen; pick whatever fits.
 Reference it from an agent with `model_provider = "openai.coding"`.
 
+## Check subscription usage
+
+Use the configured native Codex route to check quota before starting a turn:
+
+```bash
+zeroclaw auth usage --model-provider openai.coding
+zeroclaw auth usage --model-provider openai.coding --json
+```
+
+The command uses ZeroClaw's stored Codex OAuth profile and reports the five-hour
+and weekly usage percentages and UTC reset times when available. In JSON, a
+missing window or field is `null`, not zero. The lookup sends one read-only
+request to an undocumented ChatGPT usage endpoint. It does not start inference,
+refresh credentials, or accept a custom endpoint. If the access token has
+expired, run `zeroclaw auth refresh --model-provider openai-codex` separately.
+
+### In the web dashboard
+
+Operators can open **Codex usage** beside the chat model picker. **Check Codex
+usage** makes one read-only check on the current chat socket; nothing is polled
+or stored. The panel shows the chat route, percentage used and local reset time
+for each window, and when the check ran. Missing windows and failed checks are
+not shown as 0%. Starting another check clears the previous result, even if
+an account has been relinked under the same alias. An out-of-band relink does
+not notify the dashboard; check again for the newly linked account.
+
+Before the first message on a new or reconnected chat socket, the gateway can
+check the agent’s configured primary route without starting a turn or
+initializing the agent. Once the socket has an agent, it checks the installed
+primary route, including a successful model switch, not the model picker’s
+saved selection. The browser cannot supply a route, profile, account, or
+endpoint to the check. Usage is unavailable while a turn is active, when the
+route depends on the next prompt, or when a configuration change makes the
+socket’s installed route stale. Reconnect if the configuration changed. The
+check does not predict which provider might serve a turn after fallback.
+
+Results go only to the initiating chat socket, not into chat history or an HTTP
+cache. The gateway requires a still-paired operator bearer or a currently
+admitted administrator dashboard session before any usage lookup. Scoped
+accounts and open (pairing-disabled) gateways cannot read the shared account.
+The same native lookup as the CLI supplies the numbers; account IDs, auth
+material, and raw upstream errors are never returned.
+
 ## Models
 
 The `responses` wire API hits the Codex backend directly, so the `model` value

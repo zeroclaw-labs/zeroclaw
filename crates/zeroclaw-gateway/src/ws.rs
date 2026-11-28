@@ -8,6 +8,7 @@ use super::{
     AppState, GW_SESSION_PREFIX, gateway_cancel_key, register_cancel_token,
     remove_cancel_token_if_current,
 };
+use crate::api_codex_usage as usage;
 use crate::ws_approval::{PendingApprovals, WsApprovalChannel, new_pending_approvals};
 use axum::{
     Extension,
@@ -142,6 +143,7 @@ pub async fn handle_ws_chat(
     State(state): State<AppState>,
     dashboard: Option<Extension<Arc<crate::dashboard_session::DashboardAuth>>>,
     core: Option<Extension<crate::core_rpc::CoreRpc>>,
+    #[cfg(test)] extensions: axum::http::Extensions,
     Query(params): Query<WsQuery>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
@@ -260,8 +262,12 @@ pub async fn handle_ws_chat(
     let caller = SocketCaller {
         approval_subject: auth_subject,
         session: session_watch,
+        #[cfg(test)]
+        codex_usage_lookup: extensions
+            .get::<Arc<dyn usage::CodexUsageLookup>>()
+            .cloned(),
     };
-    ws.on_upgrade(move |socket| {
+    let mut response = ws.on_upgrade(move |socket| {
         handle_socket(
             socket,
             state,
@@ -271,8 +277,13 @@ pub async fn handle_ws_chat(
             session_cwd,
             caller,
         )
-    })
-    .into_response()
+    });
+    // Usage travels only on the live socket; the HTTP upgrade is not cacheable.
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 pub(crate) fn websocket_ping_interval(
@@ -587,6 +598,120 @@ struct SocketCaller {
     /// The dashboard session that opened the socket, if one did. The socket
     /// closes when the session stops admitting it.
     session: Option<crate::dashboard_session::SessionWatch>,
+    #[cfg(test)]
+    codex_usage_lookup: Option<Arc<dyn usage::CodexUsageLookup>>,
+}
+
+#[derive(Clone, Copy)]
+struct InstalledUsageRoute<'a> {
+    route: Option<(&'a zeroclaw_config::schema::Config, &'a str)>,
+    revision: zeroclaw_config::live::ConfigRevision,
+    generation: u64,
+}
+
+/// A check on a cold socket uses the configured primary; a warm socket must
+/// use its actual Agent and may not fall back to the configured default.
+#[allow(clippy::too_many_arguments)]
+async fn send_codex_usage(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+    state: &AppState,
+    session: &mut Option<crate::dashboard_session::SessionWatch>,
+    gateway_stopping: &mut tokio::sync::watch::Receiver<bool>,
+    auth_subject: Option<&str>,
+    agent_alias: &str,
+    id: u64,
+    installed: Option<InstalledUsageRoute<'_>>,
+    lookup: &dyn usage::CodexUsageLookup,
+) -> bool {
+    if let Err(code) = crate::dashboard_session::session_admits_now(session, state).await {
+        close_with(sender, receiver, code, "dashboard session ended").await;
+        return false;
+    }
+    let admin = session
+        .as_ref()
+        .is_some_and(crate::dashboard_session::SessionWatch::is_operator);
+    let is_operator = || usage::operator(&state.pairing, auth_subject, admin);
+    let reply = if !is_operator() {
+        usage::unavailable(id, "not_permitted")
+    } else if let Ok(_reservation) = state.agent_lifecycle.reserve_admission(agent_alias) {
+        let cold_config = installed
+            .is_none()
+            .then(|| state.config.snapshot_with_revision());
+        let revision = installed
+            .map(|route| route.revision)
+            .or_else(|| cold_config.as_ref().map(|(_, revision)| *revision));
+        let generation = installed.map_or_else(
+            || state.agent_lifecycle.alias_generation(agent_alias),
+            |route| route.generation,
+        );
+        let route_is_current = || {
+            if state.agent_lifecycle.alias_generation(agent_alias) != generation {
+                return false;
+            }
+            let published = state.config.read();
+            Some(published.revision()) == revision
+                && published
+                    .agent(agent_alias)
+                    .is_some_and(|agent| agent.enabled)
+        };
+        let resolve = || {
+            if !route_is_current() {
+                return None;
+            }
+            if let Some(installed) = installed {
+                return installed.route;
+            }
+            let (config, _) = cold_config.as_ref()?;
+            zeroclaw_runtime::agent::Agent::configured_fixed_primary_route(config, agent_alias)
+                .map(|route| (config, route))
+        };
+        let check = usage::check(id, is_operator, resolve, lookup);
+        let reply = tokio::select! {
+            biased;
+            code = crate::dashboard_session::session_lost(session, state) => {
+                close_with(sender, receiver, code, "dashboard session ended").await;
+                return false;
+            }
+            _ = gateway_stop_signal(gateway_stopping) => {
+                close_for_reconnect(sender, receiver, "gateway restarting").await;
+                return false;
+            }
+            reply = check => reply,
+        };
+        if let Err(code) = crate::dashboard_session::session_admits_now(session, state).await {
+            close_with(sender, receiver, code, "dashboard session ended").await;
+            return false;
+        }
+        if gateway_stopping.has_changed().unwrap_or(true) {
+            close_for_reconnect(sender, receiver, "gateway restarting").await;
+            return false;
+        }
+        if !is_operator() {
+            usage::unavailable(id, "not_permitted")
+        } else if !route_is_current() {
+            usage::unavailable(id, "route_unavailable")
+        } else {
+            reply
+        }
+    } else {
+        usage::unavailable(id, "route_unavailable")
+    };
+    match send_unless_lost(
+        sender,
+        Message::Text(reply.to_string().into()),
+        session,
+        state,
+    )
+    .await
+    {
+        Sent::Delivered => true,
+        Sent::PeerGone => false,
+        Sent::SessionLost(code) => {
+            close_with(sender, receiver, code, "dashboard session ended").await;
+            false
+        }
+    }
 }
 
 async fn handle_socket(
@@ -601,7 +726,15 @@ async fn handle_socket(
     let SocketCaller {
         approval_subject: auth_subject,
         session: mut session_watch,
+        #[cfg(test)]
+        codex_usage_lookup,
     } = caller;
+    #[cfg(test)]
+    let codex_usage_lookup = codex_usage_lookup
+        .as_deref()
+        .unwrap_or(&usage::NativeCodexUsage);
+    #[cfg(not(test))]
+    let codex_usage_lookup = &usage::NativeCodexUsage;
     let (mut sender, mut receiver) = socket.split();
     // An upgraded socket outlives the listener it arrived on, so a reload or
     // stop of this gateway instance has to end it here. Subscribed before any
@@ -751,6 +884,28 @@ async fn handle_socket(
                             "message": "Connection established"
                         });
                         let _ = sender.send(Message::Text(ack.to_string().into())).await;
+                    } else if cp.msg_type == usage::REQUEST {
+                        let frame = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+                        let Some(id) = usage::request_id(&frame) else {
+                            continue;
+                        };
+                        if !send_codex_usage(
+                            &mut sender,
+                            &mut receiver,
+                            &state,
+                            &mut session_watch,
+                            &mut gateway_stopping,
+                            auth_subject.as_deref(),
+                            &agent_alias,
+                            id,
+                            None,
+                            codex_usage_lookup,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        continue;
                     } else {
                         // Not a connect message — fall through to normal processing
                         first_msg_fallback = Some(text.to_string());
@@ -786,7 +941,7 @@ async fn handle_socket(
             }
         };
     let turn_generation = state.agent_lifecycle.alias_generation(&agent_alias);
-    let config = state.config.read().clone();
+    let (config, route_revision) = state.config.snapshot_with_revision();
     if let Some(ref backend) = state.session_backend {
         if let Some(ref name) = session_name
             && !name.is_empty()
@@ -1091,6 +1246,29 @@ async fn handle_socket(
                 };
 
                 let msg_type = parsed["type"].as_str().unwrap_or("");
+
+                if msg_type == usage::REQUEST {
+                    let Some(id) = usage::request_id(&parsed) else { continue };
+                    if !send_codex_usage(
+                        &mut sender,
+                        &mut receiver,
+                        &state,
+                        &mut session_watch,
+                        &mut gateway_stopping,
+                        auth_subject.as_deref(),
+                        &agent_alias,
+                        id,
+                        Some(InstalledUsageRoute {
+                            route: agent.fixed_primary_route(),
+                            revision: route_revision,
+                            generation: turn_generation,
+                        }),
+                        codex_usage_lookup,
+                    ).await {
+                        break;
+                    }
+                    continue;
+                }
 
                 // ── Voice duplex event dispatch (gated by feature flag + runtime config) ──
                 #[cfg(feature = "gateway-voice-duplex")]
@@ -2344,6 +2522,20 @@ async fn process_chat_message(
                                     continue;
                                 };
                                 match parsed["type"].as_str() {
+                                    Some(usage::REQUEST) => {
+                                        if let Some(id) = usage::request_id(&parsed) {
+                                            // The turn owns a mutable Agent. Do
+                                            // not guess its route or block the turn.
+                                            let admin = session.as_ref().is_some_and(crate::dashboard_session::SessionWatch::is_operator);
+                                            let reason = if usage::operator(&state.pairing, auth_subject, admin) {
+                                                "route_unavailable"
+                                            } else {
+                                                "not_permitted"
+                                            };
+                                            let frame = usage::unavailable(id, reason);
+                                            send_to_viewer!(Message::Text(frame.to_string().into()));
+                                        }
+                                    }
                                     Some("approval_response") => {
                                         // A SOP-kind frame is a gate resolution (keyed by run_id),
                                         // not a tool-prompt response (keyed by request_id). Resolve
@@ -3642,6 +3834,15 @@ data: {{\"type\":\"message_stop\"}}\n\n"
             context: Option<(u64, usize, usize)>,
             adjust: impl FnOnce(&mut zeroclaw_config::schema::Config),
         ) -> Self {
+            Self::spawn_with_usage(sign_in, context, adjust, None).await
+        }
+
+        async fn spawn_with_usage(
+            sign_in: Option<&str>,
+            context: Option<(u64, usize, usize)>,
+            adjust: impl FnOnce(&mut zeroclaw_config::schema::Config),
+            usage_lookup: Option<Arc<dyn usage::CodexUsageLookup>>,
+        ) -> Self {
             let (request_seen_tx, request_seen) =
                 tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
             let (released, released_rx) = tokio::sync::watch::channel(0usize);
@@ -3829,6 +4030,11 @@ data: {{\"type\":\"message_stop\"}}\n\n"
                     },
                     crate::dashboard_session::layer,
                 ));
+            let gateway_app = if let Some(lookup) = usage_lookup {
+                gateway_app.layer(Extension(lookup))
+            } else {
+                gateway_app
+            };
             let (gateway_addr, gateway_server) =
                 crate::dashboard_session::test_support::serve(gateway_app).await;
             Self {
@@ -4073,6 +4279,286 @@ data: {\"type\":\"message_stop\"}\n\n",
         client.close(None).await.expect("client close frame");
         drop(client);
         tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    #[test]
+    fn codex_usage_follows_operator_socket_admission() {
+        run_ws_regression("ws-codex-usage-admission", async || {
+            let idp = crate::dashboard_session::test_support::idp(&["admins", "ops"], "gw").await;
+            let fixture = ParkedTurnFixture::spawn_signed_in_with(&idp.uri(), |config| {
+                config.gateway.paired_tokens = vec!["synthetic-operator-device".into()];
+            })
+            .await;
+            let request = |id| {
+                serde_json::json!({
+                    "type": usage::REQUEST, "request_id": id,
+                    // Even an operator cannot substitute a route in this frame.
+                    "provider": "openai.not-this-socket", "profile": "synthetic"
+                })
+            };
+            let (cookie, _) = fixture.sign_in(3600).await;
+            let (mut admin, _) = fixture
+                .connect_signed_in("codex-usage-admin", &cookie)
+                .await;
+            send_raw(&mut admin, request(1)).await;
+            assert_eq!(
+                next_text_frame(&mut admin).await,
+                usage::unavailable(1, "unsupported_route")
+            );
+            send_raw(&mut admin, serde_json::json!({"type": "connect"})).await;
+            assert_eq!(next_text_frame(&mut admin).await["type"], "connected");
+            send_raw(&mut admin, request(2)).await;
+            assert_eq!(
+                next_text_frame(&mut admin).await,
+                usage::unavailable(2, "unsupported_route")
+            );
+
+            fixture.revoke_admin();
+            send_raw(&mut admin, request(3)).await;
+            let (close, frames) = crate::dashboard_session::test_support::until_closed(
+                &mut admin,
+                Duration::from_secs(5),
+            )
+            .await;
+            assert_eq!(close, Some(4403));
+            assert!(frames.iter().all(|frame| {
+                serde_json::from_str::<serde_json::Value>(frame).unwrap()["type"] != "codex_usage"
+            }));
+
+            use tokio_tungstenite::tungstenite::Error;
+            let bearer_request = |bearer: &str| {
+                let mut req = crate::dashboard_session::test_support::loopback_ws_request(
+                    fixture.gateway_addr,
+                    "/ws/chat?agent=web&session_id=codex-usage-paired",
+                );
+                req.headers_mut().insert(
+                    header::AUTHORIZATION,
+                    format!("Bearer {bearer}").parse().unwrap(),
+                );
+                req
+            };
+            assert!(
+                matches!(connect_async(bearer_request("synthetic-unpaired")).await,
+                Err(Error::Http(response)) if response.status() == 401)
+            );
+            let (mut paired, upgrade) = connect_async(bearer_request("synthetic-operator-device"))
+                .await
+                .unwrap();
+            assert_eq!(
+                upgrade.headers().get(header::CACHE_CONTROL).unwrap(),
+                "no-store"
+            );
+            assert_eq!(next_text_frame(&mut paired).await["type"], "session_start");
+            send_raw(&mut paired, serde_json::json!({"type": "connect"})).await;
+            assert_eq!(next_text_frame(&mut paired).await["type"], "connected");
+            send_raw(&mut paired, request(4)).await;
+            assert_eq!(
+                next_text_frame(&mut paired).await,
+                usage::unavailable(4, "unsupported_route")
+            );
+            assert!(
+                fixture
+                    .state
+                    .pairing
+                    .revoke_token("synthetic-operator-device")
+            );
+            send_raw(&mut paired, request(5)).await;
+            assert_eq!(
+                next_text_frame(&mut paired).await,
+                usage::unavailable(5, "not_permitted")
+            );
+            assert!(
+                fixture.request_seen.is_empty(),
+                "usage frames must never initiate inference"
+            );
+            fixture.shutdown();
+        });
+    }
+
+    #[derive(Default)]
+    struct ParkedUsageLookup {
+        arrived: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl usage::CodexUsageLookup for ParkedUsageLookup {
+        async fn lookup(
+            &self,
+            _: &zeroclaw_config::schema::Config,
+            route: &str,
+        ) -> Result<
+            zeroclaw_providers::openai_codex::usage::CodexUsage,
+            zeroclaw_providers::openai_codex::usage::CodexUsageError,
+        > {
+            use zeroclaw_providers::openai_codex::usage::{CodexUsage, CodexUsageWindow};
+            assert_eq!(route, "anthropic.fixture", "the fixture owns the route");
+            self.arrived.notify_one();
+            self.release.notified().await;
+            Ok(CodexUsage {
+                five_hour: Some(CodexUsageWindow {
+                    used_percent: Some(42.0),
+                    resets_at: None,
+                }),
+                weekly: None,
+            })
+        }
+    }
+
+    #[test]
+    fn codex_usage_discards_results_when_route_or_access_changes_in_flight() {
+        run_ws_regression("ws-parked-codex-usage", async || {
+            let idp = crate::dashboard_session::test_support::idp(&["admins", "ops"], "gw").await;
+            let lookup = Arc::new(ParkedUsageLookup::default());
+            let fixture = ParkedTurnFixture::spawn_with_usage(
+                Some(&idp.uri()),
+                None,
+                |_| {},
+                Some(lookup.clone()),
+            )
+            .await;
+            let (cookie, _) = fixture.sign_in(3600).await;
+            let (mut cold, _) = fixture.connect_signed_in("usage-cold", &cookie).await;
+            let (mut warm, _) = fixture.connect_signed_in("usage-warm", &cookie).await;
+            let request = |id| serde_json::json!({"type": usage::REQUEST, "request_id": id});
+            let wait_for_lookup = || async {
+                tokio::time::timeout(Duration::from_secs(5), lookup.arrived.notified())
+                    .await
+                    .expect("usage lookup reached the controlled wait");
+            };
+
+            // Prove a successful response can reach the WebSocket without
+            // either building an Agent on the cold socket or starting a turn.
+            send_raw(&mut cold, request(1)).await;
+            wait_for_lookup().await;
+            lookup.release.notify_one();
+            let reply = next_text_frame(&mut cold).await;
+            assert_eq!(reply["type"], "codex_usage");
+            assert_eq!(reply["request_id"], 1);
+            assert_eq!(reply["status"], "ok");
+            assert_eq!(reply["five_hour"]["used_percent"], 42.0);
+            assert_eq!(reply["route"], "anthropic.fixture");
+
+            send_raw(&mut warm, serde_json::json!({"type": "connect"})).await;
+            assert_eq!(next_text_frame(&mut warm).await["type"], "connected");
+            send_raw(&mut warm, request(2)).await;
+            wait_for_lookup().await;
+            fixture.state.publish_test_config(|config| {
+                let replacement = config.providers.models.anthropic["fixture"].clone();
+                config
+                    .providers
+                    .models
+                    .anthropic
+                    .insert("replacement".into(), replacement);
+                config.agents.get_mut("web").unwrap().model_provider =
+                    "anthropic.replacement".into();
+            });
+            lookup.release.notify_one();
+            assert_eq!(
+                next_text_frame(&mut warm).await,
+                usage::unavailable(2, "route_unavailable")
+            );
+
+            // Use a fresh fixture for the independent admin transition below;
+            // the alias change above would otherwise refuse the old route first.
+            assert!(
+                fixture.request_seen.is_empty(),
+                "usage does not run inference"
+            );
+            fixture.shutdown();
+            let fixture = ParkedTurnFixture::spawn_with_usage(
+                Some(&idp.uri()),
+                None,
+                |_| {},
+                Some(lookup.clone()),
+            )
+            .await;
+            let (cookie, _) = fixture.sign_in(3600).await;
+            let (mut socket, _) = fixture.connect_signed_in("usage-revoked", &cookie).await;
+            send_raw(&mut socket, request(3)).await;
+            wait_for_lookup().await;
+            fixture.revoke_admin();
+            lookup.release.notify_one();
+            let (close, frames) = crate::dashboard_session::test_support::until_closed(
+                &mut socket,
+                Duration::from_secs(5),
+            )
+            .await;
+            assert_eq!(close, Some(4403));
+            assert!(frames.iter().all(|frame| {
+                serde_json::from_str::<serde_json::Value>(frame).unwrap()["type"] != "codex_usage"
+            }));
+            assert!(
+                fixture.request_seen.is_empty(),
+                "usage does not run inference"
+            );
+            fixture.shutdown();
+        });
+    }
+
+    #[test]
+    fn codex_usage_checks_the_configured_codex_route_before_first_message() {
+        run_ws_regression("ws-codex-usage-cold-route", async || {
+            use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+            let idp = crate::dashboard_session::test_support::idp(&["admins", "ops"], "gw").await;
+            let fixture = ParkedTurnFixture::spawn_signed_in_with(&idp.uri(), |config| {
+                config.providers.models.openai.insert(
+                    "fixture".into(),
+                    OpenAIModelProviderConfig {
+                        base: ModelProviderConfig {
+                            model: Some("codex-test".into()),
+                            requires_openai_auth: true,
+                            ..Default::default()
+                        },
+                    },
+                );
+                config.agents.get_mut("web").unwrap().model_provider = "openai.fixture".into();
+            })
+            .await;
+            let (cookie, _) = fixture.sign_in(3600).await;
+            let (mut client, start) = fixture.connect_signed_in("codex-usage-cold", &cookie).await;
+            assert_eq!(start["message_count"], 0);
+            send_raw(
+                &mut client,
+                serde_json::json!({
+                    "type": usage::REQUEST, "request_id": 1, "model_provider": "anthropic.fixture"
+                }),
+            )
+            .await;
+            // The isolated profile store does not exist. This response proves
+            // the cold request reached the configured Codex provider without
+            // sending a usage request or falling through to Agent setup.
+            assert_eq!(
+                next_text_frame(&mut client).await,
+                usage::unavailable(1, "not_signed_in")
+            );
+            assert!(!fixture._tmp.path().join("auth-profiles.json").exists());
+            assert!(
+                fixture.request_seen.is_empty(),
+                "no inference on a cold check"
+            );
+            assert!(fixture.backend.load("gw_codex-usage-cold").is_empty());
+            fixture.shutdown();
+        });
+    }
+
+    #[test]
+    fn codex_usage_refuses_an_open_gateway_socket() {
+        run_ws_regression("ws-codex-usage-open", async || {
+            let fixture = ParkedTurnFixture::spawn().await;
+            let (mut socket, _) = fixture.connect("codex-open").await;
+            send_raw(
+                &mut socket,
+                serde_json::json!({"type": usage::REQUEST, "request_id": 1}),
+            )
+            .await;
+            assert_eq!(
+                next_text_frame(&mut socket).await,
+                usage::unavailable(1, "not_permitted")
+            );
+            assert!(fixture.request_seen.is_empty());
+            fixture.shutdown();
+        });
     }
 
     // ── Dashboard sign-in: a session that ends takes the socket with it ──

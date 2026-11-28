@@ -8742,6 +8742,15 @@ enum AuthCommands {
     List,
     /// Show auth status with active profile and token expiry info
     Status,
+    /// Show ChatGPT/Codex subscription usage (5-hour and weekly) for an `openai.<alias>` route
+    Usage {
+        /// Configured native Codex route, e.g. `openai.codex`
+        #[arg(long)]
+        model_provider: String,
+        /// Emit normalized JSON instead of plain text
+        #[arg(long)]
+        json: bool,
+    },
     /// Authenticate an email channel via OAuth2 device-code flow
     EmailLogin {
         /// Email channel alias from [channels.email.<alias>] (e.g. 'hotmail')
@@ -10057,6 +10066,15 @@ async fn async_main_inner(command: clap::Command) -> Result<()> {
             unreachable!("matched the Oidc variant above")
         };
         return handle_oidc_command(oidc_command, &config).await;
+    }
+    // After normal config loading, usage does not write auth or OTP state.
+    // Skip OTP enrollment so its URI cannot pollute --json stdout.
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Auth {
+        auth_command: auth_command @ AuthCommands::Usage { .. },
+    } = cli.command
+    {
+        return handle_auth_command(auth_command, &config).await;
     }
     #[cfg(feature = "agent-runtime")]
     if config.security.otp.enabled {
@@ -14960,6 +14978,90 @@ fn read_plain_input(prompt: &str) -> Result<String> {
 }
 
 #[cfg(feature = "agent-runtime")]
+fn codex_usage_error_text(
+    err: &zeroclaw_providers::openai_codex::usage::CodexUsageError,
+) -> String {
+    use zeroclaw_providers::openai_codex::usage::CodexUsageError as E;
+    let key = match err {
+        E::UnsupportedRoute(_) => "cli-auth-usage-err-unsupported-route",
+        E::AuthStoreUnreadable => "cli-auth-usage-err-auth-store",
+        E::ProfileNotFound {
+            explicit_override: true,
+        } => "cli-auth-usage-err-profile-not-found",
+        E::ProfileNotFound {
+            explicit_override: false,
+        } => "cli-auth-usage-err-no-profile",
+        E::ProfileNotOAuth => "cli-auth-usage-err-not-oauth",
+        E::AccessTokenMissing => "cli-auth-usage-err-access-token-missing",
+        E::TokenExpired => "cli-auth-usage-err-token-expired",
+        E::AccountIdMissing => "cli-auth-usage-err-account-missing",
+        E::AccountIdMismatch => "cli-auth-usage-err-account-mismatch",
+        E::ResponseAccountMismatch => "cli-auth-usage-err-response-account",
+        E::ClientUnavailable => "cli-auth-usage-err-client",
+        E::Transport => "cli-auth-usage-err-transport",
+        E::HttpStatus(_) => "cli-auth-usage-err-http-status",
+        E::BodyTooLarge => "cli-auth-usage-err-body-too-large",
+        E::MalformedResponse => "cli-auth-usage-err-malformed",
+        E::AmbiguousWindows => "cli-auth-usage-err-ambiguous",
+        E::NoRecognizedWindows => "cli-auth-usage-err-no-windows",
+    };
+    let status = match err {
+        E::HttpStatus(status) => status.to_string(),
+        _ => String::new(),
+    };
+    zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, &[("status", &status)])
+}
+
+/// Percentage with at most one decimal, trailing `.0` dropped (`12`, `12.5`).
+#[cfg(feature = "agent-runtime")]
+fn format_usage_percent(percent: f64) -> String {
+    let rounded = format!("{percent:.1}");
+    rounded.strip_suffix(".0").unwrap_or(&rounded).to_string()
+}
+
+#[cfg(feature = "agent-runtime")]
+fn render_codex_usage(
+    usage: &zeroclaw_providers::openai_codex::usage::CodexUsage,
+    json: bool,
+) -> Result<String> {
+    use zeroclaw_runtime::i18n::{
+        get_required_cli_string as get, get_required_cli_string_with_args as geta,
+    };
+    if json {
+        return Ok(serde_json::to_string_pretty(usage)?);
+    }
+    let mut lines = vec![get("cli-auth-usage-heading")];
+    for (label_key, window) in [
+        ("cli-auth-usage-window-five-hour", &usage.five_hour),
+        ("cli-auth-usage-window-weekly", &usage.weekly),
+    ] {
+        let label = get(label_key);
+        let line = match window {
+            None => geta("cli-auth-usage-window-not-reported", &[("window", &label)]),
+            Some(window) => {
+                let used = match window.used_percent {
+                    Some(percent) => geta(
+                        "cli-auth-usage-percent",
+                        &[("percent", &format_usage_percent(percent))],
+                    ),
+                    None => get("cli-auth-usage-unknown"),
+                };
+                let reset = match window.resets_at {
+                    Some(at) => at.format("%Y-%m-%d %H:%M UTC").to_string(),
+                    None => get("cli-auth-usage-unknown"),
+                };
+                geta(
+                    "cli-auth-usage-window",
+                    &[("window", &label), ("used", &used), ("reset", &reset)],
+                )
+            }
+        };
+        lines.push(line);
+    }
+    Ok(lines.join("\n"))
+}
+
+#[cfg(feature = "agent-runtime")]
 fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
     match profile
         .token_set
@@ -15641,6 +15743,23 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                 println!("  {model_provider}: {profile_id}");
             }
 
+            Ok(())
+        }
+
+        AuthCommands::Usage {
+            model_provider,
+            json,
+        } => {
+            let provider = zeroclaw_providers::openai_codex::usage::codex_usage_provider_for_route(
+                config,
+                &model_provider,
+            )
+            .map_err(|err| anyhow::Error::msg(codex_usage_error_text(&err)))?;
+            let usage = provider
+                .fetch_usage()
+                .await
+                .map_err(|err| anyhow::Error::msg(codex_usage_error_text(&err)))?;
+            println!("{}", render_codex_usage(&usage, json)?);
             Ok(())
         }
 
@@ -18368,6 +18487,90 @@ mod tests {
             discover_desktop_app(&dirs).as_deref(),
             Some(high_bin.as_path())
         );
+    }
+
+    #[test]
+    fn auth_usage_cli_parses_route_and_json_flag() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "auth",
+            "usage",
+            "--model-provider",
+            "openai.codex",
+            "--json",
+        ])
+        .expect("auth usage should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Auth {
+                auth_command: AuthCommands::Usage { model_provider, json: true }
+            } if model_provider == "openai.codex"
+        ));
+        let cli =
+            Cli::try_parse_from(["zeroclaw", "auth", "usage", "--model-provider", "openai.x"])
+                .expect("auth usage without --json should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Auth {
+                auth_command: AuthCommands::Usage { json: false, .. }
+            }
+        ));
+        // The route is mandatory, and there is no endpoint/profile/url override flag.
+        assert!(Cli::try_parse_from(["zeroclaw", "auth", "usage"]).is_err());
+        for flag in ["--url", "--endpoint", "--profile"] {
+            assert!(
+                Cli::try_parse_from([
+                    "zeroclaw",
+                    "auth",
+                    "usage",
+                    "--model-provider",
+                    "openai.x",
+                    flag,
+                    "v",
+                ])
+                .is_err(),
+                "{flag} must not exist"
+            );
+        }
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn codex_usage_renders_plain_and_json_without_inventing_values() {
+        use zeroclaw_providers::openai_codex::usage::{CodexUsage, CodexUsageWindow};
+        let at = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let usage = CodexUsage {
+            five_hour: Some(CodexUsageWindow {
+                used_percent: Some(0.0),
+                resets_at: Some(at),
+            }),
+            weekly: Some(CodexUsageWindow {
+                used_percent: None,
+                resets_at: None,
+            }),
+        };
+        let text = render_codex_usage(&usage, false).unwrap();
+        assert!(text.contains("UTC"), "{text}");
+        assert!(text.contains("0%"), "real zero is shown as 0%: {text}");
+        assert!(text.contains("2027-01-15 08:00 UTC"), "{text}");
+        assert!(text.to_lowercase().contains("unknown"), "{text}");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&render_codex_usage(&usage, true).unwrap()).unwrap();
+        assert_eq!(json["five_hour"]["used_percent"], 0.0);
+        assert_eq!(json["weekly"]["used_percent"], serde_json::Value::Null);
+        assert_eq!(json["weekly"]["resets_at"], serde_json::Value::Null);
+        assert_eq!(json.as_object().unwrap().len(), 2);
+
+        let weekly_only = CodexUsage {
+            five_hour: None,
+            weekly: usage.weekly.clone(),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&render_codex_usage(&weekly_only, true).unwrap()).unwrap();
+        assert_eq!(json["five_hour"], serde_json::Value::Null);
+        assert_eq!(format_usage_percent(12.0), "12");
+        assert_eq!(format_usage_percent(12.34), "12.3");
     }
 
     #[test]

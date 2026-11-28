@@ -1464,6 +1464,11 @@ impl SessionWatch {
         self.session.principal().id.as_str()
     }
 
+    /// Whether this watch belongs to an admitted in-process operator socket.
+    pub(crate) fn is_operator(&self) -> bool {
+        self.require_admin && self.session.is_admin() && self.session.ended_now().is_none()
+    }
+
     /// The ends a stream can see by itself, without waiting for the task
     /// that watches it: the session's own cancellation (sign-out, eviction,
     /// revocation) and its generation's stop. Neither holds anything of the
@@ -1969,6 +1974,18 @@ pub(crate) mod test_support {
         (addr, server)
     }
 
+    pub(crate) fn loopback_ws_request(
+        addr: SocketAddr,
+        path: &str,
+    ) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+        assert!(addr.ip().is_loopback());
+        // This URL connects only to the test's loopback listener.
+        format!("ws://{addr}{path}") // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+            .into_client_request()
+            .expect("WebSocket request")
+    }
+
     /// Open a WebSocket on `path` presenting the session `cookie` from the
     /// gateway's own origin, as the dashboard does. `Err` carries the HTTP
     /// status when the upgrade is refused.
@@ -1977,11 +1994,7 @@ pub(crate) mod test_support {
         path: &str,
         cookie: &str,
     ) -> Result<WsClient, u16> {
-        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
-        // This URL connects only to the test's loopback listener.
-        let mut request = format!("ws://{addr}{path}") // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
-            .into_client_request()
-            .expect("WebSocket request");
+        let mut request = loopback_ws_request(addr, path);
         let headers = request.headers_mut();
         headers.insert("cookie", cookie.parse().expect("cookie header"));
         headers.insert(
