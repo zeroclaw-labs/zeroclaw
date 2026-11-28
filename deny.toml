@@ -318,6 +318,28 @@ version = "=0.60.2"
 name = "windows_i686_gnullvm"
 version = "=0.52.6"
 
+# flate2 1.1.11 moves to miniz_oxide 0.9 while png 0.17 and 0.18 still
+# require 0.8.9. cpal 0.18.2 moves to the windows 0.62 line (windows-core
+# 0.62, windows-result 0.4, windows-strings 0.5) while tao, wry and
+# webview2-com still require the 0.61 line. Exact duplicates only, no
+# advisory waiver. Each entry goes away when the older version leaves the
+# resolved graph.
+[[bans.skip]]
+name = "miniz_oxide"
+version = "=0.8.9"
+
+[[bans.skip]]
+name = "windows-core"
+version = "=0.61.2"
+
+[[bans.skip]]
+name = "windows-result"
+version = "=0.3.4"
+
+[[bans.skip]]
+name = "windows-strings"
+version = "=0.4.2"
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
