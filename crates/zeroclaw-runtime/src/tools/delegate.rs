@@ -4211,6 +4211,8 @@ impl DelegateTool {
         // it any more than backgrounding it does.
         let parent_step_scope = crate::sop::active_scope::active_headless_step_scope();
 
+        let parent_ssh_task = zeroclaw_tools::task_ssh::current();
+
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
         // Sender-bucket continuity: spawned tasks start with empty
@@ -4220,6 +4222,7 @@ impl DelegateTool {
         // and restore it around each worker's entire execution.
         let parent_thread_id = TOOL_LOOP_THREAD_ID.try_with(|v| v.clone()).ok().flatten();
         for (index, agent_name) in agent_names.iter().enumerate() {
+            let ssh_task = parent_ssh_task.clone();
             let agents = Arc::clone(&self.agents);
             let security = Arc::clone(&self.security);
             let global_credential = self.global_credential.clone();
@@ -4354,7 +4357,10 @@ impl DelegateTool {
                                                 DelegateAdmission::Required,
                                                 target_execution_admission,
                                             ));
-                                            worker.await
+                                            zeroclaw_tools::task_ssh::scope_inherited(
+                                                ssh_task, worker,
+                                            )
+                                            .await
                                         })
                                         .await
                                 }),
