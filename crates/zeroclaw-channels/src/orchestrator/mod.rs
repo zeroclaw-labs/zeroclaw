@@ -248,6 +248,10 @@ type HistoryCrumbMap = Arc<Mutex<lru::LruCache<String, bool>>>;
 type PendingNewSessionSet = Arc<Mutex<HashSet<String>>>;
 /// Maximum conversation senders kept in memory (LRU eviction beyond this).
 const MAX_CONVERSATION_SENDERS: usize = 1000;
+/// Maximum cached providers built for a selected model rather than for a
+/// profile's own configuration (LRU eviction beyond this). Senders choose these
+/// model ids, so unlike profile entries they are not bounded by configuration.
+const MAX_SELECTED_MODEL_PROVIDERS: usize = 32;
 /// Maximum history messages to keep per sender.
 const MAX_CHANNEL_HISTORY: usize = 50;
 /// Minimum user-message length (in chars) for auto-save to memory.
@@ -299,7 +303,7 @@ const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
 /// Guardrail for hook-modified outbound channel content.
 const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 
-type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn ModelProvider>>>>;
+type ProviderCacheMap = Arc<Mutex<ProviderCache>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
 type ThinkingOverrideMap = Arc<Mutex<HashMap<String, ThinkingLevel>>>;
 /// Session-only model overrides scoped above the per-sender [`RouteSelectionMap`].
@@ -3142,19 +3146,21 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     let (next_config, next_defaults) =
         load_runtime_config_and_defaults(&config_path, ctx.agent_alias.as_str()).await?;
     let next_config = Arc::new(next_config);
-    let next_options = zeroclaw_providers::options_for_provider_ref(
-        next_config.as_ref(),
+    let model_provider_instance = create_resilient_model_provider_nonblocking(
+        Arc::clone(&next_config),
         &next_defaults.default_model_provider,
-        &ctx.provider_runtime_options,
-    );
-    let model_provider_instance = zeroclaw_providers::create_resilient_model_provider_from_ref(
-        next_config.as_ref(),
-        &next_defaults.default_model_provider,
-        next_defaults.api_key.as_deref(),
-        next_defaults.api_url.as_deref(),
-        &next_defaults.reliability,
-        &next_options,
-    )?;
+        next_defaults.api_key.clone(),
+        next_defaults.api_url.clone(),
+        next_defaults.reliability.clone(),
+        ctx.provider_runtime_options.clone(),
+        provider_model_override(
+            next_config.as_ref(),
+            &next_defaults.default_model_provider,
+            &next_defaults.model,
+        )
+        .map(ToString::to_string),
+    )
+    .await?;
     let model_provider_instance: Arc<dyn ModelProvider> = Arc::from(model_provider_instance);
 
     if let Err(err) = ProviderDispatch::from_ref(&*model_provider_instance)
@@ -3189,12 +3195,17 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
             defaults: next_defaults.clone(),
             generation: next_generation,
         });
-        let cache_key =
-            provider_cache_key(&next_defaults.default_model_provider, None, next_generation);
+        let cache_key = ProviderCacheKey::new(
+            next_config.as_ref(),
+            &next_defaults.default_model_provider,
+            None,
+            &next_defaults.model,
+            next_generation,
+        );
 
         let mut cache = ctx.provider_cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.clear();
-        cache.insert(cache_key, Arc::clone(&model_provider_instance));
+        cache.insert_configured(cache_key, Arc::clone(&model_provider_instance));
         *override_guard = Some(next_override);
     }
 
@@ -3306,8 +3317,28 @@ fn apply_model_ref(
         sel.model = route.model.clone();
         sel.api_key = route.api_key.clone();
     } else {
+        // A model outside the route table is not that route's selection, so a
+        // credential left by an earlier route no longer applies.
         sel.model = model.to_string();
+        sel.api_key = None;
     }
+}
+
+/// The credential a model-issued switch to `model` on `provider_ref` carries:
+/// that of a route whose stored profile reference and stored model both equal
+/// the switch target exactly. A chat command's route lookup is looser: it
+/// folds case and accepts a hint.
+/// A model id that only equals a route's hint is a literal model on the
+/// profile, not that route, so the profile's own credential applies.
+fn route_api_key_for_switch<'a>(
+    model_routes: &'a [zeroclaw_config::schema::ModelRouteConfig],
+    provider_ref: &str,
+    model: &str,
+) -> Option<&'a str> {
+    model_routes
+        .iter()
+        .find(|route| route.model_provider == provider_ref && route.model == model)
+        .and_then(|route| route.api_key.as_deref())
 }
 
 fn apply_model_issued_route_switch(
@@ -4791,25 +4822,181 @@ fn load_cached_model_preview(
     Vec::new()
 }
 
-/// Build a cache key that includes the runtime-defaults generation, the
-/// model_provider name, and, when a route-specific API key is supplied, a hash
-/// of that key. Generation `0` is the immutable startup config, so its key shape
-/// stays unchanged; hot-reload generations get isolated cache entries.
-fn provider_cache_key(provider_name: &str, route_api_key: Option<&str>, generation: u64) -> String {
-    let base = match route_api_key {
-        Some(key) => {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            key.hash(&mut hasher);
-            format!("{provider_name}@{:x}", hasher.finish())
+/// Identity of a cached channel provider: the runtime-defaults generation it
+/// was built for (`0` is the immutable startup config, hot reloads get their
+/// own), the provider reference, a fingerprint of the route credential it was
+/// built with (never the credential itself), and the model it is pinned to when
+/// the selection needs a pin of its own (see [`provider_model_override`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProviderCacheKey {
+    generation: u64,
+    provider_ref: String,
+    credential_fingerprint: Option<u64>,
+    model_override: Option<String>,
+}
+
+impl ProviderCacheKey {
+    /// The key of the provider that serves `model` from `provider_ref` with
+    /// `route_api_key`, as built from `config` at `generation`.
+    fn new(
+        config: &zeroclaw_config::schema::Config,
+        provider_ref: &str,
+        route_api_key: Option<&str>,
+        model: &str,
+        generation: u64,
+    ) -> Self {
+        Self {
+            generation,
+            provider_ref: provider_ref.to_string(),
+            credential_fingerprint: route_api_key.map(|key| {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                key.hash(&mut hasher);
+                hasher.finish()
+            }),
+            model_override: provider_model_override(config, provider_ref, model)
+                .map(ToString::to_string),
         }
-        None => provider_name.to_string(),
-    };
-    if generation == 0 {
-        base
-    } else {
-        format!("g{generation}:{base}")
     }
+}
+
+/// Providers built for channel turns. Those built from a profile's own
+/// configuration are bounded by that configuration and kept until a reload;
+/// those built for a selected model are kept least recently used first out.
+struct ProviderCache {
+    configured: HashMap<ProviderCacheKey, Arc<dyn ModelProvider>>,
+    selected: lru::LruCache<ProviderCacheKey, Arc<dyn ModelProvider>>,
+}
+
+impl Default for ProviderCache {
+    fn default() -> Self {
+        Self::with_selected_capacity(
+            std::num::NonZeroUsize::new(MAX_SELECTED_MODEL_PROVIDERS)
+                .expect("MAX_SELECTED_MODEL_PROVIDERS must be positive"),
+        )
+    }
+}
+
+impl ProviderCache {
+    fn with_selected_capacity(capacity: std::num::NonZeroUsize) -> Self {
+        Self {
+            configured: HashMap::new(),
+            selected: lru::LruCache::new(capacity),
+        }
+    }
+
+    fn get(&mut self, key: &ProviderCacheKey) -> Option<Arc<dyn ModelProvider>> {
+        if let Some(provider) = self.configured.get(key) {
+            return Some(Arc::clone(provider));
+        }
+        self.selected.get(key).cloned()
+    }
+
+    /// Cache `provider` under `key` unless a concurrent build already did, and
+    /// return whichever instance is cached.
+    fn get_or_insert(
+        &mut self,
+        key: ProviderCacheKey,
+        provider: Arc<dyn ModelProvider>,
+    ) -> Arc<dyn ModelProvider> {
+        if let Some(existing) = self.get(&key) {
+            return existing;
+        }
+        if key.model_override.is_some() {
+            self.selected.put(key, Arc::clone(&provider));
+        } else {
+            self.configured.insert(key, Arc::clone(&provider));
+        }
+        provider
+    }
+
+    /// Seed the provider a runtime generation starts with.
+    fn insert_configured(&mut self, key: ProviderCacheKey, provider: Arc<dyn ModelProvider>) {
+        self.configured.insert(key, provider);
+    }
+
+    /// Drop the entry under `key` only while it is still `provider`, so a
+    /// replacement another turn already built survives.
+    fn remove_if_same(
+        &mut self,
+        key: &ProviderCacheKey,
+        provider: &Arc<dyn ModelProvider>,
+    ) -> bool {
+        if self
+            .configured
+            .get(key)
+            .is_some_and(|cached| Arc::ptr_eq(cached, provider))
+        {
+            self.configured.remove(key);
+            return true;
+        }
+        if self
+            .selected
+            .peek(key)
+            .is_some_and(|cached| Arc::ptr_eq(cached, provider))
+        {
+            self.selected.pop(key);
+            return true;
+        }
+        false
+    }
+
+    fn clear(&mut self) {
+        self.configured.clear();
+        self.selected.clear();
+    }
+}
+
+/// The model `[providers.models.<type>.<alias>]` configures for `provider_ref`,
+/// as a selection names it.
+fn configured_profile_model<'a>(
+    config: &'a zeroclaw_config::schema::Config,
+    provider_ref: &str,
+) -> Option<&'a str> {
+    model_provider_entry_for_ref(config, provider_ref)
+        .ok()?
+        .1
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+}
+
+/// The primary model the shared builder must be given for `provider_ref` so
+/// that it serves the selected `model`, which callers pass as given. Built
+/// without one, a profile serves its stored `model` exactly as stored; a
+/// profile without one passes the requested model through but leaves its
+/// `fallback_models` unbuilt, which the CLI and session RPC build around their
+/// explicit model. The shared builder trims an explicit primary model, so the
+/// pin returned is the trimmed selection.
+///
+/// `None`, so the profile's own build serves the selection, when:
+/// - the selection is blank;
+/// - the stored model equals the selection as given, or equals it trimmed, so
+///   it already serves the id the selection asks for;
+/// - the profile stores no model and either has no `fallback_models` or the
+///   selection has surrounding whitespace. A padded selection then passes
+///   through as given, with no fallback chain built around it, because a
+///   chain needs an explicit primary and that one would be trimmed.
+///
+/// Otherwise a stored model that differs gets the trimmed selection as the
+/// pin, and an unpadded selection on a profile with `fallback_models` gets
+/// itself as the primary its fallback chain is built around.
+fn provider_model_override<'a>(
+    config: &zeroclaw_config::schema::Config,
+    provider_ref: &str,
+    model: &'a str,
+) -> Option<&'a str> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (_, entry) = model_provider_entry_for_ref(config, provider_ref).ok()?;
+    let needs_own_primary = match entry.model.as_deref() {
+        Some(stored) => stored != model && stored != trimmed,
+        None => model == trimmed && !entry.fallback_models.is_empty(),
+    };
+    needs_own_primary.then_some(trimmed)
 }
 
 fn provider_credentials_for_ref(
@@ -4828,35 +5015,48 @@ fn provider_credentials_for_ref(
         })
 }
 
+/// The provider that serves `model` from `provider_name` for this turn.
 async fn get_or_create_provider(
     ctx: &ChannelRuntimeContext,
     provider_name: &str,
     route_api_key: Option<&str>,
+    model: &str,
     defaults_snapshot: &ChannelRuntimeDefaultsSnapshot,
 ) -> anyhow::Result<Arc<dyn ModelProvider>> {
-    let cache_key = provider_cache_key(provider_name, route_api_key, defaults_snapshot.generation);
+    let config = Arc::clone(&defaults_snapshot.config);
+    let defaults = defaults_snapshot.defaults.clone();
+    let cache_key = ProviderCacheKey::new(
+        config.as_ref(),
+        provider_name,
+        route_api_key,
+        model,
+        defaults_snapshot.generation,
+    );
 
     if let Some(existing) = ctx
         .provider_cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&cache_key)
-        .cloned()
     {
         return Ok(existing);
     }
 
-    let config = Arc::clone(&defaults_snapshot.config);
-    let defaults = defaults_snapshot.defaults.clone();
-
     // Only return the pre-built startup default model_provider while the
-    // current runtime defaults still match startup and there is no
-    // route-specific credential override. Once config reload changes defaults,
-    // the cache/store path above owns the live default provider.
-    if route_api_key.is_none()
-        && provider_name == defaults.default_model_provider.as_str()
+    // current runtime defaults still match startup and this is the startup
+    // default selection: no route-specific credential and the same model.
+    // Once config reload changes defaults, the cache/store path above owns
+    // the live default provider.
+    if !defaults_snapshot.hot
         && provider_name == ctx.model_provider_ref.as_str()
-        && !defaults_snapshot.hot
+        && cache_key
+            == ProviderCacheKey::new(
+                config.as_ref(),
+                &defaults.default_model_provider,
+                None,
+                &defaults.model,
+                defaults_snapshot.generation,
+            )
     {
         return Ok(Arc::clone(&ctx.model_provider));
     }
@@ -4871,6 +5071,7 @@ async fn get_or_create_provider(
         entry_api_url,
         defaults.reliability,
         ctx.provider_runtime_options.clone(),
+        cache_key.model_override.clone(),
     )
     .await?;
     let model_provider: Arc<dyn ModelProvider> = Arc::from(model_provider);
@@ -4887,13 +5088,21 @@ async fn get_or_create_provider(
         );
     }
 
-    let mut cache = ctx.provider_cache.lock().unwrap_or_else(|e| e.into_inner());
-    let cached = cache
-        .entry(cache_key)
-        .or_insert_with(|| Arc::clone(&model_provider));
-    Ok(Arc::clone(cached))
+    Ok(ctx
+        .provider_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert(cache_key, model_provider))
 }
 
+/// Build `provider_name` through the same model-carrying builder the CLI and
+/// session RPC use, pinned to `model_override` when one is given.
+///
+/// No `model_routes` reach the builder: the channel resolves a route hint into
+/// its selection before choosing a provider, so a selection never carries a
+/// hint, and a routed build would also apply a route's credential to every
+/// selection of that route's target profile. An empty default model leaves the
+/// profile's configured pin, or its absence, exactly as configured.
 async fn create_resilient_model_provider_nonblocking(
     config: Arc<zeroclaw_config::schema::Config>,
     provider_name: &str,
@@ -4901,6 +5110,7 @@ async fn create_resilient_model_provider_nonblocking(
     api_url: Option<String>,
     reliability: zeroclaw_config::schema::ReliabilityConfig,
     provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
+    model_override: Option<String>,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
     let provider_name = provider_name.to_string();
     tokio::task::spawn_blocking(move || {
@@ -4909,12 +5119,14 @@ async fn create_resilient_model_provider_nonblocking(
             &provider_name,
             &provider_runtime_options,
         );
-        zeroclaw_providers::create_resilient_model_provider_from_ref(
+        zeroclaw_providers::create_routed_model_provider_with_options(
             &config,
             &provider_name,
             api_key.as_deref(),
             api_url.as_deref(),
             &reliability,
+            &[],
+            model_override.as_deref().unwrap_or_default(),
             &options,
         )
     })
@@ -5351,11 +5563,29 @@ async fn handle_runtime_command_for_delivery(
         ChannelRuntimeCommand::SetProvider(raw_model_provider) => {
             match resolve_models_command(defaults_snapshot.config.as_ref(), &raw_model_provider) {
                 ModelsCommandResolution::Resolved(provider_ref) => {
-                    match get_or_create_provider(ctx, &provider_ref, None, &defaults_snapshot).await
+                    // The profile's own model, when it has one, is what its
+                    // turns request; otherwise the selected model carries over.
+                    let model =
+                        configured_profile_model(defaults_snapshot.config.as_ref(), &provider_ref)
+                            .map_or_else(|| current.model.clone(), ToString::to_string);
+                    match get_or_create_provider(
+                        ctx,
+                        &provider_ref,
+                        None,
+                        &model,
+                        &defaults_snapshot,
+                    )
+                    .await
                     {
                         Ok(_) => {
-                            current.model_provider = provider_ref.clone();
-                            current.automatic = false;
+                            // A plain profile selection carries no route
+                            // credential; the profile's own one applies.
+                            current = ChannelRouteSelection {
+                                model_provider: provider_ref.clone(),
+                                model,
+                                automatic: false,
+                                api_key: None,
+                            };
                             set_route_selection(
                                 ctx,
                                 &sender_key,
@@ -5363,13 +5593,21 @@ async fn handle_runtime_command_for_delivery(
                                 &defaults_snapshot,
                             );
 
-                            channel_runtime_cli_string_with_args(
+                            let mut resp = channel_runtime_cli_string_with_args(
                                 "channel-runtime-set-provider-switched",
                                 &[
                                     ("provider", provider_ref.as_str()),
                                     ("model", current.model.as_str()),
                                 ],
-                            )
+                            );
+                            resp.push_str(&shadow_note(
+                                ctx,
+                                msg,
+                                &sender_key,
+                                &defaults_snapshot,
+                                &current,
+                            ));
+                            resp
                         }
                         Err(err) => {
                             let safe_err = zeroclaw_providers::sanitize_api_error(&err.to_string());
@@ -5979,9 +6217,10 @@ async fn resolve_classifier_route(
         }
     };
 
-    let model = model_cfg.model.clone().unwrap_or_default();
     let temperature = model_cfg.temperature;
-    if model.is_empty() {
+    let Some(model) = configured_profile_model(defaults_snapshot.config.as_ref(), provider_str)
+        .map(ToString::to_string)
+    else {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -5990,12 +6229,13 @@ async fn resolve_classifier_route(
             "classifier_provider points to a [providers.models] entry without a `model` field; falling back to main agent"
         );
         return None;
-    }
+    };
 
     let provider = match get_or_create_provider(
         ctx,
         provider_str,
         model_cfg.api_key.as_deref(),
+        &model,
         defaults_snapshot,
     )
     .await
@@ -9645,6 +9885,7 @@ async fn process_channel_message_body(
         ctx.as_ref(),
         &route.model_provider,
         route.api_key.as_deref(),
+        &route.model,
         &runtime_defaults,
     )
     .await
@@ -10662,20 +10903,18 @@ async fn process_channel_message_body(
                     }
                 };
 
-                let resolved_api_key = ctx
-                    .model_routes
-                    .iter()
-                    .find(|r| {
-                        r.model_provider.eq_ignore_ascii_case(&new_model_provider)
-                            && (r.model.eq_ignore_ascii_case(&new_model)
-                                || r.hint.eq_ignore_ascii_case(&new_model))
-                    })
-                    .and_then(|r| r.api_key.clone());
+                let resolved_api_key = route_api_key_for_switch(
+                    &ctx.model_routes,
+                    &resolved_model_provider,
+                    &new_model,
+                )
+                .map(ToString::to_string);
 
                 match get_or_create_provider(
                     ctx.as_ref(),
                     &resolved_model_provider,
                     resolved_api_key.as_deref(),
+                    &new_model,
                     &runtime_defaults,
                 )
                 .await
@@ -11439,18 +11678,22 @@ async fn process_channel_message_body(
                     started_at.elapsed().as_millis(),
                 );
 
-                // Evict cached model_provider on auth errors so the next request
-                // re-creates it with fresh OAuth credentials.
+                // On an auth error, remove the cache entry while it still holds the
+                // provider that failed, so a later turn builds that provider again
+                // instead of reusing it. The cold startup fast path can still serve
+                // the original startup provider for the default selection.
                 if context_window_exceeded.is_none()
                     && zeroclaw_providers::reliable::is_auth_error(&e)
                 {
-                    let cache_key = provider_cache_key(
+                    let cache_key = ProviderCacheKey::new(
+                        runtime_defaults.config.as_ref(),
                         &route.model_provider,
                         route.api_key.as_deref(),
+                        &route.model,
                         runtime_defaults.generation,
                     );
                     let mut cache = ctx.provider_cache.lock().unwrap_or_else(|p| p.into_inner());
-                    if cache.remove(&cache_key).is_some() {
+                    if cache.remove_if_same(&cache_key, &active_model_provider) {
                         ::zeroclaw_log::record!(
                             INFO,
                             ::zeroclaw_log::Event::new(
@@ -11460,7 +11703,7 @@ async fn process_channel_message_body(
                             .with_attrs(
                                 ::serde_json::json!({"model_provider": route.model_provider})
                             ),
-                            "Evicted cached model_provider after auth error; next request will re-create with fresh credentials"
+                            "Removed the cache entry holding the model_provider that failed authentication"
                         );
                     }
                 }
@@ -17242,6 +17485,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
         let provider_reliability = runtime_defaults.reliability.clone();
         let provider_runtime_options =
             zeroclaw_providers::provider_runtime_options_for_agent(&config, agent_alias);
+        let startup_provider_key = ProviderCacheKey::new(&config, &provider_name, None, &model, 0);
         let model_provider: Arc<dyn ModelProvider> = Arc::from(
             create_resilient_model_provider_nonblocking(
                 Arc::new(config.clone()),
@@ -17250,6 +17494,7 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
                 provider_api_url.clone(),
                 provider_reliability.clone(),
                 provider_runtime_options.clone(),
+                startup_provider_key.model_override.clone(),
             )
             .await?,
         );
@@ -17701,8 +17946,8 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             }
         }
 
-        let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
-        provider_cache_seed.insert(provider_name.clone(), Arc::clone(&model_provider));
+        let mut provider_cache_seed = ProviderCache::default();
+        provider_cache_seed.insert_configured(startup_provider_key, Arc::clone(&model_provider));
         let message_timeout_secs =
             effective_channel_message_timeout_secs(config.channels.message_timeout_secs);
         let interrupt_on_new_message = interrupt_on_new_message_config(&config.channels);
@@ -18461,7 +18706,7 @@ fn concurrent_persist_lock_serialization() {
             std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                 .expect("MAX_CONVERSATION_SENDERS must be positive"),
         ))),
-        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
         scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -18644,7 +18889,7 @@ fn test_channel_ctx_with_backend(
             std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                 .expect("MAX_CONVERSATION_SENDERS must be positive"),
         ))),
-        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
         scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -18768,7 +19013,7 @@ fn test_channel_ctx_with_backend_channel_and_provider(
             std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                 .expect("MAX_CONVERSATION_SENDERS must be positive"),
         ))),
-        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
         scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -21282,7 +21527,7 @@ pub(crate) mod tests {
         ctx.provider_cache
             .lock()
             .unwrap()
-            .insert("custom.capacity".to_string(), provider.clone());
+            .insert_configured(startup_profile_key("custom.capacity"), provider.clone());
         let msg = ChannelMessage {
             id: "matrix-capacity-error".to_string(),
             explicitly_addressed: true,
@@ -21309,7 +21554,8 @@ pub(crate) mod tests {
             ctx.provider_cache
                 .lock()
                 .unwrap()
-                .contains_key("custom.capacity")
+                .configured
+                .contains_key(&startup_profile_key("custom.capacity"))
         );
         assert!(!channel_impl.cancelled_drafts.lock().await.is_empty());
 
@@ -23151,7 +23397,7 @@ temperature = 0.3
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -23702,6 +23948,28 @@ temperature = 0.3
             Some(0.0),
             "alias temperature must be returned, not runtime_defaults.temperature"
         );
+
+        // A configured model with surrounding whitespace still names a model:
+        // the dedicated route resolves with the trimmed id.
+        let mut padded = ctx.prompt_config.as_ref().clone();
+        if let Some(classifier) = padded.providers.models.ensure("openai", "my-classifier") {
+            classifier.model = Some("  gpt-4o-mini  ".to_string());
+            classifier.temperature = Some(0.3);
+        }
+        let ctx = Arc::new(ChannelRuntimeContext {
+            prompt_config: Arc::new(padded.clone()),
+            live_config: zeroclaw_config::live::LiveConfig::new(padded).handle(),
+            ..(*ctx).clone()
+        });
+        let (_, model, temp) = resolve_classifier_route(
+            ctx.as_ref(),
+            &alias_ref,
+            &runtime_defaults_snapshot(ctx.as_ref()),
+        )
+        .await
+        .expect("a padded configured model must resolve to the alias");
+        assert_eq!(model, "gpt-4o-mini");
+        assert_eq!(temp, Some(0.3));
     }
 
     #[test]
@@ -24128,7 +24396,7 @@ temperature = 0.3
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -24409,11 +24677,20 @@ api_key = "anthropic-key"
 
     #[test]
     fn provider_cache_key_isolates_hot_generations() {
-        let startup = provider_cache_key("openrouter.default", None, 0);
-        let hot_1 = provider_cache_key("openrouter.default", None, 1);
-        let hot_2 = provider_cache_key("openrouter.default", None, 2);
+        let config = Config::default();
+        let startup = ProviderCacheKey::new(&config, "openrouter.default", None, "", 0);
+        let hot_1 = ProviderCacheKey::new(&config, "openrouter.default", None, "", 1);
+        let hot_2 = ProviderCacheKey::new(&config, "openrouter.default", None, "", 2);
 
-        assert_eq!(startup, "openrouter.default");
+        assert_eq!(
+            startup,
+            ProviderCacheKey {
+                generation: 0,
+                provider_ref: "openrouter.default".to_string(),
+                credential_fingerprint: None,
+                model_override: None,
+            }
+        );
         assert_ne!(hot_1, startup);
         assert_ne!(hot_1, hot_2);
     }
@@ -24650,7 +24927,7 @@ api_key = "anthropic-key"
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -24759,7 +25036,7 @@ api_key = "anthropic-key"
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -24886,7 +25163,7 @@ api_key = "anthropic-key"
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -25017,7 +25294,7 @@ api_key = "anthropic-key"
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -27055,7 +27332,7 @@ api_key = "anthropic-key"
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -27162,7 +27439,7 @@ api_key = "anthropic-key"
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -30603,7 +30880,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -30785,7 +31062,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -30965,7 +31242,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -31174,7 +31451,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -31363,7 +31640,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -31564,7 +31841,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -32139,7 +32416,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -32291,7 +32568,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -32419,7 +32696,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -32727,7 +33004,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -32864,7 +33141,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -33023,7 +33300,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -33165,7 +33442,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -33292,7 +33569,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -33437,7 +33714,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            provider_cache: Arc::new(Mutex::new(startup_profile_cache(provider_cache_seed))),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -33604,7 +33881,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            provider_cache: Arc::new(Mutex::new(startup_profile_cache(provider_cache_seed))),
             route_overrides: Arc::new(Mutex::new(route_overrides)),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -33699,6 +33976,1349 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    /// Channel runtime whose provider profiles are built by the channel's own
+    /// construction path and all reach one OpenAI-compatible mock endpoint, so
+    /// a test reads the model each turn actually requests on the wire.
+    ///
+    /// `custom.caller` is the agent's profile and pins `caller-model`;
+    /// `custom.other` pins `other-model`; `custom.nomodel` pins nothing. Each
+    /// profile has its own path prefix on the endpoint, so a request also shows
+    /// which profile sent it.
+    struct ModelSelectionWireFixture {
+        server: wiremock::MockServer,
+        ctx: Arc<ChannelRuntimeContext>,
+        channel: Arc<TelegramRecordingChannel>,
+        startup_provider: Arc<dyn ModelProvider>,
+        next_id: AtomicUsize,
+    }
+
+    /// A provider cache seeded the way startup seeds it, with one profile entry
+    /// per provider reference that these fixtures do not pin.
+    fn startup_profile_cache(entries: HashMap<String, Arc<dyn ModelProvider>>) -> ProviderCache {
+        let mut cache = ProviderCache::default();
+        for (provider_ref, provider) in entries {
+            cache.insert_configured(startup_profile_key(&provider_ref), provider);
+        }
+        cache
+    }
+
+    fn startup_profile_key(provider_ref: &str) -> ProviderCacheKey {
+        ProviderCacheKey::new(&Config::default(), provider_ref, None, "", 0)
+    }
+
+    /// One chat request as the provider endpoint received it: the profile path
+    /// it was sent to, the model it asked for and its `Authorization` header.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct WireCall {
+        profile: String,
+        model: String,
+        authorization: Option<String>,
+    }
+
+    impl WireCall {
+        fn per_turn(profile: &str, model: &str, authorization: Option<&str>) -> [Self; 2] {
+            std::array::from_fn(|_| Self {
+                profile: profile.to_string(),
+                model: model.to_string(),
+                authorization: authorization.map(ToString::to_string),
+            })
+        }
+    }
+
+    impl ModelSelectionWireFixture {
+        async fn new(model_routes: Vec<zeroclaw_config::schema::ModelRouteConfig>) -> Self {
+            Self::with_cache(model_routes, true).await
+        }
+
+        async fn with_cache(
+            model_routes: Vec<zeroclaw_config::schema::ModelRouteConfig>,
+            seed_startup_provider: bool,
+        ) -> Self {
+            Self::with_config(model_routes, seed_startup_provider, |_| {}).await
+        }
+
+        async fn with_config(
+            model_routes: Vec<zeroclaw_config::schema::ModelRouteConfig>,
+            seed_startup_provider: bool,
+            customize: impl FnOnce(&mut Config),
+        ) -> Self {
+            use wiremock::matchers::{method, path_regex};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"/v1/chat/completions$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+                })))
+                .mount(&server)
+                .await;
+
+            let base_uri = server.uri();
+            let mut config: Config = toml::from_str(&format!(
+                r#"
+[providers.models.custom.caller]
+uri = "{base_uri}/caller/v1"
+model = "caller-model"
+
+[providers.models.custom.other]
+uri = "{base_uri}/other/v1"
+model = "other-model"
+
+[providers.models.custom.nomodel]
+uri = "{base_uri}/nomodel/v1"
+"#
+            ))
+            .expect("fixture config must parse");
+            config.model_routes = model_routes.clone();
+            customize(&mut config);
+
+            // Built and cached the way channel startup builds and caches the
+            // agent's provider.
+            let startup_cache_key =
+                ProviderCacheKey::new(&config, "custom.caller", None, "caller-model", 0);
+            let (startup_key, startup_uri) = provider_credentials_for_ref(&config, "custom.caller");
+            let startup_provider: Arc<dyn ModelProvider> = Arc::from(
+                create_resilient_model_provider_nonblocking(
+                    Arc::new(config.clone()),
+                    "custom.caller",
+                    startup_key,
+                    startup_uri,
+                    config.reliability.clone(),
+                    zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+                    startup_cache_key.model_override.clone(),
+                )
+                .await
+                .expect("startup provider must build"),
+            );
+            let mut provider_cache_seed = ProviderCache::default();
+            if seed_startup_provider {
+                provider_cache_seed
+                    .insert_configured(startup_cache_key, Arc::clone(&startup_provider));
+            }
+
+            let channel_impl = Arc::new(TelegramRecordingChannel::default());
+            let channel: Arc<dyn Channel> = channel_impl.clone();
+            let reliability = Arc::new(config.reliability.clone());
+            let base = test_runtime_ctx_with_config_agent_and_provider_ref(
+                channel,
+                Arc::clone(&startup_provider),
+                config,
+                zeroclaw_config::schema::AliasedAgentConfig::default(),
+                "custom.caller",
+                None,
+            );
+            let ctx = Arc::new(ChannelRuntimeContext {
+                model: Arc::new("caller-model".to_string()),
+                model_routes: Arc::new(model_routes),
+                reliability,
+                provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+                ..(*base).clone()
+            });
+
+            Self {
+                server,
+                ctx,
+                channel: channel_impl,
+                startup_provider,
+                next_id: AtomicUsize::new(0),
+            }
+        }
+
+        async fn send(&self, sender: &str, content: &str) {
+            let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+            process_channel_message(
+                Arc::clone(&self.ctx),
+                zeroclaw_api::channel::ChannelMessage {
+                    id: format!("wire-msg-{id}"),
+                    sender: sender.to_string(),
+                    reply_target: "chat-1".to_string(),
+                    content: content.to_string(),
+                    channel: "telegram".into(),
+                    timestamp: u64::try_from(id).unwrap_or_default() + 1,
+                    ..Default::default()
+                },
+                CancellationToken::new(),
+            )
+            .await;
+        }
+
+        /// The model named by each chat request the endpoint received, in order.
+        /// A turn sends two through its provider: the reply-intent precheck,
+        /// then the reply; [`Self::per_turn`] spells that out.
+        async fn requested_models(&self) -> Vec<String> {
+            self.calls()
+                .await
+                .into_iter()
+                .map(|call| call.model)
+                .collect()
+        }
+
+        /// Each chat request the endpoint received, in order.
+        async fn calls(&self) -> Vec<WireCall> {
+            self.server
+                .received_requests()
+                .await
+                .expect("mock endpoint records requests")
+                .iter()
+                .filter(|request| request.url.path().ends_with("/v1/chat/completions"))
+                .map(|request| WireCall {
+                    profile: request
+                        .url
+                        .path()
+                        .trim_start_matches('/')
+                        .split('/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string(),
+                    model: request
+                        .body_json::<serde_json::Value>()
+                        .expect("chat request body is JSON")["model"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    authorization: request
+                        .headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .map(ToString::to_string),
+                })
+                .collect()
+        }
+
+        fn per_turn(models: &[&str]) -> Vec<String> {
+            models
+                .iter()
+                .flat_map(|model| [(*model).to_string(), (*model).to_string()])
+                .collect()
+        }
+
+        async fn last_reply(&self) -> String {
+            self.channel
+                .sent_messages
+                .lock()
+                .await
+                .last()
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        fn cached_providers(&self) -> Vec<Arc<dyn ModelProvider>> {
+            let cache = self
+                .ctx
+                .provider_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            cache
+                .configured
+                .values()
+                .chain(cache.selected.iter().map(|(_, provider)| provider))
+                .cloned()
+                .collect()
+        }
+
+        /// The same runtime, but the agent's default provider asks on its first
+        /// chat to switch the sender to `custom.other` with `model`, and the
+        /// `model_switch` tool is available and approved.
+        fn with_switch_to(self, model: &'static str) -> Self {
+            let switching: Arc<dyn ModelProvider> =
+                Arc::new(OtherProfileSwitchRequestProvider::to(model));
+            let ctx = Arc::new(ChannelRuntimeContext {
+                model_provider: Arc::clone(&switching),
+                provider_cache: Arc::new(Mutex::new(startup_profile_cache(HashMap::from([(
+                    "custom.caller".to_string(),
+                    switching,
+                )])))),
+                tools_registry: Arc::new(
+                    zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                        Box::new(zeroclaw_runtime::tools::ModelSwitchTool::new(
+                            Arc::clone(&self.ctx.security),
+                            Arc::clone(&self.ctx.prompt_config),
+                        )),
+                    ]),
+                ),
+                approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                    &zeroclaw_config::schema::RiskProfileConfig {
+                        auto_approve: vec!["model_switch".into()],
+                        ..Default::default()
+                    },
+                )),
+                ..(*self.ctx).clone()
+            });
+            Self { ctx, ..self }
+        }
+
+        fn selected_keys(&self) -> Vec<ProviderCacheKey> {
+            self.ctx
+                .provider_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .selected
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect()
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_model_command_requests_selected_model_on_pinned_profile() {
+        let fixture = ModelSelectionWireFixture::new(Vec::new()).await;
+
+        fixture.send("alice", "/model other-model").await;
+        assert!(
+            fixture.last_reply().await.contains(
+                &zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "channel-runtime-model-switched",
+                    &[("model", "other-model"), ("provider", "custom.caller")],
+                )
+            ),
+            "unexpected reply: {}",
+            fixture.last_reply().await
+        );
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.requested_models().await,
+            ModelSelectionWireFixture::per_turn(&["other-model"])
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_model_command_requests_selected_model_on_unpinned_profile() {
+        let fixture = ModelSelectionWireFixture::new(Vec::new()).await;
+
+        fixture.send("alice", "/models custom.nomodel").await;
+        assert!(
+            fixture.last_reply().await.contains(
+                &zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "channel-runtime-set-provider-switched",
+                    &[("provider", "custom.nomodel"), ("model", "caller-model")],
+                )
+            ),
+            "a profile without a model keeps the selected model: {}",
+            fixture.last_reply().await
+        );
+        fixture.send("alice", "hello").await;
+        fixture.send("alice", "/model other-model").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.requested_models().await,
+            ModelSelectionWireFixture::per_turn(&["caller-model", "other-model"])
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_models_command_selects_profile_model_and_requests_it() {
+        let fixture = ModelSelectionWireFixture::new(Vec::new()).await;
+
+        fixture.send("alice", "/models custom.other").await;
+        assert!(
+            fixture.last_reply().await.contains(
+                &zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "channel-runtime-set-provider-switched",
+                    &[("provider", "custom.other"), ("model", "other-model")],
+                )
+            ),
+            "the reply must name the model the next turn requests: {}",
+            fixture.last_reply().await
+        );
+        fixture.send("alice", "hello").await;
+        fixture.send("alice", "/model third-model").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.requested_models().await,
+            ModelSelectionWireFixture::per_turn(&["other-model", "third-model"])
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_model_override_does_not_leak_to_other_sender_on_shared_profile() {
+        let fixture = ModelSelectionWireFixture::new(Vec::new()).await;
+
+        fixture.send("alice", "/model other-model").await;
+        fixture.send("alice", "hello").await;
+        fixture.send("bob", "hello").await;
+        fixture.send("alice", "hello again").await;
+        fixture.send("bob", "hello again").await;
+
+        assert_eq!(
+            fixture.requested_models().await,
+            ModelSelectionWireFixture::per_turn(&[
+                "other-model",
+                "caller-model",
+                "other-model",
+                "caller-model"
+            ])
+        );
+        assert!(
+            fixture
+                .cached_providers()
+                .iter()
+                .any(|cached| Arc::ptr_eq(cached, &fixture.startup_provider)),
+            "the sender without an override keeps the startup provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_turn_without_model_selection_keeps_startup_provider_and_cache() {
+        let fixture = ModelSelectionWireFixture::new(Vec::new()).await;
+        fixture.send("bob", "hello").await;
+        fixture.send("bob", "hello again").await;
+
+        assert_eq!(
+            fixture.requested_models().await,
+            ModelSelectionWireFixture::per_turn(&["caller-model", "caller-model"])
+        );
+        let cached = fixture.cached_providers();
+        assert_eq!(cached.len(), 1, "no provider beyond the startup one");
+        assert!(Arc::ptr_eq(&cached[0], &fixture.startup_provider));
+
+        // With nothing cached, the startup fast path serves the default
+        // selection without building or caching another provider.
+        let fixture = ModelSelectionWireFixture::with_cache(Vec::new(), false).await;
+        fixture.send("bob", "hello").await;
+
+        assert_eq!(
+            fixture.requested_models().await,
+            ModelSelectionWireFixture::per_turn(&["caller-model"])
+        );
+        assert!(fixture.cached_providers().is_empty());
+    }
+
+    #[tokio::test]
+    async fn channel_route_hint_requests_route_model_when_target_pins_another() {
+        let fixture =
+            ModelSelectionWireFixture::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+                hint: "fast".into(),
+                model_provider: "custom.other".into(),
+                model: "fast-model".into(),
+                api_key: None,
+            }])
+            .await;
+
+        fixture.send("alice", "/model fast").await;
+        assert!(
+            fixture.last_reply().await.contains(
+                &zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "channel-runtime-model-switched",
+                    &[("model", "fast-model"), ("provider", "custom.other")],
+                )
+            ),
+            "unexpected reply: {}",
+            fixture.last_reply().await
+        );
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.requested_models().await,
+            ModelSelectionWireFixture::per_turn(&["fast-model"])
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_auth_error_evicts_the_provider_that_served_the_override() {
+        use wiremock::matchers::{body_partial_json, method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let fixture = ModelSelectionWireFixture::new(Vec::new()).await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/chat/completions$"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "other-model"}),
+            ))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": {"message": "invalid api key", "type": "invalid_request_error"}
+            })))
+            .with_priority(1)
+            .mount(&fixture.server)
+            .await;
+
+        fixture.send("alice", "/model other-model").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.requested_models().await,
+            ModelSelectionWireFixture::per_turn(&["other-model"])
+        );
+        let cached = fixture.cached_providers();
+        assert_eq!(
+            cached.len(),
+            1,
+            "only the provider that failed authentication is evicted"
+        );
+        assert!(
+            Arc::ptr_eq(&cached[0], &fixture.startup_provider),
+            "the default provider, which did not serve the failed turn, stays cached"
+        );
+    }
+
+    /// On its first chat, asks to move the sender to `custom.other` with
+    /// `model`; answers in text afterwards.
+    struct OtherProfileSwitchRequestProvider {
+        model: &'static str,
+        call_count: AtomicUsize,
+    }
+
+    impl OtherProfileSwitchRequestProvider {
+        fn to(model: &'static str) -> Self {
+            Self {
+                model,
+                call_count: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for OtherProfileSwitchRequestProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("fallback".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let tool_calls = if self.call_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                vec![zeroclaw_providers::ToolCall {
+                    id: "switch-call".to_string(),
+                    name: "model_switch".to_string(),
+                    arguments: serde_json::json!({
+                        "action": "set",
+                        "model_provider": "custom.other",
+                        "model": self.model
+                    })
+                    .to_string(),
+                    extra_content: None,
+                }]
+            } else {
+                Vec::new()
+            };
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some(String::new()),
+                tool_calls,
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for OtherProfileSwitchRequestProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "OtherProfileSwitchRequestProvider"
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_route_credential_stays_with_the_route_selection() {
+        let fixture =
+            ModelSelectionWireFixture::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+                hint: "fast".into(),
+                model_provider: "custom.other".into(),
+                model: "fast-model".into(),
+                api_key: Some("route-key".into()),
+            }])
+            .await;
+
+        fixture.send("alice", "/models custom.other").await;
+        fixture.send("alice", "hello").await;
+        fixture.send("bob", "/model fast").await;
+        fixture.send("bob", "hello").await;
+
+        let requests: Vec<(String, Option<String>)> = fixture
+            .calls()
+            .await
+            .into_iter()
+            .map(|call| (call.model, call.authorization))
+            .collect();
+        let route_auth = Some("Bearer route-key".to_string());
+        assert_eq!(
+            requests,
+            [
+                ("other-model".to_string(), None),
+                ("other-model".to_string(), None),
+                ("fast-model".to_string(), route_auth.clone()),
+                ("fast-model".to_string(), route_auth),
+            ],
+            "selecting the profile must not pick up the credential of a route that targets it"
+        );
+    }
+
+    /// Profiles with their own credentials plus a `fast` route to `custom.other`
+    /// that carries a different one, for following one sender's credential
+    /// across selections.
+    async fn keyed_route_fixture() -> ModelSelectionWireFixture {
+        ModelSelectionWireFixture::with_config(
+            vec![zeroclaw_config::schema::ModelRouteConfig {
+                hint: "fast".into(),
+                model_provider: "custom.other".into(),
+                model: "fast-model".into(),
+                api_key: Some("route-key".into()),
+            }],
+            true,
+            |config| {
+                for (alias, key) in [("caller", "caller-key"), ("other", "other-key")] {
+                    config
+                        .providers
+                        .models
+                        .ensure("custom", alias)
+                        .expect("custom profile slot")
+                        .api_key = Some(key.into());
+                }
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn channel_literal_model_after_keyed_route_uses_profile_credential() {
+        let fixture = keyed_route_fixture().await;
+
+        fixture.send("alice", "/model fast").await;
+        fixture.send("alice", "hello").await;
+        fixture.send("alice", "/model literal-model").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            [
+                WireCall::per_turn("other", "fast-model", Some("Bearer route-key")),
+                WireCall::per_turn("other", "literal-model", Some("Bearer other-key")),
+            ]
+            .concat()
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_models_reselecting_keyed_route_profile_uses_profile_credential() {
+        let fixture = keyed_route_fixture().await;
+
+        fixture.send("alice", "/model fast").await;
+        fixture.send("alice", "/models custom.other").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            WireCall::per_turn("other", "other-model", Some("Bearer other-key"))
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_models_selecting_another_profile_drops_route_credential() {
+        let fixture = keyed_route_fixture().await;
+
+        fixture.send("alice", "/model fast").await;
+        fixture.send("alice", "/models custom.caller").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            WireCall::per_turn("caller", "caller-model", Some("Bearer caller-key"))
+        );
+    }
+
+    #[test]
+    fn provider_cache_key_separates_punctuated_aliases_and_models() {
+        let config: Config = toml::from_str(
+            r#"
+[providers.models.custom."a#b"]
+uri = "http://127.0.0.1:9/v1"
+model = "pinned"
+
+[providers.models.custom.a]
+uri = "http://127.0.0.1:9/v1"
+model = "pinned"
+"#,
+        )
+        .expect("a quoted alias containing `#` loads");
+        assert!(config.providers.models.find("custom", "a#b").is_some());
+
+        // Under a joined-string key, `custom.a#b` with no model and
+        // `custom.a` pinned to `b` were the same entry.
+        let unpinned_alias = ProviderCacheKey::new(&config, "custom.a#b", None, "pinned", 0);
+        let other_alias_and_model = ProviderCacheKey::new(&config, "custom.a", None, "b", 0);
+        assert_eq!(unpinned_alias.model_override, None);
+        assert_eq!(other_alias_and_model.model_override.as_deref(), Some("b"));
+        assert_ne!(unpinned_alias, other_alias_and_model);
+        assert_ne!(
+            ProviderCacheKey::new(&config, "custom.a", None, "x#y", 0),
+            ProviderCacheKey::new(&config, "custom.a#b", None, "y", 0)
+        );
+        assert_ne!(
+            ProviderCacheKey::new(&config, "custom.a", Some("k#1"), "pinned", 0),
+            ProviderCacheKey::new(&config, "custom.a", Some("k"), "pinned", 0)
+        );
+
+        let keyed = ProviderCacheKey::new(&config, "custom.a", Some("sk-raw-secret"), "x", 0);
+        assert!(
+            !format!("{keyed:?}").contains("sk-raw-secret"),
+            "a cache key never carries the credential itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_selected_model_providers_stay_within_capacity() {
+        let fixture = ModelSelectionWireFixture::new(Vec::new()).await;
+        for index in 0..=MAX_SELECTED_MODEL_PROVIDERS {
+            fixture
+                .send("alice", &format!("/model selected-{index}"))
+                .await;
+            fixture.send("alice", "hello").await;
+        }
+
+        assert_eq!(
+            fixture.cached_providers().len(),
+            1 + MAX_SELECTED_MODEL_PROVIDERS
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_selected_model_cache_drops_oldest_and_rebuilds_on_demand() {
+        let fixture = ModelSelectionWireFixture::new(Vec::new()).await;
+        let mut bounded = ProviderCache::with_selected_capacity(
+            std::num::NonZeroUsize::new(2).expect("positive capacity"),
+        );
+        bounded.insert_configured(
+            ProviderCacheKey::new(
+                &fixture.ctx.prompt_config,
+                "custom.caller",
+                None,
+                "caller-model",
+                0,
+            ),
+            Arc::clone(&fixture.startup_provider),
+        );
+        let ctx = Arc::new(ChannelRuntimeContext {
+            provider_cache: Arc::new(Mutex::new(bounded)),
+            ..(*fixture.ctx).clone()
+        });
+        let fixture = ModelSelectionWireFixture { ctx, ..fixture };
+        let selected = |model: &str| {
+            ProviderCacheKey::new(&fixture.ctx.prompt_config, "custom.caller", None, model, 0)
+        };
+
+        for model in ["first-model", "second-model", "third-model"] {
+            fixture.send("alice", &format!("/model {model}")).await;
+            fixture.send("alice", "hello").await;
+        }
+        let mut kept = fixture.selected_keys();
+        kept.sort_by(|left, right| left.model_override.cmp(&right.model_override));
+        assert_eq!(kept, [selected("second-model"), selected("third-model")]);
+
+        fixture.send("bob", "hello").await;
+        assert!(
+            fixture
+                .cached_providers()
+                .iter()
+                .any(|cached| Arc::ptr_eq(cached, &fixture.startup_provider)),
+            "the default selection keeps its startup provider"
+        );
+
+        fixture.send("alice", "/model first-model").await;
+        fixture.send("alice", "hello").await;
+        assert!(fixture.selected_keys().contains(&selected("first-model")));
+        assert_eq!(fixture.selected_keys().len(), 2);
+        assert_eq!(
+            fixture.requested_models().await,
+            ModelSelectionWireFixture::per_turn(&[
+                "first-model",
+                "second-model",
+                "third-model",
+                "caller-model",
+                "first-model",
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_padded_profile_model_is_requested_trimmed() {
+        let fixture = ModelSelectionWireFixture::with_config(Vec::new(), true, |config| {
+            config
+                .providers
+                .models
+                .ensure("custom", "other")
+                .expect("custom profile slot")
+                .model = Some("  other-model  ".into());
+        })
+        .await;
+
+        fixture.send("alice", "/models custom.other").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            WireCall::per_turn("other", "other-model", None)
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_padded_default_model_is_requested_trimmed_from_startup_provider() {
+        let fixture = ModelSelectionWireFixture::with_config(Vec::new(), true, |config| {
+            config
+                .providers
+                .models
+                .ensure("custom", "caller")
+                .expect("custom profile slot")
+                .model = Some("  caller-model  ".into());
+        })
+        .await;
+
+        fixture.send("bob", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            WireCall::per_turn("caller", "caller-model", None)
+        );
+        let cached = fixture.cached_providers();
+        assert_eq!(cached.len(), 1);
+        assert!(Arc::ptr_eq(&cached[0], &fixture.startup_provider));
+    }
+
+    fn padded_route() -> Vec<zeroclaw_config::schema::ModelRouteConfig> {
+        vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "pad".into(),
+            model_provider: "custom.other".into(),
+            model: "  pad-model  ".into(),
+            api_key: None,
+        }]
+    }
+
+    #[tokio::test]
+    async fn channel_route_model_matching_its_target_pin_is_requested_as_declared() {
+        let fixture = ModelSelectionWireFixture::with_config(padded_route(), true, |config| {
+            config
+                .providers
+                .models
+                .ensure("custom", "other")
+                .expect("custom profile slot")
+                .model = Some("  pad-model  ".into());
+        })
+        .await;
+
+        fixture.send("alice", "/model pad").await;
+        assert!(
+            fixture.last_reply().await.contains(
+                &zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "channel-runtime-model-switched",
+                    &[("model", "  pad-model  "), ("provider", "custom.other")],
+                )
+            ),
+            "unexpected reply: {}",
+            fixture.last_reply().await
+        );
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            WireCall::per_turn("other", "  pad-model  ", None)
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_padded_route_model_over_a_different_pin_is_requested_trimmed() {
+        let fixture = ModelSelectionWireFixture::new(padded_route()).await;
+
+        fixture.send("alice", "/model pad").await;
+        assert!(
+            fixture.last_reply().await.contains(
+                &zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "channel-runtime-model-switched",
+                    &[("model", "  pad-model  "), ("provider", "custom.other")],
+                )
+            ),
+            "unexpected reply: {}",
+            fixture.last_reply().await
+        );
+        fixture.send("alice", "hello").await;
+
+        // The selection needs its own pin, and the shared builder trims an
+        // explicit pin.
+        assert_eq!(
+            fixture.calls().await,
+            WireCall::per_turn("other", "pad-model", None)
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_padded_route_model_on_unpinned_profile_with_fallbacks_passes_through() {
+        let fixture = ModelSelectionWireFixture::with_config(
+            vec![zeroclaw_config::schema::ModelRouteConfig {
+                hint: "pad".into(),
+                model_provider: "custom.nomodel".into(),
+                model: "  pad-model  ".into(),
+                api_key: None,
+            }],
+            true,
+            |config| {
+                config
+                    .providers
+                    .models
+                    .ensure("custom", "nomodel")
+                    .expect("custom profile slot")
+                    .fallback_models = vec!["backup-model".into()];
+            },
+        )
+        .await;
+
+        fixture.send("alice", "/model pad").await;
+        assert!(
+            fixture.last_reply().await.contains(
+                &zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                    "channel-runtime-model-switched",
+                    &[("model", "  pad-model  "), ("provider", "custom.nomodel")],
+                )
+            ),
+            "unexpected reply: {}",
+            fixture.last_reply().await
+        );
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            WireCall::per_turn("nomodel", "  pad-model  ", None)
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_padded_route_model_matching_trimmed_pin_reuses_the_profile_provider() {
+        let fixture =
+            ModelSelectionWireFixture::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+                hint: "padcaller".into(),
+                model_provider: "custom.caller".into(),
+                model: "  caller-model  ".into(),
+                api_key: None,
+            }])
+            .await;
+
+        fixture.send("alice", "hello").await;
+        fixture.send("alice", "/model padcaller").await;
+        fixture.send("alice", "hello again").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            ModelSelectionWireFixture::per_turn(&["caller-model", "caller-model"])
+                .into_iter()
+                .map(|model| WireCall {
+                    profile: "caller".into(),
+                    model,
+                    authorization: None,
+                })
+                .collect::<Vec<_>>()
+        );
+        let cached = fixture.cached_providers();
+        assert_eq!(cached.len(), 1, "no second provider for the same profile");
+        assert!(Arc::ptr_eq(&cached[0], &fixture.startup_provider));
+    }
+
+    #[tokio::test]
+    async fn channel_blank_profile_model_requests_selected_model() {
+        let fixture = ModelSelectionWireFixture::with_config(Vec::new(), true, |config| {
+            let uri = config
+                .providers
+                .models
+                .find("custom", "caller")
+                .and_then(|caller| caller.uri.clone())
+                .map(|uri| uri.replace("/caller/", "/blank/"));
+            let blank = config
+                .providers
+                .models
+                .ensure("custom", "blank")
+                .expect("custom profile slot");
+            blank.uri = uri;
+            blank.model = Some(String::new());
+        })
+        .await;
+
+        fixture.send("alice", "/models custom.blank").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            WireCall::per_turn("blank", "caller-model", None)
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_unpinned_profile_with_fallback_models_builds_the_fallback_chain() {
+        use wiremock::matchers::{body_partial_json, method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let fixture = ModelSelectionWireFixture::with_config(Vec::new(), true, |config| {
+            config.reliability.provider_retries = 0;
+            config
+                .providers
+                .models
+                .ensure("custom", "nomodel")
+                .expect("custom profile slot")
+                .fallback_models = vec!["nomodel-fallback".into()];
+        })
+        .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/chat/completions$"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "picked-model"}),
+            ))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error": {"message": "upstream unavailable", "type": "server_error"}
+            })))
+            .with_priority(1)
+            .mount(&fixture.server)
+            .await;
+
+        fixture.send("alice", "/models custom.nomodel").await;
+        fixture.send("alice", "/model picked-model").await;
+        fixture.send("alice", "hello").await;
+
+        let attempt = [
+            WireCall::per_turn("nomodel", "picked-model", None)[0].clone(),
+            WireCall::per_turn("nomodel", "nomodel-fallback", None)[0].clone(),
+        ];
+        assert_eq!(fixture.calls().await, [attempt.clone(), attempt].concat());
+    }
+
+    #[tokio::test]
+    async fn channel_auth_eviction_keeps_a_provider_a_concurrent_turn_replaced() {
+        use wiremock::matchers::{body_partial_json, method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let fixture = ModelSelectionWireFixture::new(Vec::new()).await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/v1/chat/completions$"))
+            .and(body_partial_json(
+                serde_json::json!({"model": "other-model"}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_delay(Duration::from_millis(300))
+                    .set_body_json(serde_json::json!({
+                        "error": {"message": "invalid api key", "type": "invalid_request_error"}
+                    })),
+            )
+            .with_priority(1)
+            .mount(&fixture.server)
+            .await;
+        fixture.send("alice", "/model other-model").await;
+
+        let override_key = ProviderCacheKey::new(
+            &fixture.ctx.prompt_config,
+            "custom.caller",
+            None,
+            "other-model",
+            0,
+        );
+        let turn_ctx = Arc::clone(&fixture.ctx);
+        let turn = zeroclaw_spawn::spawn!(process_channel_message(
+            turn_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "evict-race-turn".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "hello".to_string(),
+                channel: "telegram".into(),
+                timestamp: 100,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !fixture
+                .ctx
+                .provider_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .selected
+                .contains(&override_key)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the turn caches its provider");
+        let replacement: Arc<dyn ModelProvider> = Arc::new(ModelCaptureModelProvider::default());
+        fixture
+            .ctx
+            .provider_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .selected
+            .put(override_key.clone(), Arc::clone(&replacement));
+        turn.await.expect("turn completes");
+
+        let cached = fixture
+            .ctx
+            .provider_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&override_key);
+        assert!(
+            cached.is_some_and(|cached| Arc::ptr_eq(&cached, &replacement)),
+            "the failed turn evicts only the instance it used"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_reload_rebuilds_default_and_selection_for_the_new_generation() {
+        let fixture = ModelSelectionWireFixture::new(Vec::new()).await;
+        let zeroclaw_dir = tempfile::TempDir::new().unwrap();
+        let base_uri = fixture.server.uri();
+        std::fs::write(
+            zeroclaw_dir.path().join("config.toml"),
+            format!(
+                r#"
+schema_version = 4
+
+[agents."test-agent"]
+model_provider = "custom.caller"
+
+[providers.models.custom.caller]
+uri = "{base_uri}/caller/v1"
+model = "reloaded-model"
+
+[providers.models.custom.other]
+uri = "{base_uri}/other/v1"
+model = "other-model"
+"#
+            ),
+        )
+        .unwrap();
+        let mut provider_runtime_options = fixture.ctx.provider_runtime_options.clone();
+        provider_runtime_options.zeroclaw_dir = Some(zeroclaw_dir.path().to_path_buf());
+        let ctx = Arc::new(ChannelRuntimeContext {
+            provider_runtime_options,
+            ..(*fixture.ctx).clone()
+        });
+        let fixture = ModelSelectionWireFixture { ctx, ..fixture };
+
+        fixture.send("bob", "hello").await;
+        fixture.send("alice", "/model selected-model").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.requested_models().await,
+            ModelSelectionWireFixture::per_turn(&["reloaded-model", "selected-model"])
+        );
+        let snapshot = runtime_defaults_snapshot(&fixture.ctx);
+        assert!(snapshot.hot);
+        assert_eq!(snapshot.generation, 1);
+        let cache = fixture
+            .ctx
+            .provider_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let default_key =
+            ProviderCacheKey::new(&snapshot.config, "custom.caller", None, "reloaded-model", 1);
+        assert_eq!(
+            cache.configured.keys().collect::<Vec<_>>(),
+            [&default_key],
+            "only the reloaded default seed remains"
+        );
+        assert!(
+            !Arc::ptr_eq(&cache.configured[&default_key], &fixture.startup_provider),
+            "the reload seeds a provider built from the new config"
+        );
+        assert_eq!(
+            cache
+                .selected
+                .iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            [&ProviderCacheKey::new(
+                &snapshot.config,
+                "custom.caller",
+                None,
+                "selected-model",
+                1,
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_models_reply_notes_a_shadowing_scope_override() {
+        let fixture = ModelSelectionWireFixture::new(Vec::new()).await;
+
+        fixture.send("alice", "/model --user other-model").await;
+        fixture.send("alice", "/models custom.nomodel").await;
+
+        let reply = fixture.last_reply().await;
+        assert!(
+            reply.contains(&zeroclaw_runtime::i18n::get_required_cli_string_with_args(
+                "channel-runtime-shadow-note",
+                &[("model", "other-model"), ("provider", "custom.caller")],
+            )),
+            "unexpected reply: {reply}"
+        );
+    }
+
+    fn calls_of(call: [WireCall; 2], count: usize) -> Vec<WireCall> {
+        vec![call[0].clone(); count]
+    }
+
+    #[tokio::test]
+    async fn channel_model_issued_switch_to_a_hint_name_uses_profile_credential() {
+        let fixture = keyed_route_fixture().await.with_switch_to("fast");
+
+        fixture.send("alice", "switch please").await;
+        fixture.send("alice", "hello").await;
+
+        // The retry of the switched turn, then both requests of the next one.
+        assert_eq!(
+            fixture.calls().await,
+            calls_of(
+                WireCall::per_turn("other", "fast", Some("Bearer other-key")),
+                3
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_model_issued_switch_to_a_route_model_uses_route_credential() {
+        let fixture = keyed_route_fixture().await.with_switch_to("fast-model");
+
+        fixture.send("alice", "switch please").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            calls_of(
+                WireCall::per_turn("other", "fast-model", Some("Bearer route-key")),
+                3
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_model_issued_switch_credential_needs_exact_profile_and_model() {
+        // Each decoy route differs from the switch target only by letter case:
+        // one in its profile alias, one in its model id.
+        let fixture = ModelSelectionWireFixture::with_config(
+            vec![
+                zeroclaw_config::schema::ModelRouteConfig {
+                    hint: "upper-profile".into(),
+                    model_provider: "custom.Other".into(),
+                    model: "fast-model".into(),
+                    api_key: Some("profile-case-key".into()),
+                },
+                zeroclaw_config::schema::ModelRouteConfig {
+                    hint: "upper-model".into(),
+                    model_provider: "custom.other".into(),
+                    model: "Fast-Model".into(),
+                    api_key: Some("model-case-key".into()),
+                },
+            ],
+            true,
+            |config| {
+                let uri = config
+                    .providers
+                    .models
+                    .find("custom", "other")
+                    .and_then(|other| other.uri.clone())
+                    .map(|uri| uri.replace("/other/", "/Other/"));
+                let upper = config
+                    .providers
+                    .models
+                    .ensure("custom", "Other")
+                    .expect("custom profile slot");
+                upper.uri = uri;
+                upper.model = Some("upper-model".into());
+                upper.api_key = Some("upper-key".into());
+                config
+                    .providers
+                    .models
+                    .ensure("custom", "other")
+                    .expect("custom profile slot")
+                    .api_key = Some("other-key".into());
+            },
+        )
+        .await
+        .with_switch_to("fast-model");
+
+        fixture.send("alice", "switch please").await;
+        fixture.send("alice", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            calls_of(
+                WireCall::per_turn("other", "fast-model", Some("Bearer other-key")),
+                3
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_whitespace_precheck_profile_falls_back_to_main_precheck_provider() {
+        let fixture = ModelSelectionWireFixture::with_config(Vec::new(), true, |config| {
+            let uri = config
+                .providers
+                .models
+                .find("custom", "caller")
+                .and_then(|caller| caller.uri.clone())
+                .map(|uri| uri.replace("/caller/", "/precheck/"));
+            let precheck = config
+                .providers
+                .models
+                .ensure("custom", "precheck")
+                .expect("custom profile slot");
+            precheck.uri = uri;
+            precheck.model = Some("   ".into());
+        })
+        .await;
+        let ctx = Arc::new(ChannelRuntimeContext {
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig {
+                classifier_provider: zeroclaw_config::providers::ModelProviderRef::from(
+                    "custom.precheck",
+                ),
+                ..Default::default()
+            }),
+            ..(*fixture.ctx).clone()
+        });
+        let fixture = ModelSelectionWireFixture { ctx, ..fixture };
+
+        fixture.send("bob", "hello").await;
+
+        assert_eq!(
+            fixture.calls().await,
+            WireCall::per_turn("caller", "caller-model", None)
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_model_issued_switch_requests_the_switched_model() {
+        let fixture = ModelSelectionWireFixture::new(Vec::new())
+            .await
+            .with_switch_to("switched-model");
+
+        fixture.send("alice", "switch please").await;
+        fixture.send("alice", "hello").await;
+
+        // The switched turn retries on the new provider after its precheck ran
+        // on the old one; the next turn runs both requests on the new one.
+        assert_eq!(
+            fixture.requested_models().await,
+            ["switched-model", "switched-model", "switched-model"]
+        );
+    }
+
     #[tokio::test]
     async fn process_channel_message_preserves_trim_provenance_and_route_credential_across_model_switch()
      {
@@ -33723,13 +35343,18 @@ BTC is currently around $65,000 based on latest tool output."#
         // mock for the switched provider instead of constructing a real one.
         // The cache key hashes the route-specific api_key together with the
         // resolved (dotted) provider ref at the current (startup) generation.
-        let mut provider_cache_seed: HashMap<String, Arc<dyn ModelProvider>> = HashMap::new();
-        provider_cache_seed.insert(
+        let mut provider_cache_seed = startup_profile_cache(HashMap::from([(
             "test-provider".to_string(),
             Arc::clone(&default_model_provider),
-        );
-        provider_cache_seed.insert(
-            provider_cache_key(switched_provider_ref, switched_key, 0),
+        )]));
+        provider_cache_seed.insert_configured(
+            ProviderCacheKey::new(
+                &Config::default(),
+                switched_provider_ref,
+                switched_key,
+                "",
+                0,
+            ),
             Arc::clone(&switched_model_provider),
         );
 
@@ -34042,7 +35667,10 @@ BTC is currently around $65,000 based on latest tool output."#
             .provider_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert("openai.my-classifier".to_string(), classifier_provider);
+            .insert_configured(
+                startup_profile_key("openai.my-classifier"),
+                classifier_provider,
+            );
 
         process_channel_message(
             runtime_ctx,
@@ -34332,7 +35960,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            provider_cache: Arc::new(Mutex::new(startup_profile_cache(provider_cache_seed))),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -34454,7 +36082,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -34586,7 +36214,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -36076,7 +37704,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -36286,7 +37914,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -36457,7 +38085,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -36621,7 +38249,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -36792,7 +38420,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -37011,7 +38639,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -37244,7 +38872,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -37390,7 +39018,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -38073,7 +39701,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -38213,7 +39841,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
@@ -38356,7 +39984,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
@@ -38491,7 +40119,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
@@ -38626,7 +40254,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
@@ -39048,7 +40676,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
@@ -40582,7 +42210,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -43541,10 +45169,10 @@ BTC is currently around $65,000 based on latest tool output."#
         });
         let provider: Arc<dyn ModelProvider> = provider_impl.clone();
         ctx.model_provider = Arc::clone(&provider);
-        ctx.provider_cache = Arc::new(Mutex::new(HashMap::from([
+        ctx.provider_cache = Arc::new(Mutex::new(startup_profile_cache(HashMap::from([
             ("custom.local".into(), Arc::clone(&provider)),
             ("custom.cloud".into(), provider),
-        ])));
+        ]))));
 
         (Arc::new(ctx), provider_impl, channel_impl)
     }
@@ -43643,11 +45271,11 @@ BTC is currently around $65,000 based on latest tool output."#
                 ctx.provider_cache
                     .lock()
                     .unwrap()
-                    .insert("custom.cloud".into(), switching.clone());
+                    .insert_configured(startup_profile_key("custom.cloud"), switching.clone());
                 ctx.provider_cache
                     .lock()
                     .unwrap()
-                    .insert("openrouter.default".into(), provider.clone());
+                    .insert_configured(startup_profile_key("openrouter.default"), provider.clone());
                 let ctx = Arc::new(ctx);
                 let channel: Arc<dyn Channel> = channel_impl;
                 let mut command = scope_test_msg("alice", "chan-1", None);
@@ -47352,7 +48980,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -47543,7 +49171,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -48127,7 +49755,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -48625,7 +50253,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -48803,7 +50431,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -52850,7 +54478,7 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -52987,7 +54615,7 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -53164,7 +54792,7 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -53483,7 +55111,7 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            provider_cache: Arc::new(Mutex::new(startup_profile_cache(provider_cache_seed))),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -53648,7 +55276,7 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            provider_cache: Arc::new(Mutex::new(startup_profile_cache(provider_cache_seed))),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -53805,7 +55433,7 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            provider_cache: Arc::new(Mutex::new(startup_profile_cache(provider_cache_seed))),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -53982,7 +55610,7 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            provider_cache: Arc::new(Mutex::new(startup_profile_cache(provider_cache_seed))),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -55166,7 +56794,7 @@ This is an example JSON object for profile settings."#;
                 std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
                     .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(ProviderCache::default())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
             scope_overrides: Arc::new(Mutex::new(HashMap::new())),
