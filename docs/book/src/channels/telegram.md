@@ -6,14 +6,16 @@ bot creation through the first authorized conversation.
 
 ## How the current implementation is wired
 
-Telegram setup has three separate sources of truth. The channel block owns the
-Telegram connection, the agent block owns routing, and peer groups own inbound
-authorization:
+Telegram setup has separate sources of truth. The channel block owns the
+Telegram connection, the agent block owns routing, peer groups own sender
+authorization, and the optional `trusted_groups` list adds group-level
+admission:
 
 ```mermaid
 flowchart LR
     T["channels.telegram.home<br/>token and channel behavior"] --> C["TelegramChannel<br/>alias = home"]
     P["matching peer groups<br/>authorized Telegram identities"] --> C
+    TG["channels.telegram.home.trusted_groups<br/>trusted group chat IDs"] --> C
     G["Telegram Bot API<br/>getUpdates long poll"] --> C
     C -->|"authorized ChannelMessage"| R["AgentRouter"]
     A["agents.primary<br/>channels includes telegram.home"] --> R
@@ -27,8 +29,10 @@ sender's numeric Telegram user ID or username, then hands an authorized
 `ChannelMessage` to the shared channel dispatch and agent-turn lifecycle.
 
 There is no `allowed_users` field under `[channels.telegram.<alias>]`.
-Authorization lives in [Peer Groups](./peer-groups.md); that page is the
+Sender authorization lives in [Peer Groups](./peer-groups.md); that page is the
 canonical reference for peer-group fields, matching, and multi-agent behavior.
+Telegram also supports an opt-in group-level grant, `trusted_groups`, described
+below.
 
 ## 1. Create a Telegram bot
 
@@ -157,6 +161,35 @@ channel instance. This includes a wildcard peer group.
 > public bot with a suitably restricted agent; it is not a shortcut for private
 > setup.
 
+### Trust every member of a group
+
+`trusted_groups` is a group-level grant: messages from a listed group or
+supergroup are accepted from **any** member, even when that sender has no
+peer-group entry. It is additive, not a restriction: groups absent from the
+list keep using the normal sender allowlist.
+
+```toml
+[channels.telegram.home]
+trusted_groups = ["-1001234567890", "-1009876543210"]
+```
+
+Entries must be negative numeric Telegram group/supergroup `chat.id` values.
+User IDs, usernames, and positive IDs are rejected by config validation. The
+grant applies to text, voice, attachments, and media groups; direct messages
+are unaffected. `trusted_groups` does not count as a peer grant for startup
+pairing, so DM pairing behavior is unchanged.
+
+`trusted_groups` does **not** bypass `mention_only`, and `ignore` deny entries
+still win. It also does not grant approval authority: a trusted-group member
+can talk to the agent, but operations that require approval must still be
+approved by a sender authorized through peer groups in the same chat.
+
+> [!CAUTION]
+> Every member of a trusted group can drive the agent and any tools its risk
+> profile permits. Enable it only for groups whose membership you control, and
+> consider `mention_only = true` plus a restricted agent/tool profile. There is
+> no wildcard in this version; list each group explicitly.
+
 ### What an unauthorized sender is told
 
 A sender outside the resolved peer set receives a notice instead of an agent reply. The built-in text follows the authorization path in use. While a one-time pairing code is still outstanding and no effective grant authorizes a peer, it carries the operator `zeroclaw channel bind-telegram` command. Once that code is redeemed or an effective grant authorizes a peer, the notice names the identity to authorize instead. Deny-only lists and grants shadowed by denies keep recovery pairing available.
@@ -270,6 +303,7 @@ running channel would read. For a valid alias it creates or updates
 | `zeroclaw channel bind-telegram ...` with a detected running systemd, OpenRC, or launchd service | The CLI saves the config and restarts the managed service automatically. |
 | `bind-telegram` while `zeroclaw daemon` or `zeroclaw channel start` is running in another terminal | After you stop and restart that foreground process. The CLI process changed the file, not the other process's in-memory config. |
 | Direct `config.toml` edit or standalone `zeroclaw config set` change | After a daemon reload or process restart. Saving alone does not rebuild long-running listeners. |
+| `trusted_groups` changed through the running config authority | On the next message; the channel resolves the grant from live config. |
 | Restart with no matching peers | A new one-time pairing code is generated. |
 | Restart after a peer was saved | The peer remains authorized and startup pairing is not activated. |
 
@@ -329,7 +363,7 @@ logging is enabled, events are also written under the install directory at
 | The bot still asks for operator approval after `bind-telegram` | The running foreground process has not reloaded, or the identity was bound to the wrong alias. Restart it and verify the `--alias` value. |
 | The bot is silent | Confirm `enabled = true`, confirm an enabled agent owns `telegram.<alias>`, run `zeroclaw channel doctor`, then inspect logs. |
 | `Telegram polling conflict (409)` | More than one process is using the same bot token. Stop the duplicate daemon or channel process. |
-| Group messages are ignored | With `mention_only = true`, mention the bot or reply directly to one of its messages. Direct messages are still processed. |
+| Group messages are ignored | With `mention_only = true`, mention the bot or reply directly to one of its messages. If the sender has no peer-group entry, add the group's negative `chat.id` to `channels.telegram.<alias>.trusted_groups` or authorize the sender. Direct messages are still processed. |
 | Draft edits report `Too Many Requests` | Increase `channels.telegram.<alias>.draft_update_interval_ms` or disable streaming. |
 | Teammates in one group or forum topic do not see each other's context | Group sessions are keyed per sender by default. Set `channels.telegram.<alias>.per_user_session = false` to share one session per chat (and per forum topic, when present). The shared session shares its controls: any member's `/new` resets the conversation for the whole group/topic, and a session-level `/model` override applies to every member, while `/stop` stays personal to each sender. Direct messages are unaffected. |
 

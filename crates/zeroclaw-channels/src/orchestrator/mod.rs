@@ -11961,6 +11961,39 @@ fn text_gate_reply_matches_approval_route(
         })
 }
 
+/// Text SOP-gate answers from Telegram must still come from a peer-authorized
+/// sender. `trusted_groups` admits group members to the agent, but it must not
+/// turn a group member into an approval authority for a parked SOP run.
+fn telegram_sop_reply_is_peer_authorized(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    config: &zeroclaw_config::schema::Config,
+) -> bool {
+    if msg.channel != "telegram" {
+        return true;
+    }
+    let Some(alias) = msg.channel_alias.as_deref() else {
+        return false;
+    };
+    let normalize = |entry: &str| {
+        let (prefix, rest) = match entry.strip_prefix('!') {
+            Some(rest) => ("!", rest),
+            None => ("", entry),
+        };
+        format!("{prefix}{}", rest.trim().trim_start_matches('@'))
+    };
+    let peers: Vec<String> = config
+        .channel_external_peers("telegram", alias)
+        .into_iter()
+        .map(|peer| normalize(&peer))
+        .collect();
+    let mut identities: Vec<String> = vec![normalize(&msg.sender)];
+    if let Some(sender_id) = msg.platform_sender_id.as_deref() {
+        identities.push(normalize(sender_id));
+    }
+    let identities: Vec<&str> = identities.iter().map(String::as_str).collect();
+    crate::allowlist::is_identity_allowed(&peers, &identities, crate::allowlist::Match::Sensitive)
+}
+
 /// Resolve a SOP gate answered from a chat channel. Two answer forms converge
 /// here, per the channel-agnostic gate-prompt seam:
 ///
@@ -11978,6 +12011,7 @@ async fn dispatch_channel_sop_gate(
     router: &AgentRouter,
     msg: &zeroclaw_api::channel::ChannelMessage,
     config: &zeroclaw_config::schema::Config,
+    live_config: &zeroclaw_config::live::LiveConfigHandle,
     gate_prompt_channels: &[Arc<dyn Channel>],
     gate_channel_route_keys: &[String],
 ) -> bool {
@@ -12149,6 +12183,30 @@ async fn dispatch_channel_sop_gate(
             Form::Text => false,
         };
     };
+
+    let telegram_reply_peer_authorized = if matches!(form, Form::Text) {
+        let live = live_config.read();
+        telegram_sop_reply_is_peer_authorized(msg, &live)
+    } else {
+        true
+    };
+    if matches!(form, Form::Text) && !telegram_reply_peer_authorized {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "run_id": run_id,
+                    "reference": reference,
+                    "sender": msg.sender.as_str(),
+                    "channel": channel_key_for_message(msg),
+                })),
+            "telegram SOP-gate text reply rejected: sender is not peer-authorized"
+        );
+        // Consume the text so it cannot become an agent turn, but do not
+        // resolve the gate. A peer-authorized sender can still answer it.
+        return true;
+    }
 
     use zeroclaw_api::channel::GateChoiceKind;
     use zeroclaw_runtime::sop::approval::ApprovalDecision;
@@ -12464,10 +12522,14 @@ async fn run_message_dispatch_loop_until_cancelled(
                 })
                 .unwrap_or_else(|| vec![channel_key_for_message(&msg)]);
             let gate_prompt_channels = unique_channel_handles(&gate_ctx.channels_by_name);
+            // Pairing and peer-group edits publish through the live authority;
+            // the prompt snapshot predates a successful `/bind`. The gate path
+            // reads peer authorization from the live handle.
             if dispatch_channel_sop_gate(
                 &router,
                 &msg,
                 gate_ctx.prompt_config.as_ref(),
+                &gate_ctx.live_config,
                 &gate_prompt_channels,
                 &gate_channel_route_keys,
             )
@@ -13275,6 +13337,19 @@ fn build_channel_by_id(
                 let alias = alias.clone();
                 Arc::new(move || cfg_arc.read().channel_voice_peers("telegram", &alias))
             };
+            let trusted_group_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || {
+                    cfg_arc
+                        .read()
+                        .channels
+                        .telegram
+                        .get(&alias)
+                        .map(|tg| tg.trusted_groups.clone())
+                        .unwrap_or_default()
+                })
+            };
             Ok(Arc::new(
                 TelegramChannel::new(
                     tg.bot_token.clone(),
@@ -13283,6 +13358,7 @@ fn build_channel_by_id(
                     tg.mention_only,
                 )
                 .with_voice_peer_resolver(voice_peer_resolver)
+                .with_trusted_group_resolver(trusted_group_resolver)
                 .with_persistence_authority(authority.clone())
                 .with_api_base(tg.api_base_url.clone())
                 .with_ack_reactions(ack)
@@ -14881,6 +14957,19 @@ fn collect_configured_channels_with_authority(
             let alias = alias.clone();
             Arc::new(move || cfg_arc.read().channel_voice_peers("telegram", &alias))
         };
+        let trusted_group_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || {
+                cfg_arc
+                    .read()
+                    .channels
+                    .telegram
+                    .get(&alias)
+                    .map(|tg| tg.trusted_groups.clone())
+                    .unwrap_or_default()
+            })
+        };
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
             alias: Some(alias.clone()),
@@ -14893,6 +14982,7 @@ fn collect_configured_channels_with_authority(
                         tg.mention_only,
                     )
                     .with_voice_peer_resolver(voice_peer_resolver)
+                    .with_trusted_group_resolver(trusted_group_resolver)
                     .with_persistence_authority(authority.clone())
                     .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
@@ -54114,6 +54204,7 @@ This is an example JSON object for profile settings."#;
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                trusted_groups: vec![],
                 unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
@@ -54149,6 +54240,7 @@ This is an example JSON object for profile settings."#;
                 multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                trusted_groups: vec![],
                 unauthorized_message: None,
                 per_user_session: true,
                 passive_group_context: false,
@@ -58732,7 +58824,16 @@ Done."#;
         let route_keys = vec![channel_key_for_message(msg)];
         let gate_prompt_channels = gate_channel.into_iter().collect::<Vec<_>>();
         let config = zeroclaw_config::schema::Config::default();
-        dispatch_channel_sop_gate(router, msg, &config, &gate_prompt_channels, &route_keys).await
+        let live = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
+        dispatch_channel_sop_gate(
+            router,
+            msg,
+            &config,
+            &live,
+            &gate_prompt_channels,
+            &route_keys,
+        )
+        .await
     }
 
     async fn dispatch_test_channel_sop_gate_with_route_keys(
@@ -58742,7 +58843,28 @@ Done."#;
     ) -> bool {
         let route_keys: Vec<String> = route_keys.iter().map(|key| (*key).to_string()).collect();
         let config = zeroclaw_config::schema::Config::default();
-        dispatch_channel_sop_gate(router, msg, &config, &[], &route_keys).await
+        let live = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
+        dispatch_channel_sop_gate(router, msg, &config, &live, &[], &route_keys).await
+    }
+
+    async fn dispatch_test_channel_sop_gate_with_config(
+        router: &AgentRouter,
+        msg: &ChannelMessage,
+        config: &zeroclaw_config::schema::Config,
+    ) -> bool {
+        let route_keys = vec![channel_key_for_message(msg)];
+        let live = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
+        dispatch_channel_sop_gate(router, msg, config, &live, &[], &route_keys).await
+    }
+
+    async fn dispatch_test_channel_sop_gate_with_live_config(
+        router: &AgentRouter,
+        msg: &ChannelMessage,
+        config: &zeroclaw_config::schema::Config,
+        live: &zeroclaw_config::live::LiveConfigHandle,
+    ) -> bool {
+        let route_keys = vec![channel_key_for_message(msg)];
+        dispatch_channel_sop_gate(router, msg, config, live, &[], &route_keys).await
     }
 
     #[tokio::test]
@@ -58898,6 +59020,111 @@ Done."#;
         assert_eq!(
             active_run_status(&engine, &run_id),
             Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval)
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_text_reply_from_trusted_group_requires_peer_authorization() {
+        let (router, engine, run_id) =
+            parked_channel_gate_router(Some("prod"), Some("telegram.home:-100200300"));
+        let config = zeroclaw_config::schema::Config::default();
+        let msg = ChannelMessage {
+            channel: "telegram".to_string(),
+            channel_alias: Some("home".to_string()),
+            sender: "stranger".to_string(),
+            platform_sender_id: Some("777".to_string()),
+            reply_target: "-100200300".to_string(),
+            content: format!("approve {run_id}"),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "stranger", "-100200300", "", "telegram", 0)
+        };
+
+        assert!(
+            dispatch_test_channel_sop_gate_with_config(&router, &msg, &config).await,
+            "a trusted-group text reply must be consumed, not become an agent turn"
+        );
+        assert_eq!(
+            active_run_status(&engine, &run_id),
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval),
+            "a sender admitted only through trusted_groups must not resolve the gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_text_reply_from_peer_authorized_telegram_sender_resolves() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let (router, engine, run_id) =
+            parked_channel_gate_router(Some("prod"), Some("telegram.home:-100200300"));
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.peer_groups.insert(
+            "telegram_home".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.home".to_string()),
+                external_peers: vec![PeerUsername::new("operator".to_string())],
+                ..Default::default()
+            },
+        );
+        let msg = ChannelMessage {
+            channel: "telegram".to_string(),
+            channel_alias: Some("home".to_string()),
+            sender: "operator".to_string(),
+            platform_sender_id: Some("111".to_string()),
+            reply_target: "-100200300".to_string(),
+            content: format!("approve {run_id}"),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "operator", "-100200300", "", "telegram", 0)
+        };
+
+        assert!(
+            dispatch_test_channel_sop_gate_with_config(&router, &msg, &config).await,
+            "a peer-authorized text reply must still be consumed as a gate answer"
+        );
+        assert_ne!(
+            active_run_status(&engine, &run_id),
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval),
+            "a peer-authorized sender must be able to resolve the gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_gate_text_reply_reads_peer_grants_from_live_config() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let (router, engine, run_id) =
+            parked_channel_gate_router(Some("prod"), Some("telegram.home:-100200300"));
+        let stale = zeroclaw_config::schema::Config::default();
+        let mut live_config = zeroclaw_config::schema::Config::default();
+        live_config.peer_groups.insert(
+            "telegram_home".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("telegram.home".to_string()),
+                external_peers: vec![PeerUsername::new("operator".to_string())],
+                ..Default::default()
+            },
+        );
+        let live = zeroclaw_config::live::LiveConfig::new(live_config).handle();
+        let msg = ChannelMessage {
+            channel: "telegram".to_string(),
+            channel_alias: Some("home".to_string()),
+            sender: "operator".to_string(),
+            platform_sender_id: Some("111".to_string()),
+            reply_target: "-100200300".to_string(),
+            content: format!("approve {run_id}"),
+            internal_sop_event: None,
+            ..ChannelMessage::new("1", "operator", "-100200300", "", "telegram", 0)
+        };
+
+        assert!(
+            dispatch_test_channel_sop_gate_with_live_config(&router, &msg, &stale, &live).await,
+            "the gate path must consume the reply"
+        );
+        assert_ne!(
+            active_run_status(&engine, &run_id),
+            Some(zeroclaw_runtime::sop::types::SopRunStatus::WaitingApproval),
+            "a newly paired peer must be read from live config, not the prompt snapshot"
         );
     }
 
@@ -59072,10 +59299,18 @@ Done."#;
             ..ChannelMessage::new("1", "111222333", "room-1", "", "discord", 0)
         };
         let config = zeroclaw_config::schema::Config::default();
+        let live = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
 
         assert!(
-            dispatch_channel_sop_gate(&router, &msg, &config, &[], &["discord.ops".to_string()],)
-                .await,
+            dispatch_channel_sop_gate(
+                &router,
+                &msg,
+                &config,
+                &live,
+                &[],
+                &["discord.ops".to_string()],
+            )
+            .await,
             "the channel approval must resolve the parked gate"
         );
 
@@ -59161,11 +59396,14 @@ Done."#;
             ..ChannelMessage::new("1", "111222333", "room-2", "", "discord", 0)
         };
 
+        let config = zeroclaw_config::schema::Config::default();
+        let live = zeroclaw_config::live::LiveConfig::new(config.clone()).handle();
         assert!(
             dispatch_channel_sop_gate(
                 &router,
                 &msg,
-                &zeroclaw_config::schema::Config::default(),
+                &config,
+                &live,
                 &prompt_channels,
                 &["discord.oncall".to_string()],
             )

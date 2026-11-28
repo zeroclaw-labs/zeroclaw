@@ -123,7 +123,7 @@ Secrets (bot tokens, API keys, passwords) are stored encrypted; set them through
 | `draft_update_interval_ms` | Streaming edit cadence (default 500 ms) |
 | `approval_timeout_secs` | Seconds to wait for operator approval on `always_ask` tools before auto-denying |
 
-Inbound senders are gated through [peer groups](./peer-groups.md), not a per-channel field.
+Inbound senders are gated through [peer groups](./peer-groups.md). Some channels also expose explicit channel-level grants, such as Telegram's `trusted_groups`, which admits every member of a listed group without replacing the sender allowlist.
 
 ### Model fallback notices
 

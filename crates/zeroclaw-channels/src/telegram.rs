@@ -2196,6 +2196,10 @@ pub struct TelegramChannel {
     /// Resolves inbound external peers from canonical state at message-time.
     /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    /// Resolves `channels.telegram.<alias>.trusted_groups` from canonical
+    /// state at message-time. The grant authorizes every member of the listed
+    /// group without bypassing the mention gate, deny entries, or approvals.
+    trusted_group_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     persist: Option<zeroclaw_runtime::LiveConfigAuthority>,
     pairing: Option<PairingGuard>,
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -3109,7 +3113,22 @@ impl TelegramChannel {
         if let Some(user_id) = user_id.as_deref() {
             identities.push(user_id);
         }
-        self.is_any_user_allowed(identities)
+        let peers = self.normalized_peer_set();
+        if crate::allowlist::is_identity_denied_by(&peers, &identities, |entry, user| entry == user)
+        {
+            return false;
+        }
+        if crate::allowlist::is_identity_allowed(
+            &peers,
+            &identities,
+            crate::allowlist::Match::Sensitive,
+        ) {
+            return true;
+        }
+        callback
+            .pointer("/message/chat/id")
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|chat_id| self.is_trusted_group_chat_id(chat_id))
     }
 
     async fn prevalidate_model_picker_callback(&self, callback: &serde_json::Value) -> bool {
@@ -3837,6 +3856,8 @@ impl TelegramChannel {
             bot_token,
             alias,
             peer_resolver,
+            trusted_group_resolver: Arc::new(Vec::new)
+                as Arc<dyn Fn() -> Vec<String> + Send + Sync>,
             persist: None,
             pairing,
             stream_mode: StreamMode::Off,
@@ -3898,6 +3919,16 @@ impl TelegramChannel {
         voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     ) -> Self {
         self.voice_peer_resolver = voice_peer_resolver;
+        self
+    }
+
+    /// Set the resolver used for `channels.telegram.<alias>.trusted_groups`.
+    /// Resolved live so the grant tracks the shared config without a restart.
+    pub fn with_trusted_group_resolver(
+        mut self,
+        trusted_group_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
+        self.trusted_group_resolver = trusted_group_resolver;
         self
     }
 
@@ -5825,6 +5856,14 @@ impl TelegramChannel {
         self.is_any_user_allowed([username])
     }
 
+    fn normalized_peer_set(&self) -> Vec<String> {
+        (self.peer_resolver)()
+            .into_iter()
+            .map(|p| Self::normalize_identity(&p))
+            .filter(|p| !p.is_empty())
+            .collect()
+    }
+
     /// A Telegram sender is known by both a username and a numeric ID, so they
     /// are evaluated together against one snapshot of the peer list. Asking per
     /// identifier lets a deny on one be defeated by a wildcard reached through
@@ -5838,16 +5877,75 @@ impl TelegramChannel {
             .map(Self::normalize_identity)
             .collect();
         let identities: Vec<&str> = owned.iter().map(String::as_str).collect();
-        let peers: Vec<String> = (self.peer_resolver)()
-            .into_iter()
-            .map(|p| Self::normalize_identity(&p))
-            .filter(|p| !p.is_empty())
-            .collect();
+        let peers = self.normalized_peer_set();
         crate::allowlist::is_identity_allowed(
             &peers,
             &identities,
             crate::allowlist::Match::Sensitive,
         )
+    }
+
+    fn is_trusted_group_chat_id(&self, chat_id: i64) -> bool {
+        (self.trusted_group_resolver)()
+            .iter()
+            .filter_map(|entry| entry.trim().parse::<i64>().ok())
+            .any(|trusted_id| trusted_id < 0 && trusted_id == chat_id)
+    }
+
+    /// Whether `message` originates from a group or supergroup listed in
+    /// `channels.telegram.<alias>.trusted_groups`.
+    fn is_trusted_group_message(&self, message: &serde_json::Value) -> bool {
+        if !Self::is_group_message(message) {
+            return false;
+        }
+        let Some(chat_id) = message
+            .get("chat")
+            .and_then(|chat| chat.get("id"))
+            .and_then(serde_json::Value::as_i64)
+        else {
+            return false;
+        };
+        self.is_trusted_group_chat_id(chat_id)
+    }
+
+    /// Inbound admission for the message parsers: the sender allowlist admits
+    /// the identity set, or the message comes from a configured trusted group.
+    ///
+    /// `ignore` deny entries are evaluated first and win over both grants. The
+    /// approval path deliberately keeps using [`Self::is_any_user_allowed`], so
+    /// a trusted-group member can talk to the agent without gaining approval
+    /// authority.
+    fn is_inbound_sender_authorized(&self, message: &serde_json::Value) -> bool {
+        let owned: Vec<String> = Self::authorization_identities(message)
+            .iter()
+            .map(|identity| Self::normalize_identity(identity))
+            .filter(|identity| !identity.is_empty())
+            .collect();
+        let identities: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let peers = self.normalized_peer_set();
+        if crate::allowlist::is_identity_denied_by(&peers, &identities, |entry, user| entry == user)
+        {
+            return false;
+        }
+        if crate::allowlist::is_identity_allowed(
+            &peers,
+            &identities,
+            crate::allowlist::Match::Sensitive,
+        ) {
+            return true;
+        }
+        if identities.is_empty() || !self.is_trusted_group_message(message) {
+            return false;
+        }
+        // `/bind` must reach the pairing path, not the agent. The listener
+        // only calls `handle_unauthorized_message` after every parser declines
+        // the update, so admitting the bind text here would turn the one-time
+        // code into ordinary model input.
+        let bind_text = message
+            .get("text")
+            .or_else(|| message.get("caption"))
+            .and_then(serde_json::Value::as_str);
+        !bind_text.is_some_and(|text| Self::extract_bind_code(text).is_some())
     }
 
     fn approval_callback_context(callback: &serde_json::Value) -> (Vec<String>, Option<String>) {
@@ -6011,7 +6109,16 @@ impl TelegramChannel {
             return;
         }
 
-        if let Some(code) = Self::extract_bind_code(text) {
+        let bind_code = Self::extract_bind_code(text);
+
+        // A trusted-group member is already admitted for this chat. Do not
+        // send the unauthorized notice for ordinary group traffic; keep the
+        // `/bind <code>` path available so DM pairing is unchanged.
+        if self.is_trusted_group_message(message) && bind_code.is_none() {
+            return;
+        }
+
+        if let Some(code) = bind_code {
             // Redemption reads the same live predicate the notice and the
             // `/bind` hint read. The guard's existence is not proof that
             // startup pairing is still the authorization path: `try_pair`
@@ -6351,8 +6458,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
     fn allowed_attachment_sender(&self, message: &serde_json::Value) -> Option<String> {
         let (_, _, sender_identity) = Self::extract_sender_info(message);
-        let identities = Self::authorization_identities(message);
-        self.is_any_user_allowed(identities.iter().map(String::as_str))
+        self.is_inbound_sender_authorized(message)
             .then_some(sender_identity)
     }
 
@@ -6829,9 +6935,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // check stays ahead of every download.
         let (_, sender_id, sender_identity) = Self::extract_sender_info(message);
 
-        let identities = Self::authorization_identities(message);
-
-        if !self.is_any_user_allowed(identities.iter().map(String::as_str)) {
+        if !self.is_inbound_sender_authorized(message) {
             return UpdateDisposition::SkipPermanent;
         }
 
@@ -7232,9 +7336,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         let (_, sender_id, sender_identity) = Self::extract_sender_info(message);
 
-        let identities = Self::authorization_identities(message);
-
-        if !self.is_any_user_allowed(identities.iter().map(String::as_str)) {
+        if !self.is_inbound_sender_authorized(message) {
             return None;
         }
 
@@ -10658,6 +10760,19 @@ mod tests {
         )
         .with_persistence_authority(telegram_alias_config(alias, multi_message_delay_ms))
         .with_streaming(StreamMode::MultiMessage, 750)
+    }
+
+    fn telegram_channel_with_trusted_groups(
+        mention_only: bool,
+        groups: Vec<String>,
+    ) -> TelegramChannel {
+        TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(Vec::new),
+            mention_only,
+        )
+        .with_trusted_group_resolver(Arc::new(move || groups.clone()))
     }
 
     #[test]
@@ -19696,6 +19811,252 @@ mod tests {
     }
 
     #[test]
+    fn trusted_group_admits_unlisted_sender_for_group_text() {
+        let ch = telegram_channel_with_trusted_groups(false, vec!["-100200300".into()]);
+        let update = serde_json::json!({
+            "update_id": 20,
+            "message": {
+                "message_id": 70,
+                "text": "hello from the trusted group",
+                "from": { "id": 777, "username": "stranger" },
+                "chat": { "id": -100_200_300, "type": "supergroup" }
+            }
+        });
+
+        let msg = ch
+            .parse_update_message(&update)
+            .expect("an exact trusted-group match must admit an unlisted sender");
+
+        assert_eq!(msg.sender, "stranger");
+        assert_eq!(msg.platform_sender_id.as_deref(), Some("777"));
+        assert_eq!(msg.reply_target, "-100200300");
+    }
+
+    #[test]
+    fn trusted_group_does_not_admit_other_groups_or_dms() {
+        let ch = telegram_channel_with_trusted_groups(false, vec!["-100200300".into()]);
+
+        let other_group = serde_json::json!({
+            "update_id": 21,
+            "message": {
+                "message_id": 71,
+                "text": "hello from another group",
+                "from": { "id": 777, "username": "stranger" },
+                "chat": { "id": -100_999_999, "type": "supergroup" }
+            }
+        });
+        assert!(ch.parse_update_message(&other_group).is_none());
+
+        let dm = serde_json::json!({
+            "update_id": 22,
+            "message": {
+                "message_id": 72,
+                "text": "hello in a DM",
+                "from": { "id": 777, "username": "stranger" },
+                "chat": { "id": 777, "type": "private" }
+            }
+        });
+        assert!(ch.parse_update_message(&dm).is_none());
+    }
+
+    #[test]
+    fn trusted_group_still_requires_mention_when_mention_only() {
+        let ch = telegram_channel_with_trusted_groups(true, vec!["-100200300".into()]);
+        *ch.bot_username.lock() = Some("testbot".to_string());
+
+        let unaddressed = serde_json::json!({
+            "update_id": 23,
+            "message": {
+                "message_id": 73,
+                "text": "just talking to the group",
+                "from": { "id": 777, "username": "stranger" },
+                "chat": { "id": -100_200_300, "type": "supergroup" }
+            }
+        });
+        assert!(ch.parse_update_message(&unaddressed).is_none());
+
+        let addressed = serde_json::json!({
+            "update_id": 24,
+            "message": {
+                "message_id": 74,
+                "text": "@testbot hello",
+                "from": { "id": 777, "username": "stranger" },
+                "chat": { "id": -100_200_300, "type": "supergroup" }
+            }
+        });
+        assert!(ch.parse_update_message(&addressed).is_some());
+    }
+
+    #[test]
+    fn trusted_group_respects_ignore_deny_entries() {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["!stranger".into()]),
+            false,
+        )
+        .with_trusted_group_resolver(Arc::new(|| vec!["-100200300".into()]));
+        let update = serde_json::json!({
+            "update_id": 25,
+            "message": {
+                "message_id": 75,
+                "text": "denied sender in a trusted group",
+                "from": { "id": 777, "username": "stranger" },
+                "chat": { "id": -100_200_300, "type": "supergroup" }
+            }
+        });
+
+        assert!(
+            ch.parse_update_message(&update).is_none(),
+            "an ignore entry must win over the trusted-group grant"
+        );
+    }
+
+    #[test]
+    fn trusted_group_bind_command_does_not_reach_the_agent() {
+        let ch = telegram_channel_with_trusted_groups(false, vec!["-100200300".into()]);
+        let update = serde_json::json!({
+            "update_id": 26,
+            "message": {
+                "message_id": 78,
+                "text": "/bind 123456",
+                "from": { "id": 777, "username": "stranger" },
+                "chat": { "id": -100_200_300, "type": "supergroup" }
+            }
+        });
+
+        assert!(
+            ch.parse_update_message(&update).is_none(),
+            "a trusted-group bind command must fall through to the pairing handler"
+        );
+    }
+
+    #[test]
+    fn trusted_group_model_picker_callback_is_allowed() {
+        let ch = telegram_channel_with_trusted_groups(false, vec!["-100200300".into()]);
+        let callback = serde_json::json!({
+            "from": { "id": 777, "username": "stranger" },
+            "message": { "chat": { "id": -100_200_300, "type": "supergroup" } }
+        });
+
+        assert!(
+            ch.model_picker_callback_user_is_allowed(&callback),
+            "the non-approval model picker must follow the trusted-group grant"
+        );
+    }
+
+    #[test]
+    fn trusted_group_model_picker_callback_rejects_ignored_sender() {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["!stranger".into()]),
+            false,
+        )
+        .with_trusted_group_resolver(Arc::new(|| vec!["-100200300".into()]));
+        let callback = serde_json::json!({
+            "from": { "id": 777, "username": "stranger" },
+            "message": { "chat": { "id": -100_200_300, "type": "supergroup" } }
+        });
+
+        assert!(
+            !ch.model_picker_callback_user_is_allowed(&callback),
+            "an explicit ignore must win over the trusted-group picker fallback"
+        );
+    }
+
+    #[test]
+    fn trusted_group_authorizes_attachment_sender() {
+        let ch = telegram_channel_with_trusted_groups(false, vec!["-100200300".into()]);
+        let message = serde_json::json!({
+            "message_id": 76,
+            "chat": { "id": -100_200_300, "type": "supergroup" },
+            "from": { "id": 777, "username": "stranger" },
+            "photo": [ { "file_id": "best", "file_size": 20 } ]
+        });
+
+        assert_eq!(
+            ch.allowed_attachment_sender(&message).as_deref(),
+            Some("stranger"),
+            "the attachment gate must use the same trusted-group grant"
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_group_authorizes_media_group_anchor_sender() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        let photo_bytes = tiny_jpeg();
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "photos/file_1.jpg" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/photos/file_1\.jpg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(photo_bytes))
+            .mount(&mock_server)
+            .await;
+
+        let ch = telegram_channel_with_trusted_groups(false, vec!["-100200300".into()])
+            .with_mock_api_base(mock_server.uri())
+            .with_workspace_dir(workspace.path().to_path_buf());
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 77,
+                "media_group_id": "trusted-album",
+                "chat": { "id": -100_200_300, "type": "supergroup" },
+                "from": { "id": 777, "username": "stranger" },
+                "photo": [ { "file_id": "best", "file_size": 20 } ],
+                "caption": "album from the trusted group"
+            }
+        });
+
+        let msg = ch
+            .try_parse_media_group_with_unsupported(&[update], &[])
+            .await
+            .expect_parsed("a trusted-group album must pass the anchor-sender gate");
+        assert_eq!(msg.reply_target, "-100200300");
+    }
+
+    #[tokio::test]
+    async fn trusted_group_member_cannot_resolve_approval() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let ch = telegram_channel_with_trusted_groups(false, vec!["-100200300".into()]);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals.lock().await.insert(
+            "trusted-approval".to_string(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: "-100200300".to_string(),
+                tool_name: "shell".to_string(),
+            },
+        );
+
+        let resolution = crate::util::resolve_pending_approval(
+            &ch.pending_approvals,
+            "trusted-approval",
+            ChannelApprovalResponse::Approve,
+            ch.is_any_user_allowed(["stranger", "777"]),
+            "-100200300",
+        )
+        .await;
+
+        assert_eq!(
+            resolution,
+            crate::util::PendingApprovalResolution::Rejected,
+            "trusted-group admission must not grant approval authority"
+        );
+    }
+
+    #[test]
     fn parse_update_message_extracts_thread_id_for_forum_topic() {
         let mention_only = false;
         let ch = TelegramChannel::new(
@@ -22060,6 +22421,59 @@ mod tests {
             mock_server.received_requests().await.unwrap().is_empty(),
             "an unauthorized sender learns nothing — not even that a limit exists"
         );
+    }
+
+    #[tokio::test]
+    async fn trusted_group_authorizes_voice_sender() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {"file_path": "voice/file.ogg"}
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/voice/file\.ogg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 100]))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/transcribe$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "hello from the trusted group"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            api_url: format!("{}/transcribe", mock_server.uri()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+        let ch = telegram_channel_with_trusted_groups(false, vec!["-100200300".into()])
+            .with_mock_api_base(mock_server.uri())
+            .with_transcription(tc);
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 5,
+                "voice": { "file_id": "voice_file", "duration": 4 },
+                "from": { "id": 777, "username": "stranger" },
+                "chat": { "id": -100_200_300, "type": "supergroup" }
+            }
+        });
+
+        let msg = ch
+            .try_parse_voice_message(&update)
+            .await
+            .expect_parsed("a trusted-group voice note must be transcribed");
+        assert!(msg.content.contains("hello from the trusted group"));
     }
 
     #[tokio::test]
