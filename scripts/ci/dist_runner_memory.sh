@@ -46,8 +46,11 @@ check_inactive() {
 }
 
 release_owned_file() {
+  local activation_attempted="${1:-true}"
   check_owned_file || return 1
-  sudo swapoff -- "$dist_swap_file" || return 1
+  if [[ "$activation_attempted" == true ]]; then
+    sudo swapoff -- "$dist_swap_file" || return 1
+  fi
   check_owned_file || return 1
   check_inactive || return 1
   rm -- "$dist_swap_file"
@@ -58,7 +61,7 @@ prepare_failure() {
   trap - EXIT
   if (( status != 0 )) && [[ -n "$dist_swap_file" && -n "$dist_swap_identity" ]]; then
     echo "Memory setup failed; attempting guarded release of its own file" >&2
-    if ! release_owned_file; then
+    if ! release_owned_file "$dist_swap_activation_attempted"; then
       echo "Swapfile retained: guarded release could not be completed" >&2
     fi
   fi
@@ -70,6 +73,7 @@ case "${1:-}" in
     : "${GITHUB_OUTPUT:?GITHUB_OUTPUT is required}"
     dist_swap_file=""
     dist_swap_identity=""
+    dist_swap_activation_attempted=false
     trap prepare_failure EXIT
     report_resources
     dist_available="$(df --output=avail -B1 -- "$dist_swap_root" | tail -n 1)"
@@ -83,6 +87,8 @@ case "${1:-}" in
     check_owned_file
     sudo fallocate -l 8G -- "$dist_swap_file"
     sudo mkswap -- "$dist_swap_file"
+    # If activation starts and fails, still attempt swapoff during cleanup.
+    dist_swap_activation_attempted=true
     sudo swapon -- "$dist_swap_file"
     check_owned_file
     dist_active_paths="$(swapon --show=NAME --noheadings --raw)"
