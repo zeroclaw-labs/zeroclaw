@@ -16727,10 +16727,53 @@ async fn assemble_channel_agent_tools(
     built: tools::AllToolsResult,
     skills: &[zeroclaw_runtime::skills::Skill],
     runtime: Arc<dyn platform::RuntimeAdapter>,
+    cancel: Option<&tokio_util::sync::CancellationToken>,
 ) -> ChannelAssembledTools {
     use zeroclaw_log::Instrument as _;
 
     let agent_attribution = zeroclaw_runtime::agent::AgentAttribution(agent_alias);
+    // Channel tools are assembled once and kept for the listener lifetime, so
+    // a granted MCP server that is skipped here stays missing until the
+    // process restarts. Connect them up front with the startup retry policy
+    // (rate limiting, MCP gateway restarting) and hand the registry to the
+    // assembly. This runs in the channels component, which does not gate the
+    // gateway's /health; the gateway's own listing and per-turn assemblies
+    // keep the single-shot `connect_all`.
+    let channel_mcp_servers = if config.mcp.enabled {
+        config.mcp_servers_for_agent(agent_alias)
+    } else {
+        Vec::new()
+    };
+    let mcp_registry = if channel_mcp_servers.is_empty() {
+        None
+    } else {
+        zeroclaw_runtime::health::mark_component_starting(&format!("mcp:{agent_alias}"));
+        let connect = zeroclaw_runtime::tools::McpRegistry::connect_all_with_retry(
+            &channel_mcp_servers,
+            &zeroclaw_runtime::tools::ConnectRetryPolicy::CHANNEL_STARTUP,
+        )
+        .instrument(zeroclaw_log::attribution_span!(&agent_attribution));
+        // The retry window can last minutes; a daemon reload must not wait
+        // for it (the channel task is aborted after a short grace and the
+        // reload would turn into a shutdown). On cancel, hand the assembly an
+        // empty registry so it does not connect again, and let the caller's
+        // cancel check end startup.
+        let connected = match cancel {
+            Some(cancel) => tokio::select! {
+                result = connect => Some(result),
+                () = cancel.cancelled() => None,
+            },
+            None => Some(connect.await),
+        };
+        match connected {
+            Some(Ok(registry)) => Some(Arc::new(registry)),
+            // Fall back to the assembly's own single-shot connect.
+            Some(Err(_)) => None,
+            None => Some(Arc::new(
+                zeroclaw_runtime::tools::McpRegistry::from_servers(Vec::new()).await,
+            )),
+        }
+    };
     let assembled = async {
         zeroclaw_log::scope!(
             model_provider: model_provider,
@@ -16757,12 +16800,8 @@ async fn assemble_channel_agent_tools(
                         // is off, matching `run`/`process_message`.
                         list_deferred_mcp_specs: false,
                         emit_assembly_logs: true,
-                        // Channel tools are assembled once at daemon startup and
-                        // retain their registry-backed wrappers for the listener
-                        // lifetime, so there is no per-turn reconnect to avoid here.
-                        // The heartbeat worker remains the only caller that supplies
-                        // a pre-built registry for reuse across repeated assemblies.
-                        mcp_registry: None,
+                        // Pre-connected above with the channel startup retry policy.
+                        mcp_registry,
                     },
                 )
                 .await
@@ -16772,6 +16811,16 @@ async fn assemble_channel_agent_tools(
     }
     .instrument(zeroclaw_log::attribution_span!(&agent_attribution))
     .await;
+    // A server still missing after the retry budget stays missing until the
+    // process restarts. Surface that on `/health` (component `mcp:<alias>`).
+    // A cancelled attempt publishes nothing: its empty registry says nothing
+    // about the servers, and the next generation marks the component again.
+    if !cancel.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
+        zeroclaw_runtime::tools::scoped::publish_mcp_connect_health(
+            agent_alias,
+            assembled.mcp_connect_status(),
+        );
+    }
     let deferred_section = assembled.deferred_section().to_string();
     let pinned_section = assembled.pinned_section().to_string();
     let zeroclaw_runtime::tools::scoped::ScopedAssembled {
@@ -17335,8 +17384,12 @@ pub async fn start_channels_with_authority_and_plugin_webhooks(
             all_tools_result_ch,
             &skills,
             Arc::clone(&runtime),
+            Some(&cancel),
         )
         .await;
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
 
         let tool_specs: Vec<(String, String)> = built_tools
             .iter()
@@ -30037,6 +30090,99 @@ BTC is currently around $65,000 based on latest tool output."#
         server
     }
 
+    /// The channel startup MCP connect retry can
+    /// last minutes; a cancelled channel attempt (daemon reload) must abandon
+    /// it promptly instead of holding the task past the reload grace period,
+    /// and must not fall back to another connect.
+    #[tokio::test]
+    async fn assemble_channel_agent_tools_abandons_mcp_retry_on_cancel() {
+        use wiremock::matchers::{body_partial_json, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, McpBundleConfig, McpServerConfig, McpTransport, RiskProfileConfig,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"method": "initialize"}),
+            ))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "30"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = Config::default();
+        config.mcp.enabled = true;
+        config.mcp.deferred_loading = true;
+        config.mcp.servers = vec![McpServerConfig {
+            name: "docs".into(),
+            transport: McpTransport::Http,
+            url: Some(server.uri()),
+            ..Default::default()
+        }];
+        config.mcp_bundles.insert(
+            "docsbundle".into(),
+            McpBundleConfig {
+                servers: vec!["docs".into()],
+                exclude: Vec::new(),
+            },
+        );
+        config
+            .risk_profiles
+            .insert("test-profile".into(), RiskProfileConfig::default());
+        config.agents.insert(
+            "cancel-agent".into(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "openai.test-provider".into(),
+                risk_profile: "test-profile".into(),
+                mcp_bundles: vec!["docsbundle".into()],
+                ..Default::default()
+            },
+        );
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let trigger = cancel.clone();
+        zeroclaw_spawn::spawn!(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            trigger.cancel();
+        });
+        let started = std::time::Instant::now();
+        let _assembled = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            assemble_channel_agent_tools(
+                &config,
+                "cancel-agent",
+                "openai.test-provider",
+                "gpt-test",
+                &security,
+                channel_all_tools_result(Vec::new()),
+                &[],
+                Arc::new(platform::NativeRuntime::new()),
+                Some(&cancel),
+            ),
+        )
+        .await
+        .expect("cancel must end the MCP retry wait");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
+        // The abandoned attempt leaves the component as it was, not "error".
+        let status = zeroclaw_runtime::health::snapshot()
+            .components
+            .get("mcp:cancel-agent")
+            .map(|c| c.status.clone());
+        assert_eq!(status.as_deref(), Some("starting"));
+        // server.verify() on drop: exactly one initialize, i.e. no retry after
+        // cancel and no single-shot fallback connect.
+    }
+
     /// Drives the REAL `assemble_channel_agent_tools` against a mock MCP server
     /// granting one pinned resource, then runs the exact post-assembly composition
     /// `start_channels` performs (`compose_channel_mcp_prompt_sections`). It proves
@@ -30100,6 +30246,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel_all_tools_result(Vec::new()),
                 &[],
                 Arc::new(platform::NativeRuntime::new()),
+                None,
             ),
         )
         .await
@@ -30212,6 +30359,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel_all_tools_result(Vec::new()),
                 &[],
                 Arc::new(platform::NativeRuntime::new()),
+                None,
             ),
         )
         .await
@@ -30294,6 +30442,7 @@ BTC is currently around $65,000 based on latest tool output."#
             built,
             &[],
             Arc::new(platform::NativeRuntime::new()),
+            None,
         )
         .await;
         let names: Vec<&str> = assembled.tools.iter().map(|t| t.name()).collect();
@@ -30329,6 +30478,7 @@ BTC is currently around $65,000 based on latest tool output."#
             built,
             &[],
             Arc::new(platform::NativeRuntime::new()),
+            None,
         )
         .await;
         let names: Vec<&str> = assembled.tools.iter().map(|t| t.name()).collect();
@@ -30367,6 +30517,7 @@ BTC is currently around $65,000 based on latest tool output."#
             built,
             &[],
             Arc::new(platform::NativeRuntime::new()),
+            None,
         )
         .await;
         let names: Vec<&str> = assembled.tools.iter().map(|t| t.name()).collect();
@@ -30454,6 +30605,7 @@ BTC is currently around $65,000 based on latest tool output."#
             built,
             &skills,
             Arc::new(FingerprintRuntime),
+            None,
         )
         .await;
         let tool = assembled
@@ -30529,6 +30681,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel_all_tools_result(vec![Box::new(NamedMockTool("shell"))]),
             &skills,
             Arc::new(platform::NativeRuntime::new()),
+            None,
         )
         .await;
         let effective_tool_names: HashSet<&str> =
