@@ -27,6 +27,63 @@ OpenAI-compatible providers warm the connection with `GET {base_url}/models`, us
 The probe consumes the response body and accepts non-success HTTP status codes, so a service without a models endpoint can still start.
 Chat-completion requests continue to use POST; warmup does not invoke inference or require a model catalog.
 
+### Recipe: Tsubasa (Chat Completions)
+
+Tsubasa exposes an OpenAI-compatible Chat Completions API. Use the `custom`
+slot; there is no built-in `tsubasa` family. Both public model ids share a
+**32,768-token** combined input/output budget, so set `context_window` and
+`max_tokens` explicitly instead of relying on ZeroClaw's 32,000-token
+unknown-model fallback.
+
+Checked so far: Chat Completions transport (JSON and streaming) and rejected
+credentials against the documented endpoint. This recipe does **not** claim
+native tool quality, vision, reasoning, or a verified end-to-end agent session.
+
+```toml
+[providers.models.custom.tsubasa_fast]
+uri            = "https://api.tsubasa.sh/v1"
+model          = "tsubasa-fast"
+api_key        = "op://platform/tsubasa/api-key"
+wire_api       = "chat_completions"
+context_window = 32768
+max_tokens     = 8192
+
+[providers.models.custom.tsubasa_pro]
+uri            = "https://api.tsubasa.sh/v1"
+model          = "tsubasa-pro"
+api_key        = "op://platform/tsubasa/api-key"
+wire_api       = "chat_completions"
+context_window = 32768
+max_tokens     = 8192
+
+[runtime_profiles.tsubasa]
+max_context_tokens = 24576
+
+[agents.default]
+model_provider  = "custom.tsubasa_fast"
+runtime_profile = "tsubasa"
+```
+
+`max_context_tokens = 24576` reserves the configured 8,192 output tokens inside
+the 32,768 combined window. ZeroClaw does not subtract `max_tokens` from the
+input budget automatically, so leave this profile attached rather than treating
+it as optional.
+
+Point `api_key` at your secrets store (see
+[Configuration → Credentials](./configuration.md#credentials)). Config loading
+resolves stored `op://` references before schema-mirror environment overrides,
+so a failed `op read` stops startup before any `ZEROCLAW_…__api_key` export can
+help. If you prefer a shell key instead of 1Password, **omit both `api_key`
+lines** from the TOML above and bridge the value:
+
+```sh
+export ZEROCLAW_providers__models__custom__tsubasa_fast__api_key="$TSUBASA_API_KEY"
+export ZEROCLAW_providers__models__custom__tsubasa_pro__api_key="$TSUBASA_API_KEY"
+```
+
+`GET /v1/models` may be unavailable on some Tsubasa deployments; pin `model`
+explicitly as above rather than relying on catalog discovery.
+
 ## First-class local-inference servers
 
 ZeroClaw ships canonical slots for popular local-inference stacks. They're all OpenAI-compatible under the hood but with default `uri` values pre-applied so you can usually omit `uri` entirely.
