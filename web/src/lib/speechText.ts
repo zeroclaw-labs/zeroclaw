@@ -22,7 +22,7 @@ function visibleText(
     case 'inlineCode':
       return node.value ?? '';
     case 'html':
-      return (node.value ?? '').replace(/<!--[\s\S]*?-->|<\/?[a-z][\w:-]*(?=[\s/>])(?:[^"'<>]|"[^"]*"|'[^']*')*>/gi, '');
+      return (node.value ?? '').replace(/<!--[\s\S]*?-->|<\/?[a-z][\w:-]*(?=[\s/>])(?:[^"'<>]|"[^"]*"|'[^']*')*>/gi, (tag) => /^<\/?(?:br|hr|p|div|li|tr|td|th|section|article|blockquote|h[1-6])(?=[\s/>])/i.test(tag) ? ' ' : '');
     case 'code':
       return '\n' + (node.value ?? '') + '\n';
     case 'image':
@@ -56,7 +56,7 @@ export function speechText(markdown: string): string {
   }
   collect(root);
   const references = new Set<string>();
-  const main = visibleText(root, definitions, references);
+  const main = visibleText(root, definitions, references).trim().replace(/(?:\s*🦀\uFE0F?)+\s*$/u, '').trim();
   const notes: string[] = [];
   for (const id of references) {
     const note = definitions.get(id)!;
