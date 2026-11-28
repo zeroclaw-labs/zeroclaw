@@ -1573,6 +1573,19 @@ fn admit_discord_message(
     Some(normalized)
 }
 
+/// A chat command addressed to the bot by mention: `<@bot> /model x` yields
+/// `/model x`. The shared command parser only recognizes a message that
+/// starts with `/`, and in a guild with `mention_only` the mention has to come
+/// first, so without this the command reaches the model as plain text.
+/// Anything that is not a command keeps its mention.
+fn discord_command_after_mention<'a>(content: &'a str, bot_user_id: &str) -> Option<&'a str> {
+    let rest = mention_tags(bot_user_id)
+        .iter()
+        .find_map(|tag| content.strip_prefix(tag.as_str()))?
+        .trim_start();
+    rest.starts_with('/').then_some(rest)
+}
+
 /// Minimal base64 decode (no extra dep) — only needs to decode the user ID portion
 #[allow(clippy::cast_possible_truncation)]
 fn base64_decode(input: &str) -> Option<String> {
@@ -3329,6 +3342,11 @@ impl Channel for DiscordChannel {
                     ) else {
                         continue;
                     };
+                    let clean_content =
+                        match discord_command_after_mention(&clean_content, &bot_user_id) {
+                            Some(command) => command.to_string(),
+                            None => clean_content,
+                        };
 
                     let client = self.http_client();
                     let (attachment_text, media_attachments) = process_attachments(
@@ -6528,6 +6546,42 @@ mod tests {
         assert!(!is_conversational_message_type(21)); // THREAD_STARTER_MESSAGE
         assert!(!is_conversational_message_type(6)); // CHANNEL_PINNED_MESSAGE
         assert!(!is_conversational_message_type(7)); // USER_JOIN
+    }
+
+    #[test]
+    fn command_after_leading_mention_reaches_the_command_parser() {
+        assert_eq!(
+            discord_command_after_mention("<@42> /model gpt-x", "42"),
+            Some("/model gpt-x")
+        );
+        assert_eq!(
+            discord_command_after_mention("<@!42>   /thinking high", "42"),
+            Some("/thinking high"),
+            "nickname mentions and extra spaces are accepted"
+        );
+        assert_eq!(
+            discord_command_after_mention("<@42>/new", "42"),
+            Some("/new")
+        );
+    }
+
+    #[test]
+    fn mention_is_kept_when_no_command_follows_it() {
+        assert_eq!(
+            discord_command_after_mention("<@42> what is /model?", "42"),
+            None
+        );
+        assert_eq!(discord_command_after_mention("<@42> hello", "42"), None);
+        assert_eq!(
+            discord_command_after_mention("/model x <@42>", "42"),
+            None,
+            "a bare command needs no rewrite"
+        );
+        assert_eq!(
+            discord_command_after_mention("<@7> /model x", "42"),
+            None,
+            "a command addressed to another user is not ours"
+        );
     }
 
     #[test]
