@@ -99,6 +99,71 @@ and `structuredClone()`.
 - Firefox 113+
 - Safari 16.2+
 
+## Provisioning OpenBao secrets from the dashboard
+
+With a server-side OpenBao identity configured, the operator selects **OpenBao**,
+enters the secret value, and selects **Add credential**. The editable reference
+is suggested from the mount, prefix, alias and field. The gateway handles vault
+authentication, so the operator can complete the task without issuing or
+copying a vault token. **Link existing secret** saves the reference without
+writing a value to OpenBao.
+
+Set `BAO_ADDR` to the operator-configured HTTPS origin of an OpenBao server
+and `ZEROCLAW_OPENBAO_WRITE_PREFIX` to an allowed KV v2 mount and prefix,
+for example `secret/agents`. OpenBao then offers **Add** to create a
+record and **Link existing secret** to register an existing reference.
+The editable reference defaults to `<prefix>/<alias>/<field>`.
+Existing read-side OpenBao identity and ACLs still govern later use.
+Set `BAO_CACERT` to a PEM CA bundle if the vault uses a private CA.
+
+For managed writes, set `ZEROCLAW_OPENBAO_WRITE_TOKEN_FILE` to the absolute
+path of a dedicated, short-lived write token managed by OpenBao Agent or an
+equivalent deployment service. If omitted, the gateway can use the configured
+OpenBao Agent token file from BAO_TOKEN_PATH. The dashboard asks the authenticated
+operator for the value only. The gateway reads the token file on each
+write, so lease renewal and replacement do not require a gateway restart.
+Protect the file and the writer identity from agent tools and untrusted
+processes. An explicitly shared OpenBao identity needs scoped permissions for both reads and writes. Use a separate writer identity where the gateway has its own execution boundary. Without a server-side writer, the WebUI can still link an existing secret without issuing an OpenBao write. Give the writer token `create` for new records or `patch` plus `read`
+on the metadata endpoint for rotations, restricted to the configured
+prefix. The gateway sends the value and token over verified HTTPS and
+persists only the encrypted reference. New records use KV v2 CAS zero.
+Replace with a value patches the field on the same reference against
+its current version. A blank replacement preserves the external value.
+Delete removes the catalog entry. Use the vault for remote destruction.
+
+If OpenBao accepts a new write but persisting the local reference fails,
+use **Link existing secret** with the same reference to recover. A
+retry of **Add** cannot overwrite it. A gateway timeout may also leave
+the result uncertain. Verify in OpenBao before retrying.
+
+### Other external vaults
+
+Each writer is opt-in. Set the matching prefix on the gateway host. The
+browser suggests a reference inside that scope, and editing the reference
+remains subject to the scope and the provider ACL. The operator enters
+write authorization per operation. The existing CLI-based read flows
+retain their own credentials.
+
+| Provider | Gateway setting and example | Operator write authority |
+| --- | --- | --- |
+| 1Password | `ZEROCLAW_1PASSWORD_WRITE_PREFIX=op://<vault-id>` and `ZEROCLAW_1PASSWORD_CONNECT_URL=https://connect.example.com` | A Connect write token scoped to the vault. Set `ZEROCLAW_1PASSWORD_CONNECT_CA` to a PEM bundle if the origin uses a private CA. |
+| Azure Key Vault | `ZEROCLAW_AZURE_WRITE_PREFIX=vault-name/jarvis-` | A bearer token for Azure Key Vault with metadata-list and secret-set permissions in the configured scope. Public Azure endpoint. |
+| AWS Secrets Manager | `ZEROCLAW_AWS_WRITE_PREFIX=us-east-1/jarvis` | Temporary AWS STS access key, secret access key and session token with CreateSecret and PutSecretValue permissions for the scope. Commercial AWS endpoints. |
+| Google Secret Manager | `ZEROCLAW_GOOGLE_WRITE_PREFIX=project-id/jarvis-` | An OAuth access token with the cloud-platform scope and permissions to create secrets and add versions. Global secrets, using `latest` references. |
+
+The 1Password writer checks for an existing item title and stores the
+item and field IDs returned by Connect. Rotation patches the field by
+ID. Azure checks version metadata before setting a value. Azure Set
+Secret and 1Password item creation lack a conditional create by name.
+Use a dedicated vault or name prefix with one writer to avoid races with
+external writers. AWS and Google reject creation of an existing name
+at the provider.
+
+Google creates the resource and its first version in separate requests.
+If the version write fails, verify the resource in Google Cloud, then
+link the existing identifier and use **Replace** to add the version.
+Retried adds cannot replace an existing AWS or Google resource.
+
 ## Browser voice controls
 
 Paired browsers can open **Config → Other → Browser Voice and Audio** to enable microphone and

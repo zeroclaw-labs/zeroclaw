@@ -265,6 +265,62 @@ pub fn build_spec() -> serde_json::Value {
                 "responses": prop_get_responses,
             },
         },
+        "/api/config/plugin-tls-credentials": {
+            "get": {
+                "tags": ["config"],
+                "summary": "List plugin TLS credential bindings",
+                "description": "An authenticated operator receives binding metadata and configured state. Credential values are write-only.",
+                "responses": {
+                    "200": {
+                        "description": "Credential binding metadata",
+                        "content": {"application/json": {"schema": {
+                            "type": "object",
+                            "required": ["encryption_enabled", "credentials"],
+                            "properties": {
+                                "encryption_enabled": {"type": "boolean"},
+                                "credentials": {"type": "array", "items": {
+                                    "type": "object",
+                                    "required": ["instance", "property", "configured", "profiles"],
+                                    "properties": {
+                                        "instance": {"type": "string"},
+                                        "property": {"type": "string"},
+                                        "configured": {"type": "boolean"},
+                                        "profiles": {"type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}}}
+                                    }
+                                }}
+                            }
+                        }}}
+                    },
+                    "403": {"description": "Authenticated operator required"}
+                }
+            },
+            "post": {
+                "tags": ["config"],
+                "summary": "Set, replace or delete a bound plugin TLS credential",
+                "description": "Uses the existing encrypted plugin configuration. Deleting a credential removes the local value and can interrupt dependent TLS profiles.",
+                "requestBody": {
+                    "required": true,
+                    "content": {"application/json": {"schema": {
+                        "type": "object",
+                        "required": ["instance", "property", "operation"],
+                        "properties": {
+                            "instance": {"type": "string"},
+                            "property": {"type": "string"},
+                            "operation": {"type": "string", "enum": ["create", "replace", "delete"]},
+                            "value": {"type": "string", "writeOnly": true, "maxLength": 32768}
+                        }
+                    }}}
+                },
+                "responses": {
+                    "200": {"description": "Only the resulting configured state"},
+                    "400": {"description": "Invalid credential request"},
+                    "403": {"description": "Authenticated operator required"},
+                    "404": {"description": "Binding not found"},
+                    "409": {"description": "Credential state no longer matches the operation"},
+                    "412": {"description": "Secret encryption and an initialized encryption key are required"}
+                }
+            }
+        },
         "/api/config/list": {
             "get": {
                 "tags": ["config"],
