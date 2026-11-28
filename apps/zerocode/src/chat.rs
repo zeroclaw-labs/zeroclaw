@@ -7371,6 +7371,7 @@ fn render_tool_entry(
     name: &str,
     input_json: &str,
     result: Option<&str>,
+    waiting: bool,
     is_selected: bool,
     disclosure: ToolDisclosure,
 ) -> Option<usize> {
@@ -7688,7 +7689,13 @@ fn render_tool_entry(
     }
 
     if let Some(input) = subagent_input.as_ref() {
-        let missing = crate::i18n::t("zc-chat-tool-result-not-recorded");
+        // Only a call this pane saw start in the running turn may say it is
+        // waiting; restored history cannot know, so it stays neutral.
+        let missing = crate::i18n::t(if waiting {
+            "zc-chat-tool-waiting-for-response"
+        } else {
+            "zc-chat-tool-result-not-recorded"
+        });
         let res = result.unwrap_or(&missing);
         let (response, details) = if name == "delegate" {
             delegate_response_parts(input, res)
@@ -7774,12 +7781,74 @@ fn render_tool_entry(
 
 /// Render a single committed entry into `lines`.
 /// The transcript layout owner uses this renderer in every rebuild mode.
+/// The child tool calls under a delegate card: one summary line, and the
+/// call list when the card is open.
+fn render_delegate_activity(
+    lines: &mut Vec<Line<'static>>,
+    log: &DelegateActivityLog,
+    in_flight: bool,
+    is_selected: bool,
+    disclosure: ToolDisclosure,
+) {
+    if log.calls.is_empty() {
+        return;
+    }
+    let sel_mod = if is_selected {
+        Modifier::REVERSED
+    } else {
+        Modifier::empty()
+    };
+    let safe = |text: &str, max: usize| terminal_safe_tool_text_limited(text, max, 1).0;
+    let total = (log.calls.len() + log.dropped).to_string();
+    let mut summary = crate::i18n::t_args("zc-chat-tool-child-calls", &[("count", &total)]);
+    if in_flight && let Some(call) = log.running() {
+        summary.push_str(" · ");
+        summary.push_str(&crate::i18n::t_args(
+            "zc-chat-tool-child-now",
+            &[("tool", &safe(&call.tool_name, 64))],
+        ));
+    }
+    lines.push(Line::from(Span::styled(
+        format!("  {summary}"),
+        theme::tool_label_style().add_modifier(sel_mod),
+    )));
+    if !disclosure.is_open() {
+        return;
+    }
+    for call in &log.calls {
+        let mark = match call.success {
+            None if in_flight => "…",
+            None => "·",
+            Some(true) => "✓",
+            Some(false) => "✗",
+        };
+        let indent = "  ".repeat(call.depth.min(4) as usize);
+        let mut text = format!(
+            "    {indent}{mark} {}: {}",
+            safe(&call.agent, 40),
+            safe(&call.tool_name, 64)
+        );
+        if !call.arguments_summary.is_empty() {
+            text.push_str(&format!(" ({})", safe(&call.arguments_summary, 100)));
+        }
+        if call.success.is_none() && !in_flight {
+            text.push_str(" · ");
+            text.push_str(&crate::i18n::t("zc-chat-tool-result-not-recorded"));
+        }
+        lines.push(Line::from(Span::styled(
+            text,
+            theme::dim_style().add_modifier(sel_mod),
+        )));
+    }
+}
+
 fn render_entry_into(
     entry: &ChatEntry,
     is_selected: bool,
     show_thoughts: bool,
     tool_disclosure: ToolDisclosure,
     width: u16,
+    waiting: bool,
     lines: &mut Vec<Line<'static>>,
 ) -> Option<usize> {
     let sel_mod = if is_selected {
@@ -7849,16 +7918,28 @@ fn render_entry_into(
             name,
             input_json,
             result,
+            delegate_activity,
             ..
         } => {
-            return render_tool_entry(
+            let footer = render_tool_entry(
                 lines,
                 name.as_ref(),
                 input_json.as_ref(),
                 result.as_deref().map(|s| s as &str),
+                waiting && result.is_none(),
                 is_selected,
                 tool_disclosure,
             );
+            if let Some(log) = delegate_activity.as_deref() {
+                render_delegate_activity(
+                    lines,
+                    log,
+                    waiting && result.is_none(),
+                    is_selected,
+                    tool_disclosure,
+                );
+            }
+            return footer;
         }
     }
     None
@@ -10091,7 +10172,68 @@ pub enum ChatEntry {
         /// Tool output. `None` while the call is in flight,
         /// `Some(Arc<str>)` once the result arrives.
         result: Option<Arc<str>>,
+        /// Live tool calls of the delegate this call ran. `None` for
+        /// ordinary tools and for restored history.
+        delegate_activity: Option<Box<DelegateActivityLog>>,
     },
+}
+
+/// Child tool calls reported for one parent `delegate` call, newest last.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct DelegateActivityLog {
+    pub calls: Vec<DelegateChildCall>,
+    /// Calls dropped from the front once the per-card limit is reached.
+    pub dropped: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DelegateChildCall {
+    pub agent: String,
+    pub depth: u32,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub arguments_summary: String,
+    /// `None` while running, else whether it succeeded.
+    pub success: Option<bool>,
+}
+
+/// Child calls kept per delegate card.
+const DELEGATE_ACTIVITY_LIMIT: usize = 50;
+
+impl DelegateActivityLog {
+    fn apply(&mut self, activity: zeroclaw_api::agent::DelegateActivity) {
+        use zeroclaw_api::agent::DelegateActivityPhase;
+        match activity.phase {
+            DelegateActivityPhase::Started { arguments_summary } => {
+                self.calls.push(DelegateChildCall {
+                    agent: activity.agent,
+                    depth: activity.depth,
+                    tool_call_id: activity.tool_call_id,
+                    tool_name: activity.tool_name,
+                    arguments_summary,
+                    success: None,
+                });
+                if self.calls.len() > DELEGATE_ACTIVITY_LIMIT {
+                    self.calls.remove(0);
+                    self.dropped += 1;
+                }
+            }
+            DelegateActivityPhase::Finished { success, .. } => {
+                if let Some(call) = self.calls.iter_mut().rev().find(|call| {
+                    call.tool_call_id == activity.tool_call_id
+                        && call.agent == activity.agent
+                        && call.depth == activity.depth
+                        && call.success.is_none()
+                }) {
+                    call.success = Some(success);
+                }
+            }
+        }
+    }
+
+    fn running(&self) -> Option<&DelegateChildCall> {
+        self.calls.iter().rev().find(|call| call.success.is_none())
+    }
 }
 
 impl ChatEntry {
@@ -10159,6 +10301,9 @@ impl ChatEntry {
             (Self::AgentMessageContinuation(old), Self::AgentMessage(new)) => {
                 old.as_str() == new.as_ref()
             }
+            (Self::Tool { .. }, Self::Tool { .. }) => {
+                self.without_delegate_activity() == canonical.without_delegate_activity()
+            }
             _ => self == canonical,
         }
     }
@@ -10181,7 +10326,49 @@ impl ChatEntry {
             Self::AgentMessageContinuation(text) => {
                 Some(Self::AgentMessage(Arc::from(text.as_str())))
             }
+            Self::Tool { .. } => Some(self.without_delegate_activity()),
             _ => Some(self.clone()),
+        }
+    }
+
+    /// Keep what this client knows that the store does not: the
+    /// already-rendered form of an unchanged user row, and a delegate
+    /// card's live child calls, which history never carries.
+    fn carry_into_refreshed(&self, refreshed: &mut Self) {
+        match (self, refreshed) {
+            (Self::UserMessage { .. }, refreshed) => *refreshed = self.clone(),
+            (
+                Self::Tool {
+                    delegate_activity: Some(activity),
+                    ..
+                },
+                Self::Tool {
+                    delegate_activity: slot @ None,
+                    ..
+                },
+            ) => *slot = Some(activity.clone()),
+            _ => {}
+        }
+    }
+
+    /// A tool row without its live delegate activity, which history never
+    /// carries, so a live card and its stored row compare equal.
+    fn without_delegate_activity(&self) -> Self {
+        match self {
+            Self::Tool {
+                tool_call_id,
+                name,
+                input_json,
+                result,
+                ..
+            } => Self::Tool {
+                tool_call_id: tool_call_id.clone(),
+                name: name.clone(),
+                input_json: input_json.clone(),
+                result: result.clone(),
+                delegate_activity: None,
+            },
+            other => other.clone(),
         }
     }
 }
@@ -10448,6 +10635,9 @@ pub struct ChatState {
     tool_footer_rects: Vec<(usize, ratatui::layout::Rect)>,
     /// Per-tool disclosure overrides; file tools otherwise default to preview.
     tool_disclosures: BTreeMap<Arc<str>, ToolDisclosure>,
+    /// Tool calls this pane saw start in the turn still running. Only these
+    /// may claim to be waiting; restored or abandoned calls stay neutral.
+    live_tool_calls: HashSet<Arc<str>>,
     /// Clickable `[Copy]` labels from the last draw.
     copy_hit_regions: Vec<CopyHitRegion>,
     /// URL hit segments projected from the complete wrapped transcript into
@@ -10573,6 +10763,7 @@ impl ChatState {
             tool_header_rects: Vec::new(),
             tool_footer_rects: Vec::new(),
             tool_disclosures: BTreeMap::new(),
+            live_tool_calls: HashSet::new(),
             copy_hit_regions: Vec::new(),
             url_hit_regions: Vec::new(),
             pending_url_activation: None,
@@ -11480,34 +11671,38 @@ impl ChatState {
         let browse_cursor = self.browse_cursor;
         let browse_multi = &self.browse_multi;
         let tool_disclosures = &self.tool_disclosures;
-        let inputs =
-            self.entries[range.clone()]
-                .iter()
-                .enumerate()
-                .map(|(relative_index, entry)| {
-                    let index = range.start + relative_index;
-                    let highlighted = browse_multi.contains(&index)
-                        || browse_range.is_some_and(|(lo, hi)| index >= lo && index <= hi)
-                        || browse_cursor == Some(index);
-                    let disclosure = match entry {
-                        ChatEntry::Tool {
-                            tool_call_id,
-                            name,
-                            input_json,
-                            ..
-                        } => tool_disclosures
-                            .get(tool_call_id)
-                            .copied()
-                            .unwrap_or_else(|| default_tool_disclosure(name, input_json)),
-                        _ => ToolDisclosure::Collapsed,
-                    };
-                    EntryLayoutInput {
-                        index,
-                        entry,
-                        highlighted,
-                        disclosure,
-                    }
-                });
+        let live_tool_calls = &self.live_tool_calls;
+        let inputs = self.entries[range.clone()].iter().enumerate().map(
+            |(relative_index, entry)| {
+                let index = range.start + relative_index;
+                let highlighted = browse_multi.contains(&index)
+                    || browse_range.is_some_and(|(lo, hi)| index >= lo && index <= hi)
+                    || browse_cursor == Some(index);
+                let disclosure = match entry {
+                    ChatEntry::Tool {
+                        tool_call_id,
+                        name,
+                        input_json,
+                        ..
+                    } => tool_disclosures
+                        .get(tool_call_id)
+                        .copied()
+                        .unwrap_or_else(|| default_tool_disclosure(name, input_json)),
+                    _ => ToolDisclosure::Collapsed,
+                };
+                let waiting = matches!(
+                    entry,
+                    ChatEntry::Tool { tool_call_id, .. } if live_tool_calls.contains(tool_call_id)
+                );
+                EntryLayoutInput {
+                    index,
+                    entry,
+                    highlighted,
+                    disclosure,
+                    waiting,
+                }
+            },
+        );
         self.transcript_layout
             .rebuild(width, range.clone(), self.show_thoughts, inputs);
     }
@@ -12184,6 +12379,7 @@ impl ChatState {
             | SessionUpdate::HistoryTrimmed { session_id, .. }
             | SessionUpdate::TurnComplete { session_id, .. }
             | SessionUpdate::Plan { session_id, .. }
+            | SessionUpdate::DelegateActivity { session_id, .. }
             | SessionUpdate::BudgetWarning { session_id, .. } => session_id.as_str(),
         };
         if update_sid != self.session_id {
@@ -12236,13 +12432,18 @@ impl ChatState {
                 if self.turn_in_flight {
                     self.turn_status = TurnStatus::CallingTool(name.clone());
                 }
+                let tool_call_id = Arc::<str>::from(tool_call_id);
+                if self.turn_in_flight {
+                    self.live_tool_calls.insert(Arc::clone(&tool_call_id));
+                }
                 self.entries.push(ChatEntry::Tool {
-                    tool_call_id: Arc::<str>::from(tool_call_id),
+                    tool_call_id,
                     name: Arc::<str>::from(name),
                     input_json: Arc::<str>::from(
                         serde_json::to_string(&raw_input).unwrap_or_default(),
                     ),
                     result: None,
+                    delegate_activity: None,
                 });
                 self.mark_dirty_append();
             }
@@ -12274,6 +12475,25 @@ impl ChatState {
                 }
                 if self.turn_in_flight && matches!(self.turn_status, TurnStatus::CallingTool(_)) {
                     self.turn_status = TurnStatus::Working;
+                }
+            }
+            SessionUpdate::DelegateActivity { activity, .. } => {
+                let parent = activity.parent_tool_call_id.clone();
+                for entry in self.entries.iter_mut().rev() {
+                    if let ChatEntry::Tool {
+                        tool_call_id,
+                        result: None,
+                        delegate_activity,
+                        ..
+                    } = entry
+                        && tool_call_id.as_ref() == parent.as_str()
+                    {
+                        delegate_activity
+                            .get_or_insert_with(Default::default)
+                            .apply(activity);
+                        self.mark_dirty_full();
+                        break;
+                    }
                 }
             }
             SessionUpdate::ApprovalRequest {
@@ -12573,6 +12793,10 @@ impl ChatState {
 
     fn settle_turn_lifecycle(&mut self, clean: bool, pause_reason: QueuePauseReason) {
         self.turn_in_flight = false;
+        if !self.live_tool_calls.is_empty() {
+            self.live_tool_calls.clear();
+            self.mark_dirty_full();
+        }
         self.optimistic_user_message = None;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
@@ -13084,6 +13308,7 @@ impl ChatState {
         self.streaming_text.clear();
         self.streaming_thought.clear();
         self.turn_in_flight = false;
+        self.live_tool_calls.clear();
         self.optimistic_user_message = None;
         self.turn_had_streaming_text = false;
         self.turn_had_tool_calls = false;
@@ -13260,9 +13485,7 @@ impl ChatState {
         if append_only {
             for (index, old) in self.entries.iter().enumerate() {
                 mapped[index] = Some(index);
-                if matches!(old, ChatEntry::UserMessage { .. }) {
-                    entries[index] = old.clone();
-                }
+                old.carry_into_refreshed(&mut entries[index]);
             }
         } else {
             let mut by_identity: HashMap<ChatEntry, VecDeque<usize>> = HashMap::new();
@@ -13294,10 +13517,7 @@ impl ChatState {
                 if let Some(index) = exact.into_iter().chain(attachment_match).min() {
                     mapped[old_index] = Some(index);
                     next = index + 1;
-                    // Keep the already-rendered form of this unchanged user row.
-                    if matches!(old, ChatEntry::UserMessage { .. }) {
-                        entries[index] = old.clone();
-                    }
+                    old.carry_into_refreshed(&mut entries[index]);
                 }
             }
         }
@@ -13517,6 +13737,7 @@ impl ChatState {
                         ),
                         input_json: Arc::<str>::from(input_json),
                         result: m.tool_output.map(bounded_tool_output).map(Arc::<str>::from),
+                        delegate_activity: None,
                     });
                     continue;
                 }
@@ -13544,6 +13765,7 @@ impl ChatState {
                             ),
                             input_json: Arc::<str>::from("null"),
                             result: Some(Arc::<str>::from(output)),
+                            delegate_activity: None,
                         });
                     }
                     continue;
@@ -13597,6 +13819,7 @@ impl ChatState {
         self.tool_header_rects.clear();
         self.tool_footer_rects.clear();
         self.tool_disclosures.clear();
+        self.live_tool_calls.clear();
         self.copy_hit_regions.clear();
         self.url_hit_regions.clear();
         self.pending_url_activation = None;
@@ -13928,6 +14151,7 @@ mod tests {
             false,
             ToolDisclosure::Collapsed,
             80,
+            false,
             &mut lines,
         );
         let url_span = lines[0]
@@ -27181,6 +27405,7 @@ mod tests {
                 "path": "fixture.txt", "content": "a line that wraps at narrow widths\n".repeat(10)
             }).to_string()),
             result: None,
+            delegate_activity: None,
         });
         s.mark_dirty_append();
         s.rebuild_lines(40);
@@ -28758,6 +28983,291 @@ mod tests {
     }
 
     #[test]
+    fn delegate_activity_finishes_match_agent_and_depth_for_reused_provider_ids() {
+        use zeroclaw_api::agent::{DelegateActivity, DelegateActivityPhase};
+        let mut log = DelegateActivityLog::default();
+        let activity = |agent: &str, depth, phase| DelegateActivity {
+            parent_tool_call_id: "parent".into(),
+            agent: agent.into(),
+            depth,
+            tool_call_id: "call_1".into(),
+            tool_name: "shell".into(),
+            phase,
+        };
+        for (agent, depth) in [("researcher", 0), ("researcher", 1), ("helper", 0)] {
+            log.apply(activity(
+                agent,
+                depth,
+                DelegateActivityPhase::Started {
+                    arguments_summary: String::new(),
+                },
+            ));
+        }
+        log.apply(activity(
+            "researcher",
+            0,
+            DelegateActivityPhase::Finished {
+                success: false,
+                output_preview: String::new(),
+            },
+        ));
+        assert_eq!(log.calls[0].success, Some(false));
+        assert_eq!(log.calls[1].success, None);
+        assert_eq!(log.calls[2].success, None);
+        log.apply(activity(
+            "researcher",
+            1,
+            DelegateActivityPhase::Finished {
+                success: true,
+                output_preview: String::new(),
+            },
+        ));
+        assert_eq!(log.calls[1].success, Some(true));
+        assert_eq!(log.calls[2].success, None);
+    }
+
+    /// A refresh replaces rows with stored history, which has no delegate
+    /// activity; the live card keeps its child calls on the appended and
+    /// the remapped path alike.
+    #[test]
+    fn delegate_activity_survives_session_refresh() {
+        use crate::client::{MessageEntry, MessageEntryKind};
+        let input = serde_json::json!({"agent": "researcher", "prompt": "look"});
+        let mut log = DelegateActivityLog::default();
+        log.calls.push(DelegateChildCall {
+            agent: "researcher".into(),
+            depth: 1,
+            tool_call_id: "child_1".into(),
+            tool_name: "shell".into(),
+            arguments_summary: "ls".into(),
+            success: Some(true),
+        });
+        let mut s = state();
+        s.entries = vec![
+            ChatEntry::UserMessage {
+                text: Some(Arc::from("go")),
+                attachments: vec![],
+            },
+            ChatEntry::Tool {
+                tool_call_id: Arc::from("delegate_1"),
+                name: Arc::from("delegate"),
+                input_json: Arc::from(input.to_string()),
+                result: Some(Arc::from("done")),
+                delegate_activity: Some(Box::new(log.clone())),
+            },
+        ];
+        let message = |role: &str, content: &str| MessageEntry {
+            role: role.into(),
+            content: content.into(),
+            ..Default::default()
+        };
+        let mut messages = vec![
+            message("user", "go"),
+            MessageEntry {
+                role: "assistant".into(),
+                kind: MessageEntryKind::ToolCall,
+                tool_call_id: Some("delegate_1".into()),
+                tool_name: Some("delegate".into()),
+                tool_input: Some(input.clone()),
+                tool_output: Some("done".into()),
+                ..Default::default()
+            },
+            message("assistant", "external answer"),
+        ];
+        let activity_at = |s: &ChatState, index: usize| match &s.entries[index] {
+            ChatEntry::Tool {
+                delegate_activity, ..
+            } => delegate_activity.as_deref().cloned(),
+            other => panic!("row {index} is not a tool: {other:?}"),
+        };
+
+        s.refresh_history(messages.clone(), false).unwrap();
+        assert_eq!(s.entries.len(), 3);
+        assert_eq!(activity_at(&s, 1), Some(log.clone()));
+
+        // Another client's earlier prompt shifts every row.
+        messages.insert(0, message("user", "earlier prompt"));
+        s.refresh_history(messages, false).unwrap();
+        assert_eq!(s.entries.len(), 4);
+        assert_eq!(activity_at(&s, 2), Some(log));
+    }
+
+    #[test]
+    fn delegate_activity_finishes_skip_settled_calls_with_reused_provider_ids() {
+        use zeroclaw_api::agent::{DelegateActivity, DelegateActivityPhase};
+        let mut log = DelegateActivityLog::default();
+        let activity = |phase| DelegateActivity {
+            parent_tool_call_id: "parent".into(),
+            agent: "researcher".into(),
+            depth: 0,
+            tool_call_id: "call_1".into(),
+            tool_name: "shell".into(),
+            phase,
+        };
+        for _ in 0..2 {
+            log.apply(activity(DelegateActivityPhase::Started {
+                arguments_summary: String::new(),
+            }));
+        }
+        for success in [false, true, false] {
+            log.apply(activity(DelegateActivityPhase::Finished {
+                success,
+                output_preview: String::new(),
+            }));
+        }
+        assert_eq!(log.calls[0].success, Some(true));
+        assert_eq!(log.calls[1].success, Some(false));
+    }
+
+    #[test]
+    fn delegate_card_shows_child_activity_while_running_and_keeps_it_after() {
+        use zeroclaw_api::agent::{DelegateActivity, DelegateActivityPhase};
+        let mut s = state();
+        s.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".into(),
+            tool_call_id: "parent".into(),
+            name: "delegate".into(),
+            raw_input: serde_json::json!({"agent": "researcher", "prompt": "Look it up"}),
+        });
+        let activity = |id: &str, phase| SessionUpdate::DelegateActivity {
+            session_id: "sess-1".into(),
+            activity: DelegateActivity {
+                parent_tool_call_id: "parent".into(),
+                agent: "researcher".into(),
+                depth: 0,
+                tool_call_id: id.into(),
+                tool_name: "web_fetch".into(),
+                phase,
+            },
+        };
+        s.apply_update(activity(
+            "c1",
+            DelegateActivityPhase::Started {
+                arguments_summary: "url: https://example.com".into(),
+            },
+        ));
+        let render = |s: &ChatState, disclosure| {
+            let mut lines = Vec::new();
+            render_entry_into(
+                &s.entries()[0],
+                false,
+                false,
+                disclosure,
+                120,
+                true,
+                &mut lines,
+            );
+            rendered_text(&lines)
+        };
+        let running = render(&s, ToolDisclosure::Collapsed);
+        assert!(
+            running.contains("1 child tool calls · now: web_fetch"),
+            "{running}"
+        );
+
+        s.apply_update(activity(
+            "c1",
+            DelegateActivityPhase::Finished {
+                success: true,
+                output_preview: "page".into(),
+            },
+        ));
+        s.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".into(),
+            tool_call_id: "parent".into(),
+            raw_output: "found it".into(),
+        });
+        let done = render(&s, ToolDisclosure::Full);
+        assert!(done.contains("1 child tool calls"), "{done}");
+        assert!(!done.contains("now:"), "{done}");
+        assert!(
+            done.contains("researcher: web_fetch (url: https://example.com)"),
+            "{done}"
+        );
+
+        // Activity for a call that is not a running tool card is ignored.
+        s.apply_update(activity(
+            "c2",
+            DelegateActivityPhase::Started {
+                arguments_summary: String::new(),
+            },
+        ));
+        assert!(!render(&s, ToolDisclosure::Full).contains("2 child tool calls"));
+    }
+
+    #[test]
+    fn cancelled_delegate_card_stops_naming_a_running_child_tool() {
+        use zeroclaw_api::agent::{DelegateActivity, DelegateActivityPhase};
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".into(),
+            tool_call_id: "parent".into(),
+            name: "delegate".into(),
+            raw_input: serde_json::json!({"agent": "researcher", "prompt": "Look it up"}),
+        });
+        s.apply_update(SessionUpdate::DelegateActivity {
+            session_id: "sess-1".into(),
+            activity: DelegateActivity {
+                parent_tool_call_id: "parent".into(),
+                agent: "researcher".into(),
+                depth: 0,
+                tool_call_id: "c1".into(),
+                tool_name: "web_fetch".into(),
+                phase: DelegateActivityPhase::Started {
+                    arguments_summary: String::new(),
+                },
+            },
+        });
+        s.tool_disclosures
+            .insert(Arc::from("parent"), ToolDisclosure::Full);
+        let render = |s: &mut ChatState| {
+            s.rebuild_lines(120);
+            rendered_text(&s.transcript_layout.view().cached_lines)
+        };
+        let running = render(&mut s);
+        assert!(running.contains("now: web_fetch"), "{running}");
+        assert!(running.contains("… researcher: web_fetch"), "{running}");
+
+        // Cancelled: no parent result, no child finish.
+        s.settle_turn_lifecycle(false, QueuePauseReason::Generic);
+        let settled = render(&mut s);
+        assert!(settled.contains("1 child tool calls"), "{settled}");
+        assert!(!settled.contains("now:"), "{settled}");
+        assert!(
+            settled.contains("· researcher: web_fetch · Result not recorded"),
+            "{settled}"
+        );
+        assert!(!settled.contains("… researcher: web_fetch"), "{settled}");
+    }
+
+    #[test]
+    fn subagent_card_says_waiting_only_while_its_turn_runs() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".into(),
+            tool_call_id: "child".into(),
+            name: "delegate".into(),
+            raw_input: serde_json::json!({"agent": "reviewer", "prompt": "Inspect the parser"}),
+        });
+        let render = |s: &mut ChatState| {
+            s.rebuild_lines(120);
+            rendered_text(&s.transcript_layout.view().cached_lines)
+        };
+        assert!(render(&mut s).contains("Response:\n    Waiting for response"));
+
+        // The turn ends without a result (cancelled, failed): neutral again.
+        s.settle_turn_lifecycle(false, QueuePauseReason::Generic);
+        let settled = render(&mut s);
+        assert!(
+            settled.contains("Response:\n    Result not recorded"),
+            "{settled}"
+        );
+        assert!(!settled.contains("Waiting"));
+    }
+
+    #[test]
     fn subagent_card_live_results_stay_with_the_call_not_the_prompt() {
         let mut s = state();
         for id in ["child-a", "child-b"] {
@@ -28780,7 +29290,15 @@ mod tests {
             .iter()
             .map(|entry| {
                 let mut lines = Vec::new();
-                render_entry_into(entry, false, false, ToolDisclosure::Full, 80, &mut lines);
+                render_entry_into(
+                    entry,
+                    false,
+                    false,
+                    ToolDisclosure::Full,
+                    80,
+                    false,
+                    &mut lines,
+                );
                 rendered_text(&lines)
             })
             .collect::<Vec<_>>();
@@ -28821,6 +29339,7 @@ mod tests {
             false,
             ToolDisclosure::Full,
             80,
+            false,
             &mut lines,
         );
         let text = rendered_text(&lines);
@@ -28849,6 +29368,7 @@ mod tests {
             &input,
             Some(output),
             false,
+            false,
             ToolDisclosure::Full,
         );
         let text = rendered_text(&lines);
@@ -28874,6 +29394,7 @@ mod tests {
                 "delegate",
                 &input.to_string(),
                 Some("Task started"),
+                false,
                 false,
                 ToolDisclosure::Full,
             );
@@ -28901,6 +29422,7 @@ mod tests {
             &input,
             Some(&result),
             false,
+            false,
             ToolDisclosure::Collapsed,
         );
         let collapsed = rendered_text(&collapsed);
@@ -28913,6 +29435,7 @@ mod tests {
             "delegate",
             &input,
             Some(&result),
+            false,
             false,
             ToolDisclosure::Full,
         );
@@ -28930,6 +29453,7 @@ mod tests {
             name: Arc::from("delegate"),
             input_json: Arc::from(input),
             result: Some(Arc::from(result)),
+            delegate_activity: None,
         };
         let copied = clipboard_text(&entry);
         assert!(copied.contains("task-tail"));
@@ -28949,6 +29473,7 @@ mod tests {
                 "spawn_subagent",
                 &input,
                 None,
+                false,
                 false,
                 ToolDisclosure::Full,
             );
@@ -28971,6 +29496,7 @@ mod tests {
                 input,
                 Some(result),
                 false,
+                false,
                 disclosure,
             );
             let text = rendered_text(&lines);
@@ -28990,6 +29516,7 @@ mod tests {
             name: Arc::from("delegate"),
             input_json: Arc::from(input),
             result: Some(Arc::from(result)),
+            delegate_activity: None,
         };
         assert!(clipboard_text(&entry).contains(result));
         for raw in [
@@ -29009,6 +29536,7 @@ mod tests {
                 "delegate",
                 input,
                 Some(raw),
+                false,
                 false,
                 ToolDisclosure::Full,
             );
@@ -29040,6 +29568,7 @@ mod tests {
             &input,
             Some(&result),
             false,
+            false,
             ToolDisclosure::Collapsed,
         );
         let collapsed_text = rendered_text(&collapsed);
@@ -29055,6 +29584,7 @@ mod tests {
             "shell",
             &input,
             Some(&result),
+            false,
             false,
             ToolDisclosure::Full,
         );
@@ -29082,6 +29612,7 @@ mod tests {
             &input,
             Some(&result),
             false,
+            false,
             ToolDisclosure::Full,
         );
 
@@ -29096,6 +29627,7 @@ mod tests {
             name: Arc::from("shell"),
             input_json: Arc::from(input),
             result: Some(Arc::from(result)),
+            delegate_activity: None,
         };
         let copied = clipboard_text(&entry);
         assert!(copied.contains(input_tail));
@@ -29116,6 +29648,7 @@ mod tests {
             "file_edit",
             &edit_input,
             Some("done"),
+            false,
             false,
             ToolDisclosure::Collapsed,
         );
@@ -29142,6 +29675,7 @@ mod tests {
             "file_write",
             &write_input,
             Some(&result),
+            false,
             false,
             ToolDisclosure::Preview,
         );
@@ -29173,6 +29707,7 @@ mod tests {
             &write_input,
             Some(&result),
             false,
+            false,
             ToolDisclosure::Full,
         );
         let full_text = rendered_text(&full_lines);
@@ -29200,6 +29735,7 @@ mod tests {
             &base64_input,
             None,
             false,
+            false,
             ToolDisclosure::Preview,
         );
         let base64_text = rendered_text(&base64_lines);
@@ -29215,6 +29751,7 @@ mod tests {
             "file_write",
             malformed,
             None,
+            false,
             false,
             ToolDisclosure::Preview,
         );
@@ -29268,6 +29805,7 @@ mod tests {
             name: Arc::<str>::from("file_write"),
             input_json: Arc::<str>::from(r#"{"path":"a.txt","content":"raw"}"#),
             result: Some(Arc::<str>::from("written")),
+            delegate_activity: None,
         };
         let copied = clipboard_text(&entry);
         assert!(copied.contains(r#""content":"raw""#));
@@ -29297,6 +29835,7 @@ mod tests {
                     serde_json::json!({"path": path, "content": content.clone()}).to_string(),
                 ),
                 result: Some(Arc::<str>::from("written")),
+                delegate_activity: None,
             });
         }
         state.mark_dirty_full();
@@ -33784,6 +34323,7 @@ mod tests {
                     &input,
                     Some(&result),
                     false,
+                    false,
                     ToolDisclosure::Collapsed
                 )
                 .is_some()
@@ -33799,6 +34339,7 @@ mod tests {
                 name,
                 &input,
                 Some(&result),
+                false,
                 false,
                 ToolDisclosure::Full,
             );
@@ -34104,6 +34645,7 @@ mod tests {
             &input,
             Some("Only A and C now, B waits for the dogfood rebase"),
             false,
+            false,
             ToolDisclosure::Collapsed,
         );
         let text = rendered_text(&lines);
@@ -34134,6 +34676,7 @@ mod tests {
             &input,
             None,
             false,
+            false,
             ToolDisclosure::Full,
         );
         let text = rendered_text(&lines);
@@ -34148,6 +34691,7 @@ mod tests {
             "ask_user",
             &input,
             None,
+            false,
             false,
             ToolDisclosure::Collapsed,
         );
@@ -34170,6 +34714,7 @@ mod tests {
             "poll",
             &serde_json::json!({ "options": choices, "question": "Pick" }).to_string(),
             None,
+            false,
             false,
             ToolDisclosure::Full,
         );
