@@ -417,6 +417,7 @@ channel-discord-component-expired = Ce bouton ou ce menu a expiré ou a déjà �
 channel-discord-approval-recorded = Votre décision a été enregistrée.
 channel-discord-delivery-failure-note-one = (note : je n'ai pas pu livrer {$count} fichier.)
 channel-discord-delivery-failure-note-many = (note : je n'ai pas pu livrer {$count} fichiers.)
+channel-discord-thread-fallback-name = Discussion
 channel-whatsapp-web-delivery-failure-note-one = (note : je n'ai pas pu livrer {$count} pièce jointe multimédia WhatsApp.)
 channel-whatsapp-web-delivery-failure-note-many = (note : je n'ai pas pu livrer {$count} pièces jointes multimédias WhatsApp.)
 channel-signal-delivery-failure-note-one = (note : je n'ai pas pu livrer {$count} fichier.)

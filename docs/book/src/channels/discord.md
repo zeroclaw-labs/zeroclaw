@@ -50,7 +50,9 @@ through a surface that encrypts it rather than typing it into `config.toml`:
 1. Back in the Developer Portal, open **OAuth2 -> URL Generator**.
 2. Under **Scopes**, check **bot**.
 3. Under **Bot Permissions**, check at least **Send Messages**, **Read Message
-   History**, and **View Channels**.
+   History**, and **View Channels**. If you plan to use
+   [`thread_mode = "on_mention"`](#starting-a-thread-on-mention), also check
+   **Create Public Threads** and **Send Messages in Threads**.
 4. Copy the URL at the bottom, open it in your browser, pick your server, and
    **Authorize**.
 
@@ -84,6 +86,36 @@ then right-click a server or channel and **Copy ID**.
 
 {{#thread-context channel="Discord"}}
 
+### Starting a thread on mention
+
+Thread isolation needs no setting. What `thread_mode` decides is whether the
+bot opens a thread when it is mentioned. By default it answers in the channel
+where it was mentioned. Set `thread_mode = "on_mention"` to move each
+conversation out of the channel instead:
+
+```toml
+[channels.discord.<alias>]
+mention_only = true
+thread_mode = "on_mention"
+```
+
+- An @-mention in a regular server channel starts a thread on that message,
+  named after the message, and the bot replies inside the thread. If someone
+  already started a thread on that message, the bot replies in that one.
+- In a thread the bot's account created, people can keep talking without a
+  mention, even with `mention_only = true`. Other bots still need to mention
+  it. In any other thread, `mention_only` still applies.
+- Messages that are already in a thread, and direct messages, are answered in
+  place. No second thread is created.
+- Grant both **Create Public Threads** (to start the thread) and **Send
+  Messages in Threads** (to reply in it). If Discord refuses to create the
+  thread, the bot replies in the channel and logs a warning with Discord's
+  reason.
+
+Pair it with `mention_only = true` so the channel itself stays quiet: without
+it, the bot still answers unmentioned channel messages in place. The setting is
+read when the channel starts, so reload the daemon or restart it after a change.
+
 ## Archive and search
 
 Set `archive = true` and the channel opens a sidecar `discord.db` memory store,
@@ -99,6 +131,8 @@ search; the bot still replies normally either way.
 
 - `mention_only`: when `true`, the bot only answers messages that @-mention it,
   so it stays quiet in busy channels.
+- `thread_mode`: set to `on_mention` to answer each mention in its own thread
+  (see [Starting a thread on mention](#starting-a-thread-on-mention)).
 - `reply_min_interval_secs`: a minimum gap between replies to the same person,
   useful if instant responses feel robotic.
 
@@ -109,6 +143,8 @@ search; the bot still replies normally either way.
 | Bot is online but never replies | Message Content Intent is off | Turn it on in the Developer Portal (step 2) and restart |
 | Bot replies nowhere | Not invited, or missing View Channels / Send Messages | Re-run the invite (step 4) with the right permissions |
 | Bot ignores most messages | `mention_only = true` | @-mention the bot, or set it to `false` |
+| With `thread_mode = "on_mention"`, replies stay in the channel and a warning is logged | Bot lacks Create Public Threads there, or the channel type cannot hold threads | Grant the permission to the bot's role (or re-run the invite, step 4); the warning's `reason` and `error` show which |
+| With `thread_mode = "on_mention"`, a thread appears but stays empty | Bot lacks Send Messages in Threads | Grant it to the bot's role |
 | "Invalid token" at startup | Token mistyped or reset | Reset the token in the portal, set it again (step 3) |
 
 ## Running Discord as a plugin (experimental)

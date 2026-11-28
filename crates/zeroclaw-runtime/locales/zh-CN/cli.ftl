@@ -413,6 +413,7 @@ channel-discord-component-expired = 此按钮或菜单已过期或已被使用�
 channel-discord-approval-recorded = 您的决定已记录。
 channel-discord-delivery-failure-note-one = （注意：我无法传送 {$count} 个文件。）
 channel-discord-delivery-failure-note-many = （注意：我无法传送 {$count} 个文件。）
+channel-discord-thread-fallback-name = 对话
 channel-whatsapp-web-delivery-failure-note-one = （注意：我无法传送 {$count} 个 WhatsApp 媒体附件。）
 channel-whatsapp-web-delivery-failure-note-many = （注意：我无法传送 {$count} 个 WhatsApp 媒体附件。）
 channel-signal-delivery-failure-note-one = （注意：我无法传送 {$count} 个文件。）

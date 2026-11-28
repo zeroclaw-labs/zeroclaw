@@ -85,6 +85,10 @@ pub struct DiscordChannel {
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     listen_to_bots: bool,
     mention_only: bool,
+    /// Whether a mention in a regular guild channel moves the reply into a
+    /// new thread. Construction-time wiring of `DiscordConfig.thread_mode` —
+    /// config is the source of truth; reloads rebuild the channel.
+    thread_mode: zeroclaw_config::schema::DiscordThreadMode,
     intents_mask_override: Option<u64>,
     /// Which inbound reactions to record (config `reaction_notifications`).
     /// Anything other than `Off` adds the two reaction intents to the
@@ -122,7 +126,7 @@ pub struct DiscordChannel {
     /// Seconds to wait for an operator reply to a `request_approval` prompt
     /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
-    thread_channels: Arc<AsyncMutex<HashMap<String, Option<String>>>>,
+    thread_channels: DiscordThreadCache,
     /// Ephemeral Discord gateway session state for Resume across reconnects.
     gateway_session: Mutex<DiscordGatewaySession>,
     /// When true, register and serve Discord slash commands (e.g. `/ask`)
@@ -175,6 +179,7 @@ impl DiscordChannel {
             peer_resolver,
             listen_to_bots,
             mention_only,
+            thread_mode: zeroclaw_config::schema::DiscordThreadMode::Off,
             intents_mask_override: None,
             reaction_scope: zeroclaw_config::schema::DiscordReactionScope::Off,
             typing_handles: Mutex::new(HashMap::new()),
@@ -247,6 +252,13 @@ impl DiscordChannel {
         scope: zeroclaw_config::schema::DiscordReactionScope,
     ) -> Self {
         self.reaction_scope = scope;
+        self
+    }
+
+    /// Route guild-channel mentions per `DiscordThreadMode`, which owns the
+    /// semantics of each mode.
+    pub fn with_thread_mode(mut self, mode: zeroclaw_config::schema::DiscordThreadMode) -> Self {
+        self.thread_mode = mode;
         self
     }
 
@@ -838,6 +850,27 @@ impl DiscordChannel {
 
     async fn thread_parent(&self, client: &reqwest::Client, channel_id: &str) -> Option<String> {
         discord_thread_parent(client, &self.bot_token, &self.thread_channels, channel_id).await
+    }
+
+    async fn thread_meta(
+        &self,
+        client: &reqwest::Client,
+        channel_id: &str,
+    ) -> Option<DiscordThreadMeta> {
+        discord_thread_meta(client, &self.bot_token, &self.thread_channels, channel_id).await
+    }
+
+    /// Channel to address a reaction on `message_id` through; see
+    /// [`discord_reaction_channel`]. The thread lookup only runs when the ids
+    /// match, which only happens for the message a thread was started on.
+    async fn reaction_channel(&self, channel_id: &str, message_id: &str) -> String {
+        let raw_message_id = message_id.strip_prefix("discord_").unwrap_or(message_id);
+        let parent = if raw_message_id == channel_id {
+            self.thread_parent(&self.http_client(), channel_id).await
+        } else {
+            None
+        };
+        discord_reaction_channel(channel_id, message_id, parent.as_deref()).to_string()
     }
 
     /// Apply the trust-boundary / delivery-failure emoji reactions to the
@@ -1611,14 +1644,40 @@ fn base64_decode(input: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// What Discord's channel object says about a thread: the channel it lives in
+/// and the user who created it. Discord is the source of truth; entries are
+/// only ever filled from its responses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DiscordThreadMeta {
+    parent_id: String,
+    owner_id: Option<String>,
+}
+
+/// Per-channel cache of [`DiscordThreadMeta`]: `Some` for a thread, `None`
+/// for a channel Discord reported as a non-thread. Shared with spawned tasks.
+type DiscordThreadCache = Arc<AsyncMutex<HashMap<String, Option<DiscordThreadMeta>>>>;
+
 /// Free-function form of the thread-parent lookup so spawned tasks (which
 /// cannot borrow the channel) share the same cache and semantics.
 async fn discord_thread_parent(
     client: &reqwest::Client,
     bot_token: &str,
-    thread_channels: &Arc<AsyncMutex<HashMap<String, Option<String>>>>,
+    thread_channels: &DiscordThreadCache,
     channel_id: &str,
 ) -> Option<String> {
+    discord_thread_meta(client, bot_token, thread_channels, channel_id)
+        .await
+        .map(|meta| meta.parent_id)
+}
+
+/// Resolve (and cache) whether `channel_id` is a thread, with its parent and
+/// creator, from `GET /channels/{id}`.
+async fn discord_thread_meta(
+    client: &reqwest::Client,
+    bot_token: &str,
+    thread_channels: &DiscordThreadCache,
+    channel_id: &str,
+) -> Option<DiscordThreadMeta> {
     {
         let cache = thread_channels.lock().await;
         if let Some(value) = cache.get(channel_id) {
@@ -1656,18 +1715,7 @@ async fn discord_thread_parent(
             );
             anyhow::Error::msg(format!("body parse failed: {e}"))
         })?;
-        let is_thread = body
-            .get("type")
-            .and_then(serde_json::Value::as_u64)
-            .map(is_thread_channel_type)
-            .unwrap_or(false);
-        Ok::<Option<String>, anyhow::Error>(if is_thread {
-            body.get("parent_id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        } else {
-            None
-        })
+        Ok::<Option<DiscordThreadMeta>, anyhow::Error>(thread_meta_from_channel(&body))
     };
     let result = match tokio::time::timeout(THREAD_LOOKUP_TIMEOUT, lookup).await {
         Ok(Ok(value)) => value,
@@ -1695,8 +1743,32 @@ async fn discord_thread_parent(
     result
 }
 
+/// Thread metadata from a Discord channel object: `Some` only for a thread
+/// type that names its parent channel.
+fn thread_meta_from_channel(body: &serde_json::Value) -> Option<DiscordThreadMeta> {
+    let is_thread = body
+        .get("type")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(is_thread_channel_type);
+    if !is_thread {
+        return None;
+    }
+    let parent_id = body
+        .get("parent_id")
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+    let owner_id = body
+        .get("owner_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    Some(DiscordThreadMeta {
+        parent_id,
+        owner_id,
+    })
+}
+
 async fn discord_thread_parent_cached(
-    thread_channels: &Arc<AsyncMutex<HashMap<String, Option<String>>>>,
+    thread_channels: &DiscordThreadCache,
     channel_id: &str,
 ) -> Option<String> {
     thread_channels
@@ -1705,6 +1777,236 @@ async fn discord_thread_parent_cached(
         .get(channel_id)
         .cloned()
         .flatten()
+        .map(|meta| meta.parent_id)
+}
+
+/// Whether `meta` describes a thread Discord says the bot created.
+fn discord_in_own_thread(meta: Option<&DiscordThreadMeta>, bot_user_id: &str) -> bool {
+    meta.and_then(|meta| meta.owner_id.as_deref()) == Some(bot_user_id)
+}
+
+/// Whether an inbound message must @-mention the bot to be admitted.
+///
+/// DMs never need a mention. Under `thread_mode = on_mention`, a human's
+/// follow-up in a thread the bot itself started continues that conversation,
+/// so it is admitted without a mention. Bot authors keep the mention rule so
+/// `listen_to_bots` cannot turn the bot's own thread into a bot-to-bot loop.
+fn discord_requires_mention(
+    mention_only: bool,
+    is_dm: bool,
+    thread_mode: zeroclaw_config::schema::DiscordThreadMode,
+    in_own_thread: bool,
+    author_is_bot: bool,
+) -> bool {
+    let continues_own_thread = thread_mode == zeroclaw_config::schema::DiscordThreadMode::OnMention
+        && in_own_thread
+        && !author_is_bot;
+    mention_only && !is_dm && !continues_own_thread
+}
+
+/// Whether an admitted message should be answered in a new thread started on
+/// it. DMs and messages already inside a thread are answered in place.
+fn discord_should_start_thread(
+    thread_mode: zeroclaw_config::schema::DiscordThreadMode,
+    is_dm: bool,
+    in_thread: bool,
+    mentioned: bool,
+) -> bool {
+    thread_mode == zeroclaw_config::schema::DiscordThreadMode::OnMention
+        && !is_dm
+        && !in_thread
+        && mentioned
+}
+
+/// Where the reply to an inbound message goes, as carried on
+/// `ChannelMessage::reply_target` and `thread_ts`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiscordReplyRoute {
+    reply_target: String,
+    thread_ts: Option<String>,
+}
+
+/// Route a reply: into `started_thread` when one was just opened for the
+/// message, otherwise where the message arrived (its thread when it came from
+/// one), and to the author when there is no channel id.
+fn discord_reply_route(
+    channel_id: &str,
+    author_id: &str,
+    started_thread: Option<&str>,
+    channel_is_thread: bool,
+) -> DiscordReplyRoute {
+    if let Some(thread_id) = started_thread {
+        return DiscordReplyRoute {
+            reply_target: thread_id.to_string(),
+            thread_ts: Some(thread_id.to_string()),
+        };
+    }
+    if channel_id.is_empty() {
+        return DiscordReplyRoute {
+            reply_target: author_id.to_string(),
+            thread_ts: None,
+        };
+    }
+    DiscordReplyRoute {
+        reply_target: channel_id.to_string(),
+        thread_ts: channel_is_thread.then(|| channel_id.to_string()),
+    }
+}
+
+/// The channel that holds `message_id` when a reaction targets it through
+/// `channel_id`. A thread started on a message has that message's id while
+/// the message itself stays in the parent channel, so a reaction addressed
+/// to (thread, starter message) belongs on the parent.
+fn discord_reaction_channel<'a>(
+    channel_id: &'a str,
+    message_id: &str,
+    thread_parent: Option<&'a str>,
+) -> &'a str {
+    let raw_message_id = message_id.strip_prefix("discord_").unwrap_or(message_id);
+    match thread_parent {
+        Some(parent) if raw_message_id == channel_id => parent,
+        _ => channel_id,
+    }
+}
+
+/// Discord's thread-name length limit.
+const DISCORD_THREAD_NAME_MAX_CHARS: usize = 100;
+
+/// Hard cap on the start-thread request, which runs inside the gateway loop.
+const THREAD_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Mention and custom-emoji markup does not render in thread names: user,
+/// role and channel mentions are dropped and a custom emoji keeps its
+/// `:name:`. Any other `<...>` text is kept as written.
+fn strip_discord_markup(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('<') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('>') else {
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let inner = &after[..close];
+        let is_id = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+        let mention_id = inner
+            .strip_prefix("@!")
+            .or_else(|| inner.strip_prefix("@&"))
+            .or_else(|| inner.strip_prefix('@'))
+            .or_else(|| inner.strip_prefix('#'));
+        let emoji_name = inner
+            .strip_prefix("a:")
+            .or_else(|| inner.strip_prefix(':'))
+            .and_then(|e| e.rsplit_once(':'))
+            .filter(|(name, id)| !name.is_empty() && is_id(id))
+            .map(|(name, _)| name);
+        if mention_id.is_some_and(is_id) {
+            out.push(' ');
+        } else if let Some(name) = emoji_name {
+            out.push(':');
+            out.push_str(name);
+            out.push(':');
+        } else {
+            out.push_str(&rest[open..=open + 1 + close]);
+        }
+        rest = &after[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Name for a thread started on `content`: the message text without mention
+/// markup, whitespace collapsed, capped at Discord's 100-character limit.
+/// Falls back to a localized generic name when nothing is left (for example a
+/// bare mention with an attachment).
+fn discord_thread_name(content: &str) -> String {
+    let stripped = strip_discord_markup(content);
+    let collapsed = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return i18n::get_required_cli_string("channel-discord-thread-fallback-name");
+    }
+    if collapsed.chars().count() <= DISCORD_THREAD_NAME_MAX_CHARS {
+        return collapsed;
+    }
+    let mut name: String = collapsed
+        .chars()
+        .take(DISCORD_THREAD_NAME_MAX_CHARS - 1)
+        .collect();
+    name.push('…');
+    name
+}
+
+/// Start a reply thread on `message_id` and return the thread to reply in.
+///
+/// A created thread is cached with the owner Discord reported, so the first
+/// follow-up needs no lookup. A thread that already exists on the message is
+/// reused without caching, since its owner is unknown here. On any failure
+/// this logs a warning and returns `None`: the caller then replies in the
+/// channel as it would with thread mode off.
+async fn discord_start_reply_thread(
+    client: &reqwest::Client,
+    api_base: &str,
+    bot_token: &str,
+    thread_channels: &DiscordThreadCache,
+    channel_id: &str,
+    message_id: &str,
+    name: &str,
+    timeout: Duration,
+) -> Option<String> {
+    let attempt = tokio::time::timeout(
+        timeout,
+        start_discord_thread_from_message(
+            client, api_base, bot_token, channel_id, message_id, name,
+        ),
+    )
+    .await;
+    let (reason, error) = match attempt {
+        Ok(Ok(ThreadStart::Created(thread))) => {
+            thread_channels.lock().await.insert(
+                thread.id.clone(),
+                Some(DiscordThreadMeta {
+                    parent_id: channel_id.to_string(),
+                    owner_id: thread.owner_id,
+                }),
+            );
+            return Some(thread.id);
+        }
+        Ok(Ok(ThreadStart::AlreadyExists)) => {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "channel_id": channel_id,
+                        "message_id": message_id,
+                    })),
+                "thread_mode: message already has a thread, replying in it"
+            );
+            return Some(message_id.to_string());
+        }
+        Ok(Ok(ThreadStart::Forbidden(body))) => (
+            "Discord refused (403): grant the bot Create Public Threads and Send Messages in Threads in this channel",
+            body,
+        ),
+        Ok(Err(e)) => ("Discord request failed", format!("{e}")),
+        Err(_) => (
+            "Discord did not answer in time",
+            format!("timed out after {}s", timeout.as_secs()),
+        ),
+    };
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "channel_id": channel_id,
+                "message_id": message_id,
+                "reason": reason,
+                "error": error,
+            })),
+        "thread_mode: could not start a reply thread, replying in the channel instead"
+    );
+    None
 }
 
 // Discord gateway intent bits (API v10) — the ones zeroclaw consumes or
@@ -3314,7 +3616,31 @@ impl Channel for DiscordChannel {
                     // inherently private and implicitly addressed to the bot, so bypass
                     // the mention gate — requiring a @mention in a DM is never correct.
                     let is_dm = d.get("guild_id").is_none();
-                    let effective_mention_only = self.mention_only && !is_dm;
+                    let channel_id = d
+                        .get("channel_id")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let mentioned = contains_bot_mention(content, &bot_user_id);
+                    // Thread mode needs to know, before admission, whether this
+                    // message is already in a thread and whether the bot started
+                    // that thread. Off mode skips the (cached) lookup here.
+                    let thread_meta = if self.thread_mode
+                        != zeroclaw_config::schema::DiscordThreadMode::Off
+                        && !is_dm
+                        && !channel_id.is_empty()
+                    {
+                        self.thread_meta(&self.http_client(), &channel_id).await
+                    } else {
+                        None
+                    };
+                    let effective_mention_only = discord_requires_mention(
+                        self.mention_only,
+                        is_dm,
+                        self.thread_mode,
+                        discord_in_own_thread(thread_meta.as_ref(), &bot_user_id),
+                        author_is_bot,
+                    );
                     let atts = d
                         .get("attachments")
                         .and_then(|a| a.as_array())
@@ -3343,12 +3669,6 @@ impl Channel for DiscordChannel {
                     } else {
                         format!("{clean_content}\n\n[Attachments]\n{attachment_text}")
                     };
-
-                    let channel_id = d
-                        .get("channel_id")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("")
-                        .to_string();
 
                     // Intercept approval replies before forwarding to the agent.
                     if let Some(resolution) = self
@@ -3390,14 +3710,40 @@ impl Channel for DiscordChannel {
                         });
                     }
 
-                    let thread_ts = if channel_id.is_empty() {
-                        None
-                    } else if self.thread_parent(&client, &channel_id).await.is_some()
-                    {
-                        Some(channel_id.clone())
+                    // A mention in a regular guild channel under `on_mention`
+                    // moves the reply into a new thread on that message. If
+                    // Discord refuses, the reply stays in the channel.
+                    let started_thread = if !message_id.is_empty()
+                        && !channel_id.is_empty()
+                        && discord_should_start_thread(
+                            self.thread_mode,
+                            is_dm,
+                            thread_meta.is_some(),
+                            mentioned,
+                        ) {
+                        discord_start_reply_thread(
+                            &client,
+                            DISCORD_API_BASE,
+                            &self.bot_token,
+                            &self.thread_channels,
+                            &channel_id,
+                            message_id,
+                            &discord_thread_name(content),
+                            THREAD_START_TIMEOUT,
+                        )
+                        .await
                     } else {
                         None
                     };
+                    let channel_is_thread = started_thread.is_none()
+                        && !channel_id.is_empty()
+                        && self.thread_parent(&client, &channel_id).await.is_some();
+                    let route = discord_reply_route(
+                        &channel_id,
+                        author_id,
+                        started_thread.as_deref(),
+                        channel_is_thread,
+                    );
 
                     let channel_msg = ChannelMessage {
                         id: if message_id.is_empty() {
@@ -3406,11 +3752,7 @@ impl Channel for DiscordChannel {
                             format!("discord_{message_id}")
                         },
                         sender: author_id.to_string(),
-                        reply_target: if channel_id.is_empty() {
-                            author_id.to_string()
-                        } else {
-                            channel_id.clone()
-                        },
+                        reply_target: route.reply_target,
                         content: final_content,
                         channel: "discord".to_string(),
                         channel_alias: Some(self.alias.clone()),
@@ -3418,10 +3760,13 @@ impl Channel for DiscordChannel {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
-                        interruption_scope_id: thread_ts.clone(),
-                        thread_ts,
+                        interruption_scope_id: route.thread_ts.clone(),
+                        thread_ts: route.thread_ts,
                         attachments: media_attachments,
                         subject: None,
+                        // The bot opened a thread for this mention, so it must
+                        // answer there rather than leave the thread empty.
+                        explicitly_addressed: started_thread.is_some(),
 
                         ..Default::default()};
 
@@ -3946,7 +4291,8 @@ impl Channel for DiscordChannel {
         if parse_discord_interaction_target(channel_id).is_some() {
             return Ok(());
         }
-        let url = discord_reaction_url(channel_id, message_id, emoji);
+        let channel_id = self.reaction_channel(channel_id, message_id).await;
+        let url = discord_reaction_url(&channel_id, message_id, emoji);
 
         let resp = self
             .http_client()
@@ -3978,7 +4324,8 @@ impl Channel for DiscordChannel {
         if parse_discord_interaction_target(channel_id).is_some() {
             return Ok(());
         }
-        let url = discord_reaction_url(channel_id, message_id, emoji);
+        let channel_id = self.reaction_channel(channel_id, message_id).await;
+        let url = discord_reaction_url(&channel_id, message_id, emoji);
 
         let resp = self
             .http_client()
@@ -8578,11 +8925,10 @@ mod tests {
         // message returns that parent; a channel cached as a non-thread, or one
         // never looked up, returns None. No client/token is reachable here, so a
         // non-None result can only have come from the cache (never a REST probe).
-        let cache: Arc<AsyncMutex<HashMap<String, Option<String>>>> =
-            Arc::new(AsyncMutex::new(HashMap::new()));
+        let cache: DiscordThreadCache = Arc::new(AsyncMutex::new(HashMap::new()));
         {
             let mut c = cache.lock().await;
-            c.insert("thread1".to_string(), Some("parentA".to_string()));
+            c.insert("thread1".to_string(), Some(thread_meta("parentA", None)));
             c.insert("plain1".to_string(), None);
         }
         assert_eq!(
@@ -8606,12 +8952,11 @@ mod tests {
     async fn autocomplete_authorizes_parent_allowlisted_thread_only_when_cached() {
         let peers = s(&["*"]);
         let channel_filter = s(&["parentA"]); // allowlist the PARENT only
-        let cache: Arc<AsyncMutex<HashMap<String, Option<String>>>> =
-            Arc::new(AsyncMutex::new(HashMap::new()));
-        cache
-            .lock()
-            .await
-            .insert("thread_cached".to_string(), Some("parentA".to_string()));
+        let cache: DiscordThreadCache = Arc::new(AsyncMutex::new(HashMap::new()));
+        cache.lock().await.insert(
+            "thread_cached".to_string(),
+            Some(thread_meta("parentA", None)),
+        );
 
         // Thread whose parent is cached + allowlisted → autocomplete authorized.
         let parent = discord_thread_parent_cached(&cache, "thread_cached").await;
@@ -8860,5 +9205,309 @@ mod tests {
             .unwrap();
         assert!(resp.status().is_success());
         // wiremock verifies expect(1) on drop.
+    }
+
+    fn thread_meta(parent_id: &str, owner_id: Option<&str>) -> DiscordThreadMeta {
+        DiscordThreadMeta {
+            parent_id: parent_id.to_string(),
+            owner_id: owner_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn thread_mode_starts_a_thread_only_for_a_mention_in_a_guild_channel() {
+        use zeroclaw_config::schema::DiscordThreadMode::{Off, OnMention};
+        // (mode, is_dm, in_thread, mentioned) -> start a thread?
+        let cases = [
+            (OnMention, false, false, true, true),
+            (OnMention, false, true, true, false),
+            (OnMention, true, false, true, false),
+            (OnMention, false, false, false, false),
+            (Off, false, false, true, false),
+        ];
+        for (mode, is_dm, in_thread, mentioned, expected) in cases {
+            assert_eq!(
+                discord_should_start_thread(mode, is_dm, in_thread, mentioned),
+                expected,
+                "mode={mode:?} dm={is_dm} in_thread={in_thread} mentioned={mentioned}"
+            );
+        }
+    }
+
+    #[test]
+    fn thread_mode_waives_the_mention_only_for_humans_in_the_bots_own_thread() {
+        use zeroclaw_config::schema::DiscordThreadMode::{Off, OnMention};
+        // (mention_only, is_dm, mode, in_own_thread, author_is_bot) -> mention required?
+        let cases = [
+            (true, false, OnMention, true, false, false),
+            (true, false, OnMention, true, true, true),
+            (true, false, OnMention, false, false, true),
+            (true, false, Off, true, false, true),
+            (true, true, OnMention, false, false, false),
+            (false, false, OnMention, false, false, false),
+            (false, false, Off, false, false, false),
+        ];
+        for (mention_only, is_dm, mode, own, bot, expected) in cases {
+            assert_eq!(
+                discord_requires_mention(mention_only, is_dm, mode, own, bot),
+                expected,
+                "mention_only={mention_only} dm={is_dm} mode={mode:?} own_thread={own} bot_author={bot}"
+            );
+        }
+    }
+
+    #[test]
+    fn own_thread_means_discord_names_the_bot_as_owner() {
+        let ours = thread_meta("200", Some("100"));
+        let theirs = thread_meta("200", Some("999"));
+        let unknown = thread_meta("200", None);
+        assert!(discord_in_own_thread(Some(&ours), "100"));
+        assert!(!discord_in_own_thread(Some(&theirs), "100"));
+        assert!(
+            !discord_in_own_thread(Some(&unknown), "100"),
+            "a thread without a reported owner keeps the mention rule"
+        );
+        assert!(!discord_in_own_thread(None, "100"), "not a thread");
+    }
+
+    #[test]
+    fn reply_route_follows_the_started_thread_and_falls_back_to_the_channel() {
+        let route = |channel: &str, started: Option<&str>, in_thread: bool| {
+            discord_reply_route(channel, "author", started, in_thread)
+        };
+        // Thread started for a channel mention: reply and session scope move there.
+        assert_eq!(
+            route("200", Some("400"), false),
+            DiscordReplyRoute {
+                reply_target: "400".into(),
+                thread_ts: Some("400".into())
+            }
+        );
+        // Thread start failed (or mode off): reply stays in the channel.
+        assert_eq!(
+            route("200", None, false),
+            DiscordReplyRoute {
+                reply_target: "200".into(),
+                thread_ts: None
+            }
+        );
+        // Message already in a thread: answered in place, scoped to it.
+        assert_eq!(
+            route("300", None, true),
+            DiscordReplyRoute {
+                reply_target: "300".into(),
+                thread_ts: Some("300".into())
+            }
+        );
+        // No channel id: reply to the author.
+        assert_eq!(
+            route("", None, false),
+            DiscordReplyRoute {
+                reply_target: "author".into(),
+                thread_ts: None
+            }
+        );
+    }
+
+    #[test]
+    fn reactions_on_a_threads_starter_message_go_to_the_parent_channel() {
+        // Thread 400 was started on message 400, which lives in channel 200.
+        assert_eq!(
+            discord_reaction_channel("400", "discord_400", Some("200")),
+            "200"
+        );
+        assert_eq!(discord_reaction_channel("400", "400", Some("200")), "200");
+        // Any other message in the thread lives in the thread itself.
+        assert_eq!(
+            discord_reaction_channel("400", "discord_401", Some("200")),
+            "400"
+        );
+        // Not a thread: unchanged.
+        assert_eq!(discord_reaction_channel("200", "discord_200", None), "200");
+    }
+
+    #[test]
+    fn thread_name_drops_mention_markup_and_fits_discords_limit() {
+        assert_eq!(
+            discord_thread_name("<@42>  check   the\nbuild <@!42>"),
+            "check the build"
+        );
+        assert_eq!(
+            discord_thread_name("ask <@7> in <#9> with <@&5> <:wave:123> <a:dance:55>"),
+            "ask in with :wave: :dance:"
+        );
+        assert_eq!(
+            discord_thread_name("is a < b > c? see <https://example.com>"),
+            "is a < b > c? see <https://example.com>",
+            "text that is not Discord markup is kept"
+        );
+
+        let long = discord_thread_name(&format!("<@42> {}", "a".repeat(150)));
+        assert_eq!(long.chars().count(), DISCORD_THREAD_NAME_MAX_CHARS);
+        assert!(long.ends_with('…'), "truncation is marked: {long}");
+
+        let fallback = discord_thread_name("<@42>");
+        assert!(!fallback.trim().is_empty());
+        assert!(
+            !fallback.starts_with('{'),
+            "fallback name must resolve from the Fluent catalog, got {fallback}"
+        );
+    }
+
+    #[test]
+    fn thread_meta_reads_parent_and_owner_from_thread_channels_only() {
+        let thread = serde_json::json!({
+            "id": "300", "type": 11, "parent_id": "200", "owner_id": "100"
+        });
+        assert_eq!(
+            thread_meta_from_channel(&thread),
+            Some(thread_meta("200", Some("100")))
+        );
+        let text_channel = serde_json::json!({ "id": "200", "type": 0, "parent_id": "50" });
+        assert_eq!(thread_meta_from_channel(&text_channel), None);
+        let orphan_thread = serde_json::json!({ "id": "300", "type": 11 });
+        assert_eq!(
+            thread_meta_from_channel(&orphan_thread),
+            None,
+            "a thread without a parent is not treated as a thread"
+        );
+    }
+
+    async fn start_thread_against(
+        server: &wiremock::MockServer,
+        cache: &DiscordThreadCache,
+        timeout: Duration,
+    ) -> Option<String> {
+        discord_start_reply_thread(
+            &reqwest::Client::new(),
+            &server.uri(),
+            "test-token",
+            cache,
+            "200",
+            "400",
+            "check the build",
+            timeout,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn start_reply_thread_creates_it_on_the_message_and_caches_its_owner() {
+        use wiremock::matchers::{body_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/channels/200/messages/400/threads"))
+            .and(header("Authorization", "Bot test-token"))
+            .and(body_json(serde_json::json!({ "name": "check the build" })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": "400", "type": 11, "parent_id": "200", "owner_id": "100"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cache: DiscordThreadCache = Arc::new(AsyncMutex::new(HashMap::new()));
+        let thread_id = start_thread_against(&server, &cache, THREAD_START_TIMEOUT).await;
+
+        assert_eq!(thread_id.as_deref(), Some("400"));
+        assert_eq!(
+            cache.lock().await.get("400").cloned().flatten(),
+            Some(thread_meta("200", Some("100"))),
+            "the new thread is cached with the owner Discord reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_reply_thread_reuses_a_thread_the_message_already_has() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/channels/200/messages/400/threads"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "message": "A thread has already been created for this message",
+                "code": 160004
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cache: DiscordThreadCache = Arc::new(AsyncMutex::new(HashMap::new()));
+        let thread_id = start_thread_against(&server, &cache, THREAD_START_TIMEOUT).await;
+
+        assert_eq!(
+            thread_id.as_deref(),
+            Some("400"),
+            "a thread started on a message carries that message's id"
+        );
+        assert!(
+            cache.lock().await.is_empty(),
+            "the existing thread's owner is unknown, so nothing is cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_reply_thread_falls_back_when_discord_refuses_or_fails() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (status, body) in [
+            (
+                403,
+                serde_json::json!({ "message": "Missing Permissions", "code": 50013 }),
+            ),
+            (
+                400,
+                serde_json::json!({ "message": "Cannot execute action on this channel type", "code": 50024 }),
+            ),
+            (
+                500,
+                serde_json::json!({ "message": "Internal Server Error" }),
+            ),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/channels/200/messages/400/threads"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let cache: DiscordThreadCache = Arc::new(AsyncMutex::new(HashMap::new()));
+            let thread_id = start_thread_against(&server, &cache, THREAD_START_TIMEOUT).await;
+
+            assert_eq!(
+                thread_id, None,
+                "status {status}: the reply stays in the channel"
+            );
+            assert!(
+                cache.lock().await.is_empty(),
+                "status {status}: nothing cached"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn start_reply_thread_gives_up_when_discord_hangs() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/channels/200/messages/400/threads"))
+            .respond_with(ResponseTemplate::new(201).set_delay(Duration::from_secs(5)))
+            .mount(&server)
+            .await;
+
+        let cache: DiscordThreadCache = Arc::new(AsyncMutex::new(HashMap::new()));
+        let thread_id = start_thread_against(&server, &cache, Duration::from_millis(100)).await;
+
+        assert_eq!(
+            thread_id, None,
+            "a stalled request must not block the listener"
+        );
     }
 }

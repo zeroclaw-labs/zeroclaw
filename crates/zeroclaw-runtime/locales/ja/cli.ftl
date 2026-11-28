@@ -412,6 +412,7 @@ channel-discord-component-expired = このボタンまたはメニューは期�
 channel-discord-approval-recorded = あなたの決定が記録されました。
 channel-discord-delivery-failure-note-one = （注意：{$count}個のファイルを配信できませんでした。）
 channel-discord-delivery-failure-note-many = （注意：{$count}個のファイルを配信できませんでした。）
+channel-discord-thread-fallback-name = 会話
 channel-whatsapp-web-delivery-failure-note-one = （注意：{$count}件のWhatsAppメディア添付ファイルを配信できませんでした。）
 channel-whatsapp-web-delivery-failure-note-many = （注意：{$count}件のWhatsAppメディア添付ファイルを配信できませんでした。）
 channel-signal-delivery-failure-note-one = （注意：{$count}個のファイルを配信できませんでした。）
