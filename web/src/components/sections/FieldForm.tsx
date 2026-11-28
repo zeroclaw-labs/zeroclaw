@@ -1456,7 +1456,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
         onDelete={
           showDelete || alwaysDeletable ? () => handleDelete(f.path) : undefined
         }
-        description={descriptionForPath(schema, f.path)}
+        description={descriptionForPath(schema, f.path) ?? f.description ?? null}
         elementProps={
           f.kind === "object-array"
             ? objectArrayElementProps(schema, f.path)
@@ -1566,7 +1566,7 @@ const FieldForm = forwardRef<FieldFormHandle, FieldFormProps>(
                 <SecretMapBlock
                   key={f.path}
                   entry={f}
-                  description={descriptionForPath(schema, f.path)}
+                  description={descriptionForPath(schema, f.path) ?? f.description ?? null}
                   existingKeys={children.map((c) =>
                     secretMapEntryKey(f.path, c.path),
                   )}

@@ -187,6 +187,9 @@ pub struct SecretResponse {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ListEntry {
     pub path: String,
+    /// English help for this exact property, from its schema declaration.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub description: &'static str,
     pub category: String,
     /// Stable kind tag — `string`, `bool`, `integer`, `float`, `enum`,
     /// `string-array`. Lowercase-kebab so it can be used directly as a CSS
@@ -1263,6 +1266,7 @@ pub async fn handle_list(State(state): State<AppState>, Query(q): Query<ListQuer
             let is_env_overridden = config.prop_is_env_overridden(&info.name);
             ListEntry {
                 path: info.name,
+                description: info.description,
                 category: info.category.to_string(),
                 kind: prop_kind_wire(info.kind),
                 type_hint: info.type_hint,
@@ -5976,6 +5980,7 @@ mod tests {
     fn list_entry_for_secret_omits_value_field() {
         let entry = ListEntry {
             path: "providers.models.ollama.api-key".into(),
+            description: "",
             category: "providers.models".into(),
             kind: "string",
             type_hint: "Option<String>",
@@ -5998,6 +6003,40 @@ mod tests {
         // is_secret marker must be present so the dashboard can render it as locked.
         assert_eq!(obj.get("is_secret"), Some(&serde_json::Value::Bool(true)));
         assert_eq!(obj.get("populated"), Some(&serde_json::Value::Bool(true)));
+        assert!(!obj.contains_key("description"));
+    }
+
+    #[tokio::test]
+    async fn list_returns_schema_help_for_a_named_model_route() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config
+            .model_routes
+            .push(zeroclaw_config::schema::ModelRouteConfig {
+                hint: "reasoning.deep".into(),
+                ..Default::default()
+            });
+        let path = "model_routes.reasoning.deep.model";
+        let expected = lookup_prop_field(&config, path).unwrap().description;
+        assert!(!expected.is_empty());
+        let (status, json) = response_json(
+            handle_list(
+                State(test_state(config)),
+                Query(ListQuery {
+                    prefix: Some("model_routes".into()),
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let entry = json["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["path"] == path)
+            .unwrap();
+        assert_eq!(entry["description"], expected);
     }
 
     #[test]
