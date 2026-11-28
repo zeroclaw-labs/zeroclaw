@@ -354,9 +354,11 @@ Both entry caps count undecodable rows as nonblank. Rolling trim copies the raw 
 
 ## Schema migration is an active-file rewrite
 
-When persistence is enabled and the active path exists, `writer::init_from_config` runs `migrate::migrate_legacy_jsonl_in_place` before starting the disk worker. The migrator streams non-empty rows through a temporary file, converts legacy rows with `timestamp` but no `@timestamp`, preserves already-current rows, skips malformed JSON with a warning, syncs the temporary file, and atomically renames it over the active path.
+When persistence is enabled and the active path exists, `writer::init_from_config` runs `migrate::migrate_legacy_jsonl_in_place` before starting the disk worker. The migrator scans until it finds a row with string `timestamp` and `event_type` fields and no `@timestamp` field. A legacy row can appear after current, blank, or malformed rows. If the scan finds no legacy row, the file stays untouched.
 
-Migration is best-effort. Its cheap schema check stops at the first non-empty row. Migration runs when that row is malformed or has `timestamp` without `@timestamp`; any other parseable JSON is treated as current, even when it is an unknown or invalid schema, so later legacy rows can remain unmigrated. If migration returns an error, initialization warns and continues, so later v2 appends can coexist with old rows that the v2 reader cannot deserialize. Rotated archives are not migrated.
+When it finds a legacy row, the migrator streams the active file through a temporary file and converts every recognized legacy row. It copies blank, current, and malformed rows as written and warns about malformed JSON during the rewrite. It adds a newline at the end if needed for the next append, syncs the temporary file, and atomically renames it over the active path.
+
+Migration is best-effort. If it returns an error, initialization warns and continues, so later v2 appends can coexist with old rows that the v2 reader cannot deserialize. Migration applies only to the active file.
 
 `LogEvent` is the schema source of truth. For each schema change, assess migration compatibility, active-file deserialization, HTTP and RPC serialization/consumers, and the architecture and operator documentation; update only the boundaries whose behavior or compatibility changes. The RPC log surfaces live in `crates/zeroclaw-runtime/src/rpc/types.rs` and `dispatch.rs`. A migration that replaces the active file invalidates byte-offset cursors, while an additive compatible change that does not rewrite existing bytes does not.
 
