@@ -25,6 +25,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::ChannelApprovalResponse;
 use zeroclaw_api::ingress::{IngressContext, SourceClass, Transport, TrustClass, TurnOrigin};
+use zeroclaw_channels::orchestrator::consolidation::build_consolidation_model as ws_consolidation_model;
+#[cfg(test)]
+use zeroclaw_providers::turn_accounting::resolve_done_context_limits;
+pub(crate) use zeroclaw_providers::turn_accounting::{
+    ContextDisplay, ProviderUsageEntry, SafeguardFallbackDisplay, UsageFold,
+    done_frame_context_limits,
+};
 use zeroclaw_runtime::agent::SteeringInput;
 use zeroclaw_runtime::sop::approval::{
     ApprovalDecision as SopApprovalDecision, ApprovalPrincipal as SopApprovalPrincipal,
@@ -47,6 +54,16 @@ const WS_APPROVAL_TIMEOUT_SECS: u64 = 120;
 /// names in observability while interactive tools still route correctly —
 /// or, worse, tools route to an arbitrary seeded channel.
 const WS_CHANNEL_KEY: &str = "wss";
+
+/// Write the latest effective context trim into a WebSocket done frame.
+pub(crate) fn add_trim_to_done(display: &ContextDisplay, done: &mut serde_json::Value) {
+    if let Some((input, source)) = display.trimmed_input() {
+        done["context_input_tokens"] = input.into();
+        if let Some(source) = source {
+            done["context_input_tokens_source"] = source.into();
+        }
+    }
+}
 
 fn gateway_steering_input(content: String) -> SteeringInput {
     SteeringInput::new(content).with_ingress(IngressContext {
@@ -446,42 +463,6 @@ async fn resolve_ws_memory_handle(
     zeroclaw_memory::create_memory_for_agent(config, agent_alias, api_key.as_deref())
         .await
         .map(Some)
-}
-
-/// Provider, model, and temperature for the turn-end WS memory
-/// consolidation, resolved from the live provider reference the agent
-/// reports after the turn. A mid-session model switch replaces the agent's
-/// active provider and model together without touching the agent's
-/// configured default, so the consolidation must be built from that live
-/// pair — resolving from the configured default and overriding only the
-/// model would pair one entry's provider with another entry's model. The
-/// live model wins when non-empty; otherwise the entry's configured model
-/// is used. Returns `None` when the reference no longer resolves (e.g. the
-/// entry was removed by a config reload, or the reference is not a dotted
-/// `<family>.<alias>`), in which case consolidation is skipped rather than
-/// silently rerouted to an unrelated entry.
-fn ws_consolidation_model(
-    config: &zeroclaw_config::schema::Config,
-    provider_ref: &str,
-    model: &str,
-) -> Option<(
-    Box<dyn zeroclaw_api::model_provider::ModelProvider>,
-    String,
-    Option<f64>,
-)> {
-    let (provider_type, provider_alias) = provider_ref.split_once('.')?;
-    let entry = config
-        .providers
-        .models
-        .find(provider_type, provider_alias)?;
-    let (provider, _, resolved_model, _) =
-        zeroclaw_runtime::agent::agent::build_session_model_provider(
-            config,
-            provider_ref,
-            Some(model),
-        )
-        .ok()?;
-    Some((provider, resolved_model, entry.temperature))
 }
 
 async fn handle_ws_sop_frame<S>(
@@ -1725,17 +1706,12 @@ pub(crate) fn history_trimmed_ws_frame(
 fn safeguard_fallback_ws_frame(
     notice: Option<&zeroclaw_providers::SafeguardFallbackNotice>,
 ) -> Option<serde_json::Value> {
-    let notice = notice?;
-    let fallback_kind = match notice.kind {
-        zeroclaw_providers::SafeguardFallbackKind::ServerSide => "server",
-        zeroclaw_providers::SafeguardFallbackKind::ClientSide => "client",
-        zeroclaw_providers::SafeguardFallbackKind::ClientAndServer => "client_server",
-    };
+    let display = SafeguardFallbackDisplay::from_notice(notice)?;
     Some(serde_json::json!({
         "type": "safeguard_fallback",
-        "fallback_kind": fallback_kind,
-        "requested_model": notice.requested_model,
-        "served_model": notice.served_model,
+        "fallback_kind": display.fallback_kind.as_str(),
+        "requested_model": display.requested_model,
+        "served_model": display.served_model,
     }))
 }
 
@@ -1786,249 +1762,6 @@ fn is_global_chat_event(event: &serde_json::Value) -> bool {
 
 fn is_observability_telemetry(event: &serde_json::Value) -> bool {
     event.get("source").and_then(serde_json::Value::as_str) == Some("observability")
-}
-
-fn resolve_done_context_limits(
-    usage_budget: Option<u64>,
-    usage_model_window: Option<u64>,
-    active_limits: zeroclaw_config::schema::ResolvedContextLimits,
-) -> (u64, Option<u64>) {
-    (
-        usage_budget.unwrap_or(active_limits.context_token_budget as u64),
-        usage_model_window.or_else(|| {
-            active_limits
-                .configured_model_context_window()
-                .map(|tokens| tokens as u64)
-        }),
-    )
-}
-
-/// Terminal-frame budget/window for the `done` event.
-///
-/// `final_limits` is the route that actually served the LAST call, carried out
-/// of the turn loop. When present it is AUTHORITATIVE and overrides the
-/// usage-derived values, which can be stale: an earlier usage-bearing route
-/// before a final no-usage call (e.g. a vision reply without token usage) would
-/// otherwise leave the frame on the earlier route's numbers. Only when no call
-/// was served this turn (a cache hit) does `final_limits` become `None`, and the
-/// frame falls back to the usage values, then to `fallback_limits`.
-fn done_frame_context_limits(
-    final_limits: Option<zeroclaw_config::schema::ResolvedContextLimits>,
-    usage_budget: Option<u64>,
-    usage_model_window: Option<u64>,
-    fallback_limits: Option<zeroclaw_config::schema::ResolvedContextLimits>,
-) -> (u64, Option<u64>) {
-    match final_limits {
-        Some(limits) => (
-            limits.context_token_budget as u64,
-            limits.configured_model_context_window().map(|t| t as u64),
-        ),
-        None => resolve_done_context_limits(
-            usage_budget,
-            usage_model_window,
-            fallback_limits.unwrap_or(zeroclaw_config::schema::ResolvedContextLimits {
-                model_context_window: zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
-                context_token_budget: 0,
-                model_context_window_source:
-                    zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
-            }),
-        ),
-    }
-}
-
-/// Per-provider usage snapshot in the `usage_by_provider` done-frame array.
-/// Tracks ALL billable attempts (accepted + rejected Reliable attempts).
-/// The scalar `cost_usd` in the done frame is the sum of `usage_by_provider[*].cost_usd`,
-/// making the breakdown the single source of truth for both token counts and cost.
-#[derive(Debug, Clone, Default)]
-struct ProviderUsageEntry {
-    provider_ref: String,
-    model: String,
-    input_tokens: u64,
-    output_tokens: u64,
-    cached_input_tokens: u64,
-    cost_usd: f64,
-}
-
-/// Fold state for `TurnEvent::Usage` inside the WS chat loop.
-///
-/// `process_chat_message` owns one per turn and feeds it every Usage event
-/// verbatim; the done/cancel frame paths then read the accumulated state.
-/// Billing aggregation (turn-wide totals plus the per-(provider, model)
-/// breakdown) accumulates every billable attempt, including rejected ones.
-/// The accepted-serving snapshot (`last_provider_ref` / `last_model` /
-/// `last_input_tokens`) advances only on `accepted: true` events, so a later
-/// billed rejected attempt cannot re-point the terminal identity or the
-/// context-meter ceiling (see the `TurnEvent::Usage` contract).
-#[derive(Debug, Default)]
-struct UsageFold {
-    total_input_tokens: Option<u64>,
-    total_output_tokens: Option<u64>,
-    last_provider_ref: Option<String>,
-    last_model: Option<String>,
-    last_input_tokens: Option<u64>,
-    last_context_token_budget: Option<u64>,
-    last_model_context_window: Option<u64>,
-    usage_by_provider: std::collections::HashMap<(String, String), ProviderUsageEntry>,
-}
-
-impl UsageFold {
-    fn apply(&mut self, event: zeroclaw_api::agent::TurnEvent) {
-        let zeroclaw_api::agent::TurnEvent::Usage {
-            input_tokens,
-            cached_input_tokens,
-            output_tokens,
-            cost_usd,
-            context_token_budget,
-            model_context_window,
-            provider_ref,
-            model: served_model,
-            accepted,
-            // Deliberately ignored. This fold is the billing/accounting
-            // ledger: totals, the per-(provider, model) breakdown, and the
-            // accepted-serving snapshot must all describe provider-measured
-            // usage only. The display estimate is a context-meter concern and
-            // is carried to clients on the RPC `context_usage` surface, which
-            // labels it via `input_tokens_source`.
-            estimated_input_tokens: _,
-        } = event
-        else {
-            return;
-        };
-        // Turn-wide billing totals accumulate every billable attempt,
-        // including rejected ones (`accepted: false` is billing-only
-        // telemetry per the TurnEvent::Usage contract). Only the
-        // accepted-serving snapshot below is gated on `accepted`.
-        if let Some(it) = input_tokens {
-            self.total_input_tokens = Some(self.total_input_tokens.unwrap_or(0) + it);
-        }
-        if let Some(ot) = output_tokens {
-            self.total_output_tokens = Some(self.total_output_tokens.unwrap_or(0) + ot);
-        }
-        if accepted {
-            self.last_provider_ref = Some(provider_ref.clone());
-            self.last_model = Some(served_model.clone());
-            self.last_context_token_budget = context_token_budget;
-            self.last_model_context_window = model_context_window;
-            if let Some(it) = input_tokens {
-                self.last_input_tokens = Some(it);
-            } else {
-                // Accepted call returned no usage data; clear the previous
-                // route's input snapshot to prevent stale values from a
-                // different route being rendered against this route's
-                // context window.
-                self.last_input_tokens = None;
-            }
-        }
-        // Per-(provider, model) breakdown accumulation.
-        // The event-owned strings move into the map key; entry
-        // fields clone from the key only on insert, so repeat
-        // events for a known pair cost no extra clones.
-        let entry = self
-            .usage_by_provider
-            .entry((provider_ref, served_model))
-            .or_insert_with_key(|(provider_ref, model)| ProviderUsageEntry {
-                provider_ref: provider_ref.clone(),
-                model: model.clone(),
-                ..Default::default()
-            });
-        if let Some(it) = input_tokens {
-            entry.input_tokens = entry.input_tokens.saturating_add(it);
-        }
-        if let Some(ot) = output_tokens {
-            entry.output_tokens = entry.output_tokens.saturating_add(ot);
-        }
-        if let Some(ct) = cached_input_tokens {
-            entry.cached_input_tokens = entry.cached_input_tokens.saturating_add(ct);
-        }
-        if let Some(cu) = cost_usd {
-            entry.cost_usd += cu;
-        }
-    }
-
-    /// Sorted per-(provider, model) breakdown in wire order; drains the map.
-    /// `total_cost_usd` sums over this vector — never over the HashMap
-    /// directly — so float accumulation order (and the emitted total) is
-    /// deterministic.
-    fn take_sorted_entries(&mut self) -> Vec<ProviderUsageEntry> {
-        let mut entries: Vec<_> = std::mem::take(&mut self.usage_by_provider)
-            .into_values()
-            .collect();
-        entries.sort_by(|a, b| {
-            a.provider_ref
-                .cmp(&b.provider_ref)
-                .then(a.model.cmp(&b.model))
-        });
-        entries
-    }
-
-    /// Turn-wide cost total over the sorted breakdown; `None` when nothing
-    /// billable was recorded.
-    fn total_cost_usd(entries: &[ProviderUsageEntry]) -> Option<f64> {
-        let sum: f64 = entries.iter().map(|e| e.cost_usd).sum();
-        if sum > 0.0 { Some(sum) } else { None }
-    }
-}
-
-/// A per-turn display projection of the latest real history trim. The trim
-/// event is authoritative for this retained-context estimate; `UsageFold`
-/// remains the provider-measured ledger. Any later accepted call (even one
-/// without usage) supersedes the estimate. Rejected billable attempts do not.
-///
-/// Both chat relays keep one: the in-process relay observes `TurnEvent`s, and
-/// the scoped relay in `chat_core` observes the core's `session/update`
-/// notifications, where `context_usage` is sent for exactly the accepted
-/// calls. Both go through [`Self::accepted_call`] and [`Self::trimmed`].
-#[derive(Debug, Default)]
-pub(crate) struct ContextDisplay {
-    trimmed_input: Option<(u64, Option<&'static str>)>,
-}
-
-impl ContextDisplay {
-    fn observe(&mut self, event: &zeroclaw_api::agent::TurnEvent) {
-        use zeroclaw_api::agent::TurnEvent;
-        match event {
-            TurnEvent::Usage { accepted: true, .. } => self.accepted_call(),
-            TurnEvent::HistoryTrimmed {
-                dropped_messages,
-                tokens_after,
-                tokens_after_source,
-                ..
-            } => self.trimmed(*dropped_messages, *tokens_after, *tokens_after_source),
-            _ => {}
-        }
-    }
-
-    /// A later accepted call measured the context again.
-    pub(crate) fn accepted_call(&mut self) {
-        self.trimmed_input = None;
-    }
-
-    /// A trim notice. Only one that dropped history and reports what was
-    /// kept moves the displayed count: a zero-drop floor notice describes a
-    /// rejected request, and a message-limit trim has no token count.
-    pub(crate) fn trimmed(
-        &mut self,
-        dropped_messages: usize,
-        tokens_after: Option<u64>,
-        tokens_after_source: Option<zeroclaw_api::agent::TokenCountSource>,
-    ) {
-        if dropped_messages == 0 {
-            return;
-        }
-        if let Some(after) = tokens_after {
-            self.trimmed_input = Some((after, tokens_after_source.map(|source| source.as_str())));
-        }
-    }
-
-    pub(crate) fn add_to_done(&self, done: &mut serde_json::Value) {
-        if let Some((input, source)) = self.trimmed_input {
-            done["context_input_tokens"] = input.into();
-            if let Some(source) = source {
-                done["context_input_tokens_source"] = source.into();
-            }
-        }
-    }
 }
 
 /// Scalar inputs to build a done-frame JSON.
@@ -2699,15 +2432,7 @@ async fn process_chat_message(
                 }
             }
 
-            let total_tokens = match (
-                usage_fold.total_input_tokens,
-                usage_fold.total_output_tokens,
-            ) {
-                (Some(i), Some(o)) => Some(i.saturating_add(o)),
-                (Some(i), None) => Some(i),
-                (None, Some(o)) => Some(o),
-                (None, None) => None,
-            };
+            let total_tokens = usage_fold.total_tokens();
             // Deterministic ordering: sort by (provider_ref, model) so the wire
             // format is stable (avoids flaky assertions in tests). cost_usd is
             // summed over this sorted vector — never over the HashMap directly —
@@ -2762,7 +2487,7 @@ async fn process_chat_message(
             // classifier `category` (and any refusal explanation) never do.
             let safeguard_notice = outcome.safeguard_fallback.as_ref();
             let mut done = build_done_frame_json(&meta, &usage_by_provider_vec);
-            context_display.add_to_done(&mut done);
+            add_trim_to_done(&context_display, &mut done);
             for frame in success_terminal_ws_frames(safeguard_notice, done) {
                 let _ = sender.send(Message::Text(frame.to_string().into())).await;
             }
@@ -3047,7 +2772,7 @@ mod tests {
 
         // A real trim may remain at a floor: its count is useful even though
         // the notice must not claim the request fits the configured budget.
-        assert_eq!(display.trimmed_input, Some((90_000, Some("calibrated"))));
+        assert_eq!(display.trimmed_input(), Some((90_000, Some("calibrated"))));
         assert_eq!(fold.last_input_tokens, Some(180_000));
         assert_eq!(fold.last_context_token_budget, None);
         assert_eq!(fold.total_input_tokens, Some(180_000));
@@ -3062,18 +2787,18 @@ mod tests {
         let mut display = ContextDisplay::default();
         display.observe(&context_trim(0, Some(80_000)));
         display.observe(&context_trim(2, None));
-        assert_eq!(display.trimmed_input, None);
+        assert_eq!(display.trimmed_input(), None);
         let mut done = serde_json::json!({"type": "done", "last_input_tokens": null});
-        display.add_to_done(&mut done);
+        add_trim_to_done(&display, &mut done);
         assert!(done.get("context_input_tokens").is_none());
         assert!(done.get("context_input_tokens_source").is_none());
 
         display.observe(&context_trim(4, Some(90_000)));
         display.observe(&context_trim(0, Some(10_000)));
         display.observe(&context_trim(2, None));
-        assert_eq!(display.trimmed_input, Some((90_000, Some("calibrated"))));
+        assert_eq!(display.trimmed_input(), Some((90_000, Some("calibrated"))));
         display.observe(&context_trim(2, Some(70_000)));
-        display.add_to_done(&mut done);
+        add_trim_to_done(&display, &mut done);
         assert_eq!(done["context_input_tokens"], 70_000);
         assert_eq!(done["context_input_tokens_source"], "calibrated");
         assert!(done["last_input_tokens"].is_null());
@@ -3093,7 +2818,7 @@ mod tests {
                 Some(0.1),
                 false,
             ));
-            assert_eq!(display.trimmed_input, Some((90_000, Some("calibrated"))));
+            assert_eq!(display.trimmed_input(), Some((90_000, Some("calibrated"))));
             // Includes an accepted cached-only response with no input count.
             display.observe(&usage_event(
                 "accepted.route",
@@ -3104,9 +2829,9 @@ mod tests {
                 None,
                 true,
             ));
-            assert_eq!(display.trimmed_input, None);
+            assert_eq!(display.trimmed_input(), None);
             let mut done = serde_json::json!({"type": "done"});
-            display.add_to_done(&mut done);
+            add_trim_to_done(&display, &mut done);
             assert!(done.get("context_input_tokens").is_none());
             assert!(done.get("context_input_tokens_source").is_none());
         }

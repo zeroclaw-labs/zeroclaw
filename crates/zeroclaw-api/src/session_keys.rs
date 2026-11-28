@@ -8,6 +8,9 @@
 //! writing the JSONL file, every other layer must use the same sanitized form
 //! to keep lookups consistent across daemon restarts and persisted backends.
 
+/// Maximum number of Unicode scalar values in a session display name.
+pub const MAX_SESSION_NAME_CHARS: usize = 200;
+
 /// Replace every character outside `[A-Za-z0-9_-]` with `_`. Idempotent.
 ///
 /// Callers building session keys must pre-apply this so the runtime HashMap

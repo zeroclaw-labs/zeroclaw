@@ -2855,7 +2855,7 @@ pub async fn run_gateway_with_plugin_webhooks(
         .route("/api/events", get(sse::handle_sse_events))
         .route("/api/events/history", get(sse::handle_events_history))
         // ── ACP client bridge ──
-        .route("/acp", get(acp::handle_ws_acp))
+        .route("/acp", get(acp::handle_ws_acp).layer(axum::Extension(Arc::new(acp::AcpTurnHub::new(Arc::clone(&state.session_queue))))))
         // ── WebSocket agent chat ──
         .route("/ws/chat", get(ws::handle_ws_chat))
         // ── WebSocket SOP runs feed ──
