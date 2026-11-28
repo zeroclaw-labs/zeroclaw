@@ -66,7 +66,7 @@ pub fn compact_category_to_budget(
     if max_bytes > 0 {
         loop {
             let current_bytes = conn.query_row(
-                "SELECT COALESCE(SUM(LENGTH(content)), 0)
+                "SELECT COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0)
                  FROM memories
                  WHERE category = ?1 AND superseded_by IS NULL",
                 params![category],
