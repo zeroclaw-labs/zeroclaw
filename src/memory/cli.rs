@@ -140,8 +140,8 @@ async fn handle_list(
     for entry in &page {
         println!(
             "- {} [{}]",
-            style(&entry.key).white().bold(),
-            entry.category,
+            style(sanitize_terminal_text(&entry.key, false)).white().bold(),
+            sanitize_terminal_text(&entry.category.to_string(), false),
         );
         println!("    {}", truncate_content(&entry.content, 80));
     }
@@ -195,8 +195,8 @@ async fn handle_get(config: &Config, key: &str) -> Result<()> {
             for entry in matches {
                 println!(
                     "- {} [{}]",
-                    style(&entry.key).white().bold(),
-                    entry.category
+                    style(sanitize_terminal_text(&entry.key, false)).white().bold(),
+                    sanitize_terminal_text(&entry.category.to_string(), false)
                 );
             }
             println!(
@@ -213,11 +213,15 @@ async fn handle_get(config: &Config, key: &str) -> Result<()> {
 }
 
 fn print_entry(entry: &super::traits::MemoryEntry) {
+    let safe_key = sanitize_terminal_text(&entry.key, false);
+    let safe_cat = sanitize_terminal_text(&entry.category.to_string(), false);
+    let safe_content = sanitize_terminal_text(&entry.content, true);
+
     println!(
         "{}",
         mt_args(
             "cli-memory-key",
-            &[("value", &style(&entry.key).white().bold().to_string())],
+            &[("value", &style(&safe_key).white().bold().to_string())],
             "Key"
         )
     );
@@ -225,7 +229,7 @@ fn print_entry(entry: &super::traits::MemoryEntry) {
         "{}",
         mt_args(
             "cli-memory-category",
-            &[("value", &entry.category.to_string())],
+            &[("value", &safe_cat)],
             "Category"
         )
     );
@@ -238,12 +242,13 @@ fn print_entry(entry: &super::traits::MemoryEntry) {
         )
     );
     if let Some(sid) = &entry.session_id {
+        let safe_sid = sanitize_terminal_text(sid, false);
         println!(
             "{}",
-            mt_args("cli-memory-session", &[("value", sid)], "Session")
+            mt_args("cli-memory-session", &[("value", &safe_sid)], "Session")
         );
     }
-    println!("\n{}", entry.content);
+    println!("\n{safe_content}");
 }
 
 async fn handle_stats(config: &Config) -> Result<()> {
@@ -288,7 +293,8 @@ async fn handle_stats(config: &Config) -> Result<()> {
         let mut sorted: Vec<_> = counts.into_iter().collect();
         sorted.sort_by_key(|entry| std::cmp::Reverse(entry.1));
         for (cat, count) in sorted {
-            println!("    {cat:<20} {count}");
+            let safe_cat = sanitize_terminal_text(&cat, false);
+            println!("    {safe_cat:<20} {count}");
         }
     }
 
@@ -342,11 +348,12 @@ async fn handle_clear(
     }
 
     let scope = category.as_deref().unwrap_or("all categories");
+    let safe_scope = sanitize_terminal_text(scope, false);
     println!(
         "{}",
         mt_args(
             "cli-memory-found-in-scope",
-            &[("count", &entries.len().to_string()), ("scope", scope)],
+            &[("count", &entries.len().to_string()), ("scope", &safe_scope)],
             "Found entries"
         )
     );
@@ -411,8 +418,8 @@ async fn handle_clear_key(mem: &dyn Memory, key: &str, yes: bool) -> Result<()> 
                 for entry in matches {
                     println!(
                         "- {} [{}]",
-                        style(&entry.key).white().bold(),
-                        entry.category
+                        style(sanitize_terminal_text(&entry.key, false)).white().bold(),
+                        sanitize_terminal_text(&entry.category.to_string(), false)
                     );
                 }
                 println!(
@@ -428,8 +435,9 @@ async fn handle_clear_key(mem: &dyn Memory, key: &str, yes: bool) -> Result<()> 
     };
 
     if !yes {
+        let safe_target = sanitize_terminal_text(&target, false);
         let confirmed = dialoguer::Confirm::new()
-            .with_prompt(format!("  Delete '{target}'?"))
+            .with_prompt(format!("  Delete '{safe_target}'?"))
             .default(false)
             .interact()?;
         if !confirmed {
@@ -439,14 +447,87 @@ async fn handle_clear_key(mem: &dyn Memory, key: &str, yes: bool) -> Result<()> 
     }
 
     if mem.forget(&target).await? {
+        let safe_target = sanitize_terminal_text(&target, false);
         println!(
             "{} {}",
             style("✓").green().bold(),
-            mt_args("cli-memory-deleted-key", &[("key", &target)], "Deleted key")
+            mt_args("cli-memory-deleted-key", &[("key", &safe_target)], "Deleted key")
         );
     }
 
     Ok(())
+}
+
+/// Strip ANSI escape sequences and dangerous control characters from text destined
+/// for the terminal.
+///
+/// If `allow_newlines` is false (for keys, categories, session IDs, and single-line summaries),
+/// control characters including newlines are replaced with spaces or stripped.
+/// If `allow_newlines` is true (for full entry content body), `\n` and `\t` are preserved,
+/// while `\r` and all other control characters and ANSI sequences are removed or replaced.
+pub fn sanitize_terminal_text(s: &str, allow_newlines: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '\u{001b}' {
+            match chars.peek() {
+                Some(&'[') => {
+                    chars.next();
+                    for nc in chars.by_ref() {
+                        if ('\u{0040}'..='\u{007e}').contains(&nc) {
+                            break;
+                        }
+                    }
+                }
+                Some(&']') => {
+                    chars.next();
+                    while let Some(nc) = chars.next() {
+                        if nc == '\x07' {
+                            break;
+                        }
+                        if nc == '\u{001b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(&'P') | Some(&'_') | Some(&'^') | Some(&'X') => {
+                    chars.next();
+                    while let Some(nc) = chars.next() {
+                        if nc == '\x07' {
+                            break;
+                        }
+                        if nc == '\u{001b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(&c2) if c2.is_ascii() => {
+                    chars.next();
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if ('\u{0080}'..='\u{009f}').contains(&c) {
+            continue;
+        }
+
+        if allow_newlines && (c == '\n' || c == '\t') {
+            out.push(c);
+        } else if c == '\r' {
+            continue;
+        } else if c.is_control() {
+            out.push(' ');
+        } else {
+            out.push(c);
+        }
+    }
+
+    out
 }
 
 fn parse_category(s: &str) -> MemoryCategory {
@@ -460,10 +541,11 @@ fn parse_category(s: &str) -> MemoryCategory {
 
 fn truncate_content(s: &str, max_len: usize) -> String {
     let line = s.lines().next().unwrap_or(s);
-    if line.len() <= max_len {
-        return line.to_string();
+    let clean = sanitize_terminal_text(line, false);
+    if clean.len() <= max_len {
+        return clean;
     }
-    let truncated: String = line.chars().take(max_len.saturating_sub(3)).collect();
+    let truncated: String = clean.chars().take(max_len.saturating_sub(3)).collect();
     format!("{truncated}...")
 }
 
@@ -624,5 +706,33 @@ mod tests {
 
         let msg = err.to_string();
         assert!(msg.contains("'qdrant'"), "got: {msg}");
+    }
+
+    #[test]
+    fn sanitize_terminal_text_strips_ansi_csi_and_osc() {
+        let csi = "normal\x1b[31;1mred bold\x1b[0m normal";
+        assert_eq!(sanitize_terminal_text(csi, false), "normalred bold normal");
+
+        let osc = "text\x1b]0;Title Change\x07after";
+        assert_eq!(sanitize_terminal_text(osc, false), "textafter");
+
+        let osc_st = "text\x1b]52;c;Y2F0Cg==\x1b\\after";
+        assert_eq!(sanitize_terminal_text(osc_st, false), "textafter");
+    }
+
+    #[test]
+    fn sanitize_terminal_text_handles_control_chars_and_newlines() {
+        let cr = "hello\rworld";
+        assert_eq!(sanitize_terminal_text(cr, false), "helloworld");
+
+        let multiline = "line1\nline2\ttab\x07bell";
+        assert_eq!(sanitize_terminal_text(multiline, true), "line1\nline2\ttab bell");
+        assert_eq!(sanitize_terminal_text(multiline, false), "line1 line2 tab bell");
+    }
+
+    #[test]
+    fn truncate_content_sanitizes_escape_sequences() {
+        let evil = "\x1b[2J\x1b[HSystem Hacked!";
+        assert_eq!(truncate_content(evil, 80), "System Hacked!");
     }
 }
