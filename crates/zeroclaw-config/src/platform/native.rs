@@ -1158,16 +1158,36 @@ mod tests {
         );
     }
 
+    #[cfg(all(unix, not(target_os = "android")))]
+    fn bash_test_path() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Command construction only needs a file with executable permissions.
+        let dir = tempfile::tempdir().unwrap();
+        let bash = dir.path().join("bash");
+        std::fs::write(&bash, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bash, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
     #[test]
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(all(unix, not(target_os = "android")))]
     fn native_with_shell_bash() {
         let runtime = NativeRuntime::with_shell("bash".into());
         let cwd = std::env::temp_dir();
-        let cmd = runtime.build_shell_command("echo hi", &cwd).unwrap();
+        let bash_path = bash_test_path();
+        let cmd = runtime
+            .build_shell_command_with_effective_path(
+                "echo hi",
+                &cwd,
+                Some(bash_path.path().as_os_str()),
+            )
+            .unwrap();
+        let expected = bash_path.path().join("bash").canonicalize().unwrap();
         assert_eq!(
-            std::path::Path::new(cmd.as_std().get_program()).file_name(),
-            Some(std::ffi::OsStr::new("bash")),
-            "configured shell should resolve to an executable named 'bash'"
+            cmd.as_std().get_program(),
+            expected.as_os_str(),
+            "configured bash should resolve through the effective PATH"
         );
     }
 
@@ -1222,14 +1242,23 @@ mod tests {
     fn native_with_shell_passes_c_flag() {
         let runtime = NativeRuntime::with_shell("bash".into());
         let cwd = std::env::temp_dir();
+        let command = "echo test_command";
+        #[cfg(all(unix, not(target_os = "android")))]
+        let bash_path = Some(bash_test_path());
+        #[cfg(not(all(unix, not(target_os = "android"))))]
+        let bash_path: Option<tempfile::TempDir> = None;
         let cmd = runtime
-            .build_shell_command("echo test_command", &cwd)
+            .build_shell_command_with_effective_path(
+                command,
+                &cwd,
+                bash_path.as_ref().map(|dir| dir.path().as_os_str()),
+            )
             .unwrap();
         let debug = format!("{cmd:?}");
 
         // The command string is preserved verbatim on every platform.
         assert!(
-            debug.contains("echo test_command"),
+            debug.contains(command),
             "command should contain the passed string, got: {debug}"
         );
 
@@ -1238,9 +1267,10 @@ mod tests {
         // PATH for spawned processes), so mirror that runtime branch here.
         #[cfg(not(target_os = "windows"))]
         {
-            assert!(
-                debug.contains("-c"),
-                "shell command must use -c flag, got: {debug}"
+            assert_eq!(
+                cmd.as_std().get_args().collect::<Vec<_>>(),
+                [OsStr::new("-c"), OsStr::new(command)],
+                "shell command must pass the script as the argument to -c"
             );
             if is_android() {
                 assert!(
