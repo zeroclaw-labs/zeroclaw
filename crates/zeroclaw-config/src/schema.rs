@@ -39970,6 +39970,7 @@ default_temperature = 0.7
         let b = BrowserConfig {
             enabled: true,
             automation_enabled: true,
+            credential_submission_enabled: true,
             allowed_domains: vec!["example.com".into(), "docs.example.com".into()],
             session_name: None,
             backend: "auto".into(),
@@ -39993,6 +39994,7 @@ default_temperature = 0.7
         let parsed: BrowserConfig = toml::from_str(&toml_str).unwrap();
         assert!(parsed.enabled);
         assert!(parsed.automation_enabled);
+        assert!(parsed.credential_submission_enabled);
         assert_eq!(parsed.allowed_domains.len(), 2);
         assert_eq!(parsed.allowed_domains[0], "example.com");
         assert_eq!(parsed.backend, "auto");

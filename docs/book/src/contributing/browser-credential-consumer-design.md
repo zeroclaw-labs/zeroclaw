@@ -8,6 +8,18 @@ In **Settings → Secrets → Permissions**, give username/password entries a br
 
 ## Runtime boundary
 
+The Permissions panel displays the scope warning before an operator adds or
+edits a browser grant. This screenshot uses synthetic catalog metadata on the
+production dashboard route, with the add-authorization editor open:
+
+![Browser credential grant warning and authorization editor](../assets/screenshots/browser-credential-permissions.png)
+
+The screenshot was captured from `0ea4ccae0` in Chromium at 1440 × 1000, in
+English. The dashboard HTTP metadata was supplied by a disposable fixture.
+The fixture also saved an additional browser origin, reloaded the page, and
+confirmed that the separate TOTP entry retained its empty grant list. This
+validates the operator interface, not managed session isolation or login.
+
 Use an isolated managed browser context and trusted, purpose-built login operations. The caller supplies an alias. The executor resolves it just in time from the existing catalog and configured vault. Treat the seed as a secret and keep generated codes inside the executor. A password operation and a TOTP operation check their own grants, including after redirects and on multi-step login flows. A challenge displayed by a page carries no authority. Bind both the active top-level origin and the receiving document and submission destination to the approved HTTPS origin. Reject unsupported frames, insecure transport, certificate errors and ambiguous destinations. Retain existing browser policies and operator approvals. A delegated or resumed task must pass the same checks against current policy.
 
 Keep credential-bearing pages and browser session material out of generic snapshots, screenshots, downloads, script evaluation, and tool results during the credential operation. Verify that secrets never enter process arguments, diagnostics, telemetry, model context, or persisted browser profiles. Start with a backend that can enforce these properties and fail closed elsewhere. Return only a bounded status. A successful fill is distinct from successful authentication. Support a TOTP-only grant for a session already at a verification step. Keep browser sessions isolated by task and close them on termination.
