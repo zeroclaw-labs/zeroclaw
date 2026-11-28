@@ -295,6 +295,13 @@ pub fn serde_get_prop<T: serde::Serialize>(
 }
 
 /// Set a property value via serde roundtrip.
+///
+/// `empty_is_value` is set for `Option<String>` fields (via the
+/// `#[empty_is_value]` attribute) where an empty string is a meaningful
+/// stored value rather than the "clear the override" signal: such a field
+/// keeps `Some("")` distinct from the unset (`None`) that inherits a
+/// parent value. The explicit `UNSET_DISPLAY` and `"****"` sentinels still
+/// clear the field for every option field, including these.
 pub fn serde_set_prop<T: serde::Serialize + serde::de::DeserializeOwned>(
     target: &mut T,
     prefix: &str,
@@ -302,12 +309,15 @@ pub fn serde_set_prop<T: serde::Serialize + serde::de::DeserializeOwned>(
     value_str: &str,
     kind: PropKind,
     is_option: bool,
+    empty_is_value: bool,
 ) -> anyhow::Result<()> {
     let serde_name = prop_name_to_serde_field(prefix, name)?;
     let mut table: toml::Table = toml::from_str(&toml::to_string(target)?)?;
-    if (value_str.is_empty() || value_str == crate::traits::UNSET_DISPLAY || value_str == "****")
-        && is_option
-    {
+    let clears_option = is_option
+        && (value_str == crate::traits::UNSET_DISPLAY
+            || value_str == "****"
+            || (value_str.is_empty() && !empty_is_value));
+    if clears_option {
         table.remove(&serde_name);
     } else {
         let parsed = if kind == PropKind::ObjectArray && name.ends_with("read_memory_from") {

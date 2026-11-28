@@ -895,6 +895,27 @@ impl fmt::Display for FinalizePartialDelivery {
 
 impl std::error::Error for FinalizePartialDelivery {}
 
+/// An in-progress acknowledgement a channel already posted for an inbound
+/// message, reported to the orchestrator so it withdraws exactly the emoji the
+/// channel added and waits for the channel's own add to land first.
+///
+/// The channel is the canonical source of the emoji it actually added, so the
+/// orchestrator resolves it here instead of recomputing it: a configured value
+/// that changed between receipt and cleanup would otherwise withdraw a
+/// different emoji and strand the reaction the channel left on the message.
+///
+/// The wait for [`completion`](Self::completion) is deliberately deferred: it
+/// is awaited only during cleanup, never before the reply, so a stalled
+/// reaction endpoint can never delay the agent's answer.
+pub struct InboundAck {
+    /// The in-progress acknowledgement emoji the channel posted for the
+    /// message.
+    pub emoji: String,
+    /// Resolves once the channel's own add has finished. `None` when the
+    /// channel has no separate add task to wait for.
+    pub completion: Option<tokio::task::JoinHandle<()>>,
+}
+
 /// Error a [`Channel::finalize_draft`] implementation returns when it could not
 /// deliver any part of the final answer and the platform has asked it not to
 /// send again yet (for example a Telegram flood limit with `retry_after`).
@@ -1339,6 +1360,37 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         _emoji: &str,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Whether this channel posts its own acknowledgement reaction on inbound
+    /// messages instead of going through [`Channel::add_reaction`].
+    ///
+    /// Such a channel owns a reaction on the message that the orchestrator
+    /// never added, so cleanup must still call [`Channel::remove_reaction`]
+    /// when the configured in-progress emoji is empty: an empty value means
+    /// the orchestrator adds nothing, not that the channel has nothing to
+    /// clear. Channels that react only through `add_reaction` keep the
+    /// default `false`, so an empty in-progress emoji skips both calls.
+    fn posts_native_ack(&self) -> bool {
+        false
+    }
+
+    /// The in-progress acknowledgement this channel already posted to
+    /// `message_id` when the message arrived, if the channel fast-acks inbound
+    /// messages.
+    ///
+    /// The channel is the canonical source of the emoji it actually added, so
+    /// the orchestrator resolves it here instead of recomputing it: a
+    /// configured value that changed between receipt and cleanup would
+    /// otherwise withdraw a different emoji and strand the reaction the
+    /// channel left on the message. The default returns `None`, and the
+    /// orchestrator then resolves and withdraws the in-progress emoji itself.
+    ///
+    /// The returned [`InboundAck::completion`] is awaited only during cleanup,
+    /// never before the reply, so a stalled reaction endpoint cannot delay the
+    /// answer.
+    async fn inbound_ack(&self, _message_id: &str) -> Option<InboundAck> {
+        None
     }
 
     /// Pin a message in the channel.
