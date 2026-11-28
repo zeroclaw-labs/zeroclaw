@@ -3080,6 +3080,15 @@ impl Chat {
                 state.mark_dirty_append();
             }
         }
+        self.invalidate_refresh_for_goal_event(session_id);
+    }
+
+    fn invalidate_refresh_for_goal_event(&mut self, session_id: &str) {
+        if let Some(attempt) = self.session_refresh.as_mut()
+            && attempt.session_id == session_id
+        {
+            attempt.invalidated = true;
+        }
     }
 
     /// Whether a `session/update` is this session's live terminal frame (the
@@ -3280,6 +3289,7 @@ impl Chat {
                     .entries
                     .push(ChatEntry::SystemMessage(Arc::<str>::from(message)));
                 state.mark_dirty_append();
+                self.invalidate_refresh_for_goal_event(&completion.session_id);
             }
 
             let release_notifications = if completion.releases_launch_barrier {
@@ -27530,6 +27540,18 @@ mod tests {
     }
 
     fn assert_reconnect_question_in_terminal(chat: &mut Chat) {
+        let rendered = render_reconnect_transcript(chat);
+        let paused = crate::i18n::t("zc-goal-paused");
+        assert_eq!(
+            rendered.matches(RECONNECT_QUESTION).count(),
+            2,
+            "{rendered}"
+        );
+        assert_eq!(rendered.matches(&paused).count(), 1, "{rendered}");
+        assert!(rendered.rfind(RECONNECT_QUESTION).unwrap() < rendered.find(&paused).unwrap());
+    }
+
+    fn render_reconnect_transcript(chat: &mut Chat) -> String {
         use ratatui::{Terminal, backend::TestBackend};
 
         let mut acp = crate::acp::Acp::new(chat.rpc.clone());
@@ -27553,15 +27575,168 @@ mod tests {
             .as_ref()
             .expect("production chat draw captures transcript area")
             .area;
-        let rendered = overlay_text(&terminal, area);
+        overlay_text(&terminal, area)
+    }
+
+    fn reconnect_question_snapshot() -> serde_json::Value {
+        serde_json::json!([
+            {"role": "user", "content": RECONNECT_PROMPT},
+            {"role": "assistant", "content": RECONNECT_QUESTION},
+        ])
+    }
+
+    fn assert_received_pause_follows_one_question(chat: &mut Chat) {
         let paused = crate::i18n::t("zc-goal-paused");
+        // The second tick must not reapply either the snapshot or the live notice.
+        for _ in 0..2 {
+            chat.tick_transport_events();
+            let rendered = render_reconnect_transcript(chat);
+            assert_eq!(
+                rendered.matches(RECONNECT_QUESTION).count(),
+                1,
+                "{rendered}"
+            );
+            assert_eq!(
+                rendered.matches(&paused).count(),
+                1,
+                "received post-snapshot Goal pause must render exactly once: {rendered}"
+            );
+            assert!(rendered.find(RECONNECT_QUESTION).unwrap() < rendered.find(&paused).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn goal_manual_refresh_preserves_received_post_snapshot_pause() {
+        let (mut chat, mut rx, outbound) =
+            goal_reconnect_chat(GoalReconnectPath::AttachEntry, true).await;
+        chat.begin_session_refresh();
+        answer_refresh(&mut rx, &outbound, reconnect_question_snapshot(), "idle").await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while chat.session_refresh_rx.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refresh result queued before the live pause");
+        assert!(chat.notif_rx.is_empty());
+        reconnect_pause(&chat);
         assert_eq!(
-            rendered.matches(RECONNECT_QUESTION).count(),
-            2,
-            "{rendered}"
+            chat.notif_rx.len(),
+            1,
+            "the live pause was received after the snapshot"
         );
-        assert_eq!(rendered.matches(&paused).count(), 1, "{rendered}");
-        assert!(rendered.rfind(RECONNECT_QUESTION).unwrap() < rendered.find(&paused).unwrap());
+        assert_received_pause_follows_one_question(&mut chat);
+    }
+
+    #[tokio::test]
+    async fn goal_manual_refresh_invalidation_is_scoped_to_applied_matching_events() {
+        use crate::wire::GoalResponse;
+        const CANDIDATE: &str = "A new live Goal candidate.";
+        const SNAPSHOT: &str = "A new durable snapshot entry.";
+        for (frame, matching_output) in [
+            ("candidate", Some(CANDIDATE.to_owned())),
+            (
+                "lifecycle",
+                Some(goal_response_message(&GoalResponse::NoCurrentGoal)),
+            ),
+            (
+                "completion",
+                Some(goal_response_message(&GoalResponse::BudgetRequired)),
+            ),
+            ("foreign", None),
+            ("stale_completion", None),
+            ("malformed", None),
+        ] {
+            let (mut chat, mut rx, outbound) =
+                goal_reconnect_chat(GoalReconnectPath::AttachEntry, false).await;
+            chat.background.push(state_for("foreign", "myagent"));
+            chat.begin_session_refresh();
+            answer_refresh(
+                &mut rx,
+                &outbound,
+                serde_json::json!([
+                    {"role": "user", "content": RECONNECT_PROMPT},
+                    {"role": "assistant", "content": SNAPSHOT},
+                ]),
+                "idle",
+            )
+            .await;
+            match frame {
+                "candidate" => reconnect_candidate(&chat, CANDIDATE),
+                "lifecycle" => chat.rpc.push_notification_for_test(
+                    "session/goal_update",
+                    serde_json::json!({"lifecycle": {
+                        "session_id": "sess-1", "response": {"kind": "no_current_goal"}
+                    }}),
+                ),
+                "completion" | "stale_completion" => chat
+                    .goal_completion_tx
+                    .try_send(GoalCompletion {
+                        session_id: if frame == "completion" {
+                            "sess-1".into()
+                        } else {
+                            "no-longer-tracked".into()
+                        },
+                        releases_launch_barrier: false,
+                        result: if frame == "completion" {
+                            Ok(GoalResponse::BudgetRequired)
+                        } else {
+                            Err("fixture rejected command".into())
+                        },
+                    })
+                    .unwrap(),
+                "foreign" => chat.rpc.push_notification_for_test(
+                    "session/goal_update",
+                    serde_json::json!({"paused_for_blocker": {"session_id": "foreign"}}),
+                ),
+                "malformed" => chat.rpc.push_notification_for_test(
+                    "session/goal_update",
+                    serde_json::json!({"paused_for_blocker": {
+                        "session_id": "sess-1", "unexpected": true
+                    }}),
+                ),
+                _ => unreachable!(),
+            }
+            finish_refresh(&mut chat).await;
+            let entries = active_state(&mut chat).entries();
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|entry| matches!(entry,
+                        ChatEntry::AgentMessage(text) if text.as_ref() == SNAPSHOT
+                    ))
+                    .count(),
+                usize::from(matching_output.is_none()),
+                "{frame}: {entries:?}"
+            );
+            if let Some(output) = matching_output {
+                assert_eq!(
+                    entries
+                        .iter()
+                        .filter(|entry| matches!(entry,
+                            ChatEntry::AgentMessage(text) | ChatEntry::SystemMessage(text)
+                            if text.as_ref() == output
+                        ))
+                        .count(),
+                    1,
+                    "{frame}: {entries:?}"
+                );
+            }
+            if frame == "foreign" {
+                assert_eq!(
+                    chat.state_for_session("foreign")
+                        .unwrap()
+                        .entries()
+                        .iter()
+                        .filter(|entry| matches!(entry,
+                            ChatEntry::SystemMessage(text)
+                            if text.as_ref() == crate::i18n::t("zc-goal-paused")
+                        ))
+                        .count(),
+                    1
+                );
+            }
+        }
     }
 
     #[tokio::test]
