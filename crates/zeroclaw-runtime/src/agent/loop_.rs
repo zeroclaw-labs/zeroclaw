@@ -2528,6 +2528,7 @@ async fn run_inner(
                                     cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
                                         &config.memory,
                                         crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                                        &config.security.nat64_prefixes,
                                     ),
                                 }),
                                 ingress: IngressContext::from_parts(
@@ -3192,6 +3193,7 @@ async fn run_inner(
                                         cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
                                             &config.memory,
                                             crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                                            &config.security.nat64_prefixes,
                                         ),
                                     }),
                                     ingress: IngressContext::from_parts(
@@ -4416,6 +4418,7 @@ async fn process_message_inner(
                         cfg: crate::agent::memory_inject::MemoryInjectConfig::from_memory_config(
                             &config.memory,
                             crate::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                            &config.security.nat64_prefixes,
                         ),
                     }),
                     Some(agent_alias),

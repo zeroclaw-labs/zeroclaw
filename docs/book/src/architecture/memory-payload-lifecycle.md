@@ -55,6 +55,27 @@ when the turn has no safe session scope or is not user-initiated. Generic memory
 loading filters autosave noise and relevance, but does not by itself enforce
 that channel-loop Conversation exclusion.
 
+With `rerank_enabled = true` and `rerank_strategy = "external"`, one more
+party sees memory: the endpoint in `[memory.external_rerank]` receives the
+recall query and the text of the candidate memories, after the scope,
+eligibility, content-scan and relevance-floor checks and before the final
+selection. It returns only an order. If it times out, errors or answers in an
+unexpected shape, the block is the one the `none` strategy renders, and a
+warning records the reason and the candidate count without any memory text.
+Point it at a service you would also trust with the memories themselves, such
+as a local llama.cpp server started with `--reranking`.
+
+The endpoint goes through the shared network guard. A cloud metadata or
+link-local address is refused when the config is loaded and again on every
+call. A private, loopback or local host (`127.0.0.1`, `192.168.x.x`,
+`localhost`, a `.local` name) needs `allow_private_endpoint = true`. Each call
+resolves the host once, checks every address it returns, and sends only to
+those addresses, without a proxy and without following redirects. An address
+under one of the deployment's `security.nat64_prefixes` is also judged by the
+IPv4 destination it translates to, so a translated metadata or private address
+is refused like a direct one; if that list does not parse, every call is
+refused.
+
 The provider request can therefore contain recalled memory without making the
 current turn a new memory. Review prompt-assembly changes by asking:
 
@@ -62,6 +83,7 @@ current turn a new memory. Review prompt-assembly changes by asking:
 - whether the query is session-scoped when conversation entries are allowed;
 - whether autosave noise, stale tool-result blocks, and low-relevance entries
   remain filtered;
+- whether anything new receives memory text before the final selection;
 - whether the user or operator can see when older context was removed.
 
 ## Session history and trimming

@@ -10574,6 +10574,7 @@ async fn process_channel_message_body(
                         ..zeroclaw_runtime::agent::memory_inject::MemoryInjectConfig::from_memory_config(
                             &ctx.prompt_config.memory,
                             zeroclaw_runtime::agent::memory_inject::DEFAULT_RECALL_LIMIT,
+                            &ctx.prompt_config.security.nat64_prefixes,
                         )
                     },
                 }),
