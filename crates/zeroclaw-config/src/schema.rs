@@ -6942,7 +6942,12 @@ pub struct ToolFilterGroup {
     pub keywords: Vec<String>,
 }
 
-/// OpenAI Whisper STT model_provider configuration (`[transcription.openai]`).
+/// OpenAI Whisper STT provider configuration (`[transcription.openai]`).
+///
+/// A missing API key can be supplied at config-load time by the native
+/// `TRANSCRIPTION_API_KEY` / `OPENAI_API_KEY` bridge when this table is
+/// configured; the resolved value still uses this typed field and normal
+/// secret masking rules.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "transcription.openai"]
