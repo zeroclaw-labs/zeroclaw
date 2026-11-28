@@ -59,11 +59,44 @@ fi
 # pass therefore runs in the background while this shell waits for it. On a
 # signal, ask timeout to stop the pass, which it does for the whole group, then
 # end this shell by the same signal so whatever called it stops too.
+pass_pid=""
+pending_signal=""
+
+# timeout exits as soon as Cargo does, so a test helper that ignores TERM can
+# outlive the pass with nothing left to stop it. Give whatever is still in the
+# pass's process group a moment to exit, then kill it.
+stop_leftovers() {
+    local i
+    for ((i = 0; i < 10; i++)); do
+        kill -0 -- "-$pass_pid" 2>/dev/null || return 0
+        sleep 0.1
+    done
+    kill -s KILL -- "-$pass_pid" 2>/dev/null || true
+}
+
 stop_pass() {
-    kill -TERM "$pass_pid" 2>/dev/null || true
+    # A TERM that reaches the pass before it has started timeout is lost, so
+    # repeat it until the pass has ended. The loop is bounded in case it never
+    # does; wait then blocks as before.
+    local i
+    for ((i = 0; i < 150; i++)); do
+        kill -TERM "$pass_pid" 2>/dev/null || break
+        sleep 0.1
+    done
     wait "$pass_pid" 2>/dev/null || true
+    stop_leftovers
     trap - "$1"
     kill -s "$1" "$$"
+}
+
+# The traps go in before the pass starts, so a signal that arrives before its
+# pid is known is kept and acted on once it is.
+on_signal() {
+    if [[ -n "$pass_pid" ]]; then
+        stop_pass "$1"
+    else
+        pending_signal="$1"
+    fi
 }
 
 for crate in "${crates[@]}"; do
@@ -73,13 +106,20 @@ for crate in "${crates[@]}"; do
         echo "==> parallel runtime regression: $crate run $run/$runs ($threads threads, $deadline_note)"
         status=0
         if ((${#deadline[@]})); then
+            pass_pid=""
+            trap 'on_signal INT' INT
+            trap 'on_signal HUP' HUP
+            trap 'on_signal TERM' TERM
             "${deadline[@]}" cargo test --locked --quiet -p "$crate" --lib -- --test-threads="$threads" &
             pass_pid=$!
-            trap 'stop_pass INT' INT
-            trap 'stop_pass HUP' HUP
-            trap 'stop_pass TERM' TERM
+            if [[ -n "$pending_signal" ]]; then
+                stop_pass "$pending_signal"
+            fi
             wait "$pass_pid" || status=$?
             trap - INT HUP TERM
+            if ((status == 124 || status == 137)); then
+                stop_leftovers
+            fi
         else
             cargo test --locked --quiet -p "$crate" --lib -- --test-threads="$threads" || status=$?
         fi

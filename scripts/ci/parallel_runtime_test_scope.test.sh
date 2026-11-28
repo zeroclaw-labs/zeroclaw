@@ -170,20 +170,41 @@ done
 # A pass that stops must fail at its deadline and say which pass it was. The
 # build call returns at once; only the test run sleeps past the deadline.
 if command -v timeout >/dev/null 2>&1; then
+    # Each test pass also starts a helper that ignores TERM, as the TTS
+    # fixtures in zeroclaw-channels do. timeout exits as soon as Cargo does, so
+    # the gate has to stop such a helper itself.
+    leftover_pid_file="${mock_dir}/leftover.pid"
+    expect_no_leftover() {
+        local name="$1" leftover_pid i
+        leftover_pid="$(cat "$leftover_pid_file")"
+        # An orphan disappears once init reaps it, which can take a moment.
+        for ((i = 0; i < 20; i++)); do
+            kill -0 "$leftover_pid" 2>/dev/null || return 0
+            sleep 0.1
+        done
+        kill -s KILL "$leftover_pid" 2>/dev/null || true
+        echo "FAIL: $name left a helper that ignores TERM running" >&2
+        exit 1
+    }
+
     cat > "${mock_dir}/cargo" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$ZEROCLAW_PARALLEL_TEST_CARGO_LOG"
 case "$*" in
     *--no-run*) exit 0 ;;
 esac
+bash -c 'trap "" TERM; while :; do sleep 0.1; done' &
+echo "$!" > "$ZEROCLAW_PARALLEL_TEST_LEFTOVER_PID"
 sleep 30
 EOF
     chmod +x "${mock_dir}/cargo"
     : > "$cargo_log"
+    rm -f "$leftover_pid_file"
     hang_output="${mock_dir}/hang.out"
     set +e
     PATH="${mock_dir}:$PATH" \
         ZEROCLAW_PARALLEL_TEST_CARGO_LOG="$cargo_log" \
+        ZEROCLAW_PARALLEL_TEST_LEFTOVER_PID="$leftover_pid_file" \
         ZEROCLAW_PARALLEL_TEST_RUNS=2 \
         ZEROCLAW_PARALLEL_TEST_SCOPE=channels \
         ZEROCLAW_PARALLEL_TEST_PASS_TIMEOUT_SECONDS=1 \
@@ -199,6 +220,7 @@ EOF
         cat "$hang_output" >&2
         exit 1
     fi
+    expect_no_leftover "a stopped pass"
     expect_cargo_log "stopped pass ends the gate" \
         'test --locked --quiet -p zeroclaw-channels --lib --no-run' \
         'test --locked --quiet -p zeroclaw-channels --lib -- --test-threads=16'
@@ -213,6 +235,8 @@ printf '%s\n' "$*" >> "$ZEROCLAW_PARALLEL_TEST_CARGO_LOG"
 case "$*" in
     *--no-run*) exit 0 ;;
 esac
+bash -c 'trap "" TERM; while :; do sleep 0.1; done' &
+echo "$!" > "$ZEROCLAW_PARALLEL_TEST_LEFTOVER_PID"
 echo "$$" > "$ZEROCLAW_PARALLEL_TEST_PASS_PID"
 exec sleep 30
 EOF
@@ -222,11 +246,12 @@ EOF
         signal="${case_spec%%:*}"
         expected_status="${case_spec##*:}"
         : > "$cargo_log"
-        rm -f "$pass_pid_file"
+        rm -f "$pass_pid_file" "$leftover_pid_file"
         set -m
         PATH="${mock_dir}:$PATH" \
             ZEROCLAW_PARALLEL_TEST_CARGO_LOG="$cargo_log" \
             ZEROCLAW_PARALLEL_TEST_PASS_PID="$pass_pid_file" \
+            ZEROCLAW_PARALLEL_TEST_LEFTOVER_PID="$leftover_pid_file" \
             ZEROCLAW_PARALLEL_TEST_RUNS=2 \
             ZEROCLAW_PARALLEL_TEST_SCOPE=channels \
             ZEROCLAW_PARALLEL_TEST_PASS_TIMEOUT_SECONDS=60 \
@@ -264,6 +289,7 @@ EOF
             echo "FAIL: SIG$signal stopped the gate but left its pass running" >&2
             exit 1
         fi
+        expect_no_leftover "SIG$signal"
         if [ "$status" -ne "$expected_status" ]; then
             echo "FAIL: SIG$signal should end the gate with status $expected_status, got $status" >&2
             exit 1
