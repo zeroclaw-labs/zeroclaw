@@ -52,6 +52,10 @@ impl Acp {
         self.inner.session_summaries()
     }
 
+    pub(crate) fn take_session_replacements(&mut self) -> Vec<(String, String)> {
+        self.inner.take_session_replacements()
+    }
+
     pub(crate) fn owns_session(&self, session_id: &str) -> bool {
         self.inner.owns_session(session_id)
     }
