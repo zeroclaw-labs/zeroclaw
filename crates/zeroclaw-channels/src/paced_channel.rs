@@ -17,6 +17,14 @@ use zeroclaw_api::channel::{
 };
 use zeroclaw_config::schema::{DEFAULT_REPLY_QUEUE_DEPTH, HasReplyPacing, PACING_RECIPIENT_CAP};
 
+// Only ephemeral progress sends expire when their caller is dropped. Ordinary
+// messages retain their existing delivery contract even if their caller leaves.
+tokio::task_local! { static EPHEMERAL_PROGRESS: (); }
+
+pub(crate) async fn scope_progress_send<F: std::future::Future>(future: F) -> F::Output {
+    EPHEMERAL_PROGRESS.scope((), future).await
+}
+
 enum PacedOp {
     /// An ordinary outbound message. Dispatches to `inner.send`.
     Send(SendMessage),
@@ -86,6 +94,7 @@ struct PendingSend {
     /// the caller. The caller awaits this so a paced `send()` still
     /// returns the inner channel's result rather than swallowing it.
     reply: oneshot::Sender<Result<()>>,
+    expires_with_caller: bool,
 }
 
 impl PendingSend {
@@ -194,6 +203,7 @@ impl PacedChannel {
 
     async fn paced_dispatch(&self, op: PacedOp) -> Result<()> {
         let recipient_key = op.recipient().to_string();
+        let expires_with_caller = EPHEMERAL_PROGRESS.try_with(|_| ()).is_ok();
 
         let (immediate, awaited) = {
             let mut map = self.recipients.lock().await;
@@ -212,12 +222,28 @@ impl PacedChannel {
                 });
             state.last_touched = touch;
 
+            state
+                .queue
+                .retain(|pending| !(pending.expires_with_caller && pending.reply.is_closed()));
+            // A final/durable reply takes precedence over live best-effort
+            // notices from any conversation lane sharing this recipient.
+            if !expires_with_caller {
+                while let Some(superseded) = state
+                    .queue
+                    .iter()
+                    .position(|pending| pending.expires_with_caller)
+                    .and_then(|index| state.queue.remove(index))
+                {
+                    let _ = superseded.reply.send(Ok(()));
+                }
+            }
             // A cancelled poll no longer needs a slot. Scan only on pressure.
             if state.queue.len() >= self.queue_depth {
                 state.queue.retain(|pending| !pending.is_cancelled_poll());
             }
 
-            let ready = state.queue.is_empty()
+            let ready = !expires_with_caller
+                && state.queue.is_empty()
                 && !state.worker_running
                 && !state.in_flight
                 && now >= state.next_allowed_at;
@@ -246,7 +272,11 @@ impl PacedChannel {
                 (None, None)
             } else {
                 let (tx, rx) = oneshot::channel();
-                let pending = PendingSend { op, reply: tx };
+                let pending = PendingSend {
+                    op,
+                    reply: tx,
+                    expires_with_caller,
+                };
                 // The worker owns even a ready poll so dropping its caller
                 // during delivery cannot strand the recipient. Hand it to the
                 // worker directly, preserving the queue slots for waiters.
@@ -306,11 +336,18 @@ impl PacedChannel {
         let min_interval = self.min_interval;
         zeroclaw_spawn::spawn!(async move {
             loop {
-                let PendingSend { op, reply } = {
+                let PendingSend {
+                    op,
+                    mut reply,
+                    expires_with_caller,
+                } = {
                     let mut map = recipients.lock().await;
                     let Some(state) = map.inner.get_mut(&recipient) else {
                         return;
                     };
+                    state.queue.retain(|pending| {
+                        !(pending.expires_with_caller && pending.reply.is_closed())
+                    });
                     let now = Instant::now();
                     let deadline = state.next_allowed_at;
                     if (first.is_some() || !state.queue.is_empty()) && now < deadline {
@@ -328,8 +365,16 @@ impl PacedChannel {
                     state.next_allowed_at = now + min_interval;
                     pending
                 };
-                let result = op.dispatch(&inner).await;
-                let _ = reply.send(result);
+                if expires_with_caller {
+                    tokio::select! {
+                        biased;
+                        _ = reply.closed() => {},
+                        result = op.dispatch(&inner) => { let _ = reply.send(result); }
+                    }
+                } else {
+                    let result = op.dispatch(&inner).await;
+                    let _ = reply.send(result);
+                }
             }
         });
     }
@@ -825,6 +870,152 @@ mod tests {
             anyhow::ensure!(!self.reject_polls, "inner channel rejected the poll");
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn final_reply_supersedes_another_lanes_live_progress() {
+        for depth in [1, 16] {
+            assert_final_reply_supersedes_live_progress(depth).await;
+        }
+    }
+
+    async fn assert_final_reply_supersedes_live_progress(queue_depth: usize) {
+        let inner = Arc::new(CountingChannel {
+            sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
+        });
+        let paced = Arc::new(PacedChannel {
+            inner: inner.clone(),
+            min_interval: Duration::from_millis(80),
+            queue_depth,
+            recipients: Arc::new(Mutex::new(RecipientMap::new())),
+        });
+        paced
+            .send(&SendMessage::new("initial", "peer"))
+            .await
+            .unwrap();
+        let notice_channel = paced.clone();
+        let notice = zeroclaw_spawn::spawn!(async move {
+            scope_progress_send(notice_channel.send(&SendMessage::new("progress", "peer"))).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !paced.recipients.lock().await.inner["peer"].queue.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("send was not queued");
+        paced
+            .send_final(&SendMessage::new("final", "peer"))
+            .await
+            .unwrap();
+        notice.await.unwrap().unwrap();
+        assert_eq!(inner.sends.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.final_sends.load(Ordering::SeqCst), 1);
+        // A discarded notice must not reserve another pacing interval.
+        assert!(paced.recipients.lock().await.inner["peer"].queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_progress_does_not_send_or_delay_final_reply() {
+        let inner = Arc::new(CountingChannel {
+            sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
+        });
+        let paced = Arc::new(PacedChannel {
+            inner: inner.clone(),
+            min_interval: Duration::from_millis(80),
+            queue_depth: 8,
+            recipients: Arc::new(Mutex::new(RecipientMap::new())),
+        });
+        paced
+            .send(&SendMessage::new("initial", "peer"))
+            .await
+            .unwrap();
+        let notice_channel = paced.clone();
+        let notice = zeroclaw_spawn::spawn!(async move {
+            scope_progress_send(notice_channel.send(&SendMessage::new("progress", "peer"))).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !paced.recipients.lock().await.inner["peer"].queue.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("send was not queued");
+        notice.abort();
+        let _ = notice.await;
+        paced
+            .send_final(&SendMessage::new("final", "peer"))
+            .await
+            .unwrap();
+        assert_eq!(inner.sends.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.final_sends.load(Ordering::SeqCst), 1);
+        // A discarded notice must not reserve another pacing interval.
+        assert!(paced.recipients.lock().await.inner["peer"].queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn timed_out_progress_expires_but_cancelled_ordinary_send_still_delivers() {
+        let inner = Arc::new(CountingChannel {
+            sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
+        });
+        let paced = Arc::new(PacedChannel {
+            inner: inner.clone(),
+            min_interval: Duration::from_millis(80),
+            queue_depth: 8,
+            recipients: Arc::new(Mutex::new(RecipientMap::new())),
+        });
+        paced
+            .send(&SendMessage::new("initial", "peer"))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                scope_progress_send(paced.send(&SendMessage::new("progress", "peer")))
+            )
+            .await
+            .is_err()
+        );
+        let ordinary_channel = paced.clone();
+        let ordinary = zeroclaw_spawn::spawn!(async move {
+            ordinary_channel
+                .send(&SendMessage::new("ordinary", "peer"))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if paced.recipients.lock().await.inner["peer"]
+                    .queue
+                    .iter()
+                    .any(|p| !p.expires_with_caller)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("send was not queued");
+        ordinary.abort();
+        let _ = ordinary.await;
+        paced
+            .send_final(&SendMessage::new("final", "peer"))
+            .await
+            .unwrap();
+        assert_eq!(inner.sends.load(Ordering::SeqCst), 2);
+        assert_eq!(inner.final_sends.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

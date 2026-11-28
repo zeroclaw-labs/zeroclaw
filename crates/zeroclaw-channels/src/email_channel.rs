@@ -1047,7 +1047,9 @@ impl Channel for EmailChannel {
         }
         let email = self.build_email_message(message)?;
         let transport = self.create_smtp_transport()?;
-        transport.send(&email)?;
+        tokio::task::spawn_blocking(move || transport.send(&email))
+            .await
+            .context("SMTP send worker failed")??;
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
