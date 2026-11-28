@@ -6,8 +6,8 @@ use anyhow::{Context as _, Result};
 
 use zeroclaw_config::schema::Config;
 
-use crate::transcription::TranscriptionManager;
-use crate::tts::TtsManager;
+use zeroclaw_providers::transcription::TranscriptionManager;
+use zeroclaw_providers::tts::TtsManager;
 
 pub struct VoicePipeline {
     stt: Option<TranscriptionManager>,
