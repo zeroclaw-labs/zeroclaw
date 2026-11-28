@@ -2135,46 +2135,6 @@ pub fn skills_dir(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join("skills")
 }
 
-/// Initialize the skills directory with a README
-pub fn init_skills_dir(workspace_dir: &Path) -> Result<()> {
-    let dir = skills_dir(workspace_dir);
-    std::fs::create_dir_all(&dir)?;
-
-    let readme = dir.join("README.md");
-    if !readme.exists() {
-        std::fs::write(
-            &readme,
-            "# ZeroClaw Skills\n\n\
-             Each subdirectory is a skill. Create a `SKILL.toml` or `SKILL.md` file inside.\n\n\
-             ## SKILL.toml format\n\n\
-             ```toml\n\
-             [skill]\n\
-             name = \"my-skill\"\n\
-             description = \"What this skill does\"\n\
-             version = \"0.1.0\"\n\
-             author = \"your-name\"\n\
-             tags = [\"productivity\", \"automation\"]\n\n\
-             [[tools]]\n\
-             name = \"my_tool\"\n\
-             description = \"What this tool does\"\n\
-             kind = \"shell\"\n\
-             command = \"echo hello\"\n\
-             ```\n\n\
-             ## SKILL.md format (simpler)\n\n\
-             Just write a markdown file with instructions for the agent.\n\
-             Optional YAML frontmatter is supported for `name`, `description`, `version`, `author`, and `tags`.\n\
-             The agent will read it and follow the instructions.\n\n\
-             ## Installing community skills\n\n\
-             ```bash\n\
-             zeroclaw skills install <source>\n\
-             zeroclaw skills list\n\
-             ```\n",
-        )?;
-    }
-
-    Ok(())
-}
-
 pub fn is_git_source(source: &str) -> bool {
     is_git_scheme_source(source, "https://")
         || is_git_scheme_source(source, "http://")
