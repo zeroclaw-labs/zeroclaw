@@ -18726,6 +18726,19 @@ pub struct MatrixConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub interrupt_on_new_message: bool,
+    /// Optional Matrix user ID of the operator to notify when an inbound
+    /// message is turned away by the sender allowlist (e.g.
+    /// `"@operator:example.org"`). When set, the channel delivers a short
+    /// heads-up DM naming the sender, the source room, and a bounded preview
+    /// of the turned-away message, plus an authorization hint. Blank values
+    /// behave as unset. Unlike the Telegram owner notice there is no
+    /// sender-echo guard: Matrix sends no public stub to the turned-away
+    /// sender, so the notice is the only signal — an operator testing from an
+    /// unauthorized MXID still receives it. Notices are throttled to one per
+    /// (sender, room) pair per 5 minutes.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub owner_user_id: Option<String>,
     /// Streaming mode for progressive response delivery.
     /// `"off"` (default): single final message. `"partial"`: edit-in-place draft.
     /// `"single_message"`: progress draft plus separate final message.
@@ -38333,6 +38346,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
     #[test]
     async fn matrix_config_serde() {
         let mc = MatrixConfig {
+            owner_user_id: None,
             enabled: true,
             homeserver: "https://matrix.org".into(),
             access_token: Some("syt_token_abc".into()),
@@ -38373,6 +38387,7 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
     #[test]
     async fn matrix_config_toml_roundtrip() {
         let mc = MatrixConfig {
+            owner_user_id: None,
             enabled: true,
             homeserver: "https://synapse.local:8448".into(),
             access_token: Some("tok".into()),
@@ -38559,6 +38574,7 @@ allowed_users = ["@u:matrix.org"]
             matrix: HashMap::from([(
                 "default".to_string(),
                 MatrixConfig {
+                    owner_user_id: None,
                     enabled: true,
                     homeserver: "https://m.org".into(),
                     access_token: Some("tok".into()),
@@ -49011,6 +49027,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn matrix_secret_fields_discovered() {
         let mx = MatrixConfig {
+            owner_user_id: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("tok".into()),
@@ -49050,6 +49067,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn matrix_secret_fields_empty_not_set() {
         let mx = MatrixConfig {
+            owner_user_id: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: None,
@@ -49094,6 +49112,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn set_secret_updates_field() {
         let mut mx = MatrixConfig {
+            owner_user_id: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("old".into()),
@@ -49127,6 +49146,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     #[test]
     async fn set_secret_unknown_name_fails() {
         let mut mx = MatrixConfig {
+            owner_user_id: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("tok".into()),
@@ -49171,6 +49191,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         config.channels.matrix.insert(
             "default".to_string(),
             MatrixConfig {
+                owner_user_id: None,
                 enabled: true,
                 homeserver: "https://m.org".into(),
                 access_token: Some("mx-tok".into()),
@@ -49214,6 +49235,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         config.channels.matrix.insert(
             "default".to_string(),
             MatrixConfig {
+                owner_user_id: None,
                 enabled: true,
                 homeserver: "https://m.org".into(),
                 access_token: Some("old".into()),
@@ -49262,6 +49284,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         config.channels.matrix.insert(
             "default".to_string(),
             MatrixConfig {
+                owner_user_id: None,
                 enabled: true,
                 homeserver: "https://m.org".into(),
                 access_token: Some("old".into()),
@@ -49378,6 +49401,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let store = crate::secrets::SecretStore::new(dir.path(), true);
 
         let mut mx = MatrixConfig {
+            owner_user_id: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("plaintext-token".into()),
@@ -49422,6 +49446,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let store = crate::secrets::SecretStore::new(dir.path(), true);
 
         let mut mx = MatrixConfig {
+            owner_user_id: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("plaintext-token".into()),
@@ -49462,6 +49487,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let store = crate::secrets::SecretStore::new(dir.path(), false);
 
         let mut mx = MatrixConfig {
+            owner_user_id: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("plaintext-token".into()),
@@ -49497,6 +49523,7 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
 
     fn test_matrix_config() -> MatrixConfig {
         MatrixConfig {
+            owner_user_id: None,
             enabled: true,
             homeserver: "https://m.org".into(),
             access_token: Some("tok".into()),

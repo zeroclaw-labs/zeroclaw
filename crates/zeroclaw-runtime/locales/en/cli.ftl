@@ -501,6 +501,21 @@ channel-telegram-unauthorized-allowlist =
 
     After the operator authorizes it, send your message again.
 
+# ── Matrix: owner notice for turned-away senders ──
+# Delivered as a DM to `channels.matrix.<alias>.owner_user_id` when the
+# sender allowlist turns an inbound message away. Unlike Telegram, Matrix
+# sends no public stub to the turned-away sender, so this notice is the only
+# signal about the attempt — there is deliberately no sender-echo guard.
+# Throttled to one notice per (sender, room) pair per 5 minutes.
+channel-matrix-unauthorized-owner-notice =
+    ⚠️ Unauthorized message turned away.
+
+    Sender: { $sender }
+    Room: { $room }
+    Preview: { $preview }
+
+    To authorize this sender, add their MXID to the channel's `peer_groups` `external_peers` (channel alias: { $alias }).
+
 # Onboarding — OpenAI auth picker
 onboard-openai-auth-note =
     OpenAI authentication:
