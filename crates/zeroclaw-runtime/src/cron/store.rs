@@ -804,6 +804,26 @@ pub(crate) fn update_job_authorized<G>(
         // Resolve current authority only after SQLite grants the writer, and hold
         // it through the UPDATE, its commit, and the returned row projection.
         let _authority = authorize(&job)?;
+        // Startup reconciliation reloads these fields from the declaration.
+        // Refuse the whole patch before applying any database-owned fields.
+        if job.source == "declarative"
+            && let Some((field, _)) = [
+                ("schedule", patch.schedule.is_some()),
+                ("command", patch.command.is_some()),
+                ("name", patch.name.is_some()),
+                ("session_target", patch.session_target.is_some()),
+                ("allowed_tools", patch.allowed_tools.is_some()),
+                ("uses_memory", patch.uses_memory.is_some()),
+            ]
+            .into_iter()
+            .find(|(_, supplied)| *supplied)
+        {
+            let key = format!("[cron.{job_id}].{field}");
+            anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                "cli-cron-declarative-field-owned",
+                &[("key", &key)]
+            ));
+        }
         let mut schedule_changed = false;
 
         if let Some(schedule) = patch.schedule {
@@ -7121,7 +7141,7 @@ schedule = { kind = "every", every_ms = 300000 }
             },
             command: Some("echo raw-decl-output".to_string()),
             prompt: None,
-            enabled: true,
+            enabled: false,
             model: None,
             allowed_tools: None,
             uses_memory: true,
@@ -7165,13 +7185,12 @@ schedule = { kind = "every", every_ms = 300000 }
             "baseline: sentinel value must be set before unrelated update"
         );
 
-        // Unrelated patch: only toggles `uses_memory`, never touches
-        // `shell_output_format`. Must not overwrite the DB column.
+        // Toggling enabled must leave the raw shell output format alone.
         update_job(
             &config,
             "raw-decl",
             CronJobPatch {
-                uses_memory: Some(false),
+                enabled: Some(true),
                 ..CronJobPatch::default()
             },
         )
@@ -7210,7 +7229,7 @@ schedule = { kind = "every", every_ms = 300000 }
             "get_job must follow the current config value, not a value snapshotted by an unrelated update"
         );
         assert!(
-            !job.uses_memory,
+            job.enabled,
             "the unrelated patch must still have taken effect"
         );
 
@@ -7274,6 +7293,94 @@ schedule = { kind = "every", every_ms = 300000 }
             err.to_string().contains("config.toml"),
             "the core update_job boundary must reject a config-owned mutation, not silently ignore it: {err}"
         );
+    }
+
+    #[test]
+    fn update_job_rejects_config_owned_declaration_fields_before_sync() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["decl-job"]);
+        let declarations = decls_map(vec![make_shell_decl(
+            "decl-job",
+            "0 2 * * *",
+            "echo declared",
+        )]);
+        config.cron = declarations.clone();
+        sync_declarative_jobs(&config, &declarations).unwrap();
+
+        let before = serde_json::to_value(get_job(&config, "decl-job").unwrap()).unwrap();
+        let imperative = add_job(&config, "test-agent", "0 2 * * *", "echo created").unwrap();
+        for (key, patch) in [
+            (
+                "command",
+                CronJobPatch {
+                    command: Some("echo edited".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "name",
+                CronJobPatch {
+                    name: Some("edited".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "schedule",
+                CronJobPatch {
+                    schedule: Some(Schedule::Every { every_ms: 60_000 }),
+                    ..Default::default()
+                },
+            ),
+            (
+                "session_target",
+                CronJobPatch {
+                    session_target: Some(SessionTarget::Main),
+                    ..Default::default()
+                },
+            ),
+            (
+                "allowed_tools",
+                CronJobPatch {
+                    allowed_tools: Some(vec!["memory_recall".into()]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "uses_memory",
+                CronJobPatch {
+                    uses_memory: Some(false),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            // This database-owned edit must also roll back if any part is refused.
+            let patch = CronJobPatch {
+                enabled: Some(false),
+                ..patch
+            };
+            let err = update_job(&config, "decl-job", patch.clone()).unwrap_err();
+            assert!(
+                err.to_string().contains(&format!("[cron.decl-job].{key}")),
+                "{err}"
+            );
+            update_job(&config, &imperative.id, patch).unwrap();
+        }
+
+        let stored = || serde_json::to_value(get_job(&config, "decl-job").unwrap()).unwrap();
+        assert_eq!(stored(), before);
+        sync_declarative_jobs(&config, &declarations).unwrap();
+        assert_eq!(stored(), before);
+        let updated = update_job(
+            &config,
+            "decl-job",
+            CronJobPatch {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!updated.enabled);
     }
 
     /// Regression: a declarative job's delivery is owned by
