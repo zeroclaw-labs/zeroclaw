@@ -1289,10 +1289,33 @@ pub struct CostQuery {
     pub to: Option<String>,
 }
 
+/// The spending limits the dashboard draws its cost bars against, from the
+/// config the budget check reads: the running tracker's when there is one,
+/// otherwise the live `[cost]` section. `tracking` is false when the gateway
+/// holds no tracker or `[cost].enabled` is off. A limit is `null` when it isn't a finite
+/// number, so the dashboard shows the amount without a bar. The warning
+/// percentage is capped at 100, as the budget check caps it.
+fn cost_budget(state: &AppState) -> serde_json::Value {
+    let (tracking, cost) = match &state.cost_tracker {
+        Some(tracker) => {
+            let cost = tracker.config();
+            (cost.enabled, cost)
+        }
+        None => (false, state.config.read().cost.clone()),
+    };
+    let limit = |usd: f64| usd.is_finite().then_some(usd);
+    serde_json::json!({
+        "tracking": tracking,
+        "daily_limit_usd": limit(cost.daily_limit_usd),
+        "monthly_limit_usd": limit(cost.monthly_limit_usd),
+        "warn_at_percent": cost.warn_at_percent.min(100),
+    })
+}
+
 /// GET /api/cost — cost summary over `[from, to)` (either bound omitted
-/// = unbounded on that side). Pass `?agent=<alias>` for the per-agent
-/// view, which ignores from/to and returns the alias's session+daily
-/// rollup.
+/// = unbounded on that side), plus the spending limits as `budget` (see
+/// `cost_budget`). Pass `?agent=<alias>` for the per-agent view, which
+/// ignores from/to and returns the alias's session+daily rollup.
 pub async fn handle_api_cost(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1316,7 +1339,11 @@ pub async fn handle_api_cost(
             None => tracker.get_summary_in_bounds(from, to),
         };
         match result {
-            Ok(summary) => Json(serde_json::json!({"cost": summary})).into_response(),
+            Ok(summary) => Json(serde_json::json!({
+                "cost": summary,
+                "budget": cost_budget(&state),
+            }))
+            .into_response(),
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": format!("Cost summary failed: {e}")})),
@@ -1334,7 +1361,8 @@ pub async fn handle_api_cost(
                 "rejected_records": 0,
                 "by_model": {},
                 "by_agent": {},
-            }
+            },
+            "budget": cost_budget(&state),
         }))
         .into_response()
     }
@@ -2573,6 +2601,69 @@ pub(crate) mod tests {
             .expect("response body")
             .to_bytes();
         serde_json::from_slice(&body).expect("valid json response")
+    }
+
+    async fn cost_response(state: AppState) -> serde_json::Value {
+        let response = handle_api_cost(
+            State(state),
+            HeaderMap::new(),
+            Query(CostQuery {
+                agent: None,
+                from: None,
+                to: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        response_json(response).await
+    }
+
+    #[tokio::test]
+    async fn api_cost_reports_the_limits_without_a_tracker() {
+        let json = cost_response(test_state(zeroclaw_config::schema::Config::default())).await;
+        assert_eq!(json["cost"]["daily_cost_usd"], serde_json::json!(0.0));
+        assert_eq!(
+            json["budget"],
+            serde_json::json!({
+                "tracking": false,
+                "daily_limit_usd": 10.0,
+                "monthly_limit_usd": 100.0,
+                "warn_at_percent": 80,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn api_cost_reports_the_running_trackers_limits() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.cost.daily_limit_usd = 0.0;
+        config.cost.monthly_limit_usd = 55.5;
+        config.cost.warn_at_percent = 150;
+        let tracker =
+            zeroclaw_runtime::cost::CostTracker::new(config.cost.clone(), temp.path()).unwrap();
+        let mut state = test_state(config.clone());
+        state.cost_tracker = Some(Arc::new(tracker));
+        let json = cost_response(state).await;
+        assert_eq!(
+            json["budget"],
+            serde_json::json!({
+                "tracking": true,
+                "daily_limit_usd": 0.0,
+                "monthly_limit_usd": 55.5,
+                "warn_at_percent": 100,
+            }),
+            "an explicit zero limit stays a number, and the warning percentage is capped"
+        );
+
+        config.cost.enabled = false;
+        let tracker =
+            zeroclaw_runtime::cost::CostTracker::new(config.cost.clone(), temp.path()).unwrap();
+        let mut state = test_state(config);
+        state.cost_tracker = Some(Arc::new(tracker));
+        let json = cost_response(state).await;
+        assert_eq!(json["budget"]["tracking"], serde_json::json!(false));
     }
 
     #[tokio::test]

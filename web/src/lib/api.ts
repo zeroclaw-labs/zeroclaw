@@ -6,6 +6,7 @@ import type {
   Integration,
   DiagResult,
   MemoryEntry,
+  CostBudget,
   CostSummary,
   CliTool,
   HealthSnapshot,
@@ -2208,14 +2209,28 @@ export function deleteMemory(key: string, agent?: string): Promise<void> {
 // Cost
 // ---------------------------------------------------------------------------
 
-export function getCost(from?: Date, to?: Date): Promise<CostSummary> {
+function costUrl(from?: Date, to?: Date): string {
   const params = new URLSearchParams();
   if (from) params.set("from", from.toISOString());
   if (to) params.set("to", to.toISOString());
   const qs = params.toString();
-  const url = qs ? `/api/cost?${qs}` : "/api/cost";
-  return apiFetch<CostSummary | { cost: CostSummary }>(url).then((data) =>
+  return qs ? `/api/cost?${qs}` : "/api/cost";
+}
+
+export function getCost(from?: Date, to?: Date): Promise<CostSummary> {
+  return apiFetch<CostSummary | { cost: CostSummary }>(costUrl(from, to)).then((data) =>
     unwrapField(data, "cost"),
+  );
+}
+
+/** {@link getCost} plus the spending limits the dashboard's cost bars are
+ * drawn against; `budget` is null when the gateway doesn't report them. */
+export function getCostOverview(
+  from?: Date,
+  to?: Date,
+): Promise<{ cost: CostSummary; budget: CostBudget | null }> {
+  return apiFetch<{ cost: CostSummary; budget?: CostBudget }>(costUrl(from, to)).then(
+    (data) => ({ cost: data.cost, budget: data.budget ?? null }),
   );
 }
 
