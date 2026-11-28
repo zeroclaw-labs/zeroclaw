@@ -170,7 +170,11 @@ profile_map = {{ "desktop-users" = "desktop" }}
                     ledger_path = data / "tls/ledger.db"
                     if ledger_path.exists():
                         with sqlite3.connect(ledger_path) as ledger:
-                            assert ledger.execute("SELECT count(*) FROM issued_certs").fetchone()[0] == 0
+                            # The daemon can create the ledger file before its schema is ready.
+                            if ledger.execute(
+                                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='issued_certs'"
+                            ).fetchone():
+                                assert ledger.execute("SELECT count(*) FROM issued_certs").fetchone()[0] == 0
                     destination = f"wss://127.0.0.1:{wss_port}/"
                     out = subprocess.run(
                         [str(client_binary), "login", "corp", destination,
