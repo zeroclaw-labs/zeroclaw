@@ -20055,7 +20055,7 @@ command = "echo hi"
             name: "apply".into(),
             description: "Apply a shared SOP proposal".into(),
             kind: "builtin".into(),
-            command: String::new(),
+            command: String::new().into(),
             args: HashMap::new(),
             target: Some("sop_workshop".into()),
             locked_args: HashMap::new(),

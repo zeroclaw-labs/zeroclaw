@@ -148,6 +148,10 @@ impl SeatbeltSandbox {
 }
 
 impl Sandbox for SeatbeltSandbox {
+    fn wrap_literal_command(&self, cmd: &mut std::process::Command) -> std::io::Result<()> {
+        self.wrap_command(cmd)
+    }
+
     fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
         let invocation = super::shell_identity::invocation(cmd, None)?;
         self.wrap_invocation(cmd, &invocation)

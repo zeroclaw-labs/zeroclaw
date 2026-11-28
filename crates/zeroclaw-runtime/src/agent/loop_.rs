@@ -17527,6 +17527,7 @@ Let me check the result."#;
         });
         let risk_profile = RiskProfileConfig::default();
         let built = crate::tools::AllToolsResult {
+            skill_sandbox: None,
             native_memory: Default::default(),
             tools: vec![mock_tool("shell")],
             reserved_host_names: std::collections::HashSet::new(),

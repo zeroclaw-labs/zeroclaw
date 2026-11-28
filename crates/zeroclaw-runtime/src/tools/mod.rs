@@ -741,6 +741,7 @@ pub struct AllToolsResult {
     /// Private creator identity and wrapper projections. External prebuilt
     /// inputs use `from_prebuilt_tools` and begin with unknown provenance.
     pub(crate) native_memory: NativeMemoryProjection,
+    pub(crate) skill_sandbox: Option<Arc<dyn Sandbox>>,
     /// The eager registry retained by this factory, before the per-agent
     /// `allowed_tools`/`excluded_tools` filter.
     ///
@@ -805,6 +806,7 @@ impl AllToolsResult {
     pub fn from_prebuilt_tools(tools: Vec<Box<dyn Tool>>) -> Self {
         Self {
             native_memory: NativeMemoryProjection::default(),
+            skill_sandbox: None,
             tools,
             reserved_host_names: std::collections::HashSet::new(),
             delegate_handle: None,
@@ -3682,6 +3684,7 @@ fn all_tools_with_runtime_on_thread(
                 );
                 let tools = native_memory.wrap_actual_tools(&tool_arcs);
                 return Ok(AllToolsResult {
+                    skill_sandbox: Some(sandbox),
                     native_memory,
                     unfiltered_tool_arcs: tool_arcs,
                     tools,
@@ -3915,6 +3918,7 @@ fn all_tools_with_runtime_on_thread(
 
     let tools = native_memory.wrap_actual_tools(&tool_arcs);
     Ok(AllToolsResult {
+        skill_sandbox: Some(sandbox),
         native_memory,
         unfiltered_tool_arcs: tool_arcs,
         tools,

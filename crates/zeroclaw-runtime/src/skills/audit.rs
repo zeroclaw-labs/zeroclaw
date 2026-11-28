@@ -216,24 +216,10 @@ fn audit_manifest_file(root: &Path, path: &Path, report: &mut SkillAuditReport) 
 
     if let Some(tools) = parsed.get("tools").and_then(toml::Value::as_array) {
         for (idx, tool) in tools.iter().enumerate() {
-            let command = tool.get("command").and_then(toml::Value::as_str);
-            let kind = tool
-                .get("kind")
-                .and_then(toml::Value::as_str)
-                .unwrap_or("unknown");
-
-            if command.is_none() {
+            if let Err(reason) = zeroclaw_tools::skill_tool::audit_tool(tool) {
                 report
                     .findings
-                    .push(format!("{rel}: tools[{idx}] is missing a command field."));
-            }
-
-            if (kind.eq_ignore_ascii_case("script") || kind.eq_ignore_ascii_case("shell"))
-                && command.is_some_and(|value| value.trim().is_empty())
-            {
-                report
-                    .findings
-                    .push(format!("{rel}: tools[{idx}] has an empty {kind} command."));
+                    .push(format!("{rel}: tools[{idx}] {reason}"));
             }
         }
     }
