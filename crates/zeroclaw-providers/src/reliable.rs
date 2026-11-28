@@ -3737,6 +3737,7 @@ impl ModelProvider for ReliableModelProvider {
                     let req = ChatRequest {
                         messages: &effective_messages,
                         tools: request.tools,
+                        thinking_level: request.thinking_level,
                         thinking: request.thinking,
                     };
                     match with_exact_dispatch_route(
@@ -4121,6 +4122,7 @@ impl ModelProvider for ReliableModelProvider {
             let req = ChatRequest {
                 messages: request.messages,
                 tools: request.tools,
+                thinking_level: request.thinking_level,
                 thinking: request.thinking,
             };
             let stream = stream_with_exact_dispatch_route(
@@ -4485,6 +4487,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "local-model",
@@ -4498,6 +4501,7 @@ mod tests {
                         ChatRequest {
                             messages: &messages,
                             tools: None,
+                            thinking_level: None,
                             thinking: None,
                         },
                         "local-model",
@@ -4813,6 +4817,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "claude-primary",
@@ -5434,6 +5439,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let err = model_provider
@@ -6131,6 +6137,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let result = model_provider
@@ -6162,6 +6169,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test",
@@ -6196,6 +6204,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test",
@@ -6271,6 +6280,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "requested-model",
@@ -6328,6 +6338,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "requested-model",
@@ -6396,6 +6407,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "requested-model",
@@ -6452,6 +6464,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "model",
@@ -6510,6 +6523,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "requested-first",
@@ -6519,6 +6533,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "requested-second",
@@ -6576,6 +6591,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test",
@@ -6610,6 +6626,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "served-model",
@@ -6655,6 +6672,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "served-model",
@@ -6711,6 +6729,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "hint:fast",
@@ -6775,6 +6794,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "hint:fast",
@@ -6833,6 +6853,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "hint:fast",
@@ -6889,6 +6910,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "hint:fast",
@@ -6953,6 +6975,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test",
@@ -6995,6 +7018,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test",
@@ -7033,6 +7057,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test",
@@ -7308,6 +7333,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let err = model_provider
@@ -7334,6 +7360,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test",
@@ -7398,6 +7425,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test",
@@ -7478,6 +7506,7 @@ mod tests {
             ChatRequest {
                 messages: &messages,
                 tools: None,
+                thinking_level: None,
                 thinking: None,
             },
             "test",
@@ -7558,6 +7587,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let result = model_provider
@@ -7591,6 +7621,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let result = model_provider
@@ -7903,6 +7934,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test",
@@ -8021,6 +8053,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test",
@@ -8062,6 +8095,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test",
@@ -9698,6 +9732,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "served-model",
@@ -9903,6 +9938,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let result = model_provider
@@ -9945,6 +9981,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let result = model_provider
@@ -10136,6 +10173,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let err = model_provider
@@ -10238,6 +10276,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let result = model_provider
@@ -10289,6 +10328,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let result = model_provider
@@ -10629,6 +10669,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
 
@@ -10848,6 +10889,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let err = all_non_stream_context_overflow_provider(Arc::clone(&chat_calls))
@@ -11861,6 +11903,7 @@ mod tests {
             ChatRequest {
                 messages: &messages,
                 tools: Some(&tools),
+                thinking_level: None,
                 thinking: None,
             },
             "model",
@@ -11896,6 +11939,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "model-requested",
@@ -11944,6 +11988,7 @@ mod tests {
             ChatRequest {
                 messages: &messages,
                 tools: Some(&tools),
+                thinking_level: None,
                 thinking: None,
             },
             "model",
@@ -11977,6 +12022,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "model-requested",
@@ -12014,6 +12060,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "model-requested",
@@ -12056,6 +12103,7 @@ mod tests {
             ChatRequest {
                 messages: &messages,
                 tools: None,
+                thinking_level: None,
                 thinking: None,
             },
             "model-requested",
@@ -12120,6 +12168,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test",
@@ -12132,6 +12181,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "test",
@@ -12186,6 +12236,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test",
@@ -12201,6 +12252,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "test",
@@ -12257,6 +12309,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test",
@@ -12272,6 +12325,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "test",
@@ -12326,6 +12380,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test",
@@ -12341,6 +12396,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "test",
@@ -12397,6 +12453,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test",
@@ -12412,6 +12469,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "test",
@@ -12456,6 +12514,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "served-model",
@@ -12469,6 +12528,7 @@ mod tests {
                             ChatRequest {
                                 messages: &messages,
                                 tools: None,
+                                thinking_level: None,
                                 thinking: None,
                             },
                             "served-model",
@@ -12519,6 +12579,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "served-model",
@@ -12531,6 +12592,7 @@ mod tests {
                         ChatRequest {
                             messages: &messages,
                             tools: None,
+                            thinking_level: None,
                             thinking: None,
                         },
                         "served-model",
@@ -12660,6 +12722,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "served-model",
@@ -12672,6 +12735,7 @@ mod tests {
                         ChatRequest {
                             messages: &messages,
                             tools: None,
+                            thinking_level: None,
                             thinking: None,
                         },
                         "served-model",
@@ -12722,6 +12786,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "served-model",
@@ -12734,6 +12799,7 @@ mod tests {
                         ChatRequest {
                             messages: &messages,
                             tools: None,
+                            thinking_level: None,
                             thinking: None,
                         },
                         "served-model",
@@ -12787,6 +12853,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "served-model",
@@ -12799,6 +12866,7 @@ mod tests {
                         ChatRequest {
                             messages: &messages,
                             tools: None,
+                            thinking_level: None,
                             thinking: None,
                         },
                         "served-model",
@@ -12837,6 +12905,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "served-model",
@@ -12849,6 +12918,7 @@ mod tests {
                         ChatRequest {
                             messages: &messages,
                             tools: None,
+                            thinking_level: None,
                             thinking: None,
                         },
                         "served-model",
@@ -12913,6 +12983,7 @@ mod tests {
                         ChatRequest {
                             messages: &messages,
                             tools: None,
+                            thinking_level: None,
                             thinking: None,
                         },
                         "requested-model",
@@ -12934,6 +13005,7 @@ mod tests {
                             ChatRequest {
                                 messages: &messages,
                                 tools: None,
+                                thinking_level: None,
                                 thinking: None,
                             },
                             "requested-model",
@@ -13006,6 +13078,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "requested-model",
@@ -13024,6 +13097,7 @@ mod tests {
                         ChatRequest {
                             messages: &messages,
                             tools: None,
+                            thinking_level: None,
                             thinking: None,
                         },
                         "requested-model",
@@ -13083,6 +13157,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "served-model",
@@ -13123,6 +13198,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "served-model",
@@ -13166,6 +13242,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "served-model",
@@ -13330,6 +13407,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test",
@@ -13352,6 +13430,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "test",
@@ -13396,6 +13475,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "test",
@@ -13413,6 +13493,7 @@ mod tests {
                         ChatRequest {
                             messages: &messages,
                             tools: None,
+                            thinking_level: None,
                             thinking: None,
                         },
                         "test",
@@ -13464,6 +13545,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test",
@@ -13481,6 +13563,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "test",
@@ -13557,6 +13640,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "hint:route",
@@ -13569,6 +13653,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "hint:route",
@@ -13630,6 +13715,7 @@ mod tests {
                 ChatRequest {
                     messages: &messages,
                     tools: Some(&tools),
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test",
@@ -13642,6 +13728,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: Some(&tools),
+                        thinking_level: None,
                         thinking: None,
                     },
                     "test",
@@ -14627,6 +14714,7 @@ mod tests {
         let req = ChatRequest {
             messages: &[],
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let _ = dispatch.chat(req, "m", None).await;

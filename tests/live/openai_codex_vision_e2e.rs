@@ -73,6 +73,7 @@ async fn provider_vision_support() -> Result<()> {
     let request = ChatRequest {
         messages: &messages,
         tools: None,
+        thinking_level: None,
         thinking: None,
     };
 
@@ -189,6 +190,7 @@ async fn openai_codex_second_vision_support() -> Result<()> {
     let request = ChatRequest {
         messages: &messages,
         tools: None,
+        thinking_level: None,
         thinking: None,
     };
 

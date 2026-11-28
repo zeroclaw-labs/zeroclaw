@@ -1490,6 +1490,7 @@ mod tests {
                         ChatRequest {
                             messages: &messages,
                             tools: None,
+                            thinking_level: None,
                             thinking: None,
                         },
                         "served-model",
@@ -1578,6 +1579,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "model",
@@ -1606,6 +1608,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("hello")],
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
 
@@ -1634,6 +1637,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "model",
@@ -1664,6 +1668,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "model",
@@ -1695,6 +1700,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[],
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let _ = dispatch.chat(request, "claude-sonnet-4-6", None).await;
@@ -1881,6 +1887,7 @@ mod tests {
                         ChatRequest {
                             messages: &messages,
                             tools: None,
+                            thinking_level: None,
                             thinking: None,
                         },
                         "served-model",
@@ -1924,6 +1931,7 @@ mod tests {
                     ChatRequest {
                         messages: &messages,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "served-model",
@@ -1978,6 +1986,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[],
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let mut stream = if borrowed {
@@ -2061,6 +2070,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[],
             tools: None,
+            thinking_level: None,
             thinking: None,
         };
         let _ = dispatch.chat(request, "claude-sonnet-4-6", None).await;

@@ -96,6 +96,7 @@ pub(crate) async fn consume_provider_streaming_response(
         ChatRequest {
             messages,
             tools: request_tools,
+            thinking_level: zeroclaw_api::current_native_thinking_level(),
             thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
                 .try_with(Clone::clone)
                 .ok()

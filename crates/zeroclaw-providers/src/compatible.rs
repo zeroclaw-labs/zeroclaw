@@ -5894,6 +5894,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -5945,6 +5946,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -5984,6 +5986,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -6007,6 +6010,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -6043,6 +6047,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -6141,6 +6146,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -6190,6 +6196,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -6270,6 +6277,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -6327,6 +6335,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -6389,6 +6398,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -6515,6 +6525,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -6558,6 +6569,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -6592,6 +6604,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &[ChatMessage::system("be brief"), ChatMessage::user("hello")],
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -6640,6 +6653,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &[ChatMessage::system("be brief"), ChatMessage::user("hello")],
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -7727,6 +7741,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: Some(params),
                 },
                 "test-model",
@@ -7759,6 +7774,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: Some(params),
                 },
                 "test-model",
@@ -8999,6 +9015,7 @@ mod tests {
                 crate::traits::ChatRequest {
                     messages: &messages,
                     tools: Some(&tools),
+                    thinking_level: None,
                     thinking: None,
                 },
                 "gpt-5",
@@ -9251,6 +9268,7 @@ mod tests {
                 crate::traits::ChatRequest {
                     messages: &turn_one,
                     tools: Some(&tools),
+                    thinking_level: None,
                     thinking: Some(thinking),
                 },
                 "test-model",
@@ -9281,6 +9299,7 @@ mod tests {
                 crate::traits::ChatRequest {
                     messages: &turn_two,
                     tools: Some(&tools),
+                    thinking_level: None,
                     thinking: Some(thinking),
                 },
                 "test-model",
@@ -9355,6 +9374,7 @@ mod tests {
                 crate::traits::ChatRequest {
                     messages: &messages,
                     tools: Some(&tools),
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -9405,6 +9425,7 @@ mod tests {
                 crate::traits::ChatRequest {
                     messages: &messages,
                     tools: Some(&tools),
+                    thinking_level: None,
                     thinking: Some(thinking),
                 },
                 "test-model",
@@ -9508,6 +9529,7 @@ mod tests {
                 crate::traits::ChatRequest {
                     messages: &messages,
                     tools: Some(&tools),
+                    thinking_level: None,
                     thinking: Some(thinking),
                 },
                 "test-model",
@@ -9627,6 +9649,7 @@ mod tests {
         let request = crate::traits::ChatRequest {
             messages: &messages,
             tools: Some(&tools),
+            thinking_level: Some(zeroclaw_api::model_provider::ThinkingLevel::Max),
             thinking: None,
         };
         assert!(!provider.supports_exact_request_replay(request, "gpt-5"));
@@ -9679,6 +9702,7 @@ mod tests {
                 crate::traits::ChatRequest {
                     messages: &messages,
                     tools: Some(&tools),
+                    thinking_level: Some(zeroclaw_api::model_provider::ThinkingLevel::Max),
                     thinking: None,
                 },
                 "gpt-5",
@@ -9741,6 +9765,7 @@ mod tests {
                     crate::traits::ChatRequest {
                         messages: &messages,
                         tools: Some(&tools),
+                        thinking_level: None,
                         thinking: None,
                     },
                     "gpt-5",
@@ -9837,6 +9862,7 @@ mod tests {
                 crate::traits::ChatRequest {
                     messages: &messages,
                     tools: Some(&tools),
+                    thinking_level: None,
                     thinking: None,
                 },
                 "gpt-5",
@@ -9889,6 +9915,7 @@ mod tests {
                 crate::traits::ChatRequest {
                     messages: &messages,
                     tools: Some(&tools),
+                    thinking_level: None,
                     thinking: None,
                 },
                 "gpt-5",
@@ -10014,6 +10041,7 @@ mod tests {
                 crate::traits::ChatRequest {
                     messages: &messages,
                     tools: Some(&tools),
+                    thinking_level: None,
                     thinking: None,
                 },
                 "gpt-5",
@@ -10091,6 +10119,7 @@ mod tests {
                 crate::traits::ChatRequest {
                     messages: &messages,
                     tools: Some(&tools),
+                    thinking_level: None,
                     thinking: None,
                 },
                 "gpt-5",
@@ -10698,6 +10727,7 @@ mod tests {
                     ProviderChatRequest {
                         messages: &messages,
                         tools: Some(&tools),
+                        thinking_level: None,
                         thinking: None,
                     },
                     "test-model",
@@ -11097,6 +11127,7 @@ mod tests {
                     ProviderChatRequest {
                         messages: &history,
                         tools: None,
+                        thinking_level: None,
                         thinking: None,
                     },
                     "m",
@@ -11116,6 +11147,7 @@ mod tests {
             ProviderChatRequest {
                 messages: &history,
                 tools: None,
+                thinking_level: None,
                 thinking: None,
             },
             "m",
@@ -11551,6 +11583,7 @@ mod tests {
             ProviderChatRequest {
                 messages: &[ChatMessage::user("hi")],
                 tools: None,
+                thinking_level: None,
                 thinking: None,
             },
             "test-model",
@@ -13112,6 +13145,7 @@ mod tests {
                 crate::traits::ChatRequest {
                     messages: &messages,
                     tools: Some(&tools),
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -14978,6 +15012,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -15030,6 +15065,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: Some(zeroclaw_api::model_provider::NativeThinkingParams {
                         budget_tokens: 2048,
                         display: None,
@@ -15103,6 +15139,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -15151,6 +15188,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -15202,6 +15240,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -15244,6 +15283,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &[ChatMessage::system("be brief"), ChatMessage::user("hello")],
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -15292,6 +15332,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "test-model",
@@ -16971,6 +17012,7 @@ mod tests {
             crate::traits::ChatRequest {
                 messages: &[ChatMessage::user("hi")],
                 tools: None,
+                thinking_level: None,
                 thinking: None,
             },
             "test-model",
@@ -17028,6 +17070,7 @@ mod tests {
             crate::traits::ChatRequest {
                 messages: &[ChatMessage::user("hi")],
                 tools: None,
+                thinking_level: None,
                 thinking: None,
             },
             "test-model",
@@ -17105,6 +17148,7 @@ mod tests {
             crate::traits::ChatRequest {
                 messages: &[ChatMessage::user("hi")],
                 tools: Some(&tools),
+                thinking_level: None,
                 thinking: None,
             },
             "test-model",
@@ -17285,6 +17329,7 @@ mod tests {
             crate::traits::ChatRequest {
                 messages: &[ChatMessage::user("hi")],
                 tools: None,
+                thinking_level: None,
                 thinking: None,
             },
             "gpt-test",

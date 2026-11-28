@@ -133,6 +133,27 @@ zeroclaw agent -a <alias> -m "hello"          # smoke-test against the agent at 
 
 </div>
 
+## Rust request construction
+
+`zeroclaw_api::model_provider::ChatRequest` includes an optional neutral
+`thinking_level` independent of its legacy `thinking` token-budget payload.
+Initialize `thinking_level: None` for an unrelated request. When rebuilding an
+existing request, copy its `thinking_level` (or use a struct update) so routing,
+fallback and recovery preserve the selected level. Exhaustive destructuring
+must include `thinking_level` or `..`. Providers that do not support it can
+ignore the field.
+
+`ThinkingLevel` is canonical in `zeroclaw_api::model_provider`; existing config
+and runtime re-exports retain their paths and serialized values. Rust callers
+of `default_budget_tokens()` must import
+`zeroclaw_config::scattered_types::ThinkingLevelBudget`, which keeps the budget
+policy in configuration. Existing TOML keys, values and budgets are unchanged.
+
+Downstream literals of the runtime's `ThinkingParams` also need its new
+`native_level` field. Use `apply_thinking_level_with_config` to resolve it from
+the existing opt-in and selected level; use `None` for a context without an
+explicit native level.
+
 ## Implementing a new `ModelProvider` trait
 
 If the endpoint isn't OpenAI-compatible and isn't one of the local-server slots, you need code.

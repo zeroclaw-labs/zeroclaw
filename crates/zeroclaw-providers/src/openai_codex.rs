@@ -36,6 +36,7 @@ pub struct OpenAiCodexModelProvider {
     custom_endpoint: bool,
     gateway_api_key: Option<String>,
     reasoning_effort: Option<String>,
+    reasoning_surface: Option<super::openai_reasoning::ReasoningSurface>,
     /// The configured `[multimodal]` policy.
     ///
     /// This provider normalizes image markers on its own boundary, and that
@@ -44,6 +45,30 @@ pub struct OpenAiCodexModelProvider {
     /// pass on the same rules the runtime already applied instead of silently
     /// reverting to defaults and re-trimming an accepted history.
     multimodal: zeroclaw_config::schema::MultimodalConfig,
+}
+
+impl OpenAiCodexModelProvider {
+    fn request_reasoning_effort(
+        &self,
+        model: &str,
+        level: Option<zeroclaw_api::model_provider::ThinkingLevel>,
+        has_tools: bool,
+        call: super::openai_reasoning::ReasoningCall,
+    ) -> String {
+        let fallback = resolve_reasoning_effort(model, self.reasoning_effort.as_deref());
+        super::openai_reasoning::ReasoningContext {
+            surface: self.reasoning_surface,
+            api: super::openai_reasoning::ReasoningApi::Responses,
+            alias: &self.alias,
+            model,
+            has_tools,
+            custom_endpoint: self.custom_endpoint,
+            call,
+        }
+        .resolve_level(level, self.reasoning_effort.as_deref(), Some(&fallback))
+        .map(|effort| effort.as_str().to_owned())
+        .unwrap_or(fallback)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -148,8 +173,17 @@ impl OpenAiCodexModelProvider {
             responses_url,
             gateway_api_key: gateway_api_key.map(ToString::to_string),
             reasoning_effort: options.reasoning_effort.clone(),
+            reasoning_surface: None,
             multimodal: options.multimodal.clone(),
         })
+    }
+
+    pub(crate) fn with_reasoning_surface(
+        mut self,
+        surface: super::openai_reasoning::ReasoningSurface,
+    ) -> Self {
+        self.reasoning_surface = Some(surface);
+        self
     }
 
     fn http_client(&self) -> Client {
@@ -1434,6 +1468,8 @@ impl OpenAiCodexModelProvider {
         instructions: Option<String>,
         tools: Option<Vec<ResponsesToolSpec>>,
         model: &str,
+        thinking_level: Option<zeroclaw_api::model_provider::ThinkingLevel>,
+        call: super::openai_reasoning::ReasoningCall,
     ) -> anyhow::Result<ResponsesTurnResult> {
         let creds = self.resolve_credentials().await?;
         let normalized_model = normalize_model_id(model);
@@ -1450,9 +1486,11 @@ impl OpenAiCodexModelProvider {
                 verbosity: "medium".to_string(),
             },
             reasoning: ResponsesReasoningOptions {
-                effort: resolve_reasoning_effort(
+                effort: self.request_reasoning_effort(
                     normalized_model,
-                    self.reasoning_effort.as_deref(),
+                    thinking_level,
+                    has_tools,
+                    call,
                 ),
                 summary: "auto".to_string(),
             },
@@ -1590,9 +1628,16 @@ impl ModelProvider for OpenAiCodexModelProvider {
             crate::multimodal::prepare_messages_for_provider(&messages, &self.multimodal).await?;
 
         let (instructions, input) = build_responses_input(&prepared.messages, model);
-        self.send_responses_request(input, instructions, None, model)
-            .await
-            .map(|response| response.text.unwrap_or_default())
+        self.send_responses_request(
+            input,
+            instructions,
+            None,
+            model,
+            zeroclaw_api::current_one_shot_native_thinking_level(),
+            super::openai_reasoning::ReasoningCall::OneShot,
+        )
+        .await
+        .map(|response| response.text.unwrap_or_default())
     }
 
     async fn chat_with_history(
@@ -1607,9 +1652,16 @@ impl ModelProvider for OpenAiCodexModelProvider {
             crate::multimodal::prepare_messages_for_provider(messages, &self.multimodal).await?;
 
         let (instructions, input) = build_responses_input(&prepared.messages, model);
-        self.send_responses_request(input, instructions, None, model)
-            .await
-            .map(|response| response.text.unwrap_or_default())
+        self.send_responses_request(
+            input,
+            instructions,
+            None,
+            model,
+            None,
+            super::openai_reasoning::ReasoningCall::OneShot,
+        )
+        .await
+        .map(|response| response.text.unwrap_or_default())
     }
 
     async fn chat(
@@ -1623,7 +1675,14 @@ impl ModelProvider for OpenAiCodexModelProvider {
                 .await?;
         let (instructions, input) = build_responses_input(&prepared.messages, model);
         let response = self
-            .send_responses_request(input, instructions, convert_tools(request.tools), model)
+            .send_responses_request(
+                input,
+                instructions,
+                convert_tools(request.tools),
+                model,
+                request.thinking_level,
+                super::openai_reasoning::ReasoningCall::Turn,
+            )
             .await?;
 
         Ok(ProviderChatResponse {
@@ -1656,6 +1715,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
         let provider = self.clone();
         let messages = request.messages.to_vec();
         let tools = request.tools.map(|items| items.to_vec());
+        let thinking_level = request.thinking_level;
         let model = model.to_string();
         let count_tokens = options.count_tokens;
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
@@ -1701,9 +1761,11 @@ impl ModelProvider for OpenAiCodexModelProvider {
                     verbosity: "medium".to_string(),
                 },
                 reasoning: ResponsesReasoningOptions {
-                    effort: resolve_reasoning_effort(
+                    effort: provider.request_reasoning_effort(
                         normalized_model,
-                        provider.reasoning_effort.as_deref(),
+                        thinking_level,
+                        has_tools,
+                        super::openai_reasoning::ReasoningCall::Turn,
                     ),
                     summary: "auto".to_string(),
                 },
@@ -2055,6 +2117,7 @@ mod tests {
             ProviderChatRequest {
                 messages: &messages,
                 tools: Some(tools),
+                thinking_level: None,
                 thinking: None,
             },
             model,
@@ -2085,6 +2148,7 @@ mod tests {
                     ProviderChatRequest {
                         messages: &messages,
                         tools: Some(&tools),
+                        thinking_level: None,
                         thinking: None,
                     },
                     model,
@@ -2420,6 +2484,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "gpt-5-codex",
@@ -2478,6 +2543,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: Some(&empty_tools),
+                    thinking_level: None,
                     thinking: None,
                 },
                 "gpt-5-codex",
@@ -2583,6 +2649,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "gpt-5-codex",
@@ -2620,6 +2687,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "gpt-5-codex",
@@ -2653,6 +2721,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "gpt-5-codex",
@@ -2686,6 +2755,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking_level: None,
                     thinking: None,
                 },
                 "gpt-5-codex",
