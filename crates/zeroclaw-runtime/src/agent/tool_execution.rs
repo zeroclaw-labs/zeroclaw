@@ -335,6 +335,8 @@ pub(crate) struct CompletedToolExecution {
     /// Created by the executor only after `Tool::execute` completes. An
     /// unavailable name returns an outcome without dispatch evidence.
     pub(crate) executed_tool_name: Option<String>,
+    /// Only the repetition guard refuses dispatch with abandonment semantics.
+    pub(crate) loop_refused: bool,
 }
 
 #[cfg(test)]
@@ -391,6 +393,7 @@ async fn execute_one_tool_with_provenance(
         DispatchResolution::Unavailable => {
             return Ok(CompletedToolExecution {
                 executed_tool_name: None,
+                loop_refused: false,
                 outcome: unavailable_tool_outcome(
                     call_name,
                     tool_call_id_owned,
@@ -404,6 +407,7 @@ async fn execute_one_tool_with_provenance(
         DispatchResolution::Unknown => {
             return Ok(CompletedToolExecution {
                 executed_tool_name: None,
+                loop_refused: false,
                 outcome: unknown_tool_outcome(
                     call_name,
                     tool_call_id_owned,
@@ -675,6 +679,7 @@ async fn execute_one_tool_with_provenance(
     outcome.map(|outcome| CompletedToolExecution {
         outcome,
         executed_tool_name: Some(tool.name().to_owned()),
+        loop_refused: false,
     })
 }
 
@@ -768,6 +773,13 @@ pub(crate) async fn execute_tools_parallel(
 
 // ── Sequential execution ─────────────────────────────────────────────────
 
+pub(crate) struct SequentialLoopGuard {
+    pub(crate) detector: super::loop_detector::LoopDetector,
+    pub(crate) ignore_tools: Vec<String>,
+    pub(crate) refused: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_tools_sequential(
     tool_calls: &[ParsedToolCall],
     dispatch: ToolDispatchContext<'_>,
@@ -776,6 +788,7 @@ pub(crate) async fn execute_tools_sequential(
     cancellation_token: Option<&CancellationToken>,
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
+    mut loop_guard: Option<&mut SequentialLoopGuard>,
 ) -> Result<Vec<Option<CompletedToolExecution>>> {
     let mut slots: Vec<Option<CompletedToolExecution>> = Vec::with_capacity(tool_calls.len());
 
@@ -799,6 +812,34 @@ pub(crate) async fn execute_tools_sequential(
                 .unwrap_or(dispatch.excluded_tools),
             model_switch_callback: dispatch.model_switch_callback,
         };
+        // Discovery in an earlier call can change the callable set after
+        // preparation. Recheck at dispatch, against this live resolution.
+        if let Some(guard) = loop_guard.as_deref_mut()
+            && let Some(name) = dispatch_tool_name(&call.name, call_dispatch)
+            && !guard.ignore_tools.contains(&name)
+            && let super::loop_detector::LoopDetectionResult::Block(message) =
+                guard.detector.check_before_call(&name, &call.arguments)
+        {
+            guard.refused = true;
+            let outcome = ToolExecutionOutcome {
+                output: message.clone(),
+                attachments: Vec::new(),
+                success: false,
+                error_reason: Some(message),
+                duration: Duration::ZERO,
+                receipt: None,
+                output_data: None,
+            };
+            if let Some(tx) = event_tx {
+                super::turn::events::emit_tool_call_pair(tx, call, &outcome).await;
+            }
+            slots.push(Some(CompletedToolExecution {
+                outcome,
+                executed_tool_name: None,
+                loop_refused: true,
+            }));
+            continue;
+        }
         let outcome = match execute_one_tool_with_provenance(
             &call.name,
             call.arguments.clone(),
@@ -816,6 +857,14 @@ pub(crate) async fn execute_tools_sequential(
             Err(e) if is_tool_loop_cancelled(&e) => break,
             Err(e) => return Err(e),
         };
+        if let Some(guard) = loop_guard.as_deref_mut()
+            && let Some(name) = outcome.executed_tool_name.as_deref()
+            && !guard.ignore_tools.iter().any(|ignored| ignored == name)
+        {
+            guard
+                .detector
+                .record(name, &call.arguments, &outcome.outcome.output);
+        }
         slots.push(Some(outcome));
     }
 
@@ -1030,6 +1079,62 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn newly_activated_tools_are_checked_before_repeated_dispatch() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let count = Arc::new(AtomicUsize::new(0));
+        let target: Arc<dyn Tool> = Arc::new(CountingTool::new("deferred", Arc::clone(&count)));
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(ActivatingTool {
+            activated: Arc::clone(&activated),
+            activates: "deferred".into(),
+            target,
+        })];
+        let mut calls = vec![parsed_tool_call("activator")];
+        calls.extend((0..4).map(|_| parsed_tool_call("deferred")));
+        calls.push(parsed_tool_call("unknown_after_refusal"));
+        let meta = TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "dynamic",
+            channel_name: "test",
+        };
+        let mut guard = super::SequentialLoopGuard {
+            detector: crate::agent::loop_detector::LoopDetector::new(Default::default()),
+            ignore_tools: Vec::new(),
+            refused: false,
+        };
+        let outcomes = super::execute_tools_sequential(
+            &calls,
+            ToolDispatchContext {
+                tools_registry: &registry,
+                activated_tools: Some(&activated),
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            None,
+            None,
+            None,
+            Some(&mut guard),
+        )
+        .await
+        .unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+        assert!(guard.refused);
+        assert!(
+            outcomes.iter().all(Option::is_some),
+            "policy refusals are not cancellation"
+        );
+        assert!(outcomes[4].as_ref().unwrap().loop_refused);
+        assert!(
+            !outcomes[5].as_ref().unwrap().loop_refused,
+            "unknown tools preserve failed-attempt audit semantics"
+        );
+        assert!(outcomes[4].as_ref().unwrap().executed_tool_name.is_none());
+        assert!(!outcomes[4].as_ref().unwrap().outcome.success);
+    }
+
     /// The dispatch context is built once for a whole response, so the exclusion
     /// slice it carries predates anything that response activates. A step that
     /// denies `sop_execute` — every step does, it is a SOP control tool — must
@@ -1078,6 +1183,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         })
@@ -1089,6 +1195,10 @@ mod tests {
             0,
             "a tool the step denies must not execute, even when a call earlier in \
              the same response activated it"
+        );
+        assert!(
+            !outcomes[1].as_ref().unwrap().loop_refused,
+            "step exclusions preserve failed-attempt audit semantics"
         );
         let second = outcomes[1]
             .as_ref()
@@ -2389,7 +2499,7 @@ mod tests {
             "precondition: outcome.output must already be scrubbed"
         );
 
-        let tool_calls = vec![ParsedToolCall {
+        let tool_calls = [ParsedToolCall {
             name: "configurable_failing_tool".to_string(),
             arguments: serde_json::json!({}),
             tool_call_id: Some("call-1".to_string()),
@@ -2404,7 +2514,7 @@ mod tests {
         let ignore: HashSet<&str> = HashSet::new();
         let collected = collect_tool_results(
             ordered,
-            &tool_calls,
+            &tool_calls.iter().cloned().map(Some).collect::<Vec<_>>(),
             &mut history,
             &mut detector,
             &ignore,

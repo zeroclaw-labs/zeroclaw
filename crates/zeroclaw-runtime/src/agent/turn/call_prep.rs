@@ -46,6 +46,9 @@ impl std::fmt::Debug for PreparationAborted {
 }
 
 pub(crate) struct PreparedToolCalls {
+    /// Canonical fact created by the preflight gate. Result collection may
+    /// change detector history, but cannot undo an already refused dispatch.
+    pub(crate) preflight_loop_stopped: bool,
     pub(crate) ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>,
     pub(crate) executable_indices: Vec<usize>,
     pub(crate) executable_calls: Vec<ParsedToolCall>,
@@ -198,9 +201,11 @@ pub(crate) async fn prepare_tool_calls(
     prompt_approval_tool_signatures: &mut HashSet<(String, String)>,
     iteration: usize,
     dedup_enabled: bool,
+    detector: Option<&crate::agent::loop_detector::LoopDetector>,
 ) -> std::result::Result<PreparedToolCalls, PreparationAborted> {
     let mut ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> =
         (0..tool_calls.len()).map(|_| None).collect();
+    let mut preflight_loop_stopped = false;
     let mut executable_indices: Vec<usize> = Vec::new();
     let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
     let mut executable_stream_calls = Vec::new();
@@ -212,6 +217,7 @@ pub(crate) async fn prepare_tool_calls(
     // prepared tool name it would have executed under.
     let mut retained_hook_contexts: Vec<(ToolCallHookContext, String)> = Vec::new();
 
+    let mut detector_preview = detector.cloned();
     for (idx, call) in tool_calls.iter().enumerate() {
         // ── Hook: before_tool_call (modifying) ──────────
         let mut tool_name = call.name.clone();
@@ -466,6 +472,51 @@ pub(crate) async fn prepare_tool_calls(
             continue;
         }
 
+        let detector_tool_name = crate::agent::tool_execution::dispatch_tool_name(
+            &tool_name,
+            crate::agent::tool_execution::ToolDispatchContext {
+                tools_registry,
+                activated_tools,
+                excluded_tools,
+                model_switch_callback: None,
+            },
+        );
+        // Discovery can admit a later call that splits an apparent repeat run.
+        // Preserve the remaining calls for the sequential dispatch detector.
+        if detector_tool_name.as_deref() == Some("tool_search") {
+            detector_preview = None;
+        }
+        if let Some(detector_tool_name) = detector_tool_name
+            && let Some(preview) = &mut detector_preview
+            && !ctx
+                .pacing
+                .loop_ignore_tools
+                .iter()
+                .any(|name| name == &detector_tool_name)
+        {
+            if let crate::agent::loop_detector::LoopDetectionResult::Block(message) =
+                preview.check_before_call(&detector_tool_name, &tool_args)
+            {
+                preflight_loop_stopped = true;
+                abandon_prepared_context(ctx, &hook_context, &tool_name).await;
+                let outcome = ToolExecutionOutcome {
+                    output: message.clone(),
+                    attachments: Vec::new(),
+                    success: false,
+                    error_reason: Some(message),
+                    duration: Duration::ZERO,
+                    receipt: None,
+                    output_data: None,
+                };
+                if let Some(tx) = ctx.event_tx {
+                    emit_tool_call_pair(tx, call, &outcome).await;
+                }
+                ordered_results[idx] = Some((tool_name, call.tool_call_id.clone(), outcome));
+                continue;
+            }
+            preview.record(&detector_tool_name, &tool_args, "pending execution");
+        }
+
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start)
@@ -530,6 +581,7 @@ pub(crate) async fn prepare_tool_calls(
     }
 
     Ok(PreparedToolCalls {
+        preflight_loop_stopped,
         ordered_results,
         executable_indices,
         executable_calls,
@@ -667,6 +719,7 @@ mod tests {
             &mut prompt_seen,
             0,
             false,
+            None,
         )
         .await
         .expect("preparation should accept the test call");
@@ -676,14 +729,18 @@ mod tests {
             &prepared.executable_indices,
             &prepared.executable_calls,
             &prepared.stream_calls,
-            vec![ToolExecutionOutcome {
-                output: "ok".to_string(),
-                attachments: Vec::new(),
-                output_data: None,
-                success: true,
-                error_reason: None,
-                duration: Duration::ZERO,
-                receipt: None,
+            vec![crate::agent::tool_execution::CompletedToolExecution {
+                executed_tool_name: Some("test_tool".into()),
+                loop_refused: false,
+                outcome: ToolExecutionOutcome {
+                    output: "ok".to_string(),
+                    attachments: Vec::new(),
+                    output_data: None,
+                    success: true,
+                    error_reason: None,
+                    duration: Duration::ZERO,
+                    receipt: None,
+                },
             }],
             &mut prepared.ordered_results,
             0,
@@ -804,6 +861,29 @@ mod tests {
                 .push(format!("after:{}:{}", tool, context.invocation_id()));
         }
 
+        async fn on_after_tool_call_with_context_and_args(
+            &self,
+            context: &zeroclaw_api::hook::ToolCallHookContext,
+            tool: &str,
+            args: &serde_json::Value,
+            result: &zeroclaw_api::tool::ToolResult,
+            duration: Duration,
+        ) {
+            if tool == "unknown" || tool == "unavailable" {
+                assert!(!result.success);
+                assert_eq!(
+                    args["attempt"],
+                    if tool == "unknown" {
+                        "unknown"
+                    } else {
+                        "excluded"
+                    }
+                );
+            }
+            self.on_after_tool_call_with_context(context, tool, result, duration)
+                .await;
+        }
+
         async fn on_tool_call_abandoned(
             &self,
             context: &zeroclaw_api::hook::ToolCallHookContext,
@@ -869,6 +949,7 @@ mod tests {
             &mut prompt_seen,
             0,
             false,
+            None,
         )
         .await
         .expect("preparation completes with the cancelled call recorded");
@@ -916,6 +997,7 @@ mod tests {
             &mut prompt_seen,
             0,
             true,
+            None,
         )
         .await
         .expect("preparation succeeds with the duplicate suppressed");
@@ -933,14 +1015,18 @@ mod tests {
             &prepared.executable_indices,
             &prepared.executable_calls,
             &prepared.stream_calls,
-            vec![ToolExecutionOutcome {
-                output: "ok".to_string(),
-                attachments: Vec::new(),
-                output_data: None,
-                success: true,
-                error_reason: None,
-                duration: Duration::ZERO,
-                receipt: None,
+            vec![crate::agent::tool_execution::CompletedToolExecution {
+                executed_tool_name: Some("test_tool".into()),
+                loop_refused: false,
+                outcome: ToolExecutionOutcome {
+                    output: "ok".to_string(),
+                    attachments: Vec::new(),
+                    output_data: None,
+                    success: true,
+                    error_reason: None,
+                    duration: Duration::ZERO,
+                    receipt: None,
+                },
             }],
             &mut prepared.ordered_results,
             0,
@@ -957,6 +1043,90 @@ mod tests {
             ],
             "the duplicate is abandoned once; the surviving call correlates to its after hook"
         );
+    }
+
+    #[tokio::test]
+    async fn only_loop_refusal_abandons_context_other_failures_keep_audit_hooks() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(16);
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runner = crate::hooks::HookRunner::new();
+        runner.register(Box::new(LifecycleRecorder {
+            events: Arc::clone(&events),
+            cancel_before_for: Vec::new(),
+        }));
+        let ctx = lifecycle_ctx(&observer, &pacing, &tx, None, Some(&runner));
+        let calls = [
+            parsed_call("attempted", serde_json::json!({}), "a"),
+            parsed_call("refused", serde_json::json!({}), "b"),
+            parsed_call("unknown", serde_json::json!({"attempt":"unknown"}), "c"),
+            parsed_call(
+                "unavailable",
+                serde_json::json!({"attempt":"excluded"}),
+                "d",
+            ),
+        ];
+        let mut seen = HashSet::new();
+        let mut prompt_seen = HashSet::new();
+        let mut prepared = prepare_tool_calls(
+            &ctx,
+            &[],
+            None,
+            &[],
+            &calls,
+            &mut seen,
+            &mut prompt_seen,
+            0,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        let outcomes = [Some("attempted"), None, None, None]
+            .into_iter()
+            .enumerate()
+            .map(
+                |(index, name)| crate::agent::tool_execution::CompletedToolExecution {
+                    executed_tool_name: name.map(str::to_owned),
+                    loop_refused: index == 1,
+                    outcome: ToolExecutionOutcome {
+                        output: "failed or refused".into(),
+                        attachments: Vec::new(),
+                        output_data: None,
+                        success: false,
+                        error_reason: Some("failed or refused".into()),
+                        duration: Duration::ZERO,
+                        receipt: None,
+                    },
+                },
+            )
+            .collect();
+        record_executed_outcomes(
+            &ctx,
+            &prepared.executable_indices,
+            &prepared.executable_calls,
+            &prepared.stream_calls,
+            outcomes,
+            &mut prepared.ordered_results,
+            0,
+        )
+        .await;
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "before:attempted:test-turn:0:0",
+                "before:refused:test-turn:0:1",
+                "before:unknown:test-turn:0:2",
+                "before:unavailable:test-turn:0:3",
+                "after:attempted:test-turn:0:0",
+                "abandoned:refused:test-turn:0:1",
+                "after:unknown:test-turn:0:2",
+                "after:unavailable:test-turn:0:3",
+            ]
+        );
+        assert!(prepared.ordered_results.iter().all(Option::is_some));
+        assert!(!prepared.ordered_results[1].as_ref().unwrap().2.success);
     }
 
     #[tokio::test]
@@ -1017,6 +1187,7 @@ mod tests {
             &mut prompt_seen,
             0,
             false,
+            None,
         );
         tokio::pin!(preparation);
 
@@ -1086,6 +1257,7 @@ mod tests {
             &mut prompt_seen,
             0,
             false,
+            None,
         )
         .await
         .expect("preparation completes with the denied call recorded");
@@ -1143,6 +1315,7 @@ mod tests {
                     &mut prompt_seen,
                     0,
                     false,
+                    None,
                 )
                 .await
                 .unwrap_or_else(|aborted| {
@@ -1251,6 +1424,7 @@ mod tests {
             &mut prompt_seen,
             0,
             false,
+            None,
         )
         .await
         .expect("preparation completes with the replaced call recorded");
@@ -1315,6 +1489,7 @@ mod tests {
             &mut prompt_seen,
             0,
             false,
+            None,
         )
         .await
         .expect("round 0 prepares");
@@ -1336,6 +1511,7 @@ mod tests {
             &mut prompt_seen,
             1,
             false,
+            None,
         )
         .await
         else {
@@ -1412,6 +1588,269 @@ mod tests {
             ],
             "a fully aborted execution batch abandons every executable context"
         );
+    }
+
+    #[tokio::test]
+    async fn loop_preflight_bounds_one_parallel_batch_and_abandons_blocked_hook() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(32);
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut runner = crate::hooks::HookRunner::new();
+        runner.register(Box::new(LifecycleRecorder {
+            events: Arc::clone(&events),
+            cancel_before_for: Vec::new(),
+        }));
+        let ctx = lifecycle_ctx(&observer, &pacing, &tx, None, Some(&runner));
+        let args = serde_json::json!({"command":"ssh target hostname"});
+        let calls: Vec<_> = (0..4)
+            .map(|index| parsed_call("shell", args.clone(), &index.to_string()))
+            .collect();
+        let detector = crate::agent::loop_detector::LoopDetector::new(Default::default());
+        let prepared = prepare_tool_calls(
+            &ctx,
+            &stub_tools(&["shell"]),
+            None,
+            &[],
+            &calls,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            0,
+            false,
+            Some(&detector),
+        )
+        .await
+        .expect("bounded batch prepares");
+        assert!(prepared.preflight_loop_stopped);
+        assert_eq!(prepared.executable_calls.len(), 3);
+        assert!(!prepared.ordered_results[3].as_ref().unwrap().2.success);
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("abandoned:"))
+                .count(),
+            1
+        );
+        assert!(!events.iter().any(|event| event.starts_with("after:")));
+    }
+
+    #[tokio::test]
+    async fn tool_search_disables_batch_preview_until_live_dispatch() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(32);
+        let mut ctx = test_ctx(&observer, &pacing, &tx);
+        let exempt = vec!["shell".to_string()];
+        ctx.dedup_exempt_tools = &exempt;
+        let args = serde_json::json!({"command":"same"});
+        let calls = vec![
+            parsed_call(
+                "tool_search",
+                serde_json::json!({"query":"deferred"}),
+                "search",
+            ),
+            parsed_call("shell", args.clone(), "a1"),
+            parsed_call("shell", args.clone(), "a2"),
+            parsed_call("shell", args.clone(), "a3"),
+            parsed_call("unresolved", serde_json::json!({}), "b"),
+            parsed_call("shell", args, "a4"),
+        ];
+        let detector = crate::agent::loop_detector::LoopDetector::new(Default::default());
+        let prepared = prepare_tool_calls(
+            &ctx,
+            &stub_tools(&["tool_search", "shell"]),
+            None,
+            &[],
+            &calls,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            0,
+            false,
+            Some(&detector),
+        )
+        .await
+        .unwrap();
+        assert!(!prepared.preflight_loop_stopped);
+        assert_eq!(
+            prepared
+                .executable_calls
+                .iter()
+                .filter(|call| call.name == "shell")
+                .count(),
+            4
+        );
+        assert!(
+            prepared
+                .executable_calls
+                .iter()
+                .any(|call| call.name == "tool_search")
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_preflight_unavailable_calls_do_not_reset_executable_repeats() {
+        for dedup_enabled in [false, true] {
+            let observer = NoopObserver;
+            let pacing = PacingConfig::default();
+            let (tx, _rx) = mpsc::channel(32);
+            let mut ctx = test_ctx(&observer, &pacing, &tx);
+            let exempt = vec!["shell".to_string()];
+            ctx.dedup_exempt_tools = &exempt;
+            let registry = stub_tools(&["shell", "excluded"]);
+            let excluded = vec!["excluded".to_string()];
+            let mut calls = Vec::new();
+            for index in 0..4 {
+                calls.push(parsed_call(
+                    "shell",
+                    serde_json::json!({"command":"same"}),
+                    &format!("s{index}"),
+                ));
+                calls.push(parsed_call(
+                    "unknown",
+                    serde_json::json!({"index":index}),
+                    &format!("u{index}"),
+                ));
+                calls.push(parsed_call(
+                    "excluded",
+                    serde_json::json!({"index":index}),
+                    &format!("e{index}"),
+                ));
+            }
+            let detector = crate::agent::loop_detector::LoopDetector::new(Default::default());
+            let prepared = prepare_tool_calls(
+                &ctx,
+                &registry,
+                None,
+                &excluded,
+                &calls,
+                &mut HashSet::new(),
+                &mut HashSet::new(),
+                0,
+                dedup_enabled,
+                Some(&detector),
+            )
+            .await
+            .unwrap();
+            assert!(prepared.preflight_loop_stopped);
+            assert_eq!(
+                prepared
+                    .executable_calls
+                    .iter()
+                    .filter(|call| call.name == "shell")
+                    .count(),
+                3
+            );
+            assert!(!prepared.ordered_results[9].as_ref().unwrap().2.success);
+        }
+    }
+
+    struct ArgumentRewriteHook {
+        varying: bool,
+        counter: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl crate::hooks::HookHandler for ArgumentRewriteHook {
+        fn name(&self) -> &str {
+            "argument-rewrite-test"
+        }
+        async fn before_tool_call_with_context(
+            &self,
+            _: &zeroclaw_api::hook::ToolCallHookContext,
+            name: String,
+            _: serde_json::Value,
+        ) -> crate::hooks::HookResult<(String, serde_json::Value)> {
+            let value = if self.varying {
+                self.counter
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            } else {
+                0
+            };
+            crate::hooks::HookResult::Continue((
+                name,
+                serde_json::json!({"command":format!("echo prepared-{value}")}),
+            ))
+        }
+    }
+    #[tokio::test]
+    async fn loop_preflight_resolves_mcp_aliases_before_admission() {
+        for previous_executions in [0, 3] {
+            let observer = NoopObserver;
+            let pacing = PacingConfig::default();
+            let (tx, _rx) = mpsc::channel(32);
+            let ctx = test_ctx(&observer, &pacing, &tx);
+            let mut activated = crate::tools::ActivatedToolSet::new();
+            activated.activate(
+                "server__action".into(),
+                Arc::new(AttributedTool {
+                    name: "server__action".into(),
+                    provenance: ToolProvenance::Native,
+                }),
+            );
+            let activated = Arc::new(std::sync::Mutex::new(activated));
+            let args = serde_json::json!({"value":1});
+            let mut detector = crate::agent::loop_detector::LoopDetector::new(Default::default());
+            for n in 0..previous_executions {
+                detector.record("server__action", &args, &format!("executed {n}"));
+            }
+            let calls: Vec<_> = ["action", "server__action", "action", "server__action"]
+                .iter()
+                .enumerate()
+                .map(|(i, name)| parsed_call(name, args.clone(), &i.to_string()))
+                .collect();
+            let prepared = prepare_tool_calls(
+                &ctx,
+                &[],
+                Some(&activated),
+                &[],
+                &calls,
+                &mut HashSet::new(),
+                &mut HashSet::new(),
+                0,
+                false,
+                Some(&detector),
+            )
+            .await
+            .unwrap();
+            assert!(prepared.preflight_loop_stopped);
+            assert_eq!(
+                prepared.executable_calls.len(),
+                if previous_executions == 0 { 3 } else { 0 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn loop_preflight_uses_post_hook_arguments_in_both_directions() {
+        for varying in [false, true] {
+            let observer = NoopObserver;
+            let pacing = PacingConfig::default();
+            let (tx, _rx) = mpsc::channel(32);
+            let mut runner = crate::hooks::HookRunner::new();
+            runner.register(Box::new(ArgumentRewriteHook {
+                varying,
+                counter: std::sync::atomic::AtomicUsize::new(0),
+            }));
+            let ctx = lifecycle_ctx(&observer, &pacing, &tx, None, Some(&runner));
+            let calls:Vec<_>=(0..4).map(|i| parsed_call("shell",serde_json::json!({"command":format!("echo raw-{}",if varying { 0 } else { i })}),&i.to_string())).collect();
+            let detector = crate::agent::loop_detector::LoopDetector::new(Default::default());
+            let prepared = prepare_tool_calls(
+                &ctx,
+                &stub_tools(&["shell"]),
+                None,
+                &[],
+                &calls,
+                &mut HashSet::new(),
+                &mut HashSet::new(),
+                0,
+                false,
+                Some(&detector),
+            )
+            .await
+            .unwrap();
+            assert_eq!(prepared.preflight_loop_stopped, !varying);
+            assert_eq!(prepared.executable_calls.len(), if varying { 4 } else { 3 });
+        }
     }
 
     // ── Calls that cannot run are not put to the operator ────────────────
@@ -1555,6 +1994,7 @@ mod tests {
             &mut prompt_seen,
             0,
             false,
+            None,
         )
         .await
         .expect("preparation completes");
