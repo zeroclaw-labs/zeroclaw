@@ -11733,10 +11733,132 @@ mod tests {
             "malformed alias payload should not execute as a tool call"
         );
         assert!(
-            history
+            history.iter().any(|msg| msg.role == "user"
+                && msg.content.contains("[Tool call not executed]")
+                && msg.content.contains("`count_tool` did not run")),
+            "history should tell the model which call was withheld and that it did not run"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_tells_the_model_a_prose_leaked_call_did_not_run() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let provider = ScriptedModelProvider::from_text_responses(vec![
+            // A weak model narrates the call instead of issuing it, then
+            // assumes it happened. Nothing may run, and the feedback must say so.
+            "I'll save the agreement now.\n\
+             {\"tool_calls\":[{\"name\":\"file_write\",\"arguments\":{\"path\":\"agreement.md\",\"content\":\"draft\"}}]}\n\
+             The file is ready for download.",
+            "Recovered answer.",
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("file_write", Arc::clone(&invocations)),
+            )]);
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("draft the consultancy agreement"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            served_route_sink: None,
+            sop_reassembly: None,
+            capability_binding: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    dispatch_model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                keep_tool_context_turns: 2,
+                context_limits: test_context_limits(0),
+                context_limits_resolver: None,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+                security: None,
+            },
+            history: &mut history,
+            // Test transcripts start fresh: no prior trim, no crumb.
+            history_has_trim_breadcrumb: &mut false,
+            injected_memory_preamble: &mut None,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            // Phase 1: stamp Internal/Trusted until per-transport
+            // stamping lands.
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("malformed tool protocol should retry and recover");
+
+        assert_eq!(result, "Recovered answer.");
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "a call written as text must never run"
+        );
+        let feedback = history
+            .iter()
+            .filter(|msg| msg.role == "user" && msg.content.contains("[Tool call not executed]"))
+            .map(|msg| msg.content.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            feedback.len(),
+            1,
+            "exactly one feedback message: {history:?}"
+        );
+        assert!(
+            feedback[0].contains("a call to `file_write`"),
+            "{}",
+            feedback[0]
+        );
+        assert!(
+            feedback[0].contains("`file_write` did not run"),
+            "{}",
+            feedback[0]
+        );
+        assert!(
+            feedback[0].contains("Do not tell the user the action was done"),
+            "{}",
+            feedback[0]
+        );
+        assert!(
+            !history
                 .iter()
-                .any(|msg| msg.role == "user" && msg.content.contains("[Tool call parse error]")),
-            "history should include internal parser feedback for the model"
+                .any(|msg| msg.role == "assistant" && msg.content.contains("file_write")),
+            "the withheld reply must not enter history: {history:?}"
         );
     }
 
@@ -11827,7 +11949,8 @@ mod tests {
         assert!(
             history
                 .iter()
-                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+                .all(|msg| !msg.content.contains("[Tool call parse error]")
+                    && !msg.content.contains("[Tool call not executed]")),
             "business JSON must not trigger internal parser feedback"
         );
     }
@@ -11918,7 +12041,8 @@ mod tests {
         assert!(
             history
                 .iter()
-                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+                .all(|msg| !msg.content.contains("[Tool call parse error]")
+                    && !msg.content.contains("[Tool call not executed]")),
             "business JSON must not trigger internal parser feedback"
         );
     }
@@ -12390,7 +12514,8 @@ mod tests {
         assert!(
             history
                 .iter()
-                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+                .all(|msg| !msg.content.contains("[Tool call parse error]")
+                    && !msg.content.contains("[Tool call not executed]")),
             "toolcalls reference JSON must not trigger internal parser feedback"
         );
     }
@@ -12578,7 +12703,8 @@ mod tests {
         assert!(
             history
                 .iter()
-                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+                .all(|msg| !msg.content.contains("[Tool call parse error]")
+                    && !msg.content.contains("[Tool call not executed]")),
             "toolcalls reference JSON must not trigger internal parser feedback"
         );
     }
@@ -12661,7 +12787,8 @@ mod tests {
         assert!(
             history
                 .iter()
-                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+                .all(|msg| !msg.content.contains("[Tool call parse error]")
+                    && !msg.content.contains("[Tool call not executed]")),
             "plain schema JSON must not trigger internal parser feedback"
         );
     }
@@ -12745,7 +12872,8 @@ mod tests {
         assert!(
             history
                 .iter()
-                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+                .all(|msg| !msg.content.contains("[Tool call parse error]")
+                    && !msg.content.contains("[Tool call not executed]")),
             "business tool_calls JSON must not trigger internal parser feedback"
         );
     }
@@ -12829,7 +12957,8 @@ mod tests {
         assert!(
             history
                 .iter()
-                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+                .all(|msg| !msg.content.contains("[Tool call parse error]")
+                    && !msg.content.contains("[Tool call not executed]")),
             "reference function_call JSON must not trigger internal parser feedback"
         );
     }
@@ -12915,7 +13044,8 @@ This is an example, not an invocation."#;
         assert!(
             history
                 .iter()
-                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+                .all(|msg| !msg.content.contains("[Tool call parse error]")
+                    && !msg.content.contains("[Tool call not executed]")),
             "tool_call tag examples must not trigger internal parser feedback"
         );
     }
@@ -13018,7 +13148,8 @@ This is an example, not an invocation."#;
         assert!(
             history
                 .iter()
-                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+                .all(|msg| !msg.content.contains("[Tool call parse error]")
+                    && !msg.content.contains("[Tool call not executed]")),
             "tool-call examples must not trigger internal parser feedback"
         );
     }
@@ -13465,7 +13596,8 @@ This is an example, not an invocation."#;
         assert!(
             history
                 .iter()
-                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+                .all(|msg| !msg.content.contains("[Tool call parse error]")
+                    && !msg.content.contains("[Tool call not executed]")),
             "tool_call fenced examples must not trigger internal parser feedback"
         );
     }
@@ -13610,7 +13742,8 @@ This is an example, not an invocation."#;
         assert!(
             history
                 .iter()
-                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+                .all(|msg| !msg.content.contains("[Tool call parse error]")
+                    && !msg.content.contains("[Tool call not executed]")),
             "split tool_call fenced examples must not trigger internal parser feedback"
         );
     }
@@ -13706,7 +13839,8 @@ This is an example, not an invocation."#;
         assert!(
             history
                 .iter()
-                .all(|msg| !msg.content.contains("[Tool call parse error]")),
+                .all(|msg| !msg.content.contains("[Tool call parse error]")
+                    && !msg.content.contains("[Tool call not executed]")),
             "JSON-fenced tool protocol examples must not trigger internal parser feedback"
         );
     }
@@ -14343,6 +14477,7 @@ This is an example, not an invocation."#;
             &provider,
             &messages,
             Some(&tools),
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -14432,6 +14567,7 @@ This is an example, not an invocation."#;
             &provider,
             &messages,
             Some(&tools),
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -14471,6 +14607,7 @@ This is an example, not an invocation."#;
             &provider,
             &messages,
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -14514,6 +14651,7 @@ This is an example, not an invocation."#;
             &provider,
             &messages,
             Some(&tools),
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -14557,6 +14695,7 @@ This is an example, not an invocation."#;
             &provider,
             &messages,
             Some(&tools),
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -14643,6 +14782,7 @@ This is an example, not an invocation."#;
             &provider,
             &messages,
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -14727,6 +14867,7 @@ This is an example, not an invocation."#;
             &provider,
             &messages,
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -14814,6 +14955,7 @@ This is an example, not an invocation."#;
             &provider,
             &messages,
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -14905,6 +15047,7 @@ This is an example, not an invocation."#;
             &provider,
             &messages,
             Some(&tools),
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -14990,6 +15133,7 @@ This is an example, not an invocation."#;
             &provider,
             &messages,
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -15078,6 +15222,7 @@ This is an example, not an invocation."#;
             &provider,
             &messages,
             None,
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -15579,6 +15724,7 @@ This is an example, not an invocation."#;
             &model_provider,
             &messages,
             Some(&tools),
+            &std::collections::HashSet::new(),
             "mock-model",
             Some(0.0),
             None,
@@ -18003,6 +18149,7 @@ Let me check the result."#;
             &model_provider,
             &messages,
             None,
+            &std::collections::HashSet::new(),
             "deepseek-v4-pro",
             Some(0.2),
             None,
@@ -18099,6 +18246,7 @@ Let me check the result."#;
             &model_provider,
             &messages,
             None,
+            &std::collections::HashSet::new(),
             "deepseek-v4-flash",
             Some(0.2),
             None,
