@@ -177,6 +177,44 @@ impl SessionActorQueue {
         }
     }
 
+    /// Acquire exclusive access to a session only when it is free now: no
+    /// holder and nothing queued. Returns `Ok(None)` instead of waiting when
+    /// the session is busy. The check and the claim happen under the slot map
+    /// lock, so two callers cannot both see the session idle.
+    pub async fn try_acquire(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionGuard>, SessionQueueError> {
+        let registration = {
+            let mut slots = self.slots.lock().await;
+            let slot = slots
+                .entry(session_id.to_string())
+                .or_insert_with(|| {
+                    Arc::new(SessionSlot {
+                        semaphore: Arc::new(Semaphore::new(1)),
+                        last_active: Mutex::new(Instant::now()),
+                        pending: AtomicUsize::new(0),
+                    })
+                })
+                .clone();
+            if slot.pending.load(Ordering::Relaxed) > 0 {
+                return Ok(None);
+            }
+            let Ok(permit) = slot.semaphore.clone().try_acquire_owned() else {
+                return Ok(None);
+            };
+            slot.pending.fetch_add(1, Ordering::Relaxed);
+            (permit, PendingRegistration { slot })
+        };
+        let (permit, registration) = registration;
+        *registration.slot.last_active.lock().await = Instant::now();
+        Ok(Some(SessionGuard {
+            _permit: permit,
+            _registration: registration,
+            session_id: session_id.to_string(),
+        }))
+    }
+
     #[cfg(test)]
     fn set_registration_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
         *self.registration_hook.lock().unwrap() = Some(hook);
@@ -216,6 +254,38 @@ impl SessionActorQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn try_acquire_claims_only_an_idle_session() {
+        let queue = Arc::new(SessionActorQueue::new(4, 5, 600));
+        let held = queue.acquire("s1").await.unwrap();
+        assert!(queue.try_acquire("s1").await.unwrap().is_none(), "held");
+
+        let waiter = queue.clone();
+        let queued = zeroclaw_spawn::spawn!(async move { waiter.acquire("s1").await });
+        while queue.queue_depth("s1").await < 2 {
+            tokio::task::yield_now().await;
+        }
+        drop(held);
+        let next = queued.await.unwrap().unwrap();
+        assert!(
+            queue.try_acquire("s1").await.unwrap().is_none(),
+            "the queued waiter owns it now"
+        );
+        drop(next);
+        assert!(
+            queue.try_acquire("s1").await.unwrap().is_some(),
+            "idle again"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_try_acquire_admits_exactly_one() {
+        let queue = Arc::new(SessionActorQueue::new(4, 5, 600));
+        let (a, b) = tokio::join!(queue.try_acquire("s1"), queue.try_acquire("s1"));
+        let claims = [a.unwrap(), b.unwrap()];
+        assert_eq!(claims.iter().filter(|c| c.is_some()).count(), 1);
+    }
 
     #[tokio::test]
     async fn serializes_same_session() {

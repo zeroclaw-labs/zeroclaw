@@ -306,6 +306,11 @@ pub const BUILTIN_TOOLS: &[BuiltinToolSpec] = &[
         tier: ToolTier::Host,
         compilation: BuiltinToolCompilation::Always,
     },
+    BuiltinToolSpec {
+        name: "sessions_prompt",
+        tier: ToolTier::Host,
+        compilation: BuiltinToolCompilation::Always,
+    },
     // SOP.
     BuiltinToolSpec {
         name: "sop_list",

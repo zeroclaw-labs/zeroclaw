@@ -350,6 +350,9 @@ pub struct NativeRecipeInputs<'a> {
     pub execution_capability: Option<crate::live_config_authority::AgentExecutionCapability>,
     /// A read view of ACP sessions, for entry points that serve ACP.
     pub acp_sessions: Option<crate::tools::AcpSessionReadView>,
+    /// Whether the agent serves RPC client turns, which can prompt other
+    /// live sessions; only those registries offer `sessions_prompt`.
+    pub session_prompts: bool,
 }
 
 /// A native compatibility recipe: builds the native registry for one eager
