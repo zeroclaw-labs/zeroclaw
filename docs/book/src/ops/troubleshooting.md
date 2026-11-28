@@ -336,6 +336,25 @@ API key invalid or expired. Regenerate at the provider's dashboard, update in `[
 
 If using OAuth (`sk-ant-oat*`), the OAuth token may have expired. OAuth-issued tokens are longer-lived but not infinite. Re-authenticate.
 
+### Semantic memory recall misses relevant entries
+
+Check the embedding model's expected query format. If the model expects a
+prefix for search queries, configure it under `[memory]` in `config.toml`.
+For a model that expects `query:` followed by a space, use this setting.
+
+```toml
+[memory]
+embedding_query_prefix = "query: "
+```
+
+Include any spaces or line breaks the model expects between the prefix and the
+query. SQLite and Qdrant apply the prefix to vector recall. Lucid uses it for
+its local SQLite search. SQLite's keyword search uses the original query.
+
+Restart ZeroClaw after changing the prefix. Stored memories are embedded from
+their original text, so you can reuse existing vectors when only the prefix
+changes. To restore the default query format, remove the key and restart.
+
 ---
 
 ## Tools
